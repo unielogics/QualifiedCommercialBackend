@@ -1,0 +1,35 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Don't commit.
+
+aws_region = "us-east-1"
+
+# Your existing IDs (probed + verified)
+existing_vpc_id          = "vpc-01987e73d0b8b590c"   # 10.0.0.0/16
+existing_ec2_instance_id = "i-093af5ff68e31616b"     # t4g.medium, 54.157.222.116
+existing_rds_identifier  = "qualifiedcommercial"     # postgres 18.3, port 5432
+
+domain_root   = "qualifiedcommercial.com"
+api_subdomain = "api"
+
+github_org  = "REPLACE-ME-with-your-github-org-or-username"
+github_repo = "QualifiedCommercial"
+
+ghcr_image = "ghcr.io/REPLACE-ME-with-your-github-org-or-username/qcbackend:latest"
+
+# RDS endpoint:  qualifiedcommercial.cq9i6qic6mr7.us-east-1.rds.amazonaws.com
+# RDS user:      postgres
+# RDS db:        (RDS instance has no default DBName set — see note in README)
+secret_payload = {
+  DATABASE_URL          = "postgresql+asyncpg://postgres:REPLACE_PW@qualifiedcommercial.cq9i6qic6mr7.us-east-1.rds.amazonaws.com:5432/qc"
+  DATABASE_URL_SYNC     = "postgresql+psycopg://postgres:REPLACE_PW@qualifiedcommercial.cq9i6qic6mr7.us-east-1.rds.amazonaws.com:5432/qc"
+  CORS_ORIGINS          = "https://app.qualifiedcommercial.com"
+  CLERK_SECRET_KEY      = "sk_live_REPLACE"
+  CLERK_JWKS_URL        = "https://clerk.qualifiedcommercial.com/.well-known/jwks.json"
+  CLERK_ISSUER          = "https://clerk.qualifiedcommercial.com"
+  ANTHROPIC_API_KEY     = "sk-ant-REPLACE"
+  ANTHROPIC_MODEL_HEAVY = "claude-sonnet-4-6"
+  ANTHROPIC_MODEL_LIGHT = "claude-haiku-4-5-20251001"
+  S3_BUCKET             = "qc-documents-prod"
+  USE_FAKE_INBOX        = "true"
+  APP_ENV               = "production"
+  LOG_LEVEL             = "INFO"
+}

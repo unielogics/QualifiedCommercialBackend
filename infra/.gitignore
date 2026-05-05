@@ -1,0 +1,15 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+*.backup
+crash.log
+
+# Vars (contains secrets)
+terraform.tfvars
+*.auto.tfvars
+
+# OS
+.DS_Store

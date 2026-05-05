@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import SessionLocal, get_db
+from app.deps import CurrentUser
+from app.enums import MessageFrom, Role
+from app.models.loan import Loan
+from app.models.message import Message
+from app.schemas.message import MessageCreate, MessageRead
+from app.ws import channel
+
+router = APIRouter(prefix="/messages", tags=["messages"])
+
+
+@router.get("", response_model=list[MessageRead])
+async def list_messages(
+    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[MessageRead]:
+    stmt = select(Message).where(Message.loan_id == loan_id).order_by(Message.sent_at)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [MessageRead.model_validate(r) for r in rows]
+
+
+@router.post("", response_model=MessageRead, status_code=status.HTTP_201_CREATED)
+async def send_message(
+    payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> MessageRead:
+    loan = await db.get(Loan, payload.loan_id)
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    msg = Message(
+        loan_id=loan.id,
+        body=payload.body,
+        from_role=payload.from_role if user.role != Role.CLIENT else MessageFrom.CLIENT,
+        is_draft=payload.is_draft,
+    )
+    db.add(msg)
+    await db.flush()
+    await db.refresh(msg)
+    await channel.broadcast(loan.deal_id, {"kind": "message", "message": MessageRead.model_validate(msg).model_dump(mode="json")})
+    return MessageRead.model_validate(msg)
+
+
+@router.websocket("/ws/{deal_id}")
+async def messages_ws(websocket: WebSocket, deal_id: str) -> None:
+    """Per-deal channel. Client subscribes by deal_id (e.g. L-2598)."""
+    await channel.connect(deal_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # ignore inbound for now
+    except WebSocketDisconnect:
+        channel.disconnect(deal_id, websocket)
