@@ -1,206 +1,163 @@
 # Deploy Runbook
 
-Architecture (locked in):
-- **Backend** → EC2 (Docker container) + RDS Postgres (pgvector) + ALB + ACM
-- **Desktop** → Vercel (Next.js)
-- **Mobile** → EAS (iOS/Android binaries)
-- **Domain** → `qualifiedcommercial.com`
+Reflects what's actually live in AWS / GitHub.
 
-| Subdomain | Points to | Purpose |
+## Architecture
+
+| Surface | Stack |
+|---|---|
+| Backend | EC2 t4g.medium (Ubuntu 26.04 ARM) → Docker container → Caddy reverse proxy (auto-TLS via Let's Encrypt) |
+| Database | RDS PostgreSQL 18.3 (db.t4g.medium, single-AZ) with `pgvector` extension |
+| Image registry | GHCR (`ghcr.io/unielogics/qcbackend`) |
+| Secrets | AWS Secrets Manager (`qcbackend/prod`) → `/etc/qcbackend.env` on the EC2 |
+| Auth | Clerk production instance (`clerk.qualifiedcommercial.com`) |
+| Backend CI/CD | GitHub Actions in `unielogics/QualifiedCommercialBackend` → OIDC into AWS → SSM rolling restart |
+| Desktop | AWS Amplify Hosting → `unielogics/QCDashboard` → SSR Next.js |
+| Mobile | EAS (Expo Application Services) → `unielogics/QCMobile` |
+
+## DNS — `qualifiedcommercial.com` (Route 53 zone `Z084364029QABG83X8LV3`)
+
+| Subdomain | Type | Target | Source |
+|---|---|---|---|
+| `api.qualifiedcommercial.com` | A | `54.157.222.116` (EC2) | Terraform `aws_route53_record.api` |
+| `app.qualifiedcommercial.com` | CNAME | Amplify-issued (TBD on first connect) | Manual (after Amplify gives the value) |
+| `clerk.qualifiedcommercial.com` | CNAME | `*.clerk.services` (Clerk-issued) | Manual (Clerk prod setup) |
+
+## Live AWS resources (current state)
+
+| | Resource | ID |
 |---|---|---|
-| `app.qualifiedcommercial.com` | Vercel | Operator desktop console |
-| `api.qualifiedcommercial.com` | EC2 ALB | Backend FastAPI |
-| `clerk.qualifiedcommercial.com` | Clerk | Production Clerk instance (CNAME) |
-| `qualifiedcommercial.com` (apex) | Vercel | Marketing or 301 → `app.` |
+| ✅ | VPC | `vpc-01987e73d0b8b590c` (10.0.0.0/16) |
+| ✅ | EC2 | `i-093af5ff68e31616b` (t4g.medium, Ubuntu 26.04, key `qc_master`) |
+| ✅ | RDS | `qualifiedcommercial` (PG 18.3, db.t4g.medium) |
+| ✅ | Secret | `qcbackend/prod` (Secrets Manager) |
+| ✅ | IAM role | `qcbackend-instance-role` + instance profile (attached to EC2) |
+| ✅ | IAM role | `qcbackend-github-deploy` (OIDC trust to `unielogics/QualifiedCommercialBackend@main`) |
+| ✅ | Route 53 A | `api.qualifiedcommercial.com` → EC2 |
+
+All managed by Terraform in [`infra/`](../infra/). Everything is **additive** alongside hand-built VPC/EC2/RDS — `terraform destroy` won't touch the latter.
 
 ---
 
-## One-time AWS setup (do this in order)
+## Backend deploys (after first deploy)
 
-### 1. Provision foundation
 ```
-us-east-1
-├── VPC qc-vpc (10.0.0.0/16)
-│   ├── 2× public subnets (for ALB)
-│   └── 2× private subnets (for EC2 + RDS)
-├── ECR repo: qcbackend
-├── Secrets Manager: qcbackend/prod (JSON blob with all env vars)
-├── ACM cert for *.qualifiedcommercial.com (in us-east-1)
-└── IAM:
-    ├── qcbackend-instance-role (S3 write, Secrets read, SSM agent)
-    └── qcbackend-deploy-role  (assumed by GitHub Actions via OIDC)
+Push to QualifiedCommercialBackend@main
+  → GitHub Actions builds image → pushes to GHCR
+  → assumes qcbackend-github-deploy role via OIDC
+  → SSM Send-Command on EC2: docker pull → docker tag → systemctl restart qcbackend
+  → live in ~3 min
 ```
 
-### 2. RDS Postgres 16 with pgvector
-- Engine: PostgreSQL 16.x (pgvector extension is built in from 15.2+)
-- Instance: `db.t4g.micro` to start (~$13/mo)
-- Storage: 20 GB gp3
-- Multi-AZ: **off** for now, **on** before paying customers
-- Backups: 7 days
-- Subnet group: the 2 private subnets in `qc-vpc`
-- Security group: inbound TCP 5432 from EC2 SG only
-- After creation, connect once and run: `CREATE EXTENSION vector;`
-
-### 3. EC2 instance
-- AMI: Amazon Linux 2023 (ARM if you went `t4g.*` for RDS — match for cost)
-- Type: `t4g.small` to start (~$15/mo)
-- Subnet: one of the public subnets (or private + NAT if you want stricter)
-- Security group:
-  - Inbound 80/443 from ALB SG only
-  - Outbound: anywhere (for ECR, RDS, Anthropic, Clerk, S3)
-- IAM instance profile: `qcbackend-instance-role`
-- User data script (runs on first boot):
-  ```bash
-  #!/bin/bash
-  set -eux
-  dnf install -y docker
-  systemctl enable --now docker
-  usermod -aG docker ec2-user
-
-  # SSM agent is preinstalled on AL2023 — confirm enabled
-  systemctl enable --now amazon-ssm-agent
-
-  # Pull /etc/qcbackend.env from Secrets Manager
-  aws secretsmanager get-secret-value \
-    --secret-id qcbackend/prod \
-    --region us-east-1 \
-    --query SecretString --output text \
-  | jq -r 'to_entries[] | "\(.key)=\(.value)"' > /etc/qcbackend.env
-  chmod 600 /etc/qcbackend.env
-  ```
-- **Tag** the instance with `Service=qcbackend` — the GitHub Actions deploy targets by tag.
-
-### 4. Application Load Balancer (ALB)
-- Listener: 443 (HTTPS) using the ACM cert
-- Listener: 80 → 301 to 443
-- Target group: HTTP:8000 → EC2 instance, health check `GET /`
-- Route 53 record: `api.qualifiedcommercial.com` ALIAS → ALB
-
-### 5. GitHub Actions OIDC role
-Trust policy on `qcbackend-deploy-role`:
-```json
-{
-  "Effect": "Allow",
-  "Principal": { "Federated": "arn:aws:iam::<acct>:oidc-provider/token.actions.githubusercontent.com" },
-  "Action": "sts:AssumeRoleWithWebIdentity",
-  "Condition": {
-    "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-    "StringLike": { "token.actions.githubusercontent.com:sub": "repo:<your-org>/<your-repo>:ref:refs/heads/main" }
-  }
-}
-```
-Permissions on the role: ECR push, SSM SendCommand on tagged instances.
-
-In GitHub repo Settings → Secrets & variables → Actions:
-- secret `AWS_DEPLOY_ROLE_ARN` = ARN of `qcbackend-deploy-role`
-- variable `AWS_REGION` = `us-east-1`
+GitHub repo settings needed (Settings → Secrets and variables → Actions):
+- **Secret** `AWS_DEPLOY_ROLE_ARN` = `arn:aws:iam::156041400244:role/qcbackend-github-deploy`
+- **Variable** `AWS_REGION` = `us-east-1`
+- **Variable** `EC2_INSTANCE_ID` = `i-093af5ff68e31616b`
 
 ---
 
-## Vercel setup (desktop)
+## Desktop deploys via AWS Amplify
 
-1. Import the repo in Vercel.
-2. **Root directory:** `qcdesktop`
-3. **Build command:** `pnpm build` (auto-detected from `vercel.json`)
-4. Add env vars (Production scope):
-   - `NEXT_PUBLIC_API_URL` = `https://api.qualifiedcommercial.com`
-   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` = your **prod** Clerk publishable key
-   - `CLERK_SECRET_KEY` = your **prod** Clerk secret key
-   - `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`
-   - `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`
-   - `NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=/`
-5. Add domain: `app.qualifiedcommercial.com` → follow Vercel's CNAME instructions (point CNAME to `cname.vercel-dns.com`).
-6. Optional: add apex `qualifiedcommercial.com` with redirect to `app.`
+### One-time setup
 
----
+1. **AWS Console → Amplify → Create new app → Host web app**
+2. **Source:** GitHub → authorize Amplify GitHub App → pick `unielogics/QCDashboard` → branch `main`
+3. **Build settings:** Amplify auto-detects Next.js. Confirm:
+   - Build spec: use the `amplify.yml` checked into the repo (Amplify will use the file automatically)
+   - Platform: **Web compute** (required for SSR / middleware / Server Actions)
+4. **Environment variables** — add ALL of these (Production scope). Get the Clerk values from the **Clerk Dashboard → API Keys**:
+   ```
+   NEXT_PUBLIC_API_URL                  = https://api.qualifiedcommercial.com
+   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY    = <pk_live_… from Clerk dashboard>
+   CLERK_SECRET_KEY                     = <sk_live_… from Clerk dashboard>
+   NEXT_PUBLIC_CLERK_SIGN_IN_URL        = /sign-in
+   NEXT_PUBLIC_CLERK_SIGN_UP_URL        = /sign-up
+   NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL  = /
+   NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL  = /
+   ```
+   Mark `CLERK_SECRET_KEY` as a **secret** (Amplify masks it from build logs). The other Clerk URL values are static and the same as in `.env.local.example`.
+5. **Service role:** Amplify will prompt to create `amplifyconsole-backend-role` — accept.
+6. **Save and deploy.** First build takes ~5 min.
 
-## Clerk production instance
+### Custom domain
 
-The current `pk_test_*` is dev only. For prod:
+Once the first build succeeds:
+1. **App settings → Domain management → Add domain**
+2. Domain: `qualifiedcommercial.com`
+3. Subdomain: `app` → branch: `main`
+4. Amplify shows you a CNAME to add in Route 53 → add it (or it'll do it automatically via Route 53 detection if your AWS account owns the zone, which it does).
+5. Cert provisioning takes ~5 min, then `app.qualifiedcommercial.com` is live.
 
-1. In Clerk dashboard, create a **Production Instance**.
-2. Set the production frontend domain to `app.qualifiedcommercial.com`.
-3. Set the Clerk-issued production frontend API to a CNAME you own: `clerk.qualifiedcommercial.com` → Clerk's address.
-4. Enable production-grade settings: 2FA, session lifetime, etc.
-5. Get new `pk_live_*` and `sk_live_*` keys; put them in Vercel env vars + Secrets Manager (`CLERK_SECRET_KEY`, `CLERK_JWKS_URL` = `https://clerk.qualifiedcommercial.com/.well-known/jwks.json`, `CLERK_ISSUER` = `https://clerk.qualifiedcommercial.com`).
-6. Add `https://app.qualifiedcommercial.com` to allowed origins in Clerk dashboard.
+### Subsequent deploys
 
----
-
-## Secrets Manager payload (`qcbackend/prod`)
-
-JSON blob:
-```json
-{
-  "DATABASE_URL": "postgresql+asyncpg://qc:<pw>@<rds-endpoint>:5432/qc",
-  "DATABASE_URL_SYNC": "postgresql+psycopg://qc:<pw>@<rds-endpoint>:5432/qc",
-  "CORS_ORIGINS": "https://app.qualifiedcommercial.com",
-  "CLERK_SECRET_KEY": "sk_live_...",
-  "CLERK_JWKS_URL": "https://clerk.qualifiedcommercial.com/.well-known/jwks.json",
-  "CLERK_ISSUER": "https://clerk.qualifiedcommercial.com",
-  "ANTHROPIC_API_KEY": "sk-ant-...",
-  "ANTHROPIC_MODEL_HEAVY": "claude-sonnet-4-6",
-  "ANTHROPIC_MODEL_LIGHT": "claude-haiku-4-5-20251001",
-  "AWS_REGION": "us-east-1",
-  "S3_BUCKET": "qc-documents-prod",
-  "USE_FAKE_INBOX": "true",
-  "APP_ENV": "production",
-  "LOG_LEVEL": "INFO"
-}
-```
-(S3 access happens via the EC2 instance role — no `AWS_ACCESS_KEY_ID` needed in env.)
+Push to `unielogics/QCDashboard@main` → Amplify webhook fires → builds via `amplify.yml` → atomic switch → ~3-5 min.
 
 ---
 
-## First deploy
+## Backend first deploy (already done — for reference)
+
+Two times in the lifecycle of the EC2 we run `deploy/ec2-bootstrap.sh`:
+- **First time:** clones repo + builds image locally + sets up systemd unit + Caddy + qc database + pgvector. Output: `qcbackend.service` enabled but not started; user runs `systemctl start qcbackend`.
+- **Re-runs:** idempotent — only does work if state is missing. Useful if you bring up a new instance.
 
 ```bash
-# 1. Build + push image manually (one-off, before the GH Actions role is set up)
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <acct>.dkr.ecr.us-east-1.amazonaws.com
-docker build -t qcbackend:v0.1.0 qcbackend
-docker tag qcbackend:v0.1.0 <acct>.dkr.ecr.us-east-1.amazonaws.com/qcbackend:latest
-docker push <acct>.dkr.ecr.us-east-1.amazonaws.com/qcbackend:latest
+ssh -i qc_master.pem ubuntu@54.157.222.116
+curl -fsSL https://raw.githubusercontent.com/unielogics/QualifiedCommercialBackend/main/deploy/ec2-bootstrap.sh \
+  | sudo -E bash
+sudo systemctl start qcbackend
+sudo journalctl -u qcbackend -f       # watch startup
+```
 
-# 2. SSH (or SSM Session Manager) into the EC2 instance, run once:
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <acct>.dkr.ecr.us-east-1.amazonaws.com
-docker run -d --name qcbackend --restart=always -p 8000:8000 \
-  --env-file /etc/qcbackend.env \
-  <acct>.dkr.ecr.us-east-1.amazonaws.com/qcbackend:latest
-
-# 3. Smoke-test
-curl https://api.qualifiedcommercial.com/                       # → {"status":"ok",...}
-curl https://api.qualifiedcommercial.com/api/v1/meta             # → enums + lending limits
-
-# 4. Promote yourself to super_admin
+After it's up:
+```bash
+curl https://api.qualifiedcommercial.com/                 # → {"status":"ok",...}
 docker exec qcbackend python -m app.promote_user \
   --email franco@unielogics.com --role super_admin
 ```
-
-After that, every push to `main` auto-deploys via GitHub Actions.
 
 ---
 
 ## Rollback
 
 ```bash
-# List recent images
-aws ecr describe-images --repository-name qcbackend --query 'imageDetails[*].[imageTags[0],imagePushedAt]' --output table
+# List recent GHCR tags
+gh api repos/unielogics/QualifiedCommercialBackend/actions/workflows/deploy.yml/runs \
+  --jq '.workflow_runs[:5] | .[] | "\(.head_sha[:8]) \(.head_commit.message)"'
 
-# On the EC2 instance, run with the previous tag:
-docker stop qcbackend && docker rm qcbackend
-docker run -d --name qcbackend --restart=always -p 8000:8000 \
-  --env-file /etc/qcbackend.env \
-  <acct>.dkr.ecr.us-east-1.amazonaws.com/qcbackend:<previous-sha>
+# On the EC2 (SSH or SSM):
+docker pull ghcr.io/unielogics/qcbackend:<sha-from-above>
+docker tag ghcr.io/unielogics/qcbackend:<sha> qcbackend:current
+sudo systemctl restart qcbackend
 ```
 
-Database rollback: Alembic supports `alembic downgrade -1`. **But this is dangerous** — only use after confirming no data depends on the new schema, and take an RDS snapshot first.
+Database rollback: `alembic downgrade -1` works but is **dangerous** with real data. Snapshot RDS first:
+```bash
+aws rds create-db-snapshot --db-instance-identifier qualifiedcommercial \
+  --db-snapshot-identifier pre-rollback-$(date +%s)
+```
+
+---
+
+## Secret rotation
+
+Edit `infra/terraform.tfvars` (gitignored), change the value, then:
+```bash
+cd infra && terraform apply
+```
+The EC2's daily cron (`/etc/cron.daily/qcbackend-refresh-env`) catches the diff and restarts the service. To force immediate refresh:
+```bash
+ssh ubuntu@54.157.222.116 "sudo /etc/cron.daily/qcbackend-refresh-env"
+```
 
 ---
 
 ## Ongoing operations
 
-- **Logs:** `docker logs -f qcbackend` on the instance, OR ship to CloudWatch via the Docker awslogs driver
-- **Metrics:** ALB target health is the basic uptime signal; add CloudWatch alarms on 5xx rate + target health
-- **DB backups:** automatic via RDS (7d retention), plus weekly manual snapshot
-- **Cost watch:** Anthropic spend dashboard, AWS Cost Explorer with a tag filter on `Service=qcbackend`
-- **Security:** rotate ANTHROPIC_API_KEY + Clerk secret on a 90-day cadence, store in Secrets Manager, never in `.env` for prod
+- **Backend logs:** `journalctl -u qcbackend -f` on the EC2
+- **Backend metrics:** `docker stats qcbackend` for CPU/mem; CloudWatch via Docker `awslogs` driver if you want centralized logs
+- **Caddy logs (TLS / 4xx / 5xx):** `journalctl -u caddy -f`
+- **RDS metrics:** RDS console → `qualifiedcommercial` → Monitoring tab
+- **Amplify logs:** Amplify console → app → Hosting → Build/Deploy logs
+- **Anthropic spend:** console.anthropic.com → Usage
+- **Cost watch:** AWS Cost Explorer, filter on tag `Project=qualified-commercial`
+- **Security:** rotate `ANTHROPIC_API_KEY` and Clerk `sk_live_*` every 90 days, update via terraform

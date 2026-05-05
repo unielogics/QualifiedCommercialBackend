@@ -20,8 +20,8 @@ Locked-in constraints. Do not change without explicit user approval.
 6. **Enums single source of truth = backend `enums.py`** → codegen TypeScript types via `datamodel-code-generator`. Both frontends import from generated `lib/enums.generated.ts`.
 7. **Tooling = `uv` (Python) + `pnpm` (Node).** No poetry, no npm.
 8. **Broker points = schema only this pass.** Award/clawback rules pending business clarification.
-9. **Prod target = AWS App Runner (backend) + Amplify (desktop) + EAS (mobile).**
-10. **Repo strategy = single git repo, three sibling folders, no workspaces.**
+9. **Prod target = EC2 + Caddy (backend) + Amplify (desktop) + EAS (mobile).** Backend runs as a Docker container on a single t4g.medium EC2 with Caddy in front for auto-TLS via Let's Encrypt. Image lives in GHCR; deploys via GitHub Actions OIDC → SSM rolling restart. Desktop SSR Next.js on AWS Amplify Hosting wired to the QCDashboard repo.
+10. **Repo strategy = three separate GitHub repos, deploy keys per repo.** `unielogics/QualifiedCommercialBackend`, `unielogics/QCDashboard`, `unielogics/QCMobile`. No monorepo / workspaces.
 
 ## Module → Implementation map
 
