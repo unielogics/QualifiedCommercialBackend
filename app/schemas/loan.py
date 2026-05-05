@@ -138,6 +138,21 @@ class RecalcRequest(BaseModel):
     ltv: float | None = None  # 0..1; recomputes amount = ltv * appraised value when given
 
 
+class FreeCalcRequest(BaseModel):
+    """Loan-less what-if calculator. Used by the standalone /simulator page
+    so users can run pricing math without first creating a loan record."""
+    type: LoanType
+    property_type: PropertyType = PropertyType.SFR
+    loan_amount: float = Field(gt=0)
+    base_rate: float = Field(default=0.075, gt=0, lt=1)
+    discount_points: float = Field(default=0, ge=0)
+    term_months: int | None = None
+    monthly_rent: float | None = None
+    annual_taxes: float = 0
+    annual_insurance: float = 0
+    monthly_hoa: float = 0
+
+
 class RecalcResponse(BaseModel):
     final_rate: float
     monthly_pi: float

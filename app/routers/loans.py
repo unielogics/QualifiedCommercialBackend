@@ -19,7 +19,7 @@ from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
 from app.schemas.activity import ActivityRead
-from app.schemas.loan import LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, StageTransition
+from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, StageTransition
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.email.parser import inject_deal_id
 from app.services.hud_template import build_hud_draft
@@ -250,4 +250,47 @@ async def recalc(
         cash_to_close_pricing=quote.cash_to_close_pricing,
         hud_total=hud.total,
         warnings=[{"code": w.code, "message": w.message, "severity": w.severity} for w in warnings],
+    )
+
+
+@router.post("/calc", response_model=RecalcResponse)
+async def free_calc(payload: FreeCalcRequest, _: CurrentUser) -> RecalcResponse:
+    """Loan-less what-if calculator. Same math as /recalc, but the operator
+    supplies the type / amount / rate / term / etc. directly so they can
+    sketch a deal before any loan record exists. Used by the standalone
+    /simulator page on the desktop."""
+    quote = pricing_quote(payload.base_rate, payload.loan_amount, payload.discount_points)
+    is_io = payload.type in {LoanType.FIX_AND_FLIP, LoanType.BRIDGE, LoanType.GROUND_UP}
+    term = payload.term_months or (12 if is_io else 360)
+    if is_io:
+        pi = round(payload.loan_amount * quote.final_rate / 12, 2)
+    else:
+        pi = round(monthly_payment(payload.loan_amount, quote.final_rate, term), 2)
+
+    dscr_val = None
+    if payload.monthly_rent and not is_io:
+        dscr_val = dscr_calc(
+            float(payload.monthly_rent),
+            payload.loan_amount,
+            quote.final_rate,
+            term,
+            float(payload.annual_taxes or 0),
+            float(payload.annual_insurance or 0),
+            float(payload.monthly_hoa or 0),
+        )
+
+    hud = build_hud_draft(
+        loan_amount=payload.loan_amount,
+        property_type=PropertyType(payload.property_type),
+        loan_type=LoanType(payload.type),
+        broker_origination_dollars=quote.broker_origination_dollars,
+    )
+
+    return RecalcResponse(
+        final_rate=quote.final_rate,
+        monthly_pi=pi,
+        dscr=dscr_val,
+        cash_to_close_pricing=quote.cash_to_close_pricing,
+        hud_total=hud.total,
+        warnings=[],  # Free-calc skips lender_matrix validation since there's no loan record to validate
     )
