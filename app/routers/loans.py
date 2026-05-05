@@ -18,6 +18,7 @@ from app.enums import LoanStage, LoanType, MessageFrom, PropertyType, Role
 from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
+from app.schemas.activity import ActivityRead
 from app.schemas.loan import LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, StageTransition
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.email.parser import inject_deal_id
@@ -57,6 +58,26 @@ async def get_loan(loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     return LoanRead.model_validate(row)
+
+
+@router.get("/{loan_id}/activity", response_model=list[ActivityRead])
+async def list_loan_activity(
+    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ActivityRead]:
+    """Immutable activity log for a loan. Newest first."""
+    # First confirm the user can see this loan (apply scope).
+    scope = _scope_query(user, select(Loan.id).where(Loan.id == loan_id))
+    visible = (await db.execute(scope)).scalar_one_or_none()
+    if visible is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    rows = (
+        await db.execute(
+            select(Activity)
+            .where(Activity.loan_id == loan_id)
+            .order_by(Activity.occurred_at.desc())
+        )
+    ).scalars().all()
+    return [ActivityRead.model_validate(r) for r in rows]
 
 
 @router.post("", response_model=LoanRead, status_code=status.HTTP_201_CREATED)
@@ -178,6 +199,21 @@ async def recalc(
     else:
         pi = round(monthly_payment(amount, quote.final_rate, term), 2)
 
+    # Advanced-mode overrides: simulator can supply taxes / insurance / HOA
+    # without persisting them to the loan record. Falls back to the loan's
+    # stored values when omitted.
+    annual_taxes = (
+        payload.annual_taxes if payload.annual_taxes is not None else float(loan.annual_taxes or 0)
+    )
+    annual_insurance = (
+        payload.annual_insurance
+        if payload.annual_insurance is not None
+        else float(loan.annual_insurance or 0)
+    )
+    monthly_hoa = (
+        payload.monthly_hoa if payload.monthly_hoa is not None else float(loan.monthly_hoa or 0)
+    )
+
     dscr_val = None
     if loan.monthly_rent and not is_io:
         dscr_val = dscr_calc(
@@ -185,9 +221,9 @@ async def recalc(
             amount,
             quote.final_rate,
             term,
-            float(loan.annual_taxes or 0),
-            float(loan.annual_insurance or 0),
-            float(loan.monthly_hoa or 0),
+            annual_taxes,
+            annual_insurance,
+            monthly_hoa,
         )
 
     hud = build_hud_draft(

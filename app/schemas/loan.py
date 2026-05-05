@@ -1,12 +1,42 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType
+from app.enums import DealHealth, LoanPurpose, LoanStage, LoanType, PropertyType
 from app.schemas.common import ORMModel
+
+
+# ── Living Loan Profile (output of "The Associate" summarizer) ───────────
+
+MarketWarning = Literal["Rate Pressure", "Rate Stability", "Rate Easing"]
+
+
+class MarketContextBlock(BaseModel):
+    narrative: str
+    warning: MarketWarning | None = None
+
+
+class NextActionsBlock(BaseModel):
+    ai: list[str] = Field(default_factory=list)
+    broker: list[str] = Field(default_factory=list)
+
+
+class LivingLoanProfile(BaseModel):
+    """Structured 4-section output from the summarizer.
+
+    Stored as JSONB on `loans.living_profile` and returned in LoanRead so
+    the frontend can render each section in its own card with the right
+    treatment (warning pill on market_context, list bullets for bottlenecks
+    and next_actions, etc.)."""
+    current_status: str
+    market_context: MarketContextBlock
+    bottlenecks: list[str] = Field(default_factory=list)
+    next_actions: NextActionsBlock = Field(default_factory=NextActionsBlock)
+    deal_health: DealHealth = DealHealth.ON_TRACK
 
 
 class LoanBase(BaseModel):
@@ -85,6 +115,10 @@ class LoanRead(ORMModel):
     dscr: float | None
     risk_score: int | None
     close_date: date | None
+    # Living Loan File
+    status_summary: str | None = None
+    deal_health: DealHealth = DealHealth.ON_TRACK
+    living_profile: LivingLoanProfile | None = None
 
 
 class StageTransition(BaseModel):
@@ -96,6 +130,12 @@ class RecalcRequest(BaseModel):
     discount_points: float = Field(default=0, ge=0)
     loan_amount: float | None = None
     base_rate: float | None = None
+    # Advanced-mode overrides — when present, they replace the loan record's
+    # values for this single recalc. None = inherit from the loan.
+    annual_taxes: float | None = None
+    annual_insurance: float | None = None
+    monthly_hoa: float | None = None
+    ltv: float | None = None  # 0..1; recomputes amount = ltv * appraised value when given
 
 
 class RecalcResponse(BaseModel):

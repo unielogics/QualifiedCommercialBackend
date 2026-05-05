@@ -43,7 +43,19 @@ class Settings(BaseSettings):
     # RentCast
     rentcast_api_key: str = ""
 
-    # Gmail (deferred)
+    # FRED (Federal Reserve Economic Data) — daily index pull
+    # Get a key at https://fred.stlouisfed.org/docs/api/api_key.html
+    fred_api_key: str = ""
+    fred_api_url: str = "https://api.stlouisfed.org/fred"
+
+    # Gmail
+    # Service-account path: when set, the Gmail client uses domain-wide
+    # delegation rather than the (deferred) end-user OAuth flow. The SA must
+    # have Gmail scopes authorized in Workspace admin and `gmail_delegated_user`
+    # must be a real mailbox in the same workspace.
+    gmail_service_account_path: str = ""
+    gmail_delegated_user: str = ""
+    # Legacy OAuth knobs — kept so future end-user OAuth path is still available
     gmail_oauth_client_id: str = ""
     gmail_oauth_client_secret: str = ""
     gmail_pubsub_topic: str = ""

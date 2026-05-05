@@ -10,7 +10,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.client import Client
-from app.schemas.client import ClientCreate, ClientRead
+from app.schemas.client import ClientCreate, ClientRead, ClientUpdate
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
@@ -49,6 +49,27 @@ async def create_client(
     if user.role == Role.BROKER and user.broker and not client.broker_id:
         client.broker_id = user.broker.id
     db.add(client)
+    await db.flush()
+    await db.refresh(client)
+    return ClientRead.model_validate(client)
+
+
+@router.patch("/{client_id}", response_model=ClientRead)
+async def update_client(
+    client_id: UUID,
+    payload: ClientUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientRead:
+    """Partial update. Only fields present in the payload are applied."""
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
+    stmt = _scope(user, select(Client).where(Client.id == client_id))
+    client = (await db.execute(stmt)).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(client, k, v)
     await db.flush()
     await db.refresh(client)
     return ClientRead.model_validate(client)

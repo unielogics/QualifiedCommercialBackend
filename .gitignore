@@ -6,6 +6,12 @@ infra/terraform.tfvars
 infra/*.auto.tfvars
 *.pem
 *.key
+# Google service-account / OAuth credential JSONs
+*service-account*.json
+*-credentials.json
+qualifiedcommercial-*.json
+google-credentials.json
+gcp-*.json
 
 # Python
 __pycache__/

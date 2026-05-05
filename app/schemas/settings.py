@@ -1,0 +1,122 @@
+"""Settings shape — typed sections that mirror the desktop Settings page."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+# --- Section: doc checklists ---------------------------------------------
+
+class DocChecklistItem(BaseModel):
+    name: str
+    required: bool = True
+    auto_request: bool = True
+
+
+class LoanTypeChecklist(BaseModel):
+    docs: list[DocChecklistItem] = Field(default_factory=list)
+    first_reminder_days: int = 3
+    second_reminder_days: int = 7
+    escalate_after_days: int = 14
+    auto_approve_risk_score: int = 90
+
+
+# --- Section: AI cadence -------------------------------------------------
+
+class AICadence(BaseModel):
+    morning_digest: str = "08:00"
+    evening_summary: str = "17:30"
+    auto_nudge_borrower: bool = True
+    auto_escalate_overdue: bool = True
+    auto_draft_replies: bool = True
+    anomaly_alerts: bool = True
+    weekend_ops: bool = False
+    confidence_floor_default: float = 0.80  # 0..1
+
+
+# --- Section: referrals --------------------------------------------------
+
+class ReferralSettings(BaseModel):
+    require_approval: bool = True
+    auto_link_from_url: bool = True
+    block_re_attribution: bool = True
+    notify_broker_on_signup: bool = True
+    points_per_dollar: float = 1.0
+    refi_multiplier: float = 1.25
+    expiry_days: int = 365
+    dispute_sla_business_days: int = 5
+
+
+# --- Section: pricing ----------------------------------------------------
+
+class PricingSettings(BaseModel):
+    daily_pull_time: str = "07:00"
+    auto_publish_threshold_bps: int = 25
+    notify_clients_on_change: bool = True
+    lock_window_business_days: int = 5
+
+
+# --- Section: security --------------------------------------------------
+
+class SecuritySettings(BaseModel):
+    sso_enabled: bool = True
+    mfa_enforced: bool = True
+    mfa_renewal_days: int = 14
+    borrower_portal_mfa: bool = False
+    session_timeout_minutes: int = 30
+    ip_allowlist: list[str] = Field(default_factory=list)
+
+
+# --- Section: simulator -------------------------------------------------
+
+class SimulatorSettings(BaseModel):
+    """Bounds + toggles for the borrower-facing Simulator screen.
+
+    Super-admins set the ranges; the screen renders sliders / chips clamped
+    to these limits. `advanced_mode_enabled` exposes the taxes/insurance/HOA
+    inputs in the UI (the recalc endpoint always accepts them).
+    """
+    points_min: float = 0.0
+    points_max: float = 3.0
+    points_step: float = 0.5
+    amount_min: float = 100_000
+    amount_max: float = 5_000_000
+    amount_step: float = 25_000
+    ltv_min: float = 0.50  # 0..1
+    ltv_max: float = 0.90
+    ltv_step: float = 0.05
+    advanced_mode_enabled: bool = True
+    show_taxes: bool = True
+    show_insurance: bool = True
+    show_hoa: bool = True
+    show_ltv_toggle: bool = True
+
+
+# --- Aggregate ----------------------------------------------------------
+
+class AppSettingsData(BaseModel):
+    """Full settings blob. Each section has sensible defaults so a bare table
+    row still produces usable values for the UI."""
+    checklists: dict[str, LoanTypeChecklist] = Field(default_factory=dict)
+    ai_cadence: AICadence = Field(default_factory=AICadence)
+    referrals: ReferralSettings = Field(default_factory=ReferralSettings)
+    pricing: PricingSettings = Field(default_factory=PricingSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
+    simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
+
+
+class AppSettingsRead(BaseModel):
+    data: AppSettingsData
+
+
+class AppSettingsUpdate(BaseModel):
+    """PATCH body — every section is optional. We deep-merge keys present in
+    the payload onto the persisted JSONB and leave the rest untouched."""
+    checklists: dict[str, LoanTypeChecklist] | None = None
+    ai_cadence: AICadence | None = None
+    referrals: ReferralSettings | None = None
+    pricing: PricingSettings | None = None
+    security: SecuritySettings | None = None
+    simulator: SimulatorSettings | None = None

@@ -64,6 +64,66 @@ async def _verify_clerk_jwt(token: str) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"JWT invalid: {exc}") from exc
 
 
+async def _fetch_clerk_user(clerk_id: str) -> dict | None:
+    """Fetch the full user record from Clerk's REST API.
+
+    Default Clerk JWTs only include the `sub` claim (user ID). To get the
+    user's email + first/last name we have to call the backend API with the
+    secret key. Returns None if the call fails — callers fall back to
+    safe defaults so a Clerk outage never blocks sign-in.
+    """
+    settings = get_settings()
+    if not settings.clerk_secret_key:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"https://api.clerk.com/v1/users/{clerk_id}",
+                headers={"Authorization": f"Bearer {settings.clerk_secret_key}"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:  # noqa: BLE001 — Clerk hiccups shouldn't block auth
+        log.warning("Clerk user fetch failed for %s: %s", clerk_id, exc)
+        return None
+
+
+def _profile_from_clerk(payload: dict, clerk_user: dict | None, clerk_id: str) -> tuple[str, str]:
+    """Resolve (email, display_name) from JWT claims + Clerk API user object."""
+    email: str | None = None
+    name: str | None = None
+
+    if clerk_user:
+        # Pick the primary email address out of the email_addresses array.
+        primary_id = clerk_user.get("primary_email_address_id")
+        for addr in clerk_user.get("email_addresses", []) or []:
+            if addr.get("id") == primary_id or email is None:
+                email = addr.get("email_address") or email
+                if addr.get("id") == primary_id:
+                    break
+        first = (clerk_user.get("first_name") or "").strip()
+        last = (clerk_user.get("last_name") or "").strip()
+        if first or last:
+            name = (first + " " + last).strip()
+        elif clerk_user.get("username"):
+            name = clerk_user.get("username")
+
+    # Fall back to JWT claims if Clerk fetch was unavailable.
+    if not email:
+        email = payload.get("email") or payload.get("primary_email_address")
+    if not name:
+        n = (payload.get("name") or payload.get("first_name") or "").strip()
+        if n:
+            name = n
+
+    # Last-resort fallbacks — never leave the row empty.
+    if not email:
+        email = f"{clerk_id}@unknown"
+    if not name:
+        name = email.split("@")[0]
+    return email, name
+
+
 async def get_current_user(
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
@@ -100,16 +160,41 @@ async def get_current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing subject")
     user = (await db.execute(select(User).where(User.clerk_id == clerk_id))).scalar_one_or_none()
     if user is None:
-        # Auto-provision on first sign-in. Default to CLIENT role — super_admin
-        # promotes from there. Email comes from the JWT (Clerk includes it
-        # under `email` when the email-address claim mapping is enabled).
-        email = payload.get("email") or payload.get("primary_email_address") or f"{clerk_id}@unknown"
-        name = payload.get("name") or payload.get("first_name") or email.split("@")[0]
-        user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CLIENT)
-        db.add(user)
-        await db.flush()
-        await db.refresh(user)
-        log.info("Auto-provisioned user clerk_id=%s email=%s", clerk_id, email)
+        # Auto-provision on first sign-in. Default Clerk JWTs only carry the
+        # `sub` claim, so we hit Clerk's REST API to pull the real email +
+        # name; otherwise we'd end up with rows like `user_xxx@unknown` that
+        # the dashboard can't personalize.
+        clerk_user = await _fetch_clerk_user(clerk_id)
+        email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
+        # If a row was pre-created by a team invite (has email + role but no
+        # clerk_id yet), bind it instead of creating a duplicate.
+        invited = (
+            await db.execute(select(User).where(User.email == email, User.clerk_id.is_(None)))
+        ).scalar_one_or_none()
+        if invited is not None:
+            invited.clerk_id = clerk_id
+            if name and not invited.name:
+                invited.name = name
+            user = invited
+            await db.flush()
+            log.info("Bound invited row to clerk_id=%s for %s (role=%s)", clerk_id, email, user.role)
+        else:
+            user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CLIENT)
+            db.add(user)
+            await db.flush()
+            await db.refresh(user)
+            log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
+    elif user.email.endswith("@unknown") or user.name.startswith("user_"):
+        # Backfill: an existing row that never got a real email/name (because
+        # the Clerk fetch wasn't wired up at sign-in time) gets repaired on
+        # the next /auth/me. Idempotent.
+        clerk_user = await _fetch_clerk_user(clerk_id)
+        email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
+        if email != user.email or name != user.name:
+            user.email = email
+            user.name = name
+            await db.flush()
+            log.info("Backfilled identity for clerk_id=%s -> %s / %s", clerk_id, email, name)
     return user
 
 

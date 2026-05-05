@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routers import (
+    ai,
+    ai_feedback,
     ai_tasks,
     auth,
     brokers,
@@ -16,11 +18,20 @@ from app.routers import (
     clients,
     credit,
     documents,
+    email_drafts,
+    fred,
     intake,
+    loan_participants,
+    loan_summary,
+    loan_workspace,
     loans,
     messages,
     meta,
+    rates,
+    reports,
     search,
+    settings as settings_router,
+    users,
 )
 
 settings = get_settings()
@@ -67,14 +78,25 @@ for r in [
     meta.router,
     auth.router,
     loans.router,
+    loan_participants.router,
+    loan_summary.router,
+    loan_workspace.router,
     clients.router,
     brokers.router,
     documents.router,
     messages.router,
     ai_tasks.router,
+    ai.router,
+    ai_feedback.router,
     calendar.router,
     credit.router,
     intake.router,
+    rates.router,
+    fred.router,
+    reports.router,
     search.router,
+    settings_router.router,
+    users.router,
+    email_drafts.router,
 ]:
     app.include_router(r, prefix=api_prefix)

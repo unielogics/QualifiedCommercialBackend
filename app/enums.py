@@ -117,6 +117,39 @@ class AITaskSource(StrEnum):
     DOCUMENTS = "documents"
     PIPELINE = "pipeline"
     RATES = "rates"
+    BROKER_SUGGESTION = "broker_suggestion"
+
+
+class DealChatRole(StrEnum):
+    """Author role on a loan_chat_messages row. Distinct from MessageFrom
+    because broker_internal turns (Q&A) never reach the client."""
+    AI = "ai"
+    SUPER_ADMIN = "super_admin"
+    BROKER_INTERNAL = "broker_internal"
+    CLIENT = "client"
+
+
+class DealChatMode(StrEnum):
+    """The mode field on POST /loans/{id}/chat — drives routing in the
+    chat handler (persist as message vs instruction vs broker suggestion)."""
+    CHAT = "chat"
+    INSTRUCT = "instruct"
+    BROKER_QUESTION = "broker_question"
+    BROKER_SUGGESTION = "broker_suggestion"
+
+
+class FeedbackOutputType(StrEnum):
+    """Polymorphic target for ai_feedback rows. Only AI_TASK is exercised
+    in this pass; the others are reserved for future surfaces."""
+    AI_TASK = "ai_task"
+    CHAT_REPLY = "chat_reply"
+    EMAIL_DRAFT = "email_draft"
+    SUMMARY = "summary"
+
+
+class FeedbackRating(StrEnum):
+    UP = "up"
+    DOWN = "down"
 
 
 class MessageFrom(StrEnum):
@@ -158,3 +191,28 @@ class CreditPullStatus(StrEnum):
     COMPLETED = "completed"
     EXPIRED = "expired"
     REVOKED = "revoked"
+
+
+class DealHealth(StrEnum):
+    """Living Loan File health indicator. Updated by the AI summarizer."""
+    ON_TRACK = "on_track"      # green
+    AT_RISK = "at_risk"        # amber — slowdowns, missing pieces, soft blockers
+    STUCK = "stuck"            # red — hard blocker, broker action required
+
+
+class ParticipantRole(StrEnum):
+    """A loan thread participant. Drives the Fintech Orchestrator privacy
+    rules — Lenders are masked from Brokers/Clients on inbound, and Super
+    Admins are auto-BCC'd on outbound mail."""
+    LENDER = "lender"
+    BROKER = "broker"
+    CLIENT = "client"
+    SUPER_ADMIN = "super_admin"
+
+
+class EmailDraftStatus(StrEnum):
+    """Auto-drafted outbound emails awaiting broker approval."""
+    PENDING = "pending"
+    APPROVED = "approved"
+    SENT = "sent"
+    DISMISSED = "dismissed"

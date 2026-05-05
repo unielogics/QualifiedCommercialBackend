@@ -72,14 +72,29 @@ async def seed() -> None:
             await db.execute(delete(tbl))
         await db.flush()
 
-        # Users (one per role + a borrower-specific user)
+        # Users (one per role + a borrower-specific user + the real workspace
+        # users that the Gmail relay impersonates).
         admin = User(clerk_id="dev-admin", email="admin@qc.dev", name="Asha Patel", role=Role.SUPER_ADMIN)
         ae = User(clerk_id="dev-ae", email="daniel@qc.dev", name="Daniel Reyes", role=Role.BROKER)
         uw = User(clerk_id="dev-uw", email="priya@qc.dev", name="Priya Singh", role=Role.LOAN_EXEC)
         client_user = User(
             clerk_id="dev-client", email="marcus@qc.dev", name="Marcus Holloway", role=Role.CLIENT
         )
-        db.add_all([admin, ae, uw, client_user])
+        # Real Workspace users — selectable from the Loan Detail "Participants"
+        # super_admin dropdown. Match the GMAIL_DELEGATED_USER + admins-on-BCC.
+        franco = User(
+            clerk_id="dev-franco",
+            email="franco@qualifiedcommercial.com",
+            name="Franco",
+            role=Role.SUPER_ADMIN,
+        )
+        denny = User(
+            clerk_id="dev-denny",
+            email="denny@qualifiedcommercial.com",
+            name="Denny",
+            role=Role.SUPER_ADMIN,
+        )
+        db.add_all([admin, ae, uw, client_user, franco, denny])
         await db.flush()
 
         # Brokers

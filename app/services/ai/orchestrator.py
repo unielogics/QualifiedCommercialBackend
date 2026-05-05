@@ -2,6 +2,12 @@
 
 Routes simple tasks to Haiku, complex ones to Sonnet, runs the tool-use loop
 inline (no LangChain). Prompt caching is on by default.
+
+For loan-scoped runs, callers should pre-assemble loan context via
+`app.services.ai.context.assemble_loan_context(...)` and concatenate it into
+the `system` argument here. That's how operator instructions, AI-modify
+corrections, and recent thumbs-down feedback influence the orchestrator's
+behavior on the same loan over time.
 """
 
 from __future__ import annotations
