@@ -96,10 +96,10 @@ async def initiate_pull(
             "A credit pull is already in flight — try again in a minute.",
         )
 
-    # FCRA paper trail row. We persist only the last 4 of SSN; the full
-    # 9-digit number is forwarded to iSoftPull below and never written to
-    # the database or logged. phone / email are derived from the User /
-    # Client records, not collected here.
+    # FCRA paper trail row. We persist only the last 4 of SSN (if given);
+    # the full 9-digit number is forwarded to iSoftPull below and never
+    # written to the database or logged. phone / email are derived from
+    # the User / Client records, not collected here.
     pull = CreditPull(
         client_id=cid,
         status=CreditPullStatus.PENDING,
@@ -110,7 +110,7 @@ async def initiate_pull(
         city=payload.city,
         state=payload.state,
         zip=payload.zip,
-        last4_ssn=payload.ssn[-4:],
+        last4_ssn=payload.ssn[-4:] if payload.ssn else None,
         fcra_consent=True,
     )
     db.add(pull)
@@ -134,7 +134,10 @@ async def initiate_pull(
                     state=payload.state,
                     zip=payload.zip,
                     dob=payload.dob.isoformat(),
-                    ssn=payload.ssn,  # full 9 digits, used in flight only
+                    # SSN is optional — when None, iSoftPull tries to
+                    # match on name+address+DOB. The frontend only asks
+                    # for SSN if THIS attempt comes back as no-hit.
+                    ssn=payload.ssn,
                 ),
                 timeout_seconds=settings.isoftpull_timeout_seconds,
                 max_retries=settings.isoftpull_max_retries,
@@ -148,6 +151,21 @@ async def initiate_pull(
             pull.status = CreditPullStatus.REVOKED
             pull.notes = f"denied: {exc}"
             await db.flush()
+            # When the bureau couldn't match (no-hit) AND the borrower
+            # didn't supply an SSN, surface a structured code so the
+            # frontend can ask for SSN and retry rather than dumping a
+            # generic "denied" error on a borrower who can still get
+            # matched. Other failure types (freeze / generic error) flow
+            # through as a normal 422.
+            detail_str = str(exc).lower()
+            if "no-hit" in detail_str and not payload.ssn:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "no_hit_provide_ssn",
+                        "message": "We couldn't match your file on name + address + DOB alone. Add your SSN and try again.",
+                    },
+                ) from exc
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
         except isoftpull_client.IsoftpullRateLimitedError as exc:
             pull.status = CreditPullStatus.REVOKED

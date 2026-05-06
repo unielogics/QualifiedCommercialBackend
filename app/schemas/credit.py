@@ -12,13 +12,14 @@ from app.schemas.common import ORMModel
 class CreditPullRequest(BaseModel):
     """Soft-pull form payload.
 
-    Only fields iSoftPull's API actually requires. Phone and email used to
-    live here for our own records; we drop them — they're already on the
-    User (Clerk) and Client records and the bureau call doesn't take them.
+    Only fields iSoftPull's API actually requires. Phone and email live
+    on the User / Client rows already and the bureau doesn't take them.
 
-    SSN is the full 9 digits (no dashes). The router persists only the
-    last 4 to credit_pulls.last4_ssn for the FCRA paper trail; the full
-    SSN never lands in the database or in logs.
+    SSN is **optional** by design — the borrower-facing form attempts the
+    pull on name + address + DOB first, since most consumers can be
+    matched on those alone. Only when the bureau returns no-hit does the
+    UI ask for SSN and retry. The full SSN, when provided, is forwarded
+    to iSoftPull and only the last 4 are persisted.
     """
     legal_first_name: str = Field(min_length=1)
     legal_last_name: str = Field(min_length=1)
@@ -27,14 +28,16 @@ class CreditPullRequest(BaseModel):
     city: str = Field(min_length=1)
     state: str = Field(min_length=2, max_length=2)
     zip: str = Field(min_length=5, max_length=10)
-    ssn: str = Field(min_length=9, max_length=9, description="9 digits, no dashes")
+    ssn: str | None = Field(default=None, description="9 digits, no dashes; optional")
     fcra_consent: bool
 
     @field_validator("ssn")
     @classmethod
-    def _ssn_digits_only(cls, v: str) -> str:
-        if not v.isdigit():
-            raise ValueError("SSN must be 9 digits, no dashes")
+    def _ssn_digits_only(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not v.isdigit() or len(v) != 9:
+            raise ValueError("SSN must be exactly 9 digits, no dashes")
         return v
 
 
