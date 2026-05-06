@@ -4,7 +4,7 @@ import uuid
 from datetime import date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,6 +31,7 @@ class Client(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(320), nullable=True)
     city: Mapped[str | None] = mapped_column(String(160), nullable=True)
     since: Mapped[date | None] = mapped_column(Date, nullable=True)
 
@@ -41,6 +42,12 @@ class Client(TimestampMixin, Base):
 
     funded_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     funded_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Investor profile (Profile → Investor Profile dialog). Free-text for
+    # v1 — operators see what the borrower wrote and can fold into the AI's
+    # context. Structured (per-property table) lands when we wire REO.
+    properties: Mapped[str | None] = mapped_column(Text, nullable=True)
+    experience: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="client")
     broker: Mapped[Broker] = relationship(back_populates="clients")

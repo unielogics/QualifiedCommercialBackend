@@ -10,7 +10,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.client import Client
-from app.schemas.client import ClientCreate, ClientRead, ClientUpdate
+from app.schemas.client import ClientCreate, ClientRead, ClientSelfUpdate, ClientUpdate
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
@@ -28,6 +28,38 @@ async def list_clients(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     stmt = _scope(user, select(Client).order_by(Client.name))
     rows = (await db.execute(stmt)).scalars().all()
     return [ClientRead.model_validate(r) for r in rows]
+
+
+@router.get("/me", response_model=ClientRead)
+async def get_my_client(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ClientRead:
+    """Return the current user's linked Client record. Used by the desktop
+    Profile page so it doesn't need to know its own client_id."""
+    if not user.client:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Current user has no linked client record"
+        )
+    return ClientRead.model_validate(user.client)
+
+
+@router.patch("/me", response_model=ClientRead)
+async def update_my_client(
+    payload: ClientSelfUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientRead:
+    """Self-edit: a CLIENT-role user updates their own profile. Only the
+    safe-to-self-edit fields land here (see ClientSelfUpdate). Tier,
+    FICO, broker assignment, funded totals stay broker/super-admin only."""
+    client = user.client
+    if client is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Current user has no linked client record"
+        )
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(client, k, v)
+    await db.flush()
+    await db.refresh(client)
+    return ClientRead.model_validate(client)
 
 
 @router.get("/{client_id}", response_model=ClientRead)

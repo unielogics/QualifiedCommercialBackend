@@ -12,6 +12,7 @@ class ClientCreate(BaseModel):
     name: str
     email: str | None = None
     phone: str | None = None
+    address: str | None = None
     city: str | None = None
     referral_source: str | None = None
     broker_id: UUID | None = None
@@ -22,12 +23,27 @@ class ClientUpdate(BaseModel):
     name: str | None = None
     email: str | None = None
     phone: str | None = None
+    address: str | None = None
     city: str | None = None
     referral_source: str | None = None
     broker_id: UUID | None = None
     tier: str | None = None
     fico: int | None = None
     avatar_color: str | None = None
+    properties: str | None = None
+    experience: str | None = None
+
+
+class ClientSelfUpdate(BaseModel):
+    """The fields a CLIENT-role user is allowed to change on themselves
+    via PATCH /clients/me. Excludes everything underwriting-sensitive
+    (tier, fico, broker_id, funded totals)."""
+    name: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    city: str | None = None
+    properties: str | None = None
+    experience: str | None = None
 
 
 class ClientRead(ORMModel):
@@ -37,6 +53,7 @@ class ClientRead(ORMModel):
     name: str
     email: str | None
     phone: str | None
+    address: str | None = None
     city: str | None
     since: date | None
     tier: str
@@ -44,3 +61,5 @@ class ClientRead(ORMModel):
     avatar_color: str | None
     funded_total: float
     funded_count: int
+    properties: str | None = None
+    experience: str | None = None
