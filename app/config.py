@@ -37,8 +37,23 @@ class Settings(BaseSettings):
     s3_bucket: str = "qc-documents-dev"
 
     # iSoftpull
-    isoftpull_api_key: str = ""
+    # Two-key auth: public key identifies the account; private key authenticates
+    # (carried as bearer / HMAC depending on what iSoftPull's contract turns out
+    # to be — verify on first live call). The legacy single `isoftpull_api_key`
+    # alias is preserved so existing .env files still load — when only the
+    # legacy key is present the client treats it as the private key.
+    isoftpull_public_key: str = ""
+    isoftpull_private_key: str = ""
+    isoftpull_api_key: str = ""  # legacy / fallback for private_key
     isoftpull_api_url: str = "https://api.isoftpull.com/v1"
+    isoftpull_timeout_seconds: float = 15.0
+    isoftpull_max_retries: int = 2
+    # Server-side dashboard login — bridge until Full Feed is enabled.
+    # When set, the backend logs into iSoftPull as a real user and scrapes
+    # the report HTML to extract the parsed FICO from the report viewer.
+    isoftpull_login_email: str = ""
+    isoftpull_login_password: str = ""
+    isoftpull_dashboard_url: str = "https://app.isoftpull.com"
 
     # RentCast
     rentcast_api_key: str = ""

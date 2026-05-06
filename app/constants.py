@@ -35,6 +35,7 @@ HUD_TITLE_INSURANCE_RATE: float = 0.005  # 0.5% of loan amount
 
 # Soft pull
 SOFT_PULL_VALIDITY_DAYS: int = 90
+SOFT_PULL_EXPIRING_SOON_DAYS: int = 14
 
 # Broker tiers (lifetime points = funded $)
 BROKER_TIER_THRESHOLDS = {

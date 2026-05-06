@@ -136,6 +136,13 @@ class RecalcRequest(BaseModel):
     annual_insurance: float | None = None
     monthly_hoa: float | None = None
     ltv: float | None = None  # 0..1; recomputes amount = ltv * appraised value when given
+    # Sizing overrides — applied through services/math/sizing.compute_loan_amount.
+    purpose: LoanPurpose | None = None
+    arv: float | None = None
+    brv: float | None = None             # F&F / Ground Up purchase price
+    rehab_budget: float | None = None    # F&F / Ground Up rehab cost
+    payoff: float | None = None          # DSCR refi existing-mortgage payoff
+    ltv_tier_cap: float | None = None    # credit-tier-derived cap (0..1)
 
 
 class FreeCalcRequest(BaseModel):
@@ -151,6 +158,29 @@ class FreeCalcRequest(BaseModel):
     annual_taxes: float = 0
     annual_insurance: float = 0
     monthly_hoa: float = 0
+    # Sizing inputs — when present, the server runs them through
+    # compute_loan_amount and may clamp `loan_amount` down to the cap.
+    purpose: LoanPurpose | None = None
+    arv: float | None = None
+    brv: float | None = None
+    rehab_budget: float | None = None
+    payoff: float | None = None
+    ltv_tier_cap: float | None = None
+
+
+class SizingBreakdown(BaseModel):
+    """Mirror of services/math/sizing.SizingResult for wire transport."""
+    loan_amount: float
+    max_allowed: float
+    binding_constraint: str
+    clamped: bool
+    ltv: float | None = None
+    ltc: float | None = None
+    arv_ltv: float | None = None
+    effective_ltv_cap: float | None = None
+    total_cost: float | None = None
+    cash_to_borrower: float | None = None
+    cash_to_close: float | None = None
 
 
 class RecalcResponse(BaseModel):
@@ -160,3 +190,5 @@ class RecalcResponse(BaseModel):
     cash_to_close_pricing: float
     hud_total: float
     warnings: list[dict]
+    loan_amount: float | None = None
+    sizing: SizingBreakdown | None = None

@@ -12,7 +12,7 @@ Status of each external service.
 | AWS Amplify (desktop hosting) | ⏳ awaiting console click | `unielogics/QCDashboard` → `app.qualifiedcommercial.com`. See `DEPLOY.md`. |
 | GitHub Actions deploy | ⏳ awaiting 3 settings | Need `AWS_DEPLOY_ROLE_ARN` secret + `AWS_REGION` + `EC2_INSTANCE_ID` variables on QualifiedCommercialBackend repo. |
 | AWS S3 (documents) | ⏳ awaiting bucket create | EC2 instance role already has `s3:*` on `qc-documents-*`. Just needs the bucket. |
-| iSoftpull (credit) | ⏳ awaiting keys | `ISOFTPULL_API_KEY`, `ISOFTPULL_API_URL`. Dev mode returns synthetic 712. |
+| iSoftpull (credit) | ✅ demo wired | `ISOFTPULL_PUBLIC_KEY`, `ISOFTPULL_PRIVATE_KEY`, `ISOFTPULL_API_URL`. Real bureau pulls — no synthetic fallback. POST /credit/pull returns 503 if keys are absent. |
 | RentCast (property) | ⏳ awaiting key | `RENTCAST_API_KEY`. SmartIntake autofill (sqft, taxes, comps). |
 | EAS (mobile) | ⏳ awaiting Expo login | `unielogics/QCMobile`. Apple/Google accounts needed for store distribution. |
 | Gmail Pub/Sub | 🛑 deferred | Local fake inbox covers the air-gap logic until prod. |
@@ -25,7 +25,7 @@ Status of each external service.
 In rough order:
 1. **GitHub PAT** (or you click in Settings) — to set the 3 deploy settings on the backend repo
 2. **AWS Console access** for Amplify — to connect QCDashboard via the Amplify GitHub App and add env vars
-3. **iSoftpull credentials** — when ready for real soft pulls
+3. **iSoftpull production credentials** — currently using demo keys; swap for production tier before shipping
 4. **RentCast API key** — when SmartIntake autofill is needed
 5. **Apple Developer + Google Play accounts** — for mobile store distribution
 

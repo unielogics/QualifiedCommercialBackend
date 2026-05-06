@@ -210,3 +210,56 @@ def require_role(*roles: Role):
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def require_valid_credit_pull(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Soft-pull gate for client-facing rate views.
+
+    CLIENT role must have a non-expired completed credit pull on file. Any
+    other role (BROKER, LOAN_EXEC, SUPER_ADMIN) is exempt — they need to
+    see rates to advise. Returns the original user object so callers can
+    chain it as their auth dependency.
+
+    The 403 body uses a structured `code` so the frontend fetch wrapper
+    can detect it and trigger the repull modal — distinct from generic
+    role 403s.
+    """
+    from datetime import datetime, timezone
+
+    from app.enums import CreditPullStatus
+    from app.models.credit_pull import CreditPull
+
+    if user.role != Role.CLIENT:
+        return user
+    cid = user.client.id if user.client else None
+    if cid is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "credit_pull_required",
+                "message": "Soft credit pull required to view rates.",
+            },
+        )
+    stmt = (
+        select(CreditPull)
+        .where(CreditPull.client_id == cid)
+        .where(CreditPull.status == CreditPullStatus.COMPLETED)
+        .where(CreditPull.expires_at > datetime.now(timezone.utc))
+        .limit(1)
+    )
+    row = (await db.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "credit_pull_required",
+                "message": "Soft credit pull required to view rates.",
+            },
+        )
+    return user
+
+
+GatedUser = Annotated[User, Depends(require_valid_credit_pull)]

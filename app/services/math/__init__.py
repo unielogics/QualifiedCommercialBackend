@@ -16,10 +16,12 @@ from app.services.math.pricing import (
     final_rate_after_buydown,
     pricing_quote,
 )
+from app.services.math.sizing import SizingResult, compute_loan_amount
 
 __all__ = [
     "amortization_schedule",
     "broker_compensation",
+    "compute_loan_amount",
     "dscr",
     "final_rate_after_buydown",
     "interest_only_payment",
@@ -27,5 +29,6 @@ __all__ = [
     "monthly_payment",
     "pitia",
     "pricing_quote",
+    "SizingResult",
     "total_interest",
 ]

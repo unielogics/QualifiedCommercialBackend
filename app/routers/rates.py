@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from app.deps import CurrentUser
+from app.deps import GatedUser
 from app.enums import LoanType
 
 router = APIRouter(prefix="/rates", tags=["rates"])
@@ -42,6 +42,8 @@ _RATES: list[RateSKU] = [
 
 
 @router.get("", response_model=list[RateSKU])
-async def list_rates(_: CurrentUser) -> list[RateSKU]:
-    """Public to all authenticated roles."""
+async def list_rates(_: GatedUser) -> list[RateSKU]:
+    """Authenticated. CLIENT role gated behind a valid soft credit pull —
+    see deps.require_valid_credit_pull. Internal roles (broker, loan_exec,
+    super_admin) bypass."""
     return _RATES

@@ -30,3 +30,8 @@ class CreditPullRead(ORMModel):
     fico: int | None
     pulled_at: datetime | None
     expires_at: datetime | None
+    # Derived (computed in router) — shaping these here means clients can
+    # render the "expires in 12 days" pill without doing date math.
+    is_expired: bool = False
+    days_until_expiry: int | None = None
+    expiring_soon: bool = False
