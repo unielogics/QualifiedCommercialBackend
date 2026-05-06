@@ -36,12 +36,20 @@ def _scope_loan(user, loan: Loan) -> bool:
 @router.get("", response_model=list[DocumentRead])
 async def list_documents(
     loan_id: UUID | None = None,
+    client_id: UUID | None = None,
     user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ) -> list[DocumentRead]:
+    """List documents. Filters: by loan (scoped to the loan's client),
+    or by client (returns all docs across that client's loans — used by
+    the operator-side Vault tab on the client profile page)."""
     stmt = select(Document)
     if loan_id is not None:
         stmt = stmt.where(Document.loan_id == loan_id)
+    if client_id is not None:
+        # Join on Loan.client_id so a single query covers all of the
+        # client's loans without round-tripping the loan list first.
+        stmt = stmt.join(Loan, Loan.id == Document.loan_id).where(Loan.client_id == client_id)
     rows = (await db.execute(stmt)).scalars().all()
     return [DocumentRead.model_validate(r) for r in rows]
 
