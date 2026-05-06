@@ -13,6 +13,7 @@ from app.models.email_draft import EmailDraft  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401
 from app.models.fred_observation import FredObservation  # noqa: F401
 from app.models.hud import HudLineItem  # noqa: F401
+from app.models.legal_acceptance import LegalAcceptance  # noqa: F401
 from app.models.lender import Lender  # noqa: F401
 from app.models.lender_spread import LenderSpread  # noqa: F401
 from app.models.loan import Loan  # noqa: F401

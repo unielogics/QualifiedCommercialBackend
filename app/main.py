@@ -21,6 +21,7 @@ from app.routers import (
     email_drafts,
     fred,
     intake,
+    legal,
     loan_participants,
     loan_summary,
     loan_workspace,
@@ -98,5 +99,6 @@ for r in [
     settings_router.router,
     users.router,
     email_drafts.router,
+    legal.router,
 ]:
     app.include_router(r, prefix=api_prefix)
