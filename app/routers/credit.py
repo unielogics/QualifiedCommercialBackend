@@ -151,12 +151,11 @@ async def initiate_pull(
             pull.status = CreditPullStatus.REVOKED
             pull.notes = f"denied: {exc}"
             await db.flush()
-            # When the bureau couldn't match (no-hit) AND the borrower
-            # didn't supply an SSN, surface a structured code so the
-            # frontend can ask for SSN and retry rather than dumping a
-            # generic "denied" error on a borrower who can still get
-            # matched. Other failure types (freeze / generic error) flow
-            # through as a normal 422.
+            # Surface structured codes for deny outcomes the frontend can
+            # act on. Generic denials still pass through with the raw bureau
+            # string so operators can debug from the audit log.
+            #   no_hit_provide_ssn → reveal SSN field, retry
+            #   bureau_freeze      → tell the borrower to lift their freeze
             detail_str = str(exc).lower()
             if "no-hit" in detail_str and not payload.ssn:
                 raise HTTPException(
@@ -164,6 +163,14 @@ async def initiate_pull(
                     detail={
                         "code": "no_hit_provide_ssn",
                         "message": "We couldn't match your file on name + address + DOB alone. Add your SSN and try again.",
+                    },
+                ) from exc
+            if "freeze" in detail_str or "frozen" in detail_str:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "code": "bureau_freeze",
+                        "message": "Your credit file is frozen at the bureau. Please lift the freeze with Experian, Equifax, or TransUnion and try again.",
                     },
                 ) from exc
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -268,15 +275,16 @@ async def initiate_pull(
             ) from exc
         return _to_read(pull)
 
-    # No iSoftPull credentials configured — fail loudly rather than fake a
-    # score. The simulator gate would interpret a fabricated FICO as real
-    # eligibility, leading to misleading rate quotes.
+    # No iSoftPull credentials configured. Log the operator-facing hint
+    # server-side so it never reaches a borrower; surface a generic
+    # message to the API caller.
     pull.status = CreditPullStatus.REVOKED
     pull.notes = "iSoftPull credentials not configured"
     await db.flush()
+    log.error("Credit pull attempted but ISOFTPULL_PRIVATE_KEY is not configured")
     raise HTTPException(
         status.HTTP_503_SERVICE_UNAVAILABLE,
-        "Credit pull service is not configured. Set ISOFTPULL_PRIVATE_KEY in the backend environment.",
+        "Credit pull service is temporarily unavailable. Please contact support.",
     )
 
 
