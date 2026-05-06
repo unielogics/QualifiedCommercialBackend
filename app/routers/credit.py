@@ -96,6 +96,10 @@ async def initiate_pull(
             "A credit pull is already in flight — try again in a minute.",
         )
 
+    # FCRA paper trail row. We persist only the last 4 of SSN; the full
+    # 9-digit number is forwarded to iSoftPull below and never written to
+    # the database or logged. phone / email are derived from the User /
+    # Client records, not collected here.
     pull = CreditPull(
         client_id=cid,
         status=CreditPullStatus.PENDING,
@@ -106,9 +110,7 @@ async def initiate_pull(
         city=payload.city,
         state=payload.state,
         zip=payload.zip,
-        phone=payload.phone,
-        email=payload.email,
-        last4_ssn=payload.last4_ssn,
+        last4_ssn=payload.ssn[-4:],
         fcra_consent=True,
     )
     db.add(pull)
@@ -131,11 +133,8 @@ async def initiate_pull(
                     city=payload.city,
                     state=payload.state,
                     zip=payload.zip,
-                    # SSN/DOB are optional for soft pulls. We capture last4
-                    # for our own KYC paper trail but iSoftPull wants the
-                    # full SSN, so we don't forward last4 — pass nothing
-                    # unless we ever start collecting full SSN in the form.
-                    dob=payload.dob.isoformat() if payload.dob else None,
+                    dob=payload.dob.isoformat(),
+                    ssn=payload.ssn,  # full 9 digits, used in flight only
                 ),
                 timeout_seconds=settings.isoftpull_timeout_seconds,
                 max_retries=settings.isoftpull_max_retries,
