@@ -110,6 +110,7 @@ async def upload_init(
     doc = Document(
         loan_id=loan.id,
         name=payload.name,
+        category=payload.category,
         s3_key=s3_key,
         status=DocStatus.PENDING,
     )

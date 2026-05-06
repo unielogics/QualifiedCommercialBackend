@@ -33,6 +33,10 @@ class DocumentUploadInit(BaseModel):
     loan_id: UUID
     name: str
     content_type: str = "application/pdf"
+    # Free-form category — used by the mobile vault to split uploads into
+    # "experience" (proof of past deals) vs "active_asset" (currently-owned
+    # properties: bank notes, leases, insurance). Persisted on Document.category.
+    category: str | None = None
 
 
 class DocumentUploadInitResponse(BaseModel):
