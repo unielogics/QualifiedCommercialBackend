@@ -65,12 +65,13 @@ class FredFetchError(Exception):
     """Raised when the FRED HTTP call fails or returns an unexpected payload."""
 
 
-async def fetch_series(series_id: str, days_back: int = 35) -> list[tuple[date, float | None]]:
+async def fetch_series(series_id: str, days_back: int = 100) -> list[tuple[date, float | None]]:
     """Fetch the most recent `days_back` observations for a series.
 
-    Defaults to 35 so we always have a 30-day window even after weekends/
-    holidays where the series doesn't update. Returns [(date, value), ...]
-    sorted oldest → newest. Raises FredFetchError on any non-2xx response.
+    Default 100 so we have ~90 valid trading days even after weekends/
+    holidays/missing values — enough to drive the /market-rates explorer's
+    longest filter (90 days). Returns [(date, value), ...] sorted oldest →
+    newest. Raises FredFetchError on any non-2xx response.
     """
     settings = get_settings()
     if not settings.fred_api_key:

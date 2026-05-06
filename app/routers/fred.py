@@ -65,16 +65,38 @@ def _delta_bps(latest: float | None, previous: float | None) -> int | None:
 
 def _build_summary(
     series_id: str,
-    history_30: list[FredObservation],
+    history_full: list[FredObservation],
     spread: LenderSpread | None,
+    requested_days: int = 30,
 ) -> FredSeriesSummary:
-    history_7 = [h for h in history_30 if (date.today() - h.observation_date).days <= 7]
-    valid = [h for h in history_30 if h.value is not None]
+    """Build a series summary from a deep history slice.
+
+    `history_full` is whatever rows the caller decided to load (typically
+    up to 100 days back). We slice 7-day and `requested_days`-day windows
+    out of that single load — no extra DB calls per window.
+    """
+    today = date.today()
+    history_7 = [h for h in history_full if (today - h.observation_date).days <= 7]
+    history_30 = [h for h in history_full if (today - h.observation_date).days <= 30]
+    history_window = [
+        h for h in history_full if (today - h.observation_date).days <= requested_days
+    ]
+    valid = [h for h in history_full if h.value is not None]
     latest = valid[-1] if valid else None
     previous = valid[-2] if len(valid) >= 2 else None
     spread_bps = spread.spread_bps if spread else 0
     latest_value = float(latest.value) if latest else None
     estimated = (latest_value + spread_bps / 100.0) if latest_value is not None else None
+
+    def _to_out(rows: list[FredObservation]) -> list[FredObservationOut]:
+        return [
+            FredObservationOut(
+                date=h.observation_date,
+                value=float(h.value) if h.value is not None else None,
+            )
+            for h in rows
+        ]
+
     return FredSeriesSummary(
         series_id=series_id,
         label=fred_service.SERIES_LABELS.get(series_id, series_id),
@@ -85,14 +107,10 @@ def _build_summary(
         delta_bps=_delta_bps(latest_value, float(previous.value) if previous else None),
         spread_bps=spread_bps,
         estimated_rate=estimated,
-        history_7d=[
-            FredObservationOut(date=h.observation_date, value=float(h.value) if h.value is not None else None)
-            for h in history_7
-        ],
-        history_30d=[
-            FredObservationOut(date=h.observation_date, value=float(h.value) if h.value is not None else None)
-            for h in history_30
-        ],
+        history_7d=_to_out(history_7),
+        history_30d=_to_out(history_30),
+        history=_to_out(history_window),
+        history_days=requested_days,
     )
 
 
@@ -101,15 +119,27 @@ def _build_summary(
 
 @router.get("/fred/series", response_model=list[FredSeriesSummary])
 async def list_series(
-    _: CurrentUser, db: AsyncSession = Depends(get_db)
+    _: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    days: int = 30,
 ) -> list[FredSeriesSummary]:
-    """Bundled summary for every tracked FRED series. One round-trip drives
-    the dashboard widget — no per-card N+1 fetch."""
+    """Bundled summary for every tracked FRED series.
+
+    `days` controls the `history` window returned in each card (1..90,
+    default 30). The fixed `history_7d` / `history_30d` fields are always
+    populated regardless of `days` — the dashboard's small chart and the
+    explorer's bigger chart can read whichever window they need from a
+    single bundled call.
+    """
+    requested_days = max(1, min(days, 90))
+    # Load enough rows to cover the longest possible window once per series,
+    # then slice in _build_summary for each window.
+    deepest = max(requested_days, 30)
     spreads = await _current_spreads(db)
     out: list[FredSeriesSummary] = []
     for series_id in fred_service.SERIES_IDS:
-        history = await fred_service.get_history(db, series_id, days=30)
-        out.append(_build_summary(series_id, history, spreads.get(series_id)))
+        history = await fred_service.get_history(db, series_id, days=deepest)
+        out.append(_build_summary(series_id, history, spreads.get(series_id), requested_days))
     return out
 
 
@@ -123,9 +153,10 @@ async def get_single_series(
     series_id = series_id.upper()
     if series_id not in fred_service.SERIES_IDS:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Series {series_id} not tracked")
-    history = await fred_service.get_history(db, series_id, days=max(7, min(days, 365)))
+    requested_days = max(1, min(days, 90))
+    history = await fred_service.get_history(db, series_id, days=max(requested_days, 30))
     spreads = await _current_spreads(db)
-    return _build_summary(series_id, history, spreads.get(series_id))
+    return _build_summary(series_id, history, spreads.get(series_id), requested_days)
 
 
 @router.post(

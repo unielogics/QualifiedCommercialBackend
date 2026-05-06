@@ -38,6 +38,10 @@ class FredSeriesSummary(BaseModel):
         estimated_rate = current_value + (spread_bps / 100)
     Both inputs are exposed so the UI can render the breakdown
     ("Index 4.35% + Spread 2.15% = Est. 6.50%").
+
+    `history` carries the variable-length window the caller requested
+    (1..90 days, defaults to 30). `history_7d` and `history_30d` are kept
+    as fixed-window conveniences for back-compat with older clients.
     """
     series_id: str
     label: str
@@ -50,6 +54,8 @@ class FredSeriesSummary(BaseModel):
     estimated_rate: float | None
     history_7d: list[FredObservationOut]
     history_30d: list[FredObservationOut]
+    history: list[FredObservationOut] = []
+    history_days: int = 30
 
 
 class FredRefreshResult(BaseModel):
