@@ -15,6 +15,7 @@ import jwt
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.db import get_db
@@ -136,12 +137,19 @@ async def get_current_user(
     Dashboard works without Clerk being wired.
     """
     settings = get_settings()
+    # Eager-load the User.client relationship on every load path. Multiple
+    # downstream routes do `if user.client: …` or `user.client.id`, and a
+    # bare relationship access in async session context raises
+    # MissingGreenlet because lazy-loading needs greenlet support. Loading
+    # it once here makes the relationship safe to touch anywhere.
+    _with_client = selectinload(User.client)
+
     if not settings.clerk_secret_key:
         # Dev mode: short-circuit auth
         stmt = (
-            select(User).where(User.email == x_dev_user)
+            select(User).options(_with_client).where(User.email == x_dev_user)
             if x_dev_user
-            else select(User).where(User.role == Role.SUPER_ADMIN).limit(1)
+            else select(User).options(_with_client).where(User.role == Role.SUPER_ADMIN).limit(1)
         )
         user = (await db.execute(stmt)).scalar_one_or_none()
         if user is None:
@@ -158,7 +166,11 @@ async def get_current_user(
     clerk_id = payload.get("sub")
     if not clerk_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing subject")
-    user = (await db.execute(select(User).where(User.clerk_id == clerk_id))).scalar_one_or_none()
+    user = (
+        await db.execute(
+            select(User).options(_with_client).where(User.clerk_id == clerk_id)
+        )
+    ).scalar_one_or_none()
     if user is None:
         # Auto-provision on first sign-in. Default Clerk JWTs only carry the
         # `sub` claim, so we hit Clerk's REST API to pull the real email +
@@ -169,7 +181,11 @@ async def get_current_user(
         # If a row was pre-created by a team invite (has email + role but no
         # clerk_id yet), bind it instead of creating a duplicate.
         invited = (
-            await db.execute(select(User).where(User.email == email, User.clerk_id.is_(None)))
+            await db.execute(
+                select(User).options(_with_client).where(
+                    User.email == email, User.clerk_id.is_(None)
+                )
+            )
         ).scalar_one_or_none()
         if invited is not None:
             invited.clerk_id = clerk_id
@@ -182,7 +198,15 @@ async def get_current_user(
             user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CLIENT)
             db.add(user)
             await db.flush()
-            await db.refresh(user)
+            # Re-fetch with the relationship eagerly loaded so downstream
+            # `user.client` accesses don't trigger a lazy-load. A freshly
+            # added User has no Client row yet, but accessing the
+            # attribute would still try to load it.
+            user = (
+                await db.execute(
+                    select(User).options(_with_client).where(User.id == user.id)
+                )
+            ).scalar_one()
             log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
     elif user.email.endswith("@unknown") or user.name.startswith("user_"):
         # Backfill: an existing row that never got a real email/name (because
