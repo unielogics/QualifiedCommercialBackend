@@ -208,18 +208,58 @@ async def get_current_user(
                 )
             ).scalar_one()
             log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
-    elif user.email.endswith("@unknown") or user.name.startswith("user_"):
-        # Backfill: an existing row that never got a real email/name (because
-        # the Clerk fetch wasn't wired up at sign-in time) gets repaired on
-        # the next /auth/me. Idempotent.
+    elif (
+        user.email.endswith("@unknown")
+        or user.name.startswith("user_")
+        or _looks_like_email_fallback_name(user.name, user.email)
+    ):
+        # Backfill: an existing row that never got a real email/name
+        # (because the Clerk fetch wasn't wired up at sign-in time, or
+        # because the user's Clerk profile was empty at first sign-in
+        # and we wrote the email local-part as a placeholder name) gets
+        # repaired on the next /auth/me. Idempotent.
+        #
+        # We also propagate any name change down to user.client.name
+        # when it's safe to do so (Client.name matched the old
+        # user.name, or it also looks like an email-fallback). This
+        # keeps the borrower's display identity consistent across
+        # User-driven UI (auth header) and Client-driven UI (PDF
+        # letter, credit pulls, calendar invitees) without clobbering
+        # a Client.name that an operator manually customized.
         clerk_user = await _fetch_clerk_user(clerk_id)
         email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
         if email != user.email or name != user.name:
+            old_name = user.name
             user.email = email
             user.name = name
+            client = getattr(user, "client", None)
+            if client is not None and client.name and (
+                client.name == old_name
+                or _looks_like_email_fallback_name(client.name, user.email)
+            ):
+                client.name = name
             await db.flush()
-            log.info("Backfilled identity for clerk_id=%s -> %s / %s", clerk_id, email, name)
+            log.info(
+                "Backfilled identity for clerk_id=%s email=%s name=%r (was %r)",
+                clerk_id, email, name, old_name,
+            )
     return user
+
+
+def _looks_like_email_fallback_name(name: str | None, email: str | None) -> bool:
+    """Heuristic for "this name was auto-generated from the email
+    local-part because Clerk had no first/last on file at first
+    sign-in." When True we treat the name as stale and re-pull from
+    Clerk on the next authed request.
+
+    Matches: lowercase / no whitespace / equals the email local-part
+    case-insensitively. Doesn't match a real one-word name like
+    "Madonna" because Clerk profiles for those would typically be set
+    explicitly anyway and not equal the email's local-part."""
+    if not name or not email or "@" not in email:
+        return False
+    local = email.split("@", 1)[0].strip().lower()
+    return name.strip().lower() == local
 
 
 def require_role(*roles: Role):

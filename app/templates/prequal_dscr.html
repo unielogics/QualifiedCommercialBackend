@@ -171,7 +171,7 @@
     <table class="terms-table">
         <tr><th>Borrower / Entity Name</th><td>{{ borrower_entity }}</td></tr>
         <tr><th>Subject Property Address</th><td>{{ target_property_address }}</td></tr>
-        <tr><th>{% if is_refi %}Estimated Property Value{% else %}Estimated Purchase Price{% endif %}</th><td>{{ purchase_price }}</td></tr>
+        <tr><th>{% if is_refi %}Property Value{% else %}Purchase Price{% endif %}</th><td>{{ purchase_price }}</td></tr>
         <tr><th>Maximum Loan Amount</th><td>{{ max_loan_amount }}</td></tr>
         <tr><th>Maximum Loan-to-Value (LTV)</th><td>{{ max_ltv }}%</td></tr>
         <tr><th>Loan Program</th><td>Commercial DSCR &mdash; 30 Year Fixed{% if is_refi %} (Refinance){% endif %}</td></tr>
