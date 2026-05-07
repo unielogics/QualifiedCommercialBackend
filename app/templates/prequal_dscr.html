@@ -112,12 +112,14 @@
             margin-top: 8px;
         }
         .signature-block { flex: 1 1 0; padding-right: 4px; }
-        .signature-block .salute { margin: 0 0 32px 0; font-size: 9.5pt; }
+        .signature-block .salute { margin: 0 0 14px 0; font-size: 9.5pt; }
+        .signature-img { display: block; max-width: 220px; max-height: 60px; margin-bottom: 2px; }
         .signature-line {
             width: 220px;
             border-bottom: 1px solid #0B1629;
             margin-bottom: 5px;
         }
+        .signed-on { font-size: 8pt; color: #6B7891; margin-top: 1px; margin-bottom: 4px; }
         .signature-block .name { font-weight: 700; font-size: 10pt; }
         .signature-block .title-line { font-size: 8.5pt; color: #3C4A60; margin-top: 2px; }
         .disclaimer {
@@ -140,9 +142,9 @@
             <div class="sub-logo">Financing &amp; Capital Advisory</div>
         </div>
         <div class="contact-info">
-            123 Financial Way, Suite 400<br>
-            Garfield, NJ 07026<br>
-            www.qualifiedcommercial.com
+            {% if office_address_line_1 %}{{ office_address_line_1 }}<br>{% endif %}
+            {% if office_address_line_2 %}{{ office_address_line_2 }}<br>{% endif %}
+            {% if office_address_line_3 %}{{ office_address_line_3 }}{% endif %}
         </div>
     </div>
 
@@ -187,9 +189,14 @@
     <div class="footer-grid">
         <div class="signature-block">
             <p class="salute">Sincerely,</p>
-            <div class="signature-line"></div>
-            <div class="name">Franco</div>
-            <div class="title-line">Managing Director | Qualified Commercial LLC</div>
+            {% if signature_data_uri %}
+                <img class="signature-img" src="{{ signature_data_uri }}" alt="Signature">
+            {% else %}
+                <div class="signature-line"></div>
+            {% endif %}
+            <div class="signed-on">Signed: {{ signed_date }}</div>
+            <div class="name">{{ officer_name }}</div>
+            <div class="title-line">{{ officer_title }}</div>
         </div>
         <div class="disclaimer">
             <strong>DISCLAIMER:</strong> This letter is a preliminary pre-qualification based on a soft-inquiry credit review and unverified, self-reported financial data provided by the borrower. This is <strong>NOT a commitment to lend</strong>, an offer of credit, or a final loan approval. All loans are strictly subject to final underwriting review, a full acceptable appraisal, environmental reports (if applicable), title clearance, verification of liquid reserves, and final approval by the designated lending institution. Qualified Commercial LLC acts as a commercial loan brokerage platform. Terms, rates, and guidelines are subject to market changes without notice and are not locked until a formal rate lock agreement is executed.

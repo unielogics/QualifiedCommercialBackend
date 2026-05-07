@@ -94,6 +94,33 @@ class SimulatorSettings(BaseModel):
     show_ltv_toggle: bool = True
 
 
+# --- Section: letterhead ------------------------------------------------
+
+class LetterheadSettings(BaseModel):
+    """Configurable letterhead values that get rendered into every
+    pre-qualification PDF — office address, signing officer's name and
+    title, and the officer's saved signature image (stored in S3, fetched
+    + base64-embedded by the PDF renderer at render time).
+
+    Edited by SUPER_ADMIN only via the firm-letterhead settings page.
+    Used by app/services/prequal_pdf.py:render_letter.
+    """
+    # Officer / signer identity (full first + last name).
+    officer_name: str = "Franco Pellegrino"
+    officer_title: str = "Managing Director | Qualified Commercial LLC"
+
+    # Three address lines on the letterhead header (top-right block).
+    # Empty string = blank that line.
+    office_address_line_1: str = "123 Financial Way, Suite 400"
+    office_address_line_2: str = "Garfield, NJ 07026"
+    office_address_line_3: str = "www.qualifiedcommercial.com"
+
+    # S3 key of the uploaded signature image (transparent PNG ideal).
+    # None until the super admin uploads one — templates fall back to a
+    # plain underline + typed name in that case.
+    signature_s3_key: str | None = None
+
+
 # --- Aggregate ----------------------------------------------------------
 
 class AppSettingsData(BaseModel):
@@ -105,6 +132,7 @@ class AppSettingsData(BaseModel):
     pricing: PricingSettings = Field(default_factory=PricingSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
+    letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -120,3 +148,18 @@ class AppSettingsUpdate(BaseModel):
     pricing: PricingSettings | None = None
     security: SecuritySettings | None = None
     simulator: SimulatorSettings | None = None
+    letterhead: LetterheadSettings | None = None
+
+
+# --- Signature image upload ---------------------------------------------
+
+class SignatureUploadInitResponse(BaseModel):
+    """Response from POST /settings/letterhead/signature/upload-init.
+
+    s3_key      — caller PUTs the bytes to upload_url and then PATCHes
+                  /settings with letterhead.signature_s3_key set to this.
+    upload_url  — presigned PUT URL (expires in 5 min). None when the
+                  backend is running without S3 credentials (local dev).
+    """
+    s3_key: str
+    upload_url: str | None

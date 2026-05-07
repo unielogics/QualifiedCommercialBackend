@@ -36,6 +36,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
 from app.models.activity import Activity
+from app.models.app_settings import AppSettings
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
@@ -417,6 +418,9 @@ async def approve_prequal_request(
     loan = None
     if req.loan_id is not None:
         loan = await db.get(Loan, req.loan_id)
+    # Load the firm-letterhead settings once; render_letter uses
+    # officer_name / office_address / signature image from this row.
+    settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
     try:
         s3_key = prequal_pdf.render_letter(
             req,
@@ -424,6 +428,7 @@ async def approve_prequal_request(
             settings=settings,
             expiration_days=payload.expiration_days,
             quote_number=req.quote_number,
+            settings_row=settings_row,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("prequal_pdf render/upload failed for request %s", req.id)

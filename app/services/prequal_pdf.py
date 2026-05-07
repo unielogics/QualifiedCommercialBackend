@@ -13,16 +13,20 @@ Dockerfile installs in the runtime stage.
 
 from __future__ import annotations
 
+import base64
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import boto3
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app.config import Settings
+from app.models.app_settings import AppSettings
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
+from app.schemas.settings import AppSettingsData, LetterheadSettings
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +66,45 @@ def _format_date(d) -> str:
     return d.strftime("%B %d, %Y")
 
 
+def _load_letterhead(settings_row: AppSettings | None) -> LetterheadSettings:
+    """Pull the letterhead section from app_settings.data, tolerating
+    older blobs that didn't have the section. Returns the default
+    LetterheadSettings if nothing is configured yet."""
+    if settings_row is None:
+        return LetterheadSettings()
+    raw: dict[str, Any] = settings_row.data or {}
+    try:
+        return AppSettingsData.model_validate(raw).letterhead
+    except Exception:  # noqa: BLE001 — never block a render on a settings parse error
+        log.warning("letterhead settings parse failed; using defaults")
+        return LetterheadSettings()
+
+
+def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
+    """Fetch the firm's signature image from S3 and return a
+    data:image/...;base64 URI suitable for inline <img src=...>.
+
+    WeasyPrint renders inline base64 images natively — embedding rather
+    than referencing keeps the PDF self-contained and avoids any
+    network dependency at render time.
+
+    Returns None on any failure (missing key, S3 unreachable, etc.). The
+    template falls back to a plain underline + typed name when this is
+    absent, so a render is never blocked by a missing signature."""
+    if not s3_key or not settings.s3_bucket:
+        return None
+    try:
+        s3 = _s3_client(settings)
+        obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
+        body = obj["Body"].read()
+        content_type = obj.get("ContentType") or "image/png"
+        b64 = base64.b64encode(body).decode("ascii")
+        return f"data:{content_type};base64,{b64}"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("signature fetch failed key=%s: %s", s3_key, exc)
+        return None
+
+
 def _resolve_borrower_entity(loan: Loan | None, request: PrequalRequest | None = None) -> str:
     """Best-effort borrower entity name for the letter. Priority:
        1. request.borrower_entity   (borrower-typed LLC, or admin override)
@@ -93,6 +136,7 @@ def render_letter(
     settings: Settings,
     expiration_days: int | None = None,
     quote_number: str | None = None,
+    settings_row: AppSettings | None = None,
 ) -> str:
     """Render the letter to PDF and upload to S3. Returns the s3_key.
 
@@ -136,6 +180,12 @@ def render_letter(
     else:
         template_name = "prequal_bridge.html"
 
+    # Letterhead — configurable by super admin via Settings → Firm
+    # letterhead. When the row hasn't been edited yet this falls back to
+    # the typed defaults in LetterheadSettings.
+    letterhead = _load_letterhead(settings_row)
+    signature_data_uri = _signature_data_uri(settings, letterhead.signature_s3_key)
+
     tpl = _jinja.get_template(template_name)
     html_str = tpl.render(
         today_date=_format_date(today),
@@ -148,6 +198,17 @@ def render_letter(
         quote_number=quote_number or request.quote_number,
         # DSCR template branches title/intro on this. None elsewhere.
         is_refi=(request.loan_type == "dscr_refi"),
+        # Configurable letterhead — see app/schemas/settings.py
+        # LetterheadSettings. None means "use the template default".
+        officer_name=letterhead.officer_name,
+        officer_title=letterhead.officer_title,
+        office_address_line_1=letterhead.office_address_line_1,
+        office_address_line_2=letterhead.office_address_line_2,
+        office_address_line_3=letterhead.office_address_line_3,
+        # Inline base64 PNG (or None). Templates render the image when
+        # present, or fall back to a plain signature line when absent.
+        signature_data_uri=signature_data_uri,
+        signed_date=_format_date(today),
         # admin_notes intentionally NOT passed — borrower sees them in
         # the dashboard, never on the printable letter.
     )
