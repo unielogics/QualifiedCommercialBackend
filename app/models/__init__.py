@@ -1,6 +1,7 @@
 """ORM models — single import surface so Alembic autogenerate sees everything."""
 
 from app.models.activity import Activity  # noqa: F401
+from app.models.ai_chat_thread import AIChatMessage, AIChatThread  # noqa: F401
 from app.models.ai_feedback import AIFeedback  # noqa: F401
 from app.models.ai_modify_correction import AIModifyCorrection  # noqa: F401
 from app.models.ai_task import AITask  # noqa: F401

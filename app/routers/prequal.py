@@ -462,7 +462,13 @@ async def _apply_approval(
     # Snapshot the approved figures + scenario + reviewer + qualification#.
     req.approved_purchase_price = payload.approved_purchase_price
     req.approved_loan_amount = payload.approved_loan_amount
-    req.admin_notes = payload.admin_notes
+    # Strip a stale "[Auto-approval declined]" preamble if the operator
+    # didn't manually edit the notes — those were written by the cron's
+    # earlier rejection pass and are confusing on an approved letter.
+    incoming_notes = (payload.admin_notes or "").strip()
+    if incoming_notes.startswith("[Auto-approval declined]"):
+        incoming_notes = ""
+    req.admin_notes = incoming_notes or None
     req.approved_scenario = payload.approved_scenario
     # F&F-specific approved overrides. Admin can rewrite ARV and the
     # SOW line items independently of what the borrower submitted —

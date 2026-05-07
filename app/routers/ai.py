@@ -32,6 +32,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import DocStatus, Role
 from app.models.activity import Activity
+from app.models.ai_chat_thread import AIChatMessage, AIChatThread
 from app.models.client import Client
 from app.models.credit_pull import CreditPull
 from app.models.document import Document
@@ -416,7 +417,292 @@ async def chat(
     except Exception as exc:  # noqa: BLE001
         log.warning("Anthropic call failed (%s) — falling back to stub", exc)
         return ChatResponse(
-            reply=_stub_reply(payload.messages, loan_context_str),
+            reply=_stub_reply(payload.messages, context_block),
             model="stub",
             used_stub=True,
         )
+
+
+# ── Persisted Underwriter chat threads (Phase 8) ──────────────────────
+#
+# The standalone Underwriter chat (mobile FAB / desktop topbar icon)
+# now persists. Each thread is owned by a single user; messages land
+# in `ai_chat_messages` ordered by created_at. Per-loan AIRail chat
+# is intentionally NOT migrated here — that has its own model
+# (`loan_chat_messages`) and is scoped to a deal.
+#
+# Endpoints (all rooted at /ai/chat/threads):
+#   GET    /                — list current user's threads
+#   POST   /                — create a new empty thread
+#   GET    /{id}            — fetch thread + messages
+#   PATCH  /{id}            — rename
+#   DELETE /{id}            — drop thread + cascade messages
+#   POST   /{id}/message    — append user message + AI reply, return both
+
+
+class AIChatThreadRead(BaseModel):
+    id: UUID
+    title: str
+    last_message_preview: str | None
+    last_message_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AIChatMessageRead(BaseModel):
+    id: UUID
+    role: str
+    body: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AIChatThreadDetail(AIChatThreadRead):
+    messages: list[AIChatMessageRead]
+
+
+class AIChatThreadCreate(BaseModel):
+    title: str | None = None
+
+
+class AIChatThreadRename(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class AIChatSendRequest(BaseModel):
+    body: str = Field(min_length=1)
+    loan_id: UUID | None = None
+
+
+class AIChatSendResponse(BaseModel):
+    user_message: AIChatMessageRead
+    assistant_message: AIChatMessageRead
+    thread: AIChatThreadRead
+    used_stub: bool
+
+
+def _preview(text: str, limit: int = 200) -> str:
+    """Compact one-line preview for the thread list. Collapses
+    whitespace and trims to `limit` chars with ellipsis."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+async def _load_thread_for_user(
+    db: AsyncSession, thread_id: UUID, user: User
+) -> AIChatThread:
+    thread = (
+        await db.execute(
+            select(AIChatThread)
+            .options(selectinload(AIChatThread.messages))
+            .where(AIChatThread.id == thread_id)
+        )
+    ).scalar_one_or_none()
+    if thread is None or thread.user_id != user.id:
+        # Don't leak existence — same response for not-found / not-owned.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+    return thread
+
+
+@router.get("/chat/threads", response_model=list[AIChatThreadRead])
+async def list_chat_threads(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[AIChatThreadRead]:
+    rows = (
+        await db.execute(
+            select(AIChatThread)
+            .where(AIChatThread.user_id == user.id)
+            .order_by(
+                AIChatThread.last_message_at.desc().nullslast(),
+                AIChatThread.created_at.desc(),
+            )
+        )
+    ).scalars().all()
+    return [AIChatThreadRead.model_validate(t) for t in rows]
+
+
+@router.post("/chat/threads", response_model=AIChatThreadRead, status_code=status.HTTP_201_CREATED)
+async def create_chat_thread(
+    payload: AIChatThreadCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatThreadRead:
+    thread = AIChatThread(
+        user_id=user.id,
+        title=(payload.title or "New conversation")[:120],
+    )
+    db.add(thread)
+    await db.commit()
+    await db.refresh(thread)
+    return AIChatThreadRead.model_validate(thread)
+
+
+@router.get("/chat/threads/{thread_id}", response_model=AIChatThreadDetail)
+async def get_chat_thread(
+    thread_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatThreadDetail:
+    thread = await _load_thread_for_user(db, thread_id, user)
+    return AIChatThreadDetail(
+        id=thread.id,
+        title=thread.title,
+        last_message_preview=thread.last_message_preview,
+        last_message_at=thread.last_message_at,
+        created_at=thread.created_at,
+        updated_at=thread.updated_at,
+        messages=[AIChatMessageRead.model_validate(m) for m in thread.messages],
+    )
+
+
+@router.patch("/chat/threads/{thread_id}", response_model=AIChatThreadRead)
+async def rename_chat_thread(
+    thread_id: UUID,
+    payload: AIChatThreadRename,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatThreadRead:
+    thread = await _load_thread_for_user(db, thread_id, user)
+    thread.title = payload.title.strip()[:120]
+    await db.commit()
+    await db.refresh(thread)
+    return AIChatThreadRead.model_validate(thread)
+
+
+@router.delete("/chat/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat_thread(
+    thread_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    thread = await _load_thread_for_user(db, thread_id, user)
+    await db.delete(thread)
+    await db.commit()
+
+
+@router.post(
+    "/chat/threads/{thread_id}/message",
+    response_model=AIChatSendResponse,
+)
+async def append_thread_message(
+    thread_id: UUID,
+    payload: AIChatSendRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatSendResponse:
+    """Append the user's turn, call the AI with full thread history +
+    fresh context, persist the assistant reply.
+
+    Context is rebuilt on every send (account- or loan-level) so the
+    AI sees the latest credit / docs / loan state, not whatever was
+    cached when the thread was created. History is what's persisted;
+    context is ephemeral.
+    """
+    thread = await _load_thread_for_user(db, thread_id, user)
+
+    # 1. Persist the user's message immediately so the panel can
+    #    optimistic-render or recover after an Anthropic failure.
+    now = datetime.now(timezone.utc)
+    user_msg = AIChatMessage(
+        thread_id=thread.id,
+        role="user",
+        body=payload.body,
+    )
+    db.add(user_msg)
+    thread.last_message_preview = _preview(payload.body)
+    thread.last_message_at = now
+    # Auto-title from the first user message — much cheaper than a
+    # round-trip to Haiku just for a title, and easy to override via
+    # PATCH /threads/{id} later.
+    if thread.title == "New conversation":
+        thread.title = _preview(payload.body, limit=60)
+    await db.flush()
+
+    # 2. Build context (account- or loan-scoped).
+    context_block: str | None = None
+    if payload.loan_id is not None:
+        loan = await db.get(Loan, payload.loan_id)
+        if loan is not None:
+            audience: Audience = (
+                "client" if user.role == Role.CLIENT
+                else "broker" if user.role == Role.BROKER
+                else "super_admin"
+            )
+            context_block = await assemble_loan_context(db, loan, audience=audience) or None
+    else:
+        user_with_client = (
+            await db.execute(
+                select(User).options(selectinload(User.client)).where(User.id == user.id)
+            )
+        ).scalar_one()
+        context_block = await _build_account_context(db, user_with_client)
+
+    # 3. Replay full history (already includes the user msg we just
+    #    flushed) into the model.
+    history_rows = (
+        await db.execute(
+            select(AIChatMessage)
+            .where(AIChatMessage.thread_id == thread.id)
+            .order_by(AIChatMessage.created_at.asc())
+        )
+    ).scalars().all()
+    api_messages = [{"role": m.role, "content": m.body} for m in history_rows]
+
+    settings = get_settings()
+    if not settings.anthropic_api_key:
+        reply_text = _stub_reply(
+            [ChatTurn(role=m.role, content=m.body) for m in history_rows],
+            context_block,
+        )
+        used_stub = True
+    else:
+        client = get_client()
+        system = _system_prompt_for(user)
+        if context_block:
+            system += "\n\n" + context_block
+        try:
+            result = await client.messages.create(
+                model=model_light(),
+                max_tokens=900,
+                system=system,
+                messages=api_messages,
+            )
+            reply_text = "".join(
+                block.text for block in result.content
+                if getattr(block, "type", None) == "text"
+            ).strip() or "(No reply.)"
+            used_stub = False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Anthropic call failed in thread %s: %s", thread.id, exc)
+            reply_text = _stub_reply(
+                [ChatTurn(role=m.role, content=m.body) for m in history_rows],
+                context_block,
+            )
+            used_stub = True
+
+    # 4. Persist the assistant reply + bump preview.
+    assistant_msg = AIChatMessage(
+        thread_id=thread.id,
+        role="assistant",
+        body=reply_text,
+    )
+    db.add(assistant_msg)
+    thread.last_message_preview = _preview(reply_text)
+    thread.last_message_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(user_msg)
+    await db.refresh(assistant_msg)
+    await db.refresh(thread)
+
+    return AIChatSendResponse(
+        user_message=AIChatMessageRead.model_validate(user_msg),
+        assistant_message=AIChatMessageRead.model_validate(assistant_msg),
+        thread=AIChatThreadRead.model_validate(thread),
+        used_stub=used_stub,
+    )

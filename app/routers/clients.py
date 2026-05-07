@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,8 +14,19 @@ from app.deps import CurrentUser
 from app.enums import Role
 from app.models.client import Client
 from app.schemas.client import ClientCreate, ClientRead, ClientSelfUpdate, ClientUpdate
+from app.services.ai.client_summarizer import refresh_client_summary
 
 router = APIRouter(prefix="/clients", tags=["clients"])
+
+
+class LivingProfileRead(BaseModel):
+    """Account-wide AI-aggregated profile (Phase 8). Empty fields when
+    the aggregator has never run for this client."""
+
+    client_id: UUID
+    living_profile: dict[str, Any] | None
+    living_summary: str | None
+    living_refreshed_at: datetime | None
 
 
 def _scope(user, stmt):
@@ -60,6 +74,99 @@ async def update_my_client(
     await db.flush()
     await db.refresh(client)
     return ClientRead.model_validate(client)
+
+
+@router.get("/me/living-profile", response_model=LivingProfileRead)
+async def get_my_living_profile(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LivingProfileRead:
+    """Borrower self-read of the account-wide AI profile. Returns the
+    last-refreshed snapshot — call POST /clients/me/summary/refresh
+    to force a fresh aggregation."""
+    if not user.client:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Current user has no linked client record"
+        )
+    return LivingProfileRead(
+        client_id=user.client.id,
+        living_profile=user.client.living_profile,
+        living_summary=user.client.living_summary,
+        living_refreshed_at=user.client.living_refreshed_at,
+    )
+
+
+@router.post("/me/summary/refresh", response_model=LivingProfileRead)
+async def refresh_my_living_profile(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LivingProfileRead:
+    """Force-refresh the borrower's living profile. Synchronous — the
+    aggregator does a single Haiku call, typically <2s. Use sparingly
+    on the borrower side; the daily 3am cron is the steady state."""
+    if not user.client:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Current user has no linked client record"
+        )
+    await refresh_client_summary(db, user.client.id)
+    fresh = (await db.execute(
+        select(Client).where(Client.id == user.client.id)
+    )).scalar_one()
+    return LivingProfileRead(
+        client_id=fresh.id,
+        living_profile=fresh.living_profile,
+        living_summary=fresh.living_summary,
+        living_refreshed_at=fresh.living_refreshed_at,
+    )
+
+
+@router.get("/{client_id}/living-profile", response_model=LivingProfileRead)
+async def get_client_living_profile(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LivingProfileRead:
+    """Operator read — broker / super-admin sees the borrower's
+    account-wide AI profile."""
+    if user.role == Role.CLIENT:
+        # Borrowers must use /me/living-profile (which scopes to themselves
+        # without taking a client_id parameter).
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Use /clients/me/living-profile")
+    stmt = _scope(user, select(Client).where(Client.id == client_id))
+    client = (await db.execute(stmt)).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    return LivingProfileRead(
+        client_id=client.id,
+        living_profile=client.living_profile,
+        living_summary=client.living_summary,
+        living_refreshed_at=client.living_refreshed_at,
+    )
+
+
+@router.post("/{client_id}/summary/refresh", response_model=LivingProfileRead)
+async def refresh_client_living_profile(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LivingProfileRead:
+    """Operator-triggered manual refresh of a specific client's profile."""
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    stmt = _scope(user, select(Client).where(Client.id == client_id))
+    client = (await db.execute(stmt)).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    await refresh_client_summary(db, client.id)
+    fresh = (await db.execute(
+        select(Client).where(Client.id == client_id)
+    )).scalar_one()
+    return LivingProfileRead(
+        client_id=fresh.id,
+        living_profile=fresh.living_profile,
+        living_summary=fresh.living_summary,
+        living_refreshed_at=fresh.living_refreshed_at,
+    )
 
 
 @router.get("/{client_id}", response_model=ClientRead)
