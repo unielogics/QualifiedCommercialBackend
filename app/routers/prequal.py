@@ -48,7 +48,9 @@ from app.schemas.prequal import (
     PrequalRequestStartCreate,
     PrequalSellerOutcome,
 )
+from app.schemas.settings import AppSettingsData
 from app.services import calendar_emitter, prequal_pdf
+from app.services.activity_log import mark_loan_dirty
 
 router = APIRouter(tags=["prequal"])
 log = logging.getLogger(__name__)
@@ -238,6 +240,57 @@ async def _create_request(
 # ── borrower endpoints ──────────────────────────────────────────────────
 
 
+async def _try_auto_approve(
+    db: AsyncSession,
+    req: PrequalRequest,
+    user,
+) -> PrequalRequest:
+    """Phase 5 — run the deterministic auto-approval gate. When all
+    checks pass, immediately apply the approval (renders PDF, flips
+    status, emits calendar). When they don't, the request stays in
+    `pending` and the admin queue picks it up.
+
+    The borrower receives the same response shape either way — they
+    just see a different status and admin_notes."""
+    from app.services.prequal_auto_approve import evaluate
+    from app.models.app_settings import AppSettings
+
+    settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+    settings = AppSettingsData.model_validate((settings_row.data if settings_row else {}) or {})
+    if not settings.prequal_auto_approval.enabled:
+        return req
+
+    client = user.client if hasattr(user, "client") else None
+    decision = evaluate(req, client, settings)
+
+    if not decision.auto_approve:
+        # Stash the blocker reasons in admin_notes so the operator
+        # sees them on the queue without having to re-derive.
+        req.admin_notes = (
+            "[Auto-approval declined]\n" + "\n".join(f"• {r}" for r in decision.reasons)
+        )
+        await db.flush()
+        return req
+
+    # All checks passed — synthesize the operator approval payload
+    # and run it through the same _apply_approval pipeline a manual
+    # admin click would.
+    auto_notes = "[Auto-approved]\n" + "\n".join(f"• {r}" for r in decision.reasons)
+    payload = PrequalRequestApprove(
+        approved_purchase_price=decision.approved_purchase_price,
+        approved_loan_amount=decision.approved_loan_amount,
+        admin_notes=auto_notes,
+        approved_scenario=decision.scenario,
+        expiration_days=None,  # use service default (90 days)
+        borrower_entity=None,  # don't override what the borrower typed
+    )
+    return await _apply_approval(
+        db, req, payload,
+        actor_user_id=None,
+        actor_label="ai",
+    )
+
+
 @router.post(
     "/loans/{loan_id}/prequal-requests",
     response_model=PrequalRequestRead,
@@ -249,13 +302,16 @@ async def submit_prequal_for_loan(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PrequalRequestRead:
-    """Borrower submits a pre-qual request against an existing loan."""
+    """Borrower submits a pre-qual request against an existing loan.
+    Auto-approval (Phase 5) runs after creation — request flips to
+    `approved` immediately when the math is clean."""
     loan = await db.get(Loan, loan_id)
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     if not _scope_loan_for_borrower(loan, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot submit for this loan")
     req = await _create_request(loan, payload, user, db)
+    req = await _try_auto_approve(db, req, user)
     return _to_read(req)
 
 
@@ -272,8 +328,13 @@ async def submit_prequal_spawn(
     """Borrower submits a standalone pre-qual request — NO loan record is
     created at this stage. Under the new lifecycle a Loan is only spawned
     after the borrower marks the seller's offer as accepted (see
-    /me/prequal-requests/{id}/accept-offer)."""
+    /me/prequal-requests/{id}/accept-offer).
+
+    Auto-approval (Phase 5) runs after creation — request flips to
+    `approved` immediately when the math is clean (FICO floor, LTV
+    cap, tier check, loan ceiling all pass)."""
     req = await _create_request(None, payload, user, db)
+    req = await _try_auto_approve(db, req, user)
     return _to_read(req)
 
 
@@ -346,36 +407,26 @@ async def list_admin_prequal_queue(
     return [_to_read(r) for r in rows]
 
 
-@router.put(
-    "/admin/prequal-requests/{request_id}/approve",
-    response_model=PrequalRequestRead,
-)
-async def approve_prequal_request(
-    request_id: UUID,
+async def _apply_approval(
+    db: AsyncSession,
+    req: PrequalRequest,
     payload: PrequalRequestApprove,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-) -> PrequalRequestRead:
-    if not _is_operator(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    *,
+    actor_user_id: UUID | None,
+    actor_label: str,
+) -> PrequalRequest:
+    """Core approve path. Used by both the manual route handler
+    (operator-driven, with their user_id as actor) and the
+    auto-approve hook (system-driven, actor_label='ai').
 
-    req = await db.get(PrequalRequest, request_id)
-    if req is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
-    # Allowed statuses for re-issue:
-    #   pending        — first approval, status flips to approved
-    #   approved       — re-approval (admin tweaked numbers), letter regenerates
-    #   offer_accepted — borrower already accepted; admin still wants to
-    #                    correct the letter. Status stays as is, the
-    #                    spawned Loan is left untouched (its values were
-    #                    pre-filled from the original approved_scenario;
-    #                    the operator updates the loan separately if it
-    #                    needs to track new numbers).
-    if req.status not in {"pending", "approved", "offer_accepted"}:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Request is {req.status}; cannot approve. Submit a new request instead.",
-        )
+    Validates LTV, snapshots numbers + scenario, generates Q-XXXX,
+    renders + uploads PDF, emits the closing calendar event, logs an
+    Activity row. Idempotent on re-approval — the same request can
+    be re-approved with new numbers.
+
+    Raises HTTPException on validation failure (LTV cap, unknown
+    loan type, etc.). Caller is responsible for higher-level gates
+    (auth, status). Returns the updated PrequalRequest."""
 
     # LTV cap enforcement against the matrix.
     cap = LTV_CAPS.get(req.loan_type)
@@ -417,7 +468,7 @@ async def approve_prequal_request(
     # perspective and re-prompt the borrower to confirm acceptance).
     if req.status == "pending":
         req.status = "approved"
-    req.reviewed_by = user.id
+    req.reviewed_by = actor_user_id
     req.reviewed_at = datetime.now(timezone.utc)
     # Generate the qualification # (Q-XXXX) on first approval. Re-approval
     # keeps the same number so the borrower's downloaded letter stays
@@ -473,16 +524,23 @@ async def approve_prequal_request(
     # title / starts_at if expected_closing_date moved.
     await calendar_emitter.emit_for_prequal_approval(db, req)
 
+    # Phase 6 — flag the parent loan (when present) for a Living Loan
+    # File refresh. Pre-loan prequals don't have a loan_id yet, but
+    # mark_loan_dirty handles None gracefully.
+    if loan is not None:
+        await mark_loan_dirty(db, loan.id)
+
     # Activity log lives on the loan (NOT NULL FK). Skip when no loan
     # is attached yet — the prequal_requests row is the audit until the
     # borrower accepts and we spawn one.
+    activity_kind = "prequal.auto_approved" if actor_label == "ai" else "prequal.approved"
     if loan is not None:
         db.add(
             Activity(
                 loan_id=loan.id,
-                actor_id=user.id,
-                actor_label=user.role,
-                kind="prequal.approved",
+                actor_id=actor_user_id,
+                actor_label=actor_label,
+                kind=activity_kind,
                 summary=f"Pre-qualification approved at {ltv * 100:.0f}% LTV — {req.target_property_address}",
                 payload={
                     "request_id": str(req.id),
@@ -494,11 +552,55 @@ async def approve_prequal_request(
                     "loan_type": req.loan_type,
                     "admin_notes": req.admin_notes,
                     "approved_scenario": req.approved_scenario,
+                    "auto_approved": actor_label == "ai",
                 },
             )
         )
     await db.flush()
     await db.refresh(req)
+    return req
+
+
+@router.put(
+    "/admin/prequal-requests/{request_id}/approve",
+    response_model=PrequalRequestRead,
+)
+async def approve_prequal_request(
+    request_id: UUID,
+    payload: PrequalRequestApprove,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrequalRequestRead:
+    """Manual operator approval. Auto-approval (system-driven, when
+    the math is clean at submit time) goes through `_apply_approval`
+    directly from `submit_prequal_*` handlers — see Phase 5."""
+    if not _is_operator(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+
+    req = await db.get(PrequalRequest, request_id)
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
+    # Allowed statuses for re-issue:
+    #   pending        — first approval, status flips to approved
+    #   approved       — re-approval (admin tweaked numbers), letter regenerates
+    #   offer_accepted — borrower already accepted; admin still wants to
+    #                    correct the letter. Status stays as is, the
+    #                    spawned Loan is left untouched (its values were
+    #                    pre-filled from the original approved_scenario;
+    #                    the operator updates the loan separately if it
+    #                    needs to track new numbers).
+    if req.status not in {"pending", "approved", "offer_accepted"}:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Request is {req.status}; cannot approve. Submit a new request instead.",
+        )
+
+    actor_label = user.role.value if hasattr(user.role, "value") else str(user.role)
+    req = await _apply_approval(
+        db, req, payload,
+        actor_user_id=user.id,
+        actor_label=actor_label,
+    )
     return _to_read(req)
 
 

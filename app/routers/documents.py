@@ -21,6 +21,7 @@ from app.schemas.document import (
     DocumentUploadInitResponse,
 )
 from app.services import calendar_emitter
+from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -94,6 +95,8 @@ async def request_document(
     # doc on their agenda. Default 7-day cadence; Phase 4 swaps the
     # constant for the per-loan-type checklist's first_reminder_days.
     await calendar_emitter.emit_for_document_request(db, doc)
+    # Phase 6 — Living Loan File should reflect the new outstanding doc.
+    await mark_loan_dirty(db, loan.id)
     await db.flush()
     return DocumentRead.model_validate(doc)
 

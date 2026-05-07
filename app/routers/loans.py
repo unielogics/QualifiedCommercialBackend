@@ -22,6 +22,7 @@ from app.schemas.activity import ActivityRead
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
+from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.loan_intake_automation import kickoff_loan
 from app.services.email.parser import inject_deal_id
@@ -116,6 +117,9 @@ async def create_loan(
     settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
     await kickoff_loan(db, loan, settings_row)
 
+    # Living Loan File debounced refresh — flag for the dirty-drain.
+    await mark_loan_dirty(db, loan.id)
+
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
@@ -152,6 +156,8 @@ async def update_loan(
     # ON CONFLICT collapses the no-op write.
     if "close_date" in changes and loan.stage == LoanStage.CLOSING:
         await calendar_emitter.emit_for_loan_close(db, loan)
+    # Phase 6 — flag dirty so the next drain picks up the change.
+    await mark_loan_dirty(db, loan.id)
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
@@ -191,6 +197,9 @@ async def transition_stage(
     # Emit / cancel the CLOSING milestone on the calendar. Idempotent:
     # rerunning the same PATCH leaves the existing event in place.
     await calendar_emitter.emit_for_loan_stage(db, loan, old, payload.new_stage)
+    # Phase 6 — stage moves are the most informative signal for the
+    # Living Loan File. Mark dirty for the next drain.
+    await mark_loan_dirty(db, loan.id)
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)

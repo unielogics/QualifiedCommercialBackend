@@ -94,6 +94,33 @@ class SimulatorSettings(BaseModel):
     show_ltv_toggle: bool = True
 
 
+# --- Section: prequal auto-approval ------------------------------------
+
+class PrequalAutoApprovalSettings(BaseModel):
+    """Deterministic gate for auto-approving prequalification requests.
+    See app/services/prequal_auto_approve.py — only when ALL conditions
+    pass does the system approve without admin review. Anything that
+    falls through stays in `status='pending'` for manual review.
+
+    The kill-switch: set `enabled=False` to revert to 100% manual
+    approval if the auto path ever causes a problem in prod."""
+    enabled: bool = True
+
+    # Borrowers below this score never auto-approve. Tighter than the
+    # tier_max_ltv gate because we want a margin of safety even
+    # within the "basic" tier.
+    fico_floor: int = 660
+
+    # Hard ceiling on auto-approved loan size. Anything above this
+    # always lands on the admin's desk no matter how clean the math.
+    safety_loan_ceiling_usd: int = 1_000_000
+
+    # Block auto-approve when the borrower has no credit pull on
+    # file. Prevents the system from issuing a letter against a
+    # borrower whose risk profile we haven't actually verified.
+    require_credit_pull: bool = True
+
+
 # --- Section: letterhead ------------------------------------------------
 
 class LetterheadSettings(BaseModel):
@@ -133,6 +160,7 @@ class AppSettingsData(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
     letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
+    prequal_auto_approval: PrequalAutoApprovalSettings = Field(default_factory=PrequalAutoApprovalSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -149,6 +177,7 @@ class AppSettingsUpdate(BaseModel):
     security: SecuritySettings | None = None
     simulator: SimulatorSettings | None = None
     letterhead: LetterheadSettings | None = None
+    prequal_auto_approval: PrequalAutoApprovalSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------
