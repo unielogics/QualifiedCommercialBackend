@@ -362,7 +362,16 @@ async def approve_prequal_request(
     req = await db.get(PrequalRequest, request_id)
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
-    if req.status not in {"pending", "approved"}:
+    # Allowed statuses for re-issue:
+    #   pending        — first approval, status flips to approved
+    #   approved       — re-approval (admin tweaked numbers), letter regenerates
+    #   offer_accepted — borrower already accepted; admin still wants to
+    #                    correct the letter. Status stays as is, the
+    #                    spawned Loan is left untouched (its values were
+    #                    pre-filled from the original approved_scenario;
+    #                    the operator updates the loan separately if it
+    #                    needs to track new numbers).
+    if req.status not in {"pending", "approved", "offer_accepted"}:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Request is {req.status}; cannot approve. Submit a new request instead.",
@@ -401,7 +410,13 @@ async def approve_prequal_request(
     # borrower submitted".
     if payload.borrower_entity is not None:
         req.borrower_entity = payload.borrower_entity
-    req.status = "approved"
+    # Don't downgrade a forward-state status. If the borrower already
+    # marked the seller's offer as accepted, the prequal lives in
+    # offer_accepted and editing the letter shouldn't bounce it back to
+    # approved (which would un-link the spawned Loan from a UX
+    # perspective and re-prompt the borrower to confirm acceptance).
+    if req.status == "pending":
+        req.status = "approved"
     req.reviewed_by = user.id
     req.reviewed_at = datetime.now(timezone.utc)
     # Generate the qualification # (Q-XXXX) on first approval. Re-approval
