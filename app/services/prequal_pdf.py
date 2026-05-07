@@ -141,14 +141,23 @@ def presign_get(
     settings: Settings,
     ttl_seconds: int = PRESIGN_TTL_SECONDS,
 ) -> str | None:
-    """Return a presigned GET URL for the uploaded PDF, or None if S3 isn't
-    configured (dev mode without AWS keys). Always called fresh on read so
-    URLs in API responses never go stale."""
-    if not settings.aws_access_key_id or not settings.aws_secret_access_key:
+    """Return a presigned GET URL for the uploaded PDF, or None if S3
+    isn't reachable. Always called fresh on read so URLs in API responses
+    never go stale.
+
+    boto3 walks its credential provider chain (env vars → ~/.aws → EC2
+    instance metadata) so we don't have to gate on settings.aws_*. On
+    this prod box auth comes from the qcbackend-instance-role, not env
+    vars."""
+    if not settings.s3_bucket:
         return None
-    s3 = _s3_client(settings)
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": settings.s3_bucket, "Key": s3_key},
-        ExpiresIn=ttl_seconds,
-    )
+    try:
+        s3 = _s3_client(settings)
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+            ExpiresIn=ttl_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("prequal_pdf.presign failed key=%s: %s", s3_key, exc)
+        return None
