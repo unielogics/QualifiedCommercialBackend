@@ -97,11 +97,26 @@ def evaluate(
 
     purchase = float(request.purchase_price or 0)
     loan_amt = float(request.requested_loan_amount or 0)
+    arv = float(request.arv_estimate or 0)
 
     if purchase <= 0:
         blockers.append("Purchase price must be greater than zero.")
     if loan_amt <= 0:
         blockers.append("Requested loan amount must be greater than zero.")
+
+    # F&F is sized against the after-repair value (LTARV); other
+    # products use loan / purchase. Without this branch every F&F
+    # submit was stamped declined (loan/BRV is meaningless for fix &
+    # flip — the loan funds the rehab to ARV).
+    is_fix_flip = request.loan_type == "fix_flip"
+    if is_fix_flip:
+        if arv <= 0:
+            blockers.append("F&F auto-approval requires an ARV in the Scope of Work.")
+        ltv_basis = arv
+        ltv_label = "LTARV"
+    else:
+        ltv_basis = purchase
+        ltv_label = "LTV"
 
     # Loan amount safety ceiling.
     if loan_amt > cfg.safety_loan_ceiling_usd:
@@ -114,11 +129,11 @@ def evaluate(
     cap = LTV_CAPS.get(request.loan_type)
     if cap is None:
         blockers.append(f"Unknown loan type: {request.loan_type}")
-    elif purchase > 0 and loan_amt > 0:
-        ltv = loan_amt / purchase
+    elif ltv_basis > 0 and loan_amt > 0:
+        ltv = loan_amt / ltv_basis
         if ltv > cap + 1e-6:
             blockers.append(
-                f"Requested LTV {ltv * 100:.1f}% exceeds the "
+                f"Requested {ltv_label} {ltv * 100:.1f}% exceeds the "
                 f"{request.loan_type} cap of {cap * 100:.0f}%."
             )
 
@@ -144,11 +159,11 @@ def evaluate(
                 f"Credit tier ({tier}) is blocked from new commercial "
                 f"financing."
             )
-        elif purchase > 0 and loan_amt > 0:
-            tier_ltv = loan_amt / purchase
+        elif ltv_basis > 0 and loan_amt > 0:
+            tier_ltv = loan_amt / ltv_basis
             if tier_ltv > tier_cap + 1e-6:
                 blockers.append(
-                    f"Requested LTV {tier_ltv * 100:.1f}% exceeds the "
+                    f"Requested {ltv_label} {tier_ltv * 100:.1f}% exceeds the "
                     f"borrower's tier cap of {tier_cap * 100:.0f}% ({tier})."
                 )
 
@@ -159,7 +174,7 @@ def evaluate(
     success_reasons: list[str] = []
     if auto_approve:
         success_reasons.append(
-            f"LTV {(loan_amt / purchase * 100):.1f}% within "
+            f"{ltv_label} {(loan_amt / ltv_basis * 100):.1f}% within "
             f"{cap * 100:.0f}% matrix cap."
         )
         if fico is not None:
@@ -179,7 +194,8 @@ def evaluate(
         scenario={
             "auto_approved": auto_approve,
             "loan_type": request.loan_type,
-            "ltv": (loan_amt / purchase) if purchase > 0 else None,
+            "ltv": (loan_amt / ltv_basis) if ltv_basis > 0 else None,
+            "ltv_basis": ltv_label.lower(),
             "fico_at_approval": fico,
             "fico_tier_at_approval": fico_tier(fico) if fico is not None else None,
         },

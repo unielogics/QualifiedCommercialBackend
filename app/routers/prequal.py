@@ -427,14 +427,33 @@ async def _apply_approval(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_input", "message": "Approved purchase price must be > 0."},
         )
-    ltv = payload.approved_loan_amount / payload.approved_purchase_price
+    # F&F is sized against the after-repair value (LTARV), not the
+    # as-is BRV. A $300K loan on an $85K BRV with a $450K ARV is a
+    # normal F&F deal at 67% LTARV — the old loan/BRV math threw 352%
+    # and rejected every realistic submission.
+    if req.loan_type == "fix_flip":
+        arv = payload.approved_arv or req.approved_arv or req.arv_estimate
+        if not arv or float(arv) <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "missing_arv",
+                    "message": "F&F approval requires an ARV. Add it in the Scope of Work card.",
+                },
+            )
+        ltv_basis = float(arv)
+        ltv_label = "LTARV"
+    else:
+        ltv_basis = float(payload.approved_purchase_price)
+        ltv_label = "LTV"
+    ltv = payload.approved_loan_amount / ltv_basis
     if ltv > cap + 1e-6:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": "ltv_exceeded",
                 "message": (
-                    f"Approved LTV is {ltv * 100:.1f}% but the {req.loan_type.upper()} "
+                    f"Approved {ltv_label} is {ltv * 100:.1f}% but the {req.loan_type.upper()} "
                     f"matrix caps at {cap * 100:.0f}%. Lower the approved loan amount."
                 ),
             },
