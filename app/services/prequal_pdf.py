@@ -105,27 +105,68 @@ def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
         return None
 
 
-def _resolve_borrower_entity(loan: Loan | None, request: PrequalRequest | None = None) -> str:
-    """Best-effort borrower entity name for the letter. Priority:
-       1. request.borrower_entity   (borrower-typed LLC, or admin override)
-       2. loan.entity_name          (when promoted to a Loan)
-       3. loan.client.name          (legal individual name)
-       4. "Borrower"                (last-resort generic)
-    Borrowers who left the LLC field as TBD will fall through to the
-    individual legal name on the rendered letter."""
+# Common variants of "TBD" the borrower / admin might have typed instead
+# of leaving the LLC field blank. Treated identically to None.
+_TBD_TOKENS = {"tbd", "t.b.d.", "to be determined", "n/a", "na", "none", "-"}
+
+
+def _looks_like_tbd(value: str | None) -> bool:
+    if value is None:
+        return True
+    return value.strip().lower() in _TBD_TOKENS
+
+
+def _resolve_borrower_entity(
+    loan: Loan | None,
+    request: PrequalRequest | None = None,
+    *,
+    fallback_individual_name: str | None = None,
+) -> str:
+    """Resolve the name printed on the letter's "Borrower / Entity Name"
+    row. Priority:
+
+       1. request.borrower_entity     (borrower-typed LLC, or admin
+                                       override). Skipped if it looks
+                                       like a TBD placeholder.
+       2. loan.entity_name            (set when promoted to a Loan)
+       3. individual legal name       (loan.client.name, or the
+                                       fallback supplied by the caller
+                                       when no loan exists yet)
+                                       → suffixed with "and/or
+                                       Assignee LLC (TBD)" so the
+                                       seller's attorney sees the
+                                       guarantor while the borrower
+                                       keeps the right to assign the
+                                       contract to a freshly-formed
+                                       LLC at closing.
+       4. "Borrower" (last-resort generic).
+
+    The TBD-suffix in (3) is the "Negotiation Shield" pattern — by
+    listing the individual *and/or* a future assignee LLC, the borrower
+    doesn't tip the seller on whether the entity exists yet, and they
+    keep the option to drop a new LLC into the contract on closing day
+    without renegotiating."""
     if request is not None:
         be = getattr(request, "borrower_entity", None)
-        if be and str(be).strip():
+        if be and not _looks_like_tbd(be):
             return str(be).strip()
+
     if loan is not None:
         entity = getattr(loan, "entity_name", None)
-        if entity:
+        if entity and not _looks_like_tbd(entity):
             return str(entity).strip()
+
+    individual: str | None = None
+    if loan is not None:
         client = getattr(loan, "client", None)
         if client is not None:
-            name = getattr(client, "name", None)
-            if name:
-                return str(name).strip()
+            individual = getattr(client, "name", None)
+    if not individual:
+        individual = fallback_individual_name
+
+    if individual:
+        return f"{individual.strip()} and/or Assignee LLC (TBD)"
+
     return "Borrower"
 
 
@@ -137,6 +178,7 @@ def render_letter(
     expiration_days: int | None = None,
     quote_number: str | None = None,
     settings_row: AppSettings | None = None,
+    fallback_individual_name: str | None = None,
 ) -> str:
     """Render the letter to PDF and upload to S3. Returns the s3_key.
 
@@ -190,7 +232,9 @@ def render_letter(
     html_str = tpl.render(
         today_date=_format_date(today),
         expiration_date=_format_date(expires),
-        borrower_entity=_resolve_borrower_entity(loan, request),
+        borrower_entity=_resolve_borrower_entity(
+            loan, request, fallback_individual_name=fallback_individual_name
+        ),
         target_property_address=request.target_property_address,
         purchase_price=_format_usd(purchase),
         max_loan_amount=_format_usd(loan_amount),

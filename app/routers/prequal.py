@@ -421,6 +421,18 @@ async def approve_prequal_request(
     # Load the firm-letterhead settings once; render_letter uses
     # officer_name / office_address / signature image from this row.
     settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+    # Pre-fetch the requester's individual legal name so the letter
+    # can fall back to "Jane Doe and/or Assignee LLC (TBD)" when no
+    # entity has been typed in. Pre-loan we have no loan.client to
+    # follow; threading the name explicitly is the cleanest path.
+    requester = (
+        await db.execute(
+            select(User).options(selectinload(User.client)).where(User.id == req.requester_id)
+        )
+    ).scalar_one_or_none()
+    fallback_individual_name = (
+        requester.client.name if requester and requester.client else None
+    )
     try:
         s3_key = prequal_pdf.render_letter(
             req,
@@ -429,6 +441,7 @@ async def approve_prequal_request(
             expiration_days=payload.expiration_days,
             quote_number=req.quote_number,
             settings_row=settings_row,
+            fallback_individual_name=fallback_individual_name,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("prequal_pdf render/upload failed for request %s", req.id)

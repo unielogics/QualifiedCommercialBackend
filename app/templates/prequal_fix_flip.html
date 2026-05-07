@@ -36,7 +36,7 @@
         .footer-grid { display: flex; gap: 14px; align-items: stretch; margin-top: 8px; }
         .signature-block { flex: 1 1 0; padding-right: 4px; }
         .signature-block .salute { margin: 0 0 14px 0; font-size: 9.5pt; }
-        .signature-img { display: block; max-width: 220px; max-height: 60px; margin-bottom: 2px; }
+        .signature-img { display: block; max-width: 264px; max-height: 72px; margin-bottom: 2px; }
         .signature-line { width: 220px; border-bottom: 1px solid #0B1629; margin-bottom: 5px; }
         .signed-on { font-size: 8pt; color: #6B7891; margin-top: 1px; margin-bottom: 4px; }
         .signature-block .name { font-weight: 700; font-size: 10pt; }
@@ -80,11 +80,19 @@
 
     <div class="section-title">TRANSACTION SUMMARY</div>
     <table class="terms-table">
+        {# "Negotiation Shield" — short-term products deliberately
+           omit the LTV/LTP percentage so the seller doesn't see how
+           much room the borrower has. The "Pre-Qualified Purchase
+           Loan Amount" is the initial purchase advance only; any
+           rehab / draw schedule is held off the letter. The
+           "Sufficient Funds Verified" line replaces the LTP % so the
+           seller's attorney sees that down payment is covered without
+           a precise leverage breakdown. #}
         <tr><th>Borrower / Entity Name</th><td>{{ borrower_entity }}</td></tr>
         <tr><th>Subject Property Address</th><td>{{ target_property_address }}</td></tr>
         <tr><th>Estimated Purchase Price</th><td>{{ purchase_price }}</td></tr>
-        <tr><th>Maximum Purchase Loan Amount</th><td>{{ max_loan_amount }}</td></tr>
-        <tr><th>Maximum Loan-to-Purchase (LTP)</th><td>{{ max_ltv }}%</td></tr>
+        <tr><th>Pre-Qualified Purchase Loan Amount</th><td>{{ max_loan_amount }}</td></tr>
+        <tr><th>Down Payment / Cash-to-Close</th><td>Sufficient Funds Verified</td></tr>
         <tr><th>Loan Program</th><td>Commercial Fix &amp; Flip / Rehab Financing</td></tr>
     </table>
 
