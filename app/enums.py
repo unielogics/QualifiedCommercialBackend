@@ -170,6 +170,37 @@ class CalendarEventKind(StrEnum):
     CLOSING = "closing"
 
 
+class CalendarEventStatus(StrEnum):
+    """Lifecycle of a calendar entry. We never delete — operators
+    cancel or mark done so the audit trail (and any AI feedback) lives."""
+    PENDING = "pending"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class CalendarEventSource(StrEnum):
+    """Where the event came from. Drives audience scoping —
+    borrowers see manual + auto, never raw ai (must be approved
+    via AITask flow first)."""
+    MANUAL = "manual"   # operator typed it in the UI
+    AUTO = "auto"       # lifecycle emitter (loan stage, doc due, etc.)
+    AI = "ai"           # LLM-suggested via summarizer next_actions
+
+
+class CalendarExternalRefKind(StrEnum):
+    """Idempotency namespace for auto/ai events. Paired with
+    external_ref_id (string) to give us ON CONFLICT upserts via the
+    partial unique index ix_calendar_events_external."""
+    LOAN_STAGE = "loan_stage"
+    LOAN_CLOSE = "loan_close"
+    CREDIT_PULL = "credit_pull"
+    CREDIT_EXPIRY = "credit_expiry"
+    DOCUMENT_DUE = "document_due"
+    PREQUAL_CLOSE = "prequal_close"
+    AI_ACTION = "ai_action"
+    STALLED_LOAN = "stalled_loan"
+
+
 class BrokerTier(StrEnum):
     BRONZE = "bronze"
     SILVER = "silver"

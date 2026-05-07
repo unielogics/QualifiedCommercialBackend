@@ -23,7 +23,6 @@ from app.enums import (
     AITaskPriority,
     AITaskSource,
     BrokerTier,
-    CalendarEventKind,
     DocStatus,
     LoanStage,
     LoanType,
@@ -264,29 +263,12 @@ async def seed() -> None:
                 )
             )
 
-        # Calendar events for the next 14 days
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-        for i, (loan_idx, kind, title, who, hour, dur) in enumerate(
-            [
-                (0, CalendarEventKind.CALL, "UW review — Highline rent roll", "Marisol Vega", 9, 30),
-                (1, CalendarEventKind.CALL, "UW call — 418 Sycamore", "Marisol Vega", 10, 30),
-                (2, CalendarEventKind.DOC, "Insurance binder due", "Borrower", 14, 60),
-                (3, CalendarEventKind.AI, "AI: refinance window opens", "AI", 16, 15),
-                (4, CalendarEventKind.LOCK, "Rate lock expires", "Lender", 17, 0),
-                (5, CalendarEventKind.CLOSING, "Closing — 78 Coastline", "Title Co.", 12, 90),
-            ]
-        ):
-            db.add(
-                CalendarEvent(
-                    loan_id=loans_objs[loan_idx].id,
-                    kind=kind,
-                    title=title,
-                    who=who,
-                    starts_at=(now + timedelta(days=i, hours=hour - now.hour)).replace(minute=0),
-                    duration_min=dur,
-                    priority=AITaskPriority.HIGH if kind == CalendarEventKind.CLOSING else AITaskPriority.MEDIUM,
-                )
-            )
+        # Calendar events: intentionally not seeded. They are populated
+        # exclusively by the lifecycle emitters (Phase 2) on real
+        # loan/credit/doc/prequal events, by the AI summarizer's
+        # next_actions output (Phase 7), and by manual operator
+        # creation. Seeding fake calendar entries here would mask bugs
+        # in the auto-emission pipeline and confuse demo users.
 
         # A couple of messages on loan #1
         db.add_all(
