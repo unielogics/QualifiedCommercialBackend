@@ -122,6 +122,14 @@ async def assemble_loan_context(
 # ── Section helpers ────────────────────────────────────────────────────────
 
 
+def _enum_str(v: object) -> str:
+    """Defensive — `loan.stage` etc. should be StrEnum but on some
+    code paths SQLAlchemy hands back a plain str. Either works; we
+    just want the underlying value, never crash on a missing
+    `.value` attribute."""
+    return v.value if hasattr(v, "value") else str(v) if v is not None else "—"
+
+
 def _loan_header(loan: Loan) -> str:
     # Scope marker + DB key first so the AI knows exactly what
     # conversation it's in. The bare deal_id (L-XXXX) is what humans
@@ -132,9 +140,9 @@ def _loan_header(loan: Loan) -> str:
         f"Deal ID: {loan.deal_id}",
         f"Property: {loan.address}",
         f"Client ID (UUID): {loan.client_id}",
-        f"  Stage: {loan.stage.value} | Type: {loan.type.value} | Amount: ${float(loan.amount):,.0f}",
+        f"  Stage: {_enum_str(loan.stage)} | Type: {_enum_str(loan.type)} | Amount: ${float(loan.amount or 0):,.0f}",
         f"  LTV: {loan.ltv} | DSCR: {loan.dscr} | Risk: {loan.risk_score}",
-        f"  Deal health: {loan.deal_health.value}",
+        f"  Deal health: {_enum_str(loan.deal_health)}",
     ]
     if loan.status_summary:
         lines.append(f"  Living Loan File: {loan.status_summary}")
