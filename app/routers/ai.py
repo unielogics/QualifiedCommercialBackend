@@ -567,32 +567,17 @@ async def create_chat_thread(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AIChatThreadRead:
-    title = (payload.title or "").strip()[:120]
-    if not title:
-        if payload.loan_id is None:
-            title = "Account questions"
-        else:
-            loan = await db.get(Loan, payload.loan_id)
-            if loan is not None:
-                title = f"{loan.deal_id} — {loan.address[:80]}"
-            else:
-                title = "New conversation"
-    thread = AIChatThread(
-        user_id=user.id,
-        loan_id=payload.loan_id,
-        title=title,
+    """Compatibility shim — older clients POST here to "create a
+    thread". With the canonical (user, loan_id) constraint in place
+    we treat this as find-or-create instead of insert. Returns the
+    existing thread when one already exists; lazy-spawns the
+    canonical row otherwise. The 201 status code is kept for
+    backwards compat even when we return an existing row."""
+    return await find_or_create_chat_thread(
+        AIChatThreadFindOrCreate(loan_id=payload.loan_id),
+        user,
+        db,
     )
-    db.add(thread)
-    await db.commit()
-    # Reload with loan join so the response includes deal_id/address
-    thread = (
-        await db.execute(
-            select(AIChatThread)
-            .options(selectinload(AIChatThread.loan))
-            .where(AIChatThread.id == thread.id)
-        )
-    ).scalar_one()
-    return _thread_read(thread)
 
 
 @router.post("/chat/threads/find-or-create", response_model=AIChatThreadRead)
@@ -621,7 +606,11 @@ async def find_or_create_chat_thread(
     if thread is not None:
         return _thread_read(thread)
 
-    # Lazy-create
+    # Lazy-create. The partial unique idx (alembic 0017 + 0018)
+    # guarantees only one canonical thread per (user, loan_id) at
+    # the DB level. If two parallel requests race here, one INSERT
+    # wins and the other raises IntegrityError — we catch that,
+    # rollback, and re-fetch the now-existing canonical row.
     if payload.loan_id is None:
         title = "Account questions"
     else:
@@ -635,7 +624,15 @@ async def find_or_create_chat_thread(
         title=title,
     )
     db.add(thread)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 — typically IntegrityError on the unique idx
+        log.info("find_or_create race on thread (user=%s loan=%s): %s — refetching", user.id, payload.loan_id, exc)
+        await db.rollback()
+        existing = (await db.execute(stmt)).scalars().first()
+        if existing is not None:
+            return _thread_read(existing)
+        raise
     thread = (
         await db.execute(
             select(AIChatThread)
