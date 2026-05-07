@@ -113,4 +113,13 @@ async def submit_intake(
         ),
     )
 
+    # Doc collection automation: read the firm's checklist for this
+    # loan type and auto-create the Document rows + calendar reminders.
+    # Idempotent — re-submits don't duplicate. Safe even if the
+    # checklist is empty (function logs and returns 0).
+    from app.models.app_settings import AppSettings as _AppSettings  # local import — keeps this module's import surface tight
+    from app.services.loan_intake_automation import kickoff_loan as _kickoff
+    settings_row = (await db.execute(select(_AppSettings).limit(1))).scalar_one_or_none()
+    await _kickoff(db, loan, settings_row)
+
     return SmartIntakeResponse(loan_id=loan.id, deal_id=deal_id)

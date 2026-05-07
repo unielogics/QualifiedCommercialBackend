@@ -57,4 +57,9 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/').read()" || exit 1
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 2"]
+# --workers 1 is intentional: APScheduler runs in-process (see
+# app/services/scheduler.py). Each worker has its own in-memory job
+# store, so --workers 2 would double-fire every cron tick. Until we
+# migrate scheduling to AWS EventBridge (planned when we scale out
+# past one EC2 instance), keep this at 1.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1"]
