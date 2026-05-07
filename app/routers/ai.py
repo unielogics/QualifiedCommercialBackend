@@ -90,28 +90,43 @@ def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
 # operator's "you do not finalize commitments" wording, and the
 # operator never sees the borrower-friendly framing.
 
-CLIENT_SYSTEM_PROMPT = """Role: You are the AI Intelligent Underwriter at Qualified Commercial — a borrower-facing concierge. The borrower talking to you is the named user in the ACCOUNT CONTEXT below; greet them by first name when relevant.
+CLIENT_SYSTEM_PROMPT = """Role: You are the AI Intelligent Underwriter at Qualified Commercial — a borrower-facing concierge.
 
-Your job: answer the borrower's questions about THEIR pipeline, THEIR documents, THEIR credit profile, and THEIR pre-qualifications using the context block. You always have visibility into:
-  - the borrower's name, role, and email
-  - their current credit pull (FICO, tier, expiration)
-  - their loans (deal IDs, address, stage, type, amount)
-  - outstanding document requests
-  - active and approved pre-qualifications
-  - the most recent activity across the account
+You always know exactly who you are talking to. Below this prompt the system appends a SCOPE block:
+  - SCOPE: account-wide conversation
+        → contains User ID, Client ID, the borrower's name + email +
+          role, their FICO / latest credit pull, every loan they own
+          (with loan_id UUIDs), every outstanding document, every
+          active prequal (with prequal_id UUIDs), and recent activity.
+  - SCOPE: loan-level conversation
+        → contains the specific loan_id + deal_id + client_id,
+          plus active instructions, scenarios, HUD draft, market pulse,
+          recent activity, and any operator corrections / feedback for
+          THAT loan.
+
+These IDs (User ID, Client ID, Loan ID, prequal_id, quote_number) are
+authoritative database keys. When the borrower references "my loan"
+or "my prequal" without naming it, infer from the SCOPE block. Don't
+ask the borrower for their user ID — you already have it.
+
+Your job: answer the borrower's questions about THEIR pipeline, THEIR
+documents, THEIR credit profile, and THEIR pre-qualifications using
+the context block.
 
 Style:
 - Conversational but precise. Reference specific deal IDs, doc names, dates.
-- When the borrower asks "what's my credit score?", answer with the number from the context. Don't say "I don't have access" — you do, it's right there.
+- When the borrower asks "what's my credit score?" or "what's my FICO?", answer with the exact number from the context. Don't say "I don't have access" — you do, it's right there in the ACCOUNT CONTEXT block.
 - When the borrower asks "what's next?" or "what's blocking my deal?", scan the loans + outstanding docs + recent activity and give them the single most useful action.
-- If you genuinely don't have a piece of information (e.g. no credit pull on file), say so and tell them where to go (e.g. "Run a soft credit check from your Profile page").
-- Never invent numbers, deal IDs, or facts. If the context doesn't have it, say so.
-- Never share other clients' information.
+- If you genuinely don't have a piece of information (e.g. no credit pull on file because they haven't run one), say so and tell them where to go (e.g. "Run a soft credit check from your Profile page").
+- Never invent numbers, deal IDs, FICO scores, or facts. If the context doesn't have it, say so.
+- Never share other clients' information. Borrowers can only see their own data.
 
 You can suggest actions ("you should upload your tax returns") but you never take real-world actions yourself. Operators handle approvals.
 """
 
 OPERATOR_SYSTEM_PROMPT = """Role: You are the Lead Fintech Orchestrator for Qualified Commercial. Your primary goal is to facilitate the closing of commercial real estate loans while protecting the firm's proprietary lender relationships.
+
+Below this prompt the system appends a SCOPE block telling you whether the conversation is account-wide (no loan/quote in scope — context lists every loan with loan_id UUIDs + every prequal with prequal_id UUIDs) or loan-level (specific loan_id + deal_id + client_id with full HUD / scenario / activity for THAT loan). User ID / Client ID / Loan ID / prequal_id are authoritative database keys — use them when referencing specific records.
 
 The Gateway Rule (Identity Protection):
 - LENDER → BROKER/CLIENT: You are a "One-Way Mirror." When a Lender sends a request, parse the data, extract the required documents/actions, and notify the Broker. NEVER include the Lender's name, email, company, or signature in communications sent to the Broker or Client. Refer to them only as "The Lead Underwriter" or "The Lender."
@@ -158,18 +173,31 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
     record yet, the AI gets the user's identity and role."""
     lines: list[str] = ["=== ACCOUNT CONTEXT ==="]
 
-    # Identity + role — the AI should never have to ask the user who
-    # they are.
+    # Scope marker first — the AI should know it's operating
+    # account-wide (not loan- or quote-scoped) before it reads
+    # anything else.
+    lines.append("SCOPE: account-wide conversation (no loan or quote in scope).")
+    lines.append(
+        "Use the User ID below as the database key for any data you "
+        "look up. Treat everything in this block as authoritative."
+    )
+
+    # Identity + role + DB keys — the AI should never have to ask the
+    # user who they are or guess at their database key.
     role_label = {
         Role.CLIENT: "Borrower (Client)",
         Role.BROKER: "Account Executive (Broker)",
         Role.LOAN_EXEC: "Underwriter / Loan Executive",
         Role.SUPER_ADMIN: "Super Admin",
     }.get(user.role, str(user.role))
+    lines.append("")
+    lines.append(f"User ID (UUID): {user.id}")
     lines.append(f"User: {user.name} <{user.email}>")
     lines.append(f"Role: {role_label}")
 
     client = getattr(user, "client", None)
+    if client is not None:
+        lines.append(f"Client ID (UUID): {client.id}")
 
     # Credit info — borrowers ask "what's my credit score?" all the
     # time. Pull from Client.fico (cached) + the latest credit_pull
@@ -214,7 +242,7 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
             stage = loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage)
             ltype = loan.type.value if hasattr(loan.type, "value") else str(loan.type)
             lines.append(
-                f"  - {loan.deal_id} · {loan.address}"
+                f"  - {loan.deal_id} (loan_id={loan.id}) · {loan.address}"
                 f" · {ltype} · stage={stage} · ${float(loan.amount or 0):,.0f}"
             )
             if loan.status_summary:
@@ -261,8 +289,9 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
             lines.append("Active pre-qualification requests:")
             for r in prequals:
                 lines.append(
-                    f"  - {r.target_property_address} · {r.loan_type} ·"
-                    f" status={r.status} · qnum={r.quote_number or '—'}"
+                    f"  - {r.target_property_address} (prequal_id={r.id})"
+                    f" · {r.loan_type} · status={r.status}"
+                    f" · quote_number={r.quote_number or '—'}"
                 )
 
     # Recent activity — last 8 across the whole account. Powers

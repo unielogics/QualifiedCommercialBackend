@@ -123,8 +123,15 @@ async def assemble_loan_context(
 
 
 def _loan_header(loan: Loan) -> str:
+    # Scope marker + DB key first so the AI knows exactly what
+    # conversation it's in. The bare deal_id (L-XXXX) is what humans
+    # speak; the UUID is the unique key the rest of the platform uses.
     lines = [
-        f"Deal {loan.deal_id} — {loan.address}",
+        f"SCOPE: loan-level conversation",
+        f"Loan ID (UUID): {loan.id}",
+        f"Deal ID: {loan.deal_id}",
+        f"Property: {loan.address}",
+        f"Client ID (UUID): {loan.client_id}",
         f"  Stage: {loan.stage.value} | Type: {loan.type.value} | Amount: ${float(loan.amount):,.0f}",
         f"  LTV: {loan.ltv} | DSCR: {loan.dscr} | Risk: {loan.risk_score}",
         f"  Deal health: {loan.deal_health.value}",
