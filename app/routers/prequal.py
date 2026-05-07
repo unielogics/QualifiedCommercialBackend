@@ -253,55 +253,27 @@ async def _create_request(
 # ── borrower endpoints ──────────────────────────────────────────────────
 
 
-async def _try_auto_approve(
-    db: AsyncSession,
-    req: PrequalRequest,
-    user,
-) -> PrequalRequest:
-    """Phase 5 — run the deterministic auto-approval gate. When all
-    checks pass, immediately apply the approval (renders PDF, flips
-    status, emits calendar). When they don't, the request stays in
-    `pending` and the admin queue picks it up.
-
-    The borrower receives the same response shape either way — they
-    just see a different status and admin_notes."""
-    from app.services.prequal_auto_approve import evaluate
-    from app.models.app_settings import AppSettings
-
-    settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
-    settings = AppSettingsData.model_validate((settings_row.data if settings_row else {}) or {})
-    if not settings.prequal_auto_approval.enabled:
-        return req
-
-    client = user.client if hasattr(user, "client") else None
-    decision = evaluate(req, client, settings)
-
-    if not decision.auto_approve:
-        # Stash the blocker reasons in admin_notes so the operator
-        # sees them on the queue without having to re-derive.
-        req.admin_notes = (
-            "[Auto-approval declined]\n" + "\n".join(f"• {r}" for r in decision.reasons)
-        )
-        await db.flush()
-        return req
-
-    # All checks passed — synthesize the operator approval payload
-    # and run it through the same _apply_approval pipeline a manual
-    # admin click would.
-    auto_notes = "[Auto-approved]\n" + "\n".join(f"• {r}" for r in decision.reasons)
-    payload = PrequalRequestApprove(
-        approved_purchase_price=decision.approved_purchase_price,
-        approved_loan_amount=decision.approved_loan_amount,
-        admin_notes=auto_notes,
-        approved_scenario=decision.scenario,
-        expiration_days=None,  # use service default (90 days)
-        borrower_entity=None,  # don't override what the borrower typed
-    )
-    return await _apply_approval(
-        db, req, payload,
-        actor_user_id=None,
-        actor_label="ai",
-    )
+# NOTE: `_try_auto_approve` used to run the deterministic gate inline
+# during submit, then call `_apply_approval` (PDF render + flush) on
+# the same async session. That coupled submit's response time to a
+# blocking WeasyPrint render and, on the not-auto-approve branch,
+# left the session in an expired-attribute state that crashed the
+# Pydantic response serializer (MissingGreenlet on model_validate).
+#
+# Auto-approval is now a deferred AI evaluation:
+#   1. submit_prequal_* creates the row in `status=pending`,
+#      returns immediately. No PDF, no LTV math, no flush of
+#      derived fields.
+#   2. The scheduler job `job_evaluate_pending_prequals` (every
+#      ~2 min) picks up `pending` requests, runs the deterministic
+#      check + (future) LLM sanity layer. If clean, calls
+#      `_apply_approval` with actor_label='ai'. If not, stamps
+#      admin_notes with the blocker reasons so the admin queue
+#      surfaces them.
+#
+# The borrower's mobile/desktop UI shows "Under review" until the
+# evaluator ticks. Polling /me/prequal-requests catches the status
+# flip when it lands.
 
 
 @router.post(
@@ -324,7 +296,11 @@ async def submit_prequal_for_loan(
     if not _scope_loan_for_borrower(loan, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot submit for this loan")
     req = await _create_request(loan, payload, user, db)
-    req = await _try_auto_approve(db, req, user)
+    # Auto-approval (deterministic gate + future LLM sanity check) runs
+    # asynchronously via the scheduler — see app/services/prequal_evaluator.py
+    # and scheduler.job_evaluate_pending_prequals. Submit returns fast;
+    # the borrower sees `status=pending` and the request flips to
+    # approved (or stays pending with blocker reasons) within ~2 min.
     return _to_read(req)
 
 
@@ -347,7 +323,8 @@ async def submit_prequal_spawn(
     `approved` immediately when the math is clean (FICO floor, LTV
     cap, tier check, loan ceiling all pass)."""
     req = await _create_request(None, payload, user, db)
-    req = await _try_auto_approve(db, req, user)
+    # Auto-approval runs in the background scheduler tick, not inline —
+    # see submit_prequal_for_loan note above.
     return _to_read(req)
 
 

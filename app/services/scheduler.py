@@ -67,6 +67,20 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Phase 5 (deferred) — prequal auto-approval evaluator. Runs every
+    # 2 minutes. Picks up pending requests, runs the deterministic
+    # gate, and either auto-approves (renders the PDF, flips status)
+    # or stamps blockers on admin_notes for operator review.
+    scheduler.add_job(
+        _wrap(job_evaluate_pending_prequals),
+        "interval",
+        minutes=2,
+        id="evaluate_pending_prequals",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Phase 4 — daily doc reminder + escalation pass.
     scheduler.add_job(
         _wrap(job_doc_reminders),
@@ -159,6 +173,15 @@ async def job_summary_dirty_drain() -> None:
     from app.services.activity_log import drain_summary_dirty  # local import to avoid circular
 
     await drain_summary_dirty(limit=20)
+
+
+async def job_evaluate_pending_prequals() -> None:
+    """Phase 5 (deferred) — auto-approval pass over pending prequals.
+    Local import to avoid pulling the prequal router into module
+    init."""
+    from app.services.prequal_evaluator import evaluate_pending_requests
+
+    await evaluate_pending_requests(limit=20)
 
 
 async def job_doc_reminders() -> None:
