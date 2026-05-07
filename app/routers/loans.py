@@ -20,6 +20,7 @@ from app.models.loan import Loan
 from app.models.message import Message
 from app.schemas.activity import ActivityRead
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
+from app.services import calendar_emitter
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.email.parser import inject_deal_id
 from app.services.hud_template import build_hud_draft
@@ -137,6 +138,12 @@ async def update_loan(
             payload=changes,
         )
     )
+    # If close_date moved (and the loan is at CLOSING, or already
+    # has a close milestone on the calendar), the upsert keeps it
+    # in sync. Cheap to call even when close_date didn't change —
+    # ON CONFLICT collapses the no-op write.
+    if "close_date" in changes and loan.stage == LoanStage.CLOSING:
+        await calendar_emitter.emit_for_loan_close(db, loan)
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
@@ -173,6 +180,9 @@ async def transition_stage(
     )
     # TODO: when payload.new_stage == LoanStage.FUNDED, invoke broker points
     # award; deferred per architecture constraint #8.
+    # Emit / cancel the CLOSING milestone on the calendar. Idempotent:
+    # rerunning the same PATCH leaves the existing event in place.
+    await calendar_emitter.emit_for_loan_stage(db, loan, old, payload.new_stage)
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)

@@ -20,6 +20,7 @@ from app.schemas.document import (
     DocumentUploadInit,
     DocumentUploadInitResponse,
 )
+from app.services import calendar_emitter
 from app.services.ai.vector_store import log_event as vector_log
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -89,6 +90,11 @@ async def request_document(
     )
     await db.flush()
     await db.refresh(doc)
+    # Emit a calendar reminder so the borrower / operator sees the
+    # doc on their agenda. Default 7-day cadence; Phase 4 swaps the
+    # constant for the per-loan-type checklist's first_reminder_days.
+    await calendar_emitter.emit_for_document_request(db, doc)
+    await db.flush()
     return DocumentRead.model_validate(doc)
 
 

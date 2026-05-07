@@ -18,6 +18,7 @@ from app.deps import CurrentUser
 from app.enums import CreditPullStatus, Role
 from app.models.client import Client
 from app.models.credit_pull import CreditPull
+from app.services import calendar_emitter
 from app.schemas.credit import CreditPullRead, CreditPullRequest
 from app.services import isoftpull_client
 from app.services import isoftpull_report_parser
@@ -271,6 +272,10 @@ async def initiate_pull(
                 user.client.fico = effective_fico
             await db.flush()
             await db.refresh(pull)
+            # Emit the credit-expiry milestone so operators get a
+            # calendar nudge before the soft pull stales (typically
+            # 90 days; controlled by SOFT_PULL_VALIDITY_DAYS).
+            await calendar_emitter.emit_for_credit_pull(db, pull)
         except Exception as exc:  # noqa: BLE001
             log.exception("Failed to persist credit pull result")
             pull.status = CreditPullStatus.REVOKED

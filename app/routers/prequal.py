@@ -48,7 +48,7 @@ from app.schemas.prequal import (
     PrequalRequestStartCreate,
     PrequalSellerOutcome,
 )
-from app.services import prequal_pdf
+from app.services import calendar_emitter, prequal_pdf
 
 router = APIRouter(tags=["prequal"])
 log = logging.getLogger(__name__)
@@ -467,6 +467,11 @@ async def approve_prequal_request(
 
     req.pdf_s3_key = s3_key
     await db.flush()
+
+    # Emit / refresh the prequal closing milestone on the calendar.
+    # Idempotent — re-approval just updates the existing row's
+    # title / starts_at if expected_closing_date moved.
+    await calendar_emitter.emit_for_prequal_approval(db, req)
 
     # Activity log lives on the loan (NOT NULL FK). Skip when no loan
     # is attached yet — the prequal_requests row is the audit until the
