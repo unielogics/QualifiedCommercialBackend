@@ -28,6 +28,7 @@ from app.db import Base
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.loan import Loan
     from app.models.user import User
 
 
@@ -43,11 +44,23 @@ class AIChatThread(TimestampMixin, Base):
         nullable=False,
         index=True,
     )
+    # Loan-scoped thread when set; account-wide ("Account questions")
+    # when null. Partial unique idx on (user_id, loan_id) WHERE
+    # loan_id IS NOT NULL gives us one canonical thread per
+    # (user, loan) pair while leaving account threads unconstrained.
+    loan_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("loans.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="New conversation")
     last_message_preview: Mapped[str | None] = mapped_column(String(240), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    loan: Mapped["Loan | None"] = relationship(foreign_keys=[loan_id])
 
     messages: Mapped[list["AIChatMessage"]] = relationship(
         "AIChatMessage",

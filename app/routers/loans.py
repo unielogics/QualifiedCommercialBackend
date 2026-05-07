@@ -20,6 +20,7 @@ from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
 from app.schemas.activity import ActivityRead
+from app.schemas.document import RequiredDocumentRead
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
@@ -71,6 +72,92 @@ async def get_loan(loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     return LoanRead.model_validate(row)
+
+
+@router.get("/{loan_id}/required-documents", response_model=list[RequiredDocumentRead])
+async def list_required_documents(
+    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[RequiredDocumentRead]:
+    """Returns the loan's checklist (per `AppSettings.checklists` for
+    its product, falling back to defaults) joined against existing
+    Document rows so the upload modal can render which slots are
+    filled, in flight, or empty. Always appends an "Other / not in
+    checklist" sentinel at the end so the borrower has an escape
+    hatch."""
+    from datetime import date as _date_type
+
+    from app.models.app_settings import AppSettings as _AppSettings
+    from app.models.document import Document as _Document
+    from app.enums import DocStatus as _DocStatus
+    from app.services.loan_intake_automation import _checklist_for, _coerce_settings
+
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    settings_row = (
+        await db.execute(select(_AppSettings).limit(1))
+    ).scalar_one_or_none()
+    settings = _coerce_settings(settings_row)
+    checklist = _checklist_for(settings, str(loan.type))
+
+    docs = (
+        await db.execute(
+            select(_Document).where(_Document.loan_id == loan_id)
+        )
+    ).scalars().all()
+    by_key: dict[str, _Document] = {}
+    for d in docs:
+        if d.checklist_key:
+            existing = by_key.get(d.checklist_key)
+            # Prefer the one that's furthest along (verified > received > pending > requested)
+            order = {
+                _DocStatus.VERIFIED: 5,
+                _DocStatus.RECEIVED: 4,
+                _DocStatus.FLAGGED: 3,
+                _DocStatus.PENDING: 2,
+                _DocStatus.REQUESTED: 1,
+            }
+            if existing is None or order.get(d.status, 0) > order.get(existing.status, 0):
+                by_key[d.checklist_key] = d
+
+    today = _date_type.today()
+    out: list[RequiredDocumentRead] = []
+    for item in checklist.docs:
+        cur = by_key.get(item.name)
+        days_since = None
+        if cur and cur.requested_on:
+            days_since = (today - cur.requested_on).days
+        out.append(
+            RequiredDocumentRead(
+                checklist_key=item.name,
+                label=item.name,
+                required=bool(item.required),
+                auto_request=bool(item.auto_request),
+                is_other=False,
+                current_document_id=cur.id if cur else None,
+                current_status=cur.status if cur else None,
+                received_on=cur.received_on if cur else None,
+                verified_at=cur.verified_at if cur else None,
+                days_since_requested=days_since,
+            )
+        )
+    out.append(
+        RequiredDocumentRead(
+            checklist_key=None,
+            label="Other — not in checklist",
+            required=False,
+            auto_request=False,
+            is_other=True,
+            current_document_id=None,
+            current_status=None,
+            received_on=None,
+            verified_at=None,
+            days_since_requested=None,
+        )
+    )
+    return out
 
 
 @router.get("/{loan_id}/activity", response_model=list[ActivityRead])

@@ -447,6 +447,10 @@ class AIChatThreadRead(BaseModel):
     last_message_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # Loan-scoped thread when set; account-wide when null.
+    loan_id: UUID | None = None
+    loan_deal_id: str | None = None
+    loan_address: str | None = None
 
     class Config:
         from_attributes = True
@@ -468,6 +472,15 @@ class AIChatThreadDetail(AIChatThreadRead):
 
 class AIChatThreadCreate(BaseModel):
     title: str | None = None
+    loan_id: UUID | None = None
+
+
+class AIChatThreadFindOrCreate(BaseModel):
+    """Single endpoint that returns the (user, loan_id) thread if it
+    exists, otherwise spawns it. `loan_id=None` resolves to the
+    account-wide thread."""
+
+    loan_id: UUID | None = None
 
 
 class AIChatThreadRename(BaseModel):
@@ -493,13 +506,33 @@ def _preview(text: str, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def _thread_read(thread: AIChatThread) -> AIChatThreadRead:
+    """Serialize with the lightweight loan join. Caller must have
+    eager-loaded `thread.loan` for this to avoid a lazy-load."""
+    base = AIChatThreadRead(
+        id=thread.id,
+        title=thread.title,
+        last_message_preview=thread.last_message_preview,
+        last_message_at=thread.last_message_at,
+        created_at=thread.created_at,
+        updated_at=thread.updated_at,
+        loan_id=thread.loan_id,
+        loan_deal_id=thread.loan.deal_id if thread.loan_id and thread.loan else None,
+        loan_address=thread.loan.address if thread.loan_id and thread.loan else None,
+    )
+    return base
+
+
 async def _load_thread_for_user(
     db: AsyncSession, thread_id: UUID, user: User
 ) -> AIChatThread:
     thread = (
         await db.execute(
             select(AIChatThread)
-            .options(selectinload(AIChatThread.messages))
+            .options(
+                selectinload(AIChatThread.messages),
+                selectinload(AIChatThread.loan),
+            )
             .where(AIChatThread.id == thread_id)
         )
     ).scalar_one_or_none()
@@ -517,6 +550,7 @@ async def list_chat_threads(
     rows = (
         await db.execute(
             select(AIChatThread)
+            .options(selectinload(AIChatThread.loan))
             .where(AIChatThread.user_id == user.id)
             .order_by(
                 AIChatThread.last_message_at.desc().nullslast(),
@@ -524,7 +558,7 @@ async def list_chat_threads(
             )
         )
     ).scalars().all()
-    return [AIChatThreadRead.model_validate(t) for t in rows]
+    return [_thread_read(t) for t in rows]
 
 
 @router.post("/chat/threads", response_model=AIChatThreadRead, status_code=status.HTTP_201_CREATED)
@@ -533,14 +567,83 @@ async def create_chat_thread(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AIChatThreadRead:
+    title = (payload.title or "").strip()[:120]
+    if not title:
+        if payload.loan_id is None:
+            title = "Account questions"
+        else:
+            loan = await db.get(Loan, payload.loan_id)
+            if loan is not None:
+                title = f"{loan.deal_id} — {loan.address[:80]}"
+            else:
+                title = "New conversation"
     thread = AIChatThread(
         user_id=user.id,
-        title=(payload.title or "New conversation")[:120],
+        loan_id=payload.loan_id,
+        title=title,
     )
     db.add(thread)
     await db.commit()
-    await db.refresh(thread)
-    return AIChatThreadRead.model_validate(thread)
+    # Reload with loan join so the response includes deal_id/address
+    thread = (
+        await db.execute(
+            select(AIChatThread)
+            .options(selectinload(AIChatThread.loan))
+            .where(AIChatThread.id == thread.id)
+        )
+    ).scalar_one()
+    return _thread_read(thread)
+
+
+@router.post("/chat/threads/find-or-create", response_model=AIChatThreadRead)
+async def find_or_create_chat_thread(
+    payload: AIChatThreadFindOrCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatThreadRead:
+    """Returns the canonical thread for (user, loan_id). Lazy-creates
+    on first ask. `loan_id=None` resolves to the user's account-wide
+    thread; `loan_id` set resolves to the per-loan thread (one
+    canonical row, enforced by the partial unique index)."""
+    stmt = (
+        select(AIChatThread)
+        .options(selectinload(AIChatThread.loan))
+        .where(AIChatThread.user_id == user.id)
+    )
+    if payload.loan_id is None:
+        stmt = stmt.where(AIChatThread.loan_id.is_(None))
+        # Pick the most recently used account thread if multiple exist.
+        stmt = stmt.order_by(AIChatThread.last_message_at.desc().nullslast(), AIChatThread.created_at.desc())
+    else:
+        stmt = stmt.where(AIChatThread.loan_id == payload.loan_id)
+    thread = (await db.execute(stmt)).scalars().first()
+
+    if thread is not None:
+        return _thread_read(thread)
+
+    # Lazy-create
+    if payload.loan_id is None:
+        title = "Account questions"
+    else:
+        loan = await db.get(Loan, payload.loan_id)
+        if loan is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+        title = f"{loan.deal_id} — {loan.address[:80]}"
+    thread = AIChatThread(
+        user_id=user.id,
+        loan_id=payload.loan_id,
+        title=title,
+    )
+    db.add(thread)
+    await db.commit()
+    thread = (
+        await db.execute(
+            select(AIChatThread)
+            .options(selectinload(AIChatThread.loan))
+            .where(AIChatThread.id == thread.id)
+        )
+    ).scalar_one()
+    return _thread_read(thread)
 
 
 @router.get("/chat/threads/{thread_id}", response_model=AIChatThreadDetail)
@@ -550,13 +653,9 @@ async def get_chat_thread(
     db: AsyncSession = Depends(get_db),
 ) -> AIChatThreadDetail:
     thread = await _load_thread_for_user(db, thread_id, user)
+    base = _thread_read(thread)
     return AIChatThreadDetail(
-        id=thread.id,
-        title=thread.title,
-        last_message_preview=thread.last_message_preview,
-        last_message_at=thread.last_message_at,
-        created_at=thread.created_at,
-        updated_at=thread.updated_at,
+        **base.model_dump(),
         messages=[AIChatMessageRead.model_validate(m) for m in thread.messages],
     )
 
@@ -572,7 +671,7 @@ async def rename_chat_thread(
     thread.title = payload.title.strip()[:120]
     await db.commit()
     await db.refresh(thread)
-    return AIChatThreadRead.model_validate(thread)
+    return _thread_read(thread)
 
 
 @router.delete("/chat/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -624,10 +723,14 @@ async def append_thread_message(
         thread.title = _preview(payload.body, limit=60)
     await db.flush()
 
-    # 2. Build context (account- or loan-scoped).
+    # 2. Build context (account- or loan-scoped). Source-of-truth
+    # is `thread.loan_id` — the request payload's `loan_id` is
+    # ignored when the thread is loan-scoped (mismatched loan_ids
+    # would be a frontend bug, not user intent).
+    effective_loan_id = thread.loan_id or payload.loan_id
     context_block: str | None = None
-    if payload.loan_id is not None:
-        loan = await db.get(Loan, payload.loan_id)
+    if effective_loan_id is not None:
+        loan = await db.get(Loan, effective_loan_id)
         if loan is not None:
             audience: Audience = (
                 "client" if user.role == Role.CLIENT
@@ -703,6 +806,6 @@ async def append_thread_message(
     return AIChatSendResponse(
         user_message=AIChatMessageRead.model_validate(user_msg),
         assistant_message=AIChatMessageRead.model_validate(assistant_msg),
-        thread=AIChatThreadRead.model_validate(thread),
+        thread=_thread_read(thread),
         used_stub=used_stub,
     )

@@ -25,6 +25,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db import SessionLocal
 from app.enums import (
@@ -182,6 +183,7 @@ async def kickoff_loan(
         doc = Document(
             loan_id=loan.id,
             name=item.name,
+            checklist_key=item.name,
             status=DocStatus.REQUESTED,
             requested_on=today,
         )
@@ -256,8 +258,18 @@ async def evaluate_doc_reminders() -> dict[str, int]:
             doc_id_str = str(doc.id)
 
             # Use the loan-type's specific cadence when available,
-            # otherwise the global default.
-            loan = await db.get(Loan, doc.loan_id) if doc.loan_id else None
+            # otherwise the global default. Eager-load `client` so
+            # the per-doc emitter can post into the borrower's
+            # AIChatThread without a lazy-load.
+            loan = None
+            if doc.loan_id:
+                loan = (
+                    await db.execute(
+                        select(Loan)
+                        .options(selectinload(Loan.client))
+                        .where(Loan.id == doc.loan_id)
+                    )
+                ).scalar_one_or_none()
             checklist = (
                 _checklist_for(settings, str(loan.type)) if loan else None
             )
@@ -272,7 +284,7 @@ async def evaluate_doc_reminders() -> dict[str, int]:
                 _emit_second_reminder(db, doc, age)
                 counts["second_emitted"] += 1
             elif age >= first and doc_id_str not in already_first:
-                _emit_first_reminder(db, doc, age)
+                await _emit_first_reminder(db, doc, age, loan)
                 counts["first_emitted"] += 1
 
         await db.commit()
@@ -308,8 +320,22 @@ def _activity_payload_for_doc(doc: Document, age: int) -> dict[str, Any]:
     }
 
 
-def _emit_first_reminder(db: AsyncSession, doc: Document, age: int) -> None:
-    """Tier 1 — friendly nudge in the borrower's loan chat."""
+async def _emit_first_reminder(
+    db: AsyncSession,
+    doc: Document,
+    age: int,
+    loan: Loan | None,
+) -> None:
+    """Tier 1 — friendly nudge in the borrower's loan chat thread.
+
+    Lands in TWO places for v1:
+      - LoanChatMessage on the deal workspace (operator-facing,
+        legacy surface), so brokers viewing the deal still see the
+        nudge.
+      - AIChatMessage on the borrower's per-loan thread (Phase 8
+        + 0017 surface) so the borrower sees it in their Messages
+        tab on mobile / desktop.
+    """
     db.add(
         Activity(
             loan_id=doc.loan_id,
@@ -320,19 +346,33 @@ def _emit_first_reminder(db: AsyncSession, doc: Document, age: int) -> None:
             payload=_activity_payload_for_doc(doc, age),
         )
     )
+    nudge_body = (
+        f"Quick nudge — we still need **{doc.name}** to keep your file moving. "
+        f"You can upload it from the Vault tab whenever it's ready."
+    )
     if doc.loan_id:
+        # Legacy: deal-workspace chat (operator-visible)
         db.add(
             LoanChatMessage(
                 loan_id=doc.loan_id,
                 from_role=DealChatRole.AI,
                 from_user_id=None,
-                body=(
-                    f"Quick nudge — we still need **{doc.name}** to keep your file moving. "
-                    f"You can upload it from the Vault tab whenever it's ready."
-                ),
+                body=nudge_body,
                 client_visible=True,
             )
         )
+    # New: borrower's per-loan AI chat thread.
+    if loan is not None and loan.client is not None and loan.client.user_id is not None:
+        try:
+            from app.services.ai_messaging import post_ai_message  # local to avoid cycle
+            await post_ai_message(
+                db,
+                user_id=loan.client.user_id,
+                loan_id=loan.id,
+                body=nudge_body,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("doc reminder: post_ai_message failed for doc=%s", doc.id, exc_info=True)
 
 
 def _emit_second_reminder(db: AsyncSession, doc: Document, age: int) -> None:

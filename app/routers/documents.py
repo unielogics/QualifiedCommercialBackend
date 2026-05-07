@@ -17,6 +17,7 @@ from app.models.loan import Loan
 from app.schemas.document import (
     DocumentRead,
     DocumentRequest,
+    DocumentUploadComplete,
     DocumentUploadInit,
     DocumentUploadInitResponse,
 )
@@ -107,8 +108,19 @@ async def upload_init(
 ) -> DocumentUploadInitResponse:
     """Returns a presigned S3 URL the client uses to PUT the file directly.
 
-    When AWS keys are not configured (dev mode), returns the s3_key but a None
-    upload_url so the frontend can show a 'configure S3' message.
+    Three categorization paths (mutually exclusive in payload):
+      - `fulfill_document_id`: fill an existing REQUESTED row with
+        the new file. Status stays REQUESTED here; flips to RECEIVED
+        on `/upload-complete`.
+      - `checklist_key`: create a fresh row linked to that
+        checklist item (REQUESTED row didn't exist — legacy loan).
+      - `is_other=True`: off-checklist upload; the vision scanner
+        may auto-link if it recognizes a known type.
+
+    Legacy callers that send only `category` still work — the row
+    is created uncategorized (`checklist_key=None, is_other=False`)
+    and operators can re-categorize later. The vision scanner skips
+    these uncategorized legacy uploads.
     """
     settings = get_settings()
     loan = await db.get(Loan, payload.loan_id)
@@ -116,14 +128,65 @@ async def upload_init(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
 
     s3_key = f"loans/{loan.deal_id}/{uuid4()}-{payload.name}"
-    doc = Document(
-        loan_id=loan.id,
-        name=payload.name,
-        category=payload.category,
-        s3_key=s3_key,
-        status=DocStatus.PENDING,
-    )
-    db.add(doc)
+
+    doc: Document
+    if payload.fulfill_document_id is not None:
+        doc = await db.get(Document, payload.fulfill_document_id)
+        if doc is None or doc.loan_id != loan.id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "fulfill_document_id doesn't belong to this loan",
+            )
+        if doc.status not in (DocStatus.REQUESTED, DocStatus.PENDING):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Document is already in status={doc.status} — cannot replace via upload-init.",
+            )
+        # Repoint to the new file. Status stays REQUESTED until the
+        # client posts /upload-complete (we treat partial uploads as
+        # not-yet-fulfilled).
+        doc.s3_key = s3_key
+        if payload.name and payload.name != doc.name:
+            # Borrower's chosen filename — keep the checklist label
+            # but stash the user-visible filename under the row.
+            doc.name = payload.name
+        if payload.category and not doc.category:
+            doc.category = payload.category
+    elif payload.checklist_key is not None:
+        doc = Document(
+            loan_id=loan.id,
+            name=payload.name,
+            category=payload.category,
+            checklist_key=payload.checklist_key,
+            is_other=False,
+            s3_key=s3_key,
+            status=DocStatus.PENDING,
+        )
+        db.add(doc)
+    elif payload.is_other:
+        doc = Document(
+            loan_id=loan.id,
+            name=payload.name,
+            category=payload.category,
+            checklist_key=None,
+            is_other=True,
+            s3_key=s3_key,
+            status=DocStatus.PENDING,
+        )
+        db.add(doc)
+    else:
+        # Legacy path — keeps existing callers (e.g. mobile vault
+        # before this update lands) working. Doc gets no checklist
+        # link; vision scanner will skip it.
+        doc = Document(
+            loan_id=loan.id,
+            name=payload.name,
+            category=payload.category,
+            s3_key=s3_key,
+            status=DocStatus.PENDING,
+        )
+        db.add(doc)
+
     await db.flush()
     await db.refresh(doc)
 
@@ -149,3 +212,60 @@ async def upload_init(
         )
 
     return DocumentUploadInitResponse(document_id=doc.id, upload_url=upload_url, s3_key=s3_key)
+
+
+@router.post("/upload-complete", response_model=DocumentRead)
+async def upload_complete(
+    payload: DocumentUploadComplete,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRead:
+    """Posted by the client after the S3 PUT succeeds. Flips the doc
+    to RECEIVED + queues a vision scan. The scheduler's
+    `job_document_scan_drain` picks it up within ~60-120s, writes
+    notes back, posts an AI reaction to the loan's chat thread.
+
+    Idempotent — re-calling on an already-received doc is a no-op
+    (won't re-queue the scan)."""
+    doc = await db.get(Document, payload.document_id)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    loan = await db.get(Loan, doc.loan_id)
+    if loan is None or not _scope_loan(user, loan):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    already_received = doc.status in (DocStatus.RECEIVED, DocStatus.VERIFIED)
+    doc.status = DocStatus.RECEIVED
+    if doc.received_on is None:
+        doc.received_on = date.today()
+    # Only flag for scan if we haven't already (and we have an s3 key
+    # to actually fetch). Skip uncategorized legacy uploads — the
+    # scanner needs at least one of checklist_key / is_other to know
+    # what it's checking against.
+    if (
+        not already_received
+        and doc.s3_key
+        and (doc.checklist_key is not None or doc.is_other)
+    ):
+        doc.scan_dirty = True
+        doc.ai_scan_status = "queued"
+
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="document.received",
+            summary=f"Received: {doc.name}",
+            payload={
+                "doc_id": str(doc.id),
+                "checklist_key": doc.checklist_key,
+                "is_other": doc.is_other,
+            },
+        )
+    )
+    await mark_loan_dirty(db, loan.id)
+    await db.flush()
+    await db.refresh(doc)
+    return DocumentRead.model_validate(doc)

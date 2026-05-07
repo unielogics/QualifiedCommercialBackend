@@ -130,6 +130,20 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Doc-vision scan drain (alembic 0017). Every 2 min picks up
+    # Documents flagged scan_dirty=True (set by upload-complete) and
+    # runs them through Claude vision. Hard-capped at 8 docs per
+    # tick — bounds peak Anthropic spend during a mass upload.
+    scheduler.add_job(
+        _wrap(job_document_scan_drain),
+        "interval",
+        minutes=2,
+        id="document_scan_drain",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -252,3 +266,43 @@ async def job_pipeline_scan() -> None:
     from app.services.ai.pipeline_digest import scan_pipeline
 
     await scan_pipeline()
+
+
+async def job_document_scan_drain() -> None:
+    """Vision-scan freshly-uploaded Documents flagged
+    `scan_dirty=True`. Hard-cap 8 per tick — bounds Anthropic spend
+    during a mass upload. Per-doc failure is isolated; one bad
+    file doesn't poison the rest of the batch.
+
+    Cost discipline: empty ticks cost nothing (no docs flagged →
+    no Anthropic calls). Realistic steady state at borrower-side
+    volume is single-digit scans per day.
+    """
+    import asyncio
+
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models.document import Document
+    from app.services.document_scanner import scan_document
+
+    async with SessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Document.id)
+                .where(Document.scan_dirty.is_(True))
+                .order_by(Document.created_at.asc())
+                .limit(8)
+            )
+        ).scalars().all()
+        if not rows:
+            return
+        log.info("document_scan_drain: scanning %d docs", len(rows))
+        for doc_id in rows:
+            try:
+                await scan_document(db, doc_id)
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("document_scan_drain: scan failed for %s", doc_id)
+                await db.rollback()
+            await asyncio.sleep(0)
