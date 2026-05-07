@@ -56,7 +56,35 @@ log = logging.getLogger(__name__)
 # ── helpers ─────────────────────────────────────────────────────────────
 
 # Per-product LTV ceilings the underwriter is bound by on approve.
-LTV_CAPS: dict[str, float] = {"dscr": 0.80, "bridge": 0.85}
+# Note: DSCR refi runs tighter than purchase (5pt haircut) — typical
+# secondary-market spread for cash-out / rate-and-term seasoning risk.
+# Fix & Flip uses LTP (loan-to-purchase) here, not LTC + ARV — the prequal
+# letter is for the OFFER stage so we deliberately don't expose ARV /
+# rehab leverage that would tip the seller.
+LTV_CAPS: dict[str, float] = {
+    "dscr_purchase": 0.80,
+    "dscr_refi": 0.75,
+    "fix_flip": 0.85,
+    "bridge": 0.85,
+}
+
+
+def _loan_type_to_enum(prequal_type: str) -> LoanType:
+    """Map prequal sub-typed loan_type → canonical LoanType enum used by
+    the loans table when the prequal converts on offer-accepted."""
+    if prequal_type in ("dscr_purchase", "dscr_refi"):
+        return LoanType.DSCR
+    if prequal_type == "fix_flip":
+        return LoanType.FIX_AND_FLIP
+    return LoanType.BRIDGE
+
+
+def _loan_purpose_for(prequal_type: str) -> LoanPurpose:
+    """DSCR Refinance → RATE_TERM_REFI on the spawned loan; everything
+    else is a PURCHASE."""
+    if prequal_type == "dscr_refi":
+        return LoanPurpose.RATE_TERM_REFI
+    return LoanPurpose.PURCHASE
 
 
 def _gen_deal_id() -> str:
@@ -103,9 +131,8 @@ async def _spawn_loan_from_approved_request(
     loan_amount = float(request.approved_loan_amount or request.requested_loan_amount)
     scenario = request.approved_scenario or {}
 
-    loan_type_enum = (
-        LoanType.DSCR if request.loan_type == "dscr" else LoanType.BRIDGE
-    )
+    loan_type_enum = _loan_type_to_enum(request.loan_type)
+    loan_purpose = _loan_purpose_for(request.loan_type)
 
     # Look up the requesting user → client.
     user = (
@@ -126,7 +153,7 @@ async def _spawn_loan_from_approved_request(
         address=request.target_property_address,
         property_type=PropertyType.SFR,
         type=loan_type_enum,
-        purpose=LoanPurpose.PURCHASE,
+        purpose=loan_purpose,
         # Stage starts at PREQUALIFIED — this IS the prequalified loan
         # entering the pipeline. Operator moves it forward from there.
         stage=LoanStage.PREQUALIFIED,

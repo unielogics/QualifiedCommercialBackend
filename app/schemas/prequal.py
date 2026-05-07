@@ -24,7 +24,9 @@ class PrequalRequestCreate(BaseModel):
     target_property_address: str = Field(min_length=3, max_length=500)
     purchase_price: float = Field(gt=0)
     requested_loan_amount: float = Field(gt=0)
-    loan_type: Literal["dscr", "bridge"]
+    # 4 loan types — DSCR Purchase, DSCR Refinance, Fix & Flip, Bridge.
+    # Each has a distinct LTV cap on approve. See router LTV_CAPS.
+    loan_type: Literal["dscr_purchase", "dscr_refi", "fix_flip", "bridge"]
     expected_closing_date: date | None = None
     borrower_notes: str | None = Field(default=None, max_length=2000)
     # LLC / entity name. None = "TBD" (borrower hasn't formed the LLC

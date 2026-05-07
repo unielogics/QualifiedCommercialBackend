@@ -126,9 +126,16 @@ def render_letter(
     valid_for = expiration_days if expiration_days and expiration_days > 0 else DEFAULT_LETTER_VALIDITY_DAYS
     expires = today + timedelta(days=valid_for)
 
-    template_name = (
-        "prequal_dscr.html" if request.loan_type == "dscr" else "prequal_bridge.html"
-    )
+    # Template selection — DSCR variants share one template (refi just
+    # flips the title via is_refi); F&F uses its own; Bridge uses the
+    # short-term template.
+    if request.loan_type in ("dscr_purchase", "dscr_refi"):
+        template_name = "prequal_dscr.html"
+    elif request.loan_type == "fix_flip":
+        template_name = "prequal_fix_flip.html"
+    else:
+        template_name = "prequal_bridge.html"
+
     tpl = _jinja.get_template(template_name)
     html_str = tpl.render(
         today_date=_format_date(today),
@@ -139,6 +146,8 @@ def render_letter(
         max_loan_amount=_format_usd(loan_amount),
         max_ltv=ltv_pct,
         quote_number=quote_number or request.quote_number,
+        # DSCR template branches title/intro on this. None elsewhere.
+        is_refi=(request.loan_type == "dscr_refi"),
         # admin_notes intentionally NOT passed — borrower sees them in
         # the dashboard, never on the printable letter.
     )
