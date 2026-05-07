@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from typing import Any
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -195,6 +196,13 @@ async def _create_request(
     """Create a PrequalRequest. loan_id is OPTIONAL — None when this is a
     standalone request that hasn't been converted to a loan yet (which
     is the new default; loan_id is only set after offer_accepted)."""
+    # F&F SOW handling: list-of-objects → JSONB. Sum into
+    # total_construction so we don't have to re-compute on every read.
+    sow_dump: list[dict[str, Any]] | None = None
+    total_construction: float | None = None
+    if payload.sow_items:
+        sow_dump = [item.model_dump() for item in payload.sow_items]
+        total_construction = sum(float(item.total_usd) for item in payload.sow_items)
     req = PrequalRequest(
         loan_id=loan.id if loan is not None else None,
         requester_id=user.id,
@@ -205,6 +213,10 @@ async def _create_request(
         expected_closing_date=payload.expected_closing_date,
         borrower_notes=payload.borrower_notes,
         borrower_entity=payload.borrower_entity,
+        # F&F-specific (alembic 0014). Null on non-F&F products.
+        arv_estimate=payload.arv_estimate,
+        sow_items=sow_dump,
+        total_construction=total_construction,
         status="pending",
     )
     db.add(req)
@@ -455,6 +467,24 @@ async def _apply_approval(
     req.approved_loan_amount = payload.approved_loan_amount
     req.admin_notes = payload.admin_notes
     req.approved_scenario = payload.approved_scenario
+    # F&F-specific approved overrides. Admin can rewrite ARV and the
+    # SOW line items independently of what the borrower submitted —
+    # see app/routers/prequal_admin / desktop review modal Phase 7
+    # follow-up.
+    if payload.approved_arv is not None:
+        req.approved_arv = payload.approved_arv
+    if payload.approved_sow_items is not None:
+        req.sow_items = [item.model_dump() for item in payload.approved_sow_items]
+        # Recompute total_construction from the approved list so the
+        # invariant (sum == stored total) holds.
+        req.total_construction = sum(
+            float(item.total_usd) for item in payload.approved_sow_items
+        )
+    if payload.approved_total_construction is not None:
+        # Explicit override beats the SOW-sum derivation. Admin can
+        # bake a contingency into the construction total without
+        # touching the line items.
+        req.approved_total_construction = payload.approved_total_construction
     # Admin may have corrected the LLC / entity name (e.g. borrower
     # submitted "TBD" originally and now has it). Override only when the
     # admin actually supplied a value — None means "leave whatever the

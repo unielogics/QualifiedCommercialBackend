@@ -59,6 +59,21 @@ class PrequalRequest(TimestampMixin, Base):
     # legal name in the rendered PDF).
     borrower_entity: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # F&F / Ground-Up specific (alembic 0014). For F&F: purchase_price
+    # is BRV (what the borrower is paying for the as-is property),
+    # arv_estimate is the projected after-repair value, and sow_items
+    # is the borrower's scope-of-work breakdown
+    # ([{category, description, total_usd}, ...]). total_construction
+    # is the sum of sow_items.total_usd, stored for query speed +
+    # admin override. The PDF intentionally does NOT surface any of
+    # these — same Negotiation Shield rationale as the existing F&F
+    # template.
+    arv_estimate: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    approved_arv: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    sow_items: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    total_construction: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    approved_total_construction: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+
     # What the underwriter authorized (defaults to the borrower's request if
     # the admin doesn't override)
     approved_purchase_price: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)

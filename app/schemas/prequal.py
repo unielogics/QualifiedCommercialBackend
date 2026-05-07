@@ -20,8 +20,25 @@ from pydantic import BaseModel, Field
 from app.schemas.common import ORMModel
 
 
+# ── Fix & Flip Scope-of-Work line ─────────────────────────────────────
+#
+# Each row is a free-form category + brief description + total $. The
+# UI guides the borrower / admin through adding rows; the sum is what
+# we validate against ARV-based caps. Stored as JSONB on the prequal
+# row (see app/models/prequal_request.py.sow_items).
+class SowLineItem(BaseModel):
+    category: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=500)
+    total_usd: float = Field(ge=0)
+
+
 class PrequalRequestCreate(BaseModel):
     target_property_address: str = Field(min_length=3, max_length=500)
+    # For F&F this is the BRV (Before Repair Value — what the borrower
+    # is paying for the as-is property). For DSCR it's the purchase
+    # price (or property value on refi). For Bridge it's the as-is
+    # property value. The model field stays `purchase_price` for
+    # back-compat across all four products.
     purchase_price: float = Field(gt=0)
     requested_loan_amount: float = Field(gt=0)
     # 4 loan types — DSCR Purchase, DSCR Refinance, Fix & Flip, Bridge.
@@ -33,6 +50,12 @@ class PrequalRequestCreate(BaseModel):
     # yet); letter falls back to the borrower's individual legal name
     # in that case.
     borrower_entity: str | None = Field(default=None, max_length=500)
+    # F&F (and Ground-Up later) collect the after-repair value + scope
+    # of work alongside the BRV. Optional on submit so the schema
+    # stays compatible with non-rehab products. Validated server-side
+    # when loan_type='fix_flip'.
+    arv_estimate: float | None = Field(default=None, ge=0)
+    sow_items: list[SowLineItem] | None = None
 
 
 class PrequalRequestStartCreate(PrequalRequestCreate):
@@ -59,6 +82,13 @@ class PrequalRequestApprove(BaseModel):
     # Admin can edit the LLC / entity name — borrower may have submitted
     # "TBD" and now has it, or the original name needs correcting.
     borrower_entity: str | None = Field(default=None, max_length=500)
+    # F&F-specific overrides (alembic 0014). Approving admin can edit
+    # ARV and the SOW line items independently of what the borrower
+    # submitted; the project-viability check (BRV + total_construction
+    # vs ARV cap) re-runs server-side against these values.
+    approved_arv: float | None = Field(default=None, ge=0)
+    approved_sow_items: list[SowLineItem] | None = None
+    approved_total_construction: float | None = Field(default=None, ge=0)
 
 
 class PrequalRequestReject(BaseModel):
@@ -82,6 +112,13 @@ class PrequalRequestRead(ORMModel):
     target_property_address: str
     purchase_price: float
     requested_loan_amount: float
+    # F&F / Ground-Up specifics. Always present in responses (null
+    # when not relevant for the product).
+    arv_estimate: float | None = None
+    sow_items: list[dict[str, Any]] | None = None
+    total_construction: float | None = None
+    approved_arv: float | None = None
+    approved_total_construction: float | None = None
     approved_purchase_price: float | None
     approved_loan_amount: float | None
     approved_scenario: dict[str, Any] | None
