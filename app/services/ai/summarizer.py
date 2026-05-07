@@ -67,12 +67,33 @@ Respond in strict JSON with this shape (no markdown, no code fences):
     "warning": "Rate Pressure" | "Rate Stability" | "Rate Easing" | null
   },
   "bottlenecks": ["<specific doc or response missing>", "..."],
-  "next_actions": {
-    "ai": ["<what you are auto-drafting or watching>", "..."],
-    "broker": ["<what the human needs to do, e.g. 'Call Client to push for tax returns'>", "..."]
-  },
+  "next_actions": [
+    {
+      "title": "<imperative one-line task>",
+      "kind": "call" | "doc" | "ai" | "inspect" | "milestone" | "lock" | "pay" | "closing",
+      "owner": "ai" | "broker" | "client",
+      "due_at": "<ISO 8601 datetime, optional>" | null,
+      "relative_days": <integer days from today, optional> | null,
+      "priority": "low" | "med" | "high",
+      "cta": "upload_doc" | "run_credit" | "complete_profile" | "submit_prequal" | "respond_to_message" | null
+    }
+  ],
   "deal_health": "on_track" | "at_risk" | "stuck"
 }
+
+### NEXT ACTIONS GUIDANCE
+- Maximum 5 actions per response. Quality over quantity.
+- `owner=ai`     : something the system will auto-do (watch a doc, regenerate
+                  the summary on inbound). Lands directly on the calendar.
+- `owner=broker` : the operator needs to act. Routed through an AITask the
+                  broker approves before it hits anyone's calendar.
+- `owner=client` : the borrower needs to act. Always routed through a
+                  broker AITask first — never written straight to a
+                  client-visible calendar.
+- Provide `due_at` (absolute, ISO 8601 with timezone) OR `relative_days`,
+  not both. The system prefers `due_at`.
+- `cta` is the borrower-facing button code when owner=client. Use null
+  when no concrete UI route applies.
 
 ### DEAL HEALTH RULES
 - "on_track" = no blockers; trajectory is normal.
@@ -107,10 +128,22 @@ def _format_summary_text(profile: dict[str, Any]) -> str:
     bottlenecks = profile.get("bottlenecks") or []
     if bottlenecks:
         parts.append("Bottlenecks: " + "; ".join(str(b) for b in bottlenecks[:3]))
-    next_actions = profile.get("next_actions") or {}
-    broker = next_actions.get("broker") or []
-    if broker:
-        parts.append("Broker action: " + str(broker[0]))
+    # Prefer the typed list when available — surfaces the highest-priority
+    # broker-owned action. Falls back to the legacy dict for older
+    # profiles that pre-date Phase 7.
+    typed = profile.get("next_actions_v2") or []
+    headline: str | None = None
+    if isinstance(typed, list) and typed:
+        broker_items = [a for a in typed if isinstance(a, dict) and a.get("owner") == "broker"]
+        if broker_items:
+            headline = str(broker_items[0].get("title", "")).strip() or None
+    if headline is None:
+        legacy = profile.get("next_actions") or {}
+        broker = legacy.get("broker") or []
+        if broker:
+            headline = str(broker[0])
+    if headline:
+        parts.append("Broker action: " + headline)
     return " ".join(parts) if parts else "No current status."
 
 
@@ -157,17 +190,46 @@ def _stub_profile(
             "warning": None,
         }
 
+    # Synthesize a typed next_actions_v2 list. Legacy dict is derived
+    # from it via _normalize_profile, so the stub goes through the
+    # same shape coercion the LLM output does.
+    stub_actions: list[dict[str, Any]] = []
+    if pending:
+        stub_actions.append({
+            "title": f"Push borrower on {pending[0]}",
+            "kind": "doc",
+            "owner": "broker",
+            "due_at": None,
+            "relative_days": 1,
+            "priority": "high" if len(pending) >= 3 else "med",
+            "cta": None,
+        })
+    elif market_pulse and market_pulse.get("warning") == "Rate Pressure":
+        stub_actions.append({
+            "title": "Lock rate while index is climbing",
+            "kind": "lock",
+            "owner": "broker",
+            "due_at": None,
+            "relative_days": 0,
+            "priority": "high",
+            "cta": None,
+        })
+    if activities:
+        stub_actions.append({
+            "title": f"Watching for: {last_activity}",
+            "kind": "ai",
+            "owner": "ai",
+            "due_at": None,
+            "relative_days": 1,
+            "priority": "low",
+            "cta": None,
+        })
+
     return {
         "current_status": status,
         "market_context": market_block,
         "bottlenecks": pending[:5],
-        "next_actions": {
-            "ai": [f"Watching for: {last_activity}"] if activities else [],
-            "broker": (
-                [f"Push borrower on {pending[0]}"] if pending
-                else (["Lock rate while index is climbing"] if market_pulse and market_pulse.get("warning") == "Rate Pressure" else [])
-            ),
-        },
+        "next_actions_v2": stub_actions,
         "deal_health": deal_health.value,
     }
 
@@ -243,24 +305,129 @@ async def _llm_profile(
         return None
 
 
+_ALLOWED_OWNERS = {"ai", "broker", "client"}
+_ALLOWED_KINDS = {"call", "doc", "ai", "inspect", "milestone", "lock", "pay", "closing"}
+_ALLOWED_PRIORITIES = {"low", "med", "medium", "high"}
+_ALLOWED_CTAS = {
+    "upload_doc", "run_credit", "complete_profile", "submit_prequal",
+    "respond_to_message", "accept_prequal_offer", "decline_prequal_offer",
+}
+
+
+def _coerce_typed_action(item: Any) -> dict[str, Any] | None:
+    """Coerce a single next_actions[] entry into the canonical typed
+    shape. Returns None when the input is unrecoverable (e.g. dict
+    with no `title`). Caller filters Nones out."""
+    if isinstance(item, str):
+        # The LLM (or stub) gave us a bare string — assume broker-owned,
+        # generic "call" kind, no due date.
+        return {
+            "title": item.strip(),
+            "kind": "call",
+            "owner": "broker",
+            "due_at": None,
+            "relative_days": None,
+            "priority": "med",
+            "cta": None,
+        }
+    if not isinstance(item, dict):
+        return None
+    title = str(item.get("title") or "").strip()
+    if not title:
+        return None
+    owner = str(item.get("owner") or "broker").lower()
+    if owner not in _ALLOWED_OWNERS:
+        owner = "broker"
+    kind = str(item.get("kind") or "call").lower()
+    if kind not in _ALLOWED_KINDS:
+        kind = "call"
+    priority = str(item.get("priority") or "med").lower()
+    if priority not in _ALLOWED_PRIORITIES:
+        priority = "med"
+    if priority == "medium":
+        priority = "med"
+    cta = item.get("cta")
+    if cta is not None:
+        cta = str(cta).lower()
+        if cta not in _ALLOWED_CTAS:
+            cta = None
+    due_at = item.get("due_at")
+    if due_at is not None and not isinstance(due_at, str):
+        due_at = None
+    relative_days = item.get("relative_days")
+    if relative_days is not None:
+        try:
+            relative_days = int(relative_days)
+        except (TypeError, ValueError):
+            relative_days = None
+    return {
+        "title": title,
+        "kind": kind,
+        "owner": owner,
+        "due_at": due_at,
+        "relative_days": relative_days,
+        "priority": priority,
+        "cta": cta,
+    }
+
+
+def _legacy_dict_from_typed_actions(actions: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Project the typed list back into the old {ai: [], broker: []}
+    dict so frontends still reading the legacy shape (e.g.
+    LoanSummaryCard) don't break during the transition."""
+    legacy: dict[str, list[str]] = {"ai": [], "broker": []}
+    for a in actions:
+        owner = a.get("owner")
+        title = a.get("title", "")
+        if owner == "ai":
+            legacy["ai"].append(title)
+        else:
+            # Both broker- and client-owned actions surface to the
+            # broker in the legacy view (operator decides which
+            # client-facing items to relay).
+            legacy["broker"].append(title)
+    return legacy
+
+
 def _normalize_profile(raw: dict[str, Any], market_pulse: dict | None) -> dict[str, Any]:
     """Defensive shape coercion — model may omit fields, return strings
-    where lists are expected, etc."""
+    where lists are expected, may produce the old dict shape OR the
+    new typed list. Always emits BOTH shapes:
+      next_actions       — canonical typed list (Phase 7 contract)
+      next_actions_legacy — {ai: [], broker: []} for back-compat with
+                            consumers that haven't migrated yet (e.g.
+                            LoanSummaryCard.tsx)."""
     market_ctx = raw.get("market_context") or {}
     if isinstance(market_ctx, str):
         market_ctx = {"narrative": market_ctx, "warning": None}
     bottlenecks = raw.get("bottlenecks") or []
     if isinstance(bottlenecks, str):
         bottlenecks = [bottlenecks]
-    next_actions = raw.get("next_actions") or {}
-    if isinstance(next_actions, list):
-        next_actions = {"ai": [], "broker": [str(x) for x in next_actions]}
-    ai_actions = next_actions.get("ai") or []
-    broker_actions = next_actions.get("broker") or []
-    if isinstance(ai_actions, str):
-        ai_actions = [ai_actions]
-    if isinstance(broker_actions, str):
-        broker_actions = [broker_actions]
+
+    raw_next = raw.get("next_actions")
+    typed_actions: list[dict[str, Any]] = []
+    if isinstance(raw_next, list):
+        # New shape — list of objects (or strings).
+        for item in raw_next:
+            coerced = _coerce_typed_action(item)
+            if coerced is not None:
+                typed_actions.append(coerced)
+    elif isinstance(raw_next, dict):
+        # Legacy shape — synthesize typed entries from the dict's
+        # string lists. Owner derived from which key holds them.
+        for owner_key, items in raw_next.items():
+            if isinstance(items, str):
+                items = [items]
+            if not isinstance(items, list):
+                continue
+            owner = owner_key if owner_key in _ALLOWED_OWNERS else "broker"
+            for s in items:
+                coerced = _coerce_typed_action({"title": str(s), "owner": owner})
+                if coerced is not None:
+                    typed_actions.append(coerced)
+    typed_actions = typed_actions[:5]
+    legacy_next = _legacy_dict_from_typed_actions(typed_actions)
+
     health_str = str(raw.get("deal_health", "on_track")).lower()
     try:
         DealHealth(health_str)
@@ -285,10 +452,11 @@ def _normalize_profile(raw: dict[str, Any], market_pulse: dict | None) -> dict[s
             "warning": market_ctx.get("warning"),
         },
         "bottlenecks": [str(b) for b in bottlenecks][:8],
-        "next_actions": {
-            "ai": [str(x) for x in ai_actions][:5],
-            "broker": [str(x) for x in broker_actions][:5],
-        },
+        # Legacy compat — frontends reading next_actions.ai / .broker.
+        "next_actions": legacy_next,
+        # New canonical contract — typed list with kind/owner/due/etc.
+        # Phase 9 frontend reads from this.
+        "next_actions_v2": typed_actions,
         "deal_health": health_str,
     }
 
@@ -318,7 +486,14 @@ async def refresh_summary(db: AsyncSession, loan_id: UUID) -> SummaryResult:
     profile = await _llm_profile(db, loan, list(activities), list(docs), market_pulse)
     used_stub = profile is None
     if profile is None:
-        profile = _stub_profile(loan, list(activities), list(docs), market_pulse)
+        # Stub returns the new typed shape but doesn't go through
+        # _normalize_profile; pass it through here so the legacy
+        # next_actions dict gets derived consistently with the LLM
+        # path.
+        profile = _normalize_profile(
+            _stub_profile(loan, list(activities), list(docs), market_pulse),
+            market_pulse,
+        )
 
     deal_health = DealHealth(profile["deal_health"])
     summary_text = _format_summary_text(profile)
@@ -338,6 +513,22 @@ async def refresh_summary(db: AsyncSession, loan_id: UUID) -> SummaryResult:
         )
     )
     await db.flush()
+
+    # Phase 7 — materialize the typed next_actions onto the calendar
+    # / AITask queue. Local import to avoid circular at module load
+    # (calendar_intent depends on app.services.ai.engagement which
+    # depends on app.models.loan which is already imported above).
+    typed_actions = profile.get("next_actions_v2") or []
+    if isinstance(typed_actions, list) and typed_actions:
+        try:
+            from app.services.ai.calendar_intent import persist_next_actions
+            await persist_next_actions(db, loan, typed_actions)
+        except Exception:
+            log.exception("calendar_intent.persist_next_actions failed loan=%s", loan.id)
+            # Don't fail the summary write on calendar persistence — the
+            # profile is already saved; calendar materialization can
+            # retry on the next refresh.
+
     return SummaryResult(
         summary=summary_text,
         deal_health=deal_health,
