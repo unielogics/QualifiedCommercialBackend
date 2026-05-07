@@ -4,7 +4,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -82,6 +82,19 @@ class Loan(TimestampMixin, Base):
     # see app/services/ai/summarizer.py and app/schemas/loan.LivingLoanProfile.
     # Nullable so older loans without a refresh still load.
     living_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    # Phase 6 — debounced Living Loan File refresh. log_activity() flips
+    # `summary_dirty=True` whenever a router writes an Activity row for
+    # this loan; the scheduler's job_summary_dirty_drain picks dirty
+    # loans up every 5 min and runs the summarizer. `summary_refreshed_at`
+    # records the last successful drain so the UI can show staleness
+    # ("updated 3 min ago"). Both columns added in alembic 0013.
+    summary_dirty: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    summary_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Deal Workspace — when set, the AI auto-reply path skips this loan until
     # the timestamp passes. Set to now()+1h whenever a super-admin sends a

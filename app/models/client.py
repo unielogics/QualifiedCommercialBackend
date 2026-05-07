@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
-from typing import TYPE_CHECKING
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -48,6 +48,19 @@ class Client(TimestampMixin, Base):
     # context. Structured (per-property table) lands when we wire REO.
     properties: Mapped[str | None] = mapped_column(Text, nullable=True)
     experience: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Phase 8 — account-wide AI aggregator (alembic 0013).
+    # client_summarizer reads + writes these:
+    #   living_profile  — JSONB with cross-loan next_actions, blockers,
+    #                     suggested-next-loan, etc. Mirrors the per-loan
+    #                     LivingLoanProfile shape.
+    #   living_summary  — human-readable narrative
+    #   living_refreshed_at — last successful aggregator run
+    living_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    living_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    living_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="client")
     broker: Mapped[Broker] = relationship(back_populates="clients")
