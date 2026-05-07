@@ -37,6 +37,10 @@ _jinja = Environment(
 # seller's agent → seller views" without forcing a new call mid-share.
 PRESIGN_TTL_SECONDS = 86400
 
+# Default validity window for the pre-qualification letter. The
+# underwriter can override on a per-letter basis from the review modal.
+DEFAULT_LETTER_VALIDITY_DAYS = 90
+
 
 def _s3_client(settings: Settings):
     """Build a boto3 S3 client. Mirrors the pattern in routers/documents.py."""
@@ -58,25 +62,37 @@ def _format_date(d) -> str:
     return d.strftime("%B %d, %Y")
 
 
-def _resolve_borrower_entity(loan: Loan) -> str:
-    """Best-effort borrower entity name for the letter:
-    loan.entity_name → loan.client.name → "Borrower" (last-resort generic)."""
-    entity = getattr(loan, "entity_name", None)
-    if entity:
-        return str(entity).strip()
-    client = getattr(loan, "client", None)
-    if client is not None:
-        name = getattr(client, "name", None)
-        if name:
-            return str(name).strip()
+def _resolve_borrower_entity(loan: Loan | None, request: PrequalRequest | None = None) -> str:
+    """Best-effort borrower entity name for the letter. Priority:
+       1. request.borrower_entity   (borrower-typed LLC, or admin override)
+       2. loan.entity_name          (when promoted to a Loan)
+       3. loan.client.name          (legal individual name)
+       4. "Borrower"                (last-resort generic)
+    Borrowers who left the LLC field as TBD will fall through to the
+    individual legal name on the rendered letter."""
+    if request is not None:
+        be = getattr(request, "borrower_entity", None)
+        if be and str(be).strip():
+            return str(be).strip()
+    if loan is not None:
+        entity = getattr(loan, "entity_name", None)
+        if entity:
+            return str(entity).strip()
+        client = getattr(loan, "client", None)
+        if client is not None:
+            name = getattr(client, "name", None)
+            if name:
+                return str(name).strip()
     return "Borrower"
 
 
 def render_letter(
     request: PrequalRequest,
-    loan: Loan,
+    loan: Loan | None = None,
     *,
     settings: Settings,
+    expiration_days: int | None = None,
+    quote_number: str | None = None,
 ) -> str:
     """Render the letter to PDF and upload to S3. Returns the s3_key.
 
@@ -84,6 +100,18 @@ def render_letter(
     what the borrower originally requested. Caller must have already
     validated LTV against the matrix cap before invoking this — this
     function trusts the inputs.
+
+    `loan` is optional now — under the new lifecycle, no Loan exists at
+    approve time. We bucket the PDF under the requester's user id when
+    no loan is available.
+
+    `expiration_days` defaults to 90; underwriter can override per
+    letter via the review modal.
+
+    `quote_number` is rendered into the title as 'Purchase
+    Pre-Qualification ({quote_number})'. Underwriter notes are NEVER
+    shown in the PDF — they live on the prequal record for the borrower
+    to read in-app, but they don't go on the letter.
     """
     # weasyprint imports cairo at module load; defer until we actually need
     # it so unit tests / dev environments without the native deps don't
@@ -95,7 +123,8 @@ def render_letter(
     ltv_pct = round((loan_amount / purchase) * 100) if purchase > 0 else 0
 
     today = datetime.now(timezone.utc).date()
-    expires = today + timedelta(days=14)
+    valid_for = expiration_days if expiration_days and expiration_days > 0 else DEFAULT_LETTER_VALIDITY_DAYS
+    expires = today + timedelta(days=valid_for)
 
     template_name = (
         "prequal_dscr.html" if request.loan_type == "dscr" else "prequal_bridge.html"
@@ -104,21 +133,28 @@ def render_letter(
     html_str = tpl.render(
         today_date=_format_date(today),
         expiration_date=_format_date(expires),
-        borrower_entity=_resolve_borrower_entity(loan),
+        borrower_entity=_resolve_borrower_entity(loan, request),
         target_property_address=request.target_property_address,
         purchase_price=_format_usd(purchase),
         max_loan_amount=_format_usd(loan_amount),
         max_ltv=ltv_pct,
-        admin_notes=request.admin_notes,
+        quote_number=quote_number or request.quote_number,
+        # admin_notes intentionally NOT passed — borrower sees them in
+        # the dashboard, never on the printable letter.
     )
 
     pdf_bytes = HTML(string=html_str).write_pdf()
     if pdf_bytes is None:
         raise RuntimeError("weasyprint returned None for write_pdf()")
 
-    # Deterministic S3 key — re-approval (admin tweaks numbers + re-clicks)
-    # overwrites cleanly without orphans.
-    s3_key = f"loans/{loan.deal_id}/pre_quals/{request.id}.pdf"
+    # S3 key prefix uses the loan's deal_id when available, otherwise
+    # the requester's user id (since no loan exists yet under the new
+    # lifecycle until the borrower marks the seller's offer accepted).
+    bucket_path = (
+        f"loans/{loan.deal_id}" if loan is not None
+        else f"prequals/{request.requester_id}"
+    )
+    s3_key = f"{bucket_path}/pre_quals/{request.id}.pdf"
 
     s3 = _s3_client(settings)
     s3.put_object(
@@ -129,8 +165,8 @@ def render_letter(
         ServerSideEncryption="AES256",
     )
     log.info(
-        "prequal_pdf.uploaded request_id=%s loan_deal=%s key=%s ltv_pct=%s size_bytes=%s",
-        request.id, loan.deal_id, s3_key, ltv_pct, len(pdf_bytes),
+        "prequal_pdf.uploaded request_id=%s key=%s ltv_pct=%s expires_in_days=%s size_bytes=%s",
+        request.id, s3_key, ltv_pct, valid_for, len(pdf_bytes),
     )
     return s3_key
 

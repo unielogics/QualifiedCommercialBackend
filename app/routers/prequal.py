@@ -22,7 +22,6 @@ whatever; the underwriter is the one bound by the matrix.
 from __future__ import annotations
 
 import logging
-import re
 import secrets
 from datetime import datetime, timezone
 from uuid import UUID
@@ -39,12 +38,14 @@ from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
 from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
+from app.models.user import User
 from app.schemas.prequal import (
     PrequalRequestApprove,
     PrequalRequestCreate,
     PrequalRequestRead,
     PrequalRequestReject,
     PrequalRequestStartCreate,
+    PrequalSellerOutcome,
 )
 from app.services import prequal_pdf
 
@@ -82,54 +83,64 @@ def _to_read(req: PrequalRequest) -> PrequalRequestRead:
     return PrequalRequestRead(**base)
 
 
-async def _find_or_spawn_loan_for_request(
-    payload: PrequalRequestStartCreate,
-    user,
+def _gen_quote_number() -> str:
+    """Q-prefixed 4-digit quote ID — generated when the borrower marks
+    the seller's offer as accepted and we promote the prequal to a
+    Loan."""
+    return f"Q-{secrets.randbelow(9000) + 1000}"
+
+
+async def _spawn_loan_from_approved_request(
+    request: PrequalRequest,
     db: AsyncSession,
 ) -> Loan:
-    """Used by the no-loan-yet POST. If the borrower already has a loan
-    at the same property, attach to that one. Otherwise spawn a new
-    Loan in stage=PREQUALIFIED so the operator pipeline picks it up."""
-    if user.client is None:
+    """Called when a prequal request flips to offer_accepted. Creates the
+    actual Loan from the approved_scenario snapshot, attaches the request
+    to it, and returns the new Loan. Pre-fills as much from the scenario
+    as we have so the underwriter doesn't re-type values they already set."""
+    # Resolve numbers — prefer approved_*, fall back to requested.
+    purchase = float(request.approved_purchase_price or request.purchase_price)
+    loan_amount = float(request.approved_loan_amount or request.requested_loan_amount)
+    scenario = request.approved_scenario or {}
+
+    loan_type_enum = (
+        LoanType.DSCR if request.loan_type == "dscr" else LoanType.BRIDGE
+    )
+
+    # Look up the requesting user → client.
+    user = (
+        await db.execute(
+            select(User).options(selectinload(User.client)).where(User.id == request.requester_id)
+        )
+    ).scalar_one_or_none()
+    if user is None or user.client is None:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Only borrowers with a client record can submit a pre-qualification request.",
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Cannot promote prequal — requester has no client record.",
         )
 
-    # Try to attach to an existing loan at the same property.
-    target_norm = _normalize_address(payload.target_property_address)
-    if target_norm:
-        existing = (
-            await db.execute(
-                select(Loan).where(Loan.client_id == user.client.id)
-            )
-        ).scalars().all()
-        for loan in existing:
-            if _normalize_address(loan.address) == target_norm:
-                return loan
-
-    # No match — spawn a new stub. Stage PREQUALIFIED is the default and
-    # also the perfect semantic match for this flow.
-    loan_type = (
-        LoanType.DSCR if payload.loan_type == "dscr" else LoanType.BRIDGE
-    )
     loan = Loan(
         deal_id=_gen_deal_id(),
         client_id=user.client.id,
         broker_id=getattr(user.client, "broker_id", None),
-        address=payload.target_property_address,
+        address=request.target_property_address,
         property_type=PropertyType.SFR,
-        type=loan_type,
+        type=loan_type_enum,
         purpose=LoanPurpose.PURCHASE,
+        # Stage starts at PREQUALIFIED — this IS the prequalified loan
+        # entering the pipeline. Operator moves it forward from there.
         stage=LoanStage.PREQUALIFIED,
-        amount=payload.requested_loan_amount,
+        amount=loan_amount,
+        # Best-effort fill from scenario; numeric columns are decimals,
+        # so leave them None when scenario doesn't have the field.
+        ltv=scenario.get("ltv") if isinstance(scenario.get("ltv"), (int, float)) else None,
     )
     db.add(loan)
     await db.flush()
     await db.refresh(loan)
     log.info(
-        "prequal.spawned_loan deal_id=%s client_id=%s address=%s",
-        loan.deal_id, user.client.id, payload.target_property_address,
+        "prequal.promoted_to_loan request_id=%s deal_id=%s amount=%s ltv=%s",
+        request.id, loan.deal_id, loan_amount, loan.ltv,
     )
     return loan
 
@@ -146,13 +157,16 @@ def _is_operator(user) -> bool:
 
 
 async def _create_request(
-    loan: Loan,
+    loan: Loan | None,
     payload: PrequalRequestCreate,
     user,
     db: AsyncSession,
 ) -> PrequalRequest:
+    """Create a PrequalRequest. loan_id is OPTIONAL — None when this is a
+    standalone request that hasn't been converted to a loan yet (which
+    is the new default; loan_id is only set after offer_accepted)."""
     req = PrequalRequest(
-        loan_id=loan.id,
+        loan_id=loan.id if loan is not None else None,
         requester_id=user.id,
         target_property_address=payload.target_property_address,
         purchase_price=payload.purchase_price,
@@ -160,27 +174,34 @@ async def _create_request(
         loan_type=payload.loan_type,
         expected_closing_date=payload.expected_closing_date,
         borrower_notes=payload.borrower_notes,
+        borrower_entity=payload.borrower_entity,
         status="pending",
     )
     db.add(req)
-    db.add(
-        Activity(
-            loan_id=loan.id,
-            actor_id=user.id,
-            actor_label=user.role,
-            kind="prequal.requested",
-            summary=f"Pre-qualification requested for {payload.target_property_address}",
-            payload={
-                "loan_type": payload.loan_type,
-                "purchase_price": float(payload.purchase_price),
-                "requested_loan_amount": float(payload.requested_loan_amount),
-                "expected_closing_date": (
-                    payload.expected_closing_date.isoformat()
-                    if payload.expected_closing_date else None
-                ),
-            },
+    # Activity rows must have a loan_id (NOT NULL on activity.loan_id).
+    # When the prequal isn't yet attached to a loan we skip the activity
+    # log on submission — the prequal_requests row itself IS the audit
+    # trail. We log activity again on approve and on offer_accepted,
+    # both of which DO have a loan_id by then.
+    if loan is not None:
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="prequal.requested",
+                summary=f"Pre-qualification requested for {payload.target_property_address}",
+                payload={
+                    "loan_type": payload.loan_type,
+                    "purchase_price": float(payload.purchase_price),
+                    "requested_loan_amount": float(payload.requested_loan_amount),
+                    "expected_closing_date": (
+                        payload.expected_closing_date.isoformat()
+                        if payload.expected_closing_date else None
+                    ),
+                },
+            )
         )
-    )
     await db.flush()
     await db.refresh(req)
     return req
@@ -220,10 +241,11 @@ async def submit_prequal_spawn(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PrequalRequestRead:
-    """Borrower submits a pre-qual request for a property they don't yet have
-    a loan record for. Backend spawns or attaches to a Loan."""
-    loan = await _find_or_spawn_loan_for_request(payload, user, db)
-    req = await _create_request(loan, payload, user, db)
+    """Borrower submits a standalone pre-qual request — NO loan record is
+    created at this stage. Under the new lifecycle a Loan is only spawned
+    after the borrower marks the seller's offer as accepted (see
+    /me/prequal-requests/{id}/accept-offer)."""
+    req = await _create_request(None, payload, user, db)
     return _to_read(req)
 
 
@@ -340,25 +362,42 @@ async def approve_prequal_request(
             },
         )
 
-    # Snapshot the approved figures + reviewer.
+    # Snapshot the approved figures + scenario + reviewer + qualification#.
     req.approved_purchase_price = payload.approved_purchase_price
     req.approved_loan_amount = payload.approved_loan_amount
     req.admin_notes = payload.admin_notes
+    req.approved_scenario = payload.approved_scenario
+    # Admin may have corrected the LLC / entity name (e.g. borrower
+    # submitted "TBD" originally and now has it). Override only when the
+    # admin actually supplied a value — None means "leave whatever the
+    # borrower submitted".
+    if payload.borrower_entity is not None:
+        req.borrower_entity = payload.borrower_entity
     req.status = "approved"
     req.reviewed_by = user.id
     req.reviewed_at = datetime.now(timezone.utc)
+    # Generate the qualification # (Q-XXXX) on first approval. Re-approval
+    # keeps the same number so the borrower's downloaded letter stays
+    # consistent across edits.
+    if not req.quote_number:
+        req.quote_number = _gen_quote_number()
     await db.flush()
 
-    # Render + upload the PDF. If this throws we want to leave status as
-    # approved already — the admin can re-approve to re-render — but
-    # surface the failure to the caller.
-    loan = await db.get(Loan, req.loan_id)
-    if loan is None:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Loan disappeared")
-
+    # Render + upload the PDF. Under the new lifecycle the prequal
+    # doesn't have a loan_id at approve time — that comes later, on
+    # offer-accepted. render_letter handles both cases.
     settings = get_settings()
+    loan = None
+    if req.loan_id is not None:
+        loan = await db.get(Loan, req.loan_id)
     try:
-        s3_key = prequal_pdf.render_letter(req, loan, settings=settings)
+        s3_key = prequal_pdf.render_letter(
+            req,
+            loan,
+            settings=settings,
+            expiration_days=payload.expiration_days,
+            quote_number=req.quote_number,
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("prequal_pdf render/upload failed for request %s", req.id)
         raise HTTPException(
@@ -369,24 +408,30 @@ async def approve_prequal_request(
     req.pdf_s3_key = s3_key
     await db.flush()
 
-    db.add(
-        Activity(
-            loan_id=loan.id,
-            actor_id=user.id,
-            actor_label=user.role,
-            kind="prequal.approved",
-            summary=f"Pre-qualification approved at {ltv * 100:.0f}% LTV — {req.target_property_address}",
-            payload={
-                "request_id": str(req.id),
-                "s3_key": s3_key,
-                "approved_purchase_price": float(req.approved_purchase_price),
-                "approved_loan_amount": float(req.approved_loan_amount),
-                "ltv": round(ltv, 4),
-                "loan_type": req.loan_type,
-                "admin_notes": req.admin_notes,
-            },
+    # Activity log lives on the loan (NOT NULL FK). Skip when no loan
+    # is attached yet — the prequal_requests row is the audit until the
+    # borrower accepts and we spawn one.
+    if loan is not None:
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="prequal.approved",
+                summary=f"Pre-qualification approved at {ltv * 100:.0f}% LTV — {req.target_property_address}",
+                payload={
+                    "request_id": str(req.id),
+                    "quote_number": req.quote_number,
+                    "s3_key": s3_key,
+                    "approved_purchase_price": float(req.approved_purchase_price),
+                    "approved_loan_amount": float(req.approved_loan_amount),
+                    "ltv": round(ltv, 4),
+                    "loan_type": req.loan_type,
+                    "admin_notes": req.admin_notes,
+                    "approved_scenario": req.approved_scenario,
+                },
+            )
         )
-    )
     await db.flush()
     await db.refresh(req)
     return _to_read(req)
@@ -420,20 +465,119 @@ async def reject_prequal_request(
     req.reviewed_at = datetime.now(timezone.utc)
     await db.flush()
 
+    # Activity log only when a loan is attached. Pre-loan rejections
+    # are audited via the prequal_requests row itself.
+    if req.loan_id is not None:
+        db.add(
+            Activity(
+                loan_id=req.loan_id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="prequal.rejected",
+                summary=f"Pre-qualification rejected — {req.target_property_address}",
+                payload={
+                    "request_id": str(req.id),
+                    "admin_notes": req.admin_notes,
+                    "loan_type": req.loan_type,
+                },
+            )
+        )
+    await db.flush()
+    await db.refresh(req)
+    return _to_read(req)
+
+
+# ── borrower offer-outcome endpoints ────────────────────────────────────
+#
+# Once approved, the borrower hands the letter to the seller. The seller
+# either accepts the offer (we create a Loan + quote#) or declines (the
+# prequal closes without a loan). The borrower reports back through these
+# endpoints; super-admin can do it on the borrower's behalf.
+
+
+async def _load_request_for_outcome(
+    request_id: UUID, user, db: AsyncSession
+) -> PrequalRequest:
+    req = await db.get(PrequalRequest, request_id)
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
+    # Borrower can only act on their own; operators on any.
+    if user.role == Role.CLIENT and req.requester_id != user.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot act on this request")
+    if not (user.role == Role.CLIENT or _is_operator(user)):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
+    if req.status != "approved":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Request is {req.status}; only approved requests can be marked accepted/declined.",
+        )
+    return req
+
+
+@router.put(
+    "/me/prequal-requests/{request_id}/accept-offer",
+    response_model=PrequalRequestRead,
+)
+async def borrower_accept_offer(
+    request_id: UUID,
+    payload: PrequalSellerOutcome,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrequalRequestRead:
+    """Borrower confirms the seller accepted their offer. This is the
+    moment we promote the prequal into a real Loan record in the
+    pipeline, mint a Q-XXXX number on the loan, and surface it to ops."""
+    req = await _load_request_for_outcome(request_id, user, db)
+
+    loan = await _spawn_loan_from_approved_request(req, db)
+    req.loan_id = loan.id
+    req.status = "offer_accepted"
+    if not req.quote_number:
+        req.quote_number = _gen_quote_number()
+    await db.flush()
+
     db.add(
         Activity(
-            loan_id=req.loan_id,
+            loan_id=loan.id,
             actor_id=user.id,
             actor_label=user.role,
-            kind="prequal.rejected",
-            summary=f"Pre-qualification rejected — {req.target_property_address}",
+            kind="prequal.offer_accepted",
+            summary=(
+                f"Seller accepted offer — Loan {loan.deal_id} created from prequal "
+                f"{req.quote_number} at {req.target_property_address}"
+            ),
             payload={
                 "request_id": str(req.id),
-                "admin_notes": req.admin_notes,
-                "loan_type": req.loan_type,
+                "quote_number": req.quote_number,
+                "deal_id": loan.deal_id,
+                "approved_purchase_price": float(req.approved_purchase_price or 0),
+                "approved_loan_amount": float(req.approved_loan_amount or 0),
+                "note": payload.note,
             },
         )
     )
     await db.flush()
+    await db.refresh(req)
+    return _to_read(req)
+
+
+@router.put(
+    "/me/prequal-requests/{request_id}/decline-offer",
+    response_model=PrequalRequestRead,
+)
+async def borrower_decline_offer(
+    request_id: UUID,
+    payload: PrequalSellerOutcome,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrequalRequestRead:
+    """Borrower reports the seller declined / they walked away. The
+    prequal closes; no loan is ever created from this request. Borrower
+    can submit a new prequal for a different property."""
+    req = await _load_request_for_outcome(request_id, user, db)
+    req.status = "offer_declined"
+    await db.flush()
+    # Pre-loan, no Activity log target — the prequal_requests row IS the
+    # audit trail. Just refresh and return.
     await db.refresh(req)
     return _to_read(req)

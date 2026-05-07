@@ -18,8 +18,10 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
+from typing import Any
+
 from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -35,8 +37,11 @@ class PrequalRequest(TimestampMixin, Base):
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    loan_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("loans.id", ondelete="CASCADE"), nullable=False
+    # NULLABLE — submit no longer spawns a Loan. The Loan is created when
+    # the borrower marks the seller's offer as accepted, and that's when
+    # this column gets populated.
+    loan_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("loans.id", ondelete="CASCADE"), nullable=True
     )
     requester_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
@@ -49,6 +54,10 @@ class PrequalRequest(TimestampMixin, Base):
     loan_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "dscr" | "bridge"
     expected_closing_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     borrower_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # LLC / entity name the letter is issued to. NULL = TBD (borrower
+    # hasn't formed the LLC yet — falls back to the individual client's
+    # legal name in the rendered PDF).
+    borrower_entity: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # What the underwriter authorized (defaults to the borrower's request if
     # the admin doesn't override)
@@ -56,7 +65,25 @@ class PrequalRequest(TimestampMixin, Base):
     approved_loan_amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # State
+    # Calculator snapshot the underwriter saves on approve. Drives the
+    # PDF and pre-fills the new Loan when the borrower accepts the
+    # seller's offer. Shape varies by loan_type (DSCR/Bridge/F&F/GU) so
+    # JSONB rather than rigid columns:
+    #   { "rate": 7.625, "points": 1.0, "monthly_pi": 2150.31,
+    #     "ltv": 0.75, "dscr": 1.18, "rent": 4250, ... }
+    approved_scenario: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+
+    # Quote number — generated on offer_accepted (Q-{4-digit}) and used
+    # on the borrower's confirmation receipt + the converted Loan's
+    # references.
+    quote_number: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # State machine:
+    #   pending → approved → offer_accepted (creates Loan) | offer_declined
+    #              ↓
+    #            rejected
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     pdf_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -65,7 +92,7 @@ class PrequalRequest(TimestampMixin, Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
-    loan: Mapped[Loan] = relationship(back_populates="prequal_requests")
+    loan: Mapped[Loan | None] = relationship(back_populates="prequal_requests")
     requester: Mapped[User] = relationship(foreign_keys=[requester_id])
     reviewer: Mapped[User | None] = relationship(foreign_keys=[reviewed_by])
 

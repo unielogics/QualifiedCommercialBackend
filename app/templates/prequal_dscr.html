@@ -2,11 +2,11 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Pre-Qualification Letter</title>
+    <title>Purchase Pre-Qualification</title>
     <style>
         @page {
             size: Letter;
-            margin: 15mm 15mm 20mm 15mm;
+            margin: 14mm 14mm 18mm 14mm;
             background-color: #ffffff;
             @bottom-left {
                 content: "Qualified Commercial LLC | New Jersey";
@@ -19,23 +19,19 @@
             font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
             color: #0B1629;
             line-height: 1.4;
-            font-size: 10pt;
+            font-size: 9.5pt;
         }
         .header {
             border-bottom: 2px solid #0B1F3A;
             padding-bottom: 8px;
-            margin-bottom: 18px;
+            margin-bottom: 14px;
             position: relative;
             display: flex;
             align-items: center;
             gap: 14px;
             min-height: 50px;
         }
-        .brand-mark {
-            width: 44px;
-            height: 44px;
-            flex-shrink: 0;
-        }
+        .brand-mark { width: 44px; height: 44px; flex-shrink: 0; }
         .brand-wordmark .logo {
             font-size: 18pt;
             font-weight: bold;
@@ -60,31 +56,35 @@
         }
         .title {
             text-align: center;
-            font-size: 14pt;
+            font-size: 13pt;
             font-weight: bold;
-            margin-bottom: 12px;
+            margin-bottom: 10px;
             text-transform: uppercase;
             letter-spacing: 1px;
             color: #0B1F3A;
         }
-        .dates {
-            margin-bottom: 14px;
-            font-size: 9.5pt;
+        .title .qnum {
+            font-size: 10pt;
+            font-weight: 600;
+            color: #6B7891;
+            letter-spacing: 0.5px;
+            text-transform: none;
         }
-        .dates p { margin: 2px 0; font-weight: bold; }
+        .dates { margin-bottom: 11px; font-size: 9pt; }
+        .dates p { margin: 1px 0; font-weight: bold; }
         .dates span { font-weight: normal; }
-        .intro { margin-bottom: 14px; text-align: justify; }
+        .intro { margin-bottom: 11px; text-align: justify; font-size: 9.5pt; }
         table.terms-table {
             width: 100%;
             border-collapse: collapse;
-            margin-bottom: 16px;
+            margin-bottom: 12px;
         }
         table.terms-table th, table.terms-table td {
-            padding: 8px;
+            padding: 6px 8px;
             border: 1px solid rgba(11, 22, 41, 0.16);
             text-align: left;
             width: 50%;
-            font-size: 9.5pt;
+            font-size: 9pt;
         }
         table.terms-table th {
             background-color: #FAF7F1;
@@ -92,36 +92,40 @@
             color: #0B1629;
         }
         .section-title {
-            font-size: 11pt;
+            font-size: 10.5pt;
             font-weight: bold;
             color: #0B1F3A;
-            margin-bottom: 6px;
+            margin-bottom: 5px;
             border-bottom: 1px solid rgba(11, 22, 41, 0.08);
-            padding-bottom: 3px;
+            padding-bottom: 2px;
         }
-        .conditions { margin-bottom: 14px; }
-        .conditions ul { margin-top: 5px; padding-left: 20px; margin-bottom: 0; }
-        .conditions li { margin-bottom: 4px; font-size: 9.5pt; }
-        .admin-notes {
-            background-color: #FAF7F1;
-            border-left: 3px solid #0F5F66;
-            padding: 8px 12px;
-            margin-bottom: 14px;
-            font-size: 9.5pt;
-            font-style: italic;
-            color: #3C4A60;
+        .conditions { margin-bottom: 12px; }
+        .conditions ul { margin-top: 4px; padding-left: 20px; margin-bottom: 0; }
+        .conditions li { margin-bottom: 3px; font-size: 9pt; }
+
+        /* Signature + disclaimer side-by-side. Each occupies ~50% so the
+           full page still fits on Letter without spilling. */
+        .footer-grid {
+            display: flex;
+            gap: 14px;
+            align-items: stretch;
+            margin-top: 8px;
         }
-        .signature-block { margin-top: 22px; margin-bottom: 22px; }
+        .signature-block { flex: 1 1 0; padding-right: 4px; }
+        .signature-block .salute { margin: 0 0 32px 0; font-size: 9.5pt; }
         .signature-line {
-            width: 250px;
+            width: 220px;
             border-bottom: 1px solid #0B1629;
             margin-bottom: 5px;
         }
+        .signature-block .name { font-weight: 700; font-size: 10pt; }
+        .signature-block .title-line { font-size: 8.5pt; color: #3C4A60; margin-top: 2px; }
         .disclaimer {
+            flex: 1 1 0;
             background-color: #fdfbf7;
             border: 1px solid #e0dcd3;
-            padding: 10px;
-            font-size: 7.5pt;
+            padding: 8px 10px;
+            font-size: 7pt;
             color: #555;
             text-align: justify;
             line-height: 1.3;
@@ -138,12 +142,14 @@
         <div class="contact-info">
             123 Financial Way, Suite 400<br>
             Garfield, NJ 07026<br>
-            support@qualifiedcommercial.com<br>
             www.qualifiedcommercial.com
         </div>
     </div>
 
-    <div class="title">Letter of Pre-Qualification</div>
+    <div class="title">
+        Purchase Pre-Qualification
+        {% if quote_number %}<span class="qnum"> ({{ quote_number }})</span>{% endif %}
+    </div>
 
     <div class="dates">
         <p>Date Issued: <span>{{ today_date }}</span></p>
@@ -169,12 +175,6 @@
         <tr><th>Loan Program</th><td>Commercial DSCR &mdash; 30 Year Fixed</td></tr>
     </table>
 
-    {% if admin_notes %}
-    <div class="admin-notes">
-        <strong>Underwriter notes:</strong> {{ admin_notes }}
-    </div>
-    {% endif %}
-
     <div class="conditions">
         <div class="section-title">STATUS &amp; CONDITIONS OF ISSUANCE</div>
         <ul>
@@ -184,16 +184,16 @@
         </ul>
     </div>
 
-    <div class="signature-block">
-        <p style="margin:0 0 35px 0;">Sincerely,</p>
-        <div class="signature-line"></div>
-        <strong>Franco</strong><br>
-        Managing Director | Qualified Commercial LLC<br>
-        franco@qualifiedcommercial.com
-    </div>
-
-    <div class="disclaimer">
-        <strong>DISCLAIMER:</strong> This letter is a preliminary pre-qualification based on a soft-inquiry credit review and unverified, self-reported financial data provided by the borrower. This is <strong>NOT a commitment to lend</strong>, an offer of credit, or a final loan approval. All loans are strictly subject to final underwriting review, a full acceptable appraisal, environmental reports (if applicable), title clearance, verification of liquid reserves, and final approval by the designated lending institution. Qualified Commercial LLC acts as a commercial loan brokerage platform. Terms, rates, and guidelines are subject to market changes without notice and are not locked until a formal rate lock agreement is executed.
+    <div class="footer-grid">
+        <div class="signature-block">
+            <p class="salute">Sincerely,</p>
+            <div class="signature-line"></div>
+            <div class="name">Franco</div>
+            <div class="title-line">Managing Director | Qualified Commercial LLC</div>
+        </div>
+        <div class="disclaimer">
+            <strong>DISCLAIMER:</strong> This letter is a preliminary pre-qualification based on a soft-inquiry credit review and unverified, self-reported financial data provided by the borrower. This is <strong>NOT a commitment to lend</strong>, an offer of credit, or a final loan approval. All loans are strictly subject to final underwriting review, a full acceptable appraisal, environmental reports (if applicable), title clearance, verification of liquid reserves, and final approval by the designated lending institution. Qualified Commercial LLC acts as a commercial loan brokerage platform. Terms, rates, and guidelines are subject to market changes without notice and are not locked until a formal rate lock agreement is executed.
+        </div>
     </div>
 </body>
 </html>
