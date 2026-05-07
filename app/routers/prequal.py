@@ -21,6 +21,7 @@ whatever; the underwriter is the one bound by the matrix.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from typing import Any
@@ -529,8 +530,15 @@ async def _apply_approval(
     fallback_individual_name = (
         requester.client.name if requester and requester.client else None
     )
+    # WeasyPrint + S3 upload are blocking calls (5–15s on rich
+    # templates). Running them inline on the async event loop pegs the
+    # worker AND, under auto-approval, can push the request past the
+    # upstream proxy's 30s timeout — the borrower sees a 502.
+    # asyncio.to_thread shoves the blocking work into the default
+    # threadpool so the event loop stays responsive.
     try:
-        s3_key = prequal_pdf.render_letter(
+        s3_key = await asyncio.to_thread(
+            prequal_pdf.render_letter,
             req,
             loan,
             settings=settings,
@@ -541,6 +549,17 @@ async def _apply_approval(
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("prequal_pdf render/upload failed for request %s", req.id)
+        # Auto-approval (actor_label='ai') should NEVER block the
+        # borrower's submit — the prequal row is already saved as
+        # `approved`. Mark the PDF as missing and let the admin regen
+        # on the queue. Manual approval (operator click) still 503s so
+        # the operator can retry the action explicitly.
+        if actor_label == "ai":
+            req.pdf_s3_key = None
+            req.admin_notes = (req.admin_notes or "") + "\n\n[PDF render deferred — admin regen needed]"
+            await db.flush()
+            await db.refresh(req)
+            return req
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Approval saved but PDF rendering failed. Re-click Approve to retry.",
