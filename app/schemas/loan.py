@@ -93,6 +93,7 @@ class LoanRead(ORMModel):
     deal_id: str
     client_id: UUID
     broker_id: UUID | None
+    lender_id: UUID | None = None
     address: str
     city: str | None
     property_type: PropertyType

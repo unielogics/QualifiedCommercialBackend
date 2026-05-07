@@ -9,6 +9,7 @@ import secrets
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +25,13 @@ from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
+from app.services.lender_connect import (
+    LenderConnectError,
+    NotifyToggle,
+    connect_lender,
+    disconnect_lender,
+)
+from app.services.lender_send import LenderSendError, draft_lender_send
 from app.services.loan_intake_automation import kickoff_loan
 from app.services.email.parser import inject_deal_id
 from app.services.hud_template import build_hud_draft
@@ -201,6 +209,158 @@ async def transition_stage(
     # Living Loan File. Mark dirty for the next drain.
     await mark_loan_dirty(db, loan.id)
     await db.flush()
+    await db.refresh(loan)
+    return LoanRead.model_validate(loan)
+
+
+# ── Connect / disconnect lender ───────────────────────────────────────
+
+
+class NotifyTogglePayload(BaseModel):
+    participant_id: UUID
+    cc_outbound: bool = False
+    bcc_outbound: bool = False
+
+
+class ConnectLenderPayload(BaseModel):
+    lender_id: UUID
+    notify: list[NotifyTogglePayload] = Field(default_factory=list)
+
+
+class ConnectLenderResponse(BaseModel):
+    loan: LoanRead
+    lender_id: UUID
+    lender_name: str
+    cc_count: int
+    bcc_count: int
+    stage_advanced: bool
+
+
+@router.post("/{loan_id}/connect-lender", response_model=ConnectLenderResponse)
+async def connect_lender_endpoint(
+    loan_id: UUID,
+    payload: ConnectLenderPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ConnectLenderResponse:
+    """Wire a lender onto this loan — sets `loan.lender_id`, ensures a
+    hide_identity LENDER participant row exists, applies the
+    operator's notify-list toggles, and promotes stage to
+    LENDER_CONNECTED if it hadn't reached it. Super-admin only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+
+    toggles = [
+        NotifyToggle(
+            participant_id=t.participant_id,
+            cc_outbound=t.cc_outbound,
+            bcc_outbound=t.bcc_outbound,
+        )
+        for t in payload.notify
+    ]
+    try:
+        result = await connect_lender(
+            db,
+            loan_id=loan_id,
+            lender_id=payload.lender_id,
+            notify_toggles=toggles,
+            actor_user_id=user.id,
+            actor_label=user.role.value if hasattr(user.role, "value") else str(user.role),
+        )
+    except LenderConnectError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    if result.stage_advanced:
+        # Mirror /stage's emitter call so the calendar still reflects
+        # the LENDER_CONNECTED milestone if there's a hook for it.
+        await calendar_emitter.emit_for_loan_stage(
+            db, result.loan, LoanStage.COLLECTING_DOCS, result.loan.stage
+        )
+
+    await db.commit()
+    await db.refresh(result.loan)
+    return ConnectLenderResponse(
+        loan=LoanRead.model_validate(result.loan),
+        lender_id=result.lender.id,
+        lender_name=result.lender.name,
+        cc_count=result.cc_count,
+        bcc_count=result.bcc_count,
+        stage_advanced=result.stage_advanced,
+    )
+
+
+class LenderSendPayload(BaseModel):
+    document_ids: list[UUID] = Field(default_factory=list)
+    delivery: str = Field(default="links", pattern="^(links|zip)$")
+
+
+class LenderSendResponse(BaseModel):
+    draft_id: UUID
+    lender_id: UUID
+    lender_name: str
+    delivery: str
+    document_count: int
+    zip_s3_key: str | None
+    to_email: str
+    subject: str
+
+
+@router.post("/{loan_id}/lender/send", response_model=LenderSendResponse)
+async def lender_send_endpoint(
+    loan_id: UUID,
+    payload: LenderSendPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderSendResponse:
+    """Package the picked docs and create an EmailDraft to the
+    connected lender. The draft lands in the existing
+    pending-broker-review queue; sending happens through the
+    standard /email-drafts/{id}/approve route. Super-admin only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    try:
+        result = await draft_lender_send(
+            db,
+            loan_id=loan_id,
+            document_ids=payload.document_ids,
+            delivery=payload.delivery,  # type: ignore[arg-type]
+            actor_user_id=user.id,
+        )
+    except LenderSendError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    return LenderSendResponse(
+        draft_id=result.draft.id,
+        lender_id=result.lender.id,
+        lender_name=result.lender.name,
+        delivery=result.delivery,
+        document_count=result.document_count,
+        zip_s3_key=result.zip_s3_key,
+        to_email=result.draft.to_email,
+        subject=result.draft.subject,
+    )
+
+
+@router.post("/{loan_id}/disconnect-lender", response_model=LoanRead)
+async def disconnect_lender_endpoint(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LoanRead:
+    """Remove the lender connection. Stage stays where it is — we
+    never auto-regress. Super-admin only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    try:
+        loan = await disconnect_lender(
+            db,
+            loan_id=loan_id,
+            actor_user_id=user.id,
+            actor_label=user.role.value if hasattr(user.role, "value") else str(user.role),
+        )
+    except LenderConnectError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
 

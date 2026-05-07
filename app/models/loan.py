@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from app.models.email_draft import EmailDraft
     from app.models.event import CalendarEvent
     from app.models.hud import HudLineItem
+    from app.models.lender import Lender
     from app.models.loan_participant import LoanParticipant
     from app.models.message import Message
     from app.models.prequal_request import PrequalRequest
@@ -38,6 +39,13 @@ class Loan(TimestampMixin, Base):
     )
     broker_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("brokers.id", ondelete="SET NULL"), nullable=True
+    )
+    # Connected lender — set when the operator runs the Connect-Lender
+    # flow. Adding a row here also creates a hide_identity=True
+    # LoanParticipant for the lender, which is what the orchestrator's
+    # Gateway Rule machinery actually keys off.
+    lender_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lenders.id", ondelete="SET NULL"), nullable=True
     )
 
     # Property
@@ -102,6 +110,7 @@ class Loan(TimestampMixin, Base):
     ai_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     client: Mapped[Client] = relationship(back_populates="loans")
+    lender: Mapped["Lender | None"] = relationship(back_populates="loans")
     documents: Mapped[list[Document]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     hud_items: Mapped[list[HudLineItem]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     activities: Mapped[list[Activity]] = relationship(back_populates="loan", cascade="all, delete-orphan")
