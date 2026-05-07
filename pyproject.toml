@@ -21,6 +21,11 @@ dependencies = [
     "websockets>=14.0",
     "psycopg[binary]>=3.3.4",
     "beautifulsoup4>=4.12.0",
+    # Pre-qualification letter PDF generator. Jinja2 was previously a
+    # transitive dep via FastAPI; promoted to direct so we can use the
+    # FileSystemLoader in app/services/prequal_pdf.py without surprise.
+    "jinja2>=3.1.0",
+    "weasyprint>=63.0",
 ]
 
 [project.optional-dependencies]

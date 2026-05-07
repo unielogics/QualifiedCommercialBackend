@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from app.models.hud import HudLineItem
     from app.models.loan_participant import LoanParticipant
     from app.models.message import Message
+    from app.models.prequal_request import PrequalRequest
 
 
 class Loan(TimestampMixin, Base):
@@ -96,3 +97,4 @@ class Loan(TimestampMixin, Base):
     calendar_events: Mapped[list[CalendarEvent]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     participants: Mapped[list[LoanParticipant]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     email_drafts: Mapped[list[EmailDraft]] = relationship(back_populates="loan", cascade="all, delete-orphan")
+    prequal_requests: Mapped[list[PrequalRequest]] = relationship(back_populates="loan", cascade="all, delete-orphan")

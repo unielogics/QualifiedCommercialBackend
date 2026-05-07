@@ -32,6 +32,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     PORT=8000
 
+# WeasyPrint native deps — Cairo + Pango + gdk-pixbuf, plus a base font
+# so SVG/text in the pre-qual letter PDF renders correctly. Adds ~70MB
+# to the runtime image; acceptable for the feature.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangoft2-1.0-0 \
+        libgdk-pixbuf-2.0-0 \
+        shared-mime-info \
+        fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 # Non-root user for security
 RUN groupadd -r app && useradd -r -g app -u 1001 app
 

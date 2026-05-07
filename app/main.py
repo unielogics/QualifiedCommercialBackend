@@ -28,6 +28,7 @@ from app.routers import (
     loans,
     messages,
     meta,
+    prequal,
     rates,
     reports,
     search,
@@ -100,5 +101,6 @@ for r in [
     users.router,
     email_drafts.router,
     legal.router,
+    prequal.router,
 ]:
     app.include_router(r, prefix=api_prefix)

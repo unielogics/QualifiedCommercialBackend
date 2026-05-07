@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pre-Qualification Letter — Bridge</title>
+    <style>
+        @page {
+            size: Letter;
+            margin: 15mm 15mm 20mm 15mm;
+            background-color: #ffffff;
+            @bottom-left {
+                content: "Qualified Commercial LLC | New Jersey";
+                font-size: 8pt;
+                color: #6B7891;
+                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            }
+        }
+        body {
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            color: #0B1629;
+            line-height: 1.4;
+            font-size: 10pt;
+        }
+        .header {
+            border-bottom: 2px solid #0B1F3A;
+            padding-bottom: 8px;
+            margin-bottom: 18px;
+            position: relative;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            min-height: 50px;
+        }
+        .brand-mark { width: 44px; height: 44px; flex-shrink: 0; }
+        .brand-wordmark .logo { font-size: 18pt; font-weight: bold; color: #0B1F3A; letter-spacing: 1px; line-height: 1.0; }
+        .brand-wordmark .sub-logo { font-size: 8.5pt; color: #6B7891; text-transform: uppercase; letter-spacing: 1.6px; margin-top: 3px; }
+        .contact-info { position: absolute; right: 0; top: 0; text-align: right; font-size: 8.5pt; color: #3C4A60; }
+        .title { text-align: center; font-size: 14pt; font-weight: bold; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; color: #0B1F3A; }
+        .dates { margin-bottom: 14px; font-size: 9.5pt; }
+        .dates p { margin: 2px 0; font-weight: bold; } .dates span { font-weight: normal; }
+        .intro { margin-bottom: 14px; text-align: justify; }
+        table.terms-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+        table.terms-table th, table.terms-table td { padding: 8px; border: 1px solid rgba(11, 22, 41, 0.16); text-align: left; width: 50%; font-size: 9.5pt; }
+        table.terms-table th { background-color: #FAF7F1; font-weight: bold; color: #0B1629; }
+        .section-title { font-size: 11pt; font-weight: bold; color: #0B1F3A; margin-bottom: 6px; border-bottom: 1px solid rgba(11, 22, 41, 0.08); padding-bottom: 3px; }
+        .conditions { margin-bottom: 14px; }
+        .conditions ul { margin-top: 5px; padding-left: 20px; margin-bottom: 0; }
+        .conditions li { margin-bottom: 4px; font-size: 9.5pt; }
+        .admin-notes { background-color: #FAF7F1; border-left: 3px solid #0F5F66; padding: 8px 12px; margin-bottom: 14px; font-size: 9.5pt; font-style: italic; color: #3C4A60; }
+        .signature-block { margin-top: 22px; margin-bottom: 22px; }
+        .signature-line { width: 250px; border-bottom: 1px solid #0B1629; margin-bottom: 5px; }
+        .disclaimer { background-color: #fdfbf7; border: 1px solid #e0dcd3; padding: 10px; font-size: 7.5pt; color: #555; text-align: justify; line-height: 1.3; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="brand-mark">{% include "_qcmark.svg.html" %}</div>
+        <div class="brand-wordmark">
+            <div class="logo">QUALIFIED COMMERCIAL</div>
+            <div class="sub-logo">Financing &amp; Capital Advisory</div>
+        </div>
+        <div class="contact-info">
+            123 Financial Way, Suite 400<br>
+            Garfield, NJ 07026<br>
+            support@qualifiedcommercial.com<br>
+            www.qualifiedcommercial.com
+        </div>
+    </div>
+
+    <div class="title">Letter of Pre-Qualification</div>
+
+    <div class="dates">
+        <p>Date Issued: <span>{{ today_date }}</span></p>
+        <p>Expiration Date: <span>{{ expiration_date }}</span></p>
+    </div>
+
+    <div class="intro">
+        To Whom It May Concern:<br><br>
+        Based on a review of the borrower's credit profile, stated liquidity, and real estate
+        investment experience, <strong>Qualified Commercial LLC</strong> is pleased to issue this
+        Pre-Qualification for the purchase of the subject property listed below. The borrower
+        meets the initial underwriting criteria for our Commercial Bridge financing program.
+    </div>
+
+    <div class="section-title">TRANSACTION SUMMARY</div>
+    <table class="terms-table">
+        <tr><th>Borrower / Entity Name</th><td>{{ borrower_entity }}</td></tr>
+        <tr><th>Subject Property Address</th><td>{{ target_property_address }}</td></tr>
+        <tr><th>Estimated Purchase Price</th><td>{{ purchase_price }}</td></tr>
+        <tr><th>Maximum Purchase Loan Amount</th><td>{{ max_loan_amount }}</td></tr>
+        <tr><th>Maximum Loan-to-Value (As-Is LTV)</th><td>{{ max_ltv }}%</td></tr>
+        <tr><th>Loan Program</th><td>Commercial Bridge / Short-Term Financing</td></tr>
+    </table>
+
+    {% if admin_notes %}
+    <div class="admin-notes">
+        <strong>Underwriter notes:</strong> {{ admin_notes }}
+    </div>
+    {% endif %}
+
+    <div class="conditions">
+        <div class="section-title">CONDITIONS TO CLOSE</div>
+        <ul>
+            <li><strong>Appraisal:</strong> Receipt of a satisfactory third-party appraisal validating the purchase price and "As-Is" market value of the property.</li>
+            <li><strong>Title &amp; Insurance:</strong> Receipt of clear, marketable title and a valid hazard/liability insurance policy listing the lender as Loss Payee.</li>
+            <li><strong>Liquidity &amp; Reserves:</strong> Verification of sufficient cash-to-close for the down payment and required closing costs.</li>
+            <li><strong>Entity Verification:</strong> Final review of LLC operating agreements and related corporate documentation.</li>
+        </ul>
+    </div>
+
+    <div class="signature-block">
+        <p style="margin:0 0 35px 0;">Sincerely,</p>
+        <div class="signature-line"></div>
+        <strong>Franco</strong><br>
+        Managing Director | Qualified Commercial LLC<br>
+        franco@qualifiedcommercial.com
+    </div>
+
+    <div class="disclaimer">
+        <strong>DISCLAIMER:</strong> This letter is a preliminary pre-qualification based on a soft-inquiry credit review and unverified, self-reported financial data provided by the borrower. This is <strong>NOT a commitment to lend</strong>, an offer of credit, or a final loan approval. All loans are strictly subject to final underwriting review, a full acceptable appraisal, environmental reports (if applicable), title clearance, verification of liquid reserves, and final approval by the designated lending institution. Qualified Commercial LLC acts as a commercial loan brokerage platform. Terms, rates, and guidelines are subject to market changes without notice and are not locked until a formal rate lock agreement is executed.
+    </div>
+</body>
+</html>

@@ -22,6 +22,7 @@ from app.models.loan_instruction import LoanInstruction  # noqa: F401
 from app.models.loan_participant import LoanParticipant  # noqa: F401
 from app.models.loan_scenario import LoanScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
+from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401
