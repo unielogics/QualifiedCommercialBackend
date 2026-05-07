@@ -55,6 +55,8 @@ def _to_read(row: CreditPull) -> CreditPullRead:
 async def current(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> CreditPullRead | None:
     cid = _client_id_for(user)
     if cid is None:
+        # User has no client record (operator role, or not yet provisioned).
+        log.info("GET /credit/current user=%s role=%s client_id=None -> null", user.email, user.role)
         return None
     stmt = (
         select(CreditPull)
@@ -65,6 +67,11 @@ async def current(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> Cred
         .limit(1)
     )
     row = (await db.execute(stmt)).scalar_one_or_none()
+    log.info(
+        "GET /credit/current user=%s role=%s client_id=%s -> %s",
+        user.email, user.role, cid,
+        f"pull_id={row.id} fico={row.fico}" if row else "null (no valid pull)",
+    )
     return _to_read(row) if row else None
 
 
