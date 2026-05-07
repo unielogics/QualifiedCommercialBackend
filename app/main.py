@@ -68,6 +68,18 @@ async def startup() -> None:
     if not settings.anthropic_api_key:
         log.warning("ANTHROPIC_API_KEY is unset — AI orchestrator will fail when invoked.")
 
+    # Start the in-process APScheduler. See app/services/scheduler.py
+    # for the SINGLE-INSTANCE assumption — must move to AWS EventBridge
+    # before scaling out to multiple backend instances.
+    from app.services.scheduler import start_scheduler
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    from app.services.scheduler import shutdown_scheduler
+    shutdown_scheduler()
+
 
 @app.get("/", tags=["health"])
 async def root() -> dict[str, str]:

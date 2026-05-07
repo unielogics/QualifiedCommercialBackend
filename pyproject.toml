@@ -26,6 +26,9 @@ dependencies = [
     # FileSystemLoader in app/services/prequal_pdf.py without surprise.
     "jinja2>=3.1.0",
     "weasyprint>=63.0",
+    # In-process scheduler for recurring AI / calendar / digest work.
+    # See app/services/scheduler.py — single-instance assumption only.
+    "apscheduler>=3.10.0",
 ]
 
 [project.optional-dependencies]
