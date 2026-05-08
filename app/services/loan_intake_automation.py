@@ -595,17 +595,23 @@ async def evaluate_doc_reminders(
             loan = await _get_loan(doc.loan_id)
             if loan is None:
                 continue
-            checklist = _checklist_for(settings, str(loan.type))
-            offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
-            # Per-item due_offset_days takes precedence over the
-            # loan-type default when the checklist item exists
-            # (alembic 0019 / doc-checklist-v2).
-            for item in checklist.docs or []:
-                if item.name == doc.checklist_key or item.name == doc.name:
-                    offset = item.due_offset_days
-                    break
-            due_date = doc.requested_on + timedelta(days=offset)
-            days_until_due = (due_date - today).days
+            # Per-loan operator override (alembic 0022) wins over
+            # both per-item and per-loan-type defaults — set via
+            # PATCH /documents/{id} from the Workflow tab.
+            if doc.due_date is not None:
+                effective_due = doc.due_date
+            else:
+                checklist = _checklist_for(settings, str(loan.type))
+                offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
+                # Per-item due_offset_days takes precedence over the
+                # loan-type default when the checklist item exists
+                # (alembic 0019 / doc-checklist-v2).
+                for item in checklist.docs or []:
+                    if item.name == doc.checklist_key or item.name == doc.name:
+                        offset = item.due_offset_days
+                        break
+                effective_due = doc.requested_on + timedelta(days=offset)
+            days_until_due = (effective_due - today).days
             scenario = classify(days_until_due)
             if scenario is None:
                 continue

@@ -20,7 +20,7 @@ from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
 from app.schemas.activity import ActivityRead
-from app.schemas.document import RequiredDocumentRead
+from app.schemas.document import RequiredDocumentRead, WorkflowDocRead, WorkflowRunResult
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
@@ -158,6 +158,134 @@ async def list_required_documents(
         )
     )
     return out
+
+
+@router.get("/{loan_id}/workflow", response_model=list[WorkflowDocRead])
+async def list_loan_workflow(
+    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[WorkflowDocRead]:
+    """The AI's collection plan for this loan. One row per Document
+    on the loan, joined with the per-loan-type checklist's
+    `due_offset_days` + the live scenario classifier so the operator
+    sees what the AI will say next and when.
+
+    Used by the Workflow tab on the loan detail page. Mutations are
+    PATCH /documents/{id}; manual reminder dispatch is
+    POST /loans/{id}/run-doc-reminders below.
+    """
+    from datetime import date as _date_type, timedelta as _timedelta
+
+    from app.models.app_settings import AppSettings as _AppSettings
+    from app.models.document import Document as _Document
+    from app.services.doc_collection_ai import classify as _classify
+    from app.services.loan_intake_automation import (
+        _checklist_for,
+        _coerce_settings,
+        _DEFAULT_FIRST_DAYS,
+    )
+
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    settings_row = (
+        await db.execute(select(_AppSettings).limit(1))
+    ).scalar_one_or_none()
+    settings = _coerce_settings(settings_row)
+    checklist = _checklist_for(settings, str(loan.type))
+    item_offset_by_name: dict[str, int] = {}
+    for item in checklist.docs or []:
+        item_offset_by_name[item.name] = item.due_offset_days
+    fallback_offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
+
+    docs = (
+        await db.execute(
+            select(_Document)
+            .where(_Document.loan_id == loan_id)
+            .order_by(_Document.name.asc())
+        )
+    ).scalars().all()
+
+    today = _date_type.today()
+    out: list[WorkflowDocRead] = []
+    for d in docs:
+        offset = item_offset_by_name.get(d.checklist_key or "", fallback_offset)
+        default_due = (
+            d.requested_on + _timedelta(days=offset) if d.requested_on else None
+        )
+        effective_due = d.due_date or default_due
+        days_until = (effective_due - today).days if effective_due else None
+        scenario = _classify(days_until) if days_until is not None else None
+
+        # Compute the next scenario boundary so the UI can show
+        # "next message in X days". Scenarios in order:
+        #   heads_up (3 → 1) → due_today (0) → just_late (-1 → -3)
+        #   → week_late (-4 → -7) → escalating (-8+)
+        next_scenario: str | None = None
+        next_in: int | None = None
+        if days_until is not None and effective_due is not None:
+            for boundary, label in [
+                (3, "heads_up"),
+                (0, "due_today"),
+                (-1, "just_late"),
+                (-4, "week_late"),
+                (-8, "escalating"),
+            ]:
+                # Days until the doc reaches `boundary` from today.
+                gap = days_until - boundary
+                if gap > 0:
+                    next_scenario = label
+                    next_in = gap
+                    break
+
+        out.append(
+            WorkflowDocRead(
+                document_id=d.id,
+                name=d.name,
+                status=d.status,
+                checklist_key=d.checklist_key,
+                is_other=bool(d.is_other),
+                requested_on=d.requested_on,
+                received_on=d.received_on,
+                due_date=d.due_date,
+                default_due_date=default_due,
+                effective_due_date=effective_due,
+                days_until_due=days_until,
+                scenario=scenario,
+                next_scenario=next_scenario,
+                next_scenario_in_days=next_in,
+            )
+        )
+    return out
+
+
+@router.post(
+    "/{loan_id}/run-doc-reminders",
+    response_model=WorkflowRunResult,
+)
+async def run_loan_doc_reminders(
+    loan_id: UUID, user: GatedUser, db: AsyncSession = Depends(get_db)
+) -> WorkflowRunResult:
+    """Manually fire the doc-collection evaluator for THIS loan only.
+
+    Operator clicks "Send reminder now" on the Workflow tab; we run
+    `evaluate_doc_reminders(scope_loan_id=...)` so any doc currently
+    in a reminder scenario gets a fresh AI message (subject to the
+    per-(doc, scenario) dedup — already-fired scenarios stay quiet).
+    Returns the per-scenario count for the toast.
+    """
+    if user.role == Role.CLIENT:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Borrowers cannot manually run reminders"
+        )
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    from app.services.loan_intake_automation import evaluate_doc_reminders
+    counts = await evaluate_doc_reminders(scope_loan_id=loan_id)
+    return WorkflowRunResult(counts=counts)
 
 
 @router.get("/{loan_id}/activity", response_model=list[ActivityRead])

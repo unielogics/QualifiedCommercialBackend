@@ -33,6 +33,11 @@ class Document(TimestampMixin, Base):
     status: Mapped[DocStatus] = mapped_column(String(32), default=DocStatus.PENDING)
 
     requested_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Per-loan override of the computed due date (alembic 0022).
+    # NULL = the cron computes `requested_on + due_offset_days` using
+    # the per-loan-type checklist defaults. Non-NULL wins — set via
+    # PATCH /documents/{id} from the loan detail's Workflow tab.
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     received_on: Mapped[date | None] = mapped_column(Date, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     verified_by: Mapped[str | None] = mapped_column(String(64), nullable=True)  # 'ai' | user_id

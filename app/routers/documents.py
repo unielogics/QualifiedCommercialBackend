@@ -19,6 +19,7 @@ from app.models.activity import Activity
 from app.models.document import Document
 from app.models.loan import Loan
 from app.schemas.document import (
+    DocumentPatch,
     DocumentRead,
     DocumentRequest,
     DocumentUploadComplete,
@@ -308,6 +309,60 @@ async def upload_complete(
 class DocumentRouteRequest(BaseModel):
     checklist_key: str | None = None
     is_other: bool = False
+
+
+@router.patch("/{document_id}", response_model=DocumentRead)
+async def patch_document(
+    document_id: UUID,
+    payload: DocumentPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRead:
+    """Partial update. Today only `due_date` is mutable through
+    this — set to a date to override the AI's collection schedule
+    for this single doc on this loan; pass null in the body to
+    clear the override and return to the per-loan-type default.
+
+    The cron honors `due_date` directly when set; the operator can
+    accelerate ("collect by Monday") or delay without touching
+    settings."""
+    doc = await db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    loan = await db.get(Loan, doc.loan_id)
+    if loan is None or not _scope_loan(user, loan):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    if user.role == Role.CLIENT:
+        # Borrowers can't reschedule their own collection — that's
+        # an operator workflow lever.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Borrowers cannot edit due dates",
+        )
+
+    sent = payload.model_fields_set
+    if "due_date" in sent:
+        doc.due_date = payload.due_date
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="document.due_date_changed",
+                summary=(
+                    f"Due date for {doc.name} → "
+                    f"{doc.due_date.isoformat() if doc.due_date else 'default'}"
+                ),
+                payload={
+                    "doc_id": str(doc.id),
+                    "due_date": doc.due_date.isoformat() if doc.due_date else None,
+                },
+            )
+        )
+
+    await db.flush()
+    await db.refresh(doc)
+    return DocumentRead.model_validate(doc)
 
 
 @router.post("/{document_id}/route", response_model=DocumentRead)
