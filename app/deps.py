@@ -246,6 +246,33 @@ async def get_current_user(
                 "Backfilled identity for clerk_id=%s email=%s name=%r (was %r)",
                 clerk_id, email, name, old_name,
             )
+
+    # Ensure every BROKER-role user has a Broker row. Without one, the
+    # `user.broker.id` scope filter in /loans, /clients, /reports,
+    # /ai-tasks, /agents/me/* silently no-ops — meaning the broker
+    # would see firm-wide data instead of their own book. Auto-create
+    # on first authed request (idempotent — only fires when missing).
+    if user.role == Role.BROKER and user.broker is None:
+        from app.models.broker import Broker as _Broker
+        broker = _Broker(
+            user_id=user.id,
+            display_name=user.name or user.email or "Broker",
+        )
+        db.add(broker)
+        await db.flush()
+        # Re-fetch with relationships loaded so downstream
+        # `user.broker.id` resolves without a lazy round-trip.
+        user = (
+            await db.execute(
+                select(User)
+                .options(_with_client, _with_broker)
+                .where(User.id == user.id)
+            )
+        ).scalar_one()
+        log.info(
+            "Auto-provisioned Broker row for user=%s email=%s",
+            user.id, user.email,
+        )
     return user
 
 
