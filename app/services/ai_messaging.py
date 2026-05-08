@@ -81,10 +81,18 @@ async def post_ai_message(
     loan_id: UUID | None,
     body: str,
     title_hint: str | None = None,
+    actions: list[dict] | None = None,
+    attachments: list[dict] | None = None,
 ) -> AIChatThread:
     """Append an assistant-role message to the (user, loan) thread.
     Find-or-creates the thread, updates last_message_preview /
     last_message_at, returns the thread.
+
+    `actions` and `attachments` ride on the message (alembic 0020):
+    `actions` are CTAs the frontend renders as buttons (kickoff
+    "Upload Bank Statements" pills, post-anchor confirmations); the
+    schema is enforced by `app.routers.ai.ChatAction`. Empty / None
+    means a plain text message — same as before.
 
     Caller is responsible for committing the surrounding session —
     this function only flushes (so it composes cleanly inside a
@@ -95,13 +103,19 @@ async def post_ai_message(
     thread = await _find_or_create_thread(
         db, user_id=user_id, loan_id=loan_id, title_hint=title_hint
     )
-    msg = AIChatMessage(thread_id=thread.id, role="assistant", body=body.strip())
+    msg = AIChatMessage(
+        thread_id=thread.id,
+        role="assistant",
+        body=body.strip(),
+        actions=actions or None,
+        attachments=attachments or None,
+    )
     db.add(msg)
     thread.last_message_preview = _preview(body)
     thread.last_message_at = datetime.now(timezone.utc)
     await db.flush()
     log.info(
-        "post_ai_message: user=%s loan=%s thread=%s body_len=%d",
-        user_id, loan_id, thread.id, len(body),
+        "post_ai_message: user=%s loan=%s thread=%s body_len=%d actions=%d",
+        user_id, loan_id, thread.id, len(body), len(actions or []),
     )
     return thread

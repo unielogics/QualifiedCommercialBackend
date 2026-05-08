@@ -114,6 +114,12 @@ class Loan(TimestampMixin, Base):
     # manual message in the client thread (handled in routers/loan_workspace.py).
     ai_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Set by the AI's `complete_property_intake` tool once enough
+    # property facts have been gathered (beds/baths/sqft/units/year).
+    # The intake opener stops asking once this is set; the chat moves
+    # on to doc collection.
+    intake_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     client: Mapped[Client] = relationship(back_populates="loans")
     lender: Mapped["Lender | None"] = relationship(back_populates="loans")
     documents: Mapped[list[Document]] = relationship(back_populates="loan", cascade="all, delete-orphan")

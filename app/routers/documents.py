@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -290,5 +291,149 @@ async def upload_complete(
 
     await mark_loan_dirty(db, loan.id)
     await db.flush()
+    await db.refresh(doc)
+    return DocumentRead.model_validate(doc)
+
+
+# ── Conversational doc-collector: re-route an orphan upload ──────────
+#
+# Hit by the `confirm_document_routing` chat CTA. The borrower
+# uploaded a file via the chat composer and the AI proposed a
+# checklist slot ("Looks like Bank Statements — file under that?").
+# Tapping confirm sends the doc here; the slot is set and any
+# pre-existing REQUESTED row is merged into this doc (so anchors
+# fire from a single source of truth).
+
+
+class DocumentRouteRequest(BaseModel):
+    checklist_key: str | None = None
+    is_other: bool = False
+
+
+@router.post("/{document_id}/route", response_model=DocumentRead)
+async def route_document(
+    document_id: UUID,
+    payload: DocumentRouteRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRead:
+    """Relink an orphan upload to a checklist slot.
+
+    Used by the chat's `confirm_document_routing` CTA after the
+    vision scan proposed a slot. If a REQUESTED row already exists
+    on the same loan with the proposed `checklist_key`, the orphan's
+    s3_key + scan results merge into that row and the orphan is
+    deleted; otherwise we just rewrite this row's checklist_key /
+    is_other and let it stand on its own.
+
+    Idempotent — calling twice with the same key is a no-op the
+    second time.
+    """
+    doc = await db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    loan = await db.get(Loan, doc.loan_id)
+    if loan is None or not _scope_loan(user, loan):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    target_key = (payload.checklist_key or "").strip() or None
+
+    if target_key is None:
+        # Mark explicitly as off-checklist. Vault still shows it.
+        doc.is_other = True
+        doc.checklist_key = None
+        await db.flush()
+        await db.refresh(doc)
+        return DocumentRead.model_validate(doc)
+
+    # Look for an existing REQUESTED row on this loan with that key.
+    target = (
+        await db.execute(
+            select(Document).where(
+                Document.loan_id == loan.id,
+                Document.checklist_key == target_key,
+                Document.id != doc.id,
+                Document.status == DocStatus.REQUESTED,
+            )
+        )
+    ).scalars().first()
+
+    if target is not None:
+        # Merge: move the orphan's blob + scan onto the REQUESTED row,
+        # then delete the orphan. Anchor scheduler fires from the
+        # surviving (target) row to keep dedup correct.
+        target.s3_key = doc.s3_key
+        target.status = DocStatus.RECEIVED
+        if target.received_on is None:
+            target.received_on = date.today()
+        target.scan_dirty = True
+        target.ai_scan_status = "queued"
+        if doc.ai_notes:
+            target.ai_notes = doc.ai_notes
+        if doc.ai_scan_confidence is not None:
+            target.ai_scan_confidence = doc.ai_scan_confidence
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="document.routed",
+                summary=f"Routed: {doc.name} → {target.name}",
+                payload={
+                    "orphan_doc_id": str(doc.id),
+                    "target_doc_id": str(target.id),
+                    "checklist_key": target_key,
+                },
+            )
+        )
+        await db.delete(doc)
+        await db.flush()
+        try:
+            from app.services.checklist_scheduler import fire_anchor_dependents
+            await fire_anchor_dependents(
+                db,
+                loan=loan,
+                anchor_event=f"doc_received:{target_key}",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "route_document: anchor scheduler failed loan=%s key=%s",
+                loan.deal_id, target_key,
+            )
+        await mark_loan_dirty(db, loan.id)
+        await db.refresh(target)
+        return DocumentRead.model_validate(target)
+
+    # No pre-existing REQUESTED row — relink in place.
+    doc.checklist_key = target_key
+    doc.is_other = False
+    if doc.status == DocStatus.PENDING:
+        doc.status = DocStatus.RECEIVED
+    if doc.received_on is None:
+        doc.received_on = date.today()
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="document.routed",
+            summary=f"Routed: {doc.name} → {target_key}",
+            payload={"doc_id": str(doc.id), "checklist_key": target_key},
+        )
+    )
+    await db.flush()
+    try:
+        from app.services.checklist_scheduler import fire_anchor_dependents
+        await fire_anchor_dependents(
+            db,
+            loan=loan,
+            anchor_event=f"doc_received:{target_key}",
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "route_document: anchor scheduler failed loan=%s key=%s",
+            loan.deal_id, target_key,
+        )
+    await mark_loan_dirty(db, loan.id)
     await db.refresh(doc)
     return DocumentRead.model_validate(doc)

@@ -347,6 +347,15 @@ async def kickoff_loan(
     except Exception:  # noqa: BLE001
         log.exception("kickoff_loan: property intake opener failed loan=%s", loan.deal_id)
 
+    # Conversational doc-list opener (Phase D). Drops a second
+    # message into the same thread listing the external items the
+    # borrower needs to upload, with up to 5 inline upload-CTAs.
+    # Skipped silently if no external docs were created.
+    try:
+        await _post_doc_collection_opener(db, loan)
+    except Exception:  # noqa: BLE001
+        log.exception("kickoff_loan: doc collection opener failed loan=%s", loan.deal_id)
+
     log.info(
         "kickoff_loan: loan=%s type=%s docs=%d tasks=%d total_in_checklist=%d",
         loan.deal_id, loan.type, docs_created, tasks_created, len(checklist.docs),
@@ -409,6 +418,98 @@ async def _post_property_intake_opener(db: AsyncSession, loan: Loan) -> None:
         user_id=client.user_id,
         loan_id=loan.id,
         body=body,
+    )
+
+
+async def _post_doc_collection_opener(db: AsyncSession, loan: Loan) -> None:
+    """Drop the conversational doc-list message right after kickoff.
+
+    Lists every external (borrower-uploadable) Document on this loan
+    that's still in REQUESTED status, with up to 5 upload-CTAs the
+    borrower can tap to jump straight into the right vault picker.
+    Anything beyond the 5-cap stays visible in the vault tab — the
+    chat just shows the most likely first asks.
+
+    Idempotent: if the loan's chat thread already has more than 1
+    message (i.e. somebody's already chatting), we skip — this is
+    a kickoff-only courtesy message.
+    """
+    from sqlalchemy import select as _select
+    from app.models.client import Client as _Client
+    from app.models.ai_chat_thread import AIChatThread as _AIChatThread, AIChatMessage as _AIChatMessage
+    from app.services.ai_messaging import post_ai_message
+
+    client = (
+        await db.execute(_select(_Client).where(_Client.id == loan.client_id))
+    ).scalar_one_or_none()
+    if client is None or client.user_id is None:
+        return
+
+    # Skip if the thread already has > 1 message (more than just the
+    # property-intake opener). Don't double-post on retry.
+    existing_thread = (
+        await db.execute(
+            _select(_AIChatThread).where(
+                _AIChatThread.user_id == client.user_id,
+                _AIChatThread.loan_id == loan.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_thread is not None:
+        msgs = (
+            await db.execute(
+                _select(_AIChatMessage).where(
+                    _AIChatMessage.thread_id == existing_thread.id
+                )
+            )
+        ).scalars().all()
+        if len(msgs) > 1:
+            return
+
+    # External docs only — borrower uploads, in REQUESTED state, with
+    # a checklist_key. Order by name for stable UX.
+    docs = (
+        await db.execute(
+            _select(Document)
+            .where(
+                Document.loan_id == loan.id,
+                Document.status == DocStatus.REQUESTED,
+                Document.checklist_key.is_not(None),
+            )
+            .order_by(Document.name.asc())
+        )
+    ).scalars().all()
+    if not docs:
+        return
+
+    top = docs[:5]
+    actions = [
+        {
+            "kind": "upload_document",
+            "label": f"Upload {d.name}",
+            "document_id": str(d.id),
+            "checklist_key": d.checklist_key,
+            "confirm": True,
+        }
+        for d in top
+    ]
+    extra = len(docs) - len(top)
+    extra_line = (
+        f"\n\nThere are **{extra} more** in your Vault tab when you're ready."
+        if extra > 0
+        else ""
+    )
+    body = (
+        "Once we wrap the property questions, here's what I'll need from you. "
+        "Tap any item below to upload — I'll review them as they come in."
+        + extra_line
+    )
+    await post_ai_message(
+        db,
+        user_id=client.user_id,
+        loan_id=loan.id,
+        body=body,
+        actions=actions,
     )
 
 
@@ -544,7 +645,7 @@ async def _emit_first_reminder(
     )
     nudge_body = (
         f"Quick nudge — we still need **{doc.name}** to keep your file moving. "
-        f"You can upload it from the Vault tab whenever it's ready."
+        f"Tap below whenever you're ready."
     )
     if doc.loan_id:
         # Legacy: deal-workspace chat (operator-visible)
@@ -557,7 +658,8 @@ async def _emit_first_reminder(
                 client_visible=True,
             )
         )
-    # New: borrower's per-loan AI chat thread.
+    # New: borrower's per-loan AI chat thread, with an inline upload
+    # CTA that deep-links into the right vault slot (Phase D).
     if loan is not None and loan.client is not None and loan.client.user_id is not None:
         try:
             from app.services.ai_messaging import post_ai_message  # local to avoid cycle
@@ -566,6 +668,15 @@ async def _emit_first_reminder(
                 user_id=loan.client.user_id,
                 loan_id=loan.id,
                 body=nudge_body,
+                actions=[
+                    {
+                        "kind": "upload_document",
+                        "label": f"Upload {doc.name}",
+                        "document_id": str(doc.id),
+                        "checklist_key": doc.checklist_key,
+                        "confirm": True,
+                    }
+                ],
             )
         except Exception:  # noqa: BLE001
             log.warning("doc reminder: post_ai_message failed for doc=%s", doc.id, exc_info=True)

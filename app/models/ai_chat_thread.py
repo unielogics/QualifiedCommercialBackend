@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -86,6 +86,15 @@ class AIChatMessage(TimestampMixin, Base):
     # replay history into the model.
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    # Structured CTAs the frontend renders as buttons under the
+    # bubble. Shape: list[ChatAction] (see app/routers/ai.py).
+    # Always None for user messages.
+    actions: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    # Files attached to this message. Shape:
+    # [{document_id, name, content_type, status, suggested_checklist_key}].
+    # User messages carry uploads from the chat composer; assistant
+    # messages may reference docs the AI scanned/produced.
+    attachments: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
 
     thread: Mapped["AIChatThread"] = relationship(
         "AIChatThread", back_populates="messages"

@@ -15,16 +15,17 @@ sees the same Living Loan File the dashboard does.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy.orm import selectinload
 
@@ -110,6 +111,74 @@ _PROPERTY_INTAKE_FIELDS = {
     "monthly_rent", "annual_taxes", "annual_insurance", "monthly_hoa",
 }
 
+
+# ── Conversational doc-collector tools (Phase B) ───────────────────────
+#
+# These three tools let the AI act like a secretary chasing the file:
+# every reply can carry up to 5 buttons the borrower taps to jump
+# straight into the right upload sheet. The tool handlers don't
+# write much state — they accumulate ChatAction dicts which the
+# tool-use loop attaches to the assistant message at the end of the
+# turn.
+
+REQUEST_DOCUMENT_UPLOAD_TOOL = {
+    "name": "request_document_upload",
+    "description": (
+        "Render an 'Upload <doc>' button under your reply. Use this "
+        "when you're asking the borrower to upload a specific file. "
+        "Pass `document_id` if a REQUESTED Document row already "
+        "exists (preferred — the upload routes straight into that "
+        "slot); otherwise pass `checklist_key` and the borrower will "
+        "be prompted to pick the file with that slot pre-selected. "
+        "`label` is the button text; default is 'Upload <doc name>'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string"},
+            "checklist_key": {"type": "string"},
+            "label": {"type": "string"},
+        },
+    },
+}
+
+CONFIRM_DOCUMENT_ROUTING_TOOL = {
+    "name": "confirm_document_routing",
+    "description": (
+        "Render a 'Yes, file under <slot>' / 'No, pick another' "
+        "button pair under your reply. Use this when the borrower "
+        "uploaded a file via the chat composer and the vision scan "
+        "suggested a slot you want to confirm before relinking. "
+        "`document_id` is the orphan upload; `target_checklist_key` "
+        "is the slot you're proposing."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string"},
+            "target_checklist_key": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": ["document_id", "target_checklist_key"],
+    },
+}
+
+COMPLETE_PROPERTY_INTAKE_TOOL = {
+    "name": "complete_property_intake",
+    "description": (
+        "Mark the property-intake interview complete. Call this only "
+        "after you have collected at least beds, baths, sqft, "
+        "year_built and unit_count via update_loan_property_details. "
+        "Sets loans.intake_complete_at = now() so the chat moves on "
+        "to doc collection."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+# Cap CTAs per assistant message so the chat doesn't turn into a
+# wall of buttons. The remainder is always visible in the vault.
+_MAX_ACTIONS_PER_MESSAGE = 5
+
 # Hard cap on tool-use round-trips per send-message. A multi-fact
 # borrower reply ("3 beds, 2 baths, 1500 sqft, built 1998") might
 # trigger 1-2 tool calls; this is a safety valve, not the steady
@@ -193,6 +262,142 @@ async def _execute_property_intake_tool(
 
     await db.flush()
     return {"ok": True, "updated": updated}
+
+
+async def _execute_request_document_upload_tool(
+    db: AsyncSession,
+    *,
+    user: User,
+    loan_id: UUID,
+    tool_input: dict,
+    accumulated_actions: list[dict],
+) -> dict:
+    """Resolve a request_document_upload tool call. Either a
+    `document_id` (preferred) or a `checklist_key` must resolve to
+    a Document on the same loan. Appends a ChatAction to
+    `accumulated_actions` and returns the resolved name + id so the
+    AI can reference it in the reply text."""
+    document_id_raw = (tool_input or {}).get("document_id")
+    checklist_key = (tool_input or {}).get("checklist_key")
+    label_override = (tool_input or {}).get("label")
+    if not document_id_raw and not checklist_key:
+        return {"ok": False, "error": "missing_target"}
+
+    doc: Document | None = None
+    if document_id_raw:
+        try:
+            doc_uuid = UUID(str(document_id_raw))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_document_id"}
+        doc = await db.get(Document, doc_uuid)
+        if doc is None or doc.loan_id != loan_id:
+            return {"ok": False, "error": "scope"}
+    else:
+        # Fallback — match the first REQUESTED row on this loan with
+        # that checklist_key.
+        doc = (
+            await db.execute(
+                select(Document).where(
+                    Document.loan_id == loan_id,
+                    Document.checklist_key == checklist_key,
+                    Document.status == DocStatus.REQUESTED,
+                )
+            )
+        ).scalars().first()
+
+    label = (label_override or "").strip() or (
+        f"Upload {doc.name}" if doc is not None else f"Upload {checklist_key}"
+    )
+
+    accumulated_actions.append({
+        "kind": "upload_document",
+        "label": label[:80],
+        "document_id": str(doc.id) if doc is not None else None,
+        "checklist_key": doc.checklist_key if doc is not None else checklist_key,
+        "confirm": True,
+    })
+    return {
+        "ok": True,
+        "document_id": str(doc.id) if doc is not None else None,
+        "name": doc.name if doc is not None else None,
+    }
+
+
+async def _execute_confirm_document_routing_tool(
+    db: AsyncSession,
+    *,
+    user: User,
+    loan_id: UUID,
+    tool_input: dict,
+    accumulated_actions: list[dict],
+) -> dict:
+    """Resolve a confirm_document_routing tool call. Validates that
+    the orphan document exists on this loan; appends a confirm +
+    decline pair to `accumulated_actions` (decline falls back to a
+    generic upload picker for the proposed slot)."""
+    document_id_raw = (tool_input or {}).get("document_id")
+    target_key = (tool_input or {}).get("target_checklist_key")
+    if not document_id_raw or not target_key:
+        return {"ok": False, "error": "missing_target"}
+    try:
+        doc_uuid = UUID(str(document_id_raw))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad_document_id"}
+    doc = await db.get(Document, doc_uuid)
+    if doc is None or doc.loan_id != loan_id:
+        return {"ok": False, "error": "scope"}
+
+    accumulated_actions.append({
+        "kind": "confirm_document_routing",
+        "label": f"Yes, file as {target_key}",
+        "document_id": str(doc.id),
+        "checklist_key": target_key,
+        "confirm": True,
+    })
+    accumulated_actions.append({
+        "kind": "upload_document",
+        "label": "No, let me pick",
+        "document_id": None,
+        "checklist_key": target_key,
+        "confirm": False,
+    })
+    return {"ok": True}
+
+
+async def _execute_complete_property_intake_tool(
+    db: AsyncSession,
+    *,
+    user: User,
+    loan_id: UUID,
+    accumulated_actions: list[dict],
+) -> dict:
+    """Mark intake complete on the Loan row. Idempotent — if it's
+    already set, leaves the existing timestamp."""
+    loan = await db.get(Loan, loan_id)
+    if loan is None:
+        return {"ok": False, "error": "loan_not_found"}
+    if user.role == Role.CLIENT:
+        if user.client is None or loan.client_id != user.client.id:
+            return {"ok": False, "error": "not_authorized"}
+    if loan.intake_complete_at is None:
+        loan.intake_complete_at = datetime.now(timezone.utc)
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label="ai",
+                kind="loan.property_intake_completed",
+                summary="Property intake interview wrapped up",
+                payload={},
+            )
+        )
+        await db.flush()
+    accumulated_actions.append({
+        "kind": "complete_property_intake",
+        "label": "Got it",
+        "confirm": False,
+    })
+    return {"ok": True}
 
 
 def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
@@ -584,11 +789,50 @@ class AIChatThreadRead(BaseModel):
         from_attributes = True
 
 
+class ChatAction(BaseModel):
+    """A button the frontend renders under an assistant bubble.
+
+    Three live `kind`s today; new kinds get added as we add CTAs:
+    - upload_document          → opens vault upload pre-targeted at
+                                 `document_id` (preferred) or
+                                 `checklist_key` (fallback)
+    - confirm_document_routing → for an orphan upload the AI is
+                                 proposing to file under
+                                 `checklist_key` (or `document_id`
+                                 of an existing REQUESTED row)
+    - complete_property_intake → no payload; fires
+                                 `loans.intake_complete_at = now()`
+                                 server-side and refetches the loan
+    - open_calendar_event      → opens a calendar event detail
+    """
+
+    kind: str
+    label: str
+    document_id: str | None = None
+    checklist_key: str | None = None
+    calendar_event_id: str | None = None
+    confirm: bool = True
+
+
+class ChatAttachment(BaseModel):
+    """A file riding on a chat message. Borrower uploads ride on the
+    user's send turn (paperclip composer); the AI inspects them via
+    the synchronous vision scan and proposes routing in its reply."""
+
+    document_id: str
+    name: str
+    content_type: str | None = None
+    status: str | None = None
+    suggested_checklist_key: str | None = None
+
+
 class AIChatMessageRead(BaseModel):
     id: UUID
     role: str
     body: str
     created_at: datetime
+    actions: list[ChatAction] | None = None
+    attachments: list[ChatAttachment] | None = None
 
     class Config:
         from_attributes = True
@@ -616,8 +860,14 @@ class AIChatThreadRename(BaseModel):
 
 
 class AIChatSendRequest(BaseModel):
-    body: str = Field(min_length=1)
+    # Allow empty body when attachments are present (paperclip-only sends).
+    body: str = ""
     loan_id: UUID | None = None
+    # Document IDs returned from /attachments/upload-init that should
+    # ride on this user message. Backend flips them PENDING→RECEIVED,
+    # runs vision scan, persists attachment metadata on the user msg,
+    # and feeds the scan suggestion into the AI's context.
+    attachment_tokens: list[UUID] | None = None
 
 
 class AIChatSendResponse(BaseModel):
@@ -625,6 +875,17 @@ class AIChatSendResponse(BaseModel):
     assistant_message: AIChatMessageRead
     thread: AIChatThreadRead
     used_stub: bool
+
+
+class ChatAttachmentInitRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    content_type: str = "application/pdf"
+
+
+class ChatAttachmentInitResponse(BaseModel):
+    document_id: UUID
+    upload_url: str | None
+    s3_key: str
 
 
 def _preview(text: str, limit: int = 200) -> str:
@@ -811,6 +1072,78 @@ async def delete_chat_thread(
 
 
 @router.post(
+    "/chat/threads/{thread_id}/attachments/upload-init",
+    response_model=ChatAttachmentInitResponse,
+)
+async def chat_attachment_upload_init(
+    thread_id: UUID,
+    payload: ChatAttachmentInitRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ChatAttachmentInitResponse:
+    """Mint a presigned PUT for a file the borrower drops into the
+    chat composer. Creates a PENDING `is_other=True` Document on the
+    thread's loan; the next /message send (with this id in
+    `attachment_tokens`) flips it RECEIVED, runs the vision scan,
+    and lets the AI propose a routing.
+
+    Account-wide threads can't accept attachments — there's no loan
+    to attach the doc to. 400 in that case."""
+    thread = await _load_thread_for_user(db, thread_id, user)
+    if thread.loan_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Attachments require a loan-scoped chat thread.",
+        )
+    loan = await db.get(Loan, thread.loan_id)
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    settings = get_settings()
+    s3_key = f"loans/{loan.deal_id}/{uuid4()}-{payload.name}"
+    doc = Document(
+        loan_id=loan.id,
+        name=payload.name,
+        category=payload.content_type,
+        checklist_key=None,
+        is_other=True,
+        s3_key=s3_key,
+        status=DocStatus.PENDING,
+    )
+    db.add(doc)
+    await db.flush()
+    await db.refresh(doc)
+
+    upload_url: str | None = None
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        import boto3
+
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region,
+        )
+        upload_url = s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": settings.s3_bucket,
+                "Key": s3_key,
+                "ContentType": payload.content_type,
+                "ServerSideEncryption": "AES256",
+            },
+            ExpiresIn=900,
+        )
+
+    await db.commit()
+    return ChatAttachmentInitResponse(
+        document_id=doc.id,
+        upload_url=upload_url,
+        s3_key=s3_key,
+    )
+
+
+@router.post(
     "/chat/threads/{thread_id}/message",
     response_model=AIChatSendResponse,
 )
@@ -830,23 +1163,102 @@ async def append_thread_message(
     """
     thread = await _load_thread_for_user(db, thread_id, user)
 
+    body_text = (payload.body or "").strip()
+    attachment_tokens = payload.attachment_tokens or []
+    if not body_text and not attachment_tokens:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Message must include body text, an attachment, or both.",
+        )
+
     # 1. Persist the user's message immediately so the panel can
     #    optimistic-render or recover after an Anthropic failure.
     now = datetime.now(timezone.utc)
     user_msg = AIChatMessage(
         thread_id=thread.id,
         role="user",
-        body=payload.body,
+        body=body_text or "(attachment)",
     )
     db.add(user_msg)
-    thread.last_message_preview = _preview(payload.body)
+    preview_seed = body_text or "(attachment)"
+    thread.last_message_preview = _preview(preview_seed)
     thread.last_message_at = now
     # Auto-title from the first user message — much cheaper than a
     # round-trip to Haiku just for a title, and easy to override via
     # PATCH /threads/{id} later.
     if thread.title == "New conversation":
-        thread.title = _preview(payload.body, limit=60)
+        thread.title = _preview(preview_seed, limit=60)
     await db.flush()
+
+    # 1b. Process attachments (Phase C). For each token, flip the
+    #     pre-created Document PENDING → RECEIVED, run a synchronous
+    #     vision scan with an 8s cap, persist a chat attachment
+    #     record on the user_msg, and stash a context line for the
+    #     AI's prompt so it can fire confirm_document_routing.
+    attachment_records: list[dict] = []
+    attachment_context_lines: list[str] = []
+    if attachment_tokens and thread.loan_id is not None:
+        from app.services.document_scanner import scan_document  # local import — avoids circular
+
+        for token in attachment_tokens:
+            doc = await db.get(Document, token)
+            if doc is None or doc.loan_id != thread.loan_id:
+                log.warning(
+                    "attachment token %s skipped — not on thread loan", token
+                )
+                continue
+            if doc.status == DocStatus.PENDING and doc.s3_key:
+                doc.status = DocStatus.RECEIVED
+                if doc.received_on is None:
+                    doc.received_on = date.today()
+                doc.scan_dirty = True
+                doc.ai_scan_status = "queued"
+                await db.flush()
+            scan_result = None
+            if doc.s3_key and (doc.is_other or doc.checklist_key):
+                try:
+                    scan_result = await asyncio.wait_for(
+                        scan_document(db, doc.id), timeout=8.0
+                    )
+                except asyncio.TimeoutError:
+                    log.info("chat attachment scan timed out doc=%s", doc.id)
+                    scan_result = None
+                except Exception:  # noqa: BLE001
+                    log.exception("chat attachment scan failed doc=%s", doc.id)
+                    scan_result = None
+            await db.refresh(doc)
+            status_val = (
+                doc.status.value if hasattr(doc.status, "value") else str(doc.status)
+            )
+            attachment_records.append({
+                "document_id": str(doc.id),
+                "name": doc.name,
+                "content_type": doc.category,
+                "status": status_val,
+                "suggested_checklist_key": (
+                    scan_result.suggested_checklist_key if scan_result else None
+                ),
+            })
+            if scan_result is not None:
+                attachment_context_lines.append(
+                    f"User attached '{doc.name}' (document_id={doc.id}). "
+                    f"Vision scan: suggested_checklist_key="
+                    f"{scan_result.suggested_checklist_key!r}, "
+                    f"confidence={scan_result.confidence:.2f}, "
+                    f"matches_expected={scan_result.matches_expected}. "
+                    f"If you're reasonably confident, call "
+                    f"confirm_document_routing(document_id, target_checklist_key)."
+                )
+            else:
+                attachment_context_lines.append(
+                    f"User attached '{doc.name}' (document_id={doc.id}). "
+                    f"Vision scan unavailable — propose a slot based on the "
+                    f"filename and call confirm_document_routing if you're "
+                    f"confident, or list options with request_document_upload."
+                )
+        if attachment_records:
+            user_msg.attachments = attachment_records
+            await db.flush()
 
     # 2. Build context (account- or loan-scoped). Source-of-truth
     # is `thread.loan_id` — the request payload's `loan_id` is
@@ -895,12 +1307,20 @@ async def append_thread_message(
         if context_block:
             system += "\n\n" + context_block
 
-        # Loan-scoped threads get the property-intake tool. The AI
-        # calls update_loan_property_details to write structured
-        # facts onto the Loan row as the borrower answers — beds,
-        # baths, sqft, year_built, unit_count, etc. The intake
-        # opener (posted in kickoff_loan) primes the conversation.
-        tools = [PROPERTY_INTAKE_TOOL] if effective_loan_id is not None else None
+        # Loan-scoped threads get the property-intake tool plus the
+        # conversational doc-collector tools (Phase B). All of these
+        # need a loan_id to scope writes; outside that, the tool list
+        # is None and the AI replies in pure text.
+        tools = (
+            [
+                PROPERTY_INTAKE_TOOL,
+                REQUEST_DOCUMENT_UPLOAD_TOOL,
+                CONFIRM_DOCUMENT_ROUTING_TOOL,
+                COMPLETE_PROPERTY_INTAKE_TOOL,
+            ]
+            if effective_loan_id is not None
+            else None
+        )
 
         # Tool-use loop. Convert api_messages (string-content) into
         # block-content for the loop — Anthropic accepts both shapes
@@ -909,8 +1329,27 @@ async def append_thread_message(
         loop_messages: list[dict] = [
             {"role": m["role"], "content": m["content"]} for m in api_messages
         ]
+        # Inject attachment context into the final user turn so the AI
+        # sees the scan results without polluting the persisted
+        # message body. Wrapped in [SYSTEM] markers so the model
+        # knows it's metadata, not borrower-typed text.
+        if attachment_context_lines and loop_messages:
+            for i in range(len(loop_messages) - 1, -1, -1):
+                if loop_messages[i].get("role") == "user":
+                    addendum = "\n".join(
+                        ["", "[SYSTEM ATTACHMENT CONTEXT]", *attachment_context_lines]
+                    )
+                    loop_messages[i] = {
+                        "role": "user",
+                        "content": loop_messages[i]["content"] + addendum,
+                    }
+                    break
         reply_text = ""
         used_stub = False
+        # CTAs accumulated across all tool calls in this turn — the
+        # final assistant message persists them on `actions` (capped
+        # to _MAX_ACTIONS_PER_MESSAGE).
+        accumulated_actions: list[dict] = []
         try:
             iteration = 0
             while iteration < _TOOL_USE_MAX_ITERATIONS:
@@ -962,12 +1401,37 @@ async def append_thread_message(
                     tool_name = getattr(b, "name", "")
                     tool_id = getattr(b, "id", "")
                     tool_input = getattr(b, "input", {}) or {}
-                    if tool_name == "update_loan_property_details" and effective_loan_id is not None:
+                    if effective_loan_id is None:
+                        outcome = {"ok": False, "error": "no_loan_scope"}
+                    elif tool_name == "update_loan_property_details":
                         outcome = await _execute_property_intake_tool(
                             db,
                             user=user,
                             loan_id=effective_loan_id,
                             tool_input=tool_input,
+                        )
+                    elif tool_name == "request_document_upload":
+                        outcome = await _execute_request_document_upload_tool(
+                            db,
+                            user=user,
+                            loan_id=effective_loan_id,
+                            tool_input=tool_input,
+                            accumulated_actions=accumulated_actions,
+                        )
+                    elif tool_name == "confirm_document_routing":
+                        outcome = await _execute_confirm_document_routing_tool(
+                            db,
+                            user=user,
+                            loan_id=effective_loan_id,
+                            tool_input=tool_input,
+                            accumulated_actions=accumulated_actions,
+                        )
+                    elif tool_name == "complete_property_intake":
+                        outcome = await _execute_complete_property_intake_tool(
+                            db,
+                            user=user,
+                            loan_id=effective_loan_id,
+                            accumulated_actions=accumulated_actions,
                         )
                     else:
                         outcome = {"ok": False, "error": "unknown_tool"}
@@ -991,10 +1455,16 @@ async def append_thread_message(
             used_stub = True
 
     # 4. Persist the assistant reply + bump preview.
+    persisted_actions = (
+        accumulated_actions[:_MAX_ACTIONS_PER_MESSAGE]
+        if "accumulated_actions" in locals() and accumulated_actions
+        else None
+    )
     assistant_msg = AIChatMessage(
         thread_id=thread.id,
         role="assistant",
         body=reply_text,
+        actions=persisted_actions,
     )
     db.add(assistant_msg)
     thread.last_message_preview = _preview(reply_text)

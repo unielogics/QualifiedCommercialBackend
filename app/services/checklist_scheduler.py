@@ -247,6 +247,8 @@ async def fire_anchor_dependents(
     existing_actions = await _existing_ai_task_actions(db, loan.id)
     docs_total = 0
     tasks_total = 0
+    new_external_items: list[DocChecklistItem] = []
+    new_internal_items: list[DocChecklistItem] = []
     for item in matching:
         d, t = await materialize_item(
             db, loan, item,
@@ -255,11 +257,133 @@ async def fire_anchor_dependents(
         )
         docs_total += d
         tasks_total += t
+        if d > 0 and item.type == "external":
+            new_external_items.append(item)
+        if t > 0 and item.type == "internal":
+            new_internal_items.append(item)
     log.info(
         "fire_anchor_dependents: loan=%s anchor=%r → %d doc(s), %d task(s)",
         loan.deal_id, anchor_event, docs_total, tasks_total,
     )
+
+    # Conversational anchor narration (Phase D). When a doc-received
+    # anchor fires, drop a short message in the borrower's chat:
+    # external dependents get inline upload CTAs; internal-only
+    # firings get a "we've ordered X" status update with no buttons.
+    # Best-effort — never fail the scheduler over messaging hiccups.
+    if new_external_items or new_internal_items:
+        try:
+            await _post_anchor_narration(
+                db,
+                loan=loan,
+                anchor_event=anchor_event,
+                external_items=new_external_items,
+                internal_items=new_internal_items,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "fire_anchor_dependents: narration failed loan=%s anchor=%s",
+                loan.deal_id, anchor_event,
+            )
+
     return docs_total, tasks_total
+
+
+# Human-readable ETAs for each internal action — used when narrating
+# anchor firings ("I've ordered the appraisal — that usually takes
+# 5–7 business days"). Falls back to a generic line for unknown
+# action keys.
+_INTERNAL_ACTION_ETAS: dict[str, str] = {
+    "order_appraisal": "5–7 business days",
+    "order_title": "3–5 business days",
+    "shop_insurance": "2–3 business days",
+    "request_pfs": "shortly — we'll be in touch",
+}
+
+
+def _trigger_label_from_anchor(anchor_event: str) -> str:
+    """`doc_received:Bank Statements (2 mo)` → `Bank Statements (2 mo)`."""
+    if anchor_event.startswith("doc_received:"):
+        return anchor_event.split(":", 1)[1].strip() or "your last upload"
+    return "your last upload"
+
+
+async def _post_anchor_narration(
+    db: AsyncSession,
+    *,
+    loan: Loan,
+    anchor_event: str,
+    external_items: list[DocChecklistItem],
+    internal_items: list[DocChecklistItem],
+) -> None:
+    """Drop a chat message describing what just happened after an
+    anchor fired. Mixed firings (external + internal) get one
+    message that lists both — the borrower sees their next ask plus
+    what we ordered on their behalf."""
+    from sqlalchemy import select as _select
+    from app.models.client import Client as _Client
+    from app.services.ai_messaging import post_ai_message
+
+    client = (
+        await db.execute(_select(_Client).where(_Client.id == loan.client_id))
+    ).scalar_one_or_none()
+    if client is None or client.user_id is None:
+        return
+
+    trigger = _trigger_label_from_anchor(anchor_event)
+    parts: list[str] = []
+    actions: list[dict] = []
+
+    if external_items:
+        names = ", ".join(f"**{_display(item)}**" for item in external_items[:3])
+        parts.append(f"Got your {trigger}! Next up I need {names}.")
+        # Re-resolve the freshly-created Documents so we can deep-link
+        # the upload CTAs to specific document_ids.
+        from app.models.document import Document as _Document
+        from app.enums import DocStatus as _DocStatus
+        for item in external_items[:5]:
+            doc = (
+                await db.execute(
+                    _select(_Document).where(
+                        _Document.loan_id == loan.id,
+                        _Document.checklist_key == item.name,
+                        _Document.status == _DocStatus.REQUESTED,
+                    )
+                )
+            ).scalars().first()
+            actions.append({
+                "kind": "upload_document",
+                "label": f"Upload {_display(item)}",
+                "document_id": str(doc.id) if doc is not None else None,
+                "checklist_key": item.name,
+                "confirm": True,
+            })
+    if internal_items:
+        order_phrases: list[str] = []
+        for item in internal_items:
+            action = (item.internal_action or "").strip()
+            eta = _INTERNAL_ACTION_ETAS.get(action, "soon")
+            order_phrases.append(f"the {_display(item).lower()} ({eta})")
+        if order_phrases:
+            joined = ", ".join(order_phrases)
+            if external_items:
+                parts.append(f"On our side I've kicked off: {joined}.")
+            else:
+                parts.append(
+                    f"Got your {trigger}! On our side I've kicked off: {joined}."
+                )
+
+    if not parts:
+        return
+
+    body = " ".join(parts)
+    await post_ai_message(
+        db,
+        user_id=client.user_id,
+        loan_id=loan.id,
+        body=body,
+        actions=actions or None,
+    )
 
 
 async def materialize_kickoff_items(
