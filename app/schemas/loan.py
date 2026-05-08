@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.enums import DealHealth, LoanPurpose, LoanStage, LoanType, PropertyType
+from app.enums import DealHealth, LoanPurpose, LoanSide, LoanStage, LoanType, PropertyType
 from app.schemas.common import ORMModel
 
 
@@ -45,6 +45,9 @@ class LoanBase(BaseModel):
     property_type: PropertyType = PropertyType.SFR
     type: LoanType
     purpose: LoanPurpose | None = None
+    # Buyer-side or seller-side transaction (alembic 0023). Drives
+    # checklist filtering at kickoff. Defaults to buyer.
+    side: LoanSide = LoanSide.BUYER
     amount: float
     ltv: float | None = None
     ltc: float | None = None
@@ -72,6 +75,7 @@ class LoanUpdate(BaseModel):
     city: str | None = None
     property_type: PropertyType | None = None
     purpose: LoanPurpose | None = None
+    side: LoanSide | None = None
     stage: LoanStage | None = None
     amount: float | None = None
     ltv: float | None = None
@@ -107,6 +111,7 @@ class LoanRead(ORMModel):
     property_type: PropertyType
     type: LoanType
     purpose: LoanPurpose | None
+    side: LoanSide = LoanSide.BUYER
     stage: LoanStage
     amount: float
     ltv: float | None

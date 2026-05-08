@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from sqlalchemy import Date, ForeignKey, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -34,6 +34,14 @@ class Broker(TimestampMixin, Base):
     balance_points: Mapped[int] = mapped_column(Integer, default=0)
     funded_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     funded_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Per-broker overlay over the firm's settings (alembic 0023).
+    # Shape: AgentSettingsData in app/schemas/broker_settings.py.
+    # Includes the agent's checklist additions/disables (per loan_type
+    # × side), per-broker AI cadence overrides, and personal letterhead.
+    settings_data: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="broker")
     clients: Mapped[list[Client]] = relationship(back_populates="broker")

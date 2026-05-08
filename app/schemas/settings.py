@@ -55,6 +55,13 @@ class DocChecklistItem(BaseModel):
     # render the right CTA on the AITask. Examples:
     #   order_appraisal | order_title | shop_insurance | request_pfs
     internal_action: str | None = None
+    # Which side of the transaction this item applies to (alembic
+    # 0023). The kickoff cron filters by `loan.side`:
+    #   "buyer"  — only materialize when loan.side == buyer
+    #   "seller" — only materialize when loan.side == seller
+    #   "both"   — fires regardless (default; preserves existing
+    #              behavior for un-split firm checklists)
+    side: Literal["buyer", "seller", "both"] = "both"
 
 
 class LoanTypeChecklist(BaseModel):

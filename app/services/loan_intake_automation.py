@@ -330,12 +330,29 @@ async def kickoff_loan(
     callers happy).
     """
     from app.services.checklist_scheduler import materialize_kickoff_items  # local — avoid circular
+    from app.services.agent_checklist import resolve_loan_checklist  # alembic 0023
 
     settings = _coerce_settings(settings_row)
-    checklist = _checklist_for(settings, str(loan.type))
-    if not checklist.docs:
-        log.info("kickoff_loan: no checklist for type=%s loan=%s", loan.type, loan.deal_id)
+    # Resolved = firm baseline filtered by `loan.side` + agent overlay
+    # (disabled firm items dropped, agent's extra_items appended).
+    # Wrap the resolved items in a synthetic LoanTypeChecklist so the
+    # downstream materialize_kickoff_items keeps its existing shape.
+    resolved_items, base_checklist = await resolve_loan_checklist(
+        db, loan=loan, settings=settings,
+    )
+    if not resolved_items:
+        log.info(
+            "kickoff_loan: empty resolved checklist for type=%s side=%s loan=%s",
+            loan.type, getattr(loan, "side", "?"), loan.deal_id,
+        )
         return 0
+    checklist = LoanTypeChecklist(
+        docs=resolved_items,
+        first_reminder_days=base_checklist.first_reminder_days,
+        second_reminder_days=base_checklist.second_reminder_days,
+        escalate_after_days=base_checklist.escalate_after_days,
+        auto_approve_risk_score=base_checklist.auto_approve_risk_score,
+    )
 
     docs_created, tasks_created = await materialize_kickoff_items(db, loan, checklist)
 
@@ -601,12 +618,18 @@ async def evaluate_doc_reminders(
             if doc.due_date is not None:
                 effective_due = doc.due_date
             else:
-                checklist = _checklist_for(settings, str(loan.type))
-                offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
+                # Resolved checklist (alembic 0023): firm baseline
+                # filtered by loan.side, with agent overlay applied
+                # (disabled firm items dropped, custom items added).
+                from app.services.agent_checklist import resolve_loan_checklist
+                resolved_items, base_checklist = await resolve_loan_checklist(
+                    db, loan=loan, settings=settings,
+                )
+                offset = base_checklist.first_reminder_days if base_checklist else _DEFAULT_FIRST_DAYS
                 # Per-item due_offset_days takes precedence over the
                 # loan-type default when the checklist item exists
                 # (alembic 0019 / doc-checklist-v2).
-                for item in checklist.docs or []:
+                for item in resolved_items or []:
                     if item.name == doc.checklist_key or item.name == doc.name:
                         offset = item.due_offset_days
                         break

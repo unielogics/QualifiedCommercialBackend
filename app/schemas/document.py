@@ -34,15 +34,37 @@ class DocumentRead(ORMModel):
 
 
 class DocumentPatch(BaseModel):
-    """Partial update — currently used by the loan detail's
-    Workflow tab to set/clear `due_date`. Fields are independently
-    optional; missing keys leave the column alone, explicit `null`
-    clears the override (returns to computed default)."""
+    """Partial update from the loan detail's Workflow tab.
+    Fields are independently optional; missing keys leave the column
+    alone, explicit `null` (where applicable) clears the override.
+
+    Mutable today:
+      - `due_date` — set/clear the per-loan due date override
+      - `status`   — flip between REQUESTED ↔ SKIPPED (alembic 0023)
+      - `name`     — rename a custom doc the agent created"""
 
     due_date: date | None = None
+    status: DocStatus | None = None
+    name: str | None = None
     # Sentinel string the PATCH handler reads to distinguish
     # "leave alone" (key absent) from "clear" (key=null). pydantic
     # collapses both to None, so the handler uses model_fields_set.
+
+
+class DocumentCustomCreate(BaseModel):
+    """POST /loans/{id}/documents/custom — operator/agent adds a
+    one-off doc to a single loan's collection plan. Creates a
+    `Document` row with `is_other=True, checklist_key=null,
+    status=REQUESTED, requested_on=today` and returns the new row.
+    Used by the WorkflowTab's "+ Add custom item" button and the
+    SmartIntakeModal's pre-loan Documents step."""
+
+    name: str
+    due_date: date | None = None
+    # Optional checklist anchor. When set, points the custom doc at
+    # an existing checklist key so the cron knows which slot it
+    # fulfills. Most custom items leave this null.
+    checklist_key: str | None = None
 
 
 class WorkflowDocRead(BaseModel):
@@ -82,6 +104,10 @@ class WorkflowDocRead(BaseModel):
     # days from today). Helps the operator see what's coming.
     next_scenario: str | None = None
     next_scenario_in_days: int | None = None
+    # Which side of the transaction this doc applies to (alembic
+    # 0023). Carried so the Workflow tab can show a side pill per
+    # row. Falls back to "both" for is_other / custom rows.
+    side: str = "both"
 
 
 class WorkflowRunResult(BaseModel):

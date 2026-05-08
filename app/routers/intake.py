@@ -60,6 +60,8 @@ async def submit_intake(
         annual_taxes=payload.asset.annual_taxes,
         annual_insurance=payload.asset.annual_insurance,
         type=payload.numbers.type,
+        # Buyer / seller (alembic 0023). Drives checklist filtering.
+        side=payload.side,
         stage=LoanStage.PREQUALIFIED,
         amount=payload.numbers.amount,
         ltv=payload.numbers.ltv,
@@ -121,5 +123,41 @@ async def submit_intake(
     from app.services.loan_intake_automation import kickoff_loan as _kickoff
     settings_row = (await db.execute(select(_AppSettings).limit(1))).scalar_one_or_none()
     await _kickoff(db, loan, settings_row)
+
+    # Apply pre-loan document overrides captured in the
+    # SmartIntakeModal's Documents step (alembic 0023).
+    # `skip_names` flips the matching Documents from REQUESTED →
+    # SKIPPED so the AI doesn't chase them; `add_items` creates
+    # custom one-off Documents the agent typed in.
+    overrides = payload.document_overrides
+    if overrides is not None:
+        from app.models.document import Document as _Doc
+        from app.enums import DocStatus as _DocStatus
+        from datetime import date as _date_type
+        if overrides.skip_names:
+            existing = (await db.execute(
+                select(_Doc).where(
+                    _Doc.loan_id == loan.id,
+                    _Doc.status == _DocStatus.REQUESTED,
+                )
+            )).scalars().all()
+            skip_set = {n.strip() for n in overrides.skip_names if n}
+            for d in existing:
+                if (d.checklist_key and d.checklist_key in skip_set) or d.name in skip_set:
+                    d.status = _DocStatus.SKIPPED
+        for cust in overrides.add_items or []:
+            name = (cust.name or "").strip()
+            if not name:
+                continue
+            db.add(_Doc(
+                loan_id=loan.id,
+                name=name[:255],
+                status=_DocStatus.REQUESTED,
+                requested_on=_date_type.today(),
+                due_date=cust.due_date,
+                checklist_key=cust.checklist_key,
+                is_other=(cust.checklist_key is None),
+            ))
+        await db.flush()
 
     return SmartIntakeResponse(loan_id=loan.id, deal_id=deal_id)

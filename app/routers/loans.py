@@ -20,7 +20,13 @@ from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
 from app.schemas.activity import ActivityRead
-from app.schemas.document import RequiredDocumentRead, WorkflowDocRead, WorkflowRunResult
+from app.schemas.document import (
+    DocumentCustomCreate,
+    DocumentRead,
+    RequiredDocumentRead,
+    WorkflowDocRead,
+    WorkflowRunResult,
+)
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
@@ -179,7 +185,6 @@ async def list_loan_workflow(
     from app.models.document import Document as _Document
     from app.services.doc_collection_ai import classify as _classify
     from app.services.loan_intake_automation import (
-        _checklist_for,
         _coerce_settings,
         _DEFAULT_FIRST_DAYS,
     )
@@ -193,11 +198,18 @@ async def list_loan_workflow(
         await db.execute(select(_AppSettings).limit(1))
     ).scalar_one_or_none()
     settings = _coerce_settings(settings_row)
-    checklist = _checklist_for(settings, str(loan.type))
+    # Resolved checklist (alembic 0023): firm baseline + side filter +
+    # agent overlay. Same view the cron + kickoff materializer use.
+    from app.services.agent_checklist import resolve_loan_checklist
+    resolved_items, base_checklist = await resolve_loan_checklist(
+        db, loan=loan, settings=settings,
+    )
     item_offset_by_name: dict[str, int] = {}
-    for item in checklist.docs or []:
+    item_side_by_name: dict[str, str] = {}
+    for item in resolved_items:
         item_offset_by_name[item.name] = item.due_offset_days
-    fallback_offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
+        item_side_by_name[item.name] = item.side
+    fallback_offset = base_checklist.first_reminder_days if base_checklist else _DEFAULT_FIRST_DAYS
 
     docs = (
         await db.execute(
@@ -239,6 +251,7 @@ async def list_loan_workflow(
                     next_in = gap
                     break
 
+        side = item_side_by_name.get(d.checklist_key or "", "both")
         out.append(
             WorkflowDocRead(
                 document_id=d.id,
@@ -255,9 +268,81 @@ async def list_loan_workflow(
                 scenario=scenario,
                 next_scenario=next_scenario,
                 next_scenario_in_days=next_in,
+                side=side,
             )
         )
     return out
+
+
+@router.post(
+    "/{loan_id}/documents/custom",
+    response_model=DocumentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_custom_document(
+    loan_id: UUID,
+    payload: DocumentCustomCreate,
+    user: GatedUser,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRead:
+    """Operator/agent adds a one-off doc to this loan's collection
+    plan. Creates a `Document` row with `is_other=True,
+    checklist_key=null, status=REQUESTED, requested_on=today` and
+    optionally a per-loan `due_date`. Used by the WorkflowTab's
+    '+ Add custom item' button and the SmartIntakeModal's
+    pre-loan Documents step.
+
+    Borrowers can't add docs via this — that's an operator workflow
+    lever (it implies "we're collecting this from you").
+    """
+    from datetime import date as _date_type
+    from app.models.document import Document as _Document
+    from app.enums import DocStatus as _DocStatus
+
+    if user.role == Role.CLIENT:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Borrowers cannot add custom docs"
+        )
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "name is required")
+
+    doc = _Document(
+        loan_id=loan.id,
+        name=name[:255],
+        category=None,
+        s3_key=None,
+        status=_DocStatus.REQUESTED,
+        requested_on=_date_type.today(),
+        due_date=payload.due_date,
+        checklist_key=payload.checklist_key,
+        is_other=(payload.checklist_key is None),
+    )
+    db.add(doc)
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="document.custom_created",
+            summary=f"Custom doc added: {name}",
+            payload={
+                "doc_id": None,  # filled after flush
+                "name": name,
+                "checklist_key": payload.checklist_key,
+                "due_date": payload.due_date.isoformat() if payload.due_date else None,
+            },
+        )
+    )
+    await db.flush()
+    await db.refresh(doc)
+    await mark_loan_dirty(db, loan.id)
+    return DocumentRead.model_validate(doc)
 
 
 @router.post(

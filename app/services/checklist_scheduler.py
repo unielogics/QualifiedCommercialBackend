@@ -227,12 +227,24 @@ async def fire_anchor_dependents(
         # this module).
         from sqlalchemy import select as _select
         from app.models.app_settings import AppSettings as _AppSettings
-        from app.services.loan_intake_automation import _checklist_for, _coerce_settings
+        from app.services.loan_intake_automation import _coerce_settings
+        from app.services.agent_checklist import resolve_loan_checklist
         settings_row = (
             await db.execute(_select(_AppSettings).limit(1))
         ).scalar_one_or_none()
         settings = _coerce_settings(settings_row)
-        checklist = _checklist_for(settings, str(loan.type))
+        # Resolved checklist (alembic 0023): firm filtered by
+        # loan.side + agent overlay applied.
+        resolved_items, base_checklist = await resolve_loan_checklist(
+            db, loan=loan, settings=settings,
+        )
+        checklist = LoanTypeChecklist(
+            docs=resolved_items,
+            first_reminder_days=base_checklist.first_reminder_days,
+            second_reminder_days=base_checklist.second_reminder_days,
+            escalate_after_days=base_checklist.escalate_after_days,
+            auto_approve_risk_score=base_checklist.auto_approve_risk_score,
+        )
 
     if not checklist.docs:
         return 0, 0

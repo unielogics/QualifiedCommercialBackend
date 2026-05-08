@@ -19,6 +19,7 @@ from app.models.activity import Activity
 from app.models.document import Document
 from app.models.loan import Loan
 from app.schemas.document import (
+    DocumentCustomCreate,
     DocumentPatch,
     DocumentRead,
     DocumentRequest,
@@ -359,6 +360,43 @@ async def patch_document(
                 },
             )
         )
+    if "status" in sent and payload.status is not None:
+        # Operator/agent flips a doc in/out of the AI's collection
+        # plan (alembic 0023 added DocStatus.SKIPPED). We only
+        # accept the REQUESTED ↔ SKIPPED toggle here — other
+        # statuses (RECEIVED, VERIFIED, FLAGGED) are managed by
+        # the upload + scan flow and shouldn't be set manually.
+        if payload.status not in (DocStatus.REQUESTED, DocStatus.SKIPPED):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Only REQUESTED ↔ SKIPPED transitions are allowed here.",
+            )
+        old = doc.status
+        doc.status = payload.status
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=user.id,
+                actor_label=user.role,
+                kind="document.status_changed",
+                summary=f"{doc.name}: {old} → {doc.status}",
+                payload={
+                    "doc_id": str(doc.id),
+                    "from": str(old),
+                    "to": str(doc.status),
+                    "reason": (
+                        "skipped_by_operator"
+                        if payload.status == DocStatus.SKIPPED
+                        else "unskipped_by_operator"
+                    ),
+                },
+            )
+        )
+    if "name" in sent and payload.name is not None:
+        new_name = payload.name.strip()
+        if not new_name:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "name cannot be empty")
+        doc.name = new_name[:255]
 
     await db.flush()
     await db.refresh(doc)

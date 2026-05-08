@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-from app.enums import DealHealth, LoanPurpose, LoanStage, LoanType, PropertyType
+from app.enums import DealHealth, LoanPurpose, LoanSide, LoanStage, LoanType, PropertyType
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
@@ -68,6 +68,12 @@ class Loan(TimestampMixin, Base):
     # Loan
     type: Mapped[LoanType] = mapped_column(String(32), nullable=False)
     purpose: Mapped[LoanPurpose | None] = mapped_column(String(32), nullable=True)
+    # Buyer-side or seller-side transaction (alembic 0023). Drives
+    # checklist filtering — items tagged for the opposite side are
+    # not materialized for this loan.
+    side: Mapped[LoanSide] = mapped_column(
+        String(8), nullable=False, default=LoanSide.BUYER, server_default="buyer"
+    )
     stage: Mapped[LoanStage] = mapped_column(String(32), default=LoanStage.PREQUALIFIED)
     amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     ltv: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)

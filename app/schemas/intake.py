@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import date
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
-from app.enums import EntityType, ExperienceTier, LoanType, PropertyType
+from app.enums import EntityType, ExperienceTier, LoanSide, LoanType, PropertyType
 
 
 class BorrowerStep(BaseModel):
@@ -49,11 +50,35 @@ class AIRulesStep(BaseModel):
     intro_message: str | None = None
 
 
+class IntakeDocumentOverrides(BaseModel):
+    """Optional pre-loan checklist edits captured in the
+    SmartIntakeModal's Documents step (alembic 0023).
+
+    `skip_names` — firm checklist item names the agent doesn't want
+    materialized at kickoff (matches `DocChecklistItem.name`).
+    `add_items` — custom one-off docs the agent wants the AI to
+    collect on this loan in addition to the resolved checklist.
+    """
+    skip_names: list[str] = Field(default_factory=list)
+    add_items: list["IntakeCustomDoc"] = Field(default_factory=list)
+
+
+class IntakeCustomDoc(BaseModel):
+    name: str
+    due_date: date | None = None
+    checklist_key: str | None = None
+
+
 class SmartIntakePayload(BaseModel):
     borrower: BorrowerStep
     asset: AssetStep
     numbers: NumbersStep
     ai_rules: AIRulesStep
+    # Buyer / seller (alembic 0023). Defaults to buyer for purchase
+    # loans (the dominant case in current pipeline).
+    side: LoanSide = LoanSide.BUYER
+    # Pre-loan checklist edits applied at kickoff.
+    document_overrides: IntakeDocumentOverrides | None = None
 
 
 class SmartIntakeResponse(BaseModel):

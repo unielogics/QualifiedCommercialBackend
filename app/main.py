@@ -25,6 +25,7 @@ from app.routers import (
     legal,
     lenders,
     loan_participants,
+    me,
     loan_summary,
     loan_workspace,
     loans,
@@ -118,5 +119,6 @@ for r in [
     lenders.router,
     prequal.router,
     devices.router,
+    me.router,
 ]:
     app.include_router(r, prefix=api_prefix)

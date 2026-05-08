@@ -63,6 +63,16 @@ class LoanType(StrEnum):
     CASH_OUT_REFI = "cash_out_refi"
 
 
+class LoanSide(StrEnum):
+    """Which side of the real-estate transaction the borrower is on.
+    Drives doc-checklist filtering — buyer-side and seller-side
+    items are tagged on `DocChecklistItem.side` and the cron only
+    materializes items whose side matches (or 'both'). Default is
+    `buyer` — current pipeline is dominated by purchase loans."""
+    BUYER = "buyer"
+    SELLER = "seller"
+
+
 class LoanStage(StrEnum):
     """6-stage canonical pipeline (chat2.md final state)."""
     PREQUALIFIED = "prequalified"
@@ -94,6 +104,10 @@ class DocStatus(StrEnum):
     RECEIVED = "received"
     FLAGGED = "flagged"
     VERIFIED = "verified"
+    # Operator/agent removed this doc from the AI's collection plan
+    # for THIS specific loan. Cron skips over it; vault hides by
+    # default; can be flipped back to REQUESTED via PATCH /documents/{id}.
+    SKIPPED = "skipped"
 
 
 class AITaskPriority(StrEnum):
