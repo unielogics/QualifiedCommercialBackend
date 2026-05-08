@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -10,9 +10,51 @@ from pydantic import BaseModel, Field
 # --- Section: doc checklists ---------------------------------------------
 
 class DocChecklistItem(BaseModel):
+    """One row in the per-loan-type doc checklist.
+
+    Backwards compatible: every new field has a default, so older
+    AppSettings JSONB blobs still parse cleanly.
+    """
+
+    # Stable internal key — used to match Document.checklist_key,
+    # to anchor dependents, and as the de-dup key on retry. Keep
+    # short + canonical (e.g. "Bank Statements (2 mo)"). Don't show
+    # this raw string to borrowers if `display_name` is set.
     name: str
+    # What the borrower / operator sees in the UI. Falls back to
+    # `name` when null. Lets us write "Personal Financial Statement
+    # (PFS)" without changing the internal key.
+    display_name: str | None = None
+    # Who owns the item:
+    #   external — borrower uploads (Lease, Bank Statements, etc.).
+    #              Spawns Document(REQUESTED) + calendar event.
+    #   internal — operator orders (Appraisal, Title, Insurance,
+    #              PFS). Spawns AITask only — no Document, no
+    #              calendar event. Borrower never sees it.
+    type: Literal["internal", "external"] = "external"
     required: bool = True
     auto_request: bool = True
+    # Days from when this item's anchor event fires until the doc
+    # is "due" (drives the calendar event's starts_at). Used by
+    # both kickoff + the eager anchor scheduler.
+    due_offset_days: int = 3
+    # When this item gets created. One of:
+    #   "loan_created"               — at kickoff
+    #   "doc_received:<doc name>"    — when the named doc flips to
+    #                                  RECEIVED (eager scheduler
+    #                                  fires this in
+    #                                  /documents/upload-complete)
+    anchor: str = "loan_created"
+    # When True, fan out to N copies on kickoff — one per unit on
+    # the property. e.g. a 4-plex with per_unit=True on "Lease"
+    # creates 4 Documents named "Lease — Unit 1" through
+    # "Lease — Unit 4". Each carries `checklist_key=<name>` so
+    # uploads still match the right slot.
+    per_unit: bool = False
+    # For internal items only — short tag the operator UI uses to
+    # render the right CTA on the AITask. Examples:
+    #   order_appraisal | order_title | shop_insurance | request_pfs
+    internal_action: str | None = None
 
 
 class LoanTypeChecklist(BaseModel):

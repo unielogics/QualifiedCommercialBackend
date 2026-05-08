@@ -52,59 +52,218 @@ log = logging.getLogger(__name__)
 
 
 # Sane defaults when AppSettings.checklists has no entry for a loan
-# type. Operators can override per-loan-type from the Settings UI;
-# until they do, we don't want intake to silently skip doc collection.
+# type. Operators override per-loan-type from the Settings UI; until
+# they do, we don't want intake to silently skip doc collection.
+#
+# Each item carries:
+#   - type: internal (operator-ordered, AITask) | external (borrower
+#                     upload, Document)
+#   - anchor: when this item gets created — "loan_created" fires at
+#                     kickoff; "doc_received:<name>" fires when the
+#                     named external item flips to RECEIVED
+#   - due_offset_days: days from anchor → due
+#   - per_unit: fan out to N rows on multi-unit properties
+#   - internal_action: short tag for operator UI (only on internal)
+#
+# Internal items (Appraisal, Title, Insurance Binder, PFS) live in
+# the operator AI Inbox — borrower never sees them in the vault.
 _DEFAULT_DOCS_BY_TYPE: dict[str, list[DocChecklistItem]] = {
     "dscr": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Lease(s) / Rent Roll",     required=True, auto_request=True),
-        DocChecklistItem(name="Insurance Binder",         required=True, auto_request=True),
-        DocChecklistItem(name="Property Tax Statement",   required=True, auto_request=True),
+        # ── External: borrower-supplied at intake ────────────────
+        DocChecklistItem(
+            name="Driver's License", type="external",
+            anchor="loan_created", due_offset_days=1,
+        ),
+        DocChecklistItem(
+            name="Operating Agreement", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="EIN Letter (CP-575)", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Bank Statements (2 mo)", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        # Per-unit fan-out: a 4-plex needs 4 leases.
+        DocChecklistItem(
+            name="Lease", type="external", per_unit=True,
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Rent Roll", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Property Tax Statement", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        # ── Internal: operator-ordered ───────────────────────────
+        DocChecklistItem(
+            name="Personal Financial Statement (PFS)",
+            display_name="Personal Financial Statement (PFS)",
+            type="internal", internal_action="request_pfs",
+            anchor="loan_created", due_offset_days=0,
+        ),
+        DocChecklistItem(
+            name="Title Commitment", type="internal",
+            internal_action="order_title",
+            anchor="doc_received:Operating Agreement", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Insurance Binder", type="internal",
+            internal_action="shop_insurance",
+            anchor="doc_received:Property Tax Statement", due_offset_days=5,
+        ),
+        DocChecklistItem(
+            name="Appraisal", type="internal",
+            internal_action="order_appraisal",
+            anchor="doc_received:Bank Statements (2 mo)", due_offset_days=2,
+        ),
     ],
     "fix_and_flip": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Construction Budget / SOW", required=True, auto_request=True),
-        DocChecklistItem(name="Schedule of Real Estate Owned", required=True, auto_request=True),
-        DocChecklistItem(name="Contractor Bid",           required=True, auto_request=True),
+        DocChecklistItem(
+            name="Driver's License", type="external",
+            anchor="loan_created", due_offset_days=1,
+        ),
+        DocChecklistItem(
+            name="Operating Agreement", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="EIN Letter (CP-575)", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Bank Statements (2 mo)", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Construction Budget / SOW", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Schedule of Real Estate Owned", type="external",
+            anchor="loan_created", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Contractor Bid", type="external",
+            anchor="loan_created", due_offset_days=5,
+        ),
+        DocChecklistItem(
+            name="Personal Financial Statement (PFS)",
+            display_name="Personal Financial Statement (PFS)",
+            type="internal", internal_action="request_pfs",
+            anchor="loan_created", due_offset_days=0,
+        ),
+        DocChecklistItem(
+            name="Title Commitment", type="internal",
+            internal_action="order_title",
+            anchor="doc_received:Operating Agreement", due_offset_days=3,
+        ),
+        DocChecklistItem(
+            name="Insurance Binder", type="internal",
+            internal_action="shop_insurance",
+            anchor="doc_received:Construction Budget / SOW", due_offset_days=5,
+        ),
+        DocChecklistItem(
+            name="Appraisal", type="internal",
+            internal_action="order_appraisal",
+            anchor="doc_received:Bank Statements (2 mo)", due_offset_days=2,
+        ),
     ],
     "ground_up": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Plans & Permits",          required=True, auto_request=True),
-        DocChecklistItem(name="Construction Budget",      required=True, auto_request=True),
-        DocChecklistItem(name="Builder's Risk Insurance", required=True, auto_request=True),
+        DocChecklistItem(name="Driver's License", type="external",
+                         anchor="loan_created", due_offset_days=1),
+        DocChecklistItem(name="Operating Agreement", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="EIN Letter (CP-575)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Bank Statements (2 mo)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Plans & Permits", type="external",
+                         anchor="loan_created", due_offset_days=5),
+        DocChecklistItem(name="Construction Budget", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Personal Financial Statement (PFS)",
+                         display_name="Personal Financial Statement (PFS)",
+                         type="internal", internal_action="request_pfs",
+                         anchor="loan_created", due_offset_days=0),
+        DocChecklistItem(name="Builder's Risk Insurance", type="internal",
+                         internal_action="shop_insurance",
+                         anchor="doc_received:Construction Budget", due_offset_days=5),
+        DocChecklistItem(name="Title Commitment", type="internal",
+                         internal_action="order_title",
+                         anchor="doc_received:Operating Agreement", due_offset_days=3),
+        DocChecklistItem(name="Appraisal", type="internal",
+                         internal_action="order_appraisal",
+                         anchor="doc_received:Bank Statements (2 mo)", due_offset_days=2),
     ],
     "bridge": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Exit Strategy",            required=True, auto_request=True),
-        DocChecklistItem(name="Insurance Binder",         required=True, auto_request=True),
+        DocChecklistItem(name="Driver's License", type="external",
+                         anchor="loan_created", due_offset_days=1),
+        DocChecklistItem(name="Operating Agreement", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="EIN Letter (CP-575)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Bank Statements (2 mo)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Exit Strategy", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Personal Financial Statement (PFS)",
+                         display_name="Personal Financial Statement (PFS)",
+                         type="internal", internal_action="request_pfs",
+                         anchor="loan_created", due_offset_days=0),
+        DocChecklistItem(name="Insurance Binder", type="internal",
+                         internal_action="shop_insurance",
+                         anchor="doc_received:Bank Statements (2 mo)", due_offset_days=5),
+        DocChecklistItem(name="Title Commitment", type="internal",
+                         internal_action="order_title",
+                         anchor="doc_received:Operating Agreement", due_offset_days=3),
     ],
     "portfolio": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Schedule of Real Estate Owned", required=True, auto_request=True),
-        DocChecklistItem(name="Rent Rolls (all properties)", required=True, auto_request=True),
+        DocChecklistItem(name="Driver's License", type="external",
+                         anchor="loan_created", due_offset_days=1),
+        DocChecklistItem(name="Operating Agreement", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="EIN Letter (CP-575)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Bank Statements (2 mo)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Schedule of Real Estate Owned", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Rent Rolls (all properties)", type="external",
+                         anchor="loan_created", due_offset_days=5),
+        DocChecklistItem(name="Personal Financial Statement (PFS)",
+                         display_name="Personal Financial Statement (PFS)",
+                         type="internal", internal_action="request_pfs",
+                         anchor="loan_created", due_offset_days=0),
     ],
     "cash_out_refi": [
-        DocChecklistItem(name="Driver's License",         required=True, auto_request=True),
-        DocChecklistItem(name="Operating Agreement",      required=True, auto_request=True),
-        DocChecklistItem(name="EIN Letter (CP-575)",      required=True, auto_request=True),
-        DocChecklistItem(name="Bank Statements (2 mo)",   required=True, auto_request=True),
-        DocChecklistItem(name="Existing Mortgage Statement", required=True, auto_request=True),
-        DocChecklistItem(name="Insurance Binder",         required=True, auto_request=True),
+        DocChecklistItem(name="Driver's License", type="external",
+                         anchor="loan_created", due_offset_days=1),
+        DocChecklistItem(name="Operating Agreement", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="EIN Letter (CP-575)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Bank Statements (2 mo)", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Existing Mortgage Statement", type="external",
+                         anchor="loan_created", due_offset_days=3),
+        DocChecklistItem(name="Personal Financial Statement (PFS)",
+                         display_name="Personal Financial Statement (PFS)",
+                         type="internal", internal_action="request_pfs",
+                         anchor="loan_created", due_offset_days=0),
+        DocChecklistItem(name="Insurance Binder", type="internal",
+                         internal_action="shop_insurance",
+                         anchor="doc_received:Existing Mortgage Statement", due_offset_days=5),
+        DocChecklistItem(name="Title Commitment", type="internal",
+                         internal_action="order_title",
+                         anchor="doc_received:Operating Agreement", due_offset_days=3),
+        DocChecklistItem(name="Appraisal", type="internal",
+                         internal_action="order_appraisal",
+                         anchor="doc_received:Bank Statements (2 mo)", due_offset_days=2),
     ],
 }
 
@@ -147,73 +306,110 @@ async def kickoff_loan(
     loan: Loan,
     settings_row: AppSettings | None,
 ) -> int:
-    """Idempotent — creates Document rows + calendar reminders for a
-    freshly-spawned Loan based on the operator's checklist for that
-    loan type. Skips items whose `auto_request=False` (operator opts
-    them out at the settings level).
+    """Run the per-item checklist matrix for items anchored to
+    `loan_created`. Items anchored on `doc_received:<name>` are
+    materialized lazily by `fire_anchor_dependents` when the
+    prerequisite doc flips to RECEIVED.
 
-    Returns the count of new documents created.
+    Per-item behavior (centralized in
+    `services/checklist_scheduler.materialize_item`):
 
-    The doc-name+loan_id pair is the de-dup key; a re-run leaves the
-    existing rows alone. Calendar reminders ride on the document's
-    UUID so they're separately idempotent via the partial unique
-    index in alembic 0013."""
+      type=internal       → spawn AITask only
+      type=external       → spawn Document(REQUESTED) + calendar event
+                            (fan out to N rows when per_unit=True)
+
+    Idempotent on retry — `(loan_id, name)` is the dedup key for
+    Documents; `(loan_id, action)` is the dedup key for AITasks.
+
+    Also posts the property-intake opener message into the
+    borrower's per-loan AI thread so the first thing they see is
+    a friendly chat asking about beds / baths / sqft / units.
+
+    Returns the count of NEW Documents created (legacy contract —
+    AITask count is logged but not returned to keep the existing
+    callers happy).
+    """
+    from app.services.checklist_scheduler import materialize_kickoff_items  # local — avoid circular
+
     settings = _coerce_settings(settings_row)
     checklist = _checklist_for(settings, str(loan.type))
     if not checklist.docs:
         log.info("kickoff_loan: no checklist for type=%s loan=%s", loan.type, loan.deal_id)
         return 0
 
-    # Look up which doc names already exist on this loan so we don't
-    # re-request them on a kickoff retry.
-    existing = (
-        await db.execute(
-            select(Document.name).where(Document.loan_id == loan.id)
-        )
-    ).scalars().all()
-    existing_set = {n.lower().strip() for n in existing}
+    docs_created, tasks_created = await materialize_kickoff_items(db, loan, checklist)
 
-    today = date.today()
-    created = 0
-    for item in checklist.docs:
-        if not item.auto_request:
-            continue
-        if item.name.lower().strip() in existing_set:
-            continue
-        doc = Document(
-            loan_id=loan.id,
-            name=item.name,
-            checklist_key=item.name,
-            status=DocStatus.REQUESTED,
-            requested_on=today,
-        )
-        db.add(doc)
-        await db.flush()
-        await db.refresh(doc)
-
-        db.add(
-            Activity(
-                loan_id=loan.id,
-                actor_id=None,
-                actor_label="ai",
-                kind="document.requested",
-                summary=f"Auto-requested at intake: {item.name}",
-                payload={"doc_id": str(doc.id), "auto": True, "loan_type": str(loan.type)},
-            )
-        )
-
-        # Calendar reminder due in `first_reminder_days`. Phase 4 is
-        # the first place to honor the operator's configured cadence.
-        await calendar_emitter.emit_for_document_request(
-            db, doc, due_in_days=checklist.first_reminder_days
-        )
-        created += 1
+    # Post the property-intake opener so the borrower's per-loan
+    # AI thread starts with a useful AI message instead of being
+    # empty. Best-effort — never fail kickoff on a messaging hiccup.
+    try:
+        await _post_property_intake_opener(db, loan)
+    except Exception:  # noqa: BLE001
+        log.exception("kickoff_loan: property intake opener failed loan=%s", loan.deal_id)
 
     log.info(
-        "kickoff_loan: loan=%s type=%s created=%d total_in_checklist=%d",
-        loan.deal_id, loan.type, created, len(checklist.docs),
+        "kickoff_loan: loan=%s type=%s docs=%d tasks=%d total_in_checklist=%d",
+        loan.deal_id, loan.type, docs_created, tasks_created, len(checklist.docs),
     )
-    return created
+    return docs_created
+
+
+async def _post_property_intake_opener(db: AsyncSession, loan: Loan) -> None:
+    """Drop the first AI message into the borrower's per-loan thread.
+    Skips silently when:
+      - the loan has no client (data drift)
+      - the client has no linked user
+      - the thread already has messages (re-kickoff shouldn't spam)
+    """
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import selectinload as _selectinload
+    from app.models.client import Client as _Client
+    from app.models.ai_chat_thread import AIChatThread as _AIChatThread, AIChatMessage as _AIChatMessage
+    from app.services.ai_messaging import post_ai_message
+
+    client = (
+        await db.execute(
+            _select(_Client).where(_Client.id == loan.client_id)
+        )
+    ).scalar_one_or_none()
+    if client is None or client.user_id is None:
+        return
+
+    # If the loan's thread already has messages, don't double-post.
+    existing_thread = (
+        await db.execute(
+            _select(_AIChatThread).where(
+                _AIChatThread.user_id == client.user_id,
+                _AIChatThread.loan_id == loan.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_thread is not None:
+        msg_count = (
+            await db.execute(
+                _select(_AIChatMessage).where(_AIChatMessage.thread_id == existing_thread.id).limit(1)
+            )
+        ).scalar_one_or_none()
+        if msg_count is not None:
+            return
+
+    address = loan.address or "the property"
+    body = (
+        f"Hi! Let's get your file moving. I have a few quick questions about "
+        f"{address} so the underwriting team can size your deal accurately.\n\n"
+        f"**How many bedrooms and bathrooms?**\n"
+        f"**What year was it built?**\n"
+        f"**About how many square feet?**\n"
+        f"**How many units total?** (1 for a single-family, 2-4 for a small "
+        f"multi, 5+ for a larger building)\n\n"
+        f"Reply however you like — I'll fill in the details as we go."
+    )
+    await post_ai_message(
+        db,
+        user_id=client.user_id,
+        loan_id=loan.id,
+        body=body,
+    )
 
 
 # ── reminders + escalation ──────────────────────────────────────────────

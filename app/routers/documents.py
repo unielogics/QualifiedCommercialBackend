@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from uuid import UUID, uuid4
+
+log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -265,6 +268,26 @@ async def upload_complete(
             },
         )
     )
+
+    # Fire any checklist items anchored on `doc_received:<this name>`
+    # — eager event-driven scheduler. e.g. uploading "Bank Statements
+    # (2 mo)" might trigger an internal "Order appraisal" AITask
+    # with due_offset_days=2. Idempotent: re-firing on a doc that's
+    # already RECEIVED is harmless (the dedup keys gate dupes).
+    if not already_received and doc.checklist_key:
+        try:
+            from app.services.checklist_scheduler import fire_anchor_dependents  # local import
+            await fire_anchor_dependents(
+                db,
+                loan=loan,
+                anchor_event=f"doc_received:{doc.checklist_key}",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "upload_complete: anchor scheduler failed loan=%s doc=%s",
+                loan.deal_id, doc.id,
+            )
+
     await mark_loan_dirty(db, loan.id)
     await db.flush()
     await db.refresh(doc)

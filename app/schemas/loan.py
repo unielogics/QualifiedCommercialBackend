@@ -86,6 +86,14 @@ class LoanUpdate(BaseModel):
     annual_insurance: float | None = None
     monthly_hoa: float | None = None
     close_date: date | None = None
+    # Property details — written by the AI property-intake tool +
+    # editable from the desktop PropertyTab. unit_count is new in
+    # alembic 0019; the others were on the ORM but not surfaced.
+    sqft: int | None = None
+    beds: int | None = None
+    baths: float | None = None
+    year_built: int | None = None
+    unit_count: int | None = None
 
 
 class LoanRead(ORMModel):
@@ -116,6 +124,12 @@ class LoanRead(ORMModel):
     dscr: float | None
     risk_score: int | None
     close_date: date | None
+    # Property details (writable via AI intake + desktop PropertyTab).
+    sqft: int | None = None
+    beds: int | None = None
+    baths: float | None = None
+    year_built: int | None = None
+    unit_count: int | None = None
     # Living Loan File
     status_summary: str | None = None
     deal_health: DealHealth = DealHealth.ON_TRACK

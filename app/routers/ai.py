@@ -15,6 +15,7 @@ sees the same Living Loan File the dashboard does.
 
 from __future__ import annotations
 
+import json
 import logging
 from uuid import UUID
 
@@ -65,6 +66,133 @@ class ChatResponse(BaseModel):
 # Note: the old single-tone SYSTEM_PROMPT lived here. Replaced by
 # CLIENT_SYSTEM_PROMPT / OPERATOR_SYSTEM_PROMPT below — see
 # _system_prompt_for(user).
+
+
+# ── Property-intake tool (Phase C) ─────────────────────────────────────
+#
+# When a loan-scoped chat thread is open, the AI gets ONE tool —
+# update_loan_property_details. The intake opener message
+# (kicked off in loan_intake_automation.py) asks the borrower
+# about beds / baths / sqft / year built / units / rent / taxes /
+# insurance / HOA. As they reply across multiple turns, the model
+# calls the tool to write structured facts back onto the Loan row.
+#
+# Cap iterations per send to bound spend + latency.
+
+PROPERTY_INTAKE_TOOL = {
+    "name": "update_loan_property_details",
+    "description": (
+        "Update structured property details on the loan when the borrower "
+        "has answered. Call this every time you learn one or more new "
+        "facts. Pass only the fields you've just learned — leave others "
+        "unset. Numbers should be whole integers where the schema says "
+        "integer, decimals where it says number. Do not call this with "
+        "values you're guessing."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "beds": {"type": "integer", "minimum": 0, "maximum": 50},
+            "baths": {"type": "number", "minimum": 0, "maximum": 50},
+            "sqft": {"type": "integer", "minimum": 0, "maximum": 1000000},
+            "year_built": {"type": "integer", "minimum": 1700, "maximum": 2030},
+            "unit_count": {"type": "integer", "minimum": 1, "maximum": 200},
+            "monthly_rent": {"type": "number", "minimum": 0},
+            "annual_taxes": {"type": "number", "minimum": 0},
+            "annual_insurance": {"type": "number", "minimum": 0},
+            "monthly_hoa": {"type": "number", "minimum": 0},
+        },
+    },
+}
+
+_PROPERTY_INTAKE_FIELDS = {
+    "beds", "baths", "sqft", "year_built", "unit_count",
+    "monthly_rent", "annual_taxes", "annual_insurance", "monthly_hoa",
+}
+
+# Hard cap on tool-use round-trips per send-message. A multi-fact
+# borrower reply ("3 beds, 2 baths, 1500 sqft, built 1998") might
+# trigger 1-2 tool calls; this is a safety valve, not the steady
+# state.
+_TOOL_USE_MAX_ITERATIONS = 5
+
+
+async def _execute_property_intake_tool(
+    db: AsyncSession,
+    *,
+    user: User,
+    loan_id: UUID,
+    tool_input: dict,
+) -> dict:
+    """Validate + persist the AI's tool call. Returns a small JSON
+    object the AI sees as the tool_result content.
+
+    Privilege check: the tool ONLY writes to a loan the calling
+    user has scope on. CLIENT users must own the loan via their
+    client record; operators (BROKER / SUPER_ADMIN / LOAN_EXEC)
+    pass through. Anything else → no-op + tell the AI."""
+    loan = await db.get(Loan, loan_id)
+    if loan is None:
+        return {"ok": False, "error": "loan_not_found"}
+
+    # Borrower scope: must be the loan's client.
+    if user.role == Role.CLIENT:
+        if user.client is None or loan.client_id != user.client.id:
+            return {"ok": False, "error": "not_authorized"}
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER):
+        return {"ok": False, "error": "not_authorized"}
+
+    # Whitelist + sanity-coerce.
+    updated: list[str] = []
+    for k, v in (tool_input or {}).items():
+        if k not in _PROPERTY_INTAKE_FIELDS:
+            continue
+        if v is None:
+            continue
+        try:
+            if k in ("beds", "sqft", "year_built", "unit_count"):
+                value = int(v)
+            else:
+                value = float(v)
+        except (TypeError, ValueError):
+            continue
+        setattr(loan, k, value)
+        updated.append(k)
+
+    if not updated:
+        return {"ok": True, "updated": [], "note": "no_recognized_fields"}
+
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label="ai",
+            kind="loan.property_intake_updated",
+            summary=f"Property intake updated: {', '.join(updated)}",
+            payload={"updated": updated, "values": {k: getattr(loan, k) for k in updated}},
+        )
+    )
+    # Per-unit fan-out can change when unit_count moves up — we
+    # rely on `materialize_kickoff_items` being idempotent
+    # (re-runs add only the missing per-unit rows). Re-fire it to
+    # backfill leases / rent rolls if the count went up.
+    if "unit_count" in updated:
+        try:
+            from app.models.app_settings import AppSettings as _AppSettings
+            from app.services.checklist_scheduler import materialize_kickoff_items
+            from app.services.loan_intake_automation import _checklist_for, _coerce_settings
+
+            settings_row = (
+                await db.execute(select(_AppSettings).limit(1))
+            ).scalar_one_or_none()
+            settings_data = _coerce_settings(settings_row)
+            checklist = _checklist_for(settings_data, str(loan.type))
+            await materialize_kickoff_items(db, loan, checklist)
+        except Exception:  # noqa: BLE001
+            log.exception("property_intake: re-fan failed loan=%s", loan.id)
+
+    await db.flush()
+    return {"ok": True, "updated": updated}
 
 
 def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
@@ -766,18 +894,94 @@ async def append_thread_message(
         system = _system_prompt_for(user)
         if context_block:
             system += "\n\n" + context_block
+
+        # Loan-scoped threads get the property-intake tool. The AI
+        # calls update_loan_property_details to write structured
+        # facts onto the Loan row as the borrower answers — beds,
+        # baths, sqft, year_built, unit_count, etc. The intake
+        # opener (posted in kickoff_loan) primes the conversation.
+        tools = [PROPERTY_INTAKE_TOOL] if effective_loan_id is not None else None
+
+        # Tool-use loop. Convert api_messages (string-content) into
+        # block-content for the loop — Anthropic accepts both shapes
+        # but we need to append tool_use / tool_result blocks across
+        # iterations, so use the structured form throughout.
+        loop_messages: list[dict] = [
+            {"role": m["role"], "content": m["content"]} for m in api_messages
+        ]
+        reply_text = ""
+        used_stub = False
         try:
-            result = await client.messages.create(
-                model=model_light(),
-                max_tokens=900,
-                system=system,
-                messages=api_messages,
-            )
-            reply_text = "".join(
-                block.text for block in result.content
-                if getattr(block, "type", None) == "text"
-            ).strip() or "(No reply.)"
-            used_stub = False
+            iteration = 0
+            while iteration < _TOOL_USE_MAX_ITERATIONS:
+                iteration += 1
+                kwargs = {
+                    "model": model_light(),
+                    "max_tokens": 900,
+                    "system": system,
+                    "messages": loop_messages,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                result = await client.messages.create(**kwargs)
+                # Extract any text the model emitted in this turn —
+                # we'll concatenate text fragments across iterations
+                # (model usually responds with text + tool_use blocks).
+                turn_text = "".join(
+                    b.text for b in result.content
+                    if getattr(b, "type", None) == "text"
+                ).strip()
+                if turn_text:
+                    reply_text = (
+                        (reply_text + "\n\n" + turn_text).strip()
+                        if reply_text else turn_text
+                    )
+
+                if getattr(result, "stop_reason", None) != "tool_use":
+                    break
+
+                # Append the assistant's turn (text + tool_use blocks)
+                # exactly as the model emitted them — required by
+                # Anthropic for the next round-trip to work.
+                loop_messages.append({
+                    "role": "assistant",
+                    "content": [
+                        # Each block is a Pydantic model in the SDK; we
+                        # serialize back to dict for the API.
+                        b.model_dump() if hasattr(b, "model_dump") else dict(b)
+                        for b in result.content
+                    ],
+                })
+
+                # Execute every tool_use in this turn, append all
+                # results in one user turn.
+                tool_results: list[dict] = []
+                for b in result.content:
+                    if getattr(b, "type", None) != "tool_use":
+                        continue
+                    tool_name = getattr(b, "name", "")
+                    tool_id = getattr(b, "id", "")
+                    tool_input = getattr(b, "input", {}) or {}
+                    if tool_name == "update_loan_property_details" and effective_loan_id is not None:
+                        outcome = await _execute_property_intake_tool(
+                            db,
+                            user=user,
+                            loan_id=effective_loan_id,
+                            tool_input=tool_input,
+                        )
+                    else:
+                        outcome = {"ok": False, "error": "unknown_tool"}
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": json.dumps(outcome),
+                    })
+                if not tool_results:
+                    break  # defensive — shouldn't happen if stop_reason was tool_use
+                loop_messages.append({"role": "user", "content": tool_results})
+
+            if not reply_text:
+                reply_text = "(No reply.)"
         except Exception as exc:  # noqa: BLE001
             log.warning("Anthropic call failed in thread %s: %s", thread.id, exc)
             reply_text = _stub_reply(

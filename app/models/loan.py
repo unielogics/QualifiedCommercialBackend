@@ -56,6 +56,11 @@ class Loan(TimestampMixin, Base):
     beds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     baths: Mapped[float | None] = mapped_column(Numeric(4, 1), nullable=True)
     year_built: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Number of dwelling units on the property. Drives the
+    # per-unit fan-out in the doc checklist (one Lease per unit on a
+    # 4-plex, etc.) and surfaces as a column on the Property
+    # Details tab. Defaults to 1 so legacy rows behave like SFRs.
+    unit_count: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
     annual_taxes: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     annual_insurance: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     monthly_hoa: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
