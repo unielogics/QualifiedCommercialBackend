@@ -516,14 +516,41 @@ async def _post_doc_collection_opener(db: AsyncSession, loan: Loan) -> None:
 # ── reminders + escalation ──────────────────────────────────────────────
 
 
-async def evaluate_doc_reminders() -> dict[str, int]:
-    """Daily scheduler job. Walks all outstanding Document rows and
-    emits reminder Activity rows + AITasks at three escalating tiers.
+async def evaluate_doc_reminders(
+    *, scope_loan_id: "UUID | None" = None,
+) -> dict[str, int]:
+    """Doc-collection scheduler tick. Walks all outstanding
+    Documents, classifies each into one of five collection scenarios
+    based on how close it is to its due date, bundles same-scenario
+    docs per loan, and posts a Haiku-generated conversational nudge
+    via `post_ai_message`.
 
-    Returns a dict with counts for visibility in scheduler logs:
-      {first_emitted, second_emitted, escalated}
+    Each (doc, scenario) fires AT MOST ONCE — a single doc transits
+    through scenarios as it ages (heads_up → due_today → just_late
+    → week_late → escalating), one chat message per transition.
+
+    `scope_loan_id` (optional) restricts the scan to a single loan —
+    used by the L-4760 smoke harness to test conversational copy
+    without touching every other open loan in prod.
+
+    Returns per-scenario counts for scheduler logs.
     """
-    counts = {"first_emitted": 0, "second_emitted": 0, "escalated": 0}
+    from collections import defaultdict
+    from uuid import UUID as _UUID
+    from app.services.ai_messaging import post_ai_message
+    from app.services.doc_collection_ai import (
+        ACTIVITY_KIND,
+        DocCollectionContext,
+        Scenario,
+        classify,
+        compose_collection_nudge,
+        first_name_of,
+    )
+
+    counts: dict[str, int] = {
+        "heads_up": 0, "due_today": 0, "just_late": 0,
+        "week_late": 0, "escalating": 0,
+    }
     today = date.today()
 
     async with SessionLocal() as db:
@@ -532,57 +559,125 @@ async def evaluate_doc_reminders() -> dict[str, int]:
         ).scalar_one_or_none()
         settings = _coerce_settings(settings_row)
 
-        # All currently-requested docs.
-        docs = (
-            await db.execute(
-                select(Document).where(
-                    Document.status == DocStatus.REQUESTED,
-                    Document.requested_on.is_not(None),
-                )
-            )
-        ).scalars().all()
+        # All currently-requested docs (optionally scoped).
+        docs_stmt = select(Document).where(
+            Document.status == DocStatus.REQUESTED,
+            Document.requested_on.is_not(None),
+        )
+        if scope_loan_id is not None:
+            docs_stmt = docs_stmt.where(Document.loan_id == scope_loan_id)
+        docs = (await db.execute(docs_stmt)).scalars().all()
 
-        # Pre-fetch which docs already got each reminder tier today
-        # so we don't double-emit when the cron retries.
-        already_first = await _docs_with_activity_kind(db, "doc.reminder.first")
-        already_second = await _docs_with_activity_kind(db, "doc.reminder.second")
-        already_escalated = await _docs_with_activity_kind(db, "doc.escalated")
+        # Per-scenario dedup sets. Each (doc, scenario) fires once.
+        already_emitted: dict[Scenario, set[str]] = {}
+        for sc, kind in ACTIVITY_KIND.items():
+            already_emitted[sc] = await _docs_with_activity_kind(db, kind)
 
-        for doc in docs:
-            if doc.requested_on is None:
-                continue
-            age = (today - doc.requested_on).days
-            doc_id_str = str(doc.id)
+        # Loan + checklist cache so we don't refetch per-doc.
+        loan_cache: dict[_UUID, Loan | None] = {}
 
-            # Use the loan-type's specific cadence when available,
-            # otherwise the global default. Eager-load `client` so
-            # the per-doc emitter can post into the borrower's
-            # AIChatThread without a lazy-load.
-            loan = None
-            if doc.loan_id:
-                loan = (
+        async def _get_loan(loan_id: _UUID) -> Loan | None:
+            if loan_id not in loan_cache:
+                loan_cache[loan_id] = (
                     await db.execute(
                         select(Loan)
                         .options(selectinload(Loan.client))
-                        .where(Loan.id == doc.loan_id)
+                        .where(Loan.id == loan_id)
                     )
                 ).scalar_one_or_none()
-            checklist = (
-                _checklist_for(settings, str(loan.type)) if loan else None
-            )
-            first = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
-            second = checklist.second_reminder_days if checklist else _DEFAULT_SECOND_DAYS
-            escalate = checklist.escalate_after_days if checklist else _DEFAULT_ESCALATE_DAYS
+            return loan_cache[loan_id]
 
-            if age >= escalate and doc_id_str not in already_escalated:
-                _emit_escalation(db, doc, age)
-                counts["escalated"] += 1
-            elif age >= second and doc_id_str not in already_second:
-                _emit_second_reminder(db, doc, age)
-                counts["second_emitted"] += 1
-            elif age >= first and doc_id_str not in already_first:
-                await _emit_first_reminder(db, doc, age, loan)
-                counts["first_emitted"] += 1
+        # Group by (loan_id, scenario) for bundled messaging.
+        groups: dict[tuple[_UUID, str], list[Document]] = defaultdict(list)
+        for doc in docs:
+            if doc.loan_id is None or doc.requested_on is None:
+                continue
+            loan = await _get_loan(doc.loan_id)
+            if loan is None:
+                continue
+            checklist = _checklist_for(settings, str(loan.type))
+            offset = checklist.first_reminder_days if checklist else _DEFAULT_FIRST_DAYS
+            # Per-item due_offset_days takes precedence over the
+            # loan-type default when the checklist item exists
+            # (alembic 0019 / doc-checklist-v2).
+            for item in checklist.docs or []:
+                if item.name == doc.checklist_key or item.name == doc.name:
+                    offset = item.due_offset_days
+                    break
+            due_date = doc.requested_on + timedelta(days=offset)
+            days_until_due = (due_date - today).days
+            scenario = classify(days_until_due)
+            if scenario is None:
+                continue
+            if str(doc.id) in already_emitted[scenario]:
+                continue
+            groups[(doc.loan_id, scenario)].append(doc)
+
+        # Per group → compose + post + dedup.
+        for (loan_id, scenario), focus_docs in groups.items():
+            loan = await _get_loan(loan_id)
+            if loan is None or loan.client is None or loan.client.user_id is None:
+                continue
+            already_submitted = (
+                await db.execute(
+                    select(Document).where(
+                        Document.loan_id == loan_id,
+                        Document.status.in_([DocStatus.RECEIVED, DocStatus.VERIFIED]),
+                    )
+                )
+            ).scalars().all()
+            ctx = DocCollectionContext(
+                scenario=scenario,  # type: ignore[arg-type]
+                loan=loan,
+                focus_docs=focus_docs,
+                already_submitted=list(already_submitted),
+                close_date=loan.close_date,
+                borrower_first_name=first_name_of(loan.client),
+            )
+            body = await compose_collection_nudge(ctx)
+            actions = [
+                {
+                    "kind": "upload_document",
+                    "label": f"Upload {d.name}",
+                    "document_id": str(d.id),
+                    "checklist_key": d.checklist_key,
+                    "confirm": True,
+                }
+                for d in focus_docs[:5]
+            ]
+            try:
+                await post_ai_message(
+                    db,
+                    user_id=loan.client.user_id,
+                    loan_id=loan.id,
+                    body=body,
+                    actions=actions,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "doc_collection: post_ai_message failed loan=%s scenario=%s",
+                    loan.deal_id, scenario,
+                )
+                continue
+
+            # Activity dedup rows + tier-2/3 broker AITasks.
+            for doc in focus_docs:
+                age = (today - doc.requested_on).days
+                db.add(
+                    Activity(
+                        loan_id=loan_id,
+                        actor_id=None,
+                        actor_label="ai",
+                        kind=ACTIVITY_KIND[scenario],  # type: ignore[index]
+                        summary=f"{scenario}: {doc.name} ({age}d since request)",
+                        payload=_activity_payload_for_doc(doc, age),
+                    )
+                )
+                if scenario == "week_late":
+                    _emit_second_reminder(db, doc, age)
+                elif scenario == "escalating":
+                    _emit_escalation(db, doc, age)
+            counts[scenario] += len(focus_docs)
 
         await db.commit()
 
