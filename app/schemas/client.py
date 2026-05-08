@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -25,6 +25,14 @@ class ClientCreate(BaseModel):
     # by the doc-checklist resolver downstream.
     stage: ClientStage = ClientStage.LEAD
     client_type: Literal["buyer", "seller"] | None = None
+    # Per-lead overrides (alembic 0025). Captured by the AddLeadWizard:
+    # `lead_intake` carries property/financial context, `checklist_overrides`
+    # disables firm items + appends agent extras for THIS lead, and
+    # `ai_cadence_override` lets the agent dial nudge frequency per lead.
+    # All free-shape JSONB on the backend; the wizard owns the schema.
+    lead_intake: dict[str, Any] | None = None
+    checklist_overrides: dict[str, Any] | None = None
+    ai_cadence_override: dict[str, Any] | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -48,6 +56,11 @@ class ClientUpdate(BaseModel):
     stage: ClientStage | None = None
     client_type: Literal["buyer", "seller"] | None = None
     contacted_at: datetime | None = None
+    # Per-lead overrides (alembic 0025) — same shape as ClientCreate.
+    # Send `null` to clear an override and fall back to broker defaults.
+    lead_intake: dict[str, Any] | None = None
+    checklist_overrides: dict[str, Any] | None = None
+    ai_cadence_override: dict[str, Any] | None = None
 
 
 class ClientSelfUpdate(BaseModel):
@@ -85,3 +98,7 @@ class ClientRead(ORMModel):
     contacted_at: datetime | None = None
     intake_started_at: datetime | None = None
     intake_completed_at: datetime | None = None
+    # Per-lead overrides (alembic 0025).
+    lead_intake: dict[str, Any] | None = None
+    checklist_overrides: dict[str, Any] | None = None
+    ai_cadence_override: dict[str, Any] | None = None

@@ -21,10 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
-from app.models.app_settings import AppSettings
 from app.models.broker import Broker
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
-from app.services.loan_intake_automation import _coerce_settings
 
 router = APIRouter(prefix="/me", tags=["me"])
 log = logging.getLogger(__name__)
@@ -61,12 +59,12 @@ async def put_broker_settings(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AgentSettingsRead:
-    """Whole-document replacement — the desktop sends the full
-    overlay every save. Validates that:
-      - `disabled_firm_items` references real firm item names
-        (otherwise it's dead config and the agent's intent is wrong)
-      - `extra_items[*].name` doesn't collide with firm item names
-        (avoid silent shadowing)
+    """Whole-document replacement — the desktop sends the full overlay
+    every save. Validates that checklist keys are `buyer` | `seller`
+    only (post-codex-PR shape). The Pydantic schema's
+    `_migrate_v1_shapes` validator already strips legacy
+    `loan_type:side` keys, so payloads from old clients are tolerated
+    silently.
     """
     if user.role != Role.BROKER:
         raise HTTPException(
@@ -77,35 +75,17 @@ async def put_broker_settings(
     if broker is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No broker profile for this user")
 
-    # Load firm settings to validate against.
-    settings_row = (
-        await db.execute(select(AppSettings).limit(1))
-    ).scalar_one_or_none()
-    firm = _coerce_settings(settings_row)
-
     errors: list[str] = []
     for key, overlay in (payload.checklists or {}).items():
-        # Key shape: "<loan_type>:<side>"
-        if ":" not in key:
-            errors.append(f"checklist key {key!r} must be 'loan_type:side'")
+        if key not in ("buyer", "seller"):
+            errors.append(
+                f"checklist key {key!r} must be 'buyer' or 'seller'"
+            )
             continue
-        loan_type, side = key.split(":", 1)
-        firm_chk = firm.checklists.get(loan_type)
-        firm_names = {it.name for it in (firm_chk.docs if firm_chk else [])}
-        # disabled_firm_items must reference real firm items
-        for n in overlay.disabled_firm_items:
-            if n not in firm_names:
-                errors.append(
-                    f"checklist[{key}].disabled_firm_items: "
-                    f"{n!r} doesn't match any firm item for {loan_type}"
-                )
-        # extra_items names cannot collide with firm names
+        # Agent extras carry a `side` tag for downstream resolvers;
+        # the wizard pre-fills it but defensively allow either the
+        # current tab's side or 'both'.
         for it in overlay.extra_items:
-            if it.name in firm_names:
-                errors.append(
-                    f"checklist[{key}].extra_items: {it.name!r} "
-                    f"already exists in the firm checklist (rename your item)"
-                )
             if it.side not in ("buyer", "seller", "both"):
                 errors.append(
                     f"checklist[{key}].extra_items[{it.name!r}].side "

@@ -70,6 +70,20 @@ class Client(TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Per-lead context captured by the New Lead wizard (alembic 0025).
+    # Free-shape JSONB so the wizard can evolve without migrations.
+    # Buyer leads: target price range, area, property type, timeline.
+    # Seller leads: subject property, asking price, timeline.
+    lead_intake: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Per-lead override of the agent's transaction-side checklist.
+    # Same shape as `AgentChecklistOverlay` (disabled_firm_items +
+    # extra_items). Applied at lead → loan promotion in `kickoff_loan`.
+    checklist_overrides: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Per-lead reminder cadence override. Same shape as
+    # `AgentCadenceOverride` (first/second/escalate days). Applied at
+    # promotion if the lead converts to a loan.
+    ai_cadence_override: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     # Investor profile (Profile → Investor Profile dialog). Free-text for
     # v1 — operators see what the borrower wrote and can fold into the AI's
     # context. Structured (per-property table) lands when we wire REO.

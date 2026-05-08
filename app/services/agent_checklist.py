@@ -106,12 +106,14 @@ async def resolve_loan_checklist(
     # Step 1+2: firm baseline filtered by side
     firm_items = _filter_by_side(list(base.docs), loan_side_str)
 
-    # Step 3: apply agent overlay if loan has a broker
+    # Step 3: apply agent overlay if loan has a broker.
+    # Post-codex-PR shape: checklists keyed by `side` only (no
+    # loan-type axis). Existing v1 rows with `loan_type:side` keys
+    # are silently stripped by AgentSettingsData's migration validator.
     overlay_items: list[DocChecklistItem] = firm_items
     if getattr(loan, "broker_id", None):
         agent_settings = await _load_broker_overlay(db, loan.broker_id)
-        overlay_key = f"{loan_type_str}:{loan_side_str}"
-        overlay = agent_settings.checklists.get(overlay_key)
+        overlay = agent_settings.checklists.get(loan_side_str)
         if overlay is not None:
             disabled = {n.strip() for n in overlay.disabled_firm_items if n}
             overlay_items = [
@@ -128,4 +130,52 @@ async def resolve_loan_checklist(
                     continue
                 overlay_items.append(it)
 
+    # Step 4: per-Client overrides (alembic 0025). When the loan was
+    # promoted from a lead, the agent may have customized the
+    # checklist on THAT specific lead — disable items they don't
+    # want to chase, add lead-specific extras. Layered last so
+    # per-lead intent always wins.
+    client_overrides = await _load_client_overrides(db, loan.client_id)
+    if client_overrides is not None:
+        co_disabled = {
+            n.strip() for n in client_overrides.disabled_firm_items if n
+        }
+        if co_disabled:
+            overlay_items = [
+                item for item in overlay_items if item.name not in co_disabled
+            ]
+        co_extras = _filter_by_side(list(client_overrides.extra_items), loan_side_str)
+        for it in co_extras:
+            if it.type == "internal":
+                continue
+            overlay_items.append(it)
+
     return overlay_items, base
+
+
+async def _load_client_overrides(
+    db: AsyncSession, client_id
+) -> "AgentChecklistOverlay | None":
+    """Load `Client.checklist_overrides` JSONB and parse into an
+    `AgentChecklistOverlay`. Returns None when the client has no
+    per-lead overrides configured (the common case)."""
+    from app.models.client import Client as _Client
+    from app.schemas.broker_settings import AgentChecklistOverlay
+
+    if client_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(_Client.checklist_overrides).where(_Client.id == client_id)
+        )
+    ).scalar_one_or_none()
+    if not row:
+        return None
+    try:
+        return AgentChecklistOverlay.model_validate(row)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "client %s checklist_overrides malformed, ignoring",
+            client_id, exc_info=True,
+        )
+        return None
