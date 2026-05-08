@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routers import (
+    agents,
     ai,
     ai_feedback,
     ai_tasks,
@@ -120,5 +121,6 @@ for r in [
     prequal.router,
     devices.router,
     me.router,
+    agents.router,
 ]:
     app.include_router(r, prefix=api_prefix)

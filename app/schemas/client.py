@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.enums import ClientStage
 from app.schemas.common import ORMModel
 
 
@@ -16,6 +18,13 @@ class ClientCreate(BaseModel):
     city: str | None = None
     referral_source: str | None = None
     broker_id: UUID | None = None
+    # Lead-funnel fields (alembic 0024). Defaults to 'lead' when
+    # not specified — agents creating clients via the
+    # LeadsPipelineView "+ Add Lead" button leave these to default.
+    # `client_type` (buyer/seller) optional at creation but used
+    # by the doc-checklist resolver downstream.
+    stage: ClientStage = ClientStage.LEAD
+    client_type: Literal["buyer", "seller"] | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -32,6 +41,13 @@ class ClientUpdate(BaseModel):
     avatar_color: str | None = None
     properties: str | None = None
     experience: str | None = None
+    # Lead-funnel transitions — agents flip stage via PATCH (e.g.
+    # lead → contacted on first outreach). Backend stamps
+    # `contacted_at = now()` automatically when stage flips into
+    # CONTACTED for the first time (handled in the router).
+    stage: ClientStage | None = None
+    client_type: Literal["buyer", "seller"] | None = None
+    contacted_at: datetime | None = None
 
 
 class ClientSelfUpdate(BaseModel):
@@ -63,3 +79,9 @@ class ClientRead(ORMModel):
     funded_count: int
     properties: str | None = None
     experience: str | None = None
+    # Lead-funnel state (alembic 0024).
+    stage: ClientStage = ClientStage.LEAD
+    client_type: Literal["buyer", "seller"] | None = None
+    contacted_at: datetime | None = None
+    intake_started_at: datetime | None = None
+    intake_completed_at: datetime | None = None

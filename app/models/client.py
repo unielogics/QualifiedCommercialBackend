@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from app.enums import ClientStage
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
@@ -42,6 +43,32 @@ class Client(TimestampMixin, Base):
 
     funded_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     funded_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Lead-funnel state (alembic 0024).
+    #
+    # `stage` drives the LeadsPipelineView kanban + the agent funnel
+    # metrics. Backfilled at migration time from existing Loan state
+    # (see 0024 for the strict order). New clients default to 'lead'.
+    stage: Mapped[ClientStage] = mapped_column(
+        String(32), nullable=False, default=ClientStage.LEAD,
+        server_default="lead",
+    )
+    # Buyer or seller side of the transaction. Mirrors the per-loan
+    # `Loan.side` (alembic 0023) but at the client level — a single
+    # client could have multiple loans on different sides over time.
+    client_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Stage transition timestamps. `contacted_at` is the activity
+    # baseline for stale-lead detection (NOT updated_at, which ticks
+    # on any field edit and would silently un-stale leads).
+    contacted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    intake_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    intake_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Investor profile (Profile → Investor Profile dialog). Free-text for
     # v1 — operators see what the borrower wrote and can fold into the AI's

@@ -184,9 +184,14 @@ async def create_client(
 ) -> ClientRead:
     if user.role == Role.CLIENT:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
-    client = Client(**payload.model_dump())
-    if user.role == Role.BROKER and user.broker and not client.broker_id:
-        client.broker_id = user.broker.id
+    data = payload.model_dump()
+    # Brokers never get to assign ownership — even if they send
+    # broker_id in the payload, we hard-stamp from the session so a
+    # crafted request can't put another broker's name on a client.
+    # Super-admin / loan_exec keep their ability to assign explicitly.
+    if user.role == Role.BROKER and user.broker:
+        data["broker_id"] = user.broker.id
+    client = Client(**data)
     db.add(client)
     await db.flush()
     await db.refresh(client)
@@ -200,15 +205,37 @@ async def update_client(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ClientRead:
-    """Partial update. Only fields present in the payload are applied."""
+    """Partial update. Only fields present in the payload are applied.
+
+    Stage-transition side effects (alembic 0024):
+      - When `stage` flips to CONTACTED for the first time and
+        `contacted_at` isn't already set, stamp it `now()`. Lets
+        agents PATCH `{stage: 'contacted'}` without separately
+        updating the timestamp the funnel reads."""
+    from datetime import datetime as _dt, timezone as _tz
+    from app.enums import ClientStage as _CS
+
     if user.role == Role.CLIENT:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     stmt = _scope(user, select(Client).where(Client.id == client_id))
     client = (await db.execute(stmt)).scalar_one_or_none()
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    sent = payload.model_fields_set
+    if "broker_id" in sent and user.role == Role.BROKER:
+        # Same hard-stamp rule as create — a broker can't reassign
+        # their own clients to another broker via PATCH.
+        sent.discard("broker_id")
     for k, v in payload.model_dump(exclude_unset=True).items():
+        if k == "broker_id" and user.role == Role.BROKER:
+            continue
         setattr(client, k, v)
+    if (
+        "stage" in sent
+        and payload.stage == _CS.CONTACTED
+        and client.contacted_at is None
+    ):
+        client.contacted_at = _dt.now(_tz.utc)
     await db.flush()
     await db.refresh(client)
     return ClientRead.model_validate(client)

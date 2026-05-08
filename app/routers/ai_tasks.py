@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -11,6 +11,7 @@ from app.deps import CurrentUser
 from app.enums import AITaskStatus, Role
 from app.models.activity import Activity
 from app.models.ai_task import AITask
+from app.models.loan import Loan
 from app.schemas.ai_task import AITaskDecision, AITaskRead
 
 router = APIRouter(prefix="/ai-tasks", tags=["ai-tasks"])
@@ -27,6 +28,26 @@ async def list_tasks(
         .where(AITask.status == AITaskStatus.PENDING)
         .order_by(AITask.priority, AITask.created_at.desc())
     )
+    if user.role == Role.BROKER and user.broker is not None:
+        # Brokers see tasks tied to their own loans + firm-wide
+        # null-loan tasks. The `loan_id IS NULL` widening is
+        # intentional — today's null-loan AITasks are firm-wide
+        # alerts (credit-pull expiry, prequal review queues) that
+        # ALL operators including brokers should see. If we ever
+        # introduce broker-confidential null-loan tasks, add a
+        # `visible_to_role` field on AITask rather than tightening
+        # this filter; otherwise we'd hide legitimate work the
+        # broker needs.
+        stmt = stmt.where(
+            or_(
+                AITask.loan_id.is_(None),
+                AITask.loan_id.in_(
+                    select(Loan.id).where(Loan.broker_id == user.broker.id)
+                ),
+            )
+        )
+    # SUPER_ADMIN / LOAN_EXEC keep firm-wide visibility (no extra
+    # filter beyond the PENDING gate).
     rows = (await db.execute(stmt)).scalars().all()
     return [AITaskRead.model_validate(r) for r in rows]
 

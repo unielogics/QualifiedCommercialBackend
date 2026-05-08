@@ -245,6 +245,29 @@ class DealHealth(StrEnum):
     STUCK = "stuck"            # red — hard blocker, broker action required
 
 
+class ClientStage(StrEnum):
+    """Where the client is in the agent's pipeline (alembic 0024).
+
+    Lead-stage funnel (agent-owned):
+      LEAD              — added, no outreach yet
+      CONTACTED         — agent reached out (call, email, text)
+      VERIFIED          — ID + soft credit verified
+
+    Funding-stage funnel (firm/funding-team owned):
+      READY_FOR_LENDING — handed off to funding team
+      PROCESSING        — active loan in flight
+      FUNDED            — closed loan(s) on file
+      LOST              — walked away or no response (terminal)
+    """
+    LEAD = "lead"
+    CONTACTED = "contacted"
+    VERIFIED = "verified"
+    READY_FOR_LENDING = "ready_for_lending"
+    PROCESSING = "processing"
+    FUNDED = "funded"
+    LOST = "lost"
+
+
 class ParticipantRole(StrEnum):
     """A loan thread participant. Drives the Fintech Orchestrator privacy
     rules — Lenders are masked from Brokers/Clients on inbound, and Super
