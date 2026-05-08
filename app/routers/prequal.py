@@ -170,6 +170,23 @@ async def _spawn_loan_from_approved_request(
     db.add(loan)
     await db.flush()
     await db.refresh(loan)
+
+    # Kickoff doc collection — read the firm's checklist for this
+    # loan type and create REQUESTED Document rows + calendar
+    # reminders. /loans POST and the smart-intake path already do
+    # this; the prequal → offer-accepted path was missing it, so
+    # every prequal-promoted loan was landing in the pipeline with
+    # zero docs. Idempotent: re-runs leave existing rows alone.
+    from app.models.app_settings import AppSettings as _AppSettings
+    from app.services.loan_intake_automation import kickoff_loan as _kickoff
+    settings_row = (await db.execute(select(_AppSettings).limit(1))).scalar_one_or_none()
+    try:
+        await _kickoff(db, loan, settings_row)
+    except Exception:  # noqa: BLE001
+        # Don't fail the prequal-promote on a kickoff hiccup —
+        # operator can re-run it manually. Log loud so we notice.
+        log.exception("prequal.kickoff_failed deal_id=%s", loan.deal_id)
+
     log.info(
         "prequal.promoted_to_loan request_id=%s deal_id=%s amount=%s ltv=%s",
         request.id, loan.deal_id, loan_amount, loan.ltv,
