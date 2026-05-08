@@ -137,19 +137,22 @@ async def get_current_user(
     Dashboard works without Clerk being wired.
     """
     settings = get_settings()
-    # Eager-load the User.client relationship on every load path. Multiple
-    # downstream routes do `if user.client: …` or `user.client.id`, and a
-    # bare relationship access in async session context raises
-    # MissingGreenlet because lazy-loading needs greenlet support. Loading
-    # it once here makes the relationship safe to touch anywhere.
+    # Eager-load BOTH User.client and User.broker on every load path.
+    # Multiple downstream routes touch `user.client.id` (CLIENT scoping)
+    # or `user.broker.id` (BROKER scoping in /loans, /clients, /reports,
+    # /ai-tasks, /agents/me/*). Bare relationship access in async session
+    # context raises MissingGreenlet because lazy-loading needs greenlet
+    # support. Loading them once here makes both relationships safe to
+    # touch anywhere downstream.
     _with_client = selectinload(User.client)
+    _with_broker = selectinload(User.broker)
 
     if not settings.clerk_secret_key:
         # Dev mode: short-circuit auth
         stmt = (
-            select(User).options(_with_client).where(User.email == x_dev_user)
+            select(User).options(_with_client, _with_broker).where(User.email == x_dev_user)
             if x_dev_user
-            else select(User).options(_with_client).where(User.role == Role.SUPER_ADMIN).limit(1)
+            else select(User).options(_with_client, _with_broker).where(User.role == Role.SUPER_ADMIN).limit(1)
         )
         user = (await db.execute(stmt)).scalar_one_or_none()
         if user is None:
@@ -168,7 +171,7 @@ async def get_current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing subject")
     user = (
         await db.execute(
-            select(User).options(_with_client).where(User.clerk_id == clerk_id)
+            select(User).options(_with_client, _with_broker).where(User.clerk_id == clerk_id)
         )
     ).scalar_one_or_none()
     if user is None:
@@ -182,7 +185,7 @@ async def get_current_user(
         # clerk_id yet), bind it instead of creating a duplicate.
         invited = (
             await db.execute(
-                select(User).options(_with_client).where(
+                select(User).options(_with_client, _with_broker).where(
                     User.email == email, User.clerk_id.is_(None)
                 )
             )
@@ -204,7 +207,7 @@ async def get_current_user(
             # attribute would still try to load it.
             user = (
                 await db.execute(
-                    select(User).options(_with_client).where(User.id == user.id)
+                    select(User).options(_with_client, _with_broker).where(User.id == user.id)
                 )
             ).scalar_one()
             log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
