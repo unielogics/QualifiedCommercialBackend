@@ -111,8 +111,10 @@ async def resolve_loan_checklist(
     # loan-type axis). Existing v1 rows with `loan_type:side` keys
     # are silently stripped by AgentSettingsData's migration validator.
     overlay_items: list[DocChecklistItem] = firm_items
+    broker_cadence = None
     if getattr(loan, "broker_id", None):
         agent_settings = await _load_broker_overlay(db, loan.broker_id)
+        broker_cadence = agent_settings.cadence
         overlay = agent_settings.checklists.get(loan_side_str)
         if overlay is not None:
             disabled = {n.strip() for n in overlay.disabled_firm_items if n}
@@ -150,7 +152,14 @@ async def resolve_loan_checklist(
                 continue
             overlay_items.append(it)
 
-    return overlay_items, base
+    # Step 5: cadence merge (firm → broker → client). Each field
+    # cascades — a non-null broker value overrides firm; a non-null
+    # client value overrides both. Returned via the synthesized
+    # `base_checklist` so kickoff + reminder cron pick up the merged
+    # cadence without each callsite reaching for the raw overrides.
+    client_cadence = await _load_client_cadence(db, loan.client_id)
+    merged_base = _merge_cadence(base, broker_cadence, client_cadence)
+    return overlay_items, merged_base
 
 
 async def _load_client_overrides(
@@ -179,3 +188,68 @@ async def _load_client_overrides(
             client_id, exc_info=True,
         )
         return None
+
+
+async def _load_client_cadence(
+    db: AsyncSession, client_id
+) -> "AgentCadenceOverride | None":
+    """Load `Client.ai_cadence_override` JSONB and parse into an
+    `AgentCadenceOverride`. None = no per-lead cadence configured."""
+    from app.models.client import Client as _Client
+    from app.schemas.broker_settings import AgentCadenceOverride
+
+    if client_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(_Client.ai_cadence_override).where(_Client.id == client_id)
+        )
+    ).scalar_one_or_none()
+    if not row:
+        return None
+    try:
+        return AgentCadenceOverride.model_validate(row)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "client %s ai_cadence_override malformed, ignoring",
+            client_id, exc_info=True,
+        )
+        return None
+
+
+def _merge_cadence(
+    base: LoanTypeChecklist,
+    broker_cadence: "AgentCadenceOverride | None",
+    client_cadence: "AgentCadenceOverride | None",
+) -> LoanTypeChecklist:
+    """Cascade cadence values: firm `base` → broker → client.
+
+    Per field, the lowest-priority non-null value wins:
+      client.X        if not None,
+      else broker.X   if not None,
+      else base.X.
+
+    Returns a NEW LoanTypeChecklist (mutating `base` would leak the
+    merge into the firm settings). The `docs` list and other fields
+    pass through untouched — only cadence is overlaid."""
+    if broker_cadence is None and client_cadence is None:
+        return base
+
+    def _pick(field: str, default: int) -> int:
+        if client_cadence is not None:
+            v = getattr(client_cadence, field, None)
+            if v is not None:
+                return int(v)
+        if broker_cadence is not None:
+            v = getattr(broker_cadence, field, None)
+            if v is not None:
+                return int(v)
+        return default
+
+    return LoanTypeChecklist(
+        docs=base.docs,
+        first_reminder_days=_pick("first_reminder_days", base.first_reminder_days),
+        second_reminder_days=_pick("second_reminder_days", base.second_reminder_days),
+        escalate_after_days=_pick("escalate_after_days", base.escalate_after_days),
+        auto_approve_risk_score=base.auto_approve_risk_score,
+    )

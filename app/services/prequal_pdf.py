@@ -91,6 +91,12 @@ def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
     Returns None on any failure (missing key, S3 unreachable, etc.). The
     template falls back to a plain underline + typed name when this is
     absent, so a render is never blocked by a missing signature."""
+    return _s3_image_data_uri(settings, s3_key)
+
+
+def _s3_image_data_uri(settings: Settings, s3_key: str | None) -> str | None:
+    """Generic S3-image-to-data-URI helper, used by the firm signature
+    AND the broker headshot path. Returns None on any failure."""
     if not s3_key or not settings.s3_bucket:
         return None
     try:
@@ -101,8 +107,48 @@ def _signature_data_uri(settings: Settings, s3_key: str | None) -> str | None:
         b64 = base64.b64encode(body).decode("ascii")
         return f"data:{content_type};base64,{b64}"
     except Exception as exc:  # noqa: BLE001
-        log.warning("signature fetch failed key=%s: %s", s3_key, exc)
+        log.warning("s3 image fetch failed key=%s: %s", s3_key, exc)
         return None
+
+
+def _broker_letterhead_for(loan: Loan | None) -> dict[str, Any] | None:
+    """Return the broker's letterhead JSONB blob if the loan has a
+    broker with settings_data.letterhead set. The caller composites
+    `headshot_s3_key` (preferred) or `headshot_data_url` (legacy)
+    onto the prequal header.
+
+    Tolerant: if the JSONB is malformed, returns None rather than
+    blocking the render."""
+    if loan is None or getattr(loan, "broker", None) is None:
+        return None
+    raw = getattr(loan.broker, "settings_data", None) or {}
+    letterhead = raw.get("letterhead") if isinstance(raw, dict) else None
+    if isinstance(letterhead, dict):
+        return letterhead
+    return None
+
+
+def _broker_headshot_data_uri(
+    settings: Settings, letterhead: dict[str, Any] | None
+) -> str | None:
+    """Resolve the broker's headshot to an inline data URI.
+
+    Priority:
+      1. `headshot_s3_key` — S3 fetch + base64 (production path)
+      2. `headshot_data_url` — pass-through (v1 base64 inline)
+      3. None
+    """
+    if not letterhead:
+        return None
+    s3_key = letterhead.get("headshot_s3_key")
+    if s3_key:
+        uri = _s3_image_data_uri(settings, s3_key)
+        if uri:
+            return uri
+    inline = letterhead.get("headshot_data_url")
+    if isinstance(inline, str) and inline.startswith("data:"):
+        return inline
+    return None
 
 
 # Common variants of "TBD" the borrower / admin might have typed instead
@@ -228,6 +274,16 @@ def render_letter(
     letterhead = _load_letterhead(settings_row)
     signature_data_uri = _signature_data_uri(settings, letterhead.signature_s3_key)
 
+    # Co-branded "from your agent" card. Pulled off the loan's broker
+    # row when present; absent on direct-borrower deals.
+    broker_letterhead = _broker_letterhead_for(loan)
+    broker_headshot_data_uri = _broker_headshot_data_uri(settings, broker_letterhead)
+    broker_user = getattr(loan.broker, "user", None) if loan and getattr(loan, "broker", None) else None
+    broker_name = getattr(broker_user, "name", None) if broker_user else None
+    broker_title = (broker_letterhead or {}).get("title")
+    broker_brokerage = (broker_letterhead or {}).get("brokerage_name")
+    broker_license = (broker_letterhead or {}).get("license_number")
+
     tpl = _jinja.get_template(template_name)
     html_str = tpl.render(
         today_date=_format_date(today),
@@ -253,6 +309,14 @@ def render_letter(
         # present, or fall back to a plain signature line when absent.
         signature_data_uri=signature_data_uri,
         signed_date=_format_date(today),
+        # Broker / agent co-branding card. Header renders when
+        # broker_headshot_data_uri is present; fields cascade off
+        # the broker row + their letterhead JSONB.
+        broker_headshot_data_uri=broker_headshot_data_uri,
+        broker_name=broker_name,
+        broker_title=broker_title,
+        broker_brokerage=broker_brokerage,
+        broker_license=broker_license,
         # admin_notes intentionally NOT passed — borrower sees them in
         # the dashboard, never on the printable letter.
     )

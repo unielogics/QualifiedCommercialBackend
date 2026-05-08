@@ -199,10 +199,43 @@ class LetterheadSettings(BaseModel):
 
 # --- Aggregate ----------------------------------------------------------
 
+_DEFAULT_TRANSACTION_CHECKLISTS: dict[str, "LoanTypeChecklist"] = {
+    "buyer": LoanTypeChecklist(
+        docs=[
+            DocChecklistItem(name="Government ID", side="buyer"),
+            DocChecklistItem(name="Pre-Approval Letter", side="buyer"),
+            DocChecklistItem(name="Buyer Agency Agreement", side="buyer"),
+            DocChecklistItem(name="Purchase Agreement", side="buyer"),
+            DocChecklistItem(name="Earnest Money Receipt", side="buyer"),
+            DocChecklistItem(name="Inspection Report", side="buyer"),
+            DocChecklistItem(name="Proof of Funds", side="buyer"),
+        ],
+    ),
+    "seller": LoanTypeChecklist(
+        docs=[
+            DocChecklistItem(name="Government ID", side="seller"),
+            DocChecklistItem(name="Listing Agreement", side="seller"),
+            DocChecklistItem(name="Property Disclosure", side="seller"),
+            DocChecklistItem(name="HOA Documents", side="seller"),
+            DocChecklistItem(name="Lead-Based Paint Disclosure", side="seller"),
+            DocChecklistItem(name="Title / Deed", side="seller"),
+            DocChecklistItem(name="Agency Disclosure", side="seller"),
+        ],
+    ),
+}
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
     checklists: dict[str, LoanTypeChecklist] = Field(default_factory=dict)
+    # Transaction-side defaults (alembic 0025 / realtor overhaul). Keyed by
+    # `"buyer"` | `"seller"`. Used by the agent's lead-stage checklist surfaces
+    # (settings page, AddLeadWizard) — distinct from `checklists` above which
+    # is keyed by loan type and drives funding-stage doc collection.
+    transaction_checklists: dict[str, LoanTypeChecklist] = Field(
+        default_factory=lambda: dict(_DEFAULT_TRANSACTION_CHECKLISTS)
+    )
     ai_cadence: AICadence = Field(default_factory=AICadence)
     referrals: ReferralSettings = Field(default_factory=ReferralSettings)
     pricing: PricingSettings = Field(default_factory=PricingSettings)
@@ -220,6 +253,7 @@ class AppSettingsUpdate(BaseModel):
     """PATCH body — every section is optional. We deep-merge keys present in
     the payload onto the persisted JSONB and leave the rest untouched."""
     checklists: dict[str, LoanTypeChecklist] | None = None
+    transaction_checklists: dict[str, LoanTypeChecklist] | None = None
     ai_cadence: AICadence | None = None
     referrals: ReferralSettings | None = None
     pricing: PricingSettings | None = None

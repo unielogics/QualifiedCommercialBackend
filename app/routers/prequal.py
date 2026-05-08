@@ -39,6 +39,7 @@ from app.deps import CurrentUser
 from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
 from app.models.activity import Activity
 from app.models.app_settings import AppSettings
+from app.models.broker import Broker
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
@@ -533,7 +534,16 @@ async def _apply_approval(
     settings = get_settings()
     loan = None
     if req.loan_id is not None:
-        loan = await db.get(Loan, req.loan_id)
+        # Eager-load broker + broker.user so render_letter can read
+        # the agent's letterhead JSONB and User.name without a
+        # MissingGreenlet on the async session.
+        loan = (
+            await db.execute(
+                select(Loan)
+                .options(selectinload(Loan.broker).selectinload(Broker.user))
+                .where(Loan.id == req.loan_id)
+            )
+        ).scalar_one_or_none()
     # Load the firm-letterhead settings once; render_letter uses
     # officer_name / office_address / signature image from this row.
     settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()

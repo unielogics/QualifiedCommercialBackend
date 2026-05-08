@@ -204,6 +204,150 @@ async def test_funnel_firm_wide_for_super_admin(broker_pair):
 
 
 @pytest.mark.asyncio
+async def test_per_client_checklist_override_applies(broker_pair):
+    """Setting `Client.checklist_overrides` must:
+      - drop firm items named in `disabled_firm_items`,
+      - append `extra_items` (filtered by side),
+    via `resolve_loan_checklist`. Per-lead intent wins over firm
+    baseline + broker overlay."""
+    from sqlalchemy import update
+    from app.db import SessionLocal
+    from app.models.app_settings import AppSettings
+    from app.models.client import Client
+    from app.models.loan import Loan
+    from app.schemas.settings import AppSettingsData
+    from app.services.agent_checklist import resolve_loan_checklist
+
+    a = broker_pair[0]
+    loan_id = a["loan"].id
+    client_id = a["client"].id
+
+    async with SessionLocal() as db:
+        srow = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+        settings = (
+            AppSettingsData.model_validate(srow.data or {}) if srow else AppSettingsData()
+        )
+        loan = (await db.execute(select(Loan).where(Loan.id == loan_id))).scalar_one()
+        baseline_items, _ = await resolve_loan_checklist(db, loan=loan, settings=settings)
+        baseline_names = [i.name for i in baseline_items]
+
+    if not baseline_names:
+        pytest.skip("firm checklist empty in this env — nothing to disable")
+
+    first = baseline_names[0]
+    overrides = {
+        "disabled_firm_items": [first],
+        "extra_items": [
+            {
+                "name": "smoke_test_extra",
+                "display_name": "Smoke",
+                "type": "external",
+                "required": False,
+                "auto_request": True,
+                "due_offset_days": 7,
+                "anchor": "loan_created",
+                "per_unit": False,
+                "side": loan.side or "buyer",
+            }
+        ],
+    }
+
+    async with SessionLocal() as db:
+        await db.execute(
+            update(Client).where(Client.id == client_id).values(checklist_overrides=overrides)
+        )
+        await db.commit()
+
+    try:
+        async with SessionLocal() as db:
+            srow = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+            settings = (
+                AppSettingsData.model_validate(srow.data or {}) if srow else AppSettingsData()
+            )
+            loan = (await db.execute(select(Loan).where(Loan.id == loan_id))).scalar_one()
+            after_items, _ = await resolve_loan_checklist(db, loan=loan, settings=settings)
+            after_names = [i.name for i in after_items]
+            assert first not in after_names, (
+                f"client_overrides.disabled_firm_items did not remove {first!r}"
+            )
+            assert "smoke_test_extra" in after_names, (
+                "client_overrides.extra_items did not add custom row"
+            )
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                update(Client).where(Client.id == client_id).values(checklist_overrides=None)
+            )
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_per_client_cadence_override_cascades(broker_pair):
+    """Setting `Client.ai_cadence_override` must override broker +
+    firm cadence on the resolved base_checklist. Tests the field-level
+    cascade (firm → broker → client)."""
+    from sqlalchemy import update
+    from app.db import SessionLocal
+    from app.models.app_settings import AppSettings
+    from app.models.broker import Broker
+    from app.models.client import Client
+    from app.models.loan import Loan
+    from app.schemas.settings import AppSettingsData
+    from app.services.agent_checklist import resolve_loan_checklist
+
+    a = broker_pair[0]
+    loan_id = a["loan"].id
+    client_id = a["client"].id
+    broker_id = a["broker"].id
+
+    # Set broker cadence (overrides firm) — first=5, escalate=21
+    broker_settings = {
+        "checklists": {},
+        "cadence": {
+            "first_reminder_days": 5,
+            "second_reminder_days": None,
+            "escalate_after_days": 21,
+        },
+    }
+    # Client cadence overrides broker for first only
+    client_cadence = {
+        "first_reminder_days": 2,
+        "second_reminder_days": None,
+        "escalate_after_days": None,
+    }
+
+    async with SessionLocal() as db:
+        await db.execute(
+            update(Broker).where(Broker.id == broker_id).values(settings_data=broker_settings)
+        )
+        await db.execute(
+            update(Client).where(Client.id == client_id).values(ai_cadence_override=client_cadence)
+        )
+        await db.commit()
+
+    try:
+        async with SessionLocal() as db:
+            srow = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+            settings = (
+                AppSettingsData.model_validate(srow.data or {}) if srow else AppSettingsData()
+            )
+            loan = (await db.execute(select(Loan).where(Loan.id == loan_id))).scalar_one()
+            _, base = await resolve_loan_checklist(db, loan=loan, settings=settings)
+            assert base.first_reminder_days == 2, "client cadence didn't win for first_reminder"
+            assert base.escalate_after_days == 21, "broker cadence didn't propagate for escalate"
+            # second_reminder_days falls back to firm default (both overrides null)
+    finally:
+        async with SessionLocal() as db:
+            await db.execute(
+                update(Broker).where(Broker.id == broker_id).values(settings_data={})
+            )
+            await db.execute(
+                update(Client).where(Client.id == client_id).values(ai_cadence_override=None)
+            )
+            await db.commit()
+
+
+@pytest.mark.asyncio
 async def test_aitask_null_loan_visible_to_brokers(broker_pair):
     """A null-loan AITask (firm-wide alert) must appear for both
     broker_a and broker_b. This is the deliberate widening

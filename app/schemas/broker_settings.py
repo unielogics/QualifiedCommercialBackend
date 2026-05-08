@@ -66,15 +66,21 @@ class AgentLetterhead(BaseModel):
     NOT duplicated here — agent settings reads them from /auth/me.
     Realtors don't sign loan docs, so no signature block.
 
-    `logo_data_url` and `headshot_data_url` are base64 data URLs for
-    v1; v2 follow-up moves them to S3 keys for production scale."""
+    Headshot can be supplied as either a base64 data URL
+    (`headshot_data_url`, kept for v1 backwards compat) OR an S3 key
+    (`headshot_s3_key`). The S3 key path is preferred — production
+    PDF rendering pulls from S3 to avoid bloating the JSONB row with
+    inline base64. When both are present the S3 key wins."""
 
     title: str | None = None
     license_number: str | None = None
     brokerage_name: str | None = None
-    # Firm logo + realtor headshot — both base64 data URLs in v1.
+    # Firm logo + realtor headshot — base64 data URLs (v1).
     logo_data_url: str | None = None
     headshot_data_url: str | None = None
+    # S3-backed headshot (production path). Set via the
+    # /me/broker-settings/headshot/upload-init flow.
+    headshot_s3_key: str | None = None
 
 
 class AgentSettingsData(BaseModel):

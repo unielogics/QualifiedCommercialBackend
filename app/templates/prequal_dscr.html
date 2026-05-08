@@ -132,6 +132,33 @@
             text-align: justify;
             line-height: 1.3;
         }
+        .agent-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+            padding: 7px 9px;
+            border: 1px solid #e8e3d6;
+            background-color: #fdfbf7;
+            border-radius: 4px;
+        }
+        .agent-card .agent-headshot {
+            width: 38px; height: 38px;
+            object-fit: cover;
+            border-radius: 50%;
+            border: 1px solid #d8d2c2;
+            flex-shrink: 0;
+        }
+        .agent-card .agent-meta { font-size: 8.5pt; line-height: 1.35; }
+        .agent-card .agent-meta .label {
+            font-size: 7.5pt;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: #6B7891;
+            margin-bottom: 1px;
+        }
+        .agent-card .agent-meta .name { font-weight: 700; color: #0B1629; }
+        .agent-card .agent-meta .sub { color: #3C4A60; }
     </style>
 </head>
 <body>
@@ -147,6 +174,23 @@
             {% if office_address_line_3 %}{{ office_address_line_3 }}{% endif %}
         </div>
     </div>
+
+    {% if broker_headshot_data_uri %}
+    <div class="agent-card">
+        <img class="agent-headshot" src="{{ broker_headshot_data_uri }}" alt="Agent">
+        <div class="agent-meta">
+            <div class="label">Presented by your agent</div>
+            <div class="name">{{ broker_name or "Your real estate agent" }}{% if broker_title %} &middot; {{ broker_title }}{% endif %}</div>
+            {% if broker_brokerage or broker_license %}
+            <div class="sub">
+                {% if broker_brokerage %}{{ broker_brokerage }}{% endif %}
+                {% if broker_brokerage and broker_license %} &middot; {% endif %}
+                {% if broker_license %}License #{{ broker_license }}{% endif %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
 
     <div class="title">
         {% if is_refi %}Refinance{% else %}Purchase{% endif %} Pre-Qualification
