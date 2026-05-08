@@ -33,6 +33,11 @@ class ClientCreate(BaseModel):
     lead_intake: dict[str, Any] | None = None
     checklist_overrides: dict[str, Any] | None = None
     ai_cadence_override: dict[str, Any] | None = None
+    # Experience mode (alembic 0026). Dashboard-created clients pass
+    # "guided"; self-signups leave this NULL (UI derives self_directed).
+    client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
+    client_experience_mode_reason: str | None = None
+    client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -61,6 +66,11 @@ class ClientUpdate(BaseModel):
     lead_intake: dict[str, Any] | None = None
     checklist_overrides: dict[str, Any] | None = None
     ai_cadence_override: dict[str, Any] | None = None
+    # Experience mode (alembic 0026). PATCH path so the desktop's
+    # client-detail toggle persists.
+    client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
+    client_experience_mode_reason: str | None = None
+    client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None
 
 
 class ClientSelfUpdate(BaseModel):
@@ -102,3 +112,7 @@ class ClientRead(ORMModel):
     lead_intake: dict[str, Any] | None = None
     checklist_overrides: dict[str, Any] | None = None
     ai_cadence_override: dict[str, Any] | None = None
+    # Experience mode (alembic 0026). NULL = derive from broker_id.
+    client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
+    client_experience_mode_reason: str | None = None
+    client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None

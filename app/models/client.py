@@ -70,6 +70,27 @@ class Client(TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Experience mode (alembic 0026).
+    #
+    #   guided        — agent shepherds; AI nudges + concierge tone.
+    #                   Set when the client is dashboard-created
+    #                   (agent invited the borrower).
+    #   self_directed — borrower drives; AI is hands-off. Default for
+    #                   self-signups (no invite flow).
+    #   hybrid        — both. Rarely used in v1.
+    #   NULL          — not yet decided; UI falls back to deriving via
+    #                   broker_id presence (broker → guided, none → self).
+    #
+    # Mirrors the desktop `ClientExperienceMode` type. The /clients/{id}
+    # PATCH path writes this; agents pick "guided" by default at deal
+    # creation time.
+    client_experience_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Why the mode is what it is (audit trail for the agent UI).
+    client_experience_mode_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Who locked the choice — `agent` | `client` | `firm` | NULL.
+    # When locked, the OTHER role can't toggle it from their surface.
+    client_experience_mode_locked_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     # Per-lead context captured by the New Lead wizard (alembic 0025).
     # Free-shape JSONB so the wizard can evolve without migrations.
     # Buyer leads: target price range, area, property type, timeline.

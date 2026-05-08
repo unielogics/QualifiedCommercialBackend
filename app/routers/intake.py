@@ -15,7 +15,9 @@ from app.models.activity import Activity
 from app.models.client import Client
 from app.models.hud import HudLineItem
 from app.models.loan import Loan
+from app.models.user import User
 from app.schemas.intake import SmartIntakePayload, SmartIntakeResponse
+from app.services import clerk as clerk_service
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.hud_template import build_hud_draft
 from app.services.math import pricing_quote
@@ -39,14 +41,28 @@ async def submit_intake(
         await db.execute(select(Client).where(Client.email == payload.borrower.email))
     ).scalar_one_or_none()
     if client is None:
+        # Dashboard-created client → guided experience by default
+        # (alembic 0026). Self-signups leave this NULL and the UI
+        # derives self_directed from the absence of an invite flow.
         client = Client(
             name=payload.borrower.name,
             email=payload.borrower.email,
             phone=payload.borrower.phone,
             broker_id=user.broker.id if user.broker else None,
+            client_experience_mode="guided",
+            client_experience_mode_reason="agent_invited",
+            client_experience_mode_locked_by="agent",
         )
         db.add(client)
         await db.flush()
+    elif client.client_experience_mode is None:
+        # Pre-existing client (e.g. created earlier via a different
+        # path) gets upgraded to guided when an agent runs them
+        # through the dashboard's intake flow. Don't clobber a
+        # mode the borrower already explicitly chose.
+        client.client_experience_mode = "guided"
+        client.client_experience_mode_reason = "agent_invited"
+        client.client_experience_mode_locked_by = "agent"
 
     deal_id = _new_deal_id()
     loan = Loan(
@@ -159,5 +175,38 @@ async def submit_intake(
                 is_other=(cust.checklist_key is None),
             ))
         await db.flush()
+
+    # Provision a borrower User + send Clerk invite (alembic 0026 /
+    # realtor overhaul). Best-effort: if Clerk isn't configured, the
+    # local User row still gets created so the team list / client
+    # detail page reflect that an account exists. The borrower picks
+    # up sign-in via Clerk's invite redirect → JIT-binds clerk_id on
+    # first sign-in (deps.get_current_user).
+    if payload.borrower.email:
+        existing_user = (
+            await db.execute(select(User).where(User.email == payload.borrower.email.lower()))
+        ).scalar_one_or_none()
+        if existing_user is None:
+            new_user = User(
+                email=payload.borrower.email.lower(),
+                name=payload.borrower.name,
+                role=Role.CLIENT,
+                clerk_id=None,
+            )
+            db.add(new_user)
+            await db.flush()
+            client.user_id = new_user.id
+            await db.flush()
+            # Fire-and-forget Clerk invitation. No-op when
+            # CLERK_SECRET_KEY is unset (local dev).
+            await clerk_service.invite_user(
+                email=payload.borrower.email,
+                name=payload.borrower.name,
+                role=Role.CLIENT,
+            )
+        elif client.user_id is None and existing_user.deleted_at is None:
+            # Existing user without a client linkage — bind it.
+            client.user_id = existing_user.id
+            await db.flush()
 
     return SmartIntakeResponse(loan_id=loan.id, deal_id=deal_id)
