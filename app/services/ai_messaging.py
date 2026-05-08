@@ -83,6 +83,7 @@ async def post_ai_message(
     title_hint: str | None = None,
     actions: list[dict] | None = None,
     attachments: list[dict] | None = None,
+    push_title: str | None = None,
 ) -> AIChatThread:
     """Append an assistant-role message to the (user, loan) thread.
     Find-or-creates the thread, updates last_message_preview /
@@ -93,6 +94,12 @@ async def post_ai_message(
     "Upload Bank Statements" pills, post-anchor confirmations); the
     schema is enforced by `app.routers.ai.ChatAction`. Empty / None
     means a plain text message — same as before.
+
+    Side effect (alembic 0021): every system-side call also
+    fire-and-forgets a push notification to the user's registered
+    devices. `push_title` overrides the default "Qualified
+    Commercial" title — useful for routing-aware titles like
+    "Bank Statements approved".
 
     Caller is responsible for committing the surrounding session —
     this function only flushes (so it composes cleanly inside a
@@ -118,4 +125,24 @@ async def post_ai_message(
         "post_ai_message: user=%s loan=%s thread=%s body_len=%d actions=%d",
         user_id, loan_id, thread.id, len(body), len(actions or []),
     )
+
+    # Push notification — best-effort, fire-and-forget. Caller's
+    # transaction may not have committed yet but that's fine: the
+    # task opens its own SessionLocal to look up device tokens, and
+    # the body we already have here is what we want to deliver.
+    try:
+        from app.services.push import fire_and_forget_push  # local import
+        fire_and_forget_push(
+            user_id,
+            title=push_title or "Qualified Commercial",
+            body=body.strip(),
+            data={
+                "kind": "ai_chat_message",
+                "thread_id": str(thread.id),
+                "loan_id": str(loan_id) if loan_id else None,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("post_ai_message: push dispatch enqueue failed user=%s", user_id, exc_info=True)
+
     return thread

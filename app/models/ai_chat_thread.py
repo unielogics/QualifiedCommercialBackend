@@ -59,6 +59,12 @@ class AIChatThread(TimestampMixin, Base):
     last_message_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Bumped to now() whenever the borrower opens the thread (via
+    # POST /threads/{id}/seen). NULL = never opened — UI treats
+    # every assistant message as unread until first view.
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     loan: Mapped["Loan | None"] = relationship(foreign_keys=[loan_id])
 

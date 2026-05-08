@@ -9,6 +9,7 @@ from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
 from app.models.client import Client  # noqa: F401
 from app.models.credit_pull import CreditPull  # noqa: F401
+from app.models.device_token import DeviceToken  # noqa: F401
 from app.models.document import Document  # noqa: F401
 from app.models.email_draft import EmailDraft  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401

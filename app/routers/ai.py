@@ -778,6 +778,11 @@ class AIChatThreadRead(BaseModel):
     title: str
     last_message_preview: str | None
     last_message_at: datetime | None
+    last_seen_at: datetime | None = None
+    # Computed: True iff there's a system-side message (assistant role)
+    # the user hasn't viewed yet. Frontend renders an unread dot when
+    # set. NULL last_seen_at counts as never-viewed.
+    unread: bool = False
     created_at: datetime
     updated_at: datetime
     # Loan-scoped thread when set; account-wide when null.
@@ -898,11 +903,20 @@ def _preview(text: str, limit: int = 200) -> str:
 def _thread_read(thread: AIChatThread) -> AIChatThreadRead:
     """Serialize with the lightweight loan join. Caller must have
     eager-loaded `thread.loan` for this to avoid a lazy-load."""
+    # Unread = last assistant-side activity is newer than the user's
+    # last view. NULL last_seen_at counts as never-viewed (every
+    # message is unread until first open).
+    unread = bool(
+        thread.last_message_at is not None
+        and (thread.last_seen_at is None or thread.last_message_at > thread.last_seen_at)
+    )
     base = AIChatThreadRead(
         id=thread.id,
         title=thread.title,
         last_message_preview=thread.last_message_preview,
         last_message_at=thread.last_message_at,
+        last_seen_at=thread.last_seen_at,
+        unread=unread,
         created_at=thread.created_at,
         updated_at=thread.updated_at,
         loan_id=thread.loan_id,
@@ -1060,6 +1074,22 @@ async def rename_chat_thread(
     return _thread_read(thread)
 
 
+@router.post("/chat/threads/{thread_id}/seen", response_model=AIChatThreadRead)
+async def mark_chat_thread_seen(
+    thread_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIChatThreadRead:
+    """Bumps `last_seen_at = now()`. Mobile + desktop call this on
+    thread-open so the unread dot clears. Idempotent — calling twice
+    in a row just refreshes the timestamp."""
+    thread = await _load_thread_for_user(db, thread_id, user)
+    thread.last_seen_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(thread)
+    return _thread_read(thread)
+
+
 @router.delete("/chat/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_chat_thread(
     thread_id: UUID,
@@ -1183,6 +1213,10 @@ async def append_thread_message(
     preview_seed = body_text or "(attachment)"
     thread.last_message_preview = _preview(preview_seed)
     thread.last_message_at = now
+    # User is actively typing → they've "seen" the thread up to now.
+    # Clears the unread dot for the assistant reply that's about to
+    # land in this same turn.
+    thread.last_seen_at = now
     # Auto-title from the first user message — much cheaper than a
     # round-trip to Haiku just for a title, and easy to override via
     # PATCH /threads/{id} later.
@@ -1467,8 +1501,12 @@ async def append_thread_message(
         actions=persisted_actions,
     )
     db.add(assistant_msg)
+    final_now = datetime.now(timezone.utc)
     thread.last_message_preview = _preview(reply_text)
-    thread.last_message_at = datetime.now(timezone.utc)
+    thread.last_message_at = final_now
+    # The user is actively in the thread reading the reply they just
+    # triggered — bump seen so the unread dot doesn't re-light.
+    thread.last_seen_at = final_now
     await db.commit()
     await db.refresh(user_msg)
     await db.refresh(assistant_msg)
