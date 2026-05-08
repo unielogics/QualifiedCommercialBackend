@@ -22,6 +22,9 @@ class BorrowerStep(BaseModel):
 class AssetStep(BaseModel):
     address: str
     city: str | None = None
+    # USPS 2-letter state code (alembic 0028). Captured separately
+    # from city so address columns are queryable / sortable.
+    state: str | None = None
     property_type: PropertyType
     sqft: int | None = None
     annual_taxes: float = 0

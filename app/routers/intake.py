@@ -71,6 +71,7 @@ async def submit_intake(
         broker_id=user.broker.id if user.broker else None,
         address=payload.asset.address,
         city=payload.asset.city,
+        state=payload.asset.state,
         property_type=payload.asset.property_type,
         sqft=payload.asset.sqft,
         annual_taxes=payload.asset.annual_taxes,

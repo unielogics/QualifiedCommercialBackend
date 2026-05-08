@@ -51,6 +51,9 @@ class Loan(TimestampMixin, Base):
     # Property
     address: Mapped[str] = mapped_column(String(320), nullable=False)
     city: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # USPS 2-letter state code (alembic 0028). Separate from city so
+    # the address columns are queryable / sortable / filterable.
+    state: Mapped[str | None] = mapped_column(String(2), nullable=True)
     property_type: Mapped[PropertyType] = mapped_column(String(32), default=PropertyType.SFR)
     sqft: Mapped[int | None] = mapped_column(Integer, nullable=True)
     beds: Mapped[int | None] = mapped_column(Integer, nullable=True)
