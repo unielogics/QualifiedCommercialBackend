@@ -79,9 +79,12 @@ class Loan(TimestampMixin, Base):
     ltv: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
     ltc: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
     arv: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
-    base_rate: Mapped[float | None] = mapped_column(Numeric(7, 6), nullable=True)
+    # Numeric(9, 6): up to 999.999999 — covers fix-and-flip / bridge
+    # rates that routinely sit in the 10-15% range. Old Numeric(7, 6)
+    # capped at 9.999999 and 500'd on intake (alembic 0027).
+    base_rate: Mapped[float | None] = mapped_column(Numeric(9, 6), nullable=True)
     discount_points: Mapped[float] = mapped_column(Numeric(5, 3), default=0)
-    final_rate: Mapped[float | None] = mapped_column(Numeric(7, 6), nullable=True)
+    final_rate: Mapped[float | None] = mapped_column(Numeric(9, 6), nullable=True)
     origination_pct: Mapped[float] = mapped_column(Numeric(6, 4), default=0.015)
     term_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
