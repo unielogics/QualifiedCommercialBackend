@@ -504,6 +504,12 @@ Style:
 - Prefer asking the next question over calling a tool. Tools are scaffolding; the conversation is the surface.
 - When the profile is partial, say what you know + ask what you don't.
 
+Active plan discipline:
+- When the system context block contains an [ACTIVE CLIENT AI PLAN], that block is your authoritative checklist for THIS client. Read [AI NEXT-BEST QUESTION (computed)] and ASK IT directly — do not summarize the plan, do not paraphrase the question, do not list multiple items.
+- Honor [AGENT CUSTOM INSTRUCTIONS] for the active client verbatim. If the instruction says "don't push prequal yet," do not bring it up.
+- Skip every entry in [WAIVED FOR THIS CLIENT — DO NOT ASK].
+- Items in [OPEN REQUIRED ITEMS] are what you're collecting; items NOT in that list are not your concern this turn.
+
 Hard rules:
 - NEVER quote rates, terms, monthly payments, or pricing. Defer to "the lending team" or "after prequalification" when the agent asks for these.
 - NEVER promise approval, guaranteed closing dates, or specific lender outcomes.
@@ -533,6 +539,12 @@ Style:
 - Cite the exact facts the realtor AI already captured ("I have Marcus marked as ready for lending. Target: mixed-use, ~$900k, North Jersey...").
 - ONE question per turn. The borrower is talking to you alongside the agent — don't dump intake lists.
 - When a borrower-side question would expose internal agent notes (visibility_rules.internal_only_fields), do NOT surface those. Default to bank_visible.
+
+Active plan discipline:
+- When the system context block contains an [ACTIVE CLIENT AI PLAN], that block is your authoritative checklist for THIS deal. Read [AI NEXT-BEST QUESTION (computed)] and ASK IT directly — do not summarize the plan, do not paraphrase, do not list multiple items.
+- Honor [AGENT CUSTOM INSTRUCTIONS] verbatim if present.
+- Skip every entry in [WAIVED FOR THIS CLIENT — DO NOT ASK].
+- Items in [OPEN REQUIRED ITEMS] are what you're collecting; do not bring up unrelated items.
 
 Hard rules:
 - NEVER quote rates, terms, monthly payments, or final pricing. "After we have your prequal letter" is the right deflection.
@@ -880,6 +892,16 @@ async def chat(
     # Role-aware system prompt — borrower-friendly framing for clients,
     # operator persona for everyone else.
     system = _system_prompt_for(user, None)
+    # Firm-wide AI identity + global rules go at the TOP so they
+    # override any per-client overrides further down.
+    try:
+        from app.services.ai.firm_identity import load_firm_identity, render_identity_prefix
+        _identity = await load_firm_identity(db)
+        _prefix = render_identity_prefix(_identity)
+        if _prefix:
+            system = _prefix + system
+    except Exception:  # pragma: no cover — never break the chat
+        pass
     if context_block:
         system += "\n\n" + context_block
 
@@ -1600,6 +1622,17 @@ async def append_thread_message(
         # based on scope. Loan-scoped → Bank AI; client-scoped or
         # account-wide for an agent → Realtor AI.
         system = _system_prompt_for(user, thread)
+        # Firm-wide AI identity + global rules at the TOP so they
+        # override anything below — including per-client custom
+        # instructions.
+        try:
+            from app.services.ai.firm_identity import load_firm_identity, render_identity_prefix
+            _identity = await load_firm_identity(db)
+            _prefix = render_identity_prefix(_identity)
+            if _prefix:
+                system = _prefix + system
+        except Exception:  # pragma: no cover — never break the chat
+            pass
         if context_block:
             system += "\n\n" + context_block
 
