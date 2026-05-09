@@ -369,6 +369,44 @@ def _collect_agent_notes(profile: dict[str, Any]) -> str:
     return "; ".join(bits)
 
 
+# ── Resolver-backed sibling (alembic 0032) ─────────────────────────
+#
+# Phase 4 will wire the lending packet build to call this instead of
+# `_compute_missing_lending_items`. Both stay parallel during the
+# transition so the existing test_lending_handoff_builder.py contracts
+# still hold and we can swap callers one at a time.
+
+
+async def compute_missing_lending_items_from_resolver(
+    db: AsyncSession,
+    *,
+    client_id: UUID,
+    loan_id: UUID | None,
+    loan_product: str | None,
+    context: dict[str, Any] | None = None,
+) -> list[str]:
+    """Resolver-backed missing-lending-items list. Returns the
+    requirement_key of each non-satisfied required item from the
+    resolved loan-product playbook.
+
+    Falls back to the legacy `_LENDING_REQUIRED_FIELDS` set when no
+    matching loan-product playbook is found — keeps the existing
+    handoff packet shape stable until Phase 4 flips the caller."""
+    from app.services.ai.requirement_resolver import resolve_requirements  # local: avoid circular import
+
+    resolved = await resolve_requirements(
+        db,
+        client_id=client_id,
+        loan_id=loan_id,
+        phase="lending",
+        loan_product=loan_product,
+        context=context or {},
+    )
+    if not resolved:
+        return list(_LENDING_REQUIRED_FIELDS)
+    return [r.requirement_key for r in resolved if r.required_level == "required"]
+
+
 def _default_visibility_rules() -> dict[str, Any]:
     """Per-fact visibility template. v1 is operator-default — every
     fact is bank_visible (the funding team can see it) and the

@@ -224,11 +224,43 @@ PROPOSE_MARK_FINANCE_READY_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+UPDATE_CLIENT_REQUIREMENT_STATUS_TOOL = {
+    "name": "update_client_requirement_status",
+    "description": (
+        "Mark a single requirement on the active client's AI plan as "
+        "asked / provided_unverified / uploaded / verified / "
+        "needed_later. Use after the agent or borrower confirms a fact "
+        "or after you've asked for it. The plan rebuilds automatically "
+        "on the next chat turn — you don't need to call anything else. "
+        "Only call this for keys you see in the [OPEN REQUIRED ITEMS] "
+        "list of the active plan."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["requirement_key", "status"],
+        "properties": {
+            "requirement_key": {"type": "string", "description": "Stable key as listed in the active plan, e.g. buyer_agency_agreement."},
+            "status": {
+                "type": "string",
+                "enum": [
+                    "asked",
+                    "provided_unverified",
+                    "uploaded",
+                    "verified",
+                    "needed_later",
+                ],
+            },
+            "notes": {"type": "string", "description": "Free-form note. Optional."},
+        },
+    },
+}
+
 REALTOR_TOOL_SCHEMAS = [
     UPDATE_BUYER_INTENT_TOOL,
     UPDATE_SELLER_PROPERTY_TOOL,
     RECORD_KNOWN_FACT_TOOL,
     SET_CLIENT_TYPE_TOOL,
+    UPDATE_CLIENT_REQUIREMENT_STATUS_TOOL,
     PROPOSE_REQUEST_PREQUAL_TOOL,
     PROPOSE_SEND_BUYER_AGREEMENT_TOOL,
     PROPOSE_SEND_LISTING_AGREEMENT_TOOL,
@@ -244,6 +276,7 @@ PROFILE_WRITE_TOOLS = {
     "update_seller_property",
     "record_known_fact",
     "set_client_type",
+    "update_client_requirement_status",
 }
 
 # Map: tool name → ChatAction kind that the propose_* tools emit.
@@ -302,7 +335,21 @@ async def _execute_profile_write(
     agent_id: UUID,
 ) -> dict:
     """Apply a tool-call to the Client's realtor_profile JSONB.
-    Routes by tool name → patch shape consumed by apply_profile_patch."""
+    Routes by tool name → patch shape consumed by apply_profile_patch.
+
+    Special case: `update_client_requirement_status` doesn't write the
+    realtor_profile — it upserts a `client_requirement_status` row +
+    triggers a `client_ai_plan` rebuild on the next chat turn. The AI
+    calls this when it confirms a piece of information has been
+    provided / verified / etc."""
+    if tool_name == "update_client_requirement_status":
+        return await _execute_update_requirement_status(
+            db,
+            tool_input=tool_input,
+            client_id=client_id,
+            agent_id=agent_id,
+        )
+
     client = await db.get(Client, client_id)
     if client is None:
         return {"ok": False, "error": "client_not_found"}
@@ -376,6 +423,73 @@ async def _execute_profile_write(
         "finance_ready": compute_finance_ready(new_profile),
         "listing_ready": compute_listing_ready(new_profile),
     }
+
+
+async def _execute_update_requirement_status(
+    db: AsyncSession,
+    *,
+    tool_input: dict,
+    client_id: UUID,
+    agent_id: UUID,
+) -> dict:
+    """Upsert a `client_requirement_status` row for the given key.
+    The next chat turn's plan rebuild will fold this into the active
+    plan automatically; the AI doesn't need to compute a new plan
+    here."""
+    from datetime import datetime, timezone
+    from app.models.client_requirement_status import ClientRequirementStatus
+    from app.services.ai.audit import record_event
+
+    key = (tool_input.get("requirement_key") or "").strip()
+    status = (tool_input.get("status") or "").strip()
+    notes = tool_input.get("notes")
+    if not key or not status:
+        return {"ok": False, "error": "requirement_key_and_status_required"}
+
+    # Realtor-phase by default (loan_id is None). The lending phase
+    # caller passes loan_id explicitly via a different code path
+    # (Phase 6 contradiction handler).
+    q = (
+        select(ClientRequirementStatus)
+        .where(
+            ClientRequirementStatus.client_id == client_id,
+            ClientRequirementStatus.loan_id.is_(None),
+            ClientRequirementStatus.requirement_key == key,
+        )
+    )
+    existing = (await db.execute(q)).scalar_one_or_none()
+    old_status = existing.status if existing is not None else None
+
+    if existing is None:
+        row = ClientRequirementStatus(
+            client_id=client_id,
+            loan_id=None,
+            requirement_key=key,
+            status=status,
+            source="ai_detected",
+            last_requested_at=datetime.now(timezone.utc) if status == "asked" else None,
+            notes=notes,
+        )
+        db.add(row)
+    else:
+        existing.status = status
+        if status == "asked":
+            existing.last_requested_at = datetime.now(timezone.utc)
+        if notes:
+            existing.notes = notes
+
+    await db.flush()
+    await record_event(
+        db,
+        event_type="requirement_status_updated",
+        actor_type="ai",
+        actor_id=agent_id,
+        client_id=client_id,
+        requirement_key=key,
+        old_value={"status": old_status} if old_status else None,
+        new_value={"status": status},
+    )
+    return {"ok": True, "requirement_key": key, "status": status}
 
 
 def _execute_propose_action(

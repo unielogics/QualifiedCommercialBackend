@@ -144,6 +144,19 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Cadence engine (Phase 5, alembic 0032). Every 30 min walks
+    # ai_cadence_rules + spawns draft messages / tasks / escalations.
+    # Draft-first by default — auto-send is opt-in per rule.
+    scheduler.add_job(
+        _wrap(job_cadence_pass),
+        "interval",
+        minutes=30,
+        id="cadence_pass",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -266,6 +279,24 @@ async def job_pipeline_scan() -> None:
     from app.services.ai.pipeline_digest import scan_pipeline
 
     await scan_pipeline()
+
+
+async def job_cadence_pass() -> None:
+    """Phase 5 — walk ai_cadence_rules every 30 min and fire
+    eligible actions. Draft-first: borrower-facing messages always
+    queue as AI Inbox drafts, not direct sends, unless the rule
+    explicitly opts into auto-send."""
+    from app.db import SessionLocal
+    from app.services.ai.cadence_engine import run_cadence_pass
+
+    async with SessionLocal() as db:
+        try:
+            stats = await run_cadence_pass(db)
+            await db.commit()
+            log.info("cadence_pass: %s", stats)
+        except Exception:
+            await db.rollback()
+            log.exception("cadence_pass: failed; rolled back")
 
 
 async def job_document_scan_drain() -> None:

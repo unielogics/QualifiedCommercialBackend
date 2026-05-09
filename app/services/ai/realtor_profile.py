@@ -304,6 +304,48 @@ def apply_profile_patch(
     return base
 
 
+# ── Resolver-backed sibling (alembic 0032) ──────────────────────────
+#
+# This is the playbook-driven version of `compute_missing_facts`. Phase
+# 4 will wire the Realtor AI router to call this instead of the sync
+# helper above. Both stay parallel during the transition so the
+# existing test_realtor_profile_shape.py contracts still hold and we
+# can swap callers one at a time.
+
+
+async def compute_missing_facts_from_resolver(
+    db: "Any",  # AsyncSession — typed as Any to avoid an import cycle in tests
+    *,
+    client_id: "Any",  # UUID
+    agent_id: "Any" = None,  # UUID | None
+    side: str | None = None,
+    context: dict[str, Any] | None = None,
+) -> list[str]:
+    """Resolver-backed missing-facts list. Returns the requirement_key
+    of each non-satisfied required item from the resolved buyer/seller
+    playbook.
+
+    `context` is the dict the resolver evaluates `applies_when` against.
+    Caller usually passes the same dict that plan_builder builds (see
+    plan_builder._build_resolver_context).
+
+    Falls back to an empty list when no playbooks match — the legacy
+    `compute_missing_facts` keeps the old hardcoded behavior for any
+    caller that hasn't migrated yet."""
+    from app.services.ai.requirement_resolver import resolve_requirements  # local: avoid circular import
+
+    resolved = await resolve_requirements(
+        db,
+        client_id=client_id,
+        loan_id=None,
+        phase="realtor",
+        side=side,  # type: ignore[arg-type]
+        agent_id=agent_id,
+        context=context or {},
+    )
+    return [r.requirement_key for r in resolved if r.required_level == "required"]
+
+
 def _empty_buyer_profile() -> dict[str, Any]:
     return {
         "target_property_type": None,

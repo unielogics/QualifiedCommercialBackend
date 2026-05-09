@@ -696,3 +696,204 @@ async def mark_finance_ready(
     return _realtor_action_response(
         client_id=client.id, action_kind="mark_client_finance_ready", ai_task_id=None,
     )
+
+
+# ── Client AI Plan (Phase 2) ───────────────────────────────────────
+
+
+class ClientAIPlanRead(BaseModel):
+    """Resolved active AI plan for one (client, loan?) scope.
+
+    Mirrors `client_ai_plan` 1:1. The agent's portal renders this as
+    the AI Plan card on `/clients/[id]`."""
+    client_id: UUID
+    loan_id: UUID | None
+    current_phase: str
+    custom_instructions: str | None
+    required_items: list[dict]
+    waived_items: list[dict]
+    ai_suggested_items: list[dict]
+    next_best_question: str | None
+    next_best_action: dict | None
+    readiness_score: int | None
+    active_playbook_versions: list[dict]
+    computed_at: datetime
+
+
+class ClientAIPlanPatch(BaseModel):
+    """Per-client overrides the agent can apply on top of their playbooks.
+
+    waive_keys / unwaive_keys are toggles against client_requirement_status.
+    custom_instructions free-text gets persisted on client_ai_plan."""
+    custom_instructions: str | None = None
+    waive_keys: list[str] | None = None
+    unwaive_keys: list[str] | None = None
+    rebuild: bool = True
+
+
+@router.get("/{client_id}/ai-plan", response_model=ClientAIPlanRead)
+async def get_client_ai_plan(
+    client_id: UUID,
+    user: CurrentUser,
+    loan_id: UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> ClientAIPlanRead:
+    """Return the active AI plan for this (client, loan) scope.
+    Triggers a rebuild on every read so the plan stays fresh —
+    cheap (a handful of queries)."""
+    if user.role not in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.role == Role.BROKER and user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    from app.services.ai.plan_builder import rebuild as rebuild_plan
+    plan = await rebuild_plan(db, client_id=client_id, loan_id=loan_id)
+    return ClientAIPlanRead(
+        client_id=plan.client_id,
+        loan_id=plan.loan_id,
+        current_phase=plan.current_phase,
+        custom_instructions=plan.custom_instructions,
+        required_items=list(plan.required_items or []),
+        waived_items=list(plan.waived_items or []),
+        ai_suggested_items=list(plan.ai_suggested_items or []),
+        next_best_question=plan.next_best_question,
+        next_best_action=plan.next_best_action,
+        readiness_score=plan.readiness_score,
+        active_playbook_versions=list(plan.active_playbook_versions or []),
+        computed_at=plan.computed_at,
+    )
+
+
+@router.patch("/{client_id}/ai-plan", response_model=ClientAIPlanRead)
+async def patch_client_ai_plan(
+    client_id: UUID,
+    payload: ClientAIPlanPatch,
+    user: CurrentUser,
+    loan_id: UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> ClientAIPlanRead:
+    """Apply per-client overrides:
+      - waive_keys: marks each requirement as `waived` (or `not_applicable`)
+        in client_requirement_status. Only succeeds for keys whose
+        underlying requirement has can_agent_override=True; others are
+        skipped silently. Funding-required items can NOT be waived
+        from the agent side.
+      - unwaive_keys: flips a previously waived key back to `missing`.
+      - custom_instructions: free-text per-client guidance.
+
+    All changes write `ai_audit_events` rows. Triggers a rebuild after
+    applying so the response reflects the new plan."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only override surface")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    from app.models.client_ai_plan import ClientAIPlan
+    from app.models.client_requirement_status import ClientRequirementStatus
+    from app.services.ai.audit import record_event
+    from app.services.ai.plan_builder import rebuild as rebuild_plan
+    from app.services.ai.requirement_resolver import resolve_requirements
+
+    # Index of agent-overridable keys for this scope, used to enforce
+    # the "agents can't waive funding-required items" rule.
+    profile = client.realtor_profile or {}
+    bp = profile.get("buyer_profile") or {}
+    ctx = {
+        "client_type": profile.get("client_type") or client.client_type,
+        "financing_needed": bp.get("financing_needed"),
+        "target_property_type": bp.get("target_property_type"),
+        "under_contract": bp.get("under_contract"),
+    }
+    side = "buyer" if (profile.get("client_type") in ("buyer", "buyer_and_seller")) else (
+        "seller" if profile.get("client_type") == "seller" else None
+    )
+    resolved = await resolve_requirements(
+        db,
+        client_id=client_id, loan_id=loan_id,
+        phase="lending" if loan_id else "realtor",
+        side=side, agent_id=user.id, context=ctx,
+    )
+    overridable = {r.requirement_key for r in resolved if r.can_agent_override}
+
+    async def _set_status(key: str, status_value: str) -> None:
+        existing = (await db.execute(
+            select(ClientRequirementStatus).where(
+                ClientRequirementStatus.client_id == client_id,
+                ClientRequirementStatus.loan_id == loan_id if loan_id is not None else ClientRequirementStatus.loan_id.is_(None),
+                ClientRequirementStatus.requirement_key == key,
+            )
+        )).scalar_one_or_none()
+        old = existing.status if existing else None
+        if existing is None:
+            db.add(ClientRequirementStatus(
+                client_id=client_id, loan_id=loan_id, requirement_key=key,
+                status=status_value, source="client_custom",
+            ))
+        else:
+            existing.status = status_value
+            existing.source = "client_custom"
+        await record_event(
+            db, event_type="requirement_waived" if status_value == "waived" else "client_override_added",
+            actor_type="user", actor_id=user.id, client_id=client_id, loan_id=loan_id,
+            requirement_key=key, old_value={"status": old} if old else None,
+            new_value={"status": status_value},
+        )
+
+    for key in (payload.waive_keys or []):
+        if key in overridable:
+            await _set_status(key, "waived")
+    for key in (payload.unwaive_keys or []):
+        if key in overridable:
+            await _set_status(key, "missing")
+
+    if payload.custom_instructions is not None:
+        plan_row = (await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.client_id == client_id,
+                ClientAIPlan.loan_id == loan_id if loan_id is not None else ClientAIPlan.loan_id.is_(None),
+            )
+        )).scalar_one_or_none()
+        if plan_row is not None:
+            old_instr = plan_row.custom_instructions
+            plan_row.custom_instructions = payload.custom_instructions or None
+            await record_event(
+                db, event_type="client_custom_instructions_updated",
+                actor_type="user", actor_id=user.id, client_id=client_id, loan_id=loan_id,
+                old_value={"text": old_instr} if old_instr else None,
+                new_value={"text": payload.custom_instructions},
+            )
+            await db.flush()
+
+    plan = await rebuild_plan(db, client_id=client_id, loan_id=loan_id) if payload.rebuild else None
+    if plan is None:
+        # Caller asked us to skip rebuild — return the row as-is.
+        from app.models.client_ai_plan import ClientAIPlan as _CAIP
+        plan = (await db.execute(
+            select(_CAIP).where(
+                _CAIP.client_id == client_id,
+                _CAIP.loan_id == loan_id if loan_id is not None else _CAIP.loan_id.is_(None),
+            )
+        )).scalar_one_or_none()
+        if plan is None:
+            plan = await rebuild_plan(db, client_id=client_id, loan_id=loan_id)
+
+    return ClientAIPlanRead(
+        client_id=plan.client_id,
+        loan_id=plan.loan_id,
+        current_phase=plan.current_phase,
+        custom_instructions=plan.custom_instructions,
+        required_items=list(plan.required_items or []),
+        waived_items=list(plan.waived_items or []),
+        ai_suggested_items=list(plan.ai_suggested_items or []),
+        next_best_question=plan.next_best_question,
+        next_best_action=plan.next_best_action,
+        readiness_score=plan.readiness_score,
+        active_playbook_versions=list(plan.active_playbook_versions or []),
+        computed_at=plan.computed_at,
+    )

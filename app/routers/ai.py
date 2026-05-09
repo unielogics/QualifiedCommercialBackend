@@ -735,6 +735,71 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
     return "\n".join(lines)
 
 
+def _render_plan_block(plan, audience: str = "agent") -> str | None:
+    """Render `client_ai_plan` as a system-prompt context section.
+
+    Phase 4: this block is what tells the AI which requirements are
+    active for THIS client/deal — including agent overrides and
+    per-client custom instructions. Trumps the raw missing_facts walk
+    of the legacy realtor_profile path.
+
+    Phase 7: visibility filtering. Borrower-facing renders strip
+    items + custom instructions the borrower isn't allowed to see.
+
+    Returns None if the plan has nothing to add (no required items)."""
+    if plan is None:
+        return None
+
+    from app.services.ai.visibility_filter import filter_facts as _vis_filter
+    open_items_raw = [
+        i for i in (plan.required_items or [])
+        if i.get("status") not in ("verified", "uploaded", "not_applicable", "waived")
+    ]
+    open_items = _vis_filter(open_items_raw, audience)  # type: ignore[arg-type]
+    custom_instr = plan.custom_instructions if audience != "borrower" else None
+    waived = _vis_filter(plan.waived_items or [], audience)  # type: ignore[arg-type]
+
+    if not open_items and not custom_instr:
+        return None
+
+    lines = ["[ACTIVE CLIENT AI PLAN]"]
+    lines.append(f"phase: {plan.current_phase}")
+    if plan.readiness_score is not None:
+        lines.append(f"readiness_score: {plan.readiness_score}")
+    if custom_instr:
+        lines.append(f"\n[AGENT CUSTOM INSTRUCTIONS — for THIS client]")
+        lines.append(custom_instr)
+
+    if open_items:
+        lines.append("\n[OPEN REQUIRED ITEMS]")
+        for it in open_items[:25]:  # cap so the prompt doesn't balloon
+            level = it.get("required_level", "required")
+            stage = it.get("blocks_stage") or "—"
+            src = it.get("source", "platform")
+            lines.append(
+                f"- {it.get('label', it.get('requirement_key'))} "
+                f"({level}, blocks={stage}, src={src}, status={it.get('status')})"
+            )
+
+    if plan.next_best_question:
+        lines.append("\n[AI NEXT-BEST QUESTION (computed)]")
+        lines.append(plan.next_best_question)
+
+    if waived:
+        lines.append("\n[WAIVED FOR THIS CLIENT — DO NOT ASK]")
+        for w in waived[:10]:
+            lines.append(f"- {w.get('label', w.get('requirement_key'))}")
+
+    lines.append(
+        "\nUse this block as your active checklist. Honor agent custom "
+        "instructions verbatim. Skip any item in WAIVED. Walk OPEN "
+        "REQUIRED ITEMS one at a time, prioritizing the AI NEXT-BEST "
+        "QUESTION when present. Do NOT re-ask for items already in "
+        "verified/uploaded status."
+    )
+    return "\n".join(lines)
+
+
 async def _build_loan_context(db: AsyncSession, loan_id: UUID) -> str | None:
     """Render the loan-grounded context block injected into the system prompt."""
     loan = await db.get(Loan, loan_id)
@@ -1427,6 +1492,30 @@ async def append_thread_message(
         #   else (phase=realtor or NULL) → Realtor AI gets the
         #                    Realtor Client Intelligence Profile.
         client_row = await db.get(Client, thread.client_id)
+
+        # Phase 4: rebuild the ClientAIPlan up front. The plan rolls up
+        # platform + funding + agent + per-client-override layers into
+        # the active list the AI should chase. Failures here MUST NOT
+        # block the chat turn — fall back to the legacy context blocks
+        # below if the rebuild errors out.
+        plan_block: str | None = None
+        if client_row is not None:
+            try:
+                from app.services.ai.plan_builder import rebuild as rebuild_plan
+                plan = await rebuild_plan(
+                    db,
+                    client_id=client_row.id,
+                    loan_id=thread.loan_id,
+                )
+                _audience = (
+                    "borrower" if user.role == Role.CLIENT
+                    else "underwriter" if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC)
+                    else "agent"
+                )
+                plan_block = _render_plan_block(plan, audience=_audience)
+            except Exception:  # pragma: no cover — plan is additive, not required
+                plan_block = None
+
         if client_row is not None and thread.phase == "lending" and thread.handoff_packet_id:
             from app.models.lending_handoff_packet import LendingHandoffPacket
             packet = await db.get(LendingHandoffPacket, thread.handoff_packet_id)
@@ -1471,6 +1560,14 @@ async def append_thread_message(
                 f"\n[REALTOR PROFILE JSONB]\n{json.dumps(profile, indent=2, default=str)}\n"
                 f"\n[MISSING FACTS]\n{', '.join(missing) if missing else '—'}\n"
             )
+        # Append the ClientAIPlan summary AFTER the legacy block so the
+        # plan's resolved active list (including agent overrides + custom
+        # instructions) trumps the raw missing_facts walk. Phase 4
+        # verification target.
+        if plan_block and context_block is not None:
+            context_block += "\n\n" + plan_block
+        elif plan_block:
+            context_block = plan_block
     else:
         user_with_client = (
             await db.execute(

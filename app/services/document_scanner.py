@@ -504,5 +504,38 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
     if loan.client is not None:
         loan.client.living_refreshed_at = None  # forces next refresh
 
+    # 8. Persist a DocumentAnalysisResult row + run contradiction
+    # detection (Phase 6, alembic 0032 + 0033). Failures here are
+    # logged but don't fail the scan — the row above already shows
+    # the agent the scan succeeded.
+    try:
+        from decimal import Decimal as _D
+        from app.models.document_analysis_result import DocumentAnalysisResult
+        from app.services.ai.contradiction_detector import detect_and_record
+
+        extracted: dict[str, Any] = {}
+        # Pull whatever the scanner extracted in a structured shape.
+        # The scanner today doesn't emit a clean dict; we parse out the
+        # canonical fields we know about.
+        if scan.named_borrowers:
+            extracted["borrower_name"] = scan.named_borrowers[0]
+        if scan.key_amounts:
+            # Heuristic: largest amount → purchase_price / loan_amount
+            # depending on document type. We tag both as the same field
+            # for now; downstream comparison logic does the rest.
+            extracted["purchase_price"] = max(scan.key_amounts)
+        analysis = DocumentAnalysisResult(
+            document_id=doc.id,
+            detected_document_type=scan.document_type,
+            confidence=_D(f"{float(scan.confidence):.2f}") if scan.confidence is not None else None,
+            extracted_facts=extracted or None,
+            analyzer_version="v1",
+        )
+        db.add(analysis)
+        await db.flush()
+        await detect_and_record(db, analysis=analysis)
+    except Exception:  # pragma: no cover — never break the scan
+        log.exception("scanner: contradiction detection failed for doc %s", doc.id)
+
     await db.flush()
     return scan
