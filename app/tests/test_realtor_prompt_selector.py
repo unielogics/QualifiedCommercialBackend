@@ -29,6 +29,9 @@ class FakeUser:
 class FakeThread:
     loan_id: object | None = None
     client_id: object | None = None
+    # alembic 0031 — selector reads thread.phase. Default None so
+    # legacy thread shapes still type-check.
+    phase: str | None = None
 
 
 # ── Borrowers (CLIENT role) ──────────────────────────────────────────

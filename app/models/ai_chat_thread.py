@@ -66,6 +66,38 @@ class AIChatThread(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Phase + handoff metadata (alembic 0031).
+    #
+    #   phase                realtor | lending. Drives AI persona
+    #                        selection. NULL on legacy threads /
+    #                        account-wide threads — selector falls
+    #                        back to existing role-based logic.
+    #   parent_thread_id     Lending threads point at the realtor
+    #                        thread they were spawned from. The
+    #                        Lending AI can pull full realtor history
+    #                        when it needs deeper context.
+    #   handoff_packet_id    Lending threads carry the LendingHandoffPacket
+    #                        as their bootstrap context — extracted facts,
+    #                        missing items, recommended path.
+    #   prequal_request_id   Convenience link to the quote, so the UI
+    #                        can surface it without joining through
+    #                        the packet.
+    phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    parent_thread_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("ai_chat_threads.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    handoff_packet_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("lending_handoff_packets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    prequal_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prequal_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="New conversation")
     last_message_preview: Mapped[str | None] = mapped_column(String(240), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(

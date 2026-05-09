@@ -264,6 +264,13 @@ class PrequalHandoffResponse(BaseModel):
     prequal_request_id: UUID
     client_id: UUID
     lead_promotion_status: str
+    # Lending Handoff Packet (alembic 0031). Returned so the desktop
+    # can show a confirmation summary right after the click.
+    handoff_packet_id: UUID | None = None
+    lending_thread_id: UUID | None = None
+    handoff_summary: str | None = None
+    first_lending_question: str | None = None
+    missing_lending_items: list[str] = []
 
 
 @router.post("/{client_id}/request-prequalification", response_model=PrequalHandoffResponse)
@@ -397,11 +404,133 @@ async def request_prequalification(
     await db.flush()
     await db.refresh(client)
 
+    # ── Lending Handoff Packet (alembic 0031) ──────────────────────
+    # The button doesn't just flip a flag — it creates a structured
+    # bridge between the Realtor AI's relationship work and the
+    # Lending AI's loan-intelligence work. We:
+    #
+    #   1. Find the client's realtor thread (if any) so we can link
+    #      back to the conversation history.
+    #   2. Build the handoff packet — extracted facts, missing
+    #      lending items, recommended path, first lending question.
+    #   3. Persist the packet.
+    #   4. Spawn the lending-phase thread (parent_thread_id pointing
+    #      at the realtor thread, handoff_packet_id pointing at the
+    #      packet, prequal_request_id linking the quote).
+    #   5. Drop the first lending AI message into the new thread —
+    #      deterministic for v1; the AI takes over from message 2.
+    from app.models.ai_chat_thread import AIChatMessage, AIChatThread
+    from app.models.lending_handoff_packet import LendingHandoffPacket
+    from app.services.ai.handoff_builder import build_handoff_packet
+
+    realtor_thread = (
+        await db.execute(
+            select(AIChatThread)
+            .where(
+                AIChatThread.user_id == user.id,
+                AIChatThread.client_id == client.id,
+                AIChatThread.loan_id.is_(None),
+            )
+            .order_by(AIChatThread.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    packet_payload = await build_handoff_packet(
+        db,
+        client=client,
+        agent_id=user.id,
+        realtor_thread_id=realtor_thread.id if realtor_thread else None,
+    )
+    packet_payload["prequal_request_id"] = prequal.id
+
+    packet = LendingHandoffPacket(**packet_payload)
+    db.add(packet)
+    await db.flush()
+
+    # Mark the realtor thread as phase=realtor (legacy threads were
+    # NULL) — gives a clean audit trail post-handoff.
+    if realtor_thread is not None and realtor_thread.phase is None:
+        realtor_thread.phase = "realtor"
+
+    # Spawn the lending-phase thread linked back to the realtor side.
+    lending_thread = AIChatThread(
+        user_id=user.id,
+        client_id=client.id,
+        loan_id=None,
+        phase="lending",
+        parent_thread_id=realtor_thread.id if realtor_thread else None,
+        handoff_packet_id=packet.id,
+        prequal_request_id=prequal.id,
+        title=f"Lending — {client.name[:80]}",
+    )
+    db.add(lending_thread)
+    await db.flush()
+
+    # Backfill the packet with the lending thread id now that we have it.
+    packet.lending_thread_id = lending_thread.id
+
+    # Drop the first Lending AI message — deterministic, derived from
+    # the packet. The AI takes over from message 2 onwards using the
+    # handoff packet as its context block (LENDING_AI_SYSTEM_PROMPT
+    # selector, see app/routers/ai.py).
+    first_msg_body = _compose_first_lending_message(packet_payload, client)
+    db.add(AIChatMessage(
+        thread_id=lending_thread.id,
+        role="assistant",
+        body=first_msg_body,
+        actions=None,
+        attachments=None,
+    ))
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    lending_thread.last_message_preview = first_msg_body[:200]
+    lending_thread.last_message_at = now
+
+    await db.flush()
+    await db.refresh(packet)
+
     return PrequalHandoffResponse(
         prequal_request_id=prequal.id,
         client_id=client.id,
         lead_promotion_status=client.lead_promotion_status,
+        handoff_packet_id=packet.id,
+        lending_thread_id=lending_thread.id,
+        handoff_summary=packet.handoff_summary,
+        first_lending_question=packet.first_lending_question,
+        missing_lending_items=packet.missing_lending_items or [],
     )
+
+
+def _compose_first_lending_message(packet: dict, client: Client) -> str:
+    """Build the deterministic first-message body the Lending AI
+    drops into the freshly-spawned lending thread. Demonstrates
+    memory inheritance — lists what we know, lists what's missing,
+    asks the highest-leverage first question."""
+    lines: list[str] = []
+    lines.append(f"I have {client.name} marked as ready for lending.")
+    summary = packet.get("handoff_summary") or ""
+    if summary:
+        lines.append("")
+        lines.append("Here's what I already know from the realtor side:")
+        for s in summary.split("\n"):
+            if s.strip() and not s.lower().startswith("client:"):
+                lines.append(f"  • {s.strip()}")
+    missing = packet.get("missing_lending_items") or []
+    if missing:
+        lines.append("")
+        lines.append("To start the lending package correctly, I still need:")
+        for m in missing[:5]:
+            lines.append(f"  • {_humanize_field(m)}")
+    first_q = packet.get("first_lending_question")
+    if first_q:
+        lines.append("")
+        lines.append(first_q)
+    return "\n".join(lines)
+
+
+def _humanize_field(field: str) -> str:
+    return field.replace("_", " ").replace(".", " · ").capitalize()
 
 
 # ── Realtor AI ChatAction confirm-endpoints (alembic 0030) ───────────

@@ -513,22 +513,62 @@ Hard rules:
 """
 
 
+LENDING_AI_SYSTEM_PROMPT = """Role: You are the Lending Intake + Loan Intelligence Assistant for Qualified Commercial. You take over from the Realtor AI once the agent fires "Ready for Lending." You are NOT a lender — you don't quote rates, terms, or pricing. You don't promise approval. You collect the lending-side facts the funding team needs to move from a quote to a loan.
+
+You operate on a Lending Handoff Packet the Realtor AI handed you. The packet contains: realtor_summary (intent + relationship_stage at handoff), extracted_facts (what the agent already told the realtor AI: client name, target property type, location, budget, timeline, financing_needed, etc.), missing_lending_items (the lending-side gaps you need to close — borrower_entity_type, credit_authorization, liquidity_docs, property_address, rent_or_income_details, experience_tier), uploaded_document_refs (files already collected, with relevant_to_lending tag), recommended_lending_path (loan_type_guess, urgency, rationale), and visibility_rules (which facts the borrower can see vs internal-only).
+
+Goals:
+1. Acknowledge what's already known. Never re-ask for facts the packet already carries — that breaks the agent's trust in the system memory.
+2. Close lending-side gaps one at a time. Walk the missing_lending_items list, prioritize by urgency, ask the next question conversationally.
+3. Verify documents already uploaded. When uploaded_document_refs has a relevant_to_lending=true entry, surface it ("I see you uploaded the purchase agreement — let me confirm the terms").
+4. Identify conflicts. If a fact in extracted_facts disagrees with a fresh borrower answer, surface the discrepancy + ask which is current.
+5. Hand the agent + funding team a clean prequal package. The AI Inbox sees what's pending; the operator queue picks up the formal review.
+
+Tools (invoke as you learn things — same safety pattern as the Realtor AI):
+- Mirror profile updates onto the same Client.realtor_profile / extracted_facts so the agent sees consistent state across phases.
+- ChatAction emitters for state changes — borrower invite, document request, escalation to underwriter.
+
+Style:
+- Conversational, short, useful. Sound like the agent's bank-side counterpart, not a form.
+- Cite the exact facts the realtor AI already captured ("I have Marcus marked as ready for lending. Target: mixed-use, ~$900k, North Jersey...").
+- ONE question per turn. The borrower is talking to you alongside the agent — don't dump intake lists.
+- When a borrower-side question would expose internal agent notes (visibility_rules.internal_only_fields), do NOT surface those. Default to bank_visible.
+
+Hard rules:
+- NEVER quote rates, terms, monthly payments, or final pricing. "After we have your prequal letter" is the right deflection.
+- NEVER promise approval, guaranteed timelines, or specific lender outcomes.
+- NEVER expose another client's data.
+- NEVER re-ask for a fact already in the packet's extracted_facts (unless the borrower volunteers a contradiction).
+- NEVER fire a state-changing action without a ChatAction the agent or borrower confirms.
+"""
+
+
 def _system_prompt_for(user: User, thread: AIChatThread | None = None) -> str:
     """Pick the framing the AI should adopt for this caller + thread
     scope. Borrowers always get the concierge tone scoped to their own
-    data. Operators split based on thread scope:
+    data. Operators split based on thread phase + scope:
 
-      - loan-scoped thread       → Bank AI (OPERATOR_SYSTEM_PROMPT)
-      - client-scoped thread     → Realtor AI (BROKER) / Bank AI (others)
-      - account-wide (both null) → Realtor AI (BROKER) / Bank AI (others)
+      - thread.phase = "lending"     → Lending AI (post-handoff)
+      - thread.phase = "realtor"     → Realtor AI (relationship phase)
+      - thread.loan_id set           → Bank AI (loan-scoped)
+      - client-scoped thread (no
+        phase set) for a BROKER      → Realtor AI (legacy, pre-0031)
+      - account-wide for a BROKER    → Realtor AI
+      - everyone else                → Bank AI
+
+    Phase wins over scope so freshly-spawned lending threads get the
+    right persona immediately even though they're client-scoped.
     """
     if user.role == Role.CLIENT:
         return CLIENT_SYSTEM_PROMPT
-    # Loan-scoped: Bank AI for everyone (the loan exists, underwriting
-    # is the relevant frame).
-    if thread is not None and thread.loan_id is not None:
-        return OPERATOR_SYSTEM_PROMPT
-    # Pre-loan (client-scoped or account-wide): split by role.
+    if thread is not None:
+        if thread.phase == "lending":
+            return LENDING_AI_SYSTEM_PROMPT
+        if thread.phase == "realtor":
+            return REALTOR_SYSTEM_PROMPT
+        if thread.loan_id is not None:
+            return OPERATOR_SYSTEM_PROMPT
+    # Pre-loan, no phase set: split by role.
     if user.role == Role.BROKER:
         return REALTOR_SYSTEM_PROMPT
     return OPERATOR_SYSTEM_PROMPT
@@ -1380,17 +1420,39 @@ async def append_thread_message(
             )
             context_block = await assemble_loan_context(db, loan, audience=audience) or None
     elif thread.client_id is not None:
-        # Realtor AI per-client thread (alembic 0030). Inject the
-        # client row + the Realtor Client Intelligence Profile so
-        # the AI knows who it's talking about and what's known /
-        # missing without asking again.
-        from app.services.ai.realtor_profile import (
-            empty_profile,
-            compute_finance_ready,
-            compute_missing_facts,
-        )
+        # Client-scoped thread. Two flavors:
+        #   phase=lending → Lending AI gets the LendingHandoffPacket
+        #                    as bootstrap memory ("here's everything
+        #                    the realtor AI captured before handoff").
+        #   else (phase=realtor or NULL) → Realtor AI gets the
+        #                    Realtor Client Intelligence Profile.
         client_row = await db.get(Client, thread.client_id)
-        if client_row is not None:
+        if client_row is not None and thread.phase == "lending" and thread.handoff_packet_id:
+            from app.models.lending_handoff_packet import LendingHandoffPacket
+            packet = await db.get(LendingHandoffPacket, thread.handoff_packet_id)
+            if packet is not None:
+                context_block = (
+                    f"[LENDING HANDOFF CONTEXT]\n"
+                    f"client_id: {client_row.id}\n"
+                    f"name: {client_row.name}\n"
+                    f"email: {client_row.email or '—'}\n"
+                    f"phone: {client_row.phone or '—'}\n"
+                    f"client_type: {client_row.client_type or 'unknown'}\n"
+                    f"\n[HANDOFF SUMMARY]\n{packet.handoff_summary or '—'}\n"
+                    f"\n[REALTOR SUMMARY]\n{json.dumps(packet.realtor_summary or {}, indent=2, default=str)}\n"
+                    f"\n[EXTRACTED FACTS]\n{json.dumps(packet.extracted_facts or [], indent=2, default=str)}\n"
+                    f"\n[MISSING LENDING ITEMS]\n{', '.join(packet.missing_lending_items or []) or '—'}\n"
+                    f"\n[UPLOADED DOCUMENTS]\n{json.dumps(packet.uploaded_document_refs or [], indent=2, default=str)}\n"
+                    f"\n[RECOMMENDED PATH]\n{json.dumps(packet.recommended_lending_path or {}, indent=2, default=str)}\n"
+                    f"\nNEVER re-ask for facts already in EXTRACTED FACTS. Walk MISSING LENDING ITEMS one at a time."
+                )
+        if context_block is None and client_row is not None:
+            # Realtor AI per-client thread (alembic 0030).
+            from app.services.ai.realtor_profile import (
+                empty_profile,
+                compute_finance_ready,
+                compute_missing_facts,
+            )
             profile = client_row.realtor_profile or empty_profile(
                 str(client_row.id),
                 str(user.id),
