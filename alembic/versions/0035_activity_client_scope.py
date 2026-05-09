@@ -30,7 +30,10 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    op.create_index("ix_activities_client", "activities", ["client_id", "created_at"])
+    # Activity uses occurred_at (not created_at) — see app/models/activity.py.
+    # Earlier draft of this migration referenced the wrong column and crashed
+    # alembic on first apply against a real DB.
+    op.create_index("ix_activities_client", "activities", ["client_id", "occurred_at"])
 
 
 def downgrade() -> None:
