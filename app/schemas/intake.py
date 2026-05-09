@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
-from app.enums import EntityType, ExperienceTier, LoanSide, LoanType, PropertyType
+from app.enums import EntityType, ExperienceTier, LoanPurpose, LoanSide, LoanType, PropertyType
 
 
 class BorrowerStep(BaseModel):
@@ -34,6 +34,10 @@ class AssetStep(BaseModel):
 
 class NumbersStep(BaseModel):
     type: LoanType
+    # Loan purpose — set by Step 1's Purchase/Refinance toggle. Maps to
+    # the existing LoanPurpose enum (frontend sends PURCHASE or
+    # CASH_OUT_REFI; rate-term refi can be added later).
+    purpose: LoanPurpose | None = None
     amount: float
     ltv: float
     ltc: float | None = None
@@ -61,9 +65,14 @@ class IntakeDocumentOverrides(BaseModel):
     materialized at kickoff (matches `DocChecklistItem.name`).
     `add_items` — custom one-off docs the agent wants the AI to
     collect on this loan in addition to the resolved checklist.
+    `due_offset_overrides` — per-item due-offset override applied at
+    kickoff. Maps firm/agent checklist item name → days. Wins over the
+    LoanTypeChecklist default for THIS loan only. Captured by Step 4's
+    inline due-offset input.
     """
     skip_names: list[str] = Field(default_factory=list)
     add_items: list["IntakeCustomDoc"] = Field(default_factory=list)
+    due_offset_overrides: dict[str, int] = Field(default_factory=dict)
 
 
 class IntakeCustomDoc(BaseModel):

@@ -48,6 +48,11 @@ class CreditPullRead(ORMModel):
     fico: int | None
     pulled_at: datetime | None
     expires_at: datetime | None
+    # Operator-typed notes from the credit pull — what iSoftpull / the
+    # human reviewer captured about THIS report (e.g. "FICO bumped 18
+    # points after Capital One $0 charge-off cleared"). Operator-only
+    # surface; the frontend gates rendering by role.
+    notes: str | None = None
     # Derived (computed in router) — shaping these here means clients can
     # render the "expires in 12 days" pill without doing date math.
     is_expired: bool = False

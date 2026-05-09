@@ -77,6 +77,9 @@ async def submit_intake(
         annual_taxes=payload.asset.annual_taxes,
         annual_insurance=payload.asset.annual_insurance,
         type=payload.numbers.type,
+        # Purchase / refinance set by SmartIntakeModal Step 1's toggle.
+        # Persisted on Loan.purpose so prequal + simulator branches off it.
+        purpose=payload.numbers.purpose,
         # Buyer / seller (alembic 0023). Drives checklist filtering.
         side=payload.side,
         stage=LoanStage.PREQUALIFIED,
@@ -150,8 +153,10 @@ async def submit_intake(
     if overrides is not None:
         from app.models.document import Document as _Doc
         from app.enums import DocStatus as _DocStatus
-        from datetime import date as _date_type
-        if overrides.skip_names:
+        from datetime import date as _date_type, timedelta as _timedelta
+        # Skip + due-offset overrides both target the Documents that
+        # kickoff_loan just materialized — fetch once.
+        if overrides.skip_names or overrides.due_offset_overrides:
             existing = (await db.execute(
                 select(_Doc).where(
                     _Doc.loan_id == loan.id,
@@ -159,9 +164,20 @@ async def submit_intake(
                 )
             )).scalars().all()
             skip_set = {n.strip() for n in overrides.skip_names if n}
+            offset_overrides = {
+                k.strip(): v for k, v in (overrides.due_offset_overrides or {}).items() if k
+            }
+            today = _date_type.today()
             for d in existing:
+                key = d.checklist_key or d.name
                 if (d.checklist_key and d.checklist_key in skip_set) or d.name in skip_set:
                     d.status = _DocStatus.SKIPPED
+                elif key in offset_overrides:
+                    # Wins over the LoanTypeChecklist default for THIS
+                    # loan only. requested_on is set by the spawner;
+                    # fall back to today if absent.
+                    base = d.requested_on or today
+                    d.due_date = base + _timedelta(days=int(offset_overrides[key]))
         for cust in overrides.add_items or []:
             name = (cust.name or "").strip()
             if not name:
