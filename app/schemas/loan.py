@@ -83,6 +83,8 @@ class LoanUpdate(BaseModel):
     arv: float | None = None
     base_rate: float | None = None
     discount_points: float | None = None
+    final_rate: float | None = None
+    dscr: float | None = None
     origination_pct: float | None = None
     term_months: int | None = None
     monthly_rent: float | None = None

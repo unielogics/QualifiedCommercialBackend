@@ -397,8 +397,8 @@ async def list_loan_activity(
 async def create_loan(
     payload: LoanCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> LoanRead:
-    if user.role == Role.CLIENT:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Clients cannot create loans")
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Internal funding role required")
     deal_id = payload.deal_id or _gen_deal_id()
     loan = Loan(deal_id=deal_id, **payload.model_dump(exclude={"deal_id"}))
     db.add(loan)
@@ -440,9 +440,10 @@ async def update_loan(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> LoanRead:
-    if user.role == Role.CLIENT:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
-    loan = await db.get(Loan, loan_id)
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Internal funding role required")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     changes = payload.model_dump(exclude_none=True)
@@ -478,7 +479,10 @@ async def transition_stage(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> LoanRead:
-    loan = await db.get(Loan, loan_id)
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Internal funding role required")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     old = loan.stage
@@ -729,16 +733,20 @@ async def recalc(
     user: GatedUser,
     db: AsyncSession = Depends(get_db),
 ) -> RecalcResponse:
-    loan = await db.get(Loan, loan_id)
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
 
     base_rate = payload.base_rate or float(loan.base_rate or 0.07)
+    arv_for_sizing = payload.arv if payload.arv is not None else (float(loan.arv) if loan.arv else None)
     requested_amount = payload.loan_amount or float(loan.amount)
+    if payload.loan_amount is None and payload.ltv is not None and arv_for_sizing:
+        requested_amount = float(payload.ltv) * arv_for_sizing
     sizing = _try_size(
         loan_type=LoanType(loan.type),
         purpose=payload.purpose or loan.purpose,
-        arv=payload.arv if payload.arv is not None else (float(loan.arv) if loan.arv else None),
+        arv=arv_for_sizing,
         brv=payload.brv,
         rehab_budget=payload.rehab_budget,
         payoff=payload.payoff,
@@ -796,7 +804,7 @@ async def recalc(
     fresh_arv_ltv = (
         sizing.arv_ltv
         if (sizing and sizing.arv_ltv is not None)
-        else ((amount / float(loan.arv)) if loan.arv else None)
+        else ((amount / arv_for_sizing) if arv_for_sizing else None)
     )
     warnings = validate_loan(
         loan_type=LoanType(loan.type),
