@@ -28,6 +28,7 @@ from app.db import Base
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.client import Client
     from app.models.loan import Loan
     from app.models.user import User
 
@@ -54,6 +55,17 @@ class AIChatThread(TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Client-scoped thread for the Realtor AI (alembic 0030). Realtor
+    # work happens before a loan exists, so threads anchor on the
+    # Client row instead. Partial unique on (user_id, client_id) WHERE
+    # client_id IS NOT NULL — see migration 0030. NULL = thread isn't
+    # client-scoped (loan-scoped or account-wide).
+    client_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="New conversation")
     last_message_preview: Mapped[str | None] = mapped_column(String(240), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
@@ -67,6 +79,7 @@ class AIChatThread(TimestampMixin, Base):
     )
 
     loan: Mapped["Loan | None"] = relationship(foreign_keys=[loan_id])
+    client: Mapped["Client | None"] = relationship(foreign_keys=[client_id])
 
     messages: Mapped[list["AIChatMessage"]] = relationship(
         "AIChatMessage",

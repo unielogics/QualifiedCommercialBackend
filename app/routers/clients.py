@@ -402,3 +402,168 @@ async def request_prequalification(
         client_id=client.id,
         lead_promotion_status=client.lead_promotion_status,
     )
+
+
+# ── Realtor AI ChatAction confirm-endpoints (alembic 0030) ───────────
+#
+# Each ChatAction the Realtor AI emits has a backend partner that
+# fires when the agent taps the card. v1 ships stubs — they record
+# the intent on Client.realtor_profile + spawn an AITask in the
+# agent's queue so the work isn't lost. Full template / DocuSign /
+# Twilio integrations land in follow-up.
+
+
+class RealtorActionResponse(BaseModel):
+    client_id: UUID
+    action_kind: str
+    ai_task_id: UUID | None = None
+
+
+def _realtor_action_response(
+    *, client_id: UUID, action_kind: str, ai_task_id: UUID | None
+) -> RealtorActionResponse:
+    return RealtorActionResponse(
+        client_id=client_id,
+        action_kind=action_kind,
+        ai_task_id=ai_task_id,
+    )
+
+
+async def _spawn_realtor_action_task(
+    db: AsyncSession,
+    *,
+    user: CurrentUser,
+    client: Client,
+    action_kind: str,
+    title: str,
+    summary: str,
+    payload: dict | None = None,
+) -> AITask:
+    """Common spawner — every Realtor ChatAction confirm-endpoint
+    drops one of these into the agent's AI Inbox so the actual side
+    effect (sending the buyer agreement, scheduling picture day,
+    etc.) is queued for the operator's approval."""
+    task = AITask(
+        loan_id=None,
+        source=AITaskSource.PIPELINE,
+        priority=AITaskPriority.MEDIUM,
+        status=AITaskStatus.PENDING,
+        action=action_kind,
+        title=title,
+        summary=summary,
+        agent="realtor_ai",
+        confidence=1.0,
+        draft_payload={
+            "client_id": str(client.id),
+            "agent_id": str(user.id),
+            **(payload or {}),
+        },
+    )
+    db.add(task)
+    await db.flush()
+    return task
+
+
+@router.post("/{client_id}/send-buyer-agreement", response_model=RealtorActionResponse)
+async def send_buyer_agreement(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RealtorActionResponse:
+    """v1 stub — records intent + spawns AITask. The actual buyer
+    agency agreement template + DocuSign send lands in a follow-up."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    task = await _spawn_realtor_action_task(
+        db, user=user, client=client,
+        action_kind="send_buyer_agreement",
+        title=f"Send buyer agreement · {client.name}",
+        summary=(
+            f"Agent {user.name or user.email} requested sending the buyer "
+            f"agency agreement to {client.name}. Template + DocuSign "
+            f"integration is a v2 follow-up — for now, this is a tracked "
+            f"reminder."
+        ),
+    )
+    # Mirror onto the realtor_profile so the AI sees the status update.
+    if client.realtor_profile:
+        bp = client.realtor_profile.get("buyer_profile") or {}
+        bp["buyer_agreement_status"] = "sent"
+        client.realtor_profile["buyer_profile"] = bp
+        await db.flush()
+    return _realtor_action_response(
+        client_id=client.id, action_kind="send_buyer_agreement", ai_task_id=task.id,
+    )
+
+
+@router.post("/{client_id}/send-listing-agreement", response_model=RealtorActionResponse)
+async def send_listing_agreement(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RealtorActionResponse:
+    """v1 stub — records intent + spawns AITask."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    task = await _spawn_realtor_action_task(
+        db, user=user, client=client,
+        action_kind="send_listing_agreement",
+        title=f"Send listing agreement · {client.name}",
+        summary=(
+            f"Agent {user.name or user.email} requested sending the listing "
+            f"agreement to {client.name}. Template + DocuSign integration "
+            f"is a v2 follow-up."
+        ),
+    )
+    if client.realtor_profile:
+        sp = client.realtor_profile.get("seller_profile") or {}
+        sp["listing_agreement_status"] = "sent"
+        client.realtor_profile["seller_profile"] = sp
+        await db.flush()
+    return _realtor_action_response(
+        client_id=client.id, action_kind="send_listing_agreement", ai_task_id=task.id,
+    )
+
+
+@router.post("/{client_id}/mark-finance-ready", response_model=RealtorActionResponse)
+async def mark_finance_ready(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RealtorActionResponse:
+    """Flips the realtor_profile.relationship_stage = 'finance_ready'
+    + Client.stage = 'verified' so the funding team can pick it up.
+    Doesn't fire the prequal handoff yet — that's a separate confirm
+    via /request-prequalification."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    profile = client.realtor_profile or {}
+    profile["relationship_stage"] = "finance_ready"
+    client.realtor_profile = profile
+    # Keep Client.stage aligned — verified means the agent has done
+    # the discovery + agreement work.
+    from app.enums import ClientStage as _CS
+    if client.stage != _CS.VERIFIED:
+        client.stage = _CS.VERIFIED
+    await db.flush()
+    return _realtor_action_response(
+        client_id=client.id, action_kind="mark_client_finance_ready", ai_task_id=None,
+    )

@@ -143,6 +143,42 @@ class Client(TimestampMixin, Base):
     properties: Mapped[str | None] = mapped_column(Text, nullable=True)
     experience: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Realtor Client Intelligence Profile (alembic 0030).
+    #
+    # Free-shape JSONB the Realtor AI reads + writes every conversational
+    # turn. Carries:
+    #
+    #   client_type            buyer | seller | buyer_and_seller | unknown
+    #   relationship_stage     new_lead | contacted | needs_discovery |
+    #                          agreement_pending | active_client |
+    #                          finance_ready | handoff_to_lending |
+    #                          under_contract | closed | lost
+    #   intent_summary         AI-written single-line gist of the lead
+    #   buyer_profile          target_property_type / target_location /
+    #                          target_budget / purchase_timeline /
+    #                          buyer_agreement_status / showing_activity /
+    #                          prequalified / etc.
+    #   seller_profile         property_address / desired_list_price /
+    #                          listing_agreement_status / cma_status /
+    #                          photos_status / occupancy_status / etc.
+    #   known_facts            structured list of {field, value, source,
+    #                          captured_at}; the AI's authoritative
+    #                          structured memory.
+    #   missing_facts          list[str] computed each turn — drives
+    #                          next_best_question.
+    #   documents              status mirror of relationship docs
+    #                          (buyer agency agreement, listing
+    #                          agreement, CMA, etc.)
+    #   open_tasks             AI-proposed tasks awaiting agent action
+    #   next_best_question     null until the AI computes one
+    #   next_best_action       null until the AI computes one
+    #   readiness_score        0-100, recomputed on every patch
+    #
+    # Distinct from `living_profile` below — that's the bank-side
+    # AI's loan aggregator. This one is the realtor-side relationship
+    # profile, owns the first 20% of the journey before financing.
+    realtor_profile: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     # Phase 8 — account-wide AI aggregator (alembic 0013).
     # client_summarizer reads + writes these:
     #   living_profile  — JSONB with cross-loan next_actions, blockers,

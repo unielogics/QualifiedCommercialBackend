@@ -181,3 +181,9 @@ class ClientRead(ORMModel):
     originating_agent_id: UUID | None = None
     current_agent_id: UUID | None = None
     source_channel: str | None = None
+    # Realtor Client Intelligence Profile (alembic 0030). Free-shape
+    # JSONB written by the Realtor AI. Surfaced here so the Client
+    # Readiness Card on /clients/[id] can render without an extra
+    # round-trip. Never set on Create — populated by the AI as the
+    # conversation evolves.
+    realtor_profile: dict[str, Any] | None = None

@@ -483,11 +483,55 @@ Constraint: Do not engage in casual conversation. Every message must drive the l
 """
 
 
-def _system_prompt_for(user: User) -> str:
-    """Pick the framing the AI should adopt for this caller. Borrower-style
-    framing for clients (concierge tone, scoped to their own data);
-    operator-style framing for the rest."""
-    return CLIENT_SYSTEM_PROMPT if user.role == Role.CLIENT else OPERATOR_SYSTEM_PROMPT
+REALTOR_SYSTEM_PROMPT = """Role: You are the AI Real Estate Assistant for Qualified Commercial agents. You sit alongside the agent throughout the relationship and transaction stage of every lead — from intake through agreements through showings through finance-readiness. You are NOT an underwriter. You do not quote rates, terms, or pricing. The Bank/Lending AI takes over once a buyer is finance-ready and the agent fires the handoff.
+
+You read + write a Realtor Client Intelligence Profile every turn. The profile carries: client_type (buyer | seller | buyer_and_seller | unknown), relationship_stage, intent_summary, buyer_profile (target_property_type, target_location, target_budget, purchase_timeline, financing_needed, buyer_agreement_status, ...), seller_profile (property_address, desired_list_price, listing_agreement_status, cma_status, photos_status, occupancy_status, ...), known_facts, missing_facts (what's still unknown), open_tasks, next_best_question, next_best_action, readiness_score.
+
+Goals:
+1. Help the agent organize the relationship — who is the lead, what do they want, where are they in the journey.
+2. Capture the right buyer/seller information conversationally. ONE next-best question at a time. Never dump a full intake form unless the agent explicitly asks.
+3. Move agreements + showings + listing prep + CMAs forward with action cards (chat buttons the agent taps to confirm).
+4. Identify when a buyer is finance-ready (has target property type / location / budget / timeline / financing-needed / agent permission), then offer the handoff via the request_prequalification action card.
+
+Tools (call when applicable):
+- update_buyer_intent / update_seller_property / record_known_fact — patch the profile as you learn.
+- compute_next_best_question — after a profile patch, find the highest-leverage gap.
+- propose_send_buyer_agreement / propose_send_listing_agreement / propose_create_buyer_intake_task / propose_create_seller_intake_task / propose_schedule_showing / propose_schedule_picture_day / propose_prepare_cma_task / propose_listing_prep_checklist / propose_send_property_matches / propose_draft_follow_up_text / propose_draft_follow_up_email / propose_request_prequalification / propose_mark_finance_ready / propose_update_pipeline_stage — emit ChatAction cards. Each only PROPOSES; the agent's tap fires the actual side effect.
+
+Style:
+- Conversational, short, useful. Sound like a sharp assistant, not a form.
+- Cite concrete values from the profile when present.
+- Prefer asking the next question over calling a tool. Tools are scaffolding; the conversation is the surface.
+- When the profile is partial, say what you know + ask what you don't.
+
+Hard rules:
+- NEVER quote rates, terms, monthly payments, or pricing. Defer to "the lending team" or "after prequalification" when the agent asks for these.
+- NEVER promise approval, guaranteed closing dates, or specific lender outcomes.
+- NEVER fire a state-changing action without first emitting an action card the agent can tap.
+- NEVER invent borrower / property facts. If you don't know, ask.
+- ONE question per turn unless the agent says "give me everything."
+"""
+
+
+def _system_prompt_for(user: User, thread: AIChatThread | None = None) -> str:
+    """Pick the framing the AI should adopt for this caller + thread
+    scope. Borrowers always get the concierge tone scoped to their own
+    data. Operators split based on thread scope:
+
+      - loan-scoped thread       → Bank AI (OPERATOR_SYSTEM_PROMPT)
+      - client-scoped thread     → Realtor AI (BROKER) / Bank AI (others)
+      - account-wide (both null) → Realtor AI (BROKER) / Bank AI (others)
+    """
+    if user.role == Role.CLIENT:
+        return CLIENT_SYSTEM_PROMPT
+    # Loan-scoped: Bank AI for everyone (the loan exists, underwriting
+    # is the relevant frame).
+    if thread is not None and thread.loan_id is not None:
+        return OPERATOR_SYSTEM_PROMPT
+    # Pre-loan (client-scoped or account-wide): split by role.
+    if user.role == Role.BROKER:
+        return REALTOR_SYSTEM_PROMPT
+    return OPERATOR_SYSTEM_PROMPT
 
 
 # ── Account-wide context (no loan_id) ──────────────────────────────────
@@ -730,7 +774,7 @@ async def chat(
     client = get_client()
     # Role-aware system prompt — borrower-friendly framing for clients,
     # operator persona for everyone else.
-    system = _system_prompt_for(user)
+    system = _system_prompt_for(user, None)
     if context_block:
         system += "\n\n" + context_block
 
@@ -789,6 +833,10 @@ class AIChatThreadRead(BaseModel):
     loan_id: UUID | None = None
     loan_deal_id: str | None = None
     loan_address: str | None = None
+    # Client-scoped thread (alembic 0030). Set on Realtor AI threads
+    # that anchor to a Client row instead of a Loan.
+    client_id: UUID | None = None
+    client_name: str | None = None
 
     class Config:
         from_attributes = True
@@ -853,11 +901,17 @@ class AIChatThreadCreate(BaseModel):
 
 
 class AIChatThreadFindOrCreate(BaseModel):
-    """Single endpoint that returns the (user, loan_id) thread if it
-    exists, otherwise spawns it. `loan_id=None` resolves to the
-    account-wide thread."""
+    """Single endpoint that returns the canonical thread, otherwise
+    spawns it. Routing precedence:
+
+      loan_id set     → per-loan thread (Bank AI)
+      client_id set,
+      loan_id null    → per-client thread (Realtor AI, alembic 0030)
+      both null       → account-wide thread (role-aware AI selection)
+    """
 
     loan_id: UUID | None = None
+    client_id: UUID | None = None
 
 
 class AIChatThreadRename(BaseModel):
@@ -922,6 +976,8 @@ def _thread_read(thread: AIChatThread) -> AIChatThreadRead:
         loan_id=thread.loan_id,
         loan_deal_id=thread.loan.deal_id if thread.loan_id and thread.loan else None,
         loan_address=thread.loan.address if thread.loan_id and thread.loan else None,
+        client_id=thread.client_id,
+        client_name=thread.client.name if thread.client_id and thread.client else None,
     )
     return base
 
@@ -934,7 +990,7 @@ async def _load_thread_for_user(
             select(AIChatThread)
             .options(
                 selectinload(AIChatThread.messages),
-                selectinload(AIChatThread.loan),
+                selectinload(AIChatThread.loan), selectinload(AIChatThread.client),
             )
             .where(AIChatThread.id == thread_id)
         )
@@ -953,7 +1009,7 @@ async def list_chat_threads(
     rows = (
         await db.execute(
             select(AIChatThread)
-            .options(selectinload(AIChatThread.loan))
+            .options(selectinload(AIChatThread.loan), selectinload(AIChatThread.client))
             .where(AIChatThread.user_id == user.id)
             .order_by(
                 AIChatThread.last_message_at.desc().nullslast(),
@@ -995,35 +1051,49 @@ async def find_or_create_chat_thread(
     canonical row, enforced by the partial unique index)."""
     stmt = (
         select(AIChatThread)
-        .options(selectinload(AIChatThread.loan))
+        .options(selectinload(AIChatThread.loan), selectinload(AIChatThread.client))
         .where(AIChatThread.user_id == user.id)
     )
-    if payload.loan_id is None:
-        stmt = stmt.where(AIChatThread.loan_id.is_(None))
+    # Routing: loan_id wins over client_id. Both null = account-wide.
+    if payload.loan_id is not None:
+        stmt = stmt.where(AIChatThread.loan_id == payload.loan_id)
+    elif payload.client_id is not None:
+        stmt = stmt.where(
+            AIChatThread.client_id == payload.client_id,
+            AIChatThread.loan_id.is_(None),
+        )
+    else:
+        stmt = stmt.where(
+            AIChatThread.loan_id.is_(None),
+            AIChatThread.client_id.is_(None),
+        )
         # Pick the most recently used account thread if multiple exist.
         stmt = stmt.order_by(AIChatThread.last_message_at.desc().nullslast(), AIChatThread.created_at.desc())
-    else:
-        stmt = stmt.where(AIChatThread.loan_id == payload.loan_id)
     thread = (await db.execute(stmt)).scalars().first()
 
     if thread is not None:
         return _thread_read(thread)
 
-    # Lazy-create. The partial unique idx (alembic 0017 + 0018)
-    # guarantees only one canonical thread per (user, loan_id) at
-    # the DB level. If two parallel requests race here, one INSERT
-    # wins and the other raises IntegrityError — we catch that,
-    # rollback, and re-fetch the now-existing canonical row.
-    if payload.loan_id is None:
-        title = "Account questions"
-    else:
+    # Lazy-create. The partial unique idxs (alembic 0017 + 0018 +
+    # 0030) enforce one canonical thread per (user, scope). On race,
+    # the second INSERT raises IntegrityError; we catch + refetch.
+    if payload.loan_id is not None:
         loan = await db.get(Loan, payload.loan_id)
         if loan is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
         title = f"{loan.deal_id} — {loan.address[:80]}"
+    elif payload.client_id is not None:
+        from app.models.client import Client as _Client
+        client = await db.get(_Client, payload.client_id)
+        if client is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+        title = f"Lead — {client.name[:80]}"
+    else:
+        title = "Account questions"
     thread = AIChatThread(
         user_id=user.id,
         loan_id=payload.loan_id,
+        client_id=payload.client_id,
         title=title,
     )
     db.add(thread)
@@ -1039,7 +1109,7 @@ async def find_or_create_chat_thread(
     thread = (
         await db.execute(
             select(AIChatThread)
-            .options(selectinload(AIChatThread.loan))
+            .options(selectinload(AIChatThread.loan), selectinload(AIChatThread.client))
             .where(AIChatThread.id == thread.id)
         )
     ).scalar_one()
@@ -1309,6 +1379,36 @@ async def append_thread_message(
                 else "super_admin"
             )
             context_block = await assemble_loan_context(db, loan, audience=audience) or None
+    elif thread.client_id is not None:
+        # Realtor AI per-client thread (alembic 0030). Inject the
+        # client row + the Realtor Client Intelligence Profile so
+        # the AI knows who it's talking about and what's known /
+        # missing without asking again.
+        from app.services.ai.realtor_profile import (
+            empty_profile,
+            compute_finance_ready,
+            compute_missing_facts,
+        )
+        client_row = await db.get(Client, thread.client_id)
+        if client_row is not None:
+            profile = client_row.realtor_profile or empty_profile(
+                str(client_row.id),
+                str(user.id),
+            )
+            missing = compute_missing_facts(profile)
+            finance_ready = compute_finance_ready(profile)
+            context_block = (
+                f"[REALTOR CLIENT CONTEXT]\n"
+                f"client_id: {client_row.id}\n"
+                f"name: {client_row.name}\n"
+                f"email: {client_row.email or '—'}\n"
+                f"phone: {client_row.phone or '—'}\n"
+                f"client_type (Client.client_type col): {client_row.client_type or 'unknown'}\n"
+                f"stage (Client.stage col): {client_row.stage}\n"
+                f"finance_ready (computed): {finance_ready}\n"
+                f"\n[REALTOR PROFILE JSONB]\n{json.dumps(profile, indent=2, default=str)}\n"
+                f"\n[MISSING FACTS]\n{', '.join(missing) if missing else '—'}\n"
+            )
     else:
         user_with_client = (
             await db.execute(
@@ -1337,24 +1437,40 @@ async def append_thread_message(
         used_stub = True
     else:
         client = get_client()
-        system = _system_prompt_for(user)
+        # Pass the thread so the selector can pick REALTOR vs OPERATOR
+        # based on scope. Loan-scoped → Bank AI; client-scoped or
+        # account-wide for an agent → Realtor AI.
+        system = _system_prompt_for(user, thread)
         if context_block:
             system += "\n\n" + context_block
 
-        # Loan-scoped threads get the property-intake tool plus the
-        # conversational doc-collector tools (Phase B). All of these
-        # need a loan_id to scope writes; outside that, the tool list
-        # is None and the AI replies in pure text.
-        tools = (
-            [
+        # Tool selection by thread scope:
+        #   loan-scoped  → Bank AI tools (property intake, doc routing)
+        #   client-scoped (Realtor AI) → Realtor tools (profile patch
+        #                  + ChatAction emitters from realtor_tools.py)
+        #   account-wide → no tools today (text-only replies)
+        from app.services.ai.realtor_tools import (
+            REALTOR_TOOL_SCHEMAS,
+            execute_realtor_tool,
+            PROFILE_WRITE_TOOLS,
+            PROPOSE_TOOL_TO_ACTION_KIND,
+        )
+        is_realtor_scoped = (
+            effective_loan_id is None
+            and thread.client_id is not None
+            and user.role == Role.BROKER
+        )
+        if effective_loan_id is not None:
+            tools = [
                 PROPERTY_INTAKE_TOOL,
                 REQUEST_DOCUMENT_UPLOAD_TOOL,
                 CONFIRM_DOCUMENT_ROUTING_TOOL,
                 COMPLETE_PROPERTY_INTAKE_TOOL,
             ]
-            if effective_loan_id is not None
-            else None
-        )
+        elif is_realtor_scoped:
+            tools = REALTOR_TOOL_SCHEMAS
+        else:
+            tools = None
 
         # Tool-use loop. Convert api_messages (string-content) into
         # block-content for the loop — Anthropic accepts both shapes
@@ -1435,7 +1551,16 @@ async def append_thread_message(
                     tool_name = getattr(b, "name", "")
                     tool_id = getattr(b, "id", "")
                     tool_input = getattr(b, "input", {}) or {}
-                    if effective_loan_id is None:
+                    # Realtor tools are scoped to a client_id, not a
+                    # loan — handled below in the realtor branch. Bank
+                    # tools require a loan_id; refuse if missing.
+                    is_bank_tool = tool_name in (
+                        "update_loan_property_details",
+                        "request_document_upload",
+                        "confirm_document_routing",
+                        "complete_property_intake",
+                    )
+                    if is_bank_tool and effective_loan_id is None:
                         outcome = {"ok": False, "error": "no_loan_scope"}
                     elif tool_name == "update_loan_property_details":
                         outcome = await _execute_property_intake_tool(
@@ -1465,6 +1590,20 @@ async def append_thread_message(
                             db,
                             user=user,
                             loan_id=effective_loan_id,
+                            accumulated_actions=accumulated_actions,
+                        )
+                    elif (
+                        is_realtor_scoped
+                        and (tool_name in PROFILE_WRITE_TOOLS or tool_name in PROPOSE_TOOL_TO_ACTION_KIND)
+                    ):
+                        # Realtor AI path — profile patches + ChatAction
+                        # emitters scoped to the thread's client_id.
+                        outcome = await execute_realtor_tool(
+                            db,
+                            tool_name=tool_name,
+                            tool_input=tool_input,
+                            client_id=thread.client_id,
+                            agent_id=user.id,
                             accumulated_actions=accumulated_actions,
                         )
                     else:
