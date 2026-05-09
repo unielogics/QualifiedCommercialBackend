@@ -23,6 +23,12 @@ class Activity(Base):
     loan_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("loans.id", ondelete="CASCADE"), nullable=True
     )
+    # alembic 0035 — client_id lets agents log calls / SMS / meetings on
+    # a relationship before a loan exists. Either loan_id OR client_id
+    # is set on any meaningful activity row.
+    client_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("clients.id", ondelete="CASCADE"), nullable=True
+    )
     actor_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

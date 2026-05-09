@@ -897,3 +897,314 @@ async def patch_client_ai_plan(
         active_playbook_versions=list(plan.active_playbook_versions or []),
         computed_at=plan.computed_at,
     )
+
+
+# ── Client Properties (alembic 0034) ────────────────────────────────
+
+
+from decimal import Decimal as _Decimal
+
+
+class ClientPropertyRead(BaseModel):
+    id: UUID
+    client_id: UUID
+    side: str
+    status: str
+    address: str | None
+    city: str | None
+    state: str | None
+    zip: str | None
+    property_type: str | None
+    target_price: _Decimal | None
+    list_price: _Decimal | None
+    sold_price: _Decimal | None
+    bedrooms: int | None
+    bathrooms: _Decimal | None
+    sqft: int | None
+    units: int | None
+    notes: str | None
+    linked_loan_id: UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClientPropertyCreate(BaseModel):
+    side: str  # buyer_target | seller_listing
+    status: str = "active"
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    property_type: str | None = None
+    target_price: _Decimal | None = None
+    list_price: _Decimal | None = None
+    sold_price: _Decimal | None = None
+    bedrooms: int | None = None
+    bathrooms: _Decimal | None = None
+    sqft: int | None = None
+    units: int | None = None
+    notes: str | None = None
+    linked_loan_id: UUID | None = None
+
+
+class ClientPropertyUpdate(BaseModel):
+    status: str | None = None
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    property_type: str | None = None
+    target_price: _Decimal | None = None
+    list_price: _Decimal | None = None
+    sold_price: _Decimal | None = None
+    bedrooms: int | None = None
+    bathrooms: _Decimal | None = None
+    sqft: int | None = None
+    units: int | None = None
+    notes: str | None = None
+    linked_loan_id: UUID | None = None
+
+
+def _check_client_access(user, client) -> None:
+    """Guard: only the agent owning the client (BROKER) or admins can
+    touch the client's properties."""
+    if user.role not in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    if user.role == Role.BROKER and user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+
+def _serialize_property(row) -> ClientPropertyRead:
+    return ClientPropertyRead(
+        id=row.id, client_id=row.client_id,
+        side=row.side, status=row.status,
+        address=row.address, city=row.city, state=row.state, zip=row.zip,
+        property_type=row.property_type,
+        target_price=row.target_price, list_price=row.list_price, sold_price=row.sold_price,
+        bedrooms=row.bedrooms, bathrooms=row.bathrooms, sqft=row.sqft, units=row.units,
+        notes=row.notes, linked_loan_id=row.linked_loan_id,
+        created_at=row.created_at, updated_at=row.updated_at,
+    )
+
+
+@router.get("/{client_id}/properties", response_model=list[ClientPropertyRead])
+async def list_client_properties(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[ClientPropertyRead]:
+    """Active + non-archived properties for one client. Buyer targets
+    + seller listings appear in the same list — caller filters by side."""
+    from app.models.client_property import ClientProperty
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+    rows = (await db.execute(
+        select(ClientProperty)
+        .where(ClientProperty.client_id == client_id, ClientProperty.status != "archived")
+        .order_by(ClientProperty.created_at.desc())
+    )).scalars().all()
+    return [_serialize_property(r) for r in rows]
+
+
+@router.post("/{client_id}/properties", response_model=ClientPropertyRead, status_code=status.HTTP_201_CREATED)
+async def create_client_property(
+    client_id: UUID,
+    payload: ClientPropertyCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientPropertyRead:
+    from app.models.client_property import ClientProperty
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+    if payload.side not in ("buyer_target", "seller_listing"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "side must be buyer_target or seller_listing")
+    row = ClientProperty(
+        client_id=client_id,
+        side=payload.side,
+        status=payload.status or "active",
+        address=payload.address, city=payload.city, state=payload.state, zip=payload.zip,
+        property_type=payload.property_type,
+        target_price=payload.target_price, list_price=payload.list_price, sold_price=payload.sold_price,
+        bedrooms=payload.bedrooms, bathrooms=payload.bathrooms, sqft=payload.sqft, units=payload.units,
+        notes=payload.notes, linked_loan_id=payload.linked_loan_id,
+    )
+    db.add(row)
+    await db.flush()
+    return _serialize_property(row)
+
+
+@router.patch("/{client_id}/properties/{property_id}", response_model=ClientPropertyRead)
+async def update_client_property(
+    client_id: UUID,
+    property_id: UUID,
+    payload: ClientPropertyUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientPropertyRead:
+    from app.models.client_property import ClientProperty
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+    row = await db.get(ClientProperty, property_id)
+    if row is None or row.client_id != client_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(row, field, value)
+    await db.flush()
+    return _serialize_property(row)
+
+
+@router.delete("/{client_id}/properties/{property_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_client_property(
+    client_id: UUID,
+    property_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Soft-delete by flipping status to 'archived'. Hard delete is
+    intentionally not exposed — agents have asked for an undo affordance
+    on dropped properties before."""
+    from app.models.client_property import ClientProperty
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+    row = await db.get(ClientProperty, property_id)
+    if row is None or row.client_id != client_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    row.status = "archived"
+    await db.flush()
+
+
+# ── Agent notes — write surface for the workspace's Notes tab ──────
+
+
+class AgentNoteIn(BaseModel):
+    text: str
+    field: str | None = None  # optional grouping label, defaults to "note"
+
+
+@router.post("/{client_id}/notes")
+async def add_agent_note(
+    client_id: UUID,
+    payload: AgentNoteIn,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Append a free-form note to the client's realtor_profile.known_facts
+    with source=agent. The Realtor AI sees this on the next chat turn
+    via apply_profile_patch's known_fact merge."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty note")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    from app.services.ai.realtor_profile import apply_profile_patch
+    profile = client.realtor_profile or {}
+    patched = apply_profile_patch(
+        profile,
+        {"known_fact": {"field": payload.field or "note", "value": text, "source": "agent"}},
+        client_id=str(client_id),
+        agent_id=str(user.id),
+    )
+    client.realtor_profile = patched
+    await db.flush()
+    return {"ok": True}
+
+
+# ── Engagement / activity log (alembic 0035 adds client_id to Activity) ─
+
+
+class EngagementSignalRead(BaseModel):
+    id: UUID
+    kind: str
+    summary: str
+    actor_label: str | None
+    created_at: datetime
+    payload: dict | None
+
+
+class EngagementSignalCreate(BaseModel):
+    kind: str           # call_logged | sms_sent | email_sent | meeting_held | note
+    summary: str
+    payload: dict | None = None
+
+
+@router.get("/{client_id}/engagement", response_model=list[EngagementSignalRead])
+async def list_client_engagement(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[EngagementSignalRead]:
+    """Activity feed for one client — newest first. Includes manually-
+    logged calls/SMS/meetings + AI-spawned events (anything written to
+    Activity with client_id set)."""
+    from app.models.activity import Activity
+
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+
+    rows = (await db.execute(
+        select(Activity)
+        .where(Activity.client_id == client_id)
+        .order_by(Activity.created_at.desc())
+        .limit(100)
+    )).scalars().all()
+    return [
+        EngagementSignalRead(
+            id=r.id, kind=r.kind, summary=r.summary or "",
+            actor_label=r.actor_label, created_at=r.created_at, payload=r.payload,
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{client_id}/engagement", response_model=EngagementSignalRead, status_code=status.HTTP_201_CREATED)
+async def log_client_engagement(
+    client_id: UUID,
+    payload: EngagementSignalCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> EngagementSignalRead:
+    """Agent logs a call / SMS / meeting / email against a client.
+    The AI's per-client thread sees these as historical context on the
+    next chat turn (we don't auto-thread the activity into the chat,
+    but the resolver can read them on rebuild)."""
+    from app.models.activity import Activity
+
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    _check_client_access(user, client)
+    text = (payload.summary or "").strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty summary")
+
+    actor_label = "agent" if user.role == Role.BROKER else "operator"
+    row = Activity(
+        client_id=client_id,
+        actor_id=user.id,
+        actor_label=actor_label,
+        kind=payload.kind or "note",
+        summary=text[:512],
+        payload=payload.payload,
+    )
+    db.add(row)
+    await db.flush()
+    return EngagementSignalRead(
+        id=row.id, kind=row.kind, summary=row.summary,
+        actor_label=row.actor_label, created_at=row.created_at, payload=row.payload,
+    )

@@ -12,6 +12,7 @@ from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
 from app.models.client import Client  # noqa: F401
 from app.models.client_ai_plan import ClientAIPlan  # noqa: F401
+from app.models.client_property import ClientProperty  # noqa: F401
 from app.models.client_requirement_status import ClientRequirementStatus  # noqa: F401
 from app.models.credit_pull import CreditPull  # noqa: F401
 from app.models.device_token import DeviceToken  # noqa: F401
