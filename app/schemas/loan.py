@@ -107,6 +107,12 @@ class LoanRead(ORMModel):
     deal_id: str
     client_id: UUID
     broker_id: UUID | None
+    # Owner display name for the operator pipeline header — populated by
+    # list endpoints via a join on brokers.display_name. Renders only
+    # when the calling user is super_admin / loan_exec; agents see only
+    # their own files so the name is implicit.
+    broker_name: str | None = None
+    client_name: str | None = None
     lender_id: UUID | None = None
     address: str
     city: str | None

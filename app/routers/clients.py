@@ -32,18 +32,41 @@ class LivingProfileRead(BaseModel):
 
 
 def _scope(user, stmt):
-    if user.role == Role.CLIENT and user.client:
+    """Defense-in-depth: when role is CLIENT/BROKER but the linked record
+    is missing, force ``where(False)`` so the gate never silently leaks
+    every record. Without this an orphaned broker user (no Broker row)
+    fell through and saw every client in the firm."""
+    from sqlalchemy import false as sql_false
+    if user.role == Role.CLIENT:
+        if user.client is None:
+            return stmt.where(sql_false())
         return stmt.where(Client.id == user.client.id)
-    if user.role == Role.BROKER and user.broker:
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            return stmt.where(sql_false())
         return stmt.where(Client.broker_id == user.broker.id)
     return stmt
 
 
 @router.get("", response_model=list[ClientRead])
 async def list_clients(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[ClientRead]:
-    stmt = _scope(user, select(Client).order_by(Client.name))
+    """List clients visible to the calling user. Returns broker_name on
+    each row so the operator pipeline header (super-admin / UW view)
+    can show the agent owning the relationship without an extra
+    round-trip per row."""
+    from sqlalchemy.orm import selectinload
+    stmt = _scope(
+        user,
+        select(Client).options(selectinload(Client.broker)).order_by(Client.name),
+    )
     rows = (await db.execute(stmt)).scalars().all()
-    return [ClientRead.model_validate(r) for r in rows]
+    out: list[ClientRead] = []
+    for r in rows:
+        d = ClientRead.model_validate(r).model_dump()
+        broker_obj = getattr(r, "broker", None)
+        d["broker_name"] = getattr(broker_obj, "display_name", None) if broker_obj else None
+        out.append(ClientRead.model_validate(d))
+    return out
 
 
 @router.get("/me", response_model=ClientRead)

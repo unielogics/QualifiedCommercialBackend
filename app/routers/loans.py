@@ -56,19 +56,53 @@ def _gen_deal_id() -> str:
 
 def _scope_query(user, stmt):
     """Borrower sees only their own loans; broker sees their assigned loans;
-    super_admin sees everything; loan_exec sees everything (UW)."""
-    if user.role == Role.CLIENT and user.client:
+    super_admin sees everything; loan_exec sees everything (UW).
+
+    Defense-in-depth: when role is CLIENT or BROKER but the linked record
+    (user.client / user.broker) is missing, we return ``where(False)`` to
+    force the gate to fire — never silently fall through to "see everything".
+    """
+    from sqlalchemy import false as sql_false
+    if user.role == Role.CLIENT:
+        if user.client is None:
+            return stmt.where(sql_false())
         return stmt.where(Loan.client_id == user.client.id)
-    if user.role == Role.BROKER and user.broker:
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            return stmt.where(sql_false())
         return stmt.where(Loan.broker_id == user.broker.id)
     return stmt
 
 
 @router.get("", response_model=list[LoanRead])
 async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[LoanRead]:
-    stmt = _scope_query(user, select(Loan).order_by(Loan.created_at.desc()))
+    """List loans visible to the calling user. Returns broker_name +
+    client_name on each row so the operator pipeline can show the
+    owner reference in its header without an extra round-trip per row."""
+    from sqlalchemy.orm import selectinload
+    from app.models.broker import Broker
+    from app.models.client import Client as _Client
+
+    stmt = _scope_query(
+        user,
+        select(Loan)
+        .options(
+            selectinload(Loan.broker),
+            selectinload(Loan.client),
+        )
+        .order_by(Loan.created_at.desc()),
+    )
     rows = (await db.execute(stmt)).scalars().all()
-    return [LoanRead.model_validate(r) for r in rows]
+    out: list[LoanRead] = []
+    for r in rows:
+        d = LoanRead.model_validate(r).model_dump()
+        # Pull broker / client display names off the eager-loaded relationships.
+        broker_obj = getattr(r, "broker", None)
+        client_obj = getattr(r, "client", None)
+        d["broker_name"] = getattr(broker_obj, "display_name", None) if broker_obj else None
+        d["client_name"] = getattr(client_obj, "name", None) if client_obj else None
+        out.append(LoanRead.model_validate(d))
+    return out
 
 
 @router.get("/{loan_id}", response_model=LoanRead)

@@ -144,6 +144,9 @@ class ClientRead(ORMModel):
     id: UUID
     user_id: UUID | None
     broker_id: UUID | None
+    # Owner display name for the pipeline / clients list header.
+    # Populated by list endpoints via a join on brokers.display_name.
+    broker_name: str | None = None
     name: str
     email: str | None
     phone: str | None
