@@ -80,6 +80,13 @@ async def submit_intake(
         # Purchase / refinance set by SmartIntakeModal Step 1's toggle.
         # Persisted on Loan.purpose so prequal + simulator branches off it.
         purpose=payload.numbers.purpose,
+        # Source attribution / ownership (alembic 0029). Captured by
+        # SmartIntakeModal Step 1 + Step 4 — drives downstream
+        # rev-share + funding-team queue assignment.
+        source_attribution=payload.source_attribution,
+        referring_agent_id=payload.referring_agent_id,
+        assigned_owner_id=payload.assigned_owner_id or user.id,
+        invite_behavior=payload.invite_behavior,
         # Buyer / seller (alembic 0023). Drives checklist filtering.
         side=payload.side,
         stage=LoanStage.PREQUALIFIED,
@@ -199,7 +206,12 @@ async def submit_intake(
     # detail page reflect that an account exists. The borrower picks
     # up sign-in via Clerk's invite redirect → JIT-binds clerk_id on
     # first sign-in (deps.get_current_user).
-    if payload.borrower.email:
+    #
+    # invite_behavior gate (alembic 0029): super-admin / underwriter
+    # can choose "save_draft" or "send_after_review" to skip the
+    # Clerk invite at submit time — useful when prepping a deal
+    # internally before pinging the borrower.
+    if payload.borrower.email and payload.invite_behavior == "send_immediately":
         existing_user = (
             await db.execute(select(User).where(User.email == payload.borrower.email.lower()))
         ).scalar_one_or_none()

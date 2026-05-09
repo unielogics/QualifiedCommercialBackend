@@ -53,6 +53,21 @@ class Document(TimestampMixin, Base):
     # Distinct from `checklist_key=None` which means legacy / unclassified.
     is_other: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
+    # Document collection routing (alembic 0029).
+    #
+    #   borrower      — AI cron chases the borrower (default, the
+    #                   common case)
+    #   agent         — operator-typed; agent uploads on the borrower's
+    #                   behalf. Borrower-side cron stays quiet.
+    #   funding_team  — internal funding-team queue
+    #   title         — title company action
+    #   internal      — operator-only artifact
+    #
+    # Only `borrower` rows trigger borrower-facing reminders.
+    requested_from: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="borrower", server_default="borrower",
+    )
+
     # AI vision scan state. `ai_scan_status` is independent of
     # `status` (the workflow state) so we don't conflate them.
     #   'unscanned' — never been scanned (default for new rows)

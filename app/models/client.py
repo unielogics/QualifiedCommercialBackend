@@ -91,6 +91,38 @@ class Client(TimestampMixin, Base):
     # When locked, the OTHER role can't toggle it from their surface.
     client_experience_mode_locked_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
+    # Lead routing / ownership / attribution (alembic 0029).
+    #
+    # Captured by the AgentLeadModal at lead-creation time so the firm
+    # knows where the lead came from, how warm it is, and who owns it.
+    # All optional except `lead_promotion_status` which defaults to
+    # `not_ready` server-side.
+    lead_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    lead_temperature: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    financing_support_needed: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    contact_permission: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    relationship_context: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Promotion gate. Agents fire "Save + Request Funding Review" →
+    # status flips to `agent_requested_review` and an AITask spawns
+    # for the funding team. Underwriter promotes via /intake →
+    # `promoted_to_intake`.
+    lead_promotion_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_ready", server_default="not_ready",
+    )
+    # The user who FIRST captured the lead vs the user who owns it
+    # today. Diverge when leads are reassigned. Both FK to users.
+    originating_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    current_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
     # Per-lead context captured by the New Lead wizard (alembic 0025).
     # Free-shape JSONB so the wizard can evolve without migrations.
     # Buyer leads: target price range, area, property type, timeline.

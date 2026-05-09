@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
 from app.enums import EntityType, ExperienceTier, LoanPurpose, LoanSide, LoanType, PropertyType
+
+
+_SourceAttribution = Literal[
+    "direct_borrower",
+    "agent_referral",
+    "existing_client",
+    "website",
+    "phone_call",
+    "other",
+]
+_InviteBehavior = Literal["send_immediately", "save_draft", "send_after_review"]
+_RequestedFrom = Literal["borrower", "agent", "funding_team", "title", "internal"]
 
 
 class BorrowerStep(BaseModel):
@@ -79,6 +92,8 @@ class IntakeCustomDoc(BaseModel):
     name: str
     due_date: date | None = None
     checklist_key: str | None = None
+    # Who's the AI chasing? Defaults to borrower (the common case).
+    requested_from: _RequestedFrom = "borrower"
 
 
 class SmartIntakePayload(BaseModel):
@@ -91,6 +106,14 @@ class SmartIntakePayload(BaseModel):
     side: LoanSide = LoanSide.BUYER
     # Pre-loan checklist edits applied at kickoff.
     document_overrides: IntakeDocumentOverrides | None = None
+    # Source attribution + ownership (alembic 0029). Captured by Step 1
+    # of SmartIntakeModal so the originating Loan row carries it.
+    source_attribution: _SourceAttribution | None = None
+    referring_agent_id: UUID | None = None
+    assigned_owner_id: UUID | None = None
+    # Gates whether the Clerk invite fires at submit time. Default
+    # `send_immediately` matches the existing path.
+    invite_behavior: _InviteBehavior = "send_immediately"
 
 
 class SmartIntakeResponse(BaseModel):

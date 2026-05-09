@@ -10,6 +10,38 @@ from app.enums import ClientStage
 from app.schemas.common import ORMModel
 
 
+_LeadSource = Literal[
+    "manual_entry",
+    "open_house",
+    "referral",
+    "listing_inquiry",
+    "buyer_consultation",
+    "existing_database",
+    "other",
+]
+_LeadTemperature = Literal["hot", "warm", "nurture"]
+_FinancingSupportNeeded = Literal["yes", "maybe", "no", "unknown"]
+_ContactPermission = Literal[
+    "send_invite_now",
+    "save_lead_only",
+    "agent_will_introduce_first",
+]
+_RelationshipContext = Literal[
+    "new_lead",
+    "existing_client",
+    "past_client",
+    "referral_from_other",
+    "other",
+]
+_LeadPromotionStatus = Literal[
+    "not_ready",
+    "agent_requested_review",
+    "funding_reviewing",
+    "promoted_to_intake",
+    "declined",
+]
+
+
 class ClientCreate(BaseModel):
     name: str
     email: str | None = None
@@ -18,6 +50,18 @@ class ClientCreate(BaseModel):
     city: str | None = None
     referral_source: str | None = None
     broker_id: UUID | None = None
+    # Lead routing / ownership / attribution (alembic 0029).
+    # Captured by the AgentLeadModal; persists on the Client row so the
+    # pipeline view can filter / scope and the funding team has context
+    # at promotion time.
+    lead_source: _LeadSource | None = None
+    lead_temperature: _LeadTemperature | None = None
+    financing_support_needed: _FinancingSupportNeeded | None = None
+    contact_permission: _ContactPermission | None = None
+    relationship_context: _RelationshipContext | None = None
+    originating_agent_id: UUID | None = None
+    current_agent_id: UUID | None = None
+    source_channel: str | None = None
     # Lead-funnel fields (alembic 0024). Defaults to 'lead' when
     # not specified — agents creating clients via the
     # LeadsPipelineView "+ Add Lead" button leave these to default.
@@ -71,6 +115,17 @@ class ClientUpdate(BaseModel):
     client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
     client_experience_mode_reason: str | None = None
     client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None
+    # Lead routing fields are PATCH-able too (e.g. agent reassigns,
+    # funding team flips promotion status).
+    lead_source: _LeadSource | None = None
+    lead_temperature: _LeadTemperature | None = None
+    financing_support_needed: _FinancingSupportNeeded | None = None
+    contact_permission: _ContactPermission | None = None
+    relationship_context: _RelationshipContext | None = None
+    lead_promotion_status: _LeadPromotionStatus | None = None
+    originating_agent_id: UUID | None = None
+    current_agent_id: UUID | None = None
+    source_channel: str | None = None
 
 
 class ClientSelfUpdate(BaseModel):
@@ -116,3 +171,13 @@ class ClientRead(ORMModel):
     client_experience_mode: Literal["guided", "self_directed", "hybrid"] | None = None
     client_experience_mode_reason: str | None = None
     client_experience_mode_locked_by: Literal["agent", "client", "firm"] | None = None
+    # Lead routing / ownership / attribution (alembic 0029).
+    lead_source: _LeadSource | None = None
+    lead_temperature: _LeadTemperature | None = None
+    financing_support_needed: _FinancingSupportNeeded | None = None
+    contact_permission: _ContactPermission | None = None
+    relationship_context: _RelationshipContext | None = None
+    lead_promotion_status: _LeadPromotionStatus = "not_ready"
+    originating_agent_id: UUID | None = None
+    current_agent_id: UUID | None = None
+    source_channel: str | None = None
