@@ -156,6 +156,8 @@ class Client(TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
-    user: Mapped[User] = relationship(back_populates="client")
+    # foreign_keys disambiguates from originating_agent_id /
+    # current_agent_id (alembic 0029) which also FK to users.id.
+    user: Mapped[User] = relationship(back_populates="client", foreign_keys=[user_id])
     broker: Mapped[Broker] = relationship(back_populates="clients")
     loans: Mapped[list[Loan]] = relationship(back_populates="client")

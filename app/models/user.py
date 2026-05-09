@@ -32,6 +32,10 @@ class User(TimestampMixin, Base):
     # so historical FK references (loans.broker_id → brokers.user_id, etc.) survive.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # Optional links to broker/client profiles (one-to-one)
+    # Optional links to broker/client profiles (one-to-one).
+    # foreign_keys disambiguates Client.user_id from the post-0029
+    # routing FKs (originating_agent_id / current_agent_id).
     broker: Mapped[Broker | None] = relationship(back_populates="user", uselist=False)
-    client: Mapped[Client | None] = relationship(back_populates="user", uselist=False)
+    client: Mapped[Client | None] = relationship(
+        back_populates="user", uselist=False, foreign_keys="Client.user_id",
+    )
