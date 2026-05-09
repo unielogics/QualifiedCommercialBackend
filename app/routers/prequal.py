@@ -37,9 +37,12 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
+from pydantic import BaseModel, Field
+
 from app.models.activity import Activity
 from app.models.app_settings import AppSettings
 from app.models.broker import Broker
+from app.models.client import Client
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
@@ -385,6 +388,63 @@ async def list_my_prequal_requests(
 
 
 # ── admin endpoints ─────────────────────────────────────────────────────
+
+
+class AdminManualCreditOverride(BaseModel):
+    fico: int = Field(ge=300, le=850)
+    property_count: int = Field(ge=0)
+    has_year_of_ownership: bool
+
+
+class AdminPrequalCreate(PrequalRequestCreate):
+    """Super-admin / underwriter manually creates a prequal on behalf
+    of a borrower. Mandatory client_id; optional manual_credit_override
+    so the LTV math has FICO + portfolio context when no real
+    CreditSummary exists yet."""
+    client_id: UUID
+    manual_credit_override: AdminManualCreditOverride | None = None
+
+
+@router.post(
+    "/admin/prequal-requests",
+    response_model=PrequalRequestRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_manual_prequal(
+    payload: AdminPrequalCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrequalRequestRead:
+    """Manual prequalification creation — operator-only. Lands as
+    `pending` and is picked up by the existing PrequalReviewModal
+    approve / decline flow.
+
+    Why this exists: the borrower-facing POST /prequal-requests
+    requires user.client. Super-admins on a borrower's behalf can't
+    use that path because the prequal needs to be parented to the
+    Client row, not the operator. This endpoint stamps client_id
+    explicitly and stashes manual_credit_override JSONB the approve
+    path reads when no real CreditSummary is on file."""
+    if not _is_operator(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+
+    # Confirm the client exists.
+    client = await db.get(Client, payload.client_id)
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+
+    # Build via _create_request (loan is None — the manual flow doesn't
+    # spawn a Loan up front; one is created on offer-accepted just like
+    # the borrower path).
+    req = await _create_request(None, payload, user, db)
+
+    # Stamp the admin-only fields the borrower path doesn't carry.
+    req.client_id = payload.client_id
+    if payload.manual_credit_override is not None:
+        req.manual_credit_override = payload.manual_credit_override.model_dump()
+    await db.flush()
+    await db.refresh(req)
+    return _to_read(req)
 
 
 @router.get("/admin/prequal-requests", response_model=list[PrequalRequestRead])

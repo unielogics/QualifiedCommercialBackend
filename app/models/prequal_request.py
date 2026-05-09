@@ -46,6 +46,16 @@ class PrequalRequest(TimestampMixin, Base):
     requester_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    # alembic 0036 — client_id parents a manually-created prequal to a
+    # Client row when the admin creates it on behalf of a borrower who
+    # has no User account yet. NULL for borrower-submitted requests.
+    client_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("clients.id", ondelete="SET NULL"), nullable=True
+    )
+    # alembic 0036 — admin-entered FICO / property count / ownership
+    # used by the approve path when no real CreditSummary exists.
+    # Shape: {"fico": 720, "property_count": 1, "has_year_of_ownership": true}
+    manual_credit_override: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # What the borrower asked for
     target_property_address: Mapped[str] = mapped_column(Text, nullable=False)
