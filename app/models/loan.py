@@ -15,6 +15,7 @@ from app.models._mixins import TimestampMixin
 if TYPE_CHECKING:
     from app.models.activity import Activity
     from app.models.ai_task import AITask
+    from app.models.broker import Broker
     from app.models.client import Client
     from app.models.document import Document
     from app.models.email_draft import EmailDraft
@@ -162,6 +163,11 @@ class Loan(TimestampMixin, Base):
     intake_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     client: Mapped[Client] = relationship(back_populates="loans")
+    # Broker is denormalized onto Loan.broker_id (set from Client.broker_id at
+    # creation, optionally re-pointed for transfers). One-way relationship —
+    # the Broker.clients collection is the canonical reverse, and we don't
+    # want a Broker.loans collection-load slowing every broker fetch.
+    broker: Mapped["Broker | None"] = relationship(foreign_keys="Loan.broker_id")
     lender: Mapped["Lender | None"] = relationship(back_populates="loans")
     documents: Mapped[list[Document]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     hud_items: Mapped[list[HudLineItem]] = relationship(back_populates="loan", cascade="all, delete-orphan")
