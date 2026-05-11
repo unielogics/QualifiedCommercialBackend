@@ -127,6 +127,20 @@ def _gen_quote_number() -> str:
     return f"Q-{secrets.randbelow(9000) + 1000}"
 
 
+def _bump_quote_suffix(quote: str | None, new_version: int) -> str | None:
+    """Append (or replace) a `-v{N}` suffix on a quote number for a
+    revision. Q-1042 → Q-1042-v2; Q-1042-v2 → Q-1042-v3. Returns None
+    when the source had no quote yet — the revise endpoint pre-sets
+    only when the source was approved (which always carries a quote)."""
+    if not quote:
+        return None
+    base = quote
+    head, sep, tail = quote.rpartition("-v")
+    if sep and tail.isdigit():
+        base = head
+    return f"{base}-v{new_version}"
+
+
 async def _spawn_loan_from_approved_request(
     request: PrequalRequest,
     db: AsyncSession,
@@ -742,6 +756,141 @@ async def approve_prequal_request(
     return _to_read(req)
 
 
+@router.post(
+    "/admin/prequal-requests/{request_id}/revise",
+    response_model=PrequalRequestRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def revise_prequal_request(
+    request_id: UUID,
+    payload: PrequalRequestApprove,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrequalRequestRead:
+    """Create an Updated Version of an approved prequal.
+
+    Spawns a new prequal_requests row carrying the operator's adjusted
+    approval figures (typical use: market shift raised the offer, or a
+    client called in asking for a higher amount). The new row is linked
+    back to the source via parent_prequal_request_id and the source's
+    superseded_by_id is set to the new row — the chain is navigable in
+    both directions. quote_number inherits the source's value with a
+    -v{N} suffix (Q-1042 → Q-1042-v2 → Q-1042-v3).
+
+    Only `approved` requests with no pre-existing successor may be
+    revised. Borrower-already-acted statuses (offer_accepted /
+    offer_declined / rejected) are deliberately excluded — those need
+    their own flows (spawned-Loan update on accept; brand-new request
+    otherwise) and are out of scope for this endpoint."""
+    if not _is_operator(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+
+    source = await db.get(PrequalRequest, request_id)
+    if source is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
+    if source.status != "approved":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "not_revisable",
+                "message": (
+                    f"Cannot revise a prequal in status '{source.status}'. "
+                    "Only approved prequals (no borrower action yet) can be revised."
+                ),
+            },
+        )
+    if source.superseded_by_id is not None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "already_superseded",
+                "message": "This prequal already has a newer version. Open the latest version and revise from there.",
+            },
+        )
+
+    new_version_num = source.version_num + 1
+    new_quote = _bump_quote_suffix(source.quote_number, new_version_num)
+
+    # Spawn the new row with identity fields copied from the source.
+    # Approval-side fields (approved_purchase_price, approved_loan_amount,
+    # approved_scenario, approved_arv, etc.) will be written by
+    # _apply_approval from the operator's payload. status starts as
+    # 'pending' so _apply_approval's "if pending → approved" flip runs
+    # cleanly and we share the exact same code path as a first-time
+    # approval (LTV cap, PDF render, activity log).
+    new_req = PrequalRequest(
+        loan_id=source.loan_id,
+        requester_id=source.requester_id,
+        client_id=source.client_id,
+        manual_credit_override=source.manual_credit_override,
+        target_property_address=source.target_property_address,
+        purchase_price=source.purchase_price,
+        requested_loan_amount=source.requested_loan_amount,
+        loan_type=source.loan_type,
+        expected_closing_date=source.expected_closing_date,
+        borrower_notes=source.borrower_notes,
+        borrower_entity=source.borrower_entity,
+        arv_estimate=source.arv_estimate,
+        sow_items=source.sow_items,
+        total_construction=source.total_construction,
+        status="pending",
+        parent_prequal_request_id=source.id,
+        version_num=new_version_num,
+        # Pre-set the quote so _apply_approval doesn't mint a fresh one.
+        quote_number=new_quote,
+    )
+    db.add(new_req)
+    await db.flush()
+
+    actor_label = user.role.value if hasattr(user.role, "value") else str(user.role)
+    # If LTV fails or PDF render fails, _apply_approval raises — get_db
+    # rolls back the session and the new row is discarded. The source
+    # row stays untouched (we haven't written to it yet).
+    new_req = await _apply_approval(
+        db, new_req, payload,
+        actor_user_id=user.id,
+        actor_label=actor_label,
+    )
+
+    # Approval succeeded — link the chain forward and log the revision.
+    source.superseded_by_id = new_req.id
+    if new_req.loan_id is not None:
+        db.add(
+            Activity(
+                loan_id=new_req.loan_id,
+                actor_id=user.id,
+                actor_label=actor_label,
+                kind="prequal.revised",
+                summary=(
+                    f"Pre-qualification revised — {source.quote_number} → "
+                    f"{new_req.quote_number} ({source.target_property_address})"
+                ),
+                payload={
+                    "parent_request_id": str(source.id),
+                    "new_request_id": str(new_req.id),
+                    "old_quote_number": source.quote_number,
+                    "new_quote_number": new_req.quote_number,
+                    "old_approved_loan_amount": (
+                        float(source.approved_loan_amount)
+                        if source.approved_loan_amount is not None
+                        else None
+                    ),
+                    "new_approved_loan_amount": float(new_req.approved_loan_amount),
+                    "old_approved_purchase_price": (
+                        float(source.approved_purchase_price)
+                        if source.approved_purchase_price is not None
+                        else None
+                    ),
+                    "new_approved_purchase_price": float(new_req.approved_purchase_price),
+                    "version_num": new_req.version_num,
+                },
+            )
+        )
+    await db.flush()
+    await db.refresh(new_req)
+    return _to_read(new_req)
+
+
 @router.put(
     "/admin/prequal-requests/{request_id}/reject",
     response_model=PrequalRequestRead,
@@ -815,6 +964,22 @@ async def _load_request_for_outcome(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Request is {req.status}; only approved requests can be marked accepted/declined.",
+        )
+    # Block acceptance/decline on a superseded letter. The operator has
+    # since issued an Updated Version with new terms — the borrower must
+    # act on the current (chain-head) version, not the stale one. Without
+    # this guard, a borrower whose UI hasn't refetched yet could lock in
+    # the old loan amount.
+    if req.superseded_by_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "superseded",
+                "message": (
+                    "An updated version of this pre-qualification has been issued. "
+                    "Reload to see the latest terms before accepting or declining."
+                ),
+            },
         )
     return req
 

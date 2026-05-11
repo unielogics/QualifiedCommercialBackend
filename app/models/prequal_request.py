@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from typing import Any
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String, Text
+from sqlalchemy import Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -116,10 +116,41 @@ class PrequalRequest(TimestampMixin, Base):
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # alembic 0037 — linked-revision chain. When an operator creates an
+    # Updated Version of an approved prequal, a new row is spawned with
+    # parent_prequal_request_id pointing at the predecessor and the
+    # predecessor's superseded_by_id pointing at the new row. version_num
+    # bumps on each step (1 → 2 → 3...). The chain is strictly linear:
+    # superseded_by_id is UNIQUE.
+    parent_prequal_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prequal_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    version_num: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prequal_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
+
     # Relationships
     loan: Mapped[Loan | None] = relationship(back_populates="prequal_requests")
     requester: Mapped[User] = relationship(foreign_keys=[requester_id])
     reviewer: Mapped[User | None] = relationship(foreign_keys=[reviewed_by])
+    parent: Mapped[PrequalRequest | None] = relationship(
+        "PrequalRequest",
+        remote_side="PrequalRequest.id",
+        foreign_keys=[parent_prequal_request_id],
+        post_update=True,
+    )
+    superseded_by: Mapped[PrequalRequest | None] = relationship(
+        "PrequalRequest",
+        remote_side="PrequalRequest.id",
+        foreign_keys=[superseded_by_id],
+        post_update=True,
+    )
 
     __table_args__ = (
         # Firm-wide queue sort: pending first, then by closing date.
@@ -128,4 +159,6 @@ class PrequalRequest(TimestampMixin, Base):
         Index("ix_prequal_requests_loan", "loan_id"),
         # Borrower's own list across all their loans
         Index("ix_prequal_requests_requester_status", "requester_id", "status"),
+        # Revision-chain lookup: "what revisions descend from this parent".
+        Index("ix_prequal_requests_parent", "parent_prequal_request_id"),
     )

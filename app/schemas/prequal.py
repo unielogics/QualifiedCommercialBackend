@@ -136,3 +136,10 @@ class PrequalRequestRead(ORMModel):
     reviewed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # alembic 0037 — revision chain. parent_prequal_request_id points
+    # to the predecessor in the chain (NULL on originals); superseded_by_id
+    # is the next link forward (NULL on the chain head). version_num is
+    # 1 for originals, 2/3/... for each successive Updated Version.
+    parent_prequal_request_id: UUID | None = None
+    superseded_by_id: UUID | None = None
+    version_num: int = 1

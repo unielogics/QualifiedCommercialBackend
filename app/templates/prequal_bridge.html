@@ -9,7 +9,7 @@
             margin: 14mm 14mm 18mm 14mm;
             background-color: #ffffff;
             @bottom-left {
-                content: "Qualified Commercial LLC | New Jersey";
+                content: "Qualified Commercial LLC{% if quote_number %} | {{ quote_number }}{% endif %}";
                 font-size: 8pt;
                 color: #6B7891;
                 font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
