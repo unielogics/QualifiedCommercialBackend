@@ -5,8 +5,11 @@ Recalc is the hot path for the desktop HUD sim and mobile Simulator slider.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from uuid import UUID
+
+log = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -458,6 +461,18 @@ async def create_loan(
     # Idempotent — safe across retries.
     settings_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
     await kickoff_loan(db, loan, settings_row)
+
+    # AI Deal Secretary bootstrap (alembic 0038). Creates one
+    # ClientRequirementStatus per resolved playbook requirement so the
+    # workbench picker is pre-populated. Outreach stays off until an
+    # operator flips ai_secretary_settings.outreach_mode in the UI.
+    try:
+        from app.services.ai.deal_secretary import bootstrap_requirement_status_rows
+        await bootstrap_requirement_status_rows(db, loan, log_label="loans.create")
+    except Exception:  # noqa: BLE001
+        # Don't fail loan creation on a bootstrap hiccup — operator can
+        # re-run via the repair endpoint. Log loud so we notice.
+        log.exception("deal_secretary.bootstrap_failed deal_id=%s", deal_id)
 
     # Living Loan File debounced refresh — flag for the dirty-drain.
     await mark_loan_dirty(db, loan.id)

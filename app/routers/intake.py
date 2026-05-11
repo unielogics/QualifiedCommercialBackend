@@ -151,6 +151,18 @@ async def submit_intake(
     settings_row = (await db.execute(select(_AppSettings).limit(1))).scalar_one_or_none()
     await _kickoff(db, loan, settings_row)
 
+    # AI Deal Secretary bootstrap (alembic 0038). Same call as
+    # POST /loans — populates ClientRequirementStatus rows from the
+    # resolved playbook so the workbench picker is pre-filled.
+    try:
+        from app.services.ai.deal_secretary import bootstrap_requirement_status_rows
+        await bootstrap_requirement_status_rows(db, loan, log_label="intake")
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).exception(
+            "deal_secretary.bootstrap_failed (intake) loan_id=%s", loan.id
+        )
+
     # Apply pre-loan document overrides captured in the
     # SmartIntakeModal's Documents step (alembic 0023).
     # `skip_names` flips the matching Documents from REQUESTED →

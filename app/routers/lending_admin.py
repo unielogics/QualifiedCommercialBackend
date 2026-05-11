@@ -257,6 +257,19 @@ async def duplicate_from_platform(
             expiration_days=r.expiration_days,
             ai_request_message_template=r.ai_request_message_template,
             display_order=r.display_order,
+            # AI Deal Secretary fields (alembic 0038) — carried through
+            # so forked drafts and duplicate-from-platform copies
+            # inherit the catalog's enriched defaults.
+            default_owner_type=r.default_owner_type,
+            default_channels=list(r.default_channels or []),
+            default_cadence_hours=r.default_cadence_hours,
+            link_url=r.link_url,
+            link_label=r.link_label,
+            link_kind=r.link_kind,
+            objective_text=r.objective_text,
+            completion_criteria=r.completion_criteria,
+            completion_mode=r.completion_mode,
+            wrong_upload_response_template=r.wrong_upload_response_template,
         ))
     await db.flush()
     await record_event(
@@ -285,13 +298,40 @@ class RequirementOut(BaseModel):
     expiration_days: int | None
     ai_request_message_template: str | None
     display_order: int
+    # AI Deal Secretary fields (alembic 0038)
+    default_owner_type: str
+    default_channels: list[str]
+    default_cadence_hours: int
+    link_url: str | None
+    link_label: str | None
+    link_kind: str | None
+    objective_text: str
+    completion_criteria: str
+    completion_mode: str
+    wrong_upload_response_template: str | None
+
+
+# Closed enum for the Deal Secretary taxonomy + valid completion modes.
+# Keeping Literals in sync with app/enums.RequirementCategory + CompletionMode
+# (Pydantic Literal doesn't accept a StrEnum directly without per-version
+# Pydantic v2 plugin magic, so we mirror the values explicitly).
+_RequirementCategoryLiteral = Literal[
+    "borrower_info", "property_data", "financials", "credit", "agreements",
+    "insurance", "title_and_escrow", "appraisal_and_inspection", "scheduling",
+    "compliance", "communication", "ai_internal",
+]
+_TaskOwnerTypeLiteral = Literal["human", "ai", "shared", "funding_locked"]
+_CompletionModeLiteral = Literal[
+    "ai_can_complete", "requires_human_verify", "borrower_self_attest",
+]
+_LinkKindLiteral = Literal["docusign", "esign", "external_form", "reference"]
 
 
 class RequirementUpsert(BaseModel):
     id: UUID | None = None
     requirement_key: str
     label: str
-    category: Literal["fact", "document", "appointment", "agreement", "task"]
+    category: _RequirementCategoryLiteral
     required_level: Literal["required", "recommended", "optional"]
     applies_when: dict | None = None
     blocks_stage: str | None = None
@@ -302,6 +342,18 @@ class RequirementUpsert(BaseModel):
     expiration_days: int | None = None
     ai_request_message_template: str | None = None
     display_order: int = 0
+    # AI Deal Secretary fields (alembic 0038). All optional on upsert
+    # so a thin client can omit them and rely on server defaults.
+    default_owner_type: _TaskOwnerTypeLiteral = "human"
+    default_channels: list[str] | None = None
+    default_cadence_hours: int = 48
+    link_url: str | None = None
+    link_label: str | None = None
+    link_kind: _LinkKindLiteral | None = None
+    objective_text: str = ""
+    completion_criteria: str = ""
+    completion_mode: _CompletionModeLiteral = "ai_can_complete"
+    wrong_upload_response_template: str | None = None
 
 
 @router.get("/playbooks/{playbook_id}/requirements", response_model=list[RequirementOut])
@@ -362,6 +414,17 @@ async def upsert_requirement(
             expiration_days=payload.expiration_days,
             ai_request_message_template=payload.ai_request_message_template,
             display_order=payload.display_order,
+            # AI Deal Secretary fields (alembic 0038).
+            default_owner_type=payload.default_owner_type,
+            default_channels=payload.default_channels or ["portal"],
+            default_cadence_hours=payload.default_cadence_hours,
+            link_url=payload.link_url,
+            link_label=payload.link_label,
+            link_kind=payload.link_kind,
+            objective_text=payload.objective_text,
+            completion_criteria=payload.completion_criteria,
+            completion_mode=payload.completion_mode,
+            wrong_upload_response_template=payload.wrong_upload_response_template,
         )
         db.add(req)
         await db.flush()
@@ -698,6 +761,17 @@ def _serialize_requirement(r: AICollectionRequirement) -> RequirementOut:
         expiration_days=r.expiration_days,
         ai_request_message_template=r.ai_request_message_template,
         display_order=r.display_order,
+        # AI Deal Secretary fields (alembic 0038).
+        default_owner_type=r.default_owner_type,
+        default_channels=list(r.default_channels or []),
+        default_cadence_hours=r.default_cadence_hours,
+        link_url=r.link_url,
+        link_label=r.link_label,
+        link_kind=r.link_kind,
+        objective_text=r.objective_text or "",
+        completion_criteria=r.completion_criteria or "",
+        completion_mode=r.completion_mode,
+        wrong_upload_response_template=r.wrong_upload_response_template,
     )
 
 

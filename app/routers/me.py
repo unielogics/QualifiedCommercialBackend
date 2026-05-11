@@ -196,6 +196,21 @@ from uuid import UUID  # noqa: E402
 from datetime import datetime  # noqa: E402
 
 
+# Closed enums mirrored from app/enums.py for the agent overlay. The
+# super-admin path in lending_admin.py uses the same set — kept inline
+# here too rather than imported across router files.
+_RequirementCategoryLiteral = Literal[
+    "borrower_info", "property_data", "financials", "credit", "agreements",
+    "insurance", "title_and_escrow", "appraisal_and_inspection", "scheduling",
+    "compliance", "communication", "ai_internal",
+]
+_TaskOwnerTypeLiteral = Literal["human", "ai", "shared", "funding_locked"]
+_CompletionModeLiteral = Literal[
+    "ai_can_complete", "requires_human_verify", "borrower_self_attest",
+]
+_LinkKindLiteral = Literal["docusign", "esign", "external_form", "reference"]
+
+
 class PlaybookRequirementOut(BaseModel):
     id: UUID
     requirement_key: str
@@ -211,6 +226,17 @@ class PlaybookRequirementOut(BaseModel):
     expiration_days: int | None
     ai_request_message_template: str | None
     display_order: int
+    # AI Deal Secretary fields (alembic 0038)
+    default_owner_type: str
+    default_channels: list[str]
+    default_cadence_hours: int
+    link_url: str | None
+    link_label: str | None
+    link_kind: str | None
+    objective_text: str
+    completion_criteria: str
+    completion_mode: str
+    wrong_upload_response_template: str | None
 
 
 class AgentPlaybookOut(BaseModel):
@@ -293,6 +319,17 @@ async def get_agent_playbook(
             expiration_days=r.expiration_days,
             ai_request_message_template=r.ai_request_message_template,
             display_order=r.display_order,
+            # AI Deal Secretary fields (alembic 0038).
+            default_owner_type=r.default_owner_type,
+            default_channels=list(r.default_channels or []),
+            default_cadence_hours=r.default_cadence_hours,
+            link_url=r.link_url,
+            link_label=r.link_label,
+            link_kind=r.link_kind,
+            objective_text=r.objective_text or "",
+            completion_criteria=r.completion_criteria or "",
+            completion_mode=r.completion_mode,
+            wrong_upload_response_template=r.wrong_upload_response_template,
         )
 
     return AgentPlaybookOut(
@@ -308,11 +345,15 @@ async def get_agent_playbook(
 
 class AgentRequirementUpsert(BaseModel):
     """Either creates a new agent-overlay requirement (no id) or
-    edits an existing one (id supplied + caller must own it)."""
+    edits an existing one (id supplied + caller must own it).
+
+    AI Deal Secretary fields are optional on the wire — server applies
+    sensible defaults (owner=human, channels=["portal"], 48h cadence,
+    no link, empty objective/completion, ai_can_complete) when omitted."""
     id: UUID | None = None
     requirement_key: str
     label: str
-    category: Literal["fact", "document", "appointment", "agreement", "task"]
+    category: _RequirementCategoryLiteral
     required_level: Literal["required", "recommended", "optional"]
     applies_when: dict | None = None
     blocks_stage: str | None = None
@@ -320,6 +361,17 @@ class AgentRequirementUpsert(BaseModel):
     expiration_days: int | None = None
     ai_request_message_template: str | None = None
     display_order: int = 100
+    # AI Deal Secretary fields (alembic 0038). All optional.
+    default_owner_type: _TaskOwnerTypeLiteral = "human"
+    default_channels: list[str] | None = None
+    default_cadence_hours: int = 48
+    link_url: str | None = None
+    link_label: str | None = None
+    link_kind: _LinkKindLiteral | None = None
+    objective_text: str = ""
+    completion_criteria: str = ""
+    completion_mode: _CompletionModeLiteral = "ai_can_complete"
+    wrong_upload_response_template: str | None = None
 
 
 @router.post("/ai-playbook/{playbook_type}/requirements", response_model=PlaybookRequirementOut)
@@ -365,6 +417,18 @@ async def upsert_agent_requirement(
         req.expiration_days = payload.expiration_days
         req.ai_request_message_template = payload.ai_request_message_template
         req.display_order = payload.display_order
+        # AI Deal Secretary fields (alembic 0038).
+        req.default_owner_type = payload.default_owner_type
+        if payload.default_channels is not None:
+            req.default_channels = payload.default_channels
+        req.default_cadence_hours = payload.default_cadence_hours
+        req.link_url = payload.link_url
+        req.link_label = payload.link_label
+        req.link_kind = payload.link_kind
+        req.objective_text = payload.objective_text
+        req.completion_criteria = payload.completion_criteria
+        req.completion_mode = payload.completion_mode
+        req.wrong_upload_response_template = payload.wrong_upload_response_template
         await record_event(
             db, event_type="requirement_added", actor_type="user",
             actor_id=user.id, playbook_id=agent_pb.id,
@@ -388,6 +452,17 @@ async def upsert_agent_requirement(
             expiration_days=payload.expiration_days,
             ai_request_message_template=payload.ai_request_message_template,
             display_order=payload.display_order,
+            # AI Deal Secretary fields (alembic 0038).
+            default_owner_type=payload.default_owner_type,
+            default_channels=payload.default_channels or ["portal"],
+            default_cadence_hours=payload.default_cadence_hours,
+            link_url=payload.link_url,
+            link_label=payload.link_label,
+            link_kind=payload.link_kind,
+            objective_text=payload.objective_text,
+            completion_criteria=payload.completion_criteria,
+            completion_mode=payload.completion_mode,
+            wrong_upload_response_template=payload.wrong_upload_response_template,
         )
         db.add(req)
         await db.flush()
@@ -409,6 +484,17 @@ async def upsert_agent_requirement(
         expiration_days=req.expiration_days,
         ai_request_message_template=req.ai_request_message_template,
         display_order=req.display_order,
+        # AI Deal Secretary fields (alembic 0038).
+        default_owner_type=req.default_owner_type,
+        default_channels=list(req.default_channels or []),
+        default_cadence_hours=req.default_cadence_hours,
+        link_url=req.link_url,
+        link_label=req.link_label,
+        link_kind=req.link_kind,
+        objective_text=req.objective_text or "",
+        completion_criteria=req.completion_criteria or "",
+        completion_mode=req.completion_mode,
+        wrong_upload_response_template=req.wrong_upload_response_template,
     )
 
 

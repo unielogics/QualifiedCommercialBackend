@@ -57,12 +57,26 @@ class ResolvedRequirement:
     ai_request_message_template: str | None
     display_order: int
 
+    # AI Deal Secretary fields (alembic 0038). Carried through the
+    # resolver so the bootstrap helper (Phase 0f) can stamp the right
+    # defaults onto fresh CRS rows without a second catalog lookup.
+    default_owner_type: str = "human"
+    default_channels: list[str] | None = None
+    default_cadence_hours: int = 48
+    link_url: str | None = None
+    link_label: str | None = None
+    link_kind: str | None = None
+    objective_text: str = ""
+    completion_criteria: str = ""
+    completion_mode: str = "ai_can_complete"
+    wrong_upload_response_template: str | None = None
+
     # Provenance (set by the resolver, not the requirement row).
-    source: str
+    source: str = "platform"
     """One of: platform | funding_required | agent_playbook."""
-    playbook_id: UUID
-    playbook_version: int
-    playbook_name: str
+    playbook_id: UUID = None  # type: ignore[assignment]
+    playbook_version: int = 1
+    playbook_name: str = ""
 
     # `applies_when` is left out of the public type because it's
     # already evaluated by the resolver (it filters the list before
@@ -163,6 +177,17 @@ async def resolve_requirements(
                 expiration_days=r.expiration_days,
                 ai_request_message_template=r.ai_request_message_template,
                 display_order=r.display_order,
+                # AI Deal Secretary fields (alembic 0038).
+                default_owner_type=r.default_owner_type,
+                default_channels=list(r.default_channels or []) or None,
+                default_cadence_hours=r.default_cadence_hours,
+                link_url=r.link_url,
+                link_label=r.link_label,
+                link_kind=r.link_kind,
+                objective_text=r.objective_text or "",
+                completion_criteria=r.completion_criteria or "",
+                completion_mode=r.completion_mode,
+                wrong_upload_response_template=r.wrong_upload_response_template,
                 source=source,
                 playbook_id=pb.id,
                 playbook_version=pb.version,

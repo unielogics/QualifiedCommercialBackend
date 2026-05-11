@@ -205,6 +205,25 @@ async def _spawn_loan_from_approved_request(
         # operator can re-run it manually. Log loud so we notice.
         log.exception("prequal.kickoff_failed deal_id=%s", loan.deal_id)
 
+    # AI Deal Secretary bootstrap (alembic 0038). Same call as
+    # POST /loans + POST /intake — populates ClientRequirementStatus
+    # rows from the resolved playbook so the workbench is pre-filled
+    # the moment a borrower marks the seller's offer accepted. Phase 2
+    # also materializes any pending_assignments the agent picked in
+    # Step 4 of AgentLeadModal before the loan existed.
+    try:
+        from app.services.ai.deal_secretary import (
+            bootstrap_requirement_status_rows,
+            materialize_pending_assignments,
+        )
+        await bootstrap_requirement_status_rows(db, loan, log_label="prequal.spawn")
+        await materialize_pending_assignments(db, loan)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "deal_secretary.bootstrap_failed (prequal.spawn) deal_id=%s",
+            loan.deal_id,
+        )
+
     log.info(
         "prequal.promoted_to_loan request_id=%s deal_id=%s amount=%s ltv=%s",
         request.id, loan.deal_id, loan_amount, loan.ltv,
