@@ -188,4 +188,31 @@ class AICollectionRequirement(TimestampMixin, Base):
     single statement page; underwriting needs all pages from the
     last two months. Could you upload the full PDF?")."""
 
+    # ---- Timeline + grouping (alembic 0040) ----
+    depends_on: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]",
+    )
+    """Confirmed dependencies — requirement_keys this task waits on
+    before it can be marked 'next up'. Drives the timeline view's
+    sectioning (Next / In Progress / Upcoming)."""
+
+    parent_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    """Optional parent task. Sub-tasks roll up under a parent card in
+    the workbench. The parent is virtual from the timeline's
+    perspective — its state is the aggregate of its children."""
+
+    inferred_depends_on: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]",
+    )
+    """AI's suggested dependencies that haven't been confirmed yet.
+    Surfaces as dim 'Suggested' chips in the Settings UI; user
+    clicks to confirm which moves the keys into `depends_on`."""
+
+    deps_confirmed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true",
+    )
+    """False after the AI inference pass runs and there are
+    suggestions waiting for review. UI shows a 'Review suggested
+    order' affordance until the user accepts/rejects."""
+
     playbook: Mapped[AIPlaybookTemplate] = relationship(back_populates="requirements")

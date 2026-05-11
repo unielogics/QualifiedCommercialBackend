@@ -372,6 +372,41 @@ async def get_deal_secretary(
     left.sort(key=lambda r: (r.display_order, r.label))
     right.sort(key=lambda r: (r.display_order, r.label))
 
+    # Compute timeline state per task — Next Up / In Progress / Upcoming
+    # / Done. Sectioning is dependency-aware: a task is 'next_up' only
+    # when all keys in depends_on resolve to a done status on the same
+    # loan. Otherwise it's 'upcoming' (deps pending) or 'in_progress'
+    # (status indicates active work).
+    _DONE_STATUSES = {"verified", "waived", "not_applicable", "skipped"}
+    _IN_PROGRESS_STATUSES = {"asked", "provided_unverified", "uploaded", "conflicted"}
+    all_rows = [*left, *right]
+    status_by_key = {r.requirement_key: r.status for r in all_rows}
+
+    next_up: list[TaskRow] = []
+    in_progress: list[TaskRow] = []
+    upcoming: list[TaskRow] = []
+    done: list[TaskRow] = []
+    for row in all_rows:
+        # Compute blocked_by — any depends_on key not yet done.
+        blocked_by = [
+            k for k in (row.depends_on or [])
+            if status_by_key.get(k, "missing") not in _DONE_STATUSES
+        ]
+        row.blocked_by = blocked_by
+
+        if row.status in _DONE_STATUSES:
+            row.timeline_state = "done"
+            done.append(row)
+        elif row.status in _IN_PROGRESS_STATUSES:
+            row.timeline_state = "in_progress"
+            in_progress.append(row)
+        elif blocked_by:
+            row.timeline_state = "upcoming"
+            upcoming.append(row)
+        else:
+            row.timeline_state = "next_up"
+            next_up.append(row)
+
     plan = (
         await db.execute(
             select(ClientAIPlan).where(
@@ -391,6 +426,10 @@ async def get_deal_secretary(
         right=right,
         file_settings=file_settings,
         funding_locked_count=funding_locked,
+        next_up=next_up,
+        in_progress=in_progress,
+        upcoming=upcoming,
+        done=done,
     )
 
 
@@ -443,6 +482,15 @@ def _build_task_row(
         link_url=link_url,
         link_label=link_label,
         link_kind=link_kind,  # type: ignore[arg-type]
+        # Timeline + grouping (alembic 0040). Computed after the
+        # initial row is built; the resolver fills timeline_state +
+        # blocked_by before returning the view.
+        depends_on=list(getattr(cat, "depends_on", []) or []) if cat else [],
+        parent_key=getattr(cat, "parent_key", None) if cat else None,
+        inferred_depends_on=list(getattr(cat, "inferred_depends_on", []) or []) if cat else [],
+        deps_confirmed=getattr(cat, "deps_confirmed", True) if cat else True,
+        timeline_state=None,
+        blocked_by=[],
         due_at=crs.due_at,
         last_requested_at=crs.last_requested_at,
         last_response_at=crs.last_response_at,

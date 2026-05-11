@@ -134,6 +134,17 @@ class TaskRow(BaseModel):
     link_label: str | None = None
     link_kind: LinkKindLiteral | None = None
 
+    # ---- Timeline + grouping (alembic 0040) ----
+    depends_on: list[str] = Field(default_factory=list)
+    parent_key: str | None = None
+    inferred_depends_on: list[str] = Field(default_factory=list)
+    deps_confirmed: bool = True
+    # Computed timeline state — set by the resolver, not stored.
+    timeline_state: Literal["next_up", "in_progress", "upcoming", "done", "waived"] | None = None
+    blocked_by: list[str] = Field(default_factory=list)
+    """When timeline_state='upcoming', the requirement_keys still
+    pending (subset of depends_on that aren't done yet)."""
+
     # Per-deal state.
     due_at: date | None
     last_requested_at: datetime | None
@@ -162,6 +173,13 @@ class DealSecretaryView(BaseModel):
     right: list[TaskRow]       # owner_type = ai
     file_settings: FileSettings
     funding_locked_count: int  # client-side tooltip: "N items locked by funding"
+    # Timeline sections — same TaskRow shapes, just bucketed by
+    # computed timeline_state. Workbench renders these instead of /
+    # alongside left+right depending on view mode.
+    next_up: list[TaskRow] = Field(default_factory=list)
+    in_progress: list[TaskRow] = Field(default_factory=list)
+    upcoming: list[TaskRow] = Field(default_factory=list)
+    done: list[TaskRow] = Field(default_factory=list)
 
 
 # ── Write shapes ───────────────────────────────────────────────────
