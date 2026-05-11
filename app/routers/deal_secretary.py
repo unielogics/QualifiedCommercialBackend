@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -74,6 +74,8 @@ from app.schemas.deal_secretary import (
     FileSettings,
     FileSettingsUpdate,
     OutreachModeLiteral,
+    RequirementCategoryLiteral,
+    TaskOwnerTypeLiteral,
     TaskRow,
     UnassignRequest,
     WizardIntentRequest,
@@ -1128,6 +1130,14 @@ class CustomTaskCreate(BaseModel):
     due_at: date | None = None
 
 
+# `from __future__ import annotations` defers every annotation to a
+# string, so Literal aliases imported at module top can't be resolved by
+# Pydantic until we explicitly rebuild. Without this, FastAPI raises
+# PydanticUserError when the route is invoked — the response then has
+# no CORS headers because the exception escapes before our middleware.
+CustomTaskCreate.model_rebuild()
+
+
 @router.post(
     "/loans/{loan_id}/deal-secretary/custom-task",
     response_model=TaskRow,
@@ -1285,6 +1295,11 @@ class StartRequest(BaseModel):
     client'. Operators can up to portal_email / portal_email_sms here
     or downgrade to draft_first for a 'spin up draft only' pass."""
     mode: OutreachModeLiteral = "portal_auto"
+
+
+# Same forward-ref dance as CustomTaskCreate above — required because
+# `from __future__ import annotations` defers Literal aliases.
+StartRequest.model_rebuild()
 
 
 @router.post(
