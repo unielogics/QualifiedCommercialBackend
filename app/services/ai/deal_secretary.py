@@ -229,9 +229,9 @@ async def materialize_pending_assignments(
     db: AsyncSession,
     loan: Loan,
 ) -> int:
-    """Phase 2 helper — converts the `pending_assignments` buffer on
-    ClientAIPlan.ai_secretary_settings into real AITaskAssignment
-    rows once the Loan exists.
+    """Convert the `pending_assignments` buffer on the realtor-phase
+    ClientAIPlan into real AITaskAssignment rows + flip CRS owner_type
+    to 'ai' on the matching client_requirement_status rows.
 
     Used by the prequal-accept path: the agent picked AI-handled
     tasks in Step 4 of AgentLeadModal BEFORE there was a Loan; we
@@ -240,16 +240,33 @@ async def materialize_pending_assignments(
 
     Returns the number of AITaskAssignment rows created. Idempotent —
     clears the buffer after a successful materialization so a second
-    call is a no-op.
-
-    NOTE: full implementation lands in Phase 2 with the assignments
-    router. This stub keeps the module surface stable so callers
-    can be wired without ImportErrors. The plan_builder.rebuild()
-    follow-up + outreach gate live in Phase 4.
+    call is a no-op. Also copies file_settings (outreach_mode, etc.)
+    from the realtor-phase plan onto the new loan-scoped plan.
     """
-    # Phase 2 will fill this in. For now we just clear the buffer so
-    # subsequent ClientAIPlan reads aren't confused by stale intent.
-    plan = (
+    from app.models.ai_task_assignment import AITaskAssignment
+    from app.models.ai_playbook import AICollectionRequirement
+    from app.enums import TaskOwnerType
+
+    # Realtor-phase plan holds the buffered intent (loan_id IS NULL).
+    realtor_plan = (
+        await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.client_id == loan.client_id,
+                ClientAIPlan.loan_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if realtor_plan is None:
+        return 0
+    realtor_settings = dict(realtor_plan.ai_secretary_settings or {})
+    pending = realtor_settings.pop("pending_assignments", None)
+    file_outreach_mode = realtor_settings.get("outreach_mode")
+
+    if not pending and not file_outreach_mode:
+        return 0
+
+    # The loan-scoped plan should already exist (bootstrap created it).
+    loan_plan = (
         await db.execute(
             select(ClientAIPlan).where(
                 ClientAIPlan.client_id == loan.client_id,
@@ -257,18 +274,96 @@ async def materialize_pending_assignments(
             )
         )
     ).scalar_one_or_none()
-    if plan is None:
-        return 0
-    settings = dict(plan.ai_secretary_settings or {})
-    pending = settings.pop("pending_assignments", None)
-    if not pending:
-        return 0
-    plan.ai_secretary_settings = settings
+    if loan_plan is not None:
+        # Copy file-level settings onto the loan-scoped plan, preserving
+        # anything operators set after bootstrap.
+        loan_settings = dict(loan_plan.ai_secretary_settings or {})
+        if file_outreach_mode:
+            loan_settings["outreach_mode"] = file_outreach_mode
+        for k in ("sms_consent", "email_opt_out", "default_cadence",
+                  "complete_file_by"):
+            if k in realtor_settings and k not in loan_settings:
+                loan_settings[k] = realtor_settings[k]
+        loan_plan.ai_secretary_settings = loan_settings
+
+    created_count = 0
+    if isinstance(pending, list):
+        for entry in pending:
+            if not isinstance(entry, dict):
+                continue
+            req_key = entry.get("requirement_key")
+            if not req_key:
+                continue
+            # Find the CRS row that bootstrap_requirement_status_rows
+            # created for this loan + requirement_key.
+            crs = (
+                await db.execute(
+                    select(ClientRequirementStatus).where(
+                        ClientRequirementStatus.client_id == loan.client_id,
+                        ClientRequirementStatus.loan_id == loan.id,
+                        ClientRequirementStatus.requirement_key == req_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if crs is None:
+                # The CRS bootstrap might've skipped this key if the
+                # resolver decided it didn't apply to this loan. Skip.
+                log.info(
+                    "materialize_pending: no CRS row for key=%s on loan=%s — skipping",
+                    req_key, loan.id,
+                )
+                continue
+            if crs.ai_assignment_id is not None:
+                # Already assigned (idempotent re-run). Skip.
+                continue
+            # Funding-locked items: skip silently — agent shouldn't be
+            # able to assign these in the wizard, but defense-in-depth.
+            cat = (
+                await db.execute(
+                    select(AICollectionRequirement).where(
+                        AICollectionRequirement.requirement_key == req_key
+                    )
+                )
+            ).scalars().first()
+            if cat is not None and not cat.can_agent_override:
+                log.info(
+                    "materialize_pending: skipping funding-locked key=%s",
+                    req_key,
+                )
+                continue
+            assignment = AITaskAssignment(
+                id=uuid.uuid4(),
+                client_requirement_status_id=crs.id,
+                owner_type=TaskOwnerType.AI.value,
+                instructions=entry.get("instructions") or "",
+                instructions_visibility="agent",
+                channels=entry.get("channels") or (
+                    list(cat.default_channels) if cat and cat.default_channels else ["portal"]
+                ),
+                cadence=entry.get("cadence") or {
+                    "hours_between_attempts": cat.default_cadence_hours if cat else 48,
+                    "max_attempts": 3,
+                },
+                approval_mode=entry.get("approval_mode") or "draft_first",
+                complete_file_by=None,  # date strings: trust client to coerce later
+                link_url=entry.get("link_url") or (cat.link_url if cat else None),
+                link_label=entry.get("link_label") or (cat.link_label if cat else None),
+                link_kind=entry.get("link_kind") or (cat.link_kind if cat else None),
+                consent_state={},
+                created_by=None,
+            )
+            db.add(assignment)
+            await db.flush()
+            crs.owner_type = TaskOwnerType.AI.value
+            crs.ai_assignment_id = assignment.id
+            created_count += 1
+
+    # Clear the buffer on the realtor plan now that we've materialized.
+    realtor_plan.ai_secretary_settings = realtor_settings
     await db.flush()
     log.info(
-        "deal_secretary.materialize_pending loan_id=%s pending_count=%d "
-        "(stub — full materialization lands in Phase 2)",
-        loan.id,
-        len(pending) if isinstance(pending, list) else 0,
+        "deal_secretary.materialize_pending loan_id=%s materialized=%d "
+        "file_outreach_mode=%s",
+        loan.id, created_count, file_outreach_mode,
     )
-    return 0
+    return created_count

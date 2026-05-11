@@ -87,6 +87,166 @@ log = logging.getLogger(__name__)
 router = APIRouter(tags=["deal-secretary"])
 
 
+# ── Pipeline summary (Phase 3) ─────────────────────────────────────
+
+
+from pydantic import BaseModel
+
+
+class PipelineSummaryItem(BaseModel):
+    loan_id: UUID
+    outreach_mode: str
+    ai_task_count: int
+    ai_completed_count: int
+    blocked_count: int
+    next_outreach_at: datetime | None
+    current_blocker: str | None
+    state: str  # setup | active_work | waiting_borrower | blocked
+
+
+@router.get(
+    "/pipeline/deal-secretary-summary",
+    response_model=list[PipelineSummaryItem],
+)
+async def pipeline_summary(
+    loan_ids: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[PipelineSummaryItem]:
+    """Per-loan summary for pipeline badges. Single round-trip for the
+    whole visible page — no N+1.
+
+    `loan_ids` is a comma-separated UUID list (query param)."""
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Borrowers cannot see this surface")
+
+    ids: list[UUID] = []
+    for raw in loan_ids.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ids.append(UUID(raw))
+        except ValueError:
+            continue
+    if not ids:
+        return []
+
+    # Broker scope: filter to their own loans.
+    loan_rows = (
+        await db.execute(
+            select(Loan).where(Loan.id.in_(ids))
+        )
+    ).scalars().all()
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            return []
+        loan_rows = [l for l in loan_rows if l.broker_id == user.broker.id]
+    visible_ids = {l.id for l in loan_rows}
+
+    if not visible_ids:
+        return []
+
+    # Pull CRS + ClientAIPlan for all loans in one query each.
+    crs_rows = (
+        await db.execute(
+            select(ClientRequirementStatus).where(
+                ClientRequirementStatus.loan_id.in_(visible_ids),
+            )
+        )
+    ).scalars().all()
+    plan_rows = (
+        await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.loan_id.in_(visible_ids),
+            )
+        )
+    ).scalars().all()
+    plans_by_loan = {p.loan_id: p for p in plan_rows}
+
+    # Pull live assignments (un-deleted).
+    assignment_ids = [r.ai_assignment_id for r in crs_rows if r.ai_assignment_id]
+    assignments_by_id: dict[UUID, AITaskAssignment] = {}
+    if assignment_ids:
+        assignment_rows = (
+            await db.execute(
+                select(AITaskAssignment).where(
+                    AITaskAssignment.id.in_(assignment_ids),
+                    AITaskAssignment.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        assignments_by_id = {a.id: a for a in assignment_rows}
+
+    # Aggregate per loan.
+    result: list[PipelineSummaryItem] = []
+    for loan in loan_rows:
+        plan = plans_by_loan.get(loan.id)
+        settings = dict(plan.ai_secretary_settings or {}) if plan else {}
+        outreach_mode = settings.get("outreach_mode", "draft_first")
+
+        ai_rows = [r for r in crs_rows if r.loan_id == loan.id and r.owner_type == TaskOwnerType.AI.value]
+        ai_count = len(ai_rows)
+        completed = len([r for r in ai_rows if r.status in ("verified", "waived", "not_applicable")])
+        # Blocked = attempts maxed out OR status conflicted/stalled.
+        blocked = 0
+        blocker_label: str | None = None
+        soonest: datetime | None = None
+        catalog_labels = await _labels_for_keys(db, [r.requirement_key for r in ai_rows])
+        for r in ai_rows:
+            a = assignments_by_id.get(r.ai_assignment_id) if r.ai_assignment_id else None
+            if r.status in ("conflicted", "stalled"):
+                blocked += 1
+                if blocker_label is None:
+                    blocker_label = catalog_labels.get(r.requirement_key, r.requirement_key)
+            elif a is not None:
+                max_attempts = int((a.cadence or {}).get("max_attempts", 3))
+                if a.attempts_made >= max_attempts:
+                    blocked += 1
+                    if blocker_label is None:
+                        blocker_label = catalog_labels.get(r.requirement_key, r.requirement_key)
+                if a.next_run_at is not None:
+                    if soonest is None or a.next_run_at < soonest:
+                        soonest = a.next_run_at
+
+        if blocked > 0:
+            state = "blocked"
+        elif ai_count > 0 and outreach_mode != "off":
+            # Are any waiting on borrower?
+            waiting = any(r.status in ("asked", "waiting_on_borrower") for r in ai_rows)
+            state = "waiting_borrower" if waiting else "active_work"
+        else:
+            state = "setup"
+
+        result.append(PipelineSummaryItem(
+            loan_id=loan.id,
+            outreach_mode=outreach_mode,
+            ai_task_count=ai_count,
+            ai_completed_count=completed,
+            blocked_count=blocked,
+            next_outreach_at=soonest,
+            current_blocker=blocker_label,
+            state=state,
+        ))
+    return result
+
+
+async def _labels_for_keys(db: AsyncSession, keys: list[str]) -> dict[str, str]:
+    if not keys:
+        return {}
+    rows = (
+        await db.execute(
+            select(AICollectionRequirement.requirement_key, AICollectionRequirement.label)
+            .where(AICollectionRequirement.requirement_key.in_(keys))
+        )
+    ).all()
+    out: dict[str, str] = {}
+    for k, lbl in rows:
+        if k not in out:
+            out[k] = lbl
+    return out
+
+
 # ── helpers ─────────────────────────────────────────────────────────
 
 
