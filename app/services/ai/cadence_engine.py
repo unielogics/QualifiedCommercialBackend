@@ -117,16 +117,92 @@ async def _load_active_rules(db: AsyncSession) -> list[AICadenceRule]:
 
 async def _evaluate_rule(db: AsyncSession, rule: AICadenceRule) -> list[dict[str, Any]]:
     """Find every (client, loan) where this rule fires + spawn its
-    action. Returns one result dict per fired action."""
+    action. Returns one result dict per fired action.
+
+    Phase 4 AI Deal Secretary gate (alembic 0038): before firing any
+    borrower-visible action, look up the matching CRS row. If
+    rule.requires_ai_owner=True (new rules created via the workbench),
+    skip targets where owner_type!='ai'. Then consult the file-level
+    OutreachMode on ClientAIPlan.ai_secretary_settings:
+      • off              → skip entirely
+      • draft_first      → downgrade auto_send_reminder → draft_message
+      • portal_auto+     → proceed
+    Legacy rules with requires_ai_owner=False keep today's behavior."""
     targets = await _eligible_targets(db, rule)
     results: list[dict[str, Any]] = []
     for t in targets:
         if await _already_fired_recently(db, rule, t):
             continue
-        outcome = await _fire_action(db, rule, t)
+        # AI Deal Secretary gate.
+        effective_action = await _resolve_ai_owner_gate(db, rule, t)
+        if effective_action is None:
+            continue  # gate blocked this target
+        outcome = await _fire_action(db, rule, t, effective_action=effective_action)
         if outcome is not None:
             results.append(outcome)
     return results
+
+
+async def _resolve_ai_owner_gate(
+    db: AsyncSession,
+    rule: AICadenceRule,
+    target: dict[str, Any],
+) -> str | None:
+    """Returns the effective action_type to fire for this target,
+    or None to skip. The Deal Secretary's file-level OutreachMode
+    is the kill switch — no outreach without explicit human opt-in.
+
+    For rules where requires_ai_owner=True (the Deal Secretary's own
+    rules), we also require the matching CRS row to be owner_type='ai'.
+    Legacy rules pass straight through (requires_ai_owner=False)."""
+    requirement_key = target.get("requirement_key")
+    loan_id = target.get("loan_id")
+    client_id = target.get("client_id")
+
+    # If the rule requires an AI-owned CRS row, verify one exists.
+    if rule.requires_ai_owner:
+        if requirement_key is None or client_id is None:
+            return None
+        from app.enums import TaskOwnerType
+        crs = (
+            await db.execute(
+                select(ClientRequirementStatus).where(
+                    ClientRequirementStatus.client_id == client_id,
+                    ClientRequirementStatus.loan_id == loan_id,
+                    ClientRequirementStatus.requirement_key == requirement_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if crs is None or crs.owner_type != TaskOwnerType.AI.value:
+            return None
+
+    # Consult the file-level OutreachMode for borrower-visible rules.
+    # Internal-only rules (visibility='internal' / 'agent') bypass the
+    # mode gate — they always draft to the AI Inbox.
+    if rule.visibility != "borrower":
+        return rule.action_type
+
+    plan = None
+    if loan_id is not None or client_id is not None:
+        q = select(ClientAIPlan)
+        if loan_id is not None:
+            q = q.where(ClientAIPlan.loan_id == loan_id)
+        elif client_id is not None:
+            q = q.where(
+                ClientAIPlan.client_id == client_id,
+                ClientAIPlan.loan_id.is_(None),
+            )
+        plan = (await db.execute(q)).scalar_one_or_none()
+    settings = dict(plan.ai_secretary_settings or {}) if plan else {}
+    mode = settings.get("outreach_mode", "draft_first")
+
+    if mode == "off":
+        return None
+    if mode == "draft_first":
+        # Even auto_send_reminder must draft when the file says draft-only.
+        return "draft_message"
+    # portal_auto / portal_email / portal_email_sms → full action proceeds.
+    return rule.action_type
 
 
 async def _eligible_targets(
@@ -256,14 +332,20 @@ async def _fire_action(
     db: AsyncSession,
     rule: AICadenceRule,
     target: dict[str, Any],
+    *,
+    effective_action: str | None = None,
 ) -> dict[str, Any] | None:
-    """Spawn the action handler matching the rule's action_type."""
-    handler = _ACTION_HANDLERS.get(rule.action_type, _handle_draft_message)
+    """Spawn the action handler matching the rule's action_type, OR
+    the effective action computed by the AI Deal Secretary gate (e.g.
+    a forced downgrade from auto_send_reminder → draft_message when
+    the file-level outreach_mode is draft_first)."""
+    action = effective_action or rule.action_type
+    handler = _ACTION_HANDLERS.get(action, _handle_draft_message)
     outcome = await handler(db, rule, target)
     if outcome is not None:
         await record_event(
             db,
-            event_type=f"cadence_action_fired:{rule.action_type}",
+            event_type=f"cadence_action_fired:{action}",
             actor_type="cadence_engine",
             client_id=target["client_id"],
             loan_id=target.get("loan_id"),
@@ -271,13 +353,15 @@ async def _fire_action(
             requirement_key=target.get("requirement_key"),
             payload={
                 "rule_id": str(rule.id),
+                "rule_action": rule.action_type,
+                "effective_action": action,
                 "trigger_event": rule.trigger_event,
                 "approval_required": rule.approval_required,
                 "visibility": rule.visibility,
                 "ai_task_id": str(outcome.get("ai_task_id")) if outcome.get("ai_task_id") else None,
             },
         )
-        outcome["action_type"] = rule.action_type
+        outcome["action_type"] = action
     return outcome
 
 
@@ -393,33 +477,93 @@ async def _handle_auto_send_reminder(
     rule: AICadenceRule,
     target: dict[str, Any],
 ) -> dict[str, Any]:
-    """Auto-send is opt-in. Default behavior: downgrade to draft.
+    """Auto-send for the AI Deal Secretary path (Phase 4).
 
-    The narrow case where auto-send fires is when both conditions hold:
-      - rule.approval_required is False
-      - rule.visibility is "borrower" or "agent"
+    The OutreachMode gate in _resolve_ai_owner_gate already decided
+    this rule is allowed to actually send. We look up the matching
+    AITaskAssignment + call the outreach dispatcher for the portal
+    channel. Email/SMS are wired here too — the dispatcher does
+    consent / quiet-hours / provider gating.
 
-    Even then, v1 still routes through AI Inbox — we set
-    auto_send=true on the draft so the inbox auto-runs it. The actual
-    outbound send is handled by the existing email/SMS pipeline."""
+    If the gate would have downgraded this to a draft, the gate
+    returned 'draft_message' as effective_action and _handle_draft_message
+    runs instead — we never get here in that case.
+    """
     if rule.approval_required:
         return await _handle_draft_message(db, rule, target)
-    msg = _format_template(rule.message_template, target)
+
+    requirement_key = target.get("requirement_key")
+    loan_id = target.get("loan_id")
+    client_id = target.get("client_id")
+    if requirement_key is None or client_id is None:
+        return await _handle_draft_message(db, rule, target)
+
+    crs = (
+        await db.execute(
+            select(ClientRequirementStatus).where(
+                ClientRequirementStatus.client_id == client_id,
+                ClientRequirementStatus.loan_id == loan_id,
+                ClientRequirementStatus.requirement_key == requirement_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if crs is None or crs.ai_assignment_id is None:
+        # No live assignment to attach to — fall back to draft.
+        return await _handle_draft_message(db, rule, target)
+
+    from app.models.ai_task_assignment import AITaskAssignment as _ATA
+    assignment = await db.get(_ATA, crs.ai_assignment_id)
+    if assignment is None or assignment.deleted_at is not None:
+        return await _handle_draft_message(db, rule, target)
+
+    # Compose the body — assignment objective + rule template.
+    msg_parts = []
+    if assignment.objective_text:
+        msg_parts.append(assignment.objective_text)
+    formatted = _format_template(rule.message_template, target)
+    if formatted:
+        msg_parts.append(formatted)
+    if not msg_parts:
+        msg_parts.append("Just checking in on this item — let me know if you have any questions.")
+    if assignment.link_url and assignment.link_label:
+        msg_parts.append(f"{assignment.link_label}: {assignment.link_url}")
+    msg_body = "\n\n".join(msg_parts)
+
+    # Dispatch via every channel on the assignment. The dispatcher
+    # writes ai_outreach_events rows for each.
+    from app.services.ai.outreach_dispatcher import dispatch as _dispatch
+    channels = list(assignment.channels or ["portal"])
+    last_event_id = None
+    for ch in channels:
+        event = await _dispatch(
+            db,
+            assignment=assignment,
+            channel=ch,
+            message_body=msg_body,
+            template_key=requirement_key,
+        )
+        last_event_id = event.id
+
+    # We still create a tiny AITask so the AI Inbox shows the action
+    # for auditability — the actual outbound already fired above.
     task = AITask(
-        loan_id=target.get("loan_id"),
+        loan_id=loan_id,
         source=AITaskSource.PIPELINE,
         priority=AITaskPriority.MEDIUM,
         status=AITaskStatus.PENDING,
         action="cadence_auto_send",
-        title=f"Auto-send reminder · {target['client_name']}",
-        summary=msg or f"Cadence auto-send fired: {rule.trigger_event}.",
+        title=f"Auto-send sent · {target['client_name']}",
+        summary=msg_body[:480],
         agent="cadence",
         draft_payload={
-            "client_id": str(target["client_id"]),
+            "client_id": str(client_id),
             "rule_id": str(rule.id),
             "auto_send": True,
-            "message": msg,
+            "message": msg_body,
             "visibility": rule.visibility,
+            "outreach_event_id": str(last_event_id) if last_event_id else None,
+            "assignment_id": str(assignment.id),
+            "requirement_key": requirement_key,
         },
     )
     db.add(task)
