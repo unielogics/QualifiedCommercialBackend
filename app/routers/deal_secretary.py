@@ -847,6 +847,208 @@ async def update_file_settings(
 # ── POST /bootstrap (repair) ───────────────────────────────────────
 
 
+# ── AI clarifying questions — operator-facing chat thread ──────────
+
+
+class AIQuestionItem(BaseModel):
+    """One AI-asked question awaiting operator answer.
+
+    Surfaces in the Loan Chat tab's third mode. Phase B will have
+    Claude write to this list when an assignment is created and the
+    AI needs context before contacting the borrower (tone, timing,
+    specific items to mention, etc.). For now the endpoint returns
+    an empty list — frontend renders the placeholder state."""
+    id: UUID
+    requirement_key: str | None
+    question: str
+    context: str | None
+    created_at: datetime
+    answered_at: datetime | None
+    answer: str | None
+
+
+@router.get(
+    "/loans/{loan_id}/deal-secretary/ai-questions",
+    response_model=list[AIQuestionItem],
+)
+async def list_ai_questions(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[AIQuestionItem]:
+    """List pending AI clarifying questions on this loan. Phase B
+    populates via the orchestrator; Phase A returns [] so the UI
+    can render an empty state with the right copy."""
+    await _resolve_loan_and_gate(loan_id, user, db)
+    # TODO: Phase B — read from a new ai_clarifying_questions table
+    # the orchestrator writes to when it gets stuck.
+    return []
+
+
+class AIQuestionAnswer(BaseModel):
+    answer: str
+
+
+@router.post(
+    "/loans/{loan_id}/deal-secretary/ai-questions/{question_id}/answer",
+    response_model=AnyOk,
+)
+async def answer_ai_question(
+    loan_id: UUID,
+    question_id: UUID,
+    payload: AIQuestionAnswer,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AnyOk:
+    """Record the operator's answer to an AI question. Phase B will
+    have the orchestrator consume this on the next dispatch."""
+    await _resolve_loan_and_gate(loan_id, user, db)
+    log.info(
+        "deal_secretary.ai_question.answer loan_id=%s question_id=%s user=%s len=%d",
+        loan_id, question_id, user.id, len(payload.answer),
+    )
+    # TODO: Phase B — persist + flip flag so dispatcher reads it.
+    return AnyOk()
+
+
+# ── POST /custom-task — create an ad-hoc CRS row ───────────────────
+
+
+class CustomTaskCreate(BaseModel):
+    """Create an ad-hoc task that isn't tied to a playbook requirement.
+
+    Example: "follow up about tenant leaving on the 1st" or "confirm
+    with client when construction is finished". The row lands as a
+    real ClientRequirementStatus with source='client_custom' so it
+    shows on the AI Secretary timeline alongside playbook tasks
+    and can be assigned to AI or Human just like anything else."""
+    label: str
+    owner_type: TaskOwnerTypeLiteral = "human"
+    objective_text: str | None = None
+    completion_criteria: str | None = None
+    parent_key: str | None = None
+    depends_on: list[str] = []
+    category: RequirementCategoryLiteral = "communication"
+    due_at: date | None = None
+
+
+@router.post(
+    "/loans/{loan_id}/deal-secretary/custom-task",
+    response_model=TaskRow,
+)
+async def create_custom_task(
+    loan_id: UUID,
+    payload: CustomTaskCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> TaskRow:
+    """Create an ad-hoc task on the loan. Doesn't touch the playbook —
+    creates a free-standing CRS row + an AICollectionRequirement
+    'shadow' row on a special agent-private playbook so the TaskRow
+    response can carry the label, objective, etc.
+
+    Funding-locked items can only be created by operators.
+    """
+    loan = await _resolve_loan_and_gate(loan_id, user, db)
+    # Generate a stable requirement_key from the label + timestamp so
+    # we don't collide with playbook keys.
+    import re
+    base = re.sub(r"[^a-z0-9]+", "_", payload.label.lower()).strip("_") or "custom_task"
+    suffix = uuid.uuid4().hex[:6]
+    requirement_key = f"custom_{base}_{suffix}"[:120]
+
+    # Find-or-create a hidden "ad-hoc tasks" playbook for this loan so
+    # the row has a parent + we can render its label via the existing
+    # catalog-driven _build_task_row helper.
+    adhoc_playbook = (
+        await db.execute(
+            select(AIPlaybookTemplate).where(
+                AIPlaybookTemplate.owner_type == "agent",
+                AIPlaybookTemplate.owner_id == user.id,
+                AIPlaybookTemplate.playbook_type == "adhoc",
+            )
+        )
+    ).scalar_one_or_none()
+    if adhoc_playbook is None:
+        adhoc_playbook = AIPlaybookTemplate(
+            id=uuid.uuid4(),
+            owner_type="agent",
+            owner_id=user.id,
+            playbook_type="adhoc",
+            product_key=None,
+            name="Ad-hoc tasks",
+            description="Auto-created shadow playbook for custom tasks the operator adds inside deals.",
+            rules={},
+            version=1,
+            status="published",
+        )
+        db.add(adhoc_playbook)
+        await db.flush()
+
+    cat_row = AICollectionRequirement(
+        id=uuid.uuid4(),
+        playbook_id=adhoc_playbook.id,
+        requirement_key=requirement_key,
+        label=payload.label,
+        category=payload.category,
+        required_level="recommended",
+        visibility=["agent", "underwriter"],
+        can_agent_override=True,
+        can_underwriter_waive=True,
+        verification_required=False,
+        ai_request_message_template=None,
+        default_owner_type=payload.owner_type,
+        default_channels=["portal"],
+        default_cadence_hours=48,
+        objective_text=payload.objective_text or "",
+        completion_criteria=payload.completion_criteria or "",
+        completion_mode="ai_can_complete",
+        depends_on=payload.depends_on,
+        parent_key=payload.parent_key,
+    )
+    db.add(cat_row)
+    await db.flush()
+
+    crs = ClientRequirementStatus(
+        id=uuid.uuid4(),
+        client_id=loan.client_id,
+        loan_id=loan.id,
+        requirement_key=requirement_key,
+        status="missing",
+        source="client_custom",
+        owner_type=payload.owner_type,
+        due_at=payload.due_at,
+    )
+    db.add(crs)
+    await db.flush()
+
+    # Build the response.
+    row = _build_task_row(crs, cat_row, None)
+    # Compute timeline_state from the new row's deps relative to other
+    # CRS rows on the loan (best-effort — full re-resolve on next GET).
+    if payload.depends_on:
+        existing = (
+            await db.execute(
+                select(ClientRequirementStatus.requirement_key, ClientRequirementStatus.status).where(
+                    ClientRequirementStatus.loan_id == loan.id,
+                    ClientRequirementStatus.requirement_key.in_(payload.depends_on),
+                )
+            )
+        ).all()
+        done = {"verified", "waived", "not_applicable", "skipped"}
+        blocked = [k for k, s in existing if s not in done]
+        row.blocked_by = blocked
+        row.timeline_state = "upcoming" if blocked else "next_up"
+    else:
+        row.timeline_state = "next_up"
+
+    log.info(
+        "deal_secretary.custom_task loan_id=%s key=%s owner=%s user=%s",
+        loan.id, requirement_key, payload.owner_type, user.id,
+    )
+    return row
+
+
 @router.post(
     "/loans/{loan_id}/deal-secretary/bootstrap",
     response_model=BootstrapResponse,
