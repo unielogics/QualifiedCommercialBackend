@@ -215,7 +215,7 @@ async def bootstrap_requirement_status_rows(
                 # ai_secretary_settings: JSONB column defaults to
                 # {"outreach_mode": "draft_first"} via the model's
                 # default callable; explicit set keeps it readable.
-                ai_secretary_settings={"outreach_mode": "draft_first"},
+                ai_secretary_settings={"outreach_mode": "portal_auto"},
             )
         )
         plan_created = True

@@ -775,7 +775,7 @@ async def update_file_settings(
             required_items=[],
             waived_items=[],
             ai_suggested_items=[],
-            ai_secretary_settings={"outreach_mode": "draft_first"},
+            ai_secretary_settings={"outreach_mode": "portal_auto"},
         )
         db.add(plan)
         await db.flush()
@@ -1083,7 +1083,7 @@ async def buffer_wizard_intent(
             required_items=[],
             waived_items=[],
             ai_suggested_items=[],
-            ai_secretary_settings={"outreach_mode": "draft_first"},
+            ai_secretary_settings={"outreach_mode": "portal_auto"},
         )
         db.add(plan)
         await db.flush()

@@ -103,13 +103,17 @@ class ClientAIPlan(TimestampMixin, Base):
     #                                    # materializer creates real rows
     #   }
     #
-    # Defaults to {"outreach_mode": "draft_first"} on bootstrap so a
-    # fresh deal CAN have tasks assigned to AI without anything sending
-    # until the agent explicitly flips the mode.
+    # Defaults to {"outreach_mode": "portal_auto"} so the act of
+    # dragging a task into AI Owns IS the start signal — the cadence
+    # engine's next 30-min tick picks the assignment up and sends a
+    # portal message. The 30-min delay gives the operator a buffer
+    # to undo before the AI contacts the borrower. Operators can
+    # explicitly set 'off' or 'draft_first' from the workbench when
+    # they want a different posture.
     ai_secretary_settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False,
-        default=lambda: {"outreach_mode": "draft_first"},
-        server_default='{"outreach_mode": "draft_first"}',
+        default=lambda: {"outreach_mode": "portal_auto"},
+        server_default='{"outreach_mode": "portal_auto"}',
     )
 
     computed_at: Mapped[datetime] = mapped_column(
