@@ -237,6 +237,9 @@ class PlaybookRequirementOut(BaseModel):
     completion_criteria: str
     completion_mode: str
     wrong_upload_response_template: str | None
+    # Timeline + grouping (alembic 0040)
+    depends_on: list[str] = []
+    parent_key: str | None = None
 
 
 class AgentPlaybookOut(BaseModel):
@@ -330,6 +333,9 @@ async def get_agent_playbook(
             completion_criteria=r.completion_criteria or "",
             completion_mode=r.completion_mode,
             wrong_upload_response_template=r.wrong_upload_response_template,
+            # Timeline + grouping (alembic 0040).
+            depends_on=list(r.depends_on or []),
+            parent_key=r.parent_key,
         )
 
     return AgentPlaybookOut(
@@ -372,6 +378,9 @@ class AgentRequirementUpsert(BaseModel):
     completion_criteria: str = ""
     completion_mode: _CompletionModeLiteral = "ai_can_complete"
     wrong_upload_response_template: str | None = None
+    # Timeline + grouping (alembic 0040). All optional.
+    depends_on: list[str] | None = None
+    parent_key: str | None = None
 
 
 @router.post("/ai-playbook/{playbook_type}/requirements", response_model=PlaybookRequirementOut)
@@ -429,6 +438,10 @@ async def upsert_agent_requirement(
         req.completion_criteria = payload.completion_criteria
         req.completion_mode = payload.completion_mode
         req.wrong_upload_response_template = payload.wrong_upload_response_template
+        # Timeline + grouping (alembic 0040).
+        if payload.depends_on is not None:
+            req.depends_on = payload.depends_on
+        req.parent_key = payload.parent_key
         await record_event(
             db, event_type="requirement_added", actor_type="user",
             actor_id=user.id, playbook_id=agent_pb.id,
@@ -463,6 +476,9 @@ async def upsert_agent_requirement(
             completion_criteria=payload.completion_criteria,
             completion_mode=payload.completion_mode,
             wrong_upload_response_template=payload.wrong_upload_response_template,
+            # Timeline + grouping (alembic 0040).
+            depends_on=payload.depends_on or [],
+            parent_key=payload.parent_key,
         )
         db.add(req)
         await db.flush()
@@ -495,6 +511,9 @@ async def upsert_agent_requirement(
         completion_criteria=req.completion_criteria or "",
         completion_mode=req.completion_mode,
         wrong_upload_response_template=req.wrong_upload_response_template,
+        # Timeline + grouping (alembic 0040).
+        depends_on=list(req.depends_on or []),
+        parent_key=req.parent_key,
     )
 
 
