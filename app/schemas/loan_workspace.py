@@ -117,12 +117,66 @@ class HudLineRead(ORMModel):
     amount: float
     category: str
     editable: bool
+    # Alembic 0042 — settlement-statement-style extras.
+    payee: str | None = None
+    note: str | None = None
+    created_by_share_link_id: UUID | None = None
 
 
 class HudLinePatch(BaseModel):
     label: str | None = None
     amount: float | None = None
     category: str | None = None
+    payee: str | None = None
+    note: str | None = None
+
+
+class HudLineCreate(BaseModel):
+    """POST body for the operator-side add-row endpoint. `code` defaults
+    to "custom" since most operator additions are loan-specific line
+    items the playbook didn't seed."""
+    label: str
+    amount: float = 0
+    category: str = "variable"
+    code: str = "custom"
+    payee: str | None = None
+    note: str | None = None
+
+
+# ── HUD share links (alembic 0042) ─────────────────────────────────────
+
+
+class HudShareLinkCreate(BaseModel):
+    label: str | None = None
+    invitee_email: str | None = None
+    invitee_role: str | None = None
+    expires_at: datetime | None = None
+
+
+class HudShareLinkRead(ORMModel):
+    id: UUID
+    loan_id: UUID
+    token: str
+    label: str | None
+    invitee_email: str | None
+    invitee_role: str | None
+    created_at: datetime
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+
+
+class PublicHudView(BaseModel):
+    """Token-resolved HUD payload returned to invitees. Only loan
+    identifiers + the HUD lines they can edit (those tagged to this
+    share link OR the still-editable `category=variable` rows)."""
+    loan_label: str
+    loan_address: str
+    invitee_label: str | None
+    invitee_role: str | None
+    revoked: bool
+    expired: bool
+    lines: list[HudLineRead]
 
 
 # ── Bundled state ──────────────────────────────────────────────────────

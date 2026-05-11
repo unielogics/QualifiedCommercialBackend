@@ -5,6 +5,7 @@ from app.models.ai_audit_event import AIAuditEvent  # noqa: F401
 from app.models.ai_cadence_rule import AICadenceRule  # noqa: F401
 from app.models.ai_chat_thread import AIChatMessage, AIChatThread  # noqa: F401
 from app.models.ai_feedback import AIFeedback  # noqa: F401
+from app.models.ai_knowledge_document import AIKnowledgeDocument  # noqa: F401
 from app.models.ai_modify_correction import AIModifyCorrection  # noqa: F401
 from app.models.ai_outreach_event import AIOutreachEvent  # noqa: F401
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate  # noqa: F401
@@ -24,6 +25,7 @@ from app.models.email_draft import EmailDraft  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401
 from app.models.fred_observation import FredObservation  # noqa: F401
 from app.models.hud import HudLineItem  # noqa: F401
+from app.models.hud_share_link import HudShareLink  # noqa: F401
 from app.models.legal_acceptance import LegalAcceptance  # noqa: F401
 from app.models.lender import Lender  # noqa: F401
 from app.models.lender_spread import LenderSpread  # noqa: F401

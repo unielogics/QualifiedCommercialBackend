@@ -42,16 +42,21 @@ from app.models.loan_chat_message import LoanChatMessage
 from app.models.loan_instruction import LoanInstruction
 from app.models.loan_scenario import LoanScenario
 from app.models.user import User
+from app.models.hud_share_link import HudShareLink
 from app.schemas.loan_workspace import (
     ChatMessageRead,
     ChatSendRequest,
     ChatSendResponse,
     CorrectionCreate,
     CorrectionRead,
+    HudLineCreate,
     HudLinePatch,
     HudLineRead,
+    HudShareLinkCreate,
+    HudShareLinkRead,
     InstructionCreate,
     InstructionRead,
+    PublicHudView,
     ScenarioBase,
     ScenarioRead,
     WorkspaceState,
@@ -384,6 +389,28 @@ async def _generate_ai_reply(
     settings = get_settings()
     audience: Audience = _audience_for(requesting_user)
 
+    # Agent working-hours gate. The borrower just sent a message, so this
+    # is a client-initiated reply — the only after-hours rule that blocks
+    # it is `block_all`. The default (do_not_initiate_reply_if_client_first)
+    # explicitly permits replying after-hours when the client wrote first.
+    # `portal_replies_only` also permits the portal channel by definition;
+    # chat IS the portal channel here, so it allows too.
+    from app.enums import OutreachChannel
+    from app.services.ai.agent_settings import working_hours_for_loan
+    from app.services.ai.working_hours import evaluate as evaluate_working_hours
+    wh_rules = await working_hours_for_loan(db, loan)
+    wh_decision = evaluate_working_hours(
+        wh_rules,
+        channel=OutreachChannel.PORTAL.value,
+        is_client_initiated=True,
+    )
+    if not wh_decision.allow:
+        log.info(
+            "loan_workspace.ai_reply_blocked_by_working_hours loan=%s reason=%s",
+            loan.id, wh_decision.reason,
+        )
+        return None
+
     # Recent chat history → message turns for the LLM.
     history_stmt = (
         select(LoanChatMessage)
@@ -636,6 +663,303 @@ async def patch_hud_line(
         line.amount = body.amount
     if body.category is not None:
         line.category = body.category
+    if body.payee is not None:
+        line.payee = body.payee
+    if body.note is not None:
+        line.note = body.note
     await db.flush()
     await db.refresh(line)
     return HudLineRead.model_validate(line)
+
+
+# ── HUD list / add / delete (operator-side) ────────────────────────────
+
+
+@router.get("/hud", response_model=list[HudLineRead])
+async def list_hud_lines(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[HudLineRead]:
+    """All HUD lines for a loan, ordered by code then label so the
+    editable table renders deterministically."""
+    await _load_loan(db, loan_id, user)
+    rows = (
+        await db.execute(
+            select(HudLineItem)
+            .where(HudLineItem.loan_id == loan_id)
+            .order_by(HudLineItem.code, HudLineItem.label)
+        )
+    ).scalars().all()
+    return [HudLineRead.model_validate(r) for r in rows]
+
+
+@router.post("/hud", response_model=HudLineRead)
+async def create_hud_line(
+    loan_id: UUID,
+    body: HudLineCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> HudLineRead:
+    """Operator adds a new line item to the HUD. Internal-only access
+    so we don't accept anonymous additions through this endpoint —
+    that path goes through /public/hud/{token}/lines."""
+    if user.role not in {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    await _load_loan(db, loan_id, user)
+    line = HudLineItem(
+        loan_id=loan_id,
+        code=body.code or "custom",
+        label=body.label,
+        amount=body.amount,
+        category=body.category or "variable",
+        editable=True,
+        payee=body.payee,
+        note=body.note,
+    )
+    db.add(line)
+    await db.flush()
+    await db.refresh(line)
+    return HudLineRead.model_validate(line)
+
+
+@router.delete("/hud/{line_id}", status_code=204)
+async def delete_hud_line(
+    loan_id: UUID,
+    line_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Operator removes a HUD line. Locked playbook lines (editable=false)
+    can't be removed through this endpoint — funding team only path."""
+    if user.role not in {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    await _load_loan(db, loan_id, user)
+    line = (
+        await db.execute(
+            select(HudLineItem).where(HudLineItem.id == line_id, HudLineItem.loan_id == loan_id)
+        )
+    ).scalar_one_or_none()
+    if line is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "HUD line not found")
+    if not line.editable:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This HUD line is locked")
+    await db.delete(line)
+    await db.flush()
+
+
+# ── HUD share links (operator-side) ────────────────────────────────────
+
+
+def _new_share_token() -> str:
+    """URL-safe token; ~256 bits of entropy. Long enough that brute
+    forcing is uninteresting; short enough that the URL is shareable."""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+@router.get("/hud/shares", response_model=list[HudShareLinkRead])
+async def list_hud_share_links(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[HudShareLinkRead]:
+    if user.role not in {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    await _load_loan(db, loan_id, user)
+    rows = (
+        await db.execute(
+            select(HudShareLink)
+            .where(HudShareLink.loan_id == loan_id)
+            .order_by(HudShareLink.created_at.desc())
+        )
+    ).scalars().all()
+    return [HudShareLinkRead.model_validate(r) for r in rows]
+
+
+@router.post("/hud/shares", response_model=HudShareLinkRead)
+async def create_hud_share_link(
+    loan_id: UUID,
+    body: HudShareLinkCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> HudShareLinkRead:
+    """Mint a new public share link for the HUD. Returns the row with
+    its token so the client can build the share URL on its side."""
+    if user.role not in {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    await _load_loan(db, loan_id, user)
+    link = HudShareLink(
+        loan_id=loan_id,
+        token=_new_share_token(),
+        label=body.label,
+        invitee_email=body.invitee_email,
+        invitee_role=body.invitee_role,
+        expires_at=body.expires_at,
+        created_by=user.id,
+    )
+    db.add(link)
+    await db.flush()
+    await db.refresh(link)
+    return HudShareLinkRead.model_validate(link)
+
+
+@router.delete("/hud/shares/{share_id}", status_code=204)
+async def revoke_hud_share_link(
+    loan_id: UUID,
+    share_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Soft revoke — we keep the row for audit so we can trace which
+    line items came from which now-revoked invitee."""
+    if user.role not in {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN)
+    await _load_loan(db, loan_id, user)
+    link = (
+        await db.execute(
+            select(HudShareLink).where(
+                HudShareLink.id == share_id, HudShareLink.loan_id == loan_id
+            )
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found")
+    if link.revoked_at is None:
+        link.revoked_at = datetime.now(timezone.utc)
+    await db.flush()
+
+
+# ── PUBLIC HUD (token-resolved, no auth) ───────────────────────────────
+#
+# Exposed via a SEPARATE router with no `/loans/{id}` prefix and no auth
+# requirement. The token is the ONLY identifier — we resolve loan +
+# invitee from it. All write endpoints tag the new/edited lines with
+# the share link id so the operator can see provenance.
+
+
+public_router = APIRouter(prefix="/public/hud", tags=["public-hud"])
+
+
+async def _resolve_share_link(token: str, db: AsyncSession) -> tuple[HudShareLink, Loan]:
+    link = (
+        await db.execute(select(HudShareLink).where(HudShareLink.token == token))
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found")
+    if link.revoked_at is not None:
+        raise HTTPException(status.HTTP_410_GONE, "Share link has been revoked")
+    if link.expires_at is not None and link.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status.HTTP_410_GONE, "Share link has expired")
+    loan = (await db.execute(select(Loan).where(Loan.id == link.loan_id))).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    link.last_used_at = datetime.now(timezone.utc)
+    await db.flush()
+    return link, loan
+
+
+@public_router.get("/{token}", response_model=PublicHudView)
+async def public_hud_view(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+) -> PublicHudView:
+    link, loan = await _resolve_share_link(token, db)
+    rows = (
+        await db.execute(
+            select(HudLineItem)
+            .where(HudLineItem.loan_id == loan.id)
+            .order_by(HudLineItem.code, HudLineItem.label)
+        )
+    ).scalars().all()
+    return PublicHudView(
+        loan_label=loan.deal_id or str(loan.id)[:8],
+        loan_address=loan.address or "",
+        invitee_label=link.label,
+        invitee_role=link.invitee_role,
+        revoked=link.revoked_at is not None,
+        expired=link.expires_at is not None and link.expires_at < datetime.now(timezone.utc),
+        lines=[HudLineRead.model_validate(r) for r in rows],
+    )
+
+
+@public_router.post("/{token}/lines", response_model=HudLineRead)
+async def public_add_hud_line(
+    token: str,
+    body: HudLineCreate,
+    db: AsyncSession = Depends(get_db),
+) -> HudLineRead:
+    link, loan = await _resolve_share_link(token, db)
+    line = HudLineItem(
+        loan_id=loan.id,
+        code=body.code or "custom",
+        label=body.label,
+        amount=body.amount,
+        category=body.category or "variable",
+        editable=True,
+        payee=body.payee,
+        note=body.note,
+        created_by_share_link_id=link.id,
+    )
+    db.add(line)
+    await db.flush()
+    await db.refresh(line)
+    return HudLineRead.model_validate(line)
+
+
+@public_router.patch("/{token}/lines/{line_id}", response_model=HudLineRead)
+async def public_patch_hud_line(
+    token: str,
+    line_id: UUID,
+    body: HudLinePatch,
+    db: AsyncSession = Depends(get_db),
+) -> HudLineRead:
+    """External party can edit lines they themselves created. Anything
+    else stays read-only from the public side."""
+    link, loan = await _resolve_share_link(token, db)
+    line = (
+        await db.execute(
+            select(HudLineItem).where(
+                HudLineItem.id == line_id, HudLineItem.loan_id == loan.id
+            )
+        )
+    ).scalar_one_or_none()
+    if line is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "HUD line not found")
+    if line.created_by_share_link_id != link.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only edit lines you created")
+    if body.label is not None:
+        line.label = body.label
+    if body.amount is not None:
+        line.amount = body.amount
+    if body.category is not None:
+        line.category = body.category
+    if body.payee is not None:
+        line.payee = body.payee
+    if body.note is not None:
+        line.note = body.note
+    await db.flush()
+    await db.refresh(line)
+    return HudLineRead.model_validate(line)
+
+
+@public_router.delete("/{token}/lines/{line_id}", status_code=204)
+async def public_delete_hud_line(
+    token: str,
+    line_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    link, loan = await _resolve_share_link(token, db)
+    line = (
+        await db.execute(
+            select(HudLineItem).where(
+                HudLineItem.id == line_id, HudLineItem.loan_id == loan.id
+            )
+        )
+    ).scalar_one_or_none()
+    if line is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "HUD line not found")
+    if line.created_by_share_link_id != link.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only delete lines you created")
+    await db.delete(line)
+    await db.flush()

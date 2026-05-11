@@ -102,6 +102,7 @@ for r in [
     loan_participants.router,
     loan_summary.router,
     loan_workspace.router,
+    loan_workspace.public_router,  # /public/hud/{token} — no auth
     clients.router,
     brokers.router,
     documents.router,

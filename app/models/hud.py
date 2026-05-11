@@ -26,5 +26,13 @@ class HudLineItem(TimestampMixin, Base):
     amount: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     category: Mapped[str] = mapped_column(String(16), default="fixed")  # fixed | variable
     editable: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Alembic 0042 — settlement-statement-style extras.
+    payee: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_by_share_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("hud_share_links.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     loan: Mapped[Loan] = relationship(back_populates="hud_items")
