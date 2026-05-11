@@ -521,6 +521,60 @@ async def update_loan(
     return LoanRead.model_validate(loan)
 
 
+@router.get("/{loan_id}/term-sheet.pdf")
+async def download_term_sheet_pdf(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    interest_only_months: int = 0,
+):
+    """Streams a PDF term sheet + amortization schedule for the loan.
+    Open to brokers and the funding team — the same audience that sees
+    Criteria tab. Borrowers don't hit this directly; operators share the
+    file with them once they download it."""
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    # Generate PDF in a thread so we don't block the event loop on the
+    # CPU-heavy WeasyPrint render.
+    import asyncio
+    from app.services.term_sheet_pdf import render_term_sheet_pdf
+
+    def _render() -> bytes:
+        return render_term_sheet_pdf(
+            deal_id=loan.deal_id or str(loan.id)[:8],
+            address=loan.address,
+            city=loan.city,
+            state=loan.state,
+            loan_amount=float(loan.amount),
+            base_rate=float(loan.base_rate) if loan.base_rate is not None else None,
+            final_rate=float(loan.final_rate) if loan.final_rate is not None else None,
+            discount_points=float(loan.discount_points or 0),
+            origination_pct=float(loan.origination_pct or 0),
+            term_months=loan.term_months,
+            purpose=loan.purpose,
+            arv=float(loan.arv) if loan.arv is not None else None,
+            ltv=float(loan.ltv) if loan.ltv is not None else None,
+            annual_taxes=float(loan.annual_taxes or 0),
+            annual_insurance=float(loan.annual_insurance or 0),
+            monthly_hoa=float(loan.monthly_hoa or 0),
+            monthly_rent=float(loan.monthly_rent) if loan.monthly_rent is not None else None,
+            interest_only_months=max(0, int(interest_only_months or 0)),
+        )
+
+    pdf_bytes = await asyncio.to_thread(_render)
+    filename = f"term-sheet-{loan.deal_id or str(loan.id)[:8]}.pdf"
+    from fastapi.responses import Response
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.patch("/{loan_id}/property", response_model=LoanRead)
 async def update_property(
     loan_id: UUID,
