@@ -174,6 +174,16 @@ async def update_funding_playbook(
                 expiration_days=r.expiration_days,
                 ai_request_message_template=r.ai_request_message_template,
                 display_order=r.display_order,
+                default_owner_type=r.default_owner_type,
+                default_channels=list(r.default_channels or []),
+                default_cadence_hours=r.default_cadence_hours,
+                link_url=r.link_url,
+                link_label=r.link_label,
+                link_kind=r.link_kind,
+                objective_text=r.objective_text,
+                completion_criteria=r.completion_criteria,
+                completion_mode=r.completion_mode,
+                wrong_upload_response_template=r.wrong_upload_response_template,
             ))
         await db.flush()
         await record_event(
@@ -472,6 +482,7 @@ class CadenceRuleOut(BaseModel):
     message_template: str | None
     visibility: str
     is_active: bool
+    requires_ai_owner: bool
 
 
 class CadenceRuleUpsert(BaseModel):
@@ -486,6 +497,7 @@ class CadenceRuleUpsert(BaseModel):
     message_template: str | None = None
     visibility: Literal["internal", "agent", "borrower"] = "agent"
     is_active: bool = True
+    requires_ai_owner: bool = True
 
 
 @router.get("/cadence-rules", response_model=list[CadenceRuleOut])
@@ -500,7 +512,9 @@ async def list_funding_cadence(
         select(AICadenceRule, AIPlaybookTemplate)
         .join(AIPlaybookTemplate, AICadenceRule.playbook_id == AIPlaybookTemplate.id, isouter=True)
         .where(
-            (AIPlaybookTemplate.owner_type == "funding") | (AIPlaybookTemplate.owner_type == "platform")
+            (AIPlaybookTemplate.owner_type == "funding")
+            | (AIPlaybookTemplate.owner_type == "platform")
+            | (AICadenceRule.playbook_id.is_(None))
         )
     )).all()
     return [_serialize_cadence(r) for r, _ in rows]
@@ -526,6 +540,7 @@ async def upsert_funding_cadence(
             "trigger_event", "applies_to_requirement_key", "condition",
             "wait_hours", "action_type", "approval_required",
             "message_template", "visibility", "is_active", "playbook_id",
+            "requires_ai_owner",
         ):
             setattr(row, f, getattr(payload, f))
     else:
@@ -538,6 +553,7 @@ async def upsert_funding_cadence(
             approval_required=payload.approval_required,
             message_template=payload.message_template,
             visibility=payload.visibility, is_active=payload.is_active,
+            requires_ai_owner=payload.requires_ai_owner,
         )
         db.add(row)
     await db.flush()
@@ -783,5 +799,5 @@ def _serialize_cadence(r: AICadenceRule) -> CadenceRuleOut:
         condition=r.condition, wait_hours=r.wait_hours,
         action_type=r.action_type, approval_required=r.approval_required,
         message_template=r.message_template, visibility=r.visibility,
-        is_active=r.is_active,
+        is_active=r.is_active, requires_ai_owner=r.requires_ai_owner,
     )

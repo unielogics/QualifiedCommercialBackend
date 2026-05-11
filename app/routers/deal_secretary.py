@@ -521,6 +521,7 @@ async def assign_to_ai(
     if existing is not None:
         # Apply any overrides from the payload.
         _apply_assignment_overrides(existing, payload, cat)
+        _sync_assignment_schedule(existing, crs)
         crs.owner_type = TaskOwnerType.AI.value
         await db.flush()
         await db.refresh(crs)
@@ -534,6 +535,7 @@ async def assign_to_ai(
         created_by=user.id,
     )
     _apply_assignment_overrides(assignment, payload, cat)
+    _sync_assignment_schedule(assignment, crs)
     db.add(assignment)
     await db.flush()
 
@@ -616,6 +618,25 @@ def _apply_assignment_overrides(
     if payload.completion_mode is not None:
         assignment.completion_mode = payload.completion_mode
     assignment.updated_at = _now()
+
+
+def _sync_assignment_schedule(
+    assignment: AITaskAssignment,
+    crs: ClientRequirementStatus,
+) -> None:
+    """Keep the assignment runnable and mirror its deadline onto CRS.
+
+    The CRS row is what the file/workflow UI reads for requirement due
+    dates. The assignment row is what the cadence engine reads for next
+    consideration. Keeping both aligned makes an AI-owned task behave
+    like assigned staff work instead of a passive label.
+    """
+    if assignment.complete_file_by is None and crs.due_at is not None:
+        assignment.complete_file_by = crs.due_at
+    if assignment.complete_file_by is not None:
+        crs.due_at = assignment.complete_file_by
+    if assignment.next_run_at is None:
+        assignment.next_run_at = _now()
 
 
 # ── POST /unassign ─────────────────────────────────────────────────
@@ -708,6 +729,7 @@ async def update_assignment(
         )
     ).scalars().first()
     _apply_assignment_overrides(assignment, payload, cat)
+    _sync_assignment_schedule(assignment, crs)
     await db.flush()
     await db.refresh(assignment)
     await db.refresh(crs)

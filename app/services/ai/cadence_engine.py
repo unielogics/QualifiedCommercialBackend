@@ -28,14 +28,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import AITaskPriority, AITaskSource, AITaskStatus
 from app.models.ai_audit_event import AIAuditEvent
 from app.models.ai_cadence_rule import AICadenceRule
-from app.models.ai_playbook import AIPlaybookTemplate
+from app.models.ai_playbook import AICollectionRequirement
 from app.models.ai_task import AITask
+from app.models.ai_task_assignment import AITaskAssignment
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
 from app.models.client_requirement_status import ClientRequirementStatus
@@ -93,7 +94,7 @@ async def preview_cadence_pass(
                 "client_id": t["client_id"],
                 "client_name": t["client_name"],
                 "requirement_key": t.get("requirement_key"),
-                "message_preview": _format_template(rule.message_template, t),
+                "message_preview": _compose_assignment_message(rule, t),
                 "fires_now": True,
             })
     return out
@@ -131,12 +132,12 @@ async def _evaluate_rule(db: AsyncSession, rule: AICadenceRule) -> list[dict[str
     targets = await _eligible_targets(db, rule)
     results: list[dict[str, Any]] = []
     for t in targets:
-        if await _already_fired_recently(db, rule, t):
-            continue
         # AI Deal Secretary gate.
         effective_action = await _resolve_ai_owner_gate(db, rule, t)
         if effective_action is None:
             continue  # gate blocked this target
+        if await _already_fired_recently(db, rule, t, action_type=effective_action):
+            continue
         outcome = await _fire_action(db, rule, t, effective_action=effective_action)
         if outcome is not None:
             results.append(outcome)
@@ -270,14 +271,55 @@ async def _eligible_targets(
             else:
                 return []
         rows = (await db.execute(q)).all()
+        labels_by_key = await _requirement_labels(
+            db,
+            [status_row.requirement_key for status_row, _ in rows],
+        )
         out: list[dict[str, Any]] = []
         for status_row, client in rows:
+            assignment = await _live_assignment_for_status(db, status_row)
+            if rule.requires_ai_owner:
+                if status_row.owner_type != "ai" or assignment is None:
+                    continue
+                if _assignment_attempts_exhausted(assignment):
+                    continue
+                if not _assignment_due_for_run(assignment, now):
+                    continue
+            elif assignment is not None:
+                # Legacy/global rules may still hit an AI-owned row.
+                # Respect the row's per-task run window so broad rules
+                # cannot fire between assignment-level cadence windows.
+                if _assignment_attempts_exhausted(assignment):
+                    continue
+                if not _assignment_due_for_run(assignment, now):
+                    continue
+
+            # Borrower replied after our last ask. Do not keep nudging
+            # until another process marks the item missing/asked again.
+            if status_row.last_response_at and (
+                status_row.last_requested_at is None
+                or status_row.last_response_at > status_row.last_requested_at
+            ):
+                continue
+
+            label = labels_by_key.get(
+                status_row.requirement_key,
+                status_row.requirement_key.replace("_", " "),
+            )
+            context: dict[str, Any] = {
+                "requirement_label": label,
+                "requirement_key": status_row.requirement_key,
+                "due_at": _format_date(status_row.due_at),
+            }
+            if assignment is not None:
+                context.update(_assignment_template_context(assignment))
             out.append({
                 "client_id": client.id,
                 "client_name": client.name,
                 "loan_id": status_row.loan_id,
                 "requirement_key": status_row.requirement_key,
-                "context": {"requirement_label": status_row.requirement_key},
+                "assignment_id": assignment.id if assignment else None,
+                "context": context,
             })
         return out
 
@@ -312,19 +354,24 @@ async def _already_fired_recently(
     db: AsyncSession,
     rule: AICadenceRule,
     target: dict[str, Any],
+    *,
+    action_type: str | None = None,
 ) -> bool:
     """Avoid double-firing. v1 looks back 24h for an audit row with
     the same (event_type, client_id, requirement_key)."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    event_type = f"cadence_action_fired:{rule.action_type}"
-    rows = (await db.execute(
-        select(AIAuditEvent).where(
-            AIAuditEvent.event_type == event_type,
-            AIAuditEvent.client_id == target["client_id"],
-            AIAuditEvent.requirement_key == target.get("requirement_key"),
-            AIAuditEvent.created_at >= cutoff,
-        ).limit(1)
-    )).scalars().all()
+    event_type = f"cadence_action_fired:{action_type or rule.action_type}"
+    filters = [
+        AIAuditEvent.event_type == event_type,
+        AIAuditEvent.client_id == target["client_id"],
+        AIAuditEvent.requirement_key == target.get("requirement_key"),
+        AIAuditEvent.created_at >= cutoff,
+    ]
+    if target.get("loan_id") is not None:
+        filters.append(AIAuditEvent.loan_id == target.get("loan_id"))
+    rows = (
+        await db.execute(select(AIAuditEvent).where(*filters).limit(1))
+    ).scalars().all()
     return bool(rows)
 
 
@@ -375,14 +422,14 @@ async def _handle_draft_message(
 ) -> dict[str, Any]:
     """Draft-first default. Creates an AITask the agent reviews +
     sends from AI Inbox. Never sends to the borrower directly."""
-    msg = _format_template(rule.message_template, target)
+    msg = _compose_assignment_message(rule, target)
     task = AITask(
         loan_id=target.get("loan_id"),
         source=AITaskSource.PIPELINE,
         priority=AITaskPriority.MEDIUM,
         status=AITaskStatus.PENDING,
         action="cadence_draft_message",
-        title=f"Cadence draft · {target['client_name']}",
+        title=f"Draft borrower request · {target['client_name']}",
         summary=msg or f"Cadence rule {rule.trigger_event} fired — review draft.",
         agent="cadence",
         draft_payload={
@@ -390,8 +437,10 @@ async def _handle_draft_message(
             "rule_id": str(rule.id),
             "trigger_event": rule.trigger_event,
             "requirement_key": target.get("requirement_key"),
+            "assignment_id": str(target.get("assignment_id")) if target.get("assignment_id") else None,
             "message": msg,
             "visibility": rule.visibility,
+            "assignment_context": target.get("context") or {},
         },
     )
     db.add(task)
@@ -404,7 +453,7 @@ async def _handle_create_task(
     rule: AICadenceRule,
     target: dict[str, Any],
 ) -> dict[str, Any]:
-    msg = _format_template(rule.message_template, target)
+    msg = _compose_assignment_message(rule, target)
     task = AITask(
         loan_id=target.get("loan_id"),
         source=AITaskSource.PIPELINE,
@@ -430,7 +479,7 @@ async def _handle_escalate(
     rule: AICadenceRule,
     target: dict[str, Any],
 ) -> dict[str, Any]:
-    msg = _format_template(rule.message_template, target)
+    msg = _compose_assignment_message(rule, target)
     task = AITask(
         loan_id=target.get("loan_id"),
         source=AITaskSource.RISK,
@@ -511,23 +560,11 @@ async def _handle_auto_send_reminder(
         # No live assignment to attach to — fall back to draft.
         return await _handle_draft_message(db, rule, target)
 
-    from app.models.ai_task_assignment import AITaskAssignment as _ATA
-    assignment = await db.get(_ATA, crs.ai_assignment_id)
+    assignment = await db.get(AITaskAssignment, crs.ai_assignment_id)
     if assignment is None or assignment.deleted_at is not None:
         return await _handle_draft_message(db, rule, target)
 
-    # Compose the body — assignment objective + rule template.
-    msg_parts = []
-    if assignment.objective_text:
-        msg_parts.append(assignment.objective_text)
-    formatted = _format_template(rule.message_template, target)
-    if formatted:
-        msg_parts.append(formatted)
-    if not msg_parts:
-        msg_parts.append("Just checking in on this item — let me know if you have any questions.")
-    if assignment.link_url and assignment.link_label:
-        msg_parts.append(f"{assignment.link_label}: {assignment.link_url}")
-    msg_body = "\n\n".join(msg_parts)
+    msg_body = _compose_assignment_message(rule, target, assignment=assignment)
 
     # Dispatch via every channel on the assignment. The dispatcher
     # writes ai_outreach_events rows for each.
@@ -597,3 +634,121 @@ def _format_template(tmpl: str | None, target: dict[str, Any]) -> str | None:
     for k, v in ctx.items():
         out = out.replace("{{" + k + "}}", str(v if v is not None else "—"))
     return out
+
+
+async def _live_assignment_for_status(
+    db: AsyncSession,
+    status_row: ClientRequirementStatus,
+) -> AITaskAssignment | None:
+    if status_row.ai_assignment_id is None:
+        return None
+    assignment = await db.get(AITaskAssignment, status_row.ai_assignment_id)
+    if assignment is None or assignment.deleted_at is not None:
+        return None
+    return assignment
+
+
+def _assignment_attempts_exhausted(assignment: AITaskAssignment) -> bool:
+    cadence = assignment.cadence or {}
+    max_attempts = int(cadence.get("max_attempts", 3) or 3)
+    return max_attempts > 0 and (assignment.attempts_made or 0) >= max_attempts
+
+
+def _assignment_due_for_run(assignment: AITaskAssignment, now: datetime) -> bool:
+    return assignment.next_run_at is None or assignment.next_run_at <= now
+
+
+def _assignment_template_context(assignment: AITaskAssignment) -> dict[str, Any]:
+    cadence = assignment.cadence or {}
+    return {
+        "assignment_id": str(assignment.id),
+        "objective_text": assignment.objective_text or "",
+        "completion_criteria": assignment.completion_criteria or "",
+        "completion_mode": assignment.completion_mode or "",
+        "instructions": assignment.instructions or "",
+        "instructions_visibility": assignment.instructions_visibility,
+        "channels": list(assignment.channels or []),
+        "approval_mode": assignment.approval_mode,
+        "complete_file_by": _format_date(assignment.complete_file_by),
+        "hours_between_attempts": cadence.get("hours_between_attempts", 48),
+        "max_attempts": cadence.get("max_attempts", 3),
+        "attempts_made": assignment.attempts_made or 0,
+        "next_run_at": assignment.next_run_at.isoformat() if assignment.next_run_at else "",
+        "link_label": assignment.link_label or "",
+        "link_url": assignment.link_url or "",
+        "link_kind": assignment.link_kind or "",
+    }
+
+
+async def _requirement_labels(db: AsyncSession, keys: list[str]) -> dict[str, str]:
+    unique = list({k for k in keys if k})
+    if not unique:
+        return {}
+    rows = (
+        await db.execute(
+            select(AICollectionRequirement.requirement_key, AICollectionRequirement.label)
+            .where(AICollectionRequirement.requirement_key.in_(unique))
+        )
+    ).all()
+    out: dict[str, str] = {}
+    for key, label in rows:
+        out.setdefault(key, label)
+    return out
+
+
+def _compose_assignment_message(
+    rule: AICadenceRule,
+    target: dict[str, Any],
+    *,
+    assignment: AITaskAssignment | None = None,
+) -> str:
+    ctx = dict(target.get("context") or {})
+    parts: list[str] = []
+
+    formatted = _format_template(rule.message_template, target)
+    if formatted:
+        parts.append(formatted)
+    else:
+        label = ctx.get("requirement_label") or target.get("requirement_key") or "this item"
+        parts.append(
+            f"Hi {target.get('client_name') or 'there'}, I am following up on {label}. "
+            "Please send the item or let me know what is blocking it."
+        )
+
+    objective = ctx.get("objective_text")
+    if objective:
+        parts.append(str(objective))
+
+    completion = ctx.get("completion_criteria")
+    if completion:
+        parts.append(f"What we need to complete this: {completion}")
+
+    due = ctx.get("complete_file_by") or ctx.get("due_at")
+    if due:
+        parts.append(f"Target due date: {due}.")
+
+    if ctx.get("link_label") and ctx.get("link_url"):
+        parts.append(f"{ctx['link_label']}: {ctx['link_url']}")
+
+    added_borrower_instructions = False
+    if ctx.get("instructions_visibility") == "borrower" and ctx.get("instructions"):
+        parts.append(str(ctx["instructions"]))
+        added_borrower_instructions = True
+
+    if (
+        not added_borrower_instructions
+        and assignment is not None
+        and assignment.instructions_visibility == "borrower"
+        and assignment.instructions
+    ):
+        parts.append(assignment.instructions)
+
+    return "\n\n".join([p for p in parts if p])
+
+
+def _format_date(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)

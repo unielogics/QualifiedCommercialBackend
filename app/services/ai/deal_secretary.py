@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -45,6 +46,19 @@ from app.services.ai.requirement_resolver import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _coerce_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 
 # Loan.type + Loan.purpose → platform playbook product_key. Returns None
@@ -331,6 +345,7 @@ async def materialize_pending_assignments(
                     req_key,
                 )
                 continue
+            complete_file_by = _coerce_date(entry.get("complete_file_by")) or crs.due_at
             assignment = AITaskAssignment(
                 id=uuid.uuid4(),
                 client_requirement_status_id=crs.id,
@@ -345,17 +360,20 @@ async def materialize_pending_assignments(
                     "max_attempts": 3,
                 },
                 approval_mode=entry.get("approval_mode") or "draft_first",
-                complete_file_by=None,  # date strings: trust client to coerce later
+                complete_file_by=complete_file_by,
                 link_url=entry.get("link_url") or (cat.link_url if cat else None),
                 link_label=entry.get("link_label") or (cat.link_label if cat else None),
                 link_kind=entry.get("link_kind") or (cat.link_kind if cat else None),
                 consent_state={},
+                next_run_at=datetime.now(timezone.utc),
                 created_by=None,
             )
             db.add(assignment)
             await db.flush()
             crs.owner_type = TaskOwnerType.AI.value
             crs.ai_assignment_id = assignment.id
+            if complete_file_by is not None:
+                crs.due_at = complete_file_by
             created_count += 1
 
     # Clear the buffer on the realtor plan now that we've materialized.
