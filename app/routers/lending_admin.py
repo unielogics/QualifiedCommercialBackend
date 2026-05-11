@@ -184,6 +184,10 @@ async def update_funding_playbook(
                 completion_criteria=r.completion_criteria,
                 completion_mode=r.completion_mode,
                 wrong_upload_response_template=r.wrong_upload_response_template,
+                depends_on=list(r.depends_on or []),
+                parent_key=r.parent_key,
+                inferred_depends_on=list(r.inferred_depends_on or []),
+                deps_confirmed=r.deps_confirmed,
             ))
         await db.flush()
         await record_event(
@@ -280,6 +284,11 @@ async def duplicate_from_platform(
             completion_criteria=r.completion_criteria,
             completion_mode=r.completion_mode,
             wrong_upload_response_template=r.wrong_upload_response_template,
+            # Timeline + grouping (alembic 0040) — preserve dependency graph on copy
+            depends_on=list(r.depends_on or []),
+            parent_key=r.parent_key,
+            inferred_depends_on=list(r.inferred_depends_on or []),
+            deps_confirmed=r.deps_confirmed,
         ))
     await db.flush()
     await record_event(
@@ -319,6 +328,11 @@ class RequirementOut(BaseModel):
     completion_criteria: str
     completion_mode: str
     wrong_upload_response_template: str | None
+    # Timeline + grouping (alembic 0040)
+    depends_on: list[str] = []
+    parent_key: str | None = None
+    inferred_depends_on: list[str] = []
+    deps_confirmed: bool = True
 
 
 # Closed enum for the Deal Secretary taxonomy + valid completion modes.
@@ -364,6 +378,9 @@ class RequirementUpsert(BaseModel):
     completion_criteria: str = ""
     completion_mode: _CompletionModeLiteral = "ai_can_complete"
     wrong_upload_response_template: str | None = None
+    # Timeline + grouping (alembic 0040). All optional on upsert.
+    depends_on: list[str] | None = None
+    parent_key: str | None = None
 
 
 @router.get("/playbooks/{playbook_id}/requirements", response_model=list[RequirementOut])
@@ -435,6 +452,9 @@ async def upsert_requirement(
             completion_criteria=payload.completion_criteria,
             completion_mode=payload.completion_mode,
             wrong_upload_response_template=payload.wrong_upload_response_template,
+            # Timeline + grouping (alembic 0040)
+            depends_on=payload.depends_on or [],
+            parent_key=payload.parent_key,
         )
         db.add(req)
         await db.flush()
@@ -788,6 +808,11 @@ def _serialize_requirement(r: AICollectionRequirement) -> RequirementOut:
         completion_criteria=r.completion_criteria or "",
         completion_mode=r.completion_mode,
         wrong_upload_response_template=r.wrong_upload_response_template,
+        # Timeline + grouping (alembic 0040).
+        depends_on=list(r.depends_on or []),
+        parent_key=r.parent_key,
+        inferred_depends_on=list(r.inferred_depends_on or []),
+        deps_confirmed=r.deps_confirmed,
     )
 
 
