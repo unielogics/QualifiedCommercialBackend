@@ -73,6 +73,7 @@ from app.schemas.deal_secretary import (
     DealSecretaryView,
     FileSettings,
     FileSettingsUpdate,
+    OutreachModeLiteral,
     TaskRow,
     UnassignRequest,
     WizardIntentRequest,
@@ -813,6 +814,226 @@ async def repair_bootstrap(
     loan = await _resolve_loan_and_gate(loan_id, user, db)
     result = await bootstrap_requirement_status_rows(db, loan, log_label="repair")
     return BootstrapResponse(**result)
+
+
+# ── POST /start + /pause — the user-visible "turn on / off the AI" ──
+
+
+class StartResponse(BaseModel):
+    """Response for /deal-secretary/start.
+
+    `outreach_mode` is what we flipped to (caller passes intended_mode
+    or it defaults to portal_auto). `fired_count` is how many first-
+    touch outreach messages actually went out across all the
+    AI-owned tasks. `skipped` carries reasons each unfired task was
+    skipped (no channel match, missing borrower contact, etc.)."""
+    outreach_mode: str
+    fired_count: int
+    skipped_count: int
+    skipped: list[str]
+
+
+class StartRequest(BaseModel):
+    """Optional knob — default mode is portal_auto which the user
+    described as 'the safest default that actually contacts the
+    client'. Operators can up to portal_email / portal_email_sms here
+    or downgrade to draft_first for a 'spin up draft only' pass."""
+    mode: OutreachModeLiteral = "portal_auto"
+
+
+@router.post(
+    "/loans/{loan_id}/deal-secretary/start",
+    response_model=StartResponse,
+)
+async def start_ai_secretary(
+    loan_id: UUID,
+    payload: StartRequest | None = None,
+    *,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StartResponse:
+    """One-click "Start AI Secretary" — the user-facing primitive that
+    makes the AI actually begin contacting the borrower.
+
+    Atomically:
+      1. Flips ClientAIPlan.ai_secretary_settings.outreach_mode to the
+         requested mode (default portal_auto).
+      2. Fires first-touch outreach for every AI-owned task whose
+         assignment hasn't already sent a message. Skips the 30-min
+         cron wait — the operator sees real activity in the borrower's
+         thread within seconds.
+
+    Per-task channel + cadence still come from the assignment. The
+    outreach_dispatcher handles channel gating, consent checks, and
+    audit logging exactly as the cadence engine would."""
+    loan = await _resolve_loan_and_gate(loan_id, user, db)
+    mode = (payload.mode if payload else "portal_auto")
+
+    # Flip the file-level outreach mode (lazy-creates the plan if missing).
+    plan = (
+        await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.client_id == loan.client_id,
+                ClientAIPlan.loan_id == loan.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if plan is None:
+        plan = ClientAIPlan(
+            id=uuid.uuid4(),
+            client_id=loan.client_id,
+            loan_id=loan.id,
+            agent_id=loan.broker_id,
+            current_phase="lending",
+            active_playbook_versions=[],
+            required_items=[],
+            waived_items=[],
+            ai_suggested_items=[],
+            ai_secretary_settings={"outreach_mode": mode},
+        )
+        db.add(plan)
+    else:
+        settings = dict(plan.ai_secretary_settings or {})
+        settings["outreach_mode"] = mode
+        plan.ai_secretary_settings = settings
+    await db.flush()
+
+    # Pull every live AI assignment on this loan.
+    crs_rows = (
+        await db.execute(
+            select(ClientRequirementStatus).where(
+                ClientRequirementStatus.client_id == loan.client_id,
+                ClientRequirementStatus.loan_id == loan.id,
+                ClientRequirementStatus.owner_type == TaskOwnerType.AI.value,
+            )
+        )
+    ).scalars().all()
+    if not crs_rows:
+        return StartResponse(
+            outreach_mode=mode, fired_count=0, skipped_count=0, skipped=[],
+        )
+    assignment_ids = [r.ai_assignment_id for r in crs_rows if r.ai_assignment_id]
+    assignments = []
+    if assignment_ids:
+        assignments = (
+            await db.execute(
+                select(AITaskAssignment).where(
+                    AITaskAssignment.id.in_(assignment_ids),
+                    AITaskAssignment.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    catalog_by_key: dict[str, AICollectionRequirement] = {}
+    if crs_rows:
+        cat_rows = (
+            await db.execute(
+                select(AICollectionRequirement)
+                .where(AICollectionRequirement.requirement_key.in_(
+                    [r.requirement_key for r in crs_rows]
+                ))
+            )
+        ).scalars().all()
+        for c in cat_rows:
+            catalog_by_key.setdefault(c.requirement_key, c)
+
+    if mode in ("off", "draft_first"):
+        # Draft-only or paused — don't fire; the cadence engine will
+        # still respect the mode when it next ticks.
+        return StartResponse(
+            outreach_mode=mode, fired_count=0, skipped_count=0, skipped=[],
+        )
+
+    from app.services.ai.outreach_dispatcher import dispatch as _dispatch
+    fired = 0
+    skipped: list[str] = []
+    assignments_by_crs = {a.client_requirement_status_id: a for a in assignments}
+    for crs in crs_rows:
+        a = assignments_by_crs.get(crs.id)
+        if a is None:
+            skipped.append(f"{crs.requirement_key}: no live assignment")
+            continue
+        # Skip tasks that already have a sent outreach in the audit log —
+        # /start is for first-touch only. Re-runs are a no-op.
+        if (a.attempts_made or 0) > 0:
+            skipped.append(f"{crs.requirement_key}: already dispatched")
+            continue
+        cat = catalog_by_key.get(crs.requirement_key)
+        # Compose first-touch body.
+        parts: list[str] = []
+        if a.objective_text:
+            parts.append(a.objective_text)
+        elif cat is not None and cat.objective_text:
+            parts.append(cat.objective_text)
+        if cat is not None and cat.ai_request_message_template:
+            parts.append(cat.ai_request_message_template)
+        if not parts:
+            parts.append(f"Hi — when you have a moment, can you take care of: {cat.label if cat else crs.requirement_key}?")
+        link_url = a.link_url or (cat.link_url if cat else None)
+        link_label = a.link_label or (cat.link_label if cat else None)
+        if link_url and link_label:
+            parts.append(f"{link_label}: {link_url}")
+        msg_body = "\n\n".join(parts)
+
+        channels = list(a.channels or ["portal"])
+        sent_any = False
+        for ch in channels:
+            event = await _dispatch(
+                db,
+                assignment=a,
+                channel=ch,
+                message_body=msg_body,
+                template_key=crs.requirement_key,
+            )
+            if event.status == "sent":
+                sent_any = True
+        if sent_any:
+            fired += 1
+        else:
+            skipped.append(f"{crs.requirement_key}: dispatch blocked (consent / channel)")
+
+    log.info(
+        "deal_secretary.start loan_id=%s mode=%s fired=%d skipped=%d user=%s",
+        loan.id, mode, fired, len(skipped), user.id,
+    )
+    return StartResponse(
+        outreach_mode=mode,
+        fired_count=fired,
+        skipped_count=len(skipped),
+        skipped=skipped,
+    )
+
+
+@router.post(
+    "/loans/{loan_id}/deal-secretary/pause",
+    response_model=FileSettings,
+)
+async def pause_ai_secretary(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FileSettings:
+    """One-click "Pause AI Secretary" — sets outreach_mode to 'off'.
+    The AI keeps tracking the plan but stops sending anything until
+    /start (or a manual mode flip) re-engages it."""
+    loan = await _resolve_loan_and_gate(loan_id, user, db)
+    plan = (
+        await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.client_id == loan.client_id,
+                ClientAIPlan.loan_id == loan.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if plan is None:
+        # Nothing to pause — return a synthetic FileSettings so the
+        # frontend's optimistic UI doesn't crash.
+        return FileSettings(outreach_mode="off")
+    settings = dict(plan.ai_secretary_settings or {})
+    settings["outreach_mode"] = "off"
+    plan.ai_secretary_settings = settings
+    await db.flush()
+    log.info("deal_secretary.pause loan_id=%s user=%s", loan.id, user.id)
+    return _file_settings_from_jsonb(settings)
 
 
 # ── POST /clients/{client_id}/deal-secretary/wizard-intent ─────────
