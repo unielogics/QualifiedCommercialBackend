@@ -284,3 +284,138 @@ class EmailDraftStatus(StrEnum):
     APPROVED = "approved"
     SENT = "sent"
     DISMISSED = "dismissed"
+
+
+# -------------------------------------------------------------------------
+# AI Deal Secretary enums (alembic 0038).
+#
+# These power the "Assign to AI" workflow: who owns each task, which
+# outreach channels are allowed, how strict the approval gate is, and
+# what state the per-task workflow is in. The full mental model is in
+# the plan file — four orthogonal axes:
+#
+#   Owner          who is responsible        TaskOwnerType
+#   Outreach       can AI contact borrower   OutreachMode (file-level)
+#   Channel        where AI may contact      OutreachChannel (per task)
+#   Approval mode  do messages go live       ApprovalMode (per task)
+#
+# Funding-locked items are pinned to their default owner — agents cannot
+# move them; only underwriters can.
+# -------------------------------------------------------------------------
+
+
+class RequirementCategory(StrEnum):
+    """Single closed taxonomy used by Settings, the Deal Secretary picker,
+    pipeline filters, and AI Inbox source chips. No free-text categories
+    anywhere in the system — adding a category is a code change.
+
+    Old `category` values on AICollectionRequirement (fact / document /
+    appointment / agreement / task) are mapped onto this taxonomy by the
+    0038 data migration."""
+    BORROWER_INFO = "borrower_info"             # name, contact, entity type, identification
+    PROPERTY_DATA = "property_data"             # address, type, beds/baths/sqft, year, units
+    FINANCIALS = "financials"                   # bank statements, tax returns, PFS, rent roll
+    CREDIT = "credit"                           # soft pull, hard pull, FICO authorization
+    AGREEMENTS = "agreements"                   # buyer agency, listing, purchase contract, op agreement
+    INSURANCE = "insurance"                     # hazard, flood, liability quotes / binders
+    TITLE_AND_ESCROW = "title_and_escrow"       # title commitment, prelim, escrow instructions
+    APPRAISAL_AND_INSPECTION = "appraisal_and_inspection"  # appraisal order, inspection, walkthrough
+    SCHEDULING = "scheduling"                   # showings, picture day, walkthrough, consultation
+    COMPLIANCE = "compliance"                   # disclosures, RESPA, TRID, state-specific forms
+    COMMUNICATION = "communication"             # outreach drafts, reminders, follow-ups
+    AI_INTERNAL = "ai_internal"                 # AI-only working state (never borrower-visible)
+
+
+class TaskOwnerType(StrEnum):
+    """Who is responsible for moving a requirement to completion.
+
+    `funding_locked` is the special case — UW set it; agents cannot waive
+    or reassign. Enforced by the resolver + by the `can_agent_override`
+    flag on the catalog row."""
+    HUMAN = "human"
+    AI = "ai"
+    SHARED = "shared"
+    FUNDING_LOCKED = "funding_locked"
+
+
+class OutreachChannel(StrEnum):
+    """Per-assignment list of channels the AI is allowed to use on this
+    specific task. Subset of the file-level OutreachMode capabilities."""
+    PORTAL = "portal"
+    EMAIL = "email"
+    SMS = "sms"
+    VOICE = "voice"
+
+
+class OutreachMode(StrEnum):
+    """File-level kill switch / mode selector for AI outreach.
+
+    Stored on ClientAIPlan.ai_secretary_settings.outreach_mode. The
+    cadence engine consults this BEFORE firing any borrower-visible
+    action — see cadence_engine._evaluate_rule().
+
+    - off              : nothing sends; AI may still track + draft internally
+    - draft_first      : drafts land in AI Inbox; agent reviews + sends manually
+    - portal_auto      : portal messages auto-send; email/SMS still draft-first
+    - portal_email     : portal + email auto-send; SMS still draft-first
+    - portal_email_sms : everything auto-sends (consent + quiet hours still apply)
+    """
+    OFF = "off"
+    DRAFT_FIRST = "draft_first"
+    PORTAL_AUTO = "portal_auto"
+    PORTAL_EMAIL = "portal_email"
+    PORTAL_EMAIL_SMS = "portal_email_sms"
+
+
+class ApprovalMode(StrEnum):
+    """Per-assignment override of the file-level OutreachMode. Sensitive
+    tasks (e.g. anything touching closing dates) can opt into stricter
+    review even when the file is in portal_auto."""
+    DRAFT_FIRST = "draft_first"
+    AUTO_SEND_PORTAL = "auto_send_portal"
+    REQUIRE_PER_MESSAGE = "require_per_message"
+
+
+class OutreachEventStatus(StrEnum):
+    """Lifecycle states for one row in ai_outreach_events.
+
+    `scheduled` is the queued-but-not-yet-fired state. `drafted` lands in
+    AI Inbox. `blocked_by_*` are the legibly-failed states that explain
+    why nothing went out — important for debugging cadence gating."""
+    SCHEDULED = "scheduled"
+    DRAFTED = "drafted"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    RESPONDED = "responded"
+    FAILED = "failed"
+    BLOCKED_BY_CONSENT = "blocked_by_consent"
+    BLOCKED_BY_QUIET_HOURS = "blocked_by_quiet_hours"
+    BLOCKED_BY_POLICY = "blocked_by_policy"
+    CANCELLED = "cancelled"
+
+
+class LinkKind(StrEnum):
+    """Icon hint for the optional link_url on a catalog row or
+    per-deal assignment. DocuSign is the highest-value case (agents
+    paste their pre-built envelope URL); others are generic."""
+    DOCUSIGN = "docusign"
+    ESIGN = "esign"
+    EXTERNAL_FORM = "external_form"
+    REFERENCE = "reference"
+
+
+class CompletionMode(StrEnum):
+    """Defines what 'done' means for a task. Critical for the AI to know
+    when to stop follow-up vs hand off to a human.
+
+    - ai_can_complete       : when the scanner/chat signal fires, AI flips
+                              status='verified' and stops follow-up.
+    - requires_human_verify : AI flips status='provided_unverified' and
+                              creates an AITask for the underwriter. AI
+                              stops follow-up; resumes only on rejection.
+    - borrower_self_attest  : borrower confirms in chat. Trust score from
+                              fact_priority.py is 'borrower_confirmed'
+                              (lower than 'verified_document')."""
+    AI_CAN_COMPLETE = "ai_can_complete"
+    REQUIRES_HUMAN_VERIFY = "requires_human_verify"
+    BORROWER_SELF_ATTEST = "borrower_self_attest"

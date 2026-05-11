@@ -87,6 +87,31 @@ class ClientAIPlan(TimestampMixin, Base):
     next_best_action: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     readiness_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # AI Deal Secretary file-level settings (alembic 0038). Structured
+    # JSONB carrying the sticky kill-switch and the file-wide config:
+    #
+    #   {
+    #     "outreach_mode": "off" | "draft_first" | "portal_auto"
+    #                    | "portal_email" | "portal_email_sms",
+    #     "complete_file_by": "2026-05-28",
+    #     "sms_consent":      {"state": "granted" | "not_granted",
+    #                          "captured_at": "...", "language": "..."},
+    #     "email_opt_out":    {"opted_out_at": "...", "reason": "..."},
+    #     "default_cadence":  {...},
+    #     "pending_assignments": [...]   # wizard-intent buffer; cleared
+    #                                    # once the loan exists and the
+    #                                    # materializer creates real rows
+    #   }
+    #
+    # Defaults to {"outreach_mode": "draft_first"} on bootstrap so a
+    # fresh deal CAN have tasks assigned to AI without anything sending
+    # until the agent explicitly flips the mode.
+    ai_secretary_settings: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False,
+        default=lambda: {"outreach_mode": "draft_first"},
+        server_default='{"outreach_mode": "draft_first"}',
+    )
+
     computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )

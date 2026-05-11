@@ -62,3 +62,26 @@ class ClientRequirementStatus(TimestampMixin, Base):
     due_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     last_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ---- AI Deal Secretary fields (alembic 0038) ----
+    owner_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="human", server_default="human",
+    )
+    """TaskOwnerType — human | ai | shared | funding_locked. The
+    Deal Secretary picker on the workbench writes this on drag. Cadence
+    engine consults this BEFORE firing any borrower-visible action."""
+
+    ai_assignment_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("ai_task_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    """Live AITaskAssignment row when owner_type='ai'. NULL otherwise.
+    Soft-deleting an assignment leaves this dangling momentarily — the
+    same /unassign endpoint clears it in the same transaction."""
+
+    last_response_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    """Last borrower reply timestamp. Cadence engine reads this to
+    avoid re-asking inside the configured window."""

@@ -88,8 +88,13 @@ class AICollectionRequirement(TimestampMixin, Base):
     """Stable identifier — e.g. "purchase_contract", "buyer_agency_agreement"."""
 
     label: Mapped[str] = mapped_column(String(200), nullable=False)
-    category: Mapped[str] = mapped_column(String(16), nullable=False)
-    """fact | document | appointment | agreement | task."""
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    """RequirementCategory enum (alembic 0038). 12-value closed taxonomy:
+    borrower_info | property_data | financials | credit | agreements |
+    insurance | title_and_escrow | appraisal_and_inspection | scheduling |
+    compliance | communication | ai_internal. Legacy 5-value set
+    (fact / document / appointment / agreement / task) was remapped by
+    the 0038 upgrade()."""
 
     required_level: Mapped[str] = mapped_column(String(16), nullable=False)
     """required | recommended | optional."""
@@ -119,5 +124,68 @@ class AICollectionRequirement(TimestampMixin, Base):
     """Template the AI uses when asking the borrower/agent for this item."""
 
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    # ---- AI Deal Secretary fields (alembic 0038) ----
+    # These define the catalog-level DEFAULTS that a fresh deal inherits.
+    # Per-deal overrides live on AITaskAssignment.
+
+    default_owner_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="human", server_default="human",
+    )
+    """TaskOwnerType default — what a fresh CRS row's owner is set to
+    when bootstrap_requirement_status_rows() walks the resolver. Most
+    rows are 'human'; funding-locked items ship as 'funding_locked'."""
+
+    default_channels: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=lambda: ["portal"], server_default='["portal"]',
+    )
+    """OutreachChannel default list. Typically ["portal"] for sensitive
+    items and ["portal", "email"] for less-sensitive ones."""
+
+    default_cadence_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=48, server_default="48",
+    )
+    """Hours between follow-up attempts when this requirement lands on
+    the AI side of the workbench. Per-deal cadence can override."""
+
+    link_url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    """Optional external URL (DocuSign envelope, e-sign template,
+    intake form, marketing one-pager). Rendered as a clickable action
+    in the AI's borrower-facing message when present."""
+
+    link_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    """Display label for link_url (e.g. "Sign Buyer Agency Agreement")."""
+
+    link_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    """LinkKind enum — drives icon rendering. docusign | esign |
+    external_form | reference."""
+
+    objective_text: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    """One-line plain-language objective ("Collect 2 months of bank
+    statements"). Tells the AI what success looks like for this task."""
+
+    completion_criteria: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default="",
+    )
+    """Explicit "done" definition. The AI consults this + the
+    completion_mode to decide whether to mark the task verified or
+    hand off to a human."""
+
+    completion_mode: Mapped[str] = mapped_column(
+        String(24), nullable=False,
+        default="ai_can_complete", server_default="ai_can_complete",
+    )
+    """CompletionMode enum — ai_can_complete | requires_human_verify |
+    borrower_self_attest. Sensitive items (purchase_contract,
+    operating_agreement) ship as requires_human_verify so the AI
+    confirms receipt but never marks the task fully complete alone."""
+
+    wrong_upload_response_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Template the AI uses when the document scanner flags a
+    wrong-file upload ("Thanks for sending that — looks like it's a
+    single statement page; underwriting needs all pages from the
+    last two months. Could you upload the full PDF?")."""
 
     playbook: Mapped[AIPlaybookTemplate] = relationship(back_populates="requirements")

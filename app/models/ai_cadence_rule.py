@@ -61,3 +61,12 @@ class AICadenceRule(TimestampMixin, Base):
     """internal | agent | borrower."""
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+
+    # AI Deal Secretary integration (alembic 0038). When True, this rule
+    # only fires for (client, loan) pairs where the associated CRS row
+    # has owner_type='ai'. The cadence engine downgrades non-AI matches
+    # to no-op so a global rule can't accidentally walk every deal.
+    # Legacy rules backfill to False to preserve today's behavior.
+    requires_ai_owner: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
