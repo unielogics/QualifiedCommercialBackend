@@ -806,7 +806,7 @@ async def recalc(
     quote = pricing_quote(base_rate, amount, payload.discount_points)
 
     is_io = loan.type in {LoanType.FIX_AND_FLIP, LoanType.BRIDGE, LoanType.GROUND_UP}
-    term = loan.term_months or (12 if is_io else 360)
+    term = payload.term_months or loan.term_months or (12 if is_io else 360)
     if is_io:
         pi = round(amount * quote.final_rate / 12, 2)
     else:
@@ -827,10 +827,16 @@ async def recalc(
         payload.monthly_hoa if payload.monthly_hoa is not None else float(loan.monthly_hoa or 0)
     )
 
+    monthly_rent = (
+        payload.monthly_rent
+        if payload.monthly_rent is not None
+        else float(loan.monthly_rent or 0)
+    )
+
     dscr_val = None
-    if loan.monthly_rent and not is_io:
+    if monthly_rent and not is_io:
         dscr_val = dscr_calc(
-            float(loan.monthly_rent),
+            float(monthly_rent),
             amount,
             quote.final_rate,
             term,

@@ -24,6 +24,7 @@ from app.models.activity import Activity
 from app.models.ai_feedback import AIFeedback
 from app.models.ai_modify_correction import AIModifyCorrection
 from app.models.ai_task import AITask
+from app.models.document import Document
 from app.models.fred_observation import FredObservation
 from app.models.hud import HudLineItem
 from app.models.lender_spread import LenderSpread
@@ -104,6 +105,10 @@ async def assemble_loan_context(
                 "## AI Modify Corrections (operator notes on past turns — apply going forward)\n"
                 + corrections_block
             )
+
+    document_block = await _document_conditions_block(db, loan.id, audience=audience)
+    if document_block:
+        sections.append(f"## Document Conditions and Open File Items\n{document_block}")
 
     activity_block = await _recent_activity_block(db, loan.id)
     if activity_block:
@@ -350,6 +355,55 @@ async def _ai_modify_block(db: AsyncSession, loan_id: UUID, limit: int = 5) -> s
     if not rows:
         return ""
     return "\n".join(f"  - {r.correction}" for r in rows)
+
+
+async def _document_conditions_block(db: AsyncSession, loan_id: UUID, *, audience: Audience, limit: int = 14) -> str:
+    stmt = select(Document).where(Document.loan_id == loan_id)
+    if audience == "client":
+        stmt = stmt.where(Document.requested_from.in_(["borrower", "agent"]))
+    rows = (
+        await db.execute(
+            stmt.order_by(Document.status.asc(), Document.requested_on.asc().nulls_last(), Document.name.asc())
+        )
+    ).scalars().all()
+    if not rows:
+        return "  No document rows are currently attached to this loan."
+
+    counts: dict[str, int] = {}
+    for doc in rows:
+        status = _enum_str(doc.status)
+        counts[status] = counts.get(status, 0) + 1
+
+    parts = [
+        "  Status counts: "
+        + ", ".join(f"{status}={count}" for status, count in sorted(counts.items())),
+    ]
+
+    open_docs = [d for d in rows if _enum_str(d.status) not in {"verified", "skipped"}]
+    if open_docs:
+        parts.append("  Open items:")
+        for doc in open_docs[:limit]:
+            due = doc.due_date.isoformat() if doc.due_date else "no due date"
+            requested = doc.requested_on.isoformat() if doc.requested_on else "not requested"
+            owner = doc.requested_from or "borrower"
+            category = doc.category or doc.checklist_key or "uncategorized"
+            line = (
+                f"    - {doc.name} [{_enum_str(doc.status)}] "
+                f"owner={owner}; category={category}; requested={requested}; due={due}"
+            )
+            if doc.ai_notes:
+                line += f"; AI notes={doc.ai_notes[:180]}"
+            parts.append(line)
+        if len(open_docs) > limit:
+            parts.append(f"    - plus {len(open_docs) - limit} more open item(s)")
+    else:
+        parts.append("  Open items: none; all non-skipped document conditions are verified.")
+
+    flagged = [d for d in rows if _enum_str(d.status) == "flagged"]
+    if flagged:
+        parts.append("  Flagged items require operator review before underwriting package submission.")
+
+    return "\n".join(parts)
 
 
 async def _recent_activity_block(db: AsyncSession, loan_id: UUID, limit: int = 5) -> str:

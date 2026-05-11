@@ -52,13 +52,19 @@ async def list_documents(
     """List documents. Filters: by loan (scoped to the loan's client),
     or by client (returns all docs across that client's loans — used by
     the operator-side Vault tab on the client profile page)."""
-    stmt = select(Document)
+    stmt = select(Document).join(Loan, Loan.id == Document.loan_id)
     if loan_id is not None:
         stmt = stmt.where(Document.loan_id == loan_id)
     if client_id is not None:
-        # Join on Loan.client_id so a single query covers all of the
-        # client's loans without round-tripping the loan list first.
-        stmt = stmt.join(Loan, Loan.id == Document.loan_id).where(Loan.client_id == client_id)
+        # Filter across all of a client's loans without round-tripping the
+        # loan list first.
+        stmt = stmt.where(Loan.client_id == client_id)
+    if user.role == Role.CLIENT and user.client:
+        stmt = stmt.where(Loan.client_id == user.client.id)
+    elif user.role == Role.BROKER and user.broker:
+        stmt = stmt.where(Loan.broker_id == user.broker.id)
+    elif user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
     rows = (await db.execute(stmt)).scalars().all()
     return [DocumentRead.model_validate(r) for r in rows]
 

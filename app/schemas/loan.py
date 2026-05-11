@@ -163,6 +163,8 @@ class RecalcRequest(BaseModel):
     annual_taxes: float | None = None
     annual_insurance: float | None = None
     monthly_hoa: float | None = None
+    term_months: int | None = None
+    monthly_rent: float | None = None
     ltv: float | None = None  # 0..1; recomputes amount = ltv * appraised value when given
     # Sizing overrides — applied through services/math/sizing.compute_loan_amount.
     purpose: LoanPurpose | None = None
