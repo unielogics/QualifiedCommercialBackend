@@ -29,6 +29,9 @@ dependencies = [
     # In-process scheduler for recurring AI / calendar / digest work.
     # See app/services/scheduler.py — single-instance assumption only.
     "apscheduler>=3.10.0",
+    # PDF text extraction for agent knowledge documents (the Knowledge &
+    # Voice section of /agent-settings/ai). See services/ai/knowledge.py.
+    "pypdf>=5.0.0",
 ]
 
 [project.optional-dependencies]
