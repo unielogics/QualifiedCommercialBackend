@@ -19,6 +19,7 @@ from app.routers import (
     calendar,
     clients,
     credit,
+    deal_secretary,
     devices,
     documents,
     email_drafts,
@@ -126,5 +127,6 @@ for r in [
     devices.router,
     me.router,
     agents.router,
+    deal_secretary.router,
 ]:
     app.include_router(r, prefix=api_prefix)
