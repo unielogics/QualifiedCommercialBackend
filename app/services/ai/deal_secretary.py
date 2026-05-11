@@ -184,9 +184,28 @@ async def bootstrap_requirement_status_rows(
 
     # Ensure a ClientAIPlan row exists so the file-level
     # ai_secretary_settings JSONB (outreach_mode kill switch) is
-    # available from the first request. The JSONB column has a
-    # server default of {"outreach_mode": "draft_first"} — we
-    # rely on that here rather than rebuilding the full snapshot.
+    # available from the first request. The starting outreach_mode
+    # follows precedence: AGENT.sending_control → FIRM.outreach_defaults
+    # .approval_mode → "draft_first" (safest). Agent setting wins when
+    # both are configured.
+    from app.services.ai.agent_settings import (
+        load_agent_cadence_rules,
+        load_agent_user_id_for_loan,
+        load_firm_communication_rules,
+        sending_control_to_outreach_mode,
+    )
+    agent_user_id = await load_agent_user_id_for_loan(db, loan)
+    agent_rules = await load_agent_cadence_rules(db, agent_user_id)
+    agent_sending = agent_rules.get("sending_control") if isinstance(agent_rules, dict) else None
+
+    firm_sending = None
+    if not agent_sending:
+        firm_rules = await load_firm_communication_rules(db)
+        firm_defaults = firm_rules.get("outreach_defaults") if isinstance(firm_rules, dict) else None
+        if isinstance(firm_defaults, dict):
+            firm_sending = firm_defaults.get("approval_mode")
+    outreach_mode = sending_control_to_outreach_mode(agent_sending or firm_sending)
+
     plan_created = False
     existing_plan = (
         await db.execute(
@@ -212,10 +231,7 @@ async def bootstrap_requirement_status_rows(
                 next_best_question=None,
                 next_best_action=None,
                 readiness_score=None,
-                # ai_secretary_settings: JSONB column defaults to
-                # {"outreach_mode": "draft_first"} via the model's
-                # default callable; explicit set keeps it readable.
-                ai_secretary_settings={"outreach_mode": "portal_auto"},
+                ai_secretary_settings={"outreach_mode": outreach_mode},
             )
         )
         plan_created = True

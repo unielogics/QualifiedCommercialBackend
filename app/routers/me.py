@@ -190,10 +190,11 @@ async def headshot_upload_init(
 # ── Agent AI Playbook overlay (Phase 2) ────────────────────────────
 
 
+import uuid  # noqa: E402
 from typing import Any  # noqa: E402
 from uuid import UUID  # noqa: E402
 
-from datetime import datetime  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
 
 
 # Closed enums mirrored from app/enums.py for the agent overlay. The
@@ -723,4 +724,194 @@ async def delete_agent_cadence_rule(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not yours")
     await db.delete(row)
     await db.flush()
+    return {"ok": True}
+
+
+# ── Agent AI Knowledge (PDF / FAQ upload) ──────────────────────────
+#
+# Backs the Knowledge & Voice section of /agent-settings/ai. Two-step
+# upload mirrors documents.upload-init / upload-complete: backend mints
+# a presigned PUT URL, browser PUTs the bytes, then notifies the
+# backend which parses and flips status to 'ready'.
+#
+# Parse is synchronous in v1 — fine for small files (the page caps
+# the user at PDFs and pasted FAQ). When upload volume grows, defer
+# to the scheduler the same way the document scanner does.
+
+
+class _KnowledgeUploadInitRequest(BaseModel):
+    filename: str
+    content_type: Literal["application/pdf", "text/plain", "text/markdown"] = "application/pdf"
+    size_bytes: int = 0
+
+
+class _KnowledgeDocumentOut(BaseModel):
+    id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    status: str
+    error: str | None
+    created_at: datetime | None
+
+
+class _KnowledgeUploadInitResponse(BaseModel):
+    document: _KnowledgeDocumentOut
+    upload_url: str | None  # None in local dev when S3 creds are absent
+    s3_key: str
+
+
+class _KnowledgeUploadCompleteRequest(BaseModel):
+    document_id: UUID
+
+
+def _knowledge_s3_key(user_id: UUID, doc_id: UUID, filename: str) -> str:
+    """Namespaced per-agent so list/get can be scoped by prefix in S3
+    audits, and a rogue read on another agent's bucket prefix surfaces
+    as a 403 immediately."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)[:120]
+    return f"agent-knowledge/{user_id}/{doc_id}/{safe}"
+
+
+@router.post("/ai-knowledge/upload-init", response_model=_KnowledgeUploadInitResponse)
+async def ai_knowledge_upload_init(
+    payload: _KnowledgeUploadInitRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> _KnowledgeUploadInitResponse:
+    """Mint a presigned PUT URL + create a row in status='uploading'."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+
+    from app.models.ai_knowledge_document import AIKnowledgeDocument
+
+    doc_id = uuid.uuid4()
+    s3_key = _knowledge_s3_key(user.id, doc_id, payload.filename)
+    doc = AIKnowledgeDocument(
+        id=doc_id,
+        agent_user_id=user.id,
+        filename=payload.filename[:255] or "untitled",
+        content_type=payload.content_type,
+        size_bytes=max(0, int(payload.size_bytes or 0)),
+        s3_key=s3_key,
+        status="uploading",
+    )
+    db.add(doc)
+    await db.flush()
+
+    cfg = get_app_config()
+    upload_url: str | None = None
+    if cfg.s3_bucket and cfg.aws_access_key_id and cfg.aws_secret_access_key:
+        import boto3
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=cfg.aws_access_key_id,
+            aws_secret_access_key=cfg.aws_secret_access_key,
+            region_name=cfg.aws_region,
+        )
+        try:
+            upload_url = s3.generate_presigned_url(
+                "put_object",
+                Params={
+                    "Bucket": cfg.s3_bucket,
+                    "Key": s3_key,
+                    "ContentType": payload.content_type,
+                    "ServerSideEncryption": "AES256",
+                },
+                ExpiresIn=900,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"Could not mint knowledge upload URL: {exc}",
+            ) from exc
+
+    return _KnowledgeUploadInitResponse(
+        document=_KnowledgeDocumentOut(
+            id=doc.id, filename=doc.filename, content_type=doc.content_type,
+            size_bytes=doc.size_bytes, status=doc.status, error=doc.error,
+            created_at=doc.created_at,
+        ),
+        upload_url=upload_url,
+        s3_key=s3_key,
+    )
+
+
+@router.post("/ai-knowledge/upload-complete", response_model=_KnowledgeDocumentOut)
+async def ai_knowledge_upload_complete(
+    payload: _KnowledgeUploadCompleteRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> _KnowledgeDocumentOut:
+    """Called after the S3 PUT lands. Parses inline + flips status.
+    Idempotent — re-calling on a ready row is a no-op; on a failed row
+    it retries the parse."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+
+    from app.models.ai_knowledge_document import AIKnowledgeDocument
+    from app.services.ai.knowledge import parse_document_inline
+
+    doc = await db.get(AIKnowledgeDocument, payload.document_id)
+    if doc is None or doc.agent_user_id != user.id or doc.deleted_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    if doc.status != "ready":
+        await parse_document_inline(db, doc)
+
+    return _KnowledgeDocumentOut(
+        id=doc.id, filename=doc.filename, content_type=doc.content_type,
+        size_bytes=doc.size_bytes, status=doc.status, error=doc.error,
+        created_at=doc.created_at,
+    )
+
+
+@router.get("/ai-knowledge", response_model=list[_KnowledgeDocumentOut])
+async def list_ai_knowledge(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[_KnowledgeDocumentOut]:
+    """List the agent's non-deleted knowledge documents, newest first."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+    from app.models.ai_knowledge_document import AIKnowledgeDocument
+    rows = (
+        await db.execute(
+            select(AIKnowledgeDocument)
+            .where(
+                AIKnowledgeDocument.agent_user_id == user.id,
+                AIKnowledgeDocument.deleted_at.is_(None),
+            )
+            .order_by(AIKnowledgeDocument.created_at.desc())
+        )
+    ).scalars().all()
+    return [
+        _KnowledgeDocumentOut(
+            id=r.id, filename=r.filename, content_type=r.content_type,
+            size_bytes=r.size_bytes, status=r.status, error=r.error,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@router.delete("/ai-knowledge/{doc_id}")
+async def delete_ai_knowledge(
+    doc_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-delete the row + hard-delete the S3 object."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+
+    from app.models.ai_knowledge_document import AIKnowledgeDocument
+    from app.services.ai.knowledge import _delete_s3_object
+
+    doc = await db.get(AIKnowledgeDocument, doc_id)
+    if doc is None or doc.agent_user_id != user.id or doc.deleted_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    doc.deleted_at = datetime.now(timezone.utc)
+    await db.flush()
+    _delete_s3_object(doc.s3_key)
     return {"ok": True}

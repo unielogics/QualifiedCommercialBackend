@@ -72,6 +72,18 @@ async def assemble_loan_context(
         return ""
 
     sections: list[str] = []
+
+    # Agent knowledge first — the FAQ / PDF context the broker uploaded
+    # in /agent-settings/ai. Comes BEFORE loan facts so the AI reads
+    # the agent's voice/product guidance before reasoning about a deal.
+    from app.services.ai.agent_settings import load_agent_user_id_for_loan
+    from app.services.ai.knowledge import load_agent_knowledge
+    agent_user_id = await load_agent_user_id_for_loan(db, loan)
+    if agent_user_id is not None:
+        kb = await load_agent_knowledge(db, agent_user_id)
+        if kb:
+            sections.append(f"## Agent Knowledge (uploaded by the broker)\n{kb}")
+
     sections.append(f"## Active Loan\n{_loan_header(loan)}")
 
     instructions = await _active_instructions(db, loan.id)

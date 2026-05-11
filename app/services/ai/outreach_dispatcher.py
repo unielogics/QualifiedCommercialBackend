@@ -36,9 +36,35 @@ from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
 from app.models.client_requirement_status import ClientRequirementStatus
 from app.models.loan import Loan
+from app.services.ai.agent_settings import working_hours_for_client
+from app.services.ai.working_hours import evaluate as evaluate_working_hours
 from app.services.ai_messaging import post_ai_message
 
 log = logging.getLogger(__name__)
+
+
+async def _check_working_hours(
+    db: AsyncSession,
+    assignment: AITaskAssignment,
+    *,
+    channel: str,
+    is_client_initiated: bool,
+) -> tuple[bool, str]:
+    """Resolve the agent's working-hours policy via the assignment's CRS
+    → client → broker chain and evaluate. Returns (allow, reason).
+
+    The lookup is best-effort: if we can't find the agent (e.g. self-
+    serve loan with no broker), we ALLOW — working-hours is an agent-
+    facing convenience, not a security gate, so missing config should
+    not block borrower communication."""
+    crs = await db.get(ClientRequirementStatus, assignment.client_requirement_status_id)
+    if crs is None:
+        return True, ""
+    rules = await working_hours_for_client(db, crs.client_id)
+    decision = evaluate_working_hours(
+        rules, channel=channel, is_client_initiated=is_client_initiated,
+    )
+    return decision.allow, decision.reason
 
 
 async def dispatch_portal(
@@ -47,12 +73,29 @@ async def dispatch_portal(
     assignment: AITaskAssignment,
     message_body: str,
     template_key: str | None = None,
+    is_client_initiated: bool = False,
 ) -> AIOutreachEvent:
     """Post a borrower-facing portal message + log the dispatch.
 
     Reuses ai_messaging.post_ai_message() — the canonical
     find-or-create AIChatThread + append AIChatMessage path.
-    Auto-increments assignment.attempts_made on success."""
+    Auto-increments assignment.attempts_made on success.
+
+    `is_client_initiated=True` when the dispatch is in response to a
+    borrower message (the cadence engine sets False for cron-fired
+    nudges). The agent-level after-hours rule reads this — see
+    services/ai/working_hours.py."""
+    allow, reason = await _check_working_hours(
+        db, assignment, channel=OutreachChannel.PORTAL.value,
+        is_client_initiated=is_client_initiated,
+    )
+    if not allow:
+        return await _record_blocked(
+            db, assignment, OutreachChannel.PORTAL.value,
+            OutreachEventStatus.BLOCKED_BY_WORKING_HOURS,
+            reason, message_body, template_key,
+        )
+
     # Visibility guard: if assignment instructions are 'internal'
     # they must not appear in the rendered body. Caller is expected
     # to have respected this — we re-assert here as defense-in-depth.
@@ -129,10 +172,15 @@ async def dispatch(
     channel: str,
     message_body: str,
     template_key: str | None = None,
+    is_client_initiated: bool = False,
 ) -> AIOutreachEvent:
     """Multiplexer. Phase 4 ships portal only; email + SMS land in
     Phase 5 with the dispatcher stubs that record `blocked_by_consent`
-    or `blocked_by_policy` until provider integrations land."""
+    or `blocked_by_policy` until provider integrations land.
+
+    `is_client_initiated` propagates to the per-channel functions for
+    the working-hours gate — cron-fired cadence passes False, an
+    inbound-message reply path passes True."""
     channels = list(assignment.channels or [])
     if channel not in channels:
         return await _record_blocked(
@@ -145,19 +193,19 @@ async def dispatch(
     if channel == OutreachChannel.PORTAL.value:
         return await dispatch_portal(
             db, assignment=assignment, message_body=message_body,
-            template_key=template_key,
+            template_key=template_key, is_client_initiated=is_client_initiated,
         )
 
     if channel == OutreachChannel.EMAIL.value:
         return await dispatch_email(
             db, assignment=assignment, message_body=message_body,
-            template_key=template_key,
+            template_key=template_key, is_client_initiated=is_client_initiated,
         )
 
     if channel == OutreachChannel.SMS.value:
         return await dispatch_sms(
             db, assignment=assignment, message_body=message_body,
-            template_key=template_key,
+            template_key=template_key, is_client_initiated=is_client_initiated,
         )
 
     # Voice — permanently disabled in v1.
@@ -175,14 +223,28 @@ async def dispatch_email(
     assignment: AITaskAssignment,
     message_body: str,
     template_key: str | None = None,
+    is_client_initiated: bool = False,
 ) -> AIOutreachEvent:
     """Phase 5 — wires to the existing EmailDraft + Gmail send path.
 
     Pre-checks:
+      • Agent's working hours allow this channel right now (off-hours
+        + non-portal-replies-only rule → blocked).
       • consent_state.email.opted_out_at must be unset (CAN-SPAM
         opt-out honored).
       • Borrower has an email on the Client row.
     """
+    allow, reason = await _check_working_hours(
+        db, assignment, channel=OutreachChannel.EMAIL.value,
+        is_client_initiated=is_client_initiated,
+    )
+    if not allow:
+        return await _record_blocked(
+            db, assignment, OutreachChannel.EMAIL.value,
+            OutreachEventStatus.BLOCKED_BY_WORKING_HOURS,
+            reason, message_body, template_key,
+        )
+
     consent = (assignment.consent_state or {}).get("email") or {}
     opted_out_at = consent.get("opted_out_at")
 
@@ -266,15 +328,29 @@ async def dispatch_sms(
     assignment: AITaskAssignment,
     message_body: str,
     template_key: str | None = None,
+    is_client_initiated: bool = False,
 ) -> AIOutreachEvent:
     """Phase 5 — TCPA-gated SMS. Provider call is a stub until we
     pick a vendor; the event row + consent checks still fire.
 
     Required for SEND:
+      • Agent's working hours allow SMS right now (portal_replies_only
+        rule blocks SMS off-hours even when client initiated).
       • consent_state.sms.state == 'granted'
-      • Now is within configured quiet_hours window (default 8am-8pm
-        borrower-local; we use UTC here as a v1 simplification).
+      • Now is within per-task quiet_hours window if configured —
+        kept as a finer-grained override on top of agent hours.
     """
+    allow, reason = await _check_working_hours(
+        db, assignment, channel=OutreachChannel.SMS.value,
+        is_client_initiated=is_client_initiated,
+    )
+    if not allow:
+        return await _record_blocked(
+            db, assignment, OutreachChannel.SMS.value,
+            OutreachEventStatus.BLOCKED_BY_WORKING_HOURS,
+            reason, message_body, template_key,
+        )
+
     consent = (assignment.consent_state or {}).get("sms") or {}
     if consent.get("state") != "granted":
         return await _record_blocked(
@@ -284,7 +360,7 @@ async def dispatch_sms(
             message_body, template_key,
         )
 
-    # Quiet hours check.
+    # Quiet hours check (per-task override, finer than agent hours).
     cadence = assignment.cadence or {}
     qhs = cadence.get("quiet_hours_start")
     qhe = cadence.get("quiet_hours_end")

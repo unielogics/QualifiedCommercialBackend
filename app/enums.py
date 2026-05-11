@@ -390,6 +390,7 @@ class OutreachEventStatus(StrEnum):
     FAILED = "failed"
     BLOCKED_BY_CONSENT = "blocked_by_consent"
     BLOCKED_BY_QUIET_HOURS = "blocked_by_quiet_hours"
+    BLOCKED_BY_WORKING_HOURS = "blocked_by_working_hours"
     BLOCKED_BY_POLICY = "blocked_by_policy"
     CANCELLED = "cancelled"
 
