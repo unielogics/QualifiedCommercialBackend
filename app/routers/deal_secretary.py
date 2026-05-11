@@ -847,6 +847,202 @@ async def update_file_settings(
 # ── POST /bootstrap (repair) ───────────────────────────────────────
 
 
+# ── Phase B: AI inference of task dependencies + grouping ──────────
+#
+# Asks Claude to read every requirement's label + objective +
+# completion_criteria for a playbook and suggest:
+#   - which other tasks it depends on (must finish first)
+#   - which other task it groups under as a sub-task
+#
+# Writes the result onto each AICollectionRequirement's
+# inferred_depends_on + parent_key columns + sets deps_confirmed=false
+# so the Settings UI shows a "Suggested" review affordance.
+
+
+class InferenceRequest(BaseModel):
+    """Run AI inference on a specific playbook (loan-product or
+    buyer/seller transaction). Returns a per-key proposal that the
+    user reviews + confirms in Settings."""
+    playbook_id: UUID
+
+
+class InferredRow(BaseModel):
+    requirement_key: str
+    suggested_depends_on: list[str] = []
+    suggested_parent_key: str | None = None
+    rationale: str | None = None
+
+
+class InferenceResponse(BaseModel):
+    playbook_id: UUID
+    inferred: list[InferredRow]
+    applied_to_db: bool
+
+
+@router.post(
+    "/lending-admin/playbooks/{playbook_id}/infer-deps",
+    response_model=InferenceResponse,
+)
+async def infer_playbook_dependencies(
+    playbook_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> InferenceResponse:
+    """Operator-only. Runs a Claude pass over every requirement on
+    the playbook + writes suggestions back to inferred_depends_on +
+    parent_key columns. Sets deps_confirmed=false on rows that got a
+    suggestion so the Settings UI shows the review affordance."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+
+    pb = await db.get(AIPlaybookTemplate, playbook_id)
+    if pb is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Playbook not found")
+
+    reqs = (
+        await db.execute(
+            select(AICollectionRequirement)
+            .where(AICollectionRequirement.playbook_id == playbook_id)
+            .order_by(AICollectionRequirement.display_order)
+        )
+    ).scalars().all()
+    if not reqs:
+        return InferenceResponse(playbook_id=playbook_id, inferred=[], applied_to_db=False)
+
+    # Build the prompt context — keys + labels + objectives + completions.
+    items_block = "\n".join(
+        f"- key: {r.requirement_key}\n"
+        f"  label: {r.label}\n"
+        f"  category: {r.category}\n"
+        f"  required_level: {r.required_level}\n"
+        f"  objective: {(r.objective_text or '').strip() or '(no objective)'}\n"
+        f"  done_when: {(r.completion_criteria or '').strip() or '(no completion criteria)'}"
+        for r in reqs
+    )
+    system_prompt = (
+        "You are organizing a real-estate / lending task playbook into a "
+        "dependency-aware timeline. For each task, decide:\n"
+        "1) which OTHER task keys must finish before this one is ready "
+        "(its depends_on);\n"
+        "2) whether this task is a sub-task of another (its parent_key) — "
+        "use sparingly, only when there's a clear semantic parent/child.\n\n"
+        "Rules:\n"
+        "- Only reference keys from the list given. Never invent keys.\n"
+        "- A task is its own dependency = never. Skip self-references.\n"
+        "- Independent tasks have depends_on = [] and parent_key = null.\n"
+        "- Be conservative — only suggest dependencies that genuinely "
+        "must happen first. Don't chain things that can happen in parallel.\n"
+        "- Keep parent_key shallow (single level). No grandparents.\n\n"
+        "Output JSON: a list of {requirement_key, suggested_depends_on, "
+        "suggested_parent_key, rationale}. Include EVERY task even when "
+        "the suggestion is empty."
+    )
+    user_prompt = f"Playbook: {pb.name} ({pb.playbook_type}, product_key={pb.product_key})\n\nTasks:\n{items_block}"
+
+    from app.services.ai.anthropic_client import get_client, model_light
+    client = get_client()
+    try:
+        resp = await client.messages.create(
+            model=model_light(),
+            max_tokens=4000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("infer_deps Claude call failed: %s", e)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"AI inference failed: {e}")
+
+    # Extract JSON from the response.
+    import json, re
+    raw = "".join(getattr(block, "text", "") for block in resp.content if hasattr(block, "text"))
+    match = re.search(r"\[[\s\S]*\]", raw)
+    if not match:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "AI response was not JSON")
+    try:
+        proposals = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"AI returned malformed JSON: {e}")
+
+    valid_keys = {r.requirement_key for r in reqs}
+    by_key = {r.requirement_key: r for r in reqs}
+    rows: list[InferredRow] = []
+    for item in proposals:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("requirement_key")
+        if key not in valid_keys:
+            continue
+        deps_raw = item.get("suggested_depends_on") or []
+        # Sanitize: must be a list of strings, no self-reference, only valid keys.
+        deps = [d for d in deps_raw if isinstance(d, str) and d != key and d in valid_keys]
+        parent = item.get("suggested_parent_key")
+        if not isinstance(parent, str) or parent == key or parent not in valid_keys:
+            parent = None
+        rationale = item.get("rationale") if isinstance(item.get("rationale"), str) else None
+
+        # Write to DB: inferred_depends_on + parent_key, mark deps_confirmed=false.
+        target = by_key[key]
+        target.inferred_depends_on = deps
+        if parent and not target.parent_key:
+            target.parent_key = parent
+        # Only mark unconfirmed if there's actually a suggestion to review.
+        if deps or parent:
+            target.deps_confirmed = False
+        rows.append(InferredRow(
+            requirement_key=key,
+            suggested_depends_on=deps,
+            suggested_parent_key=parent,
+            rationale=rationale,
+        ))
+    await db.flush()
+    log.info(
+        "infer_deps playbook=%s pb_type=%s rows=%d suggested=%d",
+        playbook_id, pb.playbook_type, len(rows),
+        sum(1 for r in rows if r.suggested_depends_on or r.suggested_parent_key),
+    )
+    return InferenceResponse(playbook_id=playbook_id, inferred=rows, applied_to_db=True)
+
+
+class ConfirmInferenceRequest(BaseModel):
+    """Operator's accept of a single requirement's suggestions.
+    Moves inferred_depends_on into depends_on (replacing any
+    existing manual deps), and clears deps_confirmed."""
+    requirement_key: str
+    accept_depends_on: bool = True
+    accept_parent_key: bool = True
+
+
+@router.post(
+    "/lending-admin/playbooks/{playbook_id}/confirm-inferred",
+    response_model=AnyOk,
+)
+async def confirm_inferred(
+    playbook_id: UUID,
+    payload: ConfirmInferenceRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AnyOk:
+    """Operator clicks Accept on a row's suggested deps / parent."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
+    req = (
+        await db.execute(
+            select(AICollectionRequirement).where(
+                AICollectionRequirement.playbook_id == playbook_id,
+                AICollectionRequirement.requirement_key == payload.requirement_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Requirement not found")
+    if payload.accept_depends_on and req.inferred_depends_on:
+        req.depends_on = list(req.inferred_depends_on)
+    req.inferred_depends_on = []
+    req.deps_confirmed = True
+    await db.flush()
+    return AnyOk()
+
+
 # ── AI clarifying questions — operator-facing chat thread ──────────
 
 
