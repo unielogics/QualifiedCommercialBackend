@@ -68,6 +68,17 @@ class Loan(TimestampMixin, Base):
     annual_taxes: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     annual_insurance: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     monthly_hoa: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
+    # Listing-style fields (alembic 0043) — power the property tab's
+    # listing-page render + the Geoapify map.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lot_size_sqft: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    zoning: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    parcel_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    listing_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    highlight_features: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    street_view_url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Numeric(9, 6), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Numeric(9, 6), nullable=True)
 
     # Loan
     type: Mapped[LoanType] = mapped_column(String(32), nullable=False)

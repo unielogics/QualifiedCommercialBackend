@@ -30,7 +30,7 @@ from app.schemas.document import (
     WorkflowDocRead,
     WorkflowRunResult,
 )
-from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
+from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
 from app.services.activity_log import mark_loan_dirty
@@ -515,6 +515,42 @@ async def update_loan(
     if "close_date" in changes and loan.stage == LoanStage.CLOSING:
         await calendar_emitter.emit_for_loan_close(db, loan)
     # Phase 6 — flag dirty so the next drain picks up the change.
+    await mark_loan_dirty(db, loan.id)
+    await db.flush()
+    await db.refresh(loan)
+    return LoanRead.model_validate(loan)
+
+
+@router.patch("/{loan_id}/property", response_model=LoanRead)
+async def update_property(
+    loan_id: UUID,
+    payload: PropertyUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LoanRead:
+    """Property/listing-style patch endpoint. Open to brokers as well
+    as the funding team so agents can fill the listing-page surface
+    on the Property tab. Scope is enforced by `_scope_query`, which
+    only returns loans the broker owns."""
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Property edits require an operator role")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    changes = payload.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(loan, k, v)
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="loan.property_updated",
+            summary=f"Property updated: {', '.join(changes.keys())}",
+            payload=changes,
+        )
+    )
     await mark_loan_dirty(db, loan.id)
     await db.flush()
     await db.refresh(loan)

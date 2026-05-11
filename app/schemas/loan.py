@@ -100,6 +100,16 @@ class LoanUpdate(BaseModel):
     baths: float | None = None
     year_built: int | None = None
     unit_count: int | None = None
+    # Listing-style fields (alembic 0043).
+    description: str | None = None
+    lot_size_sqft: int | None = None
+    zoning: str | None = None
+    parcel_id: str | None = None
+    listing_status: str | None = None
+    highlight_features: list[str] | None = None
+    street_view_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class LoanRead(ORMModel):
@@ -143,10 +153,48 @@ class LoanRead(ORMModel):
     baths: float | None = None
     year_built: int | None = None
     unit_count: int | None = None
+    # Listing-style fields (alembic 0043).
+    description: str | None = None
+    lot_size_sqft: int | None = None
+    zoning: str | None = None
+    parcel_id: str | None = None
+    listing_status: str | None = None
+    highlight_features: list[str] | None = None
+    street_view_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
     # Living Loan File
     status_summary: str | None = None
     deal_health: DealHealth = DealHealth.ON_TRACK
     living_profile: LivingLoanProfile | None = None
+
+
+class PropertyUpdate(BaseModel):
+    """Broker-accessible patch for property/listing fields only. The
+    full LoanUpdate endpoint stays internal-funding-only; this carves
+    out the listing-style surface so agents can fill it from the
+    PropertyTab without escalating their permissions."""
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    property_type: PropertyType | None = None
+    sqft: int | None = None
+    beds: int | None = None
+    baths: float | None = None
+    year_built: int | None = None
+    unit_count: int | None = None
+    annual_taxes: float | None = None
+    annual_insurance: float | None = None
+    monthly_hoa: float | None = None
+    description: str | None = None
+    lot_size_sqft: int | None = None
+    zoning: str | None = None
+    parcel_id: str | None = None
+    listing_status: str | None = None
+    highlight_features: list[str] | None = None
+    street_view_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class StageTransition(BaseModel):
