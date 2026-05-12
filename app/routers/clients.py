@@ -560,6 +560,10 @@ async def update_client(
         # Same hard-stamp rule as create — a broker can't reassign
         # their own clients to another broker via PATCH.
         sent.discard("broker_id")
+    # Capture the prior broker_id BEFORE applying patches so the
+    # auto-flip rule below can decide whether this is a NULL→set
+    # transition that should also bump experience_mode.
+    prev_broker_id = client.broker_id
     for k, v in payload.model_dump(exclude_unset=True).items():
         if k == "broker_id" and user.role == Role.BROKER:
             continue
@@ -570,6 +574,25 @@ async def update_client(
         and client.contacted_at is None
     ):
         client.contacted_at = _dt.now(_tz.utc)
+    # Mobile-mode auto-flip — when a super_admin / loan_exec assigns a
+    # broker to a previously-unassigned client AND the client has no
+    # explicit experience mode set, default to "guided" with the same
+    # stamps the intake / adoption paths use. This stops the agent-
+    # assignment from leaving mobile stuck on self_directed (the bug
+    # franco@unielogics.com hit). The operator can still override via
+    # the explicit toggle on /clients/[id] afterwards.
+    if (
+        "broker_id" in sent
+        and client.broker_id is not None
+        and prev_broker_id is None
+        and client.client_experience_mode is None
+        and user.role != Role.BROKER
+    ):
+        client.client_experience_mode = "guided"
+        if client.client_experience_mode_reason is None:
+            client.client_experience_mode_reason = "agent_invited"
+        if client.client_experience_mode_locked_by is None:
+            client.client_experience_mode_locked_by = "agent"
     await db.flush()
     await db.refresh(client)
     return ClientRead.model_validate(client)
