@@ -508,6 +508,22 @@ async def attach_correction(
     db.add(correction)
     await db.flush()
     await db.refresh(correction)
+
+    from app.services.activity_log import log_change
+    await log_change(
+        db,
+        kind="ai_modify.correction_added",
+        summary=f"AI Modify correction attached · {body.correction[:120]}",
+        loan_id=loan_id,
+        actor=user,
+        payload={
+            "correction_id": str(correction.id),
+            "target_message_id": str(message_id),
+            "correction": body.correction,
+        },
+    )
+    await db.flush()
+
     return CorrectionRead.model_validate(correction)
 
 
@@ -610,6 +626,27 @@ async def save_scenario(
     db.add(scenario)
     await db.flush()
     await db.refresh(scenario)
+
+    from app.services.activity_log import log_change
+    await log_change(
+        db,
+        kind="loan.scenario_saved",
+        summary=(
+            f"Scenario saved · {body.name} · "
+            f"rate {snapshot['final_rate']}, P&I ${pi:,.0f}"
+        ),
+        loan_id=loan_id,
+        actor=user,
+        payload={
+            "scenario_id": str(scenario.id),
+            "name": body.name,
+            "loan_amount": float(amount),
+            "base_rate": float(base_rate),
+            "discount_points": float(body.discount_points or 0),
+            "snapshot": snapshot,
+        },
+    )
+
     return ScenarioRead.model_validate(scenario)
 
 
@@ -657,6 +694,13 @@ async def patch_hud_line(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "HUD line not found")
     if not line.editable:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This HUD line is not editable")
+
+    # Snapshot for the diff payload.
+    from app.services.activity_log import diff_changes, log_change
+    before = {
+        "label": line.label, "amount": line.amount, "category": line.category,
+        "payee": line.payee, "note": line.note,
+    }
     if body.label is not None:
         line.label = body.label
     if body.amount is not None:
@@ -667,6 +711,21 @@ async def patch_hud_line(
         line.payee = body.payee
     if body.note is not None:
         line.note = body.note
+    after = {
+        "label": line.label, "amount": line.amount, "category": line.category,
+        "payee": line.payee, "note": line.note,
+    }
+    changes = diff_changes(before, after, fields=("label", "amount", "category", "payee", "note"))
+    if changes:
+        await log_change(
+            db,
+            kind="hud.line_edited",
+            summary=f"HUD line edited · {line.label or '(no label)'}",
+            loan_id=loan_id,
+            actor=user,
+            payload={"line_id": str(line.id), "changes": changes},
+        )
+
     await db.flush()
     await db.refresh(line)
     return HudLineRead.model_validate(line)
@@ -720,6 +779,22 @@ async def create_hud_line(
     db.add(line)
     await db.flush()
     await db.refresh(line)
+
+    from app.services.activity_log import log_change
+    await log_change(
+        db,
+        kind="hud.line_added",
+        summary=f"HUD line added · {line.label or '(no label)'} ${float(line.amount or 0):,.2f}",
+        loan_id=loan_id,
+        actor=user,
+        payload={
+            "line_id": str(line.id),
+            "code": line.code,
+            "label": line.label,
+            "amount": float(line.amount or 0),
+            "category": line.category,
+        },
+    )
     return HudLineRead.model_validate(line)
 
 
@@ -744,6 +819,22 @@ async def delete_hud_line(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "HUD line not found")
     if not line.editable:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "This HUD line is locked")
+
+    from app.services.activity_log import log_change
+    await log_change(
+        db,
+        kind="hud.line_deleted",
+        summary=f"HUD line removed · {line.label or '(no label)'}",
+        loan_id=loan_id,
+        actor=user,
+        payload={
+            "line_id": str(line.id),
+            "code": line.code,
+            "label": line.label,
+            "amount": float(line.amount or 0),
+        },
+    )
+
     await db.delete(line)
     await db.flush()
 

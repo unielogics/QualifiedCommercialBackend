@@ -14,7 +14,7 @@ walls of whitespace into the system prompt.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -175,7 +175,7 @@ async def assemble_loan_context(
     if document_block:
         sections.append(f"## Document Conditions and Open File Items\n{document_block}")
 
-    activity_block = await _recent_activity_block(db, loan.id)
+    activity_block = await _recent_activity_block(db, loan.id, audience=audience)
     if activity_block:
         sections.append(f"## Recent Activity\n{activity_block}")
 
@@ -726,18 +726,72 @@ async def _document_conditions_block(db: AsyncSession, loan_id: UUID, *, audienc
     return "\n".join(parts)
 
 
-async def _recent_activity_block(db: AsyncSession, loan_id: UUID, limit: int = 5) -> str:
+async def _recent_activity_block(
+    db: AsyncSession,
+    loan_id: UUID,
+    *,
+    audience: Audience = "broker",
+) -> str:
+    """Recent file activity, rendered as a chronological digest the AI
+    can reference when asked "what changed?" / "what happened on this
+    file?".
+
+    Audience-aware:
+      - Internal audiences (broker / super_admin): 20 most recent rows,
+        all kinds. Diff payloads render inline ("base_rate 7.5 → 7.8")
+        so the AI can speak to specific edits.
+      - Client audience: 8 most recent rows, filtered to client-visible
+        kinds only. Pricing-only diffs are stripped from any
+        criteria_changed payloads that do reach the client.
+    """
+    from app.services.activity_log import (
+        filter_payload_for_audience,
+        is_visible_to,
+    )
+
+    over_fetch = 60 if audience != "client" else 24
     rows = (
         await db.execute(
             select(Activity)
             .where(Activity.loan_id == loan_id)
             .order_by(Activity.occurred_at.desc())
-            .limit(limit)
+            .limit(over_fetch)
         )
     ).scalars().all()
     if not rows:
         return ""
-    return "\n".join(f"  - [{a.kind}] {a.summary}" for a in rows)
+
+    limit = 20 if audience != "client" else 8
+    out: list[str] = []
+    for a in rows:
+        if not is_visible_to(a.kind, audience):
+            continue
+        ts = a.occurred_at.strftime("%Y-%m-%d %H:%M") if a.occurred_at else "?"
+        payload = filter_payload_for_audience(a.payload, kind=a.kind, audience=audience)
+        line = f"  - [{ts}] {a.kind} · {a.summary}"
+        changes = (payload or {}).get("changes") if isinstance(payload, dict) else None
+        if isinstance(changes, list) and changes:
+            # Inline the structured diff so the AI sees what actually
+            # changed, not just that something did. Cap at 5 per row.
+            for c in changes[:5]:
+                if not isinstance(c, dict):
+                    continue
+                line += f"\n      · {c.get('field')}: {_fmt_diff_value(c.get('before'))} → {_fmt_diff_value(c.get('after'))}"
+            if len(changes) > 5:
+                line += f"\n      · …and {len(changes) - 5} more"
+        out.append(line)
+        if len(out) >= limit:
+            break
+
+    return "\n".join(out) if out else ""
+
+
+def _fmt_diff_value(v: Any) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
 
 
 async def _upcoming_events_block(

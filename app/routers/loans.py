@@ -495,19 +495,23 @@ async def update_loan(
     loan = (await db.execute(scope)).scalar_one_or_none()
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    # Snapshot BEFORE the mutation so the diff helper can compute
+    # field-level changes for the activity payload.
+    from app.services.activity_log import log_loan_diff, loan_snapshot
+    before = loan_snapshot(loan)
+
     changes = payload.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(loan, k, v)
-    db.add(
-        Activity(
-            loan_id=loan.id,
-            actor_id=user.id,
-            actor_label=user.role,
-            kind="loan.updated",
-            summary=f"Updated {', '.join(changes.keys())}",
-            payload=changes,
-        )
-    )
+
+    # Diff-aware activity. Writes one row tagged either
+    # `loan.criteria_changed` (operator-visible) or `loan.pricing_changed`
+    # (internal-only) with structured before→after payload. Returns
+    # None when nothing in LOAN_DIFF_FIELDS actually changed (e.g. PATCH
+    # touched only `status_summary` or another non-diffed field).
+    await log_loan_diff(db, loan=loan, before=before, actor=user, source="operator_edit")
+
     # If close_date moved (and the loan is at CLOSING, or already
     # has a close milestone on the calendar), the upsert keeps it
     # in sync. Cheap to call even when close_date didn't change —

@@ -268,10 +268,34 @@ async def initiate_pull(
             if note_parts:
                 pull.notes = "; ".join(note_parts)
 
+            previous_fico = user.client.fico if user.client else None
             if user.client:
                 user.client.fico = effective_fico
             await db.flush()
             await db.refresh(pull)
+
+            # Log the credit pull as an Activity for the audit trail.
+            # Score and source go in payload; the verbatim bureau JSON
+            # stays only on `credit_pulls.bureau_response`.
+            from app.services.activity_log import log_change
+            await log_change(
+                db,
+                kind="credit.pulled",
+                summary=(
+                    f"Credit pulled · FICO {effective_fico}"
+                    + (f" (was {previous_fico})" if previous_fico is not None and previous_fico != effective_fico else "")
+                ),
+                client_id=pull.client_id,
+                actor=user,
+                payload={
+                    "pull_id": str(pull.id),
+                    "fico": effective_fico,
+                    "previous_fico": previous_fico,
+                    "fico_source": fico_source,
+                    "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
+                },
+            )
+
             # Emit the credit-expiry milestone so operators get a
             # calendar nudge before the soft pull stales (typically
             # 90 days; controlled by SOFT_PULL_VALIDITY_DAYS).
