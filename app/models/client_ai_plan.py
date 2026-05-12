@@ -48,6 +48,14 @@ class ClientAIPlan(TimestampMixin, Base):
         ForeignKey("loans.id", ondelete="CASCADE"),
         nullable=True,
     )
+    # alembic 0050 — deal-scoped plans. Exactly one of loan_id and
+    # deal_id may be set (CHECK constraint ck_cap_single_scope).
+    deal_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("deals.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),

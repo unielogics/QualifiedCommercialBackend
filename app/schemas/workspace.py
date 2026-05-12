@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app.schemas.client import ClientRead
 from app.schemas.common import ORMModel
+from app.schemas.deal import DealOut
 
 
 # ── Sub-shapes ────────────────────────────────────────────────────────
@@ -105,24 +106,8 @@ class FundingFileSummary(ORMModel):
     updated_at: datetime
 
 
-class DealSummary(BaseModel):
-    """Lightweight Deal row for the workspace aggregate. Populated in
-    Phase 3 once the Deal model lands; until then the workspace
-    endpoint returns an empty list."""
-
-    id: UUID
-    client_id: UUID
-    deal_type: Literal["buyer", "seller", "investor", "borrower"]
-    side: Literal["buyer", "seller"]
-    status: str
-    handoff_status: str
-    ai_status: str
-    title: str
-    promoted_loan_id: UUID | None = None
-    assigned_agent_id: UUID | None = None
-    property_id: UUID | None = None
-    created_at: datetime
-    updated_at: datetime
+# Workspace aggregate uses DealOut directly — no duplicate schema.
+DealSummary = DealOut
 
 
 class WorkspaceTabCounts(BaseModel):
@@ -141,7 +126,7 @@ class WorkspaceTabCounts(BaseModel):
 
 class WorkspaceOut(BaseModel):
     client: ClientRead
-    deals: list[DealSummary]
+    deals: list[DealOut]
     funding_files: list[FundingFileSummary]
     documents_summary: WorkspaceDocumentsSummary
     ai_summary: WorkspaceAISummary

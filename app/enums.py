@@ -440,3 +440,41 @@ class CompletionMode(StrEnum):
     AI_CAN_COMPLETE = "ai_can_complete"
     REQUIRES_HUMAN_VERIFY = "requires_human_verify"
     BORROWER_SELF_ATTEST = "borrower_self_attest"
+
+
+# ── Deal model (alembic 0047) ────────────────────────────────────────
+
+
+class DealType(StrEnum):
+    """The transaction path a Deal represents.
+
+    A client can carry multiple deals simultaneously (buyer search +
+    seller listing, buyer + investor purchase, etc.). Each Deal is
+    the agent-side transaction unit; once promoted via Ready-for-
+    Lending it spawns a Loan whose `source_deal_id` points back here."""
+    BUYER = "buyer"
+    SELLER = "seller"
+    INVESTOR = "investor"
+    BORROWER = "borrower"
+
+
+class DealStatus(StrEnum):
+    OPEN = "open"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    WON = "won"
+    LOST = "lost"
+    PROMOTED = "promoted"
+
+
+class DealHandoffStatus(StrEnum):
+    NONE = "none"
+    REQUESTED = "requested"
+    PACKET_BUILT = "packet_built"
+    PROMOTED = "promoted"
+
+
+class DealAIStatus(StrEnum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    PAUSED = "paused"

@@ -239,8 +239,10 @@ async def get_client_workspace(
 
     from app.models.activity import Activity
     from app.models.client_ai_plan import ClientAIPlan
+    from app.models.deal import Deal
     from app.models.loan import Loan
     from app.scoping import scope_client_query
+    from app.schemas.deal import DealOut
     from app.schemas.workspace import (
         FundingFileSummary,
         WorkspaceActivityRow,
@@ -463,8 +465,18 @@ async def get_client_workspace(
         recommended_tab=recommended_tab,
     )
 
+    # Deals — populated from the Deal table (Phase 3).
+    deal_rows = (
+        await db.execute(
+            select(Deal)
+            .where(Deal.client_id == client_id)
+            .order_by(Deal.created_at.desc())
+        )
+    ).scalars().all()
+    deals_out = [DealOut.model_validate(d) for d in deal_rows]
+
     tab_counts = WorkspaceTabCounts(
-        deals=0,  # Phase 3 wires this from the Deal table.
+        deals=len(deals_out),
         funding=len(funding_files),
         tasks=None,  # Phase 7 wires this from AgentTask.
         ai_follow_up=outstanding,
@@ -473,7 +485,7 @@ async def get_client_workspace(
 
     return WorkspaceOut(
         client=client_read,
-        deals=[],  # Phase 3 populates from Deal model.
+        deals=deals_out,
         funding_files=funding_files,
         documents_summary=documents_summary,
         ai_summary=ai_summary,

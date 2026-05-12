@@ -142,6 +142,35 @@ class Loan(TimestampMixin, Base):
     # Properties LLC". Distinct from client.name (natural person).
     entity_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     experience_tier: Mapped[ExperienceTier | None] = mapped_column(String(24), nullable=True)
+
+    # ── Funding-file fields (alembic 0048, Phase 4) ───────────────────
+    # Loan IS the FundingFile in this product. These four columns turn
+    # a freshly-promoted Loan into the durable handoff record. None of
+    # them are set on legacy rows; promote_deal_to_loan() stamps them
+    # at promotion time.
+    source_deal_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("deals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    """The Deal this loan was promoted from. NULL for legacy /
+    operator-created loans that didn't go through the agent flow."""
+
+    baseline_profile_snapshot: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+    )
+    """Frozen JSON snapshot of the deal-stage ClientAIPlan +
+    verified_facts + missing_lending_items + document_refs at promote
+    time. Audit-grade: never mutated after creation."""
+
+    handoff_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """AI-generated narrative captured at promote time. Distinct from
+    status_summary (which the live summarizer keeps rewriting)."""
+
+    funding_file_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    """bridge | dscr_purchase | dscr_refi | fix_flip | construction |
+    other. Derived initially from type+purpose; humans may edit."""
     # Type-specific fields. Only surfaced on the matching loan type.
     # F&F + Ground Up:
     construction_holdback_pct: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)

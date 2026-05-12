@@ -20,6 +20,7 @@ from app.routers import (
     clients,
     credit,
     deal_secretary,
+    deals,
     devices,
     documents,
     email_drafts,
@@ -104,6 +105,7 @@ for r in [
     loan_workspace.router,
     loan_workspace.public_router,  # /public/hud/{token} — no auth
     clients.router,
+    deals.router,
     brokers.router,
     documents.router,
     messages.router,

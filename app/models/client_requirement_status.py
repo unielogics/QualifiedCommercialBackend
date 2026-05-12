@@ -43,6 +43,14 @@ class ClientRequirementStatus(TimestampMixin, Base):
         ForeignKey("loans.id", ondelete="CASCADE"),
         nullable=True,
     )
+    # alembic 0049 — deal-scoped CRS rows. Exactly one of loan_id and
+    # deal_id may be set (CHECK constraint ck_crs_single_scope).
+    deal_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("deals.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
