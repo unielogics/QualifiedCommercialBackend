@@ -163,6 +163,55 @@ CONFIRM_DOCUMENT_ROUTING_TOOL = {
     },
 }
 
+PROPOSE_CALENDAR_EVENT_TOOL = {
+    "name": "propose_calendar_event",
+    "description": (
+        "Propose a calendar event for this loan when the conversation "
+        "establishes a scheduled need — a call, an inspection, a "
+        "document deadline, a closing milestone. The proposal is "
+        "queued as an AITask in the AI Inbox; a human approves it "
+        "before it appears on anyone's calendar. NEVER create an "
+        "event without explicit context: a date/time the user "
+        "mentioned, or a deadline the file structure requires. If "
+        "the user is vague ('soon', 'next week'), ASK for the exact "
+        "date instead of guessing."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["call", "doc", "inspect", "milestone", "lock", "closing"],
+                "description": "Event kind. Use 'call' for borrower calls, 'doc' for document deadlines, 'inspect' for property inspections, 'milestone' for loan-stage milestones, 'lock' for rate locks, 'closing' for funding day.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Short human-readable label, e.g. 'Borrower intake call' or 'Appraisal due'.",
+            },
+            "starts_at": {
+                "type": "string",
+                "description": "ISO-8601 datetime with timezone, e.g. '2026-05-15T14:00:00-04:00'. If only a date is known, use 09:00 local on that date.",
+            },
+            "duration_min": {
+                "type": "integer",
+                "minimum": 5,
+                "maximum": 480,
+                "description": "Length in minutes (calls and inspections only). Omit for deadline-style events.",
+            },
+            "who": {
+                "type": "string",
+                "description": "Who the event is for / with. Free text — borrower name, 'the lender', 'the appraiser'.",
+            },
+            "description": {
+                "type": "string",
+                "description": "1-3 sentences of context the human approver will see in the AI Inbox.",
+            },
+        },
+        "required": ["kind", "title", "starts_at"],
+    },
+}
+
+
 COMPLETE_PROPERTY_INTAKE_TOOL = {
     "name": "complete_property_intake",
     "description": (
@@ -362,6 +411,96 @@ async def _execute_confirm_document_routing_tool(
         "confirm": False,
     })
     return {"ok": True}
+
+
+async def _execute_propose_calendar_event_tool(
+    db: AsyncSession,
+    *,
+    user: User,
+    loan_id: UUID,
+    tool_input: dict,
+    accumulated_actions: list[dict],
+) -> dict:
+    """Queue a calendar-event proposal as an AITask in the AI Inbox.
+
+    Never creates the CalendarEvent directly — a human approves the
+    AITask via the existing /ai-tasks/{id}/decision flow, which is
+    where the materialization should live (a follow-up to wire that
+    handler is tracked in the audit log).
+
+    The AI sees these tasks in subsequent conversations because the
+    operator chat context already exposes pending AITasks, so it
+    won't propose the same event twice in a row.
+    """
+    from datetime import datetime as _dt
+    loan = await db.get(Loan, loan_id)
+    if loan is None:
+        return {"ok": False, "error": "loan_not_found"}
+    if user.role == Role.CLIENT:
+        # Client-initiated calendar requests should funnel through the
+        # broker for approval anyway — but for safety, don't let a
+        # borrower spawn AITasks unannotated.
+        return {"ok": False, "error": "not_authorized"}
+
+    kind = (tool_input.get("kind") or "").strip()
+    title = (tool_input.get("title") or "").strip()
+    starts_at_raw = (tool_input.get("starts_at") or "").strip()
+    if not kind or not title or not starts_at_raw:
+        return {"ok": False, "error": "kind, title, and starts_at are required"}
+    try:
+        starts_at = _dt.fromisoformat(starts_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return {"ok": False, "error": f"invalid starts_at: {starts_at_raw!r}"}
+
+    duration_min = tool_input.get("duration_min")
+    who = (tool_input.get("who") or "").strip() or None
+    description = (tool_input.get("description") or "").strip() or None
+
+    task = AITask(
+        loan_id=loan.id,
+        source=AITaskSource.CALENDAR,
+        priority=AITaskPriority.MEDIUM,
+        status=AITaskStatus.PENDING,
+        action="propose_calendar_event",
+        title=f"Calendar proposal · {title}",
+        summary=(
+            f"{kind.upper()} · {starts_at.isoformat()}"
+            + (f" ({duration_min} min)" if duration_min else "")
+            + (f" with {who}" if who else "")
+            + (f"\n{description}" if description else "")
+        ),
+        agent="loan_chat",
+        draft_payload={
+            "kind": kind,
+            "title": title,
+            "starts_at": starts_at.isoformat(),
+            "duration_min": duration_min,
+            "who": who,
+            "description": description,
+            "proposed_by_user_id": str(user.id),
+        },
+    )
+    db.add(task)
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label="ai",
+            kind="ai.calendar_event_proposed",
+            summary=f"AI proposed calendar event: {title} @ {starts_at.isoformat()}",
+            payload={"kind": kind, "starts_at": starts_at.isoformat()},
+        )
+    )
+    await db.flush()
+
+    # Surface a CTA so the operator can jump into the AI Inbox.
+    accumulated_actions.append({
+        "kind": "open_ai_inbox",
+        "label": "Review in AI Inbox",
+        "task_id": str(task.id),
+        "confirm": False,
+    })
+    return {"ok": True, "ai_task_id": str(task.id)}
 
 
 async def _execute_complete_property_intake_tool(
@@ -861,15 +1000,17 @@ async def chat(
     #      Intelligent Underwriter chat (mobile FAB / desktop topbar)
     #      hits, and was previously starved of context.
     context_block: str | None = None
+    audience_value: str = (
+        "client" if user.role == Role.CLIENT
+        else "broker" if user.role == Role.BROKER
+        else "super_admin"
+    )
     if payload.loan_id is not None:
         loan = await db.get(Loan, payload.loan_id)
         if loan is not None:
-            audience: Audience = (
-                "client" if user.role == Role.CLIENT
-                else "broker" if user.role == Role.BROKER
-                else "super_admin"
-            )
-            context_block = await assemble_loan_context(db, loan, audience=audience) or None
+            context_block = await assemble_loan_context(
+                db, loan, audience=audience_value,  # type: ignore[arg-type]
+            ) or None
     else:
         # Re-fetch user with client eagerly loaded so we can read
         # client.fico without lazy-loading inside the async session.
@@ -893,11 +1034,12 @@ async def chat(
     # operator persona for everyone else.
     system = _system_prompt_for(user, None)
     # Firm-wide AI identity + global rules go at the TOP so they
-    # override any per-client overrides further down.
+    # override any per-client overrides further down. Audience drives
+    # whether the immutable system rules block is rendered (client only).
     try:
         from app.services.ai.firm_identity import load_firm_identity, render_identity_prefix
         _identity = await load_firm_identity(db)
-        _prefix = render_identity_prefix(_identity)
+        _prefix = render_identity_prefix(_identity, audience=audience_value)
         if _prefix:
             system = _prefix + system
     except Exception:  # pragma: no cover — never break the chat
@@ -1497,15 +1639,17 @@ async def append_thread_message(
     # would be a frontend bug, not user intent).
     effective_loan_id = thread.loan_id or payload.loan_id
     context_block: str | None = None
+    thread_audience: str = (
+        "client" if user.role == Role.CLIENT
+        else "broker" if user.role == Role.BROKER
+        else "super_admin"
+    )
     if effective_loan_id is not None:
         loan = await db.get(Loan, effective_loan_id)
         if loan is not None:
-            audience: Audience = (
-                "client" if user.role == Role.CLIENT
-                else "broker" if user.role == Role.BROKER
-                else "super_admin"
-            )
-            context_block = await assemble_loan_context(db, loan, audience=audience) or None
+            context_block = await assemble_loan_context(
+                db, loan, audience=thread_audience,  # type: ignore[arg-type]
+            ) or None
     elif thread.client_id is not None:
         # Client-scoped thread. Two flavors:
         #   phase=lending → Lending AI gets the LendingHandoffPacket
@@ -1624,11 +1768,12 @@ async def append_thread_message(
         system = _system_prompt_for(user, thread)
         # Firm-wide AI identity + global rules at the TOP so they
         # override anything below — including per-client custom
-        # instructions.
+        # instructions. Audience drives the immutable system rules
+        # block (client only).
         try:
             from app.services.ai.firm_identity import load_firm_identity, render_identity_prefix
             _identity = await load_firm_identity(db)
-            _prefix = render_identity_prefix(_identity)
+            _prefix = render_identity_prefix(_identity, audience=thread_audience)
             if _prefix:
                 system = _prefix + system
         except Exception:  # pragma: no cover — never break the chat
@@ -1658,6 +1803,7 @@ async def append_thread_message(
                 REQUEST_DOCUMENT_UPLOAD_TOOL,
                 CONFIRM_DOCUMENT_ROUTING_TOOL,
                 COMPLETE_PROPERTY_INTAKE_TOOL,
+                PROPOSE_CALENDAR_EVENT_TOOL,
             ]
         elif is_realtor_scoped:
             tools = REALTOR_TOOL_SCHEMAS
@@ -1751,6 +1897,7 @@ async def append_thread_message(
                         "request_document_upload",
                         "confirm_document_routing",
                         "complete_property_intake",
+                        "propose_calendar_event",
                     )
                     if is_bank_tool and effective_loan_id is None:
                         outcome = {"ok": False, "error": "no_loan_scope"}
@@ -1782,6 +1929,14 @@ async def append_thread_message(
                             db,
                             user=user,
                             loan_id=effective_loan_id,
+                            accumulated_actions=accumulated_actions,
+                        )
+                    elif tool_name == "propose_calendar_event":
+                        outcome = await _execute_propose_calendar_event_tool(
+                            db,
+                            user=user,
+                            loan_id=effective_loan_id,
+                            tool_input=tool_input,
                             accumulated_actions=accumulated_actions,
                         )
                     elif (

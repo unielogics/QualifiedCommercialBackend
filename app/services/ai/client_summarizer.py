@@ -27,7 +27,7 @@ Output shape (`Client.living_profile` JSONB):
         }
       ],
       "rate_pressure_notes": [
-        "10-year benchmark up 18 bps in the last 7 days; lock soon."
+        "Rates trending higher in the last week; consider locking soon."
       ],
       "suggested_next_loan": "DSCR Refi at 75% — current portfolio
                               ratios meet matrix"
@@ -95,7 +95,7 @@ Return a JSON object EXACTLY in this shape:
     }
   ],
   "rate_pressure_notes": [
-    "10-year benchmark up 18 bps last week — lock soon if you're rate-shopping."
+    "Rates moved up slightly last week — worth checking in if you're close to locking."
   ],
   "suggested_next_loan": "Optional: a short pitch for a follow-on loan that fits this borrower's portfolio (or null)."
 }
@@ -108,6 +108,7 @@ Return a JSON object EXACTLY in this shape:
 - Cap `next_actions` at 5 items, ranked by impact-to-close.
 - Never invent loan IDs, deal IDs, FICO scores, or facts. If the context doesn't have it, leave the field empty.
 - Privacy gate: NEVER reveal specific lender names. Refer to them as "the lender" or "the underwriter."
+- Rate language: NEVER use "basis points" / "bps", spread, markup, or any rate-breakdown vocabulary in `rate_pressure_notes` or anywhere else. Speak in plain trends ("rates moved up slightly", "consider locking soon") without numeric bps deltas.
 - Strict JSON only. No prose around the object. No code fences.
 """
 

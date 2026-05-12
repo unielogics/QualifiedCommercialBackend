@@ -74,13 +74,38 @@ async def load_firm_identity(db: AsyncSession) -> dict[str, Any]:
     return dict(_DEFAULT_IDENTITY)
 
 
-def render_identity_prefix(identity: dict[str, Any]) -> str:
+# Immutable system rules — always rendered into client-audience prompts
+# regardless of whether the firm has configured any custom rules. These
+# exist to prevent the AI from explaining markup mechanics, quoting
+# rates from training data, or freelancing on legal/approval topics.
+# A firm CAN add more rules on top via /lending-admin/communication-rules
+# but CANNOT remove these.
+_HARD_SYSTEM_RULES: list[str] = [
+    "Never quote interest rates, APRs, or monthly payments from general "
+    "knowledge, news, or 'typical' market ranges. Use only the values in "
+    "this loan's Current Scenario block.",
+    "Never mention basis points, bps, spread, markup, points loaded into "
+    "the rate, or any breakdown of how the rate is built.",
+    "Never compare the borrower's rate to public benchmarks or other lenders.",
+    "Never promise loan approval or guarantee any final terms. Underwriting "
+    "must verify documents before any commitment.",
+    "Never give legal, tax, or financial planning advice.",
+    "If the borrower pushes back on terms, do not negotiate — say the "
+    "funding team will follow up directly.",
+]
+
+
+def render_identity_prefix(identity: dict[str, Any], *, audience: str | None = None) -> str:
     """Render the identity dict as a system-prompt prefix block.
     Sits at the TOP of every Realtor + Lending AI system prompt so
     these rules + the AI's name override anything below. Empty-safe:
-    returns "" if there's nothing meaningful to say."""
+    returns "" if there's nothing meaningful to say.
+
+    `audience` ("client" | "broker" | "super_admin" | None) toggles the
+    immutable hard-rule block — only emitted for client-facing turns
+    where rate leakage and bad-advice risk is highest."""
     if not identity:
-        return ""
+        identity = {}
     name = (identity.get("ai_name") or "").strip()
     voice = (identity.get("voice_summary") or "").strip()
     greeting = (identity.get("greeting_style") or "").strip()
@@ -110,9 +135,18 @@ def render_identity_prefix(identity: dict[str, Any]) -> str:
         if signature:
             parts.append(f"Sign emails / longer messages with: {signature}")
 
+    # Hard system rules — always rendered for client audience, even when
+    # the firm has not configured custom global_rules. Stacks above the
+    # firm's optional rules.
+    if audience == "client":
+        parts.append("")
+        parts.append("[SYSTEM RULES — non-negotiable, enforced for every borrower turn]")
+        for r in _HARD_SYSTEM_RULES:
+            parts.append(f"- {r}")
+
     if rules:
         parts.append("")
-        parts.append("[GLOBAL RULES — these always apply, regardless of any per-client override below]")
+        parts.append("[FIRM RULES — apply to every conversation in addition to system rules above]")
         for r in rules:
             parts.append(f"- {r}")
 
