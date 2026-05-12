@@ -9,7 +9,19 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
-from app.enums import DealHealth, LoanPurpose, LoanSide, LoanStage, LoanType, PropertyType
+from app.enums import (
+    AmortizationStyle,
+    DealHealth,
+    EntityType,
+    ExitStrategy,
+    ExperienceTier,
+    LoanPurpose,
+    LoanSide,
+    LoanStage,
+    LoanType,
+    PrepayPenalty,
+    PropertyType,
+)
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
@@ -107,6 +119,37 @@ class Loan(TimestampMixin, Base):
     monthly_rent: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     dscr: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
     risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── Underwriter fine-tuning (alembic 0044) ──────────────────────────
+    # These let the Criteria tab feel like a real underwriter calculator:
+    # the operator can fine-tune amortization style, prepay penalty,
+    # rental income assumptions, reserves, lender fees, and borrower
+    # credit on a per-loan basis. All nullable so legacy rows still work.
+    amortization_style: Mapped[AmortizationStyle | None] = mapped_column(String(24), nullable=True)
+    prepay_penalty: Mapped[PrepayPenalty | None] = mapped_column(String(16), nullable=True)
+    # 0..1 fraction; 0.05 = 5% vacancy. Reduces effective NOI for DSCR.
+    vacancy_pct: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+    # 0..1 fraction; 0.25 = 25% expense ratio. Reduces NOI for DSCR.
+    expense_ratio_pct: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+    reserves_required: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    lender_fees: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    # Underwriter override for the borrower's FICO when the bound client
+    # record doesn't yet have a pull. Stored separately so it never
+    # silently overwrites a verified pull on the client row.
+    fico_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    entity_type: Mapped[EntityType | None] = mapped_column(String(24), nullable=True)
+    experience_tier: Mapped[ExperienceTier | None] = mapped_column(String(24), nullable=True)
+    # Type-specific fields. Only surfaced on the matching loan type.
+    # F&F + Ground Up:
+    construction_holdback_pct: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+    draw_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # F&F / Ground Up / Bridge:
+    exit_strategy: Mapped[ExitStrategy | None] = mapped_column(String(16), nullable=True)
+    # Cash-Out Refi:
+    cash_to_borrower: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    seasoning_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Portfolio:
+    property_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     close_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 

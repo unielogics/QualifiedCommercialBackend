@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser, GatedUser
-from app.enums import LoanStage, LoanType, LoanPurpose, MessageFrom, PropertyType, Role
+from app.enums import AmortizationStyle, LoanStage, LoanType, LoanPurpose, MessageFrom, PropertyType, Role
 from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
@@ -563,6 +563,31 @@ async def download_term_sheet_pdf(
             monthly_hoa=float(loan.monthly_hoa or 0),
             monthly_rent=float(loan.monthly_rent) if loan.monthly_rent is not None else None,
             interest_only_months=max(0, int(interest_only_months or 0)),
+            amortization_style=loan.amortization_style,
+            prepay_penalty=loan.prepay_penalty,
+            vacancy_pct=float(loan.vacancy_pct) if loan.vacancy_pct is not None else None,
+            expense_ratio_pct=(
+                float(loan.expense_ratio_pct) if loan.expense_ratio_pct is not None else None
+            ),
+            reserves_required=(
+                float(loan.reserves_required) if loan.reserves_required is not None else None
+            ),
+            lender_fees=float(loan.lender_fees) if loan.lender_fees is not None else None,
+            construction_holdback_pct=(
+                float(loan.construction_holdback_pct)
+                if loan.construction_holdback_pct is not None
+                else None
+            ),
+            exit_strategy=loan.exit_strategy,
+            entity_type=loan.entity_type,
+            experience_tier=loan.experience_tier,
+            fico_override=loan.fico_override,
+            cash_to_borrower=(
+                float(loan.cash_to_borrower) if loan.cash_to_borrower is not None else None
+            ),
+            seasoning_months=loan.seasoning_months,
+            property_count=loan.property_count,
+            draw_count=loan.draw_count,
         )
 
     pdf_bytes = await asyncio.to_thread(_render)
@@ -893,9 +918,25 @@ async def recalc(
         ltv_tier_cap=payload.ltv_tier_cap,
     )
     amount = sizing.loan_amount if sizing else requested_amount
-    quote = pricing_quote(base_rate, amount, payload.discount_points)
+    origination_pct = (
+        payload.origination_pct
+        if payload.origination_pct is not None
+        else float(loan.origination_pct or 0.015)
+    )
+    quote = pricing_quote(base_rate, amount, payload.discount_points, origination_pct=origination_pct)
 
-    is_io = loan.type in {LoanType.FIX_AND_FLIP, LoanType.BRIDGE, LoanType.GROUND_UP}
+    # Amortization style — explicit override beats the loan-type default.
+    # F&F / Bridge / Ground Up default to interest-only; everything else
+    # defaults to fully amortizing. The new amortization_style column
+    # (alembic 0044) lets an underwriter flip either way per file.
+    default_io = loan.type in {LoanType.FIX_AND_FLIP, LoanType.BRIDGE, LoanType.GROUND_UP}
+    stored_style = (
+        AmortizationStyle(loan.amortization_style) if loan.amortization_style else None
+    )
+    style = payload.amortization_style or stored_style or (
+        AmortizationStyle.INTEREST_ONLY if default_io else AmortizationStyle.FULLY_AMORTIZING
+    )
+    is_io = style == AmortizationStyle.INTEREST_ONLY
     term = payload.term_months or loan.term_months or (12 if is_io else 360)
     if is_io:
         pi = round(amount * quote.final_rate / 12, 2)
@@ -923,17 +964,28 @@ async def recalc(
         else float(loan.monthly_rent or 0)
     )
 
-    dscr_val = None
-    if monthly_rent and not is_io:
-        dscr_val = dscr_calc(
-            float(monthly_rent),
-            amount,
-            quote.final_rate,
-            term,
-            annual_taxes,
-            annual_insurance,
-            monthly_hoa,
-        )
+    # Vacancy & expense-ratio underwrites — applied to the gross rent
+    # before it lands in the DSCR ratio. Stored as 0..1 fractions.
+    vacancy = (
+        payload.vacancy_pct if payload.vacancy_pct is not None else float(loan.vacancy_pct or 0)
+    )
+    expense_ratio = (
+        payload.expense_ratio_pct
+        if payload.expense_ratio_pct is not None
+        else float(loan.expense_ratio_pct or 0)
+    )
+    effective_rent = float(monthly_rent or 0) * max(0.0, 1.0 - vacancy) * max(0.0, 1.0 - expense_ratio)
+
+    # PITIA — uses the effective monthly debt service even when the loan
+    # is interest-only (in that case the P&I is just the interest leg).
+    pitia_pi = pi
+    effective_pitia = round(
+        pitia_pi + annual_taxes / 12 + annual_insurance / 12 + monthly_hoa, 2
+    )
+
+    dscr_val: float | None = None
+    if effective_rent and effective_pitia:
+        dscr_val = round(effective_rent / effective_pitia, 4)
 
     hud = build_hud_draft(
         loan_amount=amount,
@@ -941,6 +993,38 @@ async def recalc(
         loan_type=LoanType(loan.type),
         broker_origination_dollars=quote.broker_origination_dollars,
     )
+
+    # Cash-to-close = pricing cash (origination + discount) + flat lender
+    # fees + required reserves, less the day-1 construction holdback
+    # (borrower doesn't wire the holdback at close; it's reserved by the
+    # lender and drawn over the rehab schedule).
+    lender_fees = (
+        payload.lender_fees if payload.lender_fees is not None else float(loan.lender_fees or 0)
+    )
+    reserves_required = (
+        payload.reserves_required
+        if payload.reserves_required is not None
+        else float(loan.reserves_required or 0)
+    )
+    construction_holdback_pct = (
+        payload.construction_holdback_pct
+        if payload.construction_holdback_pct is not None
+        else float(loan.construction_holdback_pct or 0)
+    )
+    holdback_dollars = amount * max(0.0, min(1.0, construction_holdback_pct))
+    total_cash_to_close = round(
+        quote.cash_to_close_pricing + lender_fees + reserves_required - holdback_dollars, 2
+    )
+
+    # Total interest over the life of the loan (fully amortizing) or one
+    # year of interest as a ballpark for IO products. Surfaced so the UI
+    # can show summary stats without rerunning amortization client-side.
+    if is_io:
+        total_interest = round(amount * quote.final_rate, 2)  # 12 × monthly interest
+    else:
+        total_interest = round(pi * term - amount, 2) if term and pi else 0.0
+
+    monthly_interest = round(amount * quote.final_rate / 12, 2)
 
     # Validate against fresh sizing values when available — the persisted
     # loan.ltc/loan.ltv may be stale relative to the simulator inputs.
@@ -970,6 +1054,11 @@ async def recalc(
         warnings=[{"code": w.code, "message": w.message, "severity": w.severity} for w in warnings],
         loan_amount=amount,
         sizing=_sizing_to_breakdown(sizing) if sizing else None,
+        monthly_interest=monthly_interest,
+        total_interest=total_interest,
+        total_cash_to_close=total_cash_to_close,
+        effective_pitia=effective_pitia,
+        effective_rent=round(effective_rent, 2) if effective_rent else None,
     )
 
 

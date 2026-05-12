@@ -99,16 +99,39 @@ def render_term_sheet_pdf(
     interest_only_months: int = 0,
     issued_on: date | None = None,
     company_name: str = "Qualified Commercial",
+    # ── Underwriter fine-tuning (alembic 0044). All optional; surfaced
+    # in dedicated rows on the term sheet when supplied. ──
+    amortization_style: str | None = None,
+    prepay_penalty: str | None = None,
+    vacancy_pct: float | None = None,
+    expense_ratio_pct: float | None = None,
+    reserves_required: float | None = None,
+    lender_fees: float | None = None,
+    construction_holdback_pct: float | None = None,
+    exit_strategy: str | None = None,
+    entity_type: str | None = None,
+    experience_tier: str | None = None,
+    fico_override: int | None = None,
+    cash_to_borrower: float | None = None,
+    seasoning_months: int | None = None,
+    property_count: int | None = None,
+    draw_count: int | None = None,
 ) -> bytes:
     issued = issued_on or date.today()
     rate_for_amort = final_rate if final_rate is not None else base_rate
+    # IO month count: if amortization_style is explicitly IO, treat the
+    # entire term as interest-only (balloon at maturity). Otherwise honor
+    # the explicit interest_only_months arg.
+    io_months = interest_only_months
+    if amortization_style == "interest_only" and term_months:
+        io_months = term_months
     schedule: list[AmortRow] = []
     if rate_for_amort is not None and term_months is not None and term_months > 0:
         schedule = amortization_schedule(
             principal=loan_amount,
             annual_rate=rate_for_amort,
             term_months=term_months,
-            interest_only_months=interest_only_months,
+            interest_only_months=io_months,
         )
 
     # Summary stats for the cover ribbon.
@@ -179,13 +202,32 @@ def render_term_sheet_pdf(
   <div class="section-title">Loan terms</div>
   <table class="terms">
     <tr><td class="k">Purpose</td><td class="v">{(purpose or '—').replace('_', ' ').title()}</td></tr>
+    <tr><td class="k">Amortization</td><td class="v">{(amortization_style or '—').replace('_', ' ').title()}</td></tr>
     <tr><td class="k">Base rate</td><td class="v">{_fmt_pct(base_rate)}</td></tr>
     <tr><td class="k">Final rate</td><td class="v">{_fmt_pct(final_rate)}</td></tr>
     <tr><td class="k">Discount points</td><td class="v">{discount_points:.2f}</td></tr>
     <tr><td class="k">Origination</td><td class="v">{_fmt_pct(origination_pct, 2)}</td></tr>
-    <tr><td class="k">Interest-only period</td><td class="v">{interest_only_months} mo</td></tr>
+    <tr><td class="k">Lender fees</td><td class="v">{_fmt_money(lender_fees) if lender_fees else '—'}</td></tr>
+    <tr><td class="k">Prepay penalty</td><td class="v">{(prepay_penalty or '—').replace('_', ' ').upper()}</td></tr>
+    <tr><td class="k">Interest-only period</td><td class="v">{io_months} mo</td></tr>
     <tr><td class="k">LTV</td><td class="v">{_fmt_pct(ltv, 1) if ltv else '—'}</td></tr>
     <tr><td class="k">ARV / appraised value</td><td class="v">{_fmt_money(arv)}</td></tr>
+  </table>
+
+  <div class="section-title">Underwriting</div>
+  <table class="terms">
+    <tr><td class="k">Borrower entity</td><td class="v">{(entity_type or '—').replace('_', ' ').title()}</td></tr>
+    <tr><td class="k">Experience tier</td><td class="v">{(experience_tier or '—').replace('_', ' ').title()}</td></tr>
+    <tr><td class="k">FICO (UW override)</td><td class="v">{fico_override if fico_override else '—'}</td></tr>
+    <tr><td class="k">Vacancy assumption</td><td class="v">{_fmt_pct(vacancy_pct, 1) if vacancy_pct else '—'}</td></tr>
+    <tr><td class="k">Operating expense ratio</td><td class="v">{_fmt_pct(expense_ratio_pct, 1) if expense_ratio_pct else '—'}</td></tr>
+    <tr><td class="k">Reserves required</td><td class="v">{_fmt_money(reserves_required) if reserves_required else '—'}</td></tr>
+    <tr><td class="k">Construction holdback</td><td class="v">{_fmt_pct(construction_holdback_pct, 2) if construction_holdback_pct else '—'}</td></tr>
+    <tr><td class="k">Draw count</td><td class="v">{draw_count if draw_count else '—'}</td></tr>
+    <tr><td class="k">Exit strategy</td><td class="v">{(exit_strategy or '—').replace('_', ' ').title()}</td></tr>
+    <tr><td class="k">Cash to borrower</td><td class="v">{_fmt_money(cash_to_borrower) if cash_to_borrower else '—'}</td></tr>
+    <tr><td class="k">Seasoning</td><td class="v">{f'{seasoning_months} mo' if seasoning_months else '—'}</td></tr>
+    <tr><td class="k">Property count</td><td class="v">{property_count if property_count else '—'}</td></tr>
   </table>
 
   <div class="section-title">Holding economics</div>

@@ -6,7 +6,19 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.enums import DealHealth, LoanPurpose, LoanSide, LoanStage, LoanType, PropertyType
+from app.enums import (
+    AmortizationStyle,
+    DealHealth,
+    EntityType,
+    ExitStrategy,
+    ExperienceTier,
+    LoanPurpose,
+    LoanSide,
+    LoanStage,
+    LoanType,
+    PrepayPenalty,
+    PropertyType,
+)
 from app.schemas.common import ORMModel
 
 
@@ -92,6 +104,22 @@ class LoanUpdate(BaseModel):
     annual_insurance: float | None = None
     monthly_hoa: float | None = None
     close_date: date | None = None
+    # Underwriter fine-tuning fields (alembic 0044). All optional.
+    amortization_style: AmortizationStyle | None = None
+    prepay_penalty: PrepayPenalty | None = None
+    vacancy_pct: float | None = None
+    expense_ratio_pct: float | None = None
+    reserves_required: float | None = None
+    lender_fees: float | None = None
+    fico_override: int | None = None
+    entity_type: EntityType | None = None
+    experience_tier: ExperienceTier | None = None
+    construction_holdback_pct: float | None = None
+    draw_count: int | None = None
+    exit_strategy: ExitStrategy | None = None
+    cash_to_borrower: float | None = None
+    seasoning_months: int | None = None
+    property_count: int | None = None
     # Property details — written by the AI property-intake tool +
     # editable from the desktop PropertyTab. unit_count is new in
     # alembic 0019; the others were on the ORM but not surfaced.
@@ -163,6 +191,22 @@ class LoanRead(ORMModel):
     street_view_url: str | None = None
     latitude: float | None = None
     longitude: float | None = None
+    # Underwriter fine-tuning fields (alembic 0044).
+    amortization_style: AmortizationStyle | None = None
+    prepay_penalty: PrepayPenalty | None = None
+    vacancy_pct: float | None = None
+    expense_ratio_pct: float | None = None
+    reserves_required: float | None = None
+    lender_fees: float | None = None
+    fico_override: int | None = None
+    entity_type: EntityType | None = None
+    experience_tier: ExperienceTier | None = None
+    construction_holdback_pct: float | None = None
+    draw_count: int | None = None
+    exit_strategy: ExitStrategy | None = None
+    cash_to_borrower: float | None = None
+    seasoning_months: int | None = None
+    property_count: int | None = None
     # Living Loan File
     status_summary: str | None = None
     deal_health: DealHealth = DealHealth.ON_TRACK
@@ -221,6 +265,15 @@ class RecalcRequest(BaseModel):
     rehab_budget: float | None = None    # F&F / Ground Up rehab cost
     payoff: float | None = None          # DSCR refi existing-mortgage payoff
     ltv_tier_cap: float | None = None    # credit-tier-derived cap (0..1)
+    # Underwriter fine-tuning overrides (alembic 0044). Drive monthly P&I,
+    # DSCR, and cash-to-close math without persisting until Save Criteria.
+    amortization_style: AmortizationStyle | None = None
+    origination_pct: float | None = None
+    vacancy_pct: float | None = None
+    expense_ratio_pct: float | None = None
+    reserves_required: float | None = None
+    lender_fees: float | None = None
+    construction_holdback_pct: float | None = None
 
 
 class FreeCalcRequest(BaseModel):
@@ -270,3 +323,18 @@ class RecalcResponse(BaseModel):
     warnings: list[dict]
     loan_amount: float | None = None
     sizing: SizingBreakdown | None = None
+    # Underwriter calculator outputs — driven by alembic 0044 fields.
+    # monthly_interest is the IO payment when amortization_style=IO.
+    monthly_interest: float | None = None
+    # Total interest over the full term (fully-amortizing) or 12 months
+    # (IO ballpark, for in-page summary stats).
+    total_interest: float | None = None
+    # Total cash required at close: pricing + lender_fees + reserves -
+    # the construction holdback (which the borrower doesn't wire day-1).
+    total_cash_to_close: float | None = None
+    # Effective monthly debt service used in DSCR (PITIA after vacancy /
+    # expense ratio applied). Surfaced so the UI can show how the inputs
+    # changed the ratio.
+    effective_pitia: float | None = None
+    # Effective rent (gross rent × (1 - vacancy_pct) × (1 - expense_ratio_pct)).
+    effective_rent: float | None = None

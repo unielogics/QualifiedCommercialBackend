@@ -54,6 +54,26 @@ class PrepayPenalty(StrEnum):
     NONE = "none"
 
 
+class AmortizationStyle(StrEnum):
+    """How principal is paid down over the term.
+
+    fully_amortizing — standard P&I payment that retires the balance by term-end.
+    interest_only    — borrower pays interest only each month, full principal
+                       balloons at maturity. Default for F&F / Bridge / Ground Up.
+    """
+    FULLY_AMORTIZING = "fully_amortizing"
+    INTEREST_ONLY = "interest_only"
+
+
+class ExitStrategy(StrEnum):
+    """How the borrower intends to retire the loan at term-end. Used on
+    bridge / fix-and-flip / ground-up files where the lender underwrites
+    the exit, not just the entry."""
+    SALE = "sale"
+    REFINANCE = "refinance"
+    HOLD = "hold"
+
+
 class LoanType(StrEnum):
     DSCR = "dscr"
     FIX_AND_FLIP = "fix_and_flip"
