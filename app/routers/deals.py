@@ -23,7 +23,14 @@ from app.enums import DealAIStatus, DealHandoffStatus, DealStatus, DealType, Rol
 from app.models.client import Client
 from app.models.deal import Deal
 from app.scoping import scope_client_query
-from app.schemas.deal import DealCreate, DealOut, DealUpdate
+from app.schemas.deal import (
+    DealCreate,
+    DealOut,
+    DealUpdate,
+    MarkReadyRequest,
+    MarkReadyResponse,
+)
+from app.services.handoff import promote_deal_to_loan
 
 router = APIRouter(tags=["deals"])
 
@@ -148,3 +155,50 @@ async def update_deal(
     await db.flush()
     await db.refresh(deal)
     return DealOut.model_validate(deal)
+
+
+@router.post(
+    "/clients/{client_id}/deals/{deal_id}/mark-ready-for-lending",
+    response_model=MarkReadyResponse,
+)
+async def mark_ready_for_lending(
+    client_id: UUID,
+    deal_id: UUID,
+    payload: MarkReadyRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MarkReadyResponse:
+    """Promote a Deal into a Loan (the canonical FundingFile). Atomic
+    + idempotent: a second call returns the existing loan id.
+
+    Agent-only — brokers must own the client; super_admin / loan_exec
+    pass through. CLIENT role is read-only here."""
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
+    client = await _load_client_or_404(client_id, user, db)
+    deal = (
+        await db.execute(
+            select(Deal).where(Deal.id == deal_id, Deal.client_id == client_id)
+        )
+    ).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
+    _ = client  # client load already gated by scope; explicit binding for clarity
+
+    result = await promote_deal_to_loan(
+        db,
+        deal=deal,
+        user=user,
+        override_loan_type=payload.override_loan_type,
+        override_purpose=payload.override_purpose,
+        notes=payload.notes,
+    )
+    return MarkReadyResponse(
+        loan_id=result.loan.id,
+        deal_id=result.deal.id,
+        handoff_packet_id=result.handoff_packet_id,
+        prequal_request_id=result.prequal_request_id,
+        lending_thread_id=result.lending_thread_id,
+        handoff_summary=result.handoff_summary,
+        missing_lending_items=result.missing_lending_items or [],
+    )
