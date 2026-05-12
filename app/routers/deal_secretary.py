@@ -1844,6 +1844,50 @@ async def unassign_client_task(
     return _build_task_row(crs, cat, None)
 
 
+@router.post(
+    "/clients/{client_id}/ai-follow-up/bootstrap",
+)
+async def bootstrap_client_ai_follow_up(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    deal_id: UUID | None = None,
+    loan_id: UUID | None = None,
+):
+    """Repair / re-seed the CRS + ClientAIPlan for the selected scope.
+
+    Pre-promotion: scopes to deal_id and calls
+    bootstrap_deal_requirement_rows so the agent's buyer/seller
+    playbook overlay materializes. Post-promotion: scopes to loan_id
+    and calls the lending-side bootstrap. Idempotent — only inserts
+    requirements that aren't already present.
+    """
+    await _resolve_client_and_gate(client_id, user, db)
+    if loan_id is not None:
+        from app.models.loan import Loan
+        from app.services.ai.deal_secretary import bootstrap_requirement_status_rows
+
+        loan = (
+            await db.execute(select(Loan).where(Loan.id == loan_id, Loan.client_id == client_id))
+        ).scalar_one_or_none()
+        if loan is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found in this client")
+        result = await bootstrap_requirement_status_rows(db, loan, log_label="bootstrap_repair")
+        return result
+    if deal_id is not None:
+        from app.models.deal import Deal
+        from app.services.ai.deal_secretary import bootstrap_deal_requirement_rows
+
+        deal = (
+            await db.execute(select(Deal).where(Deal.id == deal_id, Deal.client_id == client_id))
+        ).scalar_one_or_none()
+        if deal is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found in this client")
+        result = await bootstrap_deal_requirement_rows(db, deal, log_label="bootstrap_repair")
+        return result
+    raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pass either deal_id or loan_id")
+
+
 @router.patch(
     "/clients/{client_id}/ai-follow-up/file-settings",
     response_model=FileSettings,
