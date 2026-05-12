@@ -53,15 +53,58 @@ def _to_read(row: CreditPull) -> CreditPullRead:
 
 
 @router.get("/current", response_model=CreditPullRead | None)
-async def current(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> CreditPullRead | None:
-    cid = _client_id_for(user)
-    if cid is None:
-        # User has no client record (operator role, or not yet provisioned).
-        log.info("GET /credit/current user=%s role=%s client_id=None -> null", user.email, user.role)
+async def current(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    client_id: str | None = None,
+) -> CreditPullRead | None:
+    """Most-recent valid credit pull for a client.
+
+    Resolution rules:
+      • client_id="self" or omitted → caller's own client (borrower app).
+      • client_id=<uuid> + operator role (super_admin / loan_exec /
+        broker) → that borrower's most-recent pull. Broker access is
+        scoped to clients owned by their broker_id. Lets operators see
+        the pulled FICO + parsed report on the loan Credit panel.
+      • client_id=<uuid> + borrower role mismatch → 403.
+    """
+    target_cid: str | None
+    if client_id and client_id != "self":
+        from uuid import UUID
+        try:
+            UUID(client_id)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "client_id must be a UUID or 'self'")
+        if user.role == Role.CLIENT:
+            own = _client_id_for(user)
+            if str(own) != client_id:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Borrowers can only fetch their own credit")
+            target_cid = own
+        elif user.role == Role.BROKER:
+            # Scope check — broker can only see pulls for their own
+            # clients. Same gate the rest of the agent surface uses.
+            from app.models.client import Client as _Client
+            row = (
+                await db.execute(
+                    select(_Client).where(_Client.id == client_id)
+                )
+            ).scalar_one_or_none()
+            broker = getattr(user, "broker", None)
+            if row is None or broker is None or row.broker_id != broker.id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+            target_cid = client_id
+        else:
+            # super_admin / loan_exec — firm-wide read.
+            target_cid = client_id
+    else:
+        target_cid = _client_id_for(user)
+
+    if target_cid is None:
+        log.info("GET /credit/current user=%s role=%s target=None -> null", user.email, user.role)
         return None
     stmt = (
         select(CreditPull)
-        .where(CreditPull.client_id == cid)
+        .where(CreditPull.client_id == target_cid)
         .where(CreditPull.status == CreditPullStatus.COMPLETED)
         .where(CreditPull.expires_at > datetime.now(timezone.utc))
         .order_by(CreditPull.pulled_at.desc())
@@ -69,8 +112,8 @@ async def current(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> Cred
     )
     row = (await db.execute(stmt)).scalar_one_or_none()
     log.info(
-        "GET /credit/current user=%s role=%s client_id=%s -> %s",
-        user.email, user.role, cid,
+        "GET /credit/current user=%s role=%s target_cid=%s -> %s",
+        user.email, user.role, target_cid,
         f"pull_id={row.id} fico={row.fico}" if row else "null (no valid pull)",
     )
     return _to_read(row) if row else None
