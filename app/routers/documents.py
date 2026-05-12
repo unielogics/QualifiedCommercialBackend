@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 from uuid import UUID, uuid4
 
 log = logging.getLogger(__name__)
@@ -534,5 +534,65 @@ async def route_document(
             loan.deal_id, target_key,
         )
     await mark_loan_dirty(db, loan.id)
+    await db.refresh(doc)
+    return DocumentRead.model_validate(doc)
+
+
+# ── Manual mark-complete (operator override) ──────────────────────────
+#
+# The scanner normally flips RECEIVED → VERIFIED after vision review.
+# This endpoint lets operators (and the agent of record) short-circuit
+# that flow when they've physically verified the doc out-of-band and
+# want it off the open list. Same gate as the upload flow — BROKER /
+# LOAN_EXEC / SUPER_ADMIN. Borrowers can never use this.
+
+
+@router.post("/{document_id}/mark-verified", response_model=DocumentRead)
+async def mark_document_verified(
+    document_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRead:
+    """Operator force-mark a document as VERIFIED. Used by the right-
+    click "Mark complete" affordance on the Documents + Conditions
+    tabs when the operator has reviewed the file out-of-band (email,
+    PDF inbox, etc.) and just wants it cleared off the open list."""
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    doc = await db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+    loan = await db.get(Loan, doc.loan_id)
+    if loan is None or not _scope_loan(user, loan):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+    old = doc.status
+    if old == DocStatus.VERIFIED:
+        # Idempotent — no-op return so the UI can fire this freely.
+        return DocumentRead.model_validate(doc)
+
+    doc.status = DocStatus.VERIFIED
+    if doc.received_on is None:
+        doc.received_on = date.today()
+    if doc.verified_at is None:
+        doc.verified_at = datetime.now(timezone.utc)
+    doc.verified_by = user.id
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="document.marked_verified",
+            summary=f"{doc.name}: {old} → verified (operator override)",
+            payload={
+                "doc_id": str(doc.id),
+                "from": str(old),
+                "to": "verified",
+                "reason": "operator_manual_override",
+            },
+        )
+    )
+    await mark_loan_dirty(db, loan.id)
+    await db.flush()
     await db.refresh(doc)
     return DocumentRead.model_validate(doc)
