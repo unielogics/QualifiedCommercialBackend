@@ -57,6 +57,7 @@ class DealUpdate(BaseModel):
     mls_number: str | None = None
     # Private agent notes (Notes tab on /deals/[id]).
     notes_text: str | None = None
+    notes_entries: list[dict[str, Any]] | None = None
 
 
 class DealOut(ORMModel):
@@ -88,6 +89,7 @@ class DealOut(ORMModel):
     mls_number: str | None = None
     # Private agent notes.
     notes_text: str | None = None
+    notes_entries: list[dict[str, Any]] | None = None
     living_profile: dict[str, Any] | None = None
     created_at: Any
     updated_at: Any

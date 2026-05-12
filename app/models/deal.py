@@ -110,10 +110,20 @@ class Deal(TimestampMixin, Base):
     listing_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     mls_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
-    # ── Agent-private notes (alembic 0052) ────────────────────────────
-    # Free-text notes visible ONLY to the agent on /deals/[id] Notes tab.
-    # The handoff visibility filter excludes this from funding.
+    # ── Agent-private notes ───────────────────────────────────────────
+    # Free-text notes visible ONLY to the agent. The handoff visibility
+    # filter excludes these from funding.
+    #
+    # `notes_text` (alembic 0052) is legacy — the single-blob version.
+    # `notes_entries` (alembic 0053) is the timestamped variant used by
+    # the floating Notes widget: a JSONB array of
+    #   {"id": uuid, "at": iso8601, "body": str, "author_id": uuid|null}
+    # The widget renders entries newest-first; appending is just a
+    # PATCH that pushes a new entry to the array.
     notes_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes_entries: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True,
+    )
 
     # Relationships ───────────────────────────────────────────────────
 
