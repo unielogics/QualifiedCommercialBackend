@@ -455,32 +455,185 @@ async def log_loan_diff(
     )
 
 
+# ── Humanization helpers ───────────────────────────────────────────
+#
+# The activity payload stores raw column names ("base_rate") and raw
+# values (Decimal("7.5000")). For human display — both the Activity.summary
+# column and the AI prompt's diff lines — those need to become labels +
+# formatted values: "Base rate: 7.50% → 7.80%".
+#
+# The frontend has a mirror of this mapping in
+# src/lib/activityFormat.ts. Keep them in sync when adding fields.
+
+
+# Field display labels keyed on the raw column name. Anything not in
+# this map falls back to a Title Case of the snake_case field.
+_FIELD_LABELS: dict[str, str] = {
+    "amount": "Loan amount",
+    "base_rate": "Base rate",
+    "discount_points": "Discount points",
+    "final_rate": "Final rate",
+    "origination_pct": "Origination",
+    "lender_fees": "Lender fees",
+    "term_months": "Term",
+    "amortization_style": "Amortization",
+    "prepay_penalty": "Prepay penalty",
+    "ltv": "LTV",
+    "ltc": "LTC",
+    "arv": "ARV",
+    "purpose": "Purpose",
+    "property_type": "Property type",
+    "monthly_rent": "Monthly rent",
+    "dscr": "DSCR",
+    "vacancy_pct": "Vacancy",
+    "expense_ratio_pct": "Expense ratio",
+    "annual_taxes": "Annual taxes",
+    "annual_insurance": "Annual insurance",
+    "monthly_hoa": "Monthly HOA",
+    "reserves_required": "Reserves required",
+    "fico_override": "FICO override",
+    "entity_type": "Entity type",
+    "experience_tier": "Experience tier",
+    "construction_holdback_pct": "Construction holdback",
+    "draw_count": "Draws",
+    "exit_strategy": "Exit strategy",
+    "cash_to_borrower": "Cash to borrower",
+    "seasoning_months": "Seasoning",
+    "property_count": "Properties",
+    "stage": "Stage",
+    "lender_id": "Lender",
+    "close_date": "Close date",
+    # HUD line fields
+    "label": "Label",
+    "category": "Category",
+    "payee": "Payee",
+    "note": "Note",
+}
+
+
+# Value-formatting kinds keyed by column name. Drives the unit / scale
+# logic in `format_field_value()`. "percent_fraction" means a value
+# stored as a 0–1 decimal (LTV 0.75 → "75.00%"); "percent_rate" means
+# already in percent units (base_rate 7.5 → "7.50%"); "months_to_years"
+# converts when the value divides cleanly by 12.
+_FIELD_VALUE_KINDS: dict[str, str] = {
+    "amount": "money",
+    "arv": "money",
+    "lender_fees": "money",
+    "monthly_rent": "money",
+    "annual_taxes": "money",
+    "annual_insurance": "money",
+    "monthly_hoa": "money",
+    "reserves_required": "money",
+    "cash_to_borrower": "money",
+    "base_rate": "percent_rate",
+    "final_rate": "percent_rate",
+    "origination_pct": "percent_fraction",
+    "ltv": "percent_fraction",
+    "ltc": "percent_fraction",
+    "vacancy_pct": "percent_fraction",
+    "expense_ratio_pct": "percent_fraction",
+    "construction_holdback_pct": "percent_fraction",
+    "discount_points": "points",
+    "dscr": "ratio",
+    "term_months": "months",
+    "seasoning_months": "months",
+    "fico_override": "integer",
+    "draw_count": "integer",
+    "property_count": "integer",
+    "close_date": "date",
+    "amortization_style": "enum",
+    "prepay_penalty": "enum",
+    "purpose": "enum",
+    "property_type": "enum",
+    "entity_type": "enum",
+    "experience_tier": "enum",
+    "exit_strategy": "enum",
+    "stage": "enum",
+}
+
+
+def field_label(field: str) -> str:
+    """Human label for an activity-payload field name. Unknown fields
+    fall back to Title Case (snake_case stripped)."""
+    if field in _FIELD_LABELS:
+        return _FIELD_LABELS[field]
+    return field.replace("_", " ").capitalize()
+
+
+def format_field_value(field: str, value: Any) -> str:
+    """Format a raw payload value for human display, keyed off the
+    field name. None becomes em-dash. Returns a string."""
+    if value is None:
+        return "—"
+    kind = _FIELD_VALUE_KINDS.get(field)
+    return _format_value_by_kind(value, kind)
+
+
+def _format_value_by_kind(value: Any, kind: str | None) -> str:
+    try:
+        if kind == "money":
+            return f"${float(value):,.0f}"
+        if kind == "percent_rate":
+            return f"{float(value):.2f}%"
+        if kind == "percent_fraction":
+            return f"{float(value) * 100:.2f}%"
+        if kind == "points":
+            return f"{float(value):.3f} pts"
+        if kind == "ratio":
+            return f"{float(value):.2f}"
+        if kind == "months":
+            n = int(float(value))
+            if n > 0 and n % 12 == 0:
+                years = n // 12
+                return f"{years} year{'s' if years != 1 else ''}"
+            return f"{n} month{'s' if n != 1 else ''}"
+        if kind == "integer":
+            return f"{int(float(value)):,}"
+        if kind == "enum":
+            s = str(value)
+            # Strip the StrEnum prefix if it leaked in ("LoanStage.PREQUALIFIED")
+            if "." in s:
+                s = s.rsplit(".", 1)[-1]
+            return s.replace("_", " ").title()
+        if kind == "date":
+            # ISO date already; strip the time portion when present.
+            s = str(value)
+            return s.split("T")[0] if "T" in s else s
+    except (TypeError, ValueError):
+        pass
+    # Fallback — generic short form.
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
 def summarize_diff(changes: list[dict[str, Any]]) -> str:
     """Human-readable one-liner for the Activity row. Caps at 3
     fields with "…and N more" for the rest so the summary column
-    (varchar 512) never overflows on a bulk edit."""
+    (varchar 512) never overflows on a bulk edit. Uses field_label +
+    format_field_value so "base_rate" becomes "Base rate" and 7.5
+    becomes "7.50%"."""
     if not changes:
         return "No changes"
     parts = []
     for c in changes[:3]:
-        parts.append(_format_field_change(c))
+        parts.append(format_field_change(c))
     extra = len(changes) - 3
     if extra > 0:
         parts.append(f"and {extra} more field{'s' if extra != 1 else ''}")
     return ", ".join(parts)
 
 
-def _format_field_change(change: dict[str, Any]) -> str:
-    field = change["field"]
-    return f"{field}: {_short_value(change['before'])} → {_short_value(change['after'])}"
-
-
-def _short_value(v: Any) -> str:
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        return f"{v:g}"
-    return str(v)
+def format_field_change(change: dict[str, Any]) -> str:
+    """Single field's human-readable diff line:
+    "Base rate: 7.50% → 7.80%"."""
+    field = change.get("field") or "?"
+    return (
+        f"{field_label(field)}: "
+        f"{format_field_value(field, change.get('before'))} → "
+        f"{format_field_value(field, change.get('after'))}"
+    )
 
 
 def filter_payload_for_audience(

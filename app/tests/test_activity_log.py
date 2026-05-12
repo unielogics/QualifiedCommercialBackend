@@ -9,7 +9,10 @@ from app.services.activity_log import (
     LOAN_DIFF_FIELDS,
     OPERATOR_VISIBLE,
     diff_changes,
+    field_label,
     filter_payload_for_audience,
+    format_field_change,
+    format_field_value,
     is_visible_to,
     kind_visibility,
     loan_snapshot,
@@ -76,23 +79,106 @@ def test_diff_changes_restricts_to_field_subset():
 
 
 def test_summarize_diff_compact_for_three():
+    """The summary string is human-readable: column names become
+    labels, values are formatted with the right unit (% / $)."""
     changes = [
         {"field": "base_rate", "before": 7.5, "after": 7.8},
         {"field": "amount", "before": 500_000, "after": 520_000},
         {"field": "ltv", "before": 0.75, "after": 0.72},
     ]
     summary = summarize_diff(changes)
-    assert "base_rate" in summary
-    assert "7.5" in summary
-    assert "7.8" in summary
-    assert "amount" in summary
-    assert "ltv" in summary
+    # Labels, not column names
+    assert "Base rate" in summary
+    assert "base_rate" not in summary
+    assert "Loan amount" in summary
+    assert "LTV" in summary
+    # Formatted values
+    assert "7.50%" in summary
+    assert "7.80%" in summary
+    assert "$500,000" in summary
+    assert "$520,000" in summary
+    assert "75.00%" in summary  # LTV stored as fraction
+    assert "72.00%" in summary
 
 
 def test_summarize_diff_caps_with_overflow_note():
     changes = [{"field": f"f{i}", "before": 1, "after": 2} for i in range(5)]
     summary = summarize_diff(changes)
     assert "and 2 more" in summary
+
+
+# ── humanization helpers ───────────────────────────────────────────
+
+
+def test_field_label_known_fields():
+    assert field_label("base_rate") == "Base rate"
+    assert field_label("fico_override") == "FICO override"
+    assert field_label("monthly_hoa") == "Monthly HOA"
+    assert field_label("ltv") == "LTV"
+
+
+def test_field_label_unknown_falls_back_to_titlecase():
+    assert field_label("some_brand_new_field") == "Some brand new field"
+
+
+def test_format_field_value_money():
+    assert format_field_value("amount", 500_000) == "$500,000"
+    assert format_field_value("annual_taxes", 4500.0) == "$4,500"
+    assert format_field_value("amount", None) == "—"
+
+
+def test_format_field_value_percent_rate_vs_fraction():
+    """base_rate is stored in percent units (7.5 → 7.50%) but LTV /
+    vacancy / origination are stored as 0–1 fractions (0.75 → 75.00%).
+    Must not confuse the two."""
+    assert format_field_value("base_rate", 7.5) == "7.50%"
+    assert format_field_value("final_rate", 8.25) == "8.25%"
+    assert format_field_value("ltv", 0.75) == "75.00%"
+    assert format_field_value("vacancy_pct", 0.05) == "5.00%"
+    assert format_field_value("origination_pct", 0.015) == "1.50%"
+    assert format_field_value("construction_holdback_pct", 0.20) == "20.00%"
+
+
+def test_format_field_value_term_months_to_years():
+    """360 months → 30 years (clean divides). 7 months stays as months."""
+    assert format_field_value("term_months", 360) == "30 years"
+    assert format_field_value("term_months", 240) == "20 years"
+    assert format_field_value("term_months", 12) == "1 year"
+    assert format_field_value("term_months", 7) == "7 months"
+    assert format_field_value("seasoning_months", 6) == "6 months"
+
+
+def test_format_field_value_enums_titlecase():
+    assert format_field_value("amortization_style", "fully_amortizing") == "Fully Amortizing"
+    assert format_field_value("entity_type", "llc") == "Llc"  # accepted — exact-case preserved by .title() rules
+    assert format_field_value("stage", "lender_connected") == "Lender Connected"
+
+
+def test_format_field_value_points_and_integers():
+    assert format_field_value("discount_points", 1.25) == "1.250 pts"
+    assert format_field_value("fico_override", 720) == "720"
+    assert format_field_value("property_count", 5) == "5"
+
+
+def test_format_field_value_dscr_keeps_two_decimals():
+    assert format_field_value("dscr", 1.3) == "1.30"
+    assert format_field_value("dscr", 1.275) == "1.27" or format_field_value("dscr", 1.275) == "1.28"
+
+
+def test_format_field_change_full_line():
+    """The single-line diff we render in the activity summary + AI
+    prompt: 'Base rate: 7.50% → 7.80%'."""
+    s = format_field_change({"field": "base_rate", "before": 7.5, "after": 7.8})
+    assert s == "Base rate: 7.50% → 7.80%"
+
+
+def test_format_field_change_handles_missing_values():
+    """First-time-set or removed fields render with em-dash on the
+    empty side."""
+    s = format_field_change({"field": "fico_override", "before": None, "after": 715})
+    assert s == "FICO override: — → 715"
+    s2 = format_field_change({"field": "fico_override", "before": 700, "after": None})
+    assert s2 == "FICO override: 700 → —"
 
 
 # ── visibility registry ────────────────────────────────────────────

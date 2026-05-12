@@ -14,7 +14,7 @@ walls of whitespace into the system prompt.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -746,6 +746,7 @@ async def _recent_activity_block(
     """
     from app.services.activity_log import (
         filter_payload_for_audience,
+        format_field_change,
         is_visible_to,
     )
 
@@ -768,15 +769,18 @@ async def _recent_activity_block(
             continue
         ts = a.occurred_at.strftime("%Y-%m-%d %H:%M") if a.occurred_at else "?"
         payload = filter_payload_for_audience(a.payload, kind=a.kind, audience=audience)
-        line = f"  - [{ts}] {a.kind} · {a.summary}"
+        line = f"  - [{ts}] {a.summary}"
         changes = (payload or {}).get("changes") if isinstance(payload, dict) else None
         if isinstance(changes, list) and changes:
             # Inline the structured diff so the AI sees what actually
             # changed, not just that something did. Cap at 5 per row.
+            # format_field_change humanizes both label and value
+            # ("Base rate: 7.50% → 7.80%") so the AI talks about the
+            # same numbers a person would read in the UI.
             for c in changes[:5]:
                 if not isinstance(c, dict):
                     continue
-                line += f"\n      · {c.get('field')}: {_fmt_diff_value(c.get('before'))} → {_fmt_diff_value(c.get('after'))}"
+                line += f"\n      · {format_field_change(c)}"
             if len(changes) > 5:
                 line += f"\n      · …and {len(changes) - 5} more"
         out.append(line)
@@ -784,14 +788,6 @@ async def _recent_activity_block(
             break
 
     return "\n".join(out) if out else ""
-
-
-def _fmt_diff_value(v: Any) -> str:
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        return f"{v:g}"
-    return str(v)
 
 
 async def _upcoming_events_block(
