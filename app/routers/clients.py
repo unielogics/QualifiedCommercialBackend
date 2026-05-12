@@ -213,6 +213,278 @@ async def get_client(client_id: UUID, user: CurrentUser, db: AsyncSession = Depe
     return ClientRead.model_validate(d)
 
 
+# ── Unified workspace aggregate (Phase 2) ────────────────────────────
+#
+# Single round-trip that backs the new /clients/[id]/workspace UI.
+# Returns the client profile, deal summary list, funding files (Loans)
+# summary list, AI plan snapshot, recent activity tail, agent notes,
+# documents roll-up, and a server-computed permissions block.
+#
+# Deals and AgentTask counts are wired progressively as later phases
+# land (Phase 3 Deal model, Phase 7 AgentTask model). Until then those
+# fields return empty lists / null counts.
+
+
+@router.get("/{client_id}/workspace")
+async def get_client_workspace(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    tab: str | None = None,
+    deal_id: UUID | None = None,
+    funding_file_id: UUID | None = None,
+    loan_id: UUID | None = None,
+):
+    from sqlalchemy.orm import selectinload
+
+    from app.models.activity import Activity
+    from app.models.client_ai_plan import ClientAIPlan
+    from app.models.loan import Loan
+    from app.scoping import scope_client_query
+    from app.schemas.workspace import (
+        FundingFileSummary,
+        WorkspaceActivityRow,
+        WorkspaceAISummary,
+        WorkspaceDocumentsSummary,
+        WorkspaceNoteRow,
+        WorkspaceOut,
+        WorkspacePermissions,
+        WorkspaceSelectedContext,
+        WorkspaceTabCounts,
+    )
+
+    stmt = scope_client_query(
+        user,
+        select(Client)
+        .where(Client.id == client_id)
+        .options(selectinload(Client.user)),
+    )
+    client = (await db.execute(stmt)).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+
+    # Project presence onto the ClientRead payload (same pattern as get_client).
+    client_payload = ClientRead.model_validate(client).model_dump()
+    linked = getattr(client, "user", None)
+    client_payload["last_seen_at"] = getattr(linked, "last_seen_at", None) if linked else None
+    client_read = ClientRead.model_validate(client_payload)
+
+    # Funding files: all loans for this client, ordered most recent first.
+    loans_stmt = (
+        select(Loan)
+        .where(Loan.client_id == client_id)
+        .order_by(Loan.created_at.desc())
+    )
+    loans = (await db.execute(loans_stmt)).scalars().all()
+    funding_files: list[FundingFileSummary] = []
+    for loan in loans:
+        funding_files.append(
+            FundingFileSummary(
+                id=loan.id,
+                deal_id=loan.deal_id,
+                client_id=loan.client_id,
+                side=str(loan.side) if loan.side is not None else None,
+                stage=str(loan.stage),
+                address=loan.address,
+                amount=float(loan.amount) if loan.amount is not None else None,
+                # Loan.funding_file_kind / source_deal_id / handoff_summary
+                # land in alembic 0048 (Phase 4). Until then these are null.
+                funding_file_kind=getattr(loan, "funding_file_kind", None),
+                source_deal_id=getattr(loan, "source_deal_id", None),
+                handoff_summary=getattr(loan, "handoff_summary", None),
+                created_at=loan.created_at,
+                updated_at=loan.updated_at,
+            )
+        )
+
+    # AI summary: pull the client-level ClientAIPlan (loan_id IS NULL,
+    # phase=realtor) when present; otherwise fall back to the most
+    # recent loan-level plan if any.
+    ai_plan = (await db.execute(
+        select(ClientAIPlan)
+        .where(ClientAIPlan.client_id == client_id, ClientAIPlan.loan_id.is_(None))
+        .order_by(ClientAIPlan.computed_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if ai_plan is None and loans:
+        ai_plan = (await db.execute(
+            select(ClientAIPlan)
+            .where(
+                ClientAIPlan.client_id == client_id,
+                ClientAIPlan.loan_id.is_not(None),
+            )
+            .order_by(ClientAIPlan.computed_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+    outreach_mode = "portal_auto"
+    if ai_plan is not None:
+        settings = ai_plan.ai_secretary_settings or {}
+        outreach_mode = settings.get("outreach_mode", "portal_auto")
+    ai_state_map = {
+        "off": "human_only",
+        "draft_first": "draft_first",
+        "portal_auto": "deployed",
+        "portal_email": "deployed",
+        "portal_email_sms": "deployed",
+    }
+    ai_state = ai_state_map.get(outreach_mode, "idle")
+
+    outstanding = 0
+    if ai_plan is not None:
+        outstanding = sum(
+            1
+            for item in (ai_plan.required_items or [])
+            if isinstance(item, dict) and item.get("status") in {"missing", "asked"}
+        )
+
+    ai_summary = WorkspaceAISummary(
+        state=ai_state,
+        outstanding_followups=outstanding,
+        current_blocker=None,
+        next_follow_up_at=None,
+        next_best_question=ai_plan.next_best_question if ai_plan else None,
+        readiness_score=ai_plan.readiness_score if ai_plan else None,
+    )
+
+    # Documents roll-up — count documents across this client's loans.
+    # Cheap COUNT(*) queries rather than loading the rows.
+    from sqlalchemy import func as sqlfunc
+    from app.models.document import Document
+
+    loan_ids = [loan.id for loan in loans]
+    if loan_ids:
+        total_q = await db.execute(
+            select(sqlfunc.count(Document.id)).where(Document.loan_id.in_(loan_ids))
+        )
+        missing_q = await db.execute(
+            select(sqlfunc.count(Document.id)).where(
+                Document.loan_id.in_(loan_ids),
+                Document.status == "missing",
+            )
+        )
+        pending_q = await db.execute(
+            select(sqlfunc.count(Document.id)).where(
+                Document.loan_id.in_(loan_ids),
+                Document.status == "pending",
+            )
+        )
+        documents_summary = WorkspaceDocumentsSummary(
+            total=int(total_q.scalar() or 0),
+            missing=int(missing_q.scalar() or 0),
+            pending_review=int(pending_q.scalar() or 0),
+        )
+    else:
+        documents_summary = WorkspaceDocumentsSummary(total=0, missing=0, pending_review=0)
+
+    # Activity tail — last 20 across the client's loans + client-level rows.
+    activity_q = (
+        select(Activity)
+        .where(
+            (Activity.client_id == client_id)
+            | (Activity.loan_id.in_(loan_ids) if loan_ids else (Activity.client_id == client_id))
+        )
+        .order_by(Activity.occurred_at.desc())
+        .limit(20)
+    )
+    activity_rows = (await db.execute(activity_q)).scalars().all()
+    activity_tail = [
+        WorkspaceActivityRow(
+            at=a.occurred_at,
+            kind=a.kind,
+            summary=a.summary or "",
+            actor=a.actor_label,
+        )
+        for a in activity_rows
+    ]
+
+    # Notes — read agent notes off realtor_profile.known_facts as the
+    # existing detail page does. Stored on the Client row directly.
+    notes: list[WorkspaceNoteRow] = []
+    profile = client.realtor_profile or {}
+    facts = profile.get("known_facts") if isinstance(profile, dict) else None
+    if isinstance(facts, list):
+        for idx, raw in enumerate(facts):
+            if not isinstance(raw, dict) or raw.get("source") != "agent":
+                continue
+            captured = raw.get("captured_at")
+            try:
+                at = datetime.fromisoformat(str(captured)) if captured else None
+            except (TypeError, ValueError):
+                at = None
+            if at is None:
+                continue
+            notes.append(
+                WorkspaceNoteRow(
+                    id=f"note-{idx}",
+                    author=str(raw.get("author") or "agent"),
+                    at=at,
+                    body=str(raw.get("value") or ""),
+                )
+            )
+
+    # Permissions — server-computed from the calling user's role + ownership.
+    is_admin = user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+    is_broker = user.role == Role.BROKER and user.broker is not None and client.broker_id == user.broker.id
+    is_client_self = user.role == Role.CLIENT and user.client is not None and user.client.id == client.id
+
+    permissions = WorkspacePermissions(
+        can_mark_ready_for_lending=bool(is_broker or is_admin),
+        can_edit_underwriting=bool(is_admin),
+        can_create_deals=bool(is_broker or is_admin),
+        can_create_funding_files=bool(is_admin),
+        can_assign_ai=bool(is_broker or is_admin),
+        can_edit_client_fields=bool(is_broker or is_admin or is_client_self),
+        can_view_funding_tab=bool(is_broker or is_admin),
+    )
+
+    # Recommended tab — pick based on role + state when caller didn't
+    # specify one. Frontend honors ?tab= first, then this hint, then
+    # its own fallback.
+    recommended_tab: str | None = None
+    if tab is None:
+        if is_admin:
+            recommended_tab = "funding" if loans else "documents"
+        elif is_broker:
+            if outstanding > 0:
+                recommended_tab = "ai-follow-up"
+            elif loans:
+                recommended_tab = "funding"
+            else:
+                recommended_tab = "deals"
+        else:
+            recommended_tab = "overview"
+
+    selected_context = WorkspaceSelectedContext(
+        tab=tab,
+        deal_id=deal_id,
+        funding_file_id=funding_file_id,
+        loan_id=loan_id,
+        recommended_tab=recommended_tab,
+    )
+
+    tab_counts = WorkspaceTabCounts(
+        deals=0,  # Phase 3 wires this from the Deal table.
+        funding=len(funding_files),
+        tasks=None,  # Phase 7 wires this from AgentTask.
+        ai_follow_up=outstanding,
+        documents=documents_summary.total,
+    )
+
+    return WorkspaceOut(
+        client=client_read,
+        deals=[],  # Phase 3 populates from Deal model.
+        funding_files=funding_files,
+        documents_summary=documents_summary,
+        ai_summary=ai_summary,
+        activity_tail=activity_tail,
+        notes=notes,
+        role_permissions=permissions,
+        selected_context=selected_context,
+        tab_counts=tab_counts,
+    )
+
+
 @router.post("", response_model=ClientRead, status_code=status.HTTP_201_CREATED)
 async def create_client(
     payload: ClientCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
