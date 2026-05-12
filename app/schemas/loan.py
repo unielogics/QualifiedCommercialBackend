@@ -113,6 +113,7 @@ class LoanUpdate(BaseModel):
     lender_fees: float | None = None
     fico_override: int | None = None
     entity_type: EntityType | None = None
+    entity_name: str | None = None
     experience_tier: ExperienceTier | None = None
     construction_holdback_pct: float | None = None
     draw_count: int | None = None
@@ -200,6 +201,7 @@ class LoanRead(ORMModel):
     lender_fees: float | None = None
     fico_override: int | None = None
     entity_type: EntityType | None = None
+    entity_name: str | None = None
     experience_tier: ExperienceTier | None = None
     construction_holdback_pct: float | None = None
     draw_count: int | None = None

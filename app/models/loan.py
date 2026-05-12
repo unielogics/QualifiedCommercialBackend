@@ -138,6 +138,9 @@ class Loan(TimestampMixin, Base):
     # silently overwrites a verified pull on the client row.
     fico_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     entity_type: Mapped[EntityType | None] = mapped_column(String(24), nullable=True)
+    # Borrowing entity display name (alembic 0045) — e.g. "Smith
+    # Properties LLC". Distinct from client.name (natural person).
+    entity_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     experience_tier: Mapped[ExperienceTier | None] = mapped_column(String(24), nullable=True)
     # Type-specific fields. Only surfaced on the matching loan type.
     # F&F + Ground Up:
