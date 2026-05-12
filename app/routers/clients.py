@@ -475,10 +475,25 @@ async def get_client_workspace(
     ).scalars().all()
     deals_out = [DealOut.model_validate(d) for d in deal_rows]
 
+    # AgentTask open count (Phase 7) — used for the Tasks tab pill.
+    from app.models.agent_task import AgentTask
+
+    open_tasks_count = int(
+        (
+            await db.execute(
+                select(sqlfunc.count(AgentTask.id)).where(
+                    AgentTask.client_id == client_id,
+                    AgentTask.status.in_(["open", "in_progress", "waiting"]),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
     tab_counts = WorkspaceTabCounts(
         deals=len(deals_out),
         funding=len(funding_files),
-        tasks=None,  # Phase 7 wires this from AgentTask.
+        tasks=open_tasks_count,
         ai_follow_up=outstanding,
         documents=documents_summary.total,
     )

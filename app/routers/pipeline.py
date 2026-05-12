@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
+from app.models.agent_task import AgentTask
 from app.models.ai_task_assignment import AITaskAssignment
 from app.models.client import Client
 from app.models.client_requirement_status import ClientRequirementStatus
@@ -153,6 +154,19 @@ async def client_summary(
         if _HANDOFF_RANK.get(d.handoff_status, 0) > _HANDOFF_RANK.get(cur, 0):
             handoff_by_client[d.client_id] = d.handoff_status
 
+    # AgentTask open count per client (Phase 7).
+    tasks_q = (
+        select(AgentTask.client_id, func.count(AgentTask.id))
+        .where(
+            AgentTask.client_id.in_(visible_list),
+            AgentTask.status.in_(["open", "in_progress", "waiting"]),
+        )
+        .group_by(AgentTask.client_id)
+    )
+    tasks_by_client: dict[UUID, int] = {
+        row[0]: int(row[1]) for row in (await db.execute(tasks_q)).all()
+    }
+
     # Funding status — pick the latest loan stage per client.
     loans_full = (
         await db.execute(
@@ -190,7 +204,7 @@ async def client_summary(
                 ),
                 deals_count=deals_by_client.get(cid, 0),
                 loans_count=loans_by_client.get(cid, 0),
-                open_tasks_count=0,  # Phase 7 wires this from AgentTask.
+                open_tasks_count=tasks_by_client.get(cid, 0),
                 last_activity_at=None,  # Reserved — keep payload tight.
             )
         )

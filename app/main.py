@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routers import (
+    agent_tasks,
     agents,
     ai,
     ai_feedback,
@@ -107,6 +108,7 @@ for r in [
     loan_workspace.public_router,  # /public/hud/{token} — no auth
     clients.router,
     deals.router,
+    agent_tasks.router,
     brokers.router,
     documents.router,
     messages.router,

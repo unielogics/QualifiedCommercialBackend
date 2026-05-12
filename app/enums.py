@@ -478,3 +478,38 @@ class DealAIStatus(StrEnum):
     IDLE = "idle"
     ACTIVE = "active"
     PAUSED = "paused"
+
+
+# ── AgentTask (alembic 0051) ─────────────────────────────────────────
+
+
+class AgentTaskCategory(StrEnum):
+    """Closed taxonomy for agent CRM tasks. Distinct from
+    RequirementCategory — those are borrower-facing AI requirements;
+    these are agent workflow items (open houses, listing prep, photo
+    scheduling, etc.)."""
+    BUYER_WORKFLOW = "buyer_workflow"
+    SELLER_WORKFLOW = "seller_workflow"
+    FUNDING_PREP = "funding_prep"
+    SHOWING = "showing"
+    OPEN_HOUSE = "open_house"
+    LISTING_PREP = "listing_prep"
+    CMA = "cma"
+    PHOTOGRAPHY = "photography"
+    DOCUMENT_COLLECTION = "document_collection"
+    OTHER = "other"
+
+
+class AgentTaskVisibility(StrEnum):
+    AGENT_PRIVATE = "agent_private"
+    TEAM_VISIBLE = "team_visible"
+    FUNDING_VISIBLE = "funding_visible"
+    CLIENT_VISIBLE = "client_visible"
+
+
+class AgentTaskStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    WAITING = "waiting"
+    DONE = "done"
+    CANCELLED = "cancelled"
