@@ -8,6 +8,7 @@ The runtime warns once at startup if dev mode is active.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Annotated
 
 import httpx
@@ -279,9 +280,9 @@ async def get_current_user(
     # avoid hammering Postgres on the chatty endpoints (workspace,
     # secretary, recalc) that fire 5-10x per page load.
     from datetime import timedelta as _td
-    now = datetime.now(timezone.utc)
-    if user.last_seen_at is None or (now - user.last_seen_at) >= _td(seconds=60):
-        user.last_seen_at = now
+    now_dt = datetime.now(timezone.utc)
+    if user.last_seen_at is None or (now_dt - user.last_seen_at) >= _td(seconds=60):
+        user.last_seen_at = now_dt
         await db.flush()
     return user
 
