@@ -202,10 +202,59 @@ async def get_current_user(
             user = User(clerk_id=clerk_id, email=email, name=name, role=Role.CLIENT)
             db.add(user)
             await db.flush()
+            # Adoption guard — when an agent pre-creates a Client by
+            # email (operator-side intake, agent invite, dashboard "+ New
+            # lead"), that row sits with `user_id IS NULL` until the
+            # borrower actually signs in via Clerk and a User row gets
+            # auto-provisioned. Without this lookup the new User has no
+            # linked Client → /clients/me 404s → mobile silently falls
+            # back to self_directed AND the borrower can't see the
+            # credit pull / docs / loan history the agent attached.
+            # Match by email + null user_id so we never adopt a Client
+            # that already belongs to someone else.
+            #
+            # We also stamp client_experience_mode=guided here when the
+            # adopted row had a broker (the same default the operator
+            # intake flow uses) so the deriveExperienceMode fallback on
+            # the client side does the right thing immediately.
+            from app.models.client import Client as _Client
+
+            adoptable = (
+                await db.execute(
+                    select(_Client)
+                    .where(_Client.email == email, _Client.user_id.is_(None))
+                    .order_by(_Client.created_at.desc())
+                )
+            ).scalars().all()
+            if adoptable:
+                target = adoptable[0]
+                target.user_id = user.id
+                if target.client_experience_mode is None and target.broker_id is not None:
+                    target.client_experience_mode = "guided"
+                    if target.client_experience_mode_reason is None:
+                        target.client_experience_mode_reason = "agent_invited"
+                    if target.client_experience_mode_locked_by is None:
+                        target.client_experience_mode_locked_by = "agent"
+                await db.flush()
+                log.info(
+                    "Adopted pre-existing Client id=%s email=%s onto auto-provisioned user clerk_id=%s",
+                    target.id, email, clerk_id,
+                )
+                if len(adoptable) > 1:
+                    # Surface duplicates so we don't silently leave
+                    # historical credit pulls / docs stranded on a
+                    # different row. Operators will see this in logs
+                    # and can merge via the support runbook.
+                    log.warning(
+                        "Multiple orphan Client rows for email=%s (%d found). Adopted the newest; "
+                        "older rows still hold credit pulls / docs / loans and need manual merge.",
+                        email, len(adoptable),
+                    )
             # Re-fetch with the relationship eagerly loaded so downstream
             # `user.client` accesses don't trigger a lazy-load. A freshly
-            # added User has no Client row yet, but accessing the
-            # attribute would still try to load it.
+            # added User without a Client row would still need the eager
+            # load; one that just adopted a Client needs the relationship
+            # to reflect the link.
             user = (
                 await db.execute(
                     select(User).options(_with_client, _with_broker).where(User.id == user.id)
