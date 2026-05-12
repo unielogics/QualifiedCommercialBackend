@@ -152,6 +152,10 @@ class LoanRead(ORMModel):
     # their own files so the name is implicit.
     broker_name: str | None = None
     client_name: str | None = None
+    # Borrower FICO joined from clients.fico (manual entry / iSoftPull
+    # ledger). Populated by the list endpoint so the operator pipeline
+    # can render a Credit column without an extra round-trip per row.
+    client_fico: int | None = None
     lender_id: UUID | None = None
     address: str
     city: str | None

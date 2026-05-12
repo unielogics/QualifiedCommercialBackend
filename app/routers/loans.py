@@ -104,6 +104,7 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
         client_obj = getattr(r, "client", None)
         d["broker_name"] = getattr(broker_obj, "display_name", None) if broker_obj else None
         d["client_name"] = getattr(client_obj, "name", None) if client_obj else None
+        d["client_fico"] = getattr(client_obj, "fico", None) if client_obj else None
         out.append(LoanRead.model_validate(d))
     return out
 
