@@ -90,6 +90,12 @@ class LoanUpdate(BaseModel):
     side: LoanSide | None = None
     stage: LoanStage | None = None
     amount: float | None = None
+    # Broker reassignment (super_admin / loan_exec only — the handler
+    # in routers/loans.py:update_loan already gates the whole PATCH
+    # to that audience). Used by the multi-loan sweep on the agent
+    # assignment flow so reassigning a Client to an agent can also
+    # carry their open loans onto the same broker's pipeline.
+    broker_id: UUID | None = None
     ltv: float | None = None
     ltc: float | None = None
     arv: float | None = None
