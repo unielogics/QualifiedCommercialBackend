@@ -78,6 +78,18 @@ class ConsentState(BaseModel):
 # ── File-level settings (lives in ClientAIPlan.ai_secretary_settings) ─
 
 
+class FollowUpSettingsSchema(BaseModel):
+    """Per-file AI re-engagement cadence. All optional — server falls
+    back to firm default → hard-coded floor when any field is unset.
+
+    See app/services/ai/follow_up.py for the resolver logic."""
+    stall_threshold_minutes: int | None = None
+    max_attempts_per_day: int | None = None
+    max_days_without_reply: int | None = None
+    quiet_hours_start: int | None = None  # 0-23
+    quiet_hours_end: int | None = None    # 0-23
+
+
 class FileSettings(BaseModel):
     """The file-level OutreachMode kill switch + supporting config.
 
@@ -93,6 +105,7 @@ class FileSettings(BaseModel):
     sms_consent: SmsConsent | None = None
     email_opt_out: EmailOptOut | None = None
     default_cadence: CadencePolicy | None = None
+    follow_up: FollowUpSettingsSchema | None = None
 
 
 # ── Read shapes ────────────────────────────────────────────────────
@@ -236,6 +249,7 @@ class FileSettingsUpdate(BaseModel):
     sms_consent: SmsConsent | None = None
     email_opt_out: EmailOptOut | None = None
     default_cadence: CadencePolicy | None = None
+    follow_up: FollowUpSettingsSchema | None = None
 
 
 # ── Wizard intent (pre-loan buffer) ────────────────────────────────

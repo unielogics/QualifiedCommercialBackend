@@ -691,6 +691,44 @@ async def patch_escalation_rules(
     return FundingRulesOut(playbook_id=pb.id, rules=pb.rules or {})
 
 
+@router.get("/follow-up-rules", response_model=FundingRulesOut)
+async def get_follow_up_rules(
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> FundingRulesOut:
+    """Firm-wide default AI re-engagement cadence. Shape:
+        {
+          "stall_threshold_minutes": int,      // wait this long after the last
+                                                // borrower message before AI nudges
+          "max_attempts_per_day":   int,       // skip if >= this many fired in 24h
+          "max_days_without_reply": int,       // stop trying after this many days
+                                                // without a borrower response
+          "quiet_hours_start":       int|null, // 0-23, borrower-local
+          "quiet_hours_end":         int|null
+        }
+    Per-file overrides live on ClientAIPlan.ai_secretary_settings.follow_up
+    (loan side) or Client.ai_cadence_override.follow_up (agent side)."""
+    _require_admin(user)
+    pb = await _ensure_funding_meta_playbook_async(db, user, "follow_up")
+    return FundingRulesOut(playbook_id=pb.id, rules=pb.rules or {})
+
+
+@router.patch("/follow-up-rules", response_model=FundingRulesOut)
+async def patch_follow_up_rules(
+    payload: FundingRulesPatch,
+    user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> FundingRulesOut:
+    _require_admin(user)
+    pb = await _ensure_funding_meta_playbook_async(db, user, "follow_up")
+    old = pb.rules or {}
+    pb.rules = payload.rules or {}
+    await record_event(
+        db, event_type="playbook_edited", actor_type="user", actor_id=user.id,
+        playbook_id=pb.id, old_value=old, new_value=payload.rules,
+    )
+    await db.flush()
+    return FundingRulesOut(playbook_id=pb.id, rules=pb.rules or {})
+
+
 @router.get("/communication-rules", response_model=FundingRulesOut)
 async def get_communication_rules(
     user: CurrentUser, db: AsyncSession = Depends(get_db),

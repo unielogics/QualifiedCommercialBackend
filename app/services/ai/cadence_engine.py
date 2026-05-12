@@ -138,10 +138,104 @@ async def _evaluate_rule(db: AsyncSession, rule: AICadenceRule) -> list[dict[str
             continue  # gate blocked this target
         if await _already_fired_recently(db, rule, t, action_type=effective_action):
             continue
+        # Follow-up cadence gate — per-file or firm default. Skips the
+        # fire if we're inside the stall window, over the daily cap,
+        # or past the max-days-without-reply ceiling. Only applies to
+        # borrower-visible actions; internal-only rules (visibility=
+        # "agent"/"internal") bypass entirely so an operator can still
+        # get their drafts.
+        if rule.visibility == "borrower":
+            block = await _follow_up_blocks(db, rule, t)
+            if block is not None:
+                log.info(
+                    "cadence_engine: rule=%s loan=%s skipped — follow_up=%s",
+                    rule.id, t.get("loan_id"), block,
+                )
+                continue
         outcome = await _fire_action(db, rule, t, effective_action=effective_action)
         if outcome is not None:
             results.append(outcome)
     return results
+
+
+async def _follow_up_blocks(
+    db: AsyncSession,
+    rule: AICadenceRule,
+    target: dict[str, Any],
+) -> str | None:
+    """Returns a skip-reason string if the follow-up cadence settings
+    block this fire, or None when the fire may proceed.
+
+    The settings come from app/services/ai/follow_up.resolve_follow_up
+    which merges per-file → firm-default → floor."""
+    from app.services.ai.follow_up import (
+        count_attempts_in_last_24h,
+        should_followup_now,
+    )
+    from app.models.message import Message
+    from app.models.ai_outreach_event import AIOutreachEvent
+    from app.models.ai_task_assignment import AITaskAssignment
+
+    loan_id = target.get("loan_id")
+    client_id = target.get("client_id")
+    if loan_id is None and client_id is None:
+        return None  # nothing to gate against
+
+    # Observables: last outbound + last borrower reply + first attempt.
+    # Pull from the borrower-portal Message table (loan-scoped). The
+    # cadence engine's AI messages here all carry from_role="ai" and
+    # borrower replies carry from_role="client".
+    last_outbound = None
+    last_borrower_reply = None
+    first_attempt = None
+    if loan_id is not None:
+        msgs = (
+            await db.execute(
+                select(Message)
+                .where(Message.loan_id == loan_id)
+                .order_by(Message.sent_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        for m in msgs:
+            if last_outbound is None and str(m.from_role) == "ai":
+                last_outbound = m.sent_at
+            if last_borrower_reply is None and str(m.from_role) == "client":
+                last_borrower_reply = m.sent_at
+            if last_outbound is not None and last_borrower_reply is not None:
+                break
+
+    # First attempt = the oldest outbound outreach event in the window
+    # since the last borrower reply (or oldest of all if never replied).
+    if loan_id is not None:
+        events = (
+            await db.execute(
+                select(AIOutreachEvent)
+                .join(AITaskAssignment, AITaskAssignment.id == AIOutreachEvent.assignment_id)
+                .where(AIOutreachEvent.direction == "outbound")
+                .where(AIOutreachEvent.status.in_(("sent", "delivered", "drafted")))
+                .order_by(AIOutreachEvent.created_at.asc())
+            )
+        ).scalars().all()
+        # Pick the oldest after the last borrower reply if any, otherwise oldest.
+        for ev in events:
+            if last_borrower_reply is not None and ev.created_at < last_borrower_reply:
+                continue
+            first_attempt = ev.created_at
+            break
+
+    sent_today = await count_attempts_in_last_24h(db, loan_id=loan_id) if loan_id else 0
+
+    decision = await should_followup_now(
+        db,
+        loan_id=loan_id,
+        client_id=client_id,
+        last_outbound_at=last_outbound,
+        last_borrower_reply_at=last_borrower_reply,
+        first_attempt_at=first_attempt,
+        sent_today_count=sent_today,
+    )
+    return None if decision.can_send else decision.reason
 
 
 async def _resolve_ai_owner_gate(
