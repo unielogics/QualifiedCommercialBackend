@@ -179,8 +179,12 @@ class TaskRow(BaseModel):
 class DealSecretaryView(BaseModel):
     """Top-level GET /loans/{id}/deal-secretary response. The picker
     renders `left` and `right` as two columns; the strip at the top
-    reads `file_settings`."""
-    loan_id: UUID
+    reads `file_settings`.
+
+    loan_id is nullable since the client-scoped variant
+    (GET /clients/{id}/ai-follow-up) returns the same shape scoped to
+    a deal — pre-promotion the agent file has no loan yet."""
+    loan_id: UUID | None = None
     client_id: UUID
     left: list[TaskRow]        # owner_type IN (human, shared, funding_locked)
     right: list[TaskRow]       # owner_type = ai

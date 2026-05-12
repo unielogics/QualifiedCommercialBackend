@@ -121,25 +121,16 @@ async def create_deal(
     await db.flush()
     await db.refresh(deal)
 
-    # Bootstrap a realtor-phase ClientAIPlan + CRS rows scoped to this
-    # deal. The Phase 3 hook lives in services/ai/deal_secretary —
-    # extended to accept `deal=` alongside `loan=`. We call it lazily
-    # via a local import to keep the router free of heavy imports.
+    # Bootstrap the realtor-phase ClientAIPlan + CRS rows scoped to
+    # this deal so the AI Secretary tab on /deals/[id] has content
+    # the moment the agent lands. Best-effort — failure here logs but
+    # doesn't roll back deal creation (operator can repair later via
+    # the wizard or the future repair endpoint).
     try:
-        from app.services.ai import deal_secretary as _ds
+        from app.services.ai.deal_secretary import bootstrap_deal_requirement_rows
 
-        if hasattr(_ds, "bootstrap_requirement_status_rows"):
-            await _ds.bootstrap_requirement_status_rows(  # type: ignore[call-arg]
-                db,
-                client=await _load_client_or_404(client_id, user, db),
-                deal=deal,
-            )
-    except TypeError:
-        # The old signature didn't accept `deal=`. That branch is fine
-        # in development; the AI plan will materialize on the next
-        # plan_builder.rebuild call. Phase 3 extends the helper.
-        pass
-    except Exception:  # pragma: no cover — bootstrap is best-effort
+        await bootstrap_deal_requirement_rows(db, deal)
+    except Exception:  # pragma: no cover — best-effort
         pass
 
     return DealOut.model_validate(deal)

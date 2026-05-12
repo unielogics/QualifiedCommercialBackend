@@ -104,6 +104,111 @@ def _context_for_loan(loan: Loan) -> dict[str, Any]:
     return ctx
 
 
+async def bootstrap_deal_requirement_rows(
+    db: AsyncSession,
+    deal,
+    *,
+    log_label: str = "deal_bootstrap",
+) -> dict[str, int]:
+    """Deal-stage variant of bootstrap_requirement_status_rows.
+
+    Creates the realtor-phase ClientRequirementStatus rows scoped to
+    `deal.id` plus a ClientAIPlan row in the same scope, so the agent
+    opens a brand-new file with the right requirement checklist already
+    populated.
+
+    Idempotent — re-running on an existing deal only inserts CRS rows
+    whose (client_id, deal_id, requirement_key) triple isn't already
+    present.
+    """
+    from app.models.client_ai_plan import ClientAIPlan
+    from app.models.deal import Deal as _Deal  # local — avoid circular
+
+    assert isinstance(deal, _Deal)
+    side = deal.side
+    agent_id = deal.assigned_agent_id
+
+    resolved: list[ResolvedRequirement] = await resolve_requirements(
+        db,
+        client_id=deal.client_id,
+        loan_id=None,
+        phase="realtor",
+        loan_product=None,
+        side=side,  # type: ignore[arg-type]
+        agent_id=agent_id,
+        context={"client_type": deal.deal_type, "deal_side": side},
+    )
+
+    existing_keys = {
+        row[0]
+        for row in (
+            await db.execute(
+                select(ClientRequirementStatus.requirement_key)
+                .where(
+                    ClientRequirementStatus.client_id == deal.client_id,
+                    ClientRequirementStatus.deal_id == deal.id,
+                )
+            )
+        ).all()
+    }
+
+    crs_inserted = 0
+    crs_skipped = 0
+    for r in resolved:
+        if r.requirement_key in existing_keys:
+            crs_skipped += 1
+            continue
+        owner_type = r.default_owner_type
+        if not r.can_agent_override and r.source == "funding_required":
+            owner_type = TaskOwnerType.FUNDING_LOCKED.value
+        db.add(
+            ClientRequirementStatus(
+                id=uuid.uuid4(),
+                client_id=deal.client_id,
+                loan_id=None,
+                deal_id=deal.id,
+                requirement_key=r.requirement_key,
+                status="missing",
+                source=r.source,
+                owner_type=owner_type,
+                due_at=None,
+                notes=None,
+            )
+        )
+        crs_inserted += 1
+
+    # Ensure a deal-scoped ClientAIPlan exists for the
+    # ai_secretary_settings (file-level outreach_mode kill switch).
+    plan_exists = (
+        await db.execute(
+            select(ClientAIPlan.id).where(
+                ClientAIPlan.client_id == deal.client_id,
+                ClientAIPlan.deal_id == deal.id,
+            )
+        )
+    ).scalar_one_or_none()
+    plan_created = False
+    if plan_exists is None:
+        db.add(
+            ClientAIPlan(
+                client_id=deal.client_id,
+                deal_id=deal.id,
+                loan_id=None,
+                agent_id=agent_id,
+                current_phase="realtor",
+                ai_secretary_settings={"outreach_mode": "draft_first"},
+            )
+        )
+        plan_created = True
+
+    await db.flush()
+    log.info(
+        "deal_secretary.%s deal_id=%s inserted=%d skipped=%d plan_created=%s",
+        log_label, deal.id, crs_inserted, crs_skipped, plan_created,
+    )
+    return {"crs_inserted": crs_inserted, "crs_skipped": crs_skipped, "plan_created": plan_created}
+
+
 async def bootstrap_requirement_status_rows(
     db: AsyncSession,
     loan: Loan,
