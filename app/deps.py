@@ -273,6 +273,16 @@ async def get_current_user(
             "Auto-provisioned Broker row for user=%s email=%s",
             user.id, user.email,
         )
+    # Presence (alembic 0046) — bump on every authed request. The
+    # column is indexed (partial, WHERE NOT NULL) so future "who's
+    # online" queries stay cheap. We update at most once per minute to
+    # avoid hammering Postgres on the chatty endpoints (workspace,
+    # secretary, recalc) that fire 5-10x per page load.
+    from datetime import timedelta as _td
+    now = datetime.now(timezone.utc)
+    if user.last_seen_at is None or (now - user.last_seen_at) >= _td(seconds=60):
+        user.last_seen_at = now
+        await db.flush()
     return user
 
 

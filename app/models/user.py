@@ -31,6 +31,9 @@ class User(TimestampMixin, Base):
     # Soft-delete: super-admin revoke sets this rather than physically deleting,
     # so historical FK references (loans.broker_id → brokers.user_id, etc.) survive.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Presence (alembic 0046). Bumped automatically by deps.get_current_user
+    # on every authed request. Drives the "online" dot in the loan header.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Optional links to broker/client profiles (one-to-one).
     # foreign_keys disambiguates Client.user_id from the post-0029

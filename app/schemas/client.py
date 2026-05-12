@@ -190,3 +190,7 @@ class ClientRead(ORMModel):
     # round-trip. Never set on Create — populated by the AI as the
     # conversation evolves.
     realtor_profile: dict[str, Any] | None = None
+    # Presence (alembic 0046) — joined from the linked User row. NULL if
+    # the client hasn't signed into the borrower app yet. Drives the
+    # online dot in the loan detail header.
+    last_seen_at: datetime | None = None

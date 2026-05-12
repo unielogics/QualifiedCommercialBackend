@@ -196,11 +196,21 @@ async def refresh_client_living_profile(
 
 @router.get("/{client_id}", response_model=ClientRead)
 async def get_client(client_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ClientRead:
-    stmt = _scope(user, select(Client).where(Client.id == client_id))
+    from sqlalchemy.orm import selectinload
+    stmt = _scope(
+        user,
+        select(Client)
+        .where(Client.id == client_id)
+        .options(selectinload(Client.user)),
+    )
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
-    return ClientRead.model_validate(row)
+    # Project presence from the linked User row (if any).
+    d = ClientRead.model_validate(row).model_dump()
+    linked = getattr(row, "user", None)
+    d["last_seen_at"] = getattr(linked, "last_seen_at", None) if linked else None
+    return ClientRead.model_validate(d)
 
 
 @router.post("", response_model=ClientRead, status_code=status.HTTP_201_CREATED)
