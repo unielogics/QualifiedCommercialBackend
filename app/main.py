@@ -36,6 +36,7 @@ from app.routers import (
     loans,
     messages,
     meta,
+    pipeline as pipeline_router,
     prequal,
     rates,
     reports,
@@ -131,5 +132,6 @@ for r in [
     me.router,
     agents.router,
     deal_secretary.router,
+    pipeline_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)
