@@ -24,7 +24,10 @@ from app.models.activity import Activity
 from app.models.ai_feedback import AIFeedback
 from app.models.ai_modify_correction import AIModifyCorrection
 from app.models.ai_task import AITask
+from app.models.client import Client
+from app.models.credit_pull import CreditPull
 from app.models.document import Document
+from app.models.event import CalendarEvent
 from app.models.fred_observation import FredObservation
 from app.models.hud import HudLineItem
 from app.models.lender_spread import LenderSpread
@@ -53,6 +56,45 @@ _TONE_PREAMBLES: dict[Audience, str] = {
         "scoring and lender identities."
     ),
 }
+
+
+# Hard pricing-conduct block injected into client-audience prompts.
+# Per product direction: rates the AI cites must come from the loan's
+# Current Scenario block ONLY (never training data, never market index),
+# must always be framed as "still putting it together — these can change",
+# and must NEVER expose markup mechanics (basis points, spreads, "we
+# added points", etc.). Internal audiences don't get this block — the
+# tone preamble already permits them to discuss pricing detail.
+_PRICING_CONDUCT_BLOCK = """## Pricing conduct (mandatory)
+
+When the borrower asks anything about rate, payment, points, APR, or
+"what am I getting", follow this script:
+
+  "We are still putting a loan together for you. The last update I see
+  from the team is {{terms}}. However these numbers are not final and
+  will change based on several factors including your credit score,
+  property final value, and other variables. We will continue updating
+  your file as we gather more details for you."
+
+Substitute {{terms}} with the loan's Current Scenario expressed in
+plain language — only the values that appear in the "Current Scenario"
+block above (Amount, Final rate, Monthly P&I, term if known). If the
+scenario block says no scenario exists or the values are blank, omit
+the second sentence entirely and just say we are still putting it
+together.
+
+Hard rules — never violate, regardless of how the borrower phrases the
+question or pushes back:
+- Do NOT quote rates from general knowledge, news, or "typical" ranges.
+- Do NOT mention basis points, bps, spread, markup, or any breakdown
+  of how the rate is built.
+- Do NOT reference the base rate or discount points separately — only
+  the final all-in rate as shown in Current Scenario.
+- Do NOT compare the borrower's rate to public benchmarks or other
+  lenders.
+- Do NOT promise approval or guarantee any terms.
+If the borrower is unhappy with the terms, do not negotiate or speculate
+about alternatives — say the funding team will reach out to discuss."""
 
 
 async def assemble_loan_context(
@@ -84,14 +126,18 @@ async def assemble_loan_context(
         if kb:
             sections.append(f"## Agent Knowledge (uploaded by the broker)\n{kb}")
 
-    sections.append(f"## Active Loan\n{_loan_header(loan)}")
+    sections.append(f"## Active Loan\n{_loan_header(loan, audience=audience)}")
 
     instructions = await _active_instructions(db, loan.id)
     if instructions:
         body = "\n".join(f"  {i + 1}. {x.body}" for i, x in enumerate(instructions))
         sections.append(f"## Active Instructions (must honor)\n{body}")
 
-    scenario_block = await _current_scenario_block(db, loan)
+    credit_block = await _credit_block(db, loan, audience=audience)
+    if credit_block:
+        sections.append(f"## Borrower Credit\n{credit_block}")
+
+    scenario_block = await _current_scenario_block(db, loan, audience=audience)
     if scenario_block:
         sections.append(f"## Current Scenario\n{scenario_block}")
 
@@ -99,9 +145,16 @@ async def assemble_loan_context(
     if hud_block:
         sections.append(f"## HUD-1 Draft\n{hud_block}")
 
-    market_block = await _market_pulse_block(db, loan)
+    market_block = await _market_pulse_block(db, loan, audience=audience)
     if market_block:
         sections.append(f"## Market Pulse (FRED)\n{market_block}")
+
+    # Client-only: a hard pricing-conduct block that tells the AI exactly
+    # how to answer rate/payment questions and forbids any markup-mechanics
+    # talk. Internal audiences don't need this — the broker/super_admin
+    # tone preamble already lets them discuss pricing detail.
+    if audience == "client":
+        sections.append(_PRICING_CONDUCT_BLOCK)
 
     feedback_block = await _negative_feedback_block(db, loan.id)
     if feedback_block:
@@ -126,6 +179,10 @@ async def assemble_loan_context(
     if activity_block:
         sections.append(f"## Recent Activity\n{activity_block}")
 
+    events_block = await _upcoming_events_block(db, loan.id, audience=audience)
+    if events_block:
+        sections.append(f"## Upcoming Events\n{events_block}")
+
     if include_chat_history:
         chat_block = await _chat_history_block(db, loan.id, audience, chat_history_limit)
         if chat_block:
@@ -147,22 +204,165 @@ def _enum_str(v: object) -> str:
     return v.value if hasattr(v, "value") else str(v) if v is not None else "—"
 
 
-def _loan_header(loan: Loan) -> str:
-    # Scope marker + DB key first so the AI knows exactly what
-    # conversation it's in. The bare deal_id (L-XXXX) is what humans
-    # speak; the UUID is the unique key the rest of the platform uses.
+def _loan_header(loan: Loan, *, audience: Audience = "broker") -> str:
+    """Render the loan-level facts that drive every AI reply on this
+    file. The single source of truth is the Loan row — same data the
+    Criteria tab UI reads from, so what the underwriter sees and what
+    the AI sees stay in sync.
+
+    Audience filtering:
+      - client: stage / type / amount / property / final rate / term
+        / close date / DSCR. NEVER: base_rate, discount_points,
+        lender_fees, risk_score, deal_health (those reveal markup
+        mechanics or internal risk scoring).
+      - broker / super_admin: everything.
+    """
+    is_internal = audience != "client"
+
     lines = [
-        f"SCOPE: loan-level conversation",
+        "SCOPE: loan-level conversation",
         f"Loan ID (UUID): {loan.id}",
         f"Deal ID: {loan.deal_id}",
-        f"Property: {loan.address}",
         f"Client ID (UUID): {loan.client_id}",
-        f"  Stage: {_enum_str(loan.stage)} | Type: {_enum_str(loan.type)} | Amount: ${float(loan.amount or 0):,.0f}",
-        f"  LTV: {loan.ltv} | DSCR: {loan.dscr} | Risk: {loan.risk_score}",
-        f"  Deal health: {_enum_str(loan.deal_health)}",
     ]
+
+    # Property block — what the UI surfaces on the Property tab.
+    prop_bits = [loan.address or "—"]
+    if loan.city or loan.state:
+        prop_bits.append(f"{loan.city or '?'}, {loan.state or '?'}")
+    lines.append(f"Property: {', '.join(prop_bits)}")
+    prop_detail = []
+    if loan.property_type:
+        prop_detail.append(f"type {_enum_str(loan.property_type)}")
+    if loan.unit_count:
+        prop_detail.append(f"{loan.unit_count} units")
+    if loan.beds is not None:
+        prop_detail.append(f"{loan.beds} bd")
+    if loan.baths is not None:
+        prop_detail.append(f"{loan.baths} ba")
+    if loan.sqft:
+        prop_detail.append(f"{loan.sqft:,} sqft")
+    if loan.year_built:
+        prop_detail.append(f"built {loan.year_built}")
+    if prop_detail:
+        lines.append(f"  {' · '.join(prop_detail)}")
+    if is_internal and (loan.zoning or loan.parcel_id or loan.listing_status):
+        zoning_bits = [
+            f"zoning {loan.zoning}" if loan.zoning else None,
+            f"parcel {loan.parcel_id}" if loan.parcel_id else None,
+            f"listing {loan.listing_status}" if loan.listing_status else None,
+        ]
+        lines.append("  " + " · ".join(b for b in zoning_bits if b))
+
+    # Loan structure — same fields the Criteria tab "Structure" section shows.
+    lines.append(
+        f"Loan: {_enum_str(loan.type)} · {_enum_str(loan.purpose) if loan.purpose else 'purchase'} · "
+        f"side={_enum_str(loan.side)} · stage={_enum_str(loan.stage)}"
+    )
+    struct_bits = []
+    if loan.term_months:
+        struct_bits.append(f"term {loan.term_months}mo")
+    if loan.amortization_style:
+        struct_bits.append(f"amort {_enum_str(loan.amortization_style)}")
+    if is_internal and loan.prepay_penalty:
+        struct_bits.append(f"prepay {_enum_str(loan.prepay_penalty)}")
+    if struct_bits:
+        lines.append(f"  {' · '.join(struct_bits)}")
+    if loan.close_date:
+        lines.append(f"  Close date: {loan.close_date.isoformat()}")
+
+    # Pricing — Criteria tab "Pricing" section. Client sees ONLY the
+    # final rate + amount; internal sees the full breakdown.
+    lines.append(f"Amount: ${float(loan.amount or 0):,.0f}")
+    if loan.final_rate is not None:
+        lines.append(f"  Final rate: {loan.final_rate}")
+    if is_internal:
+        if loan.base_rate is not None:
+            lines.append(f"  Base rate: {loan.base_rate}")
+        if loan.discount_points:
+            lines.append(f"  Discount points: {float(loan.discount_points):.3f}")
+        if loan.origination_pct:
+            lines.append(f"  Origination: {float(loan.origination_pct) * 100:.2f}%")
+        if loan.lender_fees is not None:
+            lines.append(f"  Lender fees: ${float(loan.lender_fees):,.0f}")
+
+    # Collateral — Criteria tab "Collateral" section.
+    if loan.arv is not None or loan.ltv is not None or loan.ltc is not None:
+        coll_bits = []
+        if loan.arv is not None:
+            coll_bits.append(f"ARV ${float(loan.arv):,.0f}")
+        if loan.ltv is not None:
+            coll_bits.append(f"LTV {float(loan.ltv) * 100:.2f}%")
+        if is_internal and loan.ltc is not None:
+            coll_bits.append(f"LTC {float(loan.ltc) * 100:.2f}%")
+        lines.append(f"Collateral: {' · '.join(coll_bits)}")
+
+    # Income / DSCR — Criteria tab "Income" section, DSCR-only fields.
+    if loan.monthly_rent is not None or loan.dscr is not None:
+        inc_bits = []
+        if loan.monthly_rent is not None:
+            inc_bits.append(f"rent ${float(loan.monthly_rent):,.0f}/mo")
+        if loan.dscr is not None:
+            inc_bits.append(f"DSCR {float(loan.dscr):.2f}")
+        if is_internal and loan.vacancy_pct is not None:
+            inc_bits.append(f"vacancy {float(loan.vacancy_pct) * 100:.1f}%")
+        if is_internal and loan.expense_ratio_pct is not None:
+            inc_bits.append(f"expense ratio {float(loan.expense_ratio_pct) * 100:.1f}%")
+        lines.append(f"Income: {' · '.join(inc_bits)}")
+
+    # Carrying costs — Criteria tab "Carrying costs" section.
+    carry_bits = []
+    if loan.annual_taxes:
+        carry_bits.append(f"taxes ${float(loan.annual_taxes):,.0f}/yr")
+    if loan.annual_insurance:
+        carry_bits.append(f"insurance ${float(loan.annual_insurance):,.0f}/yr")
+    if loan.monthly_hoa:
+        carry_bits.append(f"HOA ${float(loan.monthly_hoa):,.0f}/mo")
+    if is_internal and loan.reserves_required is not None:
+        carry_bits.append(f"reserves ${float(loan.reserves_required):,.0f}")
+    if carry_bits:
+        lines.append(f"Carrying: {' · '.join(carry_bits)}")
+
+    # Borrower — Criteria tab "Borrower" section. FICO lives in its
+    # own block (_credit_block); here we surface entity + experience.
+    if is_internal:
+        borrower_bits = []
+        if loan.entity_type:
+            borrower_bits.append(f"entity {_enum_str(loan.entity_type)}")
+        if loan.experience_tier:
+            borrower_bits.append(f"experience {_enum_str(loan.experience_tier)}")
+        if borrower_bits:
+            lines.append(f"Borrower: {' · '.join(borrower_bits)}")
+
+    # Type-specific — Criteria tab "{type}-specific" section. Only the
+    # fields that apply to this loan's type appear here.
+    type_bits = []
+    if is_internal and loan.construction_holdback_pct is not None:
+        type_bits.append(f"construction holdback {float(loan.construction_holdback_pct) * 100:.1f}%")
+    if is_internal and loan.draw_count is not None:
+        type_bits.append(f"{loan.draw_count} draws")
+    if loan.exit_strategy:
+        type_bits.append(f"exit {_enum_str(loan.exit_strategy)}")
+    if is_internal and loan.cash_to_borrower is not None:
+        type_bits.append(f"cash to borrower ${float(loan.cash_to_borrower):,.0f}")
+    if is_internal and loan.seasoning_months is not None:
+        type_bits.append(f"seasoning {loan.seasoning_months}mo")
+    if is_internal and loan.property_count is not None:
+        type_bits.append(f"{loan.property_count} properties")
+    if type_bits:
+        lines.append(f"Type-specific: {' · '.join(type_bits)}")
+
+    # Risk + deal health — internal only.
+    if is_internal:
+        risk_bits = []
+        if loan.risk_score is not None:
+            risk_bits.append(f"risk {loan.risk_score}")
+        risk_bits.append(f"deal health {_enum_str(loan.deal_health)}")
+        lines.append(f"  {' · '.join(risk_bits)}")
+
     if loan.status_summary:
-        lines.append(f"  Living Loan File: {loan.status_summary}")
+        lines.append(f"Living Loan File: {loan.status_summary}")
+
     return "\n".join(lines)
 
 
@@ -177,8 +377,99 @@ async def _active_instructions(db: AsyncSession, loan_id: UUID) -> list[LoanInst
     return list(rows)
 
 
-async def _current_scenario_block(db: AsyncSession, loan: Loan) -> str:
-    """Most recent saved scenario, or the loan's own current terms if none."""
+async def _credit_block(
+    db: AsyncSession,
+    loan: Loan,
+    *,
+    audience: Audience,
+) -> str:
+    """Effective borrower credit + (for internal audiences) a short
+    summary of the latest pull.
+
+    Precedence: `Loan.fico_override` (underwriter set) > `Client.fico`
+    (latest iSoftPull score copied at pull time). When neither is set,
+    we still emit a short note so the AI knows credit isn't on file.
+
+    Audience filtering:
+      - client: effective FICO only + a generic line; no tradeline /
+        derogatory detail. (We don't want the AI quoting the borrower's
+        own credit details back unprompted, even though they technically
+        own the data.)
+      - broker / super_admin: effective FICO + override-vs-pulled
+        labeling + tradeline / public-records / fraud summary from the
+        most-recent CreditPull row's parsed_report.
+    """
+    client = await db.get(Client, loan.client_id) if loan.client_id else None
+    override = loan.fico_override
+    pulled = client.fico if client else None
+    effective = override if override is not None else pulled
+
+    # Most-recent completed pull, for the internal summary.
+    last_pull: CreditPull | None = None
+    if loan.client_id is not None:
+        last_pull = (
+            await db.execute(
+                select(CreditPull)
+                .where(CreditPull.client_id == loan.client_id)
+                .order_by(CreditPull.pulled_at.desc().nullslast())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    if effective is None and last_pull is None:
+        return "  No credit pull on file. Underwriter has not set a FICO override."
+
+    lines: list[str] = []
+    if effective is not None:
+        if audience == "client":
+            lines.append(f"  Credit score on file: {effective}.")
+        else:
+            source = "override" if override is not None else "iSoftPull"
+            lines.append(f"  Effective FICO: {effective} (source: {source})")
+            if override is not None and pulled is not None and pulled != override:
+                lines.append(f"  (Underwriter override; raw pulled score: {pulled})")
+    else:
+        # Pull exists but score didn't land — surface to internal only.
+        if audience != "client":
+            lines.append("  No effective FICO available; underwriter override not set.")
+
+    if audience != "client" and last_pull is not None:
+        ts = last_pull.pulled_at.isoformat() if last_pull.pulled_at else "—"
+        status = last_pull.status.value if hasattr(last_pull.status, "value") else str(last_pull.status)
+        lines.append(f"  Last pull: {ts} (status: {status})")
+        parsed = (last_pull.bureau_response or {}).get("parsed_report") or {}
+        if isinstance(parsed, dict):
+            tradelines = parsed.get("tradelines")
+            if isinstance(tradelines, list) and tradelines:
+                lines.append(f"  Tradelines on report: {len(tradelines)}")
+            inquiries = parsed.get("inquiries")
+            if isinstance(inquiries, list) and inquiries:
+                lines.append(f"  Recent inquiries: {len(inquiries)}")
+            collections = parsed.get("collections")
+            if isinstance(collections, list) and collections:
+                lines.append(f"  Collections: {len(collections)}")
+            public_records = parsed.get("public_records")
+            if isinstance(public_records, list) and public_records:
+                lines.append(f"  Public records: {len(public_records)}")
+            fraud = parsed.get("identity_risk") or parsed.get("fraud_flags")
+            if fraud:
+                lines.append(f"  Identity risk / fraud flags present: {fraud}")
+
+    return "\n".join(lines) if lines else ""
+
+
+async def _current_scenario_block(
+    db: AsyncSession,
+    loan: Loan,
+    *,
+    audience: Audience,
+) -> str:
+    """Most recent saved scenario, or the loan's own current terms if none.
+
+    Audience-filtered: client-audience prompts NEVER see `base_rate` or
+    `discount_points` (the markup components). They see only the
+    final all-in rate + loan amount + monthly P&I + LTV / DSCR. Broker
+    and super_admin see the full breakdown."""
     row = (
         await db.execute(
             select(LoanScenario)
@@ -187,26 +478,32 @@ async def _current_scenario_block(db: AsyncSession, loan: Loan) -> str:
             .limit(1)
         )
     ).scalar_one_or_none()
+    is_internal = audience != "client"
+
     if row is None:
         # Fall back to the loan's stored terms so the AI always has *some*
         # quantitative footing when discussing the scenario.
-        return (
-            f"  (no saved scenario — using stored loan terms)\n"
-            f"  Points: {float(loan.discount_points):.2f}, "
-            f"Amount: ${float(loan.amount):,.0f}, "
-            f"Base rate: {loan.base_rate}, "
-            f"Final rate: {loan.final_rate}"
-        )
+        lines = [
+            "  (no saved scenario — using stored loan terms)",
+            f"  Amount: ${float(loan.amount or 0):,.0f}",
+        ]
+        if is_internal:
+            lines.append(f"  Points: {float(loan.discount_points or 0):.2f}")
+            lines.append(f"  Base rate: {loan.base_rate}")
+        lines.append(f"  Final rate: {loan.final_rate}")
+        return "\n".join(lines)
+
     snap = row.recalc_snapshot or {}
-    return (
-        f"  Saved as: {row.name}\n"
-        f"  Points: {float(row.discount_points):.2f}, "
-        f"Amount: {row.loan_amount}, LTV: {row.ltv}\n"
-        f"  Final rate: {snap.get('final_rate')}, "
-        f"Monthly P&I: {snap.get('monthly_pi')}, "
-        f"DSCR: {snap.get('dscr')}, "
-        f"Cash to close: {snap.get('cash_to_close_pricing')}"
-    )
+    lines = [
+        f"  Saved as: {row.name}",
+        f"  Amount: {row.loan_amount}, LTV: {row.ltv}",
+        f"  Final rate: {snap.get('final_rate')}, Monthly P&I: {snap.get('monthly_pi')}",
+        f"  DSCR: {snap.get('dscr')}, Cash to close: {snap.get('cash_to_close_pricing')}",
+    ]
+    if is_internal:
+        # Insert the internal pricing breakdown right after the saved-name line.
+        lines.insert(1, f"  Points: {float(row.discount_points or 0):.2f}")
+    return "\n".join(lines)
 
 
 async def get_market_pulse(db: AsyncSession, loan: Loan) -> dict | None:
@@ -295,7 +592,18 @@ async def get_market_pulse(db: AsyncSession, loan: Loan) -> dict | None:
     }
 
 
-async def _market_pulse_block(db: AsyncSession, loan: Loan) -> str:
+async def _market_pulse_block(
+    db: AsyncSession,
+    loan: Loan,
+    *,
+    audience: Audience,
+) -> str:
+    """FRED market context. Client-audience prompts get nothing here —
+    the spread / bps / "index + spread" math must never appear in a
+    client-facing system prompt, even as background context, because
+    the AI tends to explain its reasoning."""
+    if audience == "client":
+        return ""
     pulse = await get_market_pulse(db, loan)
     if pulse is None:
         return ""
@@ -430,6 +738,53 @@ async def _recent_activity_block(db: AsyncSession, loan_id: UUID, limit: int = 5
     if not rows:
         return ""
     return "\n".join(f"  - [{a.kind}] {a.summary}" for a in rows)
+
+
+async def _upcoming_events_block(
+    db: AsyncSession,
+    loan_id: UUID,
+    *,
+    audience: Audience,
+    limit: int = 8,
+) -> str:
+    """Next N pending calendar events for this loan, future-only,
+    so the AI knows what's scheduled before proposing or confirming
+    anything date-related.
+
+    Audience filtering:
+      - client: only events the borrower can see (status=PENDING,
+        source IN (manual, auto) — never raw 'ai' source events
+        which haven't been approved yet).
+      - broker / super_admin: all PENDING events including 'ai' source.
+    """
+    from datetime import datetime, timezone as _tz
+    now = datetime.now(_tz.utc)
+    stmt = (
+        select(CalendarEvent)
+        .where(
+            CalendarEvent.loan_id == loan_id,
+            CalendarEvent.starts_at >= now,
+            CalendarEvent.status == "pending",
+        )
+        .order_by(CalendarEvent.starts_at.asc())
+        .limit(limit)
+    )
+    if audience == "client":
+        stmt = stmt.where(CalendarEvent.source.in_(("manual", "auto")))
+    rows = (await db.execute(stmt)).scalars().all()
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for ev in rows:
+        when = ev.starts_at.isoformat() if ev.starts_at else "—"
+        kind = ev.kind.value if hasattr(ev.kind, "value") else str(ev.kind)
+        title = ev.title or "(no title)"
+        if audience == "client":
+            lines.append(f"  - {when} · {title}")
+        else:
+            src = ev.source.value if hasattr(ev.source, "value") else str(ev.source)
+            lines.append(f"  - {when} · [{kind}/{src}] {title}")
+    return "\n".join(lines)
 
 
 async def _chat_history_block(
