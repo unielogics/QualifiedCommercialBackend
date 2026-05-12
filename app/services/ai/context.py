@@ -126,7 +126,7 @@ async def assemble_loan_context(
         if kb:
             sections.append(f"## Agent Knowledge (uploaded by the broker)\n{kb}")
 
-    sections.append(f"## Active Loan\n{_loan_header(loan)}")
+    sections.append(f"## Active Loan\n{_loan_header(loan, audience=audience)}")
 
     instructions = await _active_instructions(db, loan.id)
     if instructions:
@@ -204,22 +204,165 @@ def _enum_str(v: object) -> str:
     return v.value if hasattr(v, "value") else str(v) if v is not None else "—"
 
 
-def _loan_header(loan: Loan) -> str:
-    # Scope marker + DB key first so the AI knows exactly what
-    # conversation it's in. The bare deal_id (L-XXXX) is what humans
-    # speak; the UUID is the unique key the rest of the platform uses.
+def _loan_header(loan: Loan, *, audience: Audience = "broker") -> str:
+    """Render the loan-level facts that drive every AI reply on this
+    file. The single source of truth is the Loan row — same data the
+    Criteria tab UI reads from, so what the underwriter sees and what
+    the AI sees stay in sync.
+
+    Audience filtering:
+      - client: stage / type / amount / property / final rate / term
+        / close date / DSCR. NEVER: base_rate, discount_points,
+        lender_fees, risk_score, deal_health (those reveal markup
+        mechanics or internal risk scoring).
+      - broker / super_admin: everything.
+    """
+    is_internal = audience != "client"
+
     lines = [
-        f"SCOPE: loan-level conversation",
+        "SCOPE: loan-level conversation",
         f"Loan ID (UUID): {loan.id}",
         f"Deal ID: {loan.deal_id}",
-        f"Property: {loan.address}",
         f"Client ID (UUID): {loan.client_id}",
-        f"  Stage: {_enum_str(loan.stage)} | Type: {_enum_str(loan.type)} | Amount: ${float(loan.amount or 0):,.0f}",
-        f"  LTV: {loan.ltv} | DSCR: {loan.dscr} | Risk: {loan.risk_score}",
-        f"  Deal health: {_enum_str(loan.deal_health)}",
     ]
+
+    # Property block — what the UI surfaces on the Property tab.
+    prop_bits = [loan.address or "—"]
+    if loan.city or loan.state:
+        prop_bits.append(f"{loan.city or '?'}, {loan.state or '?'}")
+    lines.append(f"Property: {', '.join(prop_bits)}")
+    prop_detail = []
+    if loan.property_type:
+        prop_detail.append(f"type {_enum_str(loan.property_type)}")
+    if loan.unit_count:
+        prop_detail.append(f"{loan.unit_count} units")
+    if loan.beds is not None:
+        prop_detail.append(f"{loan.beds} bd")
+    if loan.baths is not None:
+        prop_detail.append(f"{loan.baths} ba")
+    if loan.sqft:
+        prop_detail.append(f"{loan.sqft:,} sqft")
+    if loan.year_built:
+        prop_detail.append(f"built {loan.year_built}")
+    if prop_detail:
+        lines.append(f"  {' · '.join(prop_detail)}")
+    if is_internal and (loan.zoning or loan.parcel_id or loan.listing_status):
+        zoning_bits = [
+            f"zoning {loan.zoning}" if loan.zoning else None,
+            f"parcel {loan.parcel_id}" if loan.parcel_id else None,
+            f"listing {loan.listing_status}" if loan.listing_status else None,
+        ]
+        lines.append("  " + " · ".join(b for b in zoning_bits if b))
+
+    # Loan structure — same fields the Criteria tab "Structure" section shows.
+    lines.append(
+        f"Loan: {_enum_str(loan.type)} · {_enum_str(loan.purpose) if loan.purpose else 'purchase'} · "
+        f"side={_enum_str(loan.side)} · stage={_enum_str(loan.stage)}"
+    )
+    struct_bits = []
+    if loan.term_months:
+        struct_bits.append(f"term {loan.term_months}mo")
+    if loan.amortization_style:
+        struct_bits.append(f"amort {_enum_str(loan.amortization_style)}")
+    if is_internal and loan.prepay_penalty:
+        struct_bits.append(f"prepay {_enum_str(loan.prepay_penalty)}")
+    if struct_bits:
+        lines.append(f"  {' · '.join(struct_bits)}")
+    if loan.close_date:
+        lines.append(f"  Close date: {loan.close_date.isoformat()}")
+
+    # Pricing — Criteria tab "Pricing" section. Client sees ONLY the
+    # final rate + amount; internal sees the full breakdown.
+    lines.append(f"Amount: ${float(loan.amount or 0):,.0f}")
+    if loan.final_rate is not None:
+        lines.append(f"  Final rate: {loan.final_rate}")
+    if is_internal:
+        if loan.base_rate is not None:
+            lines.append(f"  Base rate: {loan.base_rate}")
+        if loan.discount_points:
+            lines.append(f"  Discount points: {float(loan.discount_points):.3f}")
+        if loan.origination_pct:
+            lines.append(f"  Origination: {float(loan.origination_pct) * 100:.2f}%")
+        if loan.lender_fees is not None:
+            lines.append(f"  Lender fees: ${float(loan.lender_fees):,.0f}")
+
+    # Collateral — Criteria tab "Collateral" section.
+    if loan.arv is not None or loan.ltv is not None or loan.ltc is not None:
+        coll_bits = []
+        if loan.arv is not None:
+            coll_bits.append(f"ARV ${float(loan.arv):,.0f}")
+        if loan.ltv is not None:
+            coll_bits.append(f"LTV {float(loan.ltv) * 100:.2f}%")
+        if is_internal and loan.ltc is not None:
+            coll_bits.append(f"LTC {float(loan.ltc) * 100:.2f}%")
+        lines.append(f"Collateral: {' · '.join(coll_bits)}")
+
+    # Income / DSCR — Criteria tab "Income" section, DSCR-only fields.
+    if loan.monthly_rent is not None or loan.dscr is not None:
+        inc_bits = []
+        if loan.monthly_rent is not None:
+            inc_bits.append(f"rent ${float(loan.monthly_rent):,.0f}/mo")
+        if loan.dscr is not None:
+            inc_bits.append(f"DSCR {float(loan.dscr):.2f}")
+        if is_internal and loan.vacancy_pct is not None:
+            inc_bits.append(f"vacancy {float(loan.vacancy_pct) * 100:.1f}%")
+        if is_internal and loan.expense_ratio_pct is not None:
+            inc_bits.append(f"expense ratio {float(loan.expense_ratio_pct) * 100:.1f}%")
+        lines.append(f"Income: {' · '.join(inc_bits)}")
+
+    # Carrying costs — Criteria tab "Carrying costs" section.
+    carry_bits = []
+    if loan.annual_taxes:
+        carry_bits.append(f"taxes ${float(loan.annual_taxes):,.0f}/yr")
+    if loan.annual_insurance:
+        carry_bits.append(f"insurance ${float(loan.annual_insurance):,.0f}/yr")
+    if loan.monthly_hoa:
+        carry_bits.append(f"HOA ${float(loan.monthly_hoa):,.0f}/mo")
+    if is_internal and loan.reserves_required is not None:
+        carry_bits.append(f"reserves ${float(loan.reserves_required):,.0f}")
+    if carry_bits:
+        lines.append(f"Carrying: {' · '.join(carry_bits)}")
+
+    # Borrower — Criteria tab "Borrower" section. FICO lives in its
+    # own block (_credit_block); here we surface entity + experience.
+    if is_internal:
+        borrower_bits = []
+        if loan.entity_type:
+            borrower_bits.append(f"entity {_enum_str(loan.entity_type)}")
+        if loan.experience_tier:
+            borrower_bits.append(f"experience {_enum_str(loan.experience_tier)}")
+        if borrower_bits:
+            lines.append(f"Borrower: {' · '.join(borrower_bits)}")
+
+    # Type-specific — Criteria tab "{type}-specific" section. Only the
+    # fields that apply to this loan's type appear here.
+    type_bits = []
+    if is_internal and loan.construction_holdback_pct is not None:
+        type_bits.append(f"construction holdback {float(loan.construction_holdback_pct) * 100:.1f}%")
+    if is_internal and loan.draw_count is not None:
+        type_bits.append(f"{loan.draw_count} draws")
+    if loan.exit_strategy:
+        type_bits.append(f"exit {_enum_str(loan.exit_strategy)}")
+    if is_internal and loan.cash_to_borrower is not None:
+        type_bits.append(f"cash to borrower ${float(loan.cash_to_borrower):,.0f}")
+    if is_internal and loan.seasoning_months is not None:
+        type_bits.append(f"seasoning {loan.seasoning_months}mo")
+    if is_internal and loan.property_count is not None:
+        type_bits.append(f"{loan.property_count} properties")
+    if type_bits:
+        lines.append(f"Type-specific: {' · '.join(type_bits)}")
+
+    # Risk + deal health — internal only.
+    if is_internal:
+        risk_bits = []
+        if loan.risk_score is not None:
+            risk_bits.append(f"risk {loan.risk_score}")
+        risk_bits.append(f"deal health {_enum_str(loan.deal_health)}")
+        lines.append(f"  {' · '.join(risk_bits)}")
+
     if loan.status_summary:
-        lines.append(f"  Living Loan File: {loan.status_summary}")
+        lines.append(f"Living Loan File: {loan.status_summary}")
+
     return "\n".join(lines)
 
 
