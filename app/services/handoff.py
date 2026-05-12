@@ -36,6 +36,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -50,11 +51,15 @@ from app.enums import (
     LoanType,
 )
 from app.models.activity import Activity
+from app.models.ai_chat_thread import AIChatMessage, AIChatThread
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
 from app.models.client_requirement_status import ClientRequirementStatus
 from app.models.deal import Deal
+from app.models.lending_handoff_packet import LendingHandoffPacket
 from app.models.loan import Loan
+from app.models.prequal_request import PrequalRequest
+from app.services.ai.handoff_builder import build_handoff_packet
 
 
 # Map a Deal.deal_type + Loan.purpose hint into a funding_file_kind label.
@@ -310,6 +315,100 @@ async def promote_deal_to_loan(
     except Exception:  # pragma: no cover — best-effort
         pass
 
+    # ── Lending handoff plumbing ────────────────────────────────────
+    # Find the realtor thread (if any) to link the conversation
+    # history. Build the packet via the existing handoff_builder
+    # helper — same shape the prequal flow uses, so the Lending AI
+    # treats deal-promoted handoffs identically to prequal handoffs.
+    realtor_thread = (
+        await db.execute(
+            select(AIChatThread)
+            .where(
+                AIChatThread.client_id == client.id,
+                AIChatThread.loan_id.is_(None),
+                AIChatThread.phase.in_(["realtor", None]),
+            )
+            .order_by(AIChatThread.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    user_id = getattr(user, "id", None)
+    packet_payload = await build_handoff_packet(
+        db,
+        client=client,
+        agent_id=user_id or client.broker_id,
+        realtor_thread_id=realtor_thread.id if realtor_thread else None,
+    )
+    # Prefer our deal-aware handoff_summary over the generic one the
+    # builder composes from realtor_profile alone.
+    packet_payload["handoff_summary"] = handoff_summary
+    # Link the packet to the new loan up front so audit queries can
+    # find it without a roundtrip through PrequalRequest.
+    packet_payload["loan_id"] = loan.id
+
+    # Create the matching PrequalRequest mirroring the existing flow
+    # so downstream queues (admin /prequal-requests, etc.) pick it up.
+    requester_id = client.user_id or user_id or client.broker_id
+    prequal: PrequalRequest | None = None
+    if requester_id is not None:
+        prequal = PrequalRequest(
+            loan_id=loan.id,
+            requester_id=requester_id,
+            target_property_address=address,
+            purchase_price=float(loan.amount or 0),
+            requested_loan_amount=float(loan.amount or 0) * 0.75,
+            loan_type=loan_type if loan_type in ("dscr", "bridge") else "dscr",
+            expected_closing_date=None,
+            borrower_notes=notes,
+        )
+        db.add(prequal)
+        await db.flush()
+        packet_payload["prequal_request_id"] = prequal.id
+
+    packet = LendingHandoffPacket(**packet_payload)
+    db.add(packet)
+    await db.flush()
+
+    # Spawn the lending-phase AIChatThread linked to the packet + the
+    # new loan. The realtor thread keeps its history; the lending
+    # thread is the new conversation surface for underwriting.
+    lending_thread: AIChatThread | None = None
+    if user_id is not None:
+        lending_thread = AIChatThread(
+            user_id=user_id,
+            client_id=client.id,
+            loan_id=loan.id,
+            phase="lending",
+            parent_thread_id=realtor_thread.id if realtor_thread else None,
+            handoff_packet_id=packet.id,
+            prequal_request_id=prequal.id if prequal else None,
+            title=f"Lending — {client.name[:80]}",
+        )
+        db.add(lending_thread)
+        await db.flush()
+        packet.lending_thread_id = lending_thread.id
+
+        # Deterministic first message — same composition the existing
+        # prequal flow uses so the Lending AI's first turn looks
+        # identical regardless of which handoff path fired.
+        first_msg_body = _compose_first_lending_message(packet_payload, client)
+        db.add(
+            AIChatMessage(
+                thread_id=lending_thread.id,
+                role="assistant",
+                body=first_msg_body,
+                actions=None,
+                attachments=None,
+            )
+        )
+        lending_thread.last_message_preview = first_msg_body[:200]
+        lending_thread.last_message_at = datetime.now(timezone.utc)
+
+    # Mark realtor thread phase=realtor if it was NULL (legacy threads).
+    if realtor_thread is not None and realtor_thread.phase is None:
+        realtor_thread.phase = "realtor"
+
     # Mark the deal promoted.
     deal.handoff_status = DealHandoffStatus.PROMOTED.value
     deal.status = DealStatus.PROMOTED.value
@@ -342,12 +441,45 @@ async def promote_deal_to_loan(
     return PromoteResult(
         loan=loan,
         deal=deal,
+        handoff_packet_id=packet.id,
+        prequal_request_id=prequal.id if prequal else None,
+        lending_thread_id=lending_thread.id if lending_thread else None,
         handoff_summary=handoff_summary,
         missing_lending_items=[
             str(item.get("requirement_key") or item.get("label") or "")
             for item in snapshot["missing_lending_items"]
         ],
     )
+
+
+def _compose_first_lending_message(packet: dict[str, Any], client: Client) -> str:
+    """Build the deterministic first-message body the Lending AI drops
+    into the freshly-spawned lending thread. Mirrors
+    routers/clients._compose_first_lending_message so the Lending AI's
+    first turn is identical regardless of which handoff path fired."""
+    lines: list[str] = [f"I have {client.name} marked as ready for lending."]
+    summary = packet.get("handoff_summary") or ""
+    if summary:
+        lines.append("")
+        lines.append("Here's what I already know from the realtor side:")
+        for s in summary.split("\n"):
+            if s.strip() and not s.lower().startswith("client:"):
+                lines.append(f"  • {s.strip()}")
+    missing = packet.get("missing_lending_items") or []
+    if missing:
+        lines.append("")
+        lines.append("To start the lending package correctly, I still need:")
+        for m in missing[:5]:
+            lines.append(f"  • {_humanize_field(m)}")
+    first_q = packet.get("first_lending_question")
+    if first_q:
+        lines.append("")
+        lines.append(first_q)
+    return "\n".join(lines)
+
+
+def _humanize_field(field: str) -> str:
+    return field.replace("_", " ").replace(".", " · ").capitalize()
 
 
 __all__ = ["promote_deal_to_loan", "PromoteResult"]

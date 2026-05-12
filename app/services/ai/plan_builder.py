@@ -45,6 +45,7 @@ class PlanSnapshot:
     handle the ORM row directly. Mirrors the JSONB columns 1:1."""
     client_id: UUID
     loan_id: UUID | None
+    deal_id: UUID | None
     agent_id: UUID | None
     current_phase: str
     active_playbook_versions: list[dict[str, Any]]
@@ -66,17 +67,23 @@ async def rebuild(
     *,
     client_id: UUID,
     loan_id: UUID | None = None,
+    deal_id: UUID | None = None,
     loan_product: str | None = None,
     side: Literal["buyer", "seller"] | None = None,
 ) -> ClientAIPlan:
-    """Recompute and persist the client_ai_plan row for this
-    (client, loan) scope. Returns the persisted ORM row.
+    """Recompute and persist the client_ai_plan row for this scope.
+
+    Scope is exactly one of (client / deal / loan):
+      - loan_id set → lending phase, loan-scoped plan
+      - deal_id set → realtor phase, deal-scoped plan
+      - neither → realtor phase, true client-level plan
 
     Caller controls the transaction (no commit here)."""
     snapshot = await _compute(
         db,
         client_id=client_id,
         loan_id=loan_id,
+        deal_id=deal_id,
         loan_product=loan_product,
         side=side,
         unsaved_overrides=None,
@@ -89,6 +96,7 @@ async def preview(
     *,
     client_id: UUID,
     loan_id: UUID | None = None,
+    deal_id: UUID | None = None,
     loan_product: str | None = None,
     side: Literal["buyer", "seller"] | None = None,
     overrides: dict[str, Any] | None = None,
@@ -108,6 +116,7 @@ async def preview(
         db,
         client_id=client_id,
         loan_id=loan_id,
+        deal_id=deal_id,
         loan_product=loan_product,
         side=side,
         unsaved_overrides=overrides,
@@ -122,6 +131,7 @@ async def _compute(
     *,
     client_id: UUID,
     loan_id: UUID | None,
+    deal_id: UUID | None = None,
     loan_product: str | None,
     side: Literal["buyer", "seller"] | None,
     unsaved_overrides: dict[str, Any] | None,
@@ -148,7 +158,9 @@ async def _compute(
     context = _build_resolver_context(client, profile)
 
     # ── Pull the existing plan row's pinned versions, if any ───────
-    existing = await _find_existing_plan(db, client_id=client_id, loan_id=loan_id)
+    existing = await _find_existing_plan(
+        db, client_id=client_id, loan_id=loan_id, deal_id=deal_id,
+    )
     pinned_versions: dict[str, int] = {}
     if existing is not None:
         for entry in existing.active_playbook_versions or []:
@@ -169,7 +181,9 @@ async def _compute(
     )
 
     # ── Pull per-requirement statuses for THIS scope ──────────────
-    statuses = await _load_statuses(db, client_id=client_id, loan_id=loan_id)
+    statuses = await _load_statuses(
+        db, client_id=client_id, loan_id=loan_id, deal_id=deal_id,
+    )
     status_by_key = {s.requirement_key: s for s in statuses}
 
     # ── Apply unsaved overrides on top (preview-only path) ─────────
@@ -221,6 +235,7 @@ async def _compute(
     return PlanSnapshot(
         client_id=client_id,
         loan_id=loan_id,
+        deal_id=deal_id,
         agent_id=getattr(client, "agent_id", None),
         current_phase=phase,
         active_playbook_versions=active_versions,
@@ -277,15 +292,29 @@ async def _load_statuses(
     *,
     client_id: UUID,
     loan_id: UUID | None,
+    deal_id: UUID | None = None,
 ) -> list[ClientRequirementStatus]:
-    """Fetch status rows scoped to this (client, loan) pair. Realtor
-    phase reads loan_id IS NULL; lending phase reads the matching
-    loan_id."""
+    """Fetch status rows scoped to one of (client / deal / loan):
+      - loan_id set → loan-scoped rows (deal_id IS NULL)
+      - deal_id set → deal-scoped rows (loan_id IS NULL)
+      - neither → true client-level rows (both NULL)
+    Matches the partial unique indexes added in alembic 0049."""
     q = select(ClientRequirementStatus).where(ClientRequirementStatus.client_id == client_id)
-    if loan_id is None:
-        q = q.where(ClientRequirementStatus.loan_id.is_(None))
+    if loan_id is not None:
+        q = q.where(
+            ClientRequirementStatus.loan_id == loan_id,
+            ClientRequirementStatus.deal_id.is_(None),
+        )
+    elif deal_id is not None:
+        q = q.where(
+            ClientRequirementStatus.deal_id == deal_id,
+            ClientRequirementStatus.loan_id.is_(None),
+        )
     else:
-        q = q.where(ClientRequirementStatus.loan_id == loan_id)
+        q = q.where(
+            ClientRequirementStatus.loan_id.is_(None),
+            ClientRequirementStatus.deal_id.is_(None),
+        )
     return list((await db.execute(q)).scalars().all())
 
 
@@ -294,23 +323,38 @@ async def _find_existing_plan(
     *,
     client_id: UUID,
     loan_id: UUID | None,
+    deal_id: UUID | None = None,
 ) -> ClientAIPlan | None:
     q = select(ClientAIPlan).where(ClientAIPlan.client_id == client_id)
-    if loan_id is None:
-        q = q.where(ClientAIPlan.loan_id.is_(None))
+    if loan_id is not None:
+        q = q.where(
+            ClientAIPlan.loan_id == loan_id,
+            ClientAIPlan.deal_id.is_(None),
+        )
+    elif deal_id is not None:
+        q = q.where(
+            ClientAIPlan.deal_id == deal_id,
+            ClientAIPlan.loan_id.is_(None),
+        )
     else:
-        q = q.where(ClientAIPlan.loan_id == loan_id)
+        q = q.where(
+            ClientAIPlan.loan_id.is_(None),
+            ClientAIPlan.deal_id.is_(None),
+        )
     return (await db.execute(q)).scalar_one_or_none()
 
 
 async def _upsert_plan(db: AsyncSession, snap: PlanSnapshot) -> ClientAIPlan:
     """Insert or update the client_ai_plan row for this scope."""
-    existing = await _find_existing_plan(db, client_id=snap.client_id, loan_id=snap.loan_id)
+    existing = await _find_existing_plan(
+        db, client_id=snap.client_id, loan_id=snap.loan_id, deal_id=snap.deal_id,
+    )
     if existing is None:
         row = ClientAIPlan(
             id=uuid.uuid4(),
             client_id=snap.client_id,
             loan_id=snap.loan_id,
+            deal_id=snap.deal_id,
             agent_id=snap.agent_id,
             current_phase=snap.current_phase,
             active_playbook_versions=snap.active_playbook_versions,

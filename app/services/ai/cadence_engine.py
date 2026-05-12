@@ -252,22 +252,35 @@ async def _resolve_ai_owner_gate(
     Legacy rules pass straight through (requires_ai_owner=False)."""
     requirement_key = target.get("requirement_key")
     loan_id = target.get("loan_id")
+    deal_id = target.get("deal_id")
     client_id = target.get("client_id")
 
-    # If the rule requires an AI-owned CRS row, verify one exists.
+    # If the rule requires an AI-owned CRS row, verify one exists in
+    # the same scope (loan / deal / client-level) as the target.
     if rule.requires_ai_owner:
         if requirement_key is None or client_id is None:
             return None
         from app.enums import TaskOwnerType
-        crs = (
-            await db.execute(
-                select(ClientRequirementStatus).where(
-                    ClientRequirementStatus.client_id == client_id,
-                    ClientRequirementStatus.loan_id == loan_id,
-                    ClientRequirementStatus.requirement_key == requirement_key,
-                )
+        crs_q = select(ClientRequirementStatus).where(
+            ClientRequirementStatus.client_id == client_id,
+            ClientRequirementStatus.requirement_key == requirement_key,
+        )
+        if loan_id is not None:
+            crs_q = crs_q.where(
+                ClientRequirementStatus.loan_id == loan_id,
+                ClientRequirementStatus.deal_id.is_(None),
             )
-        ).scalar_one_or_none()
+        elif deal_id is not None:
+            crs_q = crs_q.where(
+                ClientRequirementStatus.deal_id == deal_id,
+                ClientRequirementStatus.loan_id.is_(None),
+            )
+        else:
+            crs_q = crs_q.where(
+                ClientRequirementStatus.loan_id.is_(None),
+                ClientRequirementStatus.deal_id.is_(None),
+            )
+        crs = (await db.execute(crs_q)).scalar_one_or_none()
         if crs is None or crs.owner_type != TaskOwnerType.AI.value:
             return None
 
@@ -278,14 +291,22 @@ async def _resolve_ai_owner_gate(
         return rule.action_type
 
     plan = None
-    if loan_id is not None or client_id is not None:
-        q = select(ClientAIPlan)
+    if loan_id is not None or deal_id is not None or client_id is not None:
+        q = select(ClientAIPlan).where(ClientAIPlan.client_id == client_id)
         if loan_id is not None:
-            q = q.where(ClientAIPlan.loan_id == loan_id)
-        elif client_id is not None:
             q = q.where(
-                ClientAIPlan.client_id == client_id,
+                ClientAIPlan.loan_id == loan_id,
+                ClientAIPlan.deal_id.is_(None),
+            )
+        elif deal_id is not None:
+            q = q.where(
+                ClientAIPlan.deal_id == deal_id,
                 ClientAIPlan.loan_id.is_(None),
+            )
+        else:
+            q = q.where(
+                ClientAIPlan.loan_id.is_(None),
+                ClientAIPlan.deal_id.is_(None),
             )
         plan = (await db.execute(q)).scalar_one_or_none()
     settings = dict(plan.ai_secretary_settings or {}) if plan else {}
@@ -411,6 +432,7 @@ async def _eligible_targets(
                 "client_id": client.id,
                 "client_name": client.name,
                 "loan_id": status_row.loan_id,
+                "deal_id": status_row.deal_id,
                 "requirement_key": status_row.requirement_key,
                 "assignment_id": assignment.id if assignment else None,
                 "context": context,
@@ -463,6 +485,14 @@ async def _already_fired_recently(
     ]
     if target.get("loan_id") is not None:
         filters.append(AIAuditEvent.loan_id == target.get("loan_id"))
+    # Phase 6 follow-up — partition the 24h dedupe per deal so two
+    # deals on one client (e.g. buyer + seller) with the same
+    # requirement_key don't suppress each other. AIAuditEvent has no
+    # native deal_id column yet, so we filter via payload JSONB.
+    if target.get("deal_id") is not None:
+        filters.append(
+            AIAuditEvent.payload["deal_id"].astext == str(target["deal_id"])
+        )
     rows = (
         await db.execute(select(AIAuditEvent).where(*filters).limit(1))
     ).scalars().all()
@@ -499,6 +529,7 @@ async def _fire_action(
                 "trigger_event": rule.trigger_event,
                 "approval_required": rule.approval_required,
                 "visibility": rule.visibility,
+                "deal_id": str(target.get("deal_id")) if target.get("deal_id") else None,
                 "ai_task_id": str(outcome.get("ai_task_id")) if outcome.get("ai_task_id") else None,
             },
         )
