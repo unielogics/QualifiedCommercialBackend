@@ -1573,3 +1573,309 @@ async def buffer_wizard_intent(
         pending_count=len(pending),
         file_settings=_file_settings_from_jsonb(settings),
     )
+
+
+# ── Client-scoped AI Follow-Up (Phase 5) ────────────────────────────
+#
+# The unified client workspace mounts the same DealSecretaryPicker
+# the loan workbench uses, scoped to either the selected deal or the
+# selected funding file. These endpoints mirror the loan-scoped surface
+# but accept (client_id, deal_id?, loan_id?) instead of just loan_id.
+#
+# Scope resolution:
+#   loan_id provided      → CRS rows where loan_id = :loan_id AND deal_id IS NULL
+#   deal_id provided      → CRS rows where deal_id = :deal_id AND loan_id IS NULL
+#   neither               → CRS rows where loan_id IS NULL AND deal_id IS NULL
+#                          (true client-level — pre-deal, pre-loan rows)
+
+
+async def _resolve_client_and_gate(client_id: UUID, user, db: AsyncSession) -> Client:
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Borrowers cannot manage AI Follow-Up")
+    client = await db.get(Client, client_id)
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.role == Role.BROKER:
+        if user.broker is None or client.broker_id != user.broker.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Client belongs to another agent")
+    return client
+
+
+def _crs_scope_clauses(client_id: UUID, deal_id: UUID | None, loan_id: UUID | None):
+    """Return the WHERE clauses for the scope resolution rules above."""
+    base = [ClientRequirementStatus.client_id == client_id]
+    if loan_id is not None:
+        base.append(ClientRequirementStatus.loan_id == loan_id)
+        base.append(ClientRequirementStatus.deal_id.is_(None))
+    elif deal_id is not None:
+        base.append(ClientRequirementStatus.deal_id == deal_id)
+        base.append(ClientRequirementStatus.loan_id.is_(None))
+    else:
+        base.append(ClientRequirementStatus.loan_id.is_(None))
+        base.append(ClientRequirementStatus.deal_id.is_(None))
+    return base
+
+
+def _plan_scope_clauses(client_id: UUID, deal_id: UUID | None, loan_id: UUID | None):
+    base = [ClientAIPlan.client_id == client_id]
+    if loan_id is not None:
+        base.append(ClientAIPlan.loan_id == loan_id)
+        base.append(ClientAIPlan.deal_id.is_(None))
+    elif deal_id is not None:
+        base.append(ClientAIPlan.deal_id == deal_id)
+        base.append(ClientAIPlan.loan_id.is_(None))
+    else:
+        base.append(ClientAIPlan.loan_id.is_(None))
+        base.append(ClientAIPlan.deal_id.is_(None))
+    return base
+
+
+@router.get(
+    "/clients/{client_id}/ai-follow-up",
+    response_model=DealSecretaryView,
+)
+async def get_client_ai_follow_up(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    deal_id: UUID | None = None,
+    loan_id: UUID | None = None,
+) -> DealSecretaryView:
+    """Two-column view + file settings, scoped per (client, deal, loan)."""
+    client = await _resolve_client_and_gate(client_id, user, db)
+
+    clauses = _crs_scope_clauses(client_id, deal_id, loan_id)
+    crs_rows = (
+        await db.execute(select(ClientRequirementStatus).where(*clauses))
+    ).scalars().all()
+
+    assignment_ids = [r.ai_assignment_id for r in crs_rows if r.ai_assignment_id]
+    assignments_by_id: dict[UUID, AITaskAssignment] = {}
+    if assignment_ids:
+        assignments = (
+            await db.execute(
+                select(AITaskAssignment).where(
+                    AITaskAssignment.id.in_(assignment_ids),
+                    AITaskAssignment.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+        assignments_by_id = {a.id: a for a in assignments}
+
+    keys = list({r.requirement_key for r in crs_rows})
+    catalog_by_key: dict[str, AICollectionRequirement] = {}
+    if keys:
+        cat_rows = (
+            await db.execute(
+                select(AICollectionRequirement)
+                .options(selectinload(AICollectionRequirement.playbook))
+                .where(AICollectionRequirement.requirement_key.in_(keys))
+            )
+        ).scalars().all()
+        priority = {"funding": 3, "platform": 2, "agent": 1}
+        for cat in cat_rows:
+            existing = catalog_by_key.get(cat.requirement_key)
+            owner = cat.playbook.owner_type if cat.playbook else "platform"
+            if existing is None:
+                catalog_by_key[cat.requirement_key] = cat
+                continue
+            existing_owner = existing.playbook.owner_type if existing.playbook else "platform"
+            if priority.get(owner, 0) > priority.get(existing_owner, 0):
+                catalog_by_key[cat.requirement_key] = cat
+
+    left: list[TaskRow] = []
+    right: list[TaskRow] = []
+    funding_locked = 0
+    for crs in crs_rows:
+        cat = catalog_by_key.get(crs.requirement_key)
+        assignment = (
+            assignments_by_id.get(crs.ai_assignment_id) if crs.ai_assignment_id else None
+        )
+        row = _build_task_row(crs, cat, assignment)
+        if row.owner_type == TaskOwnerType.AI.value:
+            right.append(row)
+        else:
+            left.append(row)
+        if row.owner_type == TaskOwnerType.FUNDING_LOCKED.value:
+            funding_locked += 1
+
+    left.sort(key=lambda r: (r.display_order, r.label))
+    right.sort(key=lambda r: (r.display_order, r.label))
+
+    plan = (
+        await db.execute(select(ClientAIPlan).where(*_plan_scope_clauses(client_id, deal_id, loan_id)))
+    ).scalar_one_or_none()
+    file_settings = _file_settings_from_jsonb(plan.ai_secretary_settings if plan else None)
+
+    return DealSecretaryView(
+        loan_id=loan_id,
+        client_id=client.id,
+        left=left,
+        right=right,
+        file_settings=file_settings,
+        funding_locked_count=funding_locked,
+    )
+
+
+async def _resolve_crs(
+    client_id: UUID,
+    requirement_key: str,
+    deal_id: UUID | None,
+    loan_id: UUID | None,
+    db: AsyncSession,
+) -> ClientRequirementStatus:
+    clauses = _crs_scope_clauses(client_id, deal_id, loan_id)
+    clauses.append(ClientRequirementStatus.requirement_key == requirement_key)
+    crs = (
+        await db.execute(select(ClientRequirementStatus).where(*clauses))
+    ).scalar_one_or_none()
+    if crs is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Requirement {requirement_key!r} not found in this scope",
+        )
+    return crs
+
+
+@router.post(
+    "/clients/{client_id}/ai-follow-up/assign",
+    response_model=TaskRow,
+)
+async def assign_client_task(
+    client_id: UUID,
+    payload: AssignRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    deal_id: UUID | None = None,
+    loan_id: UUID | None = None,
+) -> TaskRow:
+    """Client-scoped variant of /loans/{id}/deal-secretary/assign."""
+    await _resolve_client_and_gate(client_id, user, db)
+    crs = await _resolve_crs(client_id, payload.requirement_key, deal_id, loan_id, db)
+
+    cat = (
+        await db.execute(
+            select(AICollectionRequirement)
+            .options(selectinload(AICollectionRequirement.playbook))
+            .where(AICollectionRequirement.requirement_key == payload.requirement_key)
+        )
+    ).scalars().first()
+    if cat is not None and not cat.can_agent_override and not _is_operator(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This requirement is locked by the funding team and cannot be reassigned.",
+        )
+
+    existing = None
+    if crs.ai_assignment_id:
+        existing = (
+            await db.execute(
+                select(AITaskAssignment).where(
+                    AITaskAssignment.id == crs.ai_assignment_id,
+                    AITaskAssignment.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+
+    if existing is not None:
+        _apply_assignment_overrides(existing, payload, cat)
+        _sync_assignment_schedule(existing, crs)
+        crs.owner_type = TaskOwnerType.AI.value
+        await db.flush()
+        await db.refresh(crs)
+        await db.refresh(existing)
+        return _build_task_row(crs, cat, existing)
+
+    assignment = AITaskAssignment(
+        id=uuid.uuid4(),
+        client_requirement_status_id=crs.id,
+        owner_type=TaskOwnerType.AI.value,
+        created_by=user.id,
+    )
+    _apply_assignment_overrides(assignment, payload, cat)
+    _sync_assignment_schedule(assignment, crs)
+    db.add(assignment)
+    await db.flush()
+    crs.owner_type = TaskOwnerType.AI.value
+    crs.ai_assignment_id = assignment.id
+    await db.flush()
+    await db.refresh(crs)
+    await db.refresh(assignment)
+    return _build_task_row(crs, cat, assignment)
+
+
+@router.post(
+    "/clients/{client_id}/ai-follow-up/unassign",
+    response_model=TaskRow,
+)
+async def unassign_client_task(
+    client_id: UUID,
+    payload: UnassignRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    deal_id: UUID | None = None,
+    loan_id: UUID | None = None,
+) -> TaskRow:
+    """Client-scoped variant of /loans/{id}/deal-secretary/unassign."""
+    await _resolve_client_and_gate(client_id, user, db)
+    crs = await _resolve_crs(client_id, payload.requirement_key, deal_id, loan_id, db)
+
+    cat = (
+        await db.execute(
+            select(AICollectionRequirement)
+            .options(selectinload(AICollectionRequirement.playbook))
+            .where(AICollectionRequirement.requirement_key == payload.requirement_key)
+        )
+    ).scalars().first()
+    if cat is not None and not cat.can_agent_override and not _is_operator(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This requirement is locked by the funding team.",
+        )
+
+    if crs.ai_assignment_id:
+        assignment = await db.get(AITaskAssignment, crs.ai_assignment_id)
+        if assignment is not None and assignment.deleted_at is None:
+            assignment.deleted_at = _now()
+    crs.ai_assignment_id = None
+    crs.owner_type = TaskOwnerType.HUMAN.value
+    await db.flush()
+    await db.refresh(crs)
+    return _build_task_row(crs, cat, None)
+
+
+@router.patch(
+    "/clients/{client_id}/ai-follow-up/file-settings",
+    response_model=FileSettings,
+)
+async def update_client_file_settings(
+    client_id: UUID,
+    payload: FileSettingsUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    deal_id: UUID | None = None,
+    loan_id: UUID | None = None,
+) -> FileSettings:
+    """Update file-level outreach mode / consent / deadline for the
+    selected scope. Mirrors /loans/{id}/deal-secretary/file-settings."""
+    await _resolve_client_and_gate(client_id, user, db)
+    plan = (
+        await db.execute(select(ClientAIPlan).where(*_plan_scope_clauses(client_id, deal_id, loan_id)))
+    ).scalar_one_or_none()
+    if plan is None:
+        # Create an empty plan in the right scope so the settings can land.
+        plan = ClientAIPlan(
+            client_id=client_id,
+            loan_id=loan_id,
+            deal_id=deal_id,
+            current_phase="realtor" if loan_id is None else "lending",
+            ai_secretary_settings={"outreach_mode": "portal_auto"},
+        )
+        db.add(plan)
+        await db.flush()
+    settings = dict(plan.ai_secretary_settings or {})
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        settings[k] = v
+    plan.ai_secretary_settings = settings
+    await db.flush()
+    return _file_settings_from_jsonb(settings)
