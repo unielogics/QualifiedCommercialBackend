@@ -51,6 +51,27 @@ async def _load_client_or_404(client_id: UUID, user, db: AsyncSession) -> Client
     return client
 
 
+@router.get("/deals/{deal_id}", response_model=DealOut)
+async def get_deal(
+    deal_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealOut:
+    """Fetch a single deal by id. /deals/[id] page primary loader.
+
+    Visibility:
+      - CLIENT: only their own client's deals
+      - BROKER: only deals on clients they own
+      - SUPER_ADMIN / LOAN_EXEC: all
+    """
+    deal = await db.get(Deal, deal_id)
+    if deal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
+    # Load the client through the scope filter to enforce visibility.
+    await _load_client_or_404(deal.client_id, user, db)
+    return DealOut.model_validate(deal)
+
+
 @router.get("/clients/{client_id}/deals", response_model=list[DealOut])
 async def list_deals(
     client_id: UUID,

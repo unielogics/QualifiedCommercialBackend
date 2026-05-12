@@ -24,6 +24,13 @@ class DealCreate(BaseModel):
     property_id: UUID | None = None
     assigned_agent_id: UUID | None = None
     summary: str | None = None
+    # Property fields the agent may pre-populate at create time. All
+    # optional — they fill in via the Property tab on /deals/[id].
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    property_type: str | None = None
 
 
 class DealUpdate(BaseModel):
@@ -34,6 +41,22 @@ class DealUpdate(BaseModel):
     ai_status: DealAILiteral | None = None
     assigned_agent_id: UUID | None = None
     property_id: UUID | None = None
+    # Property fields — agent edits these on the Property tab.
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    property_type: str | None = None
+    beds: int | None = None
+    baths: float | None = None
+    sqft: int | None = None
+    year_built: int | None = None
+    list_price: float | None = None
+    target_price: float | None = None
+    listing_status: str | None = None
+    mls_number: str | None = None
+    # Private agent notes (Notes tab on /deals/[id]).
+    notes_text: str | None = None
 
 
 class DealOut(ORMModel):
@@ -49,6 +72,22 @@ class DealOut(ORMModel):
     property_id: UUID | None
     assigned_agent_id: UUID | None
     promoted_loan_id: UUID | None
+    # Property fields.
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    property_type: str | None = None
+    beds: int | None = None
+    baths: float | None = None
+    sqft: int | None = None
+    year_built: int | None = None
+    list_price: float | None = None
+    target_price: float | None = None
+    listing_status: str | None = None
+    mls_number: str | None = None
+    # Private agent notes.
+    notes_text: str | None = None
     living_profile: dict[str, Any] | None = None
     created_at: Any
     updated_at: Any

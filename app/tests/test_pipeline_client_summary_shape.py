@@ -42,6 +42,8 @@ def test_pipeline_client_summary_full_payload():
         "loans_count",
         "open_tasks_count",
         "last_activity_at",
+        "primary_deal_id",
+        "primary_deal_title",
     }
     assert set(payload.keys()) == expected
 

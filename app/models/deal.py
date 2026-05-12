@@ -19,7 +19,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ForeignKey, Index, String, Text
+from decimal import Decimal
+
+from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -87,6 +89,31 @@ class Deal(TimestampMixin, Base):
     living_profile: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True,
     )
+
+    # ── Property fields (alembic 0052) ────────────────────────────────
+    # Agent edits these on the Property tab of /deals/[id]. Copied
+    # onto the Loan at promote_deal_to_loan time, so funding sees the
+    # snapshot. Distinct from ClientProperty (which is the broader
+    # buyer-target / seller-listing browser) — these are the
+    # transaction-specific overrides for THIS deal.
+    address: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    zip: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    property_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    beds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    baths: Mapped[Decimal | None] = mapped_column(Numeric(4, 1), nullable=True)
+    sqft: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year_built: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    list_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    listing_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mls_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    # ── Agent-private notes (alembic 0052) ────────────────────────────
+    # Free-text notes visible ONLY to the agent on /deals/[id] Notes tab.
+    # The handoff visibility filter excludes this from funding.
+    notes_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships ───────────────────────────────────────────────────
 

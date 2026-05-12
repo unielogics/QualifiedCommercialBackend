@@ -51,6 +51,13 @@ class PipelineClientSummary(BaseModel):
     loans_count: int = 0
     open_tasks_count: int = 0
     last_activity_at: datetime | None = None
+    # Primary deal pointer so the agent pipeline can route a row click
+    # directly to /deals/{primary_deal_id} without an N+1 fetch. NULL
+    # when the client has no deals yet — click opens a "create file"
+    # modal instead. "Primary" = most-recently-updated non-promoted
+    # deal, falling back to most-recently-updated overall.
+    primary_deal_id: UUID | None = None
+    primary_deal_title: str | None = None
 
 
 @router.get("/client-summary", response_model=list[PipelineClientSummary])
@@ -143,16 +150,30 @@ async def client_summary(
     }
 
     # Handoff status — pick the most aggressive across deals (promoted
-    # wins, then requested, then none).
+    # wins, then requested, then none). Also pick a "primary" deal per
+    # client for routing: most-recently-updated non-promoted deal, with
+    # fallback to most-recently-updated overall.
     _HANDOFF_RANK = {"none": 0, "requested": 1, "packet_built": 2, "promoted": 3}
     deals_full = (
-        await db.execute(select(Deal).where(Deal.client_id.in_(visible_list)))
+        await db.execute(
+            select(Deal)
+            .where(Deal.client_id.in_(visible_list))
+            .order_by(Deal.updated_at.desc())
+        )
     ).scalars().all()
     handoff_by_client: dict[UUID, str] = {}
+    primary_deal_by_client: dict[UUID, Deal] = {}
+    primary_promoted_fallback: dict[UUID, Deal] = {}
     for d in deals_full:
         cur = handoff_by_client.get(d.client_id, "none")
         if _HANDOFF_RANK.get(d.handoff_status, 0) > _HANDOFF_RANK.get(cur, 0):
             handoff_by_client[d.client_id] = d.handoff_status
+        # Primary picker — first non-promoted wins (rows are ordered
+        # desc by updated_at so this is the most-recent active one).
+        if d.status != "promoted" and d.client_id not in primary_deal_by_client:
+            primary_deal_by_client[d.client_id] = d
+        if d.client_id not in primary_promoted_fallback:
+            primary_promoted_fallback[d.client_id] = d
 
     # AgentTask open count per client (Phase 7).
     tasks_q = (
@@ -188,6 +209,7 @@ async def client_summary(
         # missing > 0 AND next_follow_up_at is None.
         next_at = next_run_by_client.get(cid)
         human_needed = missing > 0 and next_at is None
+        primary = primary_deal_by_client.get(cid) or primary_promoted_fallback.get(cid)
         out.append(
             PipelineClientSummary(
                 client_id=cid,
@@ -206,6 +228,8 @@ async def client_summary(
                 loans_count=loans_by_client.get(cid, 0),
                 open_tasks_count=tasks_by_client.get(cid, 0),
                 last_activity_at=None,  # Reserved — keep payload tight.
+                primary_deal_id=primary.id if primary else None,
+                primary_deal_title=primary.title if primary else None,
             )
         )
     return out

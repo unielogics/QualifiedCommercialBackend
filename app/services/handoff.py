@@ -282,18 +282,29 @@ async def promote_deal_to_loan(
     loan_purpose = override_purpose or LoanPurpose.PURCHASE.value
     side = LoanSide.SELLER.value if deal.side == "seller" else LoanSide.BUYER.value
 
-    address = client.address or "Property TBD"
+    # Property fields cross-sync from the Deal onto the new Loan.
+    # The agent edits these on /deals/[id]'s Property tab; at promote
+    # time they freeze onto the Loan so funding sees the snapshot.
+    address = deal.address or client.address or "Property TBD"
+    loan_amount = float(deal.list_price or deal.target_price or 0)
     loan = Loan(
         id=uuid.uuid4(),
         deal_id=_gen_deal_id(),
         client_id=client.id,
         broker_id=client.broker_id,
         address=address,
+        city=deal.city,
+        state=deal.state,
+        property_type=deal.property_type or "sfr",
+        beds=deal.beds,
+        baths=deal.baths,
+        sqft=deal.sqft,
+        year_built=deal.year_built,
         type=loan_type,
         purpose=loan_purpose,
         side=side,
         stage=LoanStage.PREQUALIFIED.value,
-        amount=0,
+        amount=loan_amount,
         source_deal_id=deal.id,
         baseline_profile_snapshot=snapshot,
         handoff_summary=handoff_summary,
