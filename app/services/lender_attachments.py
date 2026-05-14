@@ -65,13 +65,16 @@ class AttachmentError(ValueError):
 
 
 def _s3_client():
+    """Boto3 S3 client. Prefers explicit env keys when set, otherwise
+    falls through to the default credential chain (EC2 instance role,
+    ECS task role, ~/.aws/credentials, etc.) — production uses an
+    instance role here so the explicit keys are blank by design."""
     s = get_settings()
-    return boto3.client(
-        "s3",
-        aws_access_key_id=s.aws_access_key_id or None,
-        aws_secret_access_key=s.aws_secret_access_key or None,
-        region_name=s.aws_region,
-    )
+    kwargs: dict[str, str] = {"region_name": s.aws_region}
+    if s.aws_access_key_id and s.aws_secret_access_key:
+        kwargs["aws_access_key_id"] = s.aws_access_key_id
+        kwargs["aws_secret_access_key"] = s.aws_secret_access_key
+    return boto3.client("s3", **kwargs)
 
 
 def _safe_filename(raw: str) -> str:
@@ -123,7 +126,7 @@ async def init_outbound_upload(
     await db.flush()
 
     upload_url: str | None = None
-    if settings.s3_bucket and settings.aws_access_key_id:
+    if settings.s3_bucket:
         upload_url = _s3_client().generate_presigned_url(
             "put_object",
             Params={
@@ -240,7 +243,7 @@ async def presign_download(attachment: MessageAttachment) -> str | None:
     """Return a short-lived signed GET URL the browser can hit to
     download the file. None if S3 isn't configured."""
     settings = get_settings()
-    if not (settings.s3_bucket and settings.aws_access_key_id and attachment.s3_key):
+    if not (settings.s3_bucket and attachment.s3_key):
         return None
     return _s3_client().generate_presigned_url(
         "get_object",
@@ -264,7 +267,7 @@ async def materialize_attachments_for_send(
     attachment whose s3 fetch fails so a single bad file doesn't
     block the rest of the send (logged)."""
     settings = get_settings()
-    if not (settings.s3_bucket and settings.aws_access_key_id):
+    if not settings.s3_bucket:
         return []
     s3 = _s3_client()
     out: list[dict[str, Any]] = []
@@ -310,7 +313,7 @@ async def ingest_inbound_attachment(
     anywhere else; the Message body's text content still lands so
     the operator at least has the conversation)."""
     settings = get_settings()
-    if not (settings.s3_bucket and settings.aws_access_key_id):
+    if not settings.s3_bucket:
         log.warning(
             "ingest_inbound_attachment: S3 not configured; skipping %s",
             filename,
