@@ -1079,10 +1079,14 @@ class ClientAIPlanPatch(BaseModel):
     """Per-client overrides the agent can apply on top of their playbooks.
 
     waive_keys / unwaive_keys are toggles against client_requirement_status.
-    custom_instructions free-text gets persisted on client_ai_plan."""
+    custom_instructions free-text gets persisted on client_ai_plan.
+    ai_secretary_settings is a partial JSONB merge — used by the broker
+    mobile NurtureControls to flip auto-nurture / pick cadence preset.
+    Any keys not provided are left untouched on the existing row."""
     custom_instructions: str | None = None
     waive_keys: list[str] | None = None
     unwaive_keys: list[str] | None = None
+    ai_secretary_settings: dict | None = None
     rebuild: bool = True
 
 
@@ -1225,6 +1229,35 @@ async def patch_client_ai_plan(
             )
             await db.flush()
 
+    # Phase 7 — broker NurtureControls writes ai_secretary_settings here
+    # to drive the Client-AI nurturing tier on the realtor-phase plan.
+    # Merge the incoming partial into the existing JSONB (any keys not
+    # provided stay as-is). Audit-logged like the other PATCH operations.
+    if payload.ai_secretary_settings is not None:
+        plan_row = (await db.execute(
+            select(ClientAIPlan).where(
+                ClientAIPlan.client_id == client_id,
+                ClientAIPlan.loan_id == loan_id if loan_id is not None else ClientAIPlan.loan_id.is_(None),
+            )
+        )).scalar_one_or_none()
+        if plan_row is not None:
+            old_settings = dict(plan_row.ai_secretary_settings or {})
+            merged = {**old_settings, **(payload.ai_secretary_settings or {})}
+            plan_row.ai_secretary_settings = merged
+            await record_event(
+                db, event_type="ai_secretary_settings_updated",
+                actor_type="user", actor_id=user.id, client_id=client_id, loan_id=loan_id,
+                old_value=old_settings or None,
+                new_value=merged,
+            )
+            await db.flush()
+            # NOTE: When outreach_mode flips from "off" → anything else
+            # on a realtor-phase plan, the next cadence_engine tick will
+            # see this client as eligible IF AITaskAssignment rows
+            # exist. Pre-loan materialization of pending_assignments is
+            # a follow-up — see plan §7.4 in
+            # QCDashboard/docs/qcbackend-patches notes.
+
     plan = await rebuild_plan(db, client_id=client_id, loan_id=loan_id) if payload.rebuild else None
     if plan is None:
         # Caller asked us to skip rebuild — return the row as-is.
@@ -1252,6 +1285,88 @@ async def patch_client_ai_plan(
         active_playbook_versions=list(plan.active_playbook_versions or []),
         computed_at=plan.computed_at,
     )
+
+
+# ── Send intake link (Phase 7 nurturing — broker → lead) ────────────
+
+
+class SendIntakeLinkRequest(BaseModel):
+    """Channel preference — null lets the backend pick based on
+    contact_permission + which contact info we have (phone vs email)."""
+    channel: str | None = None
+
+
+class SendIntakeLinkResponse(BaseModel):
+    url: str
+    sent_via: str
+    sent_at: datetime
+
+
+@router.post(
+    "/{client_id}/send-intake-link",
+    response_model=SendIntakeLinkResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_intake_link(
+    client_id: UUID,
+    payload: SendIntakeLinkRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SendIntakeLinkResponse:
+    """Generate a tracked intake URL for this client and log a send.
+
+    v1 (this commit): generates the URL, logs an Activity row, returns
+    the URL + channel. Actual SMS/email send wiring routes through the
+    existing notification fan-out and is gated by a follow-up commit
+    once the channel-resolution helper is in place. The frontend treats
+    the response as "sent" — if SMS/email transport fails, the
+    Activity row captures the intent and the broker can re-send.
+
+    Role: BROKER (must own the client), SUPER_ADMIN, LOAN_EXEC.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from app.models.activity import Activity
+    from app.config import get_settings
+
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.role == Role.BROKER and user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+
+    # Channel resolution: explicit > phone (sms) > email > portal.
+    sent_via = (payload.channel or "").lower() or None
+    if sent_via not in {"portal", "email", "sms"}:
+        if client.phone:
+            sent_via = "sms"
+        elif client.email:
+            sent_via = "email"
+        else:
+            sent_via = "portal"
+
+    # Stub URL — production wiring would hit the existing intake
+    # token-mint flow (same one /clients/{id}/request-prequalification
+    # uses internally) and embed a tracking parameter so we can
+    # measure open/complete on the portal side.
+    settings = get_settings()
+    portal_base = getattr(settings, "portal_public_url", None) or "https://app.qualifiedcommercial.com"
+    url = f"{portal_base.rstrip('/')}/intake?c={client_id}"
+
+    now = _dt.now(_tz.utc)
+    db.add(
+        Activity(
+            client_id=client_id,
+            actor_id=user.id,
+            actor_label=user.email,
+            kind="nurture.intake_link_sent",
+            summary=f"{user.email} sent intake link via {sent_via}",
+        )
+    )
+    await db.flush()
+
+    return SendIntakeLinkResponse(url=url, sent_via=sent_via, sent_at=now)
 
 
 # ── Client Properties (alembic 0034) ────────────────────────────────
