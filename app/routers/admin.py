@@ -83,7 +83,7 @@ async def connect_lender_health(
         HealthCheck(
             name="Super admin role",
             status="ok",
-            detail=f"Authenticated as {user.email} ({user.role.value}).",
+            detail=f"Authenticated as {user.email} ({user.role.value if hasattr(user.role, 'value') else user.role}).",
         )
     )
 

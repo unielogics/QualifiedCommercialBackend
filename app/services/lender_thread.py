@@ -531,7 +531,11 @@ async def post_reply(
             f"Lender '{lender.name}' has no submission_email or contact_email."
         )
 
-    actor_label = actor.name or actor.email or actor.role.value
+    actor_label = (
+        actor.name
+        or actor.email
+        or (actor.role.value if hasattr(actor.role, "value") else str(actor.role))
+    )
     subject_base = f"Re: {loan.address}"
     subject = inject_deal_id(subject_base, loan.deal_id)
 
@@ -622,7 +626,7 @@ async def post_reply(
         status=status,
         triggered_by_kind="lender_thread_send_now" if mode == "send_now" else "lender_thread_instruct_ai",
         triggered_by_payload={
-            "actor_role": actor.role.value,
+            "actor_role": actor.role.value if hasattr(actor.role, "value") else str(actor.role),
             "instruction": text.strip() if mode == "instruct_ai" else None,
         },
         actioned_by=actor_for_label,
