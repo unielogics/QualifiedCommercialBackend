@@ -105,6 +105,12 @@ class ThreadEntry:
     is_ai_drafted: bool = False
     sent_message_id: str | None = None
     draft_id: str | None = None  # only populated for pending_draft
+    # Round-2: surface the actual delivery outcome so the UI can show a
+    # green/amber/red pill instead of treating every "outbound" as if it
+    # went out.
+    send_status: Literal["sent", "saved", "failed", "n/a"] = "n/a"
+    send_note: str | None = None
+    to_email: str | None = None
 
 
 @dataclass
@@ -172,26 +178,53 @@ def _lender_display_name(loan: Loan, viewer_role: Role) -> str:
 
 def _resolve_outbound_sender(
     msg: Message,
-    drafts_sent: list[EmailDraft],
-) -> tuple[str, str | None]:
+    outbound_drafts: list[EmailDraft],
+) -> tuple[str, EmailDraft | None]:
     """Find which EmailDraft row recorded this outbound Message. Returns
-    (sender_label, sent_message_id). Falls back to "Internal team" if no
-    draft within the window was found."""
+    (sender_label, draft). Matching is by closest timestamp within a
+    60s window — the reply handler writes both rows in the same
+    transaction so they cluster.
+
+    We deliberately accept any non-PENDING outbound draft (status in
+    {SENT, APPROVED}) so the saved-only path (Gmail not configured →
+    APPROVED) is also matched. The caller derives send_status from the
+    returned draft's status + sent_message_id."""
     nearest: EmailDraft | None = None
     best_delta = _SENDER_MATCH_WINDOW
-    for d in drafts_sent:
-        # EmailDraft has TimestampMixin → updated_at; that's when status
-        # flipped to SENT. We use updated_at as the proxy for "sent at".
-        if d.updated_at is None:
+    for d in outbound_drafts:
+        # EmailDraft has TimestampMixin → updated_at on SENT, created_at
+        # on the original write. created_at is more reliable since
+        # APPROVED rows may never be re-updated.
+        ts = d.updated_at or d.created_at
+        if ts is None:
             continue
-        delta = abs(msg.sent_at - d.updated_at)
+        delta = abs(msg.sent_at - ts)
         if delta <= best_delta:
             best_delta = delta
             nearest = d
     if nearest is None:
         return ("Internal team", None)
     label = nearest.actioned_by or "Internal team"
-    return (label, nearest.sent_message_id)
+    return (label, nearest)
+
+
+def _derive_send_status(draft: EmailDraft | None) -> tuple[str, str | None]:
+    """Translate an EmailDraft row into (send_status, sent_message_id)
+    for the UI pill. send_status is one of:
+      - "sent"   : Gmail confirmed delivery with a message_id
+      - "saved"  : message saved but NOT sent (Gmail not configured)
+      - "failed" : reserved for the (should-never-happen) state where
+                   status=SENT but message_id is null
+      - "n/a"    : matching draft not found
+    """
+    if draft is None:
+        return ("n/a", None)
+    if draft.status == EmailDraftStatus.SENT:
+        if draft.sent_message_id:
+            return ("sent", draft.sent_message_id)
+        return ("failed", None)
+    # APPROVED, PENDING, DISMISSED all => saved (not delivered)
+    return ("saved", None)
 
 
 async def load_thread(
@@ -220,8 +253,39 @@ async def load_thread(
         )
     ).scalars().all()
 
-    drafts_sent = [d for d in draft_rows if d.status == EmailDraftStatus.SENT]
+    # Outbound drafts = anything that's NOT pending (already actioned or
+    # saved). Used to match outbound Message rows to their corresponding
+    # EmailDraft so we can derive send_status.
+    outbound_drafts = [d for d in draft_rows if d.status != EmailDraftStatus.PENDING]
     drafts_pending = [d for d in draft_rows if d.status == EmailDraftStatus.PENDING]
+
+    # Pull recent Activity rows so we can attach the verbatim "Gmail
+    # not configured / send failed / sent" note to each outbound entry.
+    # The note lives in activities.payload.note and was written by
+    # post_reply at send time.
+    activity_rows = (
+        await db.execute(
+            select(Activity)
+            .where(Activity.loan_id == loan.id)
+            .where(Activity.kind.in_(["lender_thread.replied", "lender_thread.ai_replied"]))
+            .order_by(Activity.occurred_at.asc())
+        )
+    ).scalars().all()
+
+    def _note_for_msg(msg: Message) -> str | None:
+        nearest: Activity | None = None
+        best_delta = _SENDER_MATCH_WINDOW
+        for a in activity_rows:
+            if a.occurred_at is None:
+                continue
+            delta = abs(msg.sent_at - a.occurred_at)
+            if delta <= best_delta:
+                best_delta = delta
+                nearest = a
+        if nearest is None or not nearest.payload:
+            return None
+        n = nearest.payload.get("note")
+        return str(n) if n else None
 
     lender_label = _lender_display_name(loan, viewer.role)
     entries: list[ThreadEntry] = []
@@ -241,10 +305,12 @@ async def load_thread(
                     sender_role="lender",
                     sent_at=m.sent_at,
                     body=body,
+                    send_status="n/a",
                 )
             )
         elif m.from_role == MessageFrom.AI:
-            sender_label, sent_msg_id = _resolve_outbound_sender(m, drafts_sent)
+            sender_label, draft = _resolve_outbound_sender(m, outbound_drafts)
+            status, sent_msg_id = _derive_send_status(draft)
             entries.append(
                 ThreadEntry(
                     id=str(m.id),
@@ -253,12 +319,17 @@ async def load_thread(
                     sender_role="ai",
                     sent_at=m.sent_at,
                     body=body,
+                    subject=draft.subject if draft else None,
                     is_ai_drafted=True,
                     sent_message_id=sent_msg_id,
+                    send_status=status,
+                    send_note=_note_for_msg(m),
+                    to_email=draft.to_email if draft else None,
                 )
             )
         elif m.from_role == MessageFrom.BROKER:
-            sender_label, sent_msg_id = _resolve_outbound_sender(m, drafts_sent)
+            sender_label, draft = _resolve_outbound_sender(m, outbound_drafts)
+            status, sent_msg_id = _derive_send_status(draft)
             entries.append(
                 ThreadEntry(
                     id=str(m.id),
@@ -267,7 +338,11 @@ async def load_thread(
                     sender_role="broker",
                     sent_at=m.sent_at,
                     body=body,
+                    subject=draft.subject if draft else None,
                     sent_message_id=sent_msg_id,
+                    send_status=status,
+                    send_note=_note_for_msg(m),
+                    to_email=draft.to_email if draft else None,
                 )
             )
         # MessageFrom.CLIENT is intentionally skipped — the lender thread
@@ -288,6 +363,9 @@ async def load_thread(
                 body=body,
                 subject=d.subject,
                 draft_id=str(d.id),
+                to_email=d.to_email,
+                send_status="saved",
+                send_note="Draft — will not be sent until approved.",
             )
         )
 
@@ -657,6 +735,7 @@ async def post_reply(
     await db.refresh(msg)
     await db.refresh(draft)
 
+    derived_status, _ = _derive_send_status(draft)
     entry = ThreadEntry(
         id=str(msg.id),
         kind="ai_outbound" if mode == "instruct_ai" else "outbound",
@@ -664,10 +743,306 @@ async def post_reply(
         sender_role="ai" if mode == "instruct_ai" else "broker",
         sent_at=msg.sent_at,
         body=body,
+        subject=subject,
         is_ai_drafted=mode == "instruct_ai",
         sent_message_id=sent_message_id,
+        send_status=derived_status,
+        send_note=note,
+        to_email=to_email,
     )
     return ReplyResponse(mode=mode, entry=entry, note=note)
+
+
+# ---------------------------------------------------------------------------
+# Round-2 additions: per-message audit + preview-before-send
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GmailPayloadView:
+    """Friendly + raw view of what was (or would be) handed to Gmail."""
+
+    from_email: str
+    to_email: str
+    subject: str
+    body: str
+    raw_base64: str | None
+    would_send_via: str  # "service-account-DWD" | "(not configured)"
+
+
+@dataclass
+class EntryAuditResponse:
+    entry_id: str
+    message: dict[str, Any] | None
+    email_draft: dict[str, Any] | None
+    activity: dict[str, Any] | None
+    gmail_payload: GmailPayloadView | None
+    send_status: str
+    send_note: str | None
+
+
+def _build_gmail_payload_view(
+    *,
+    to_email: str | None,
+    subject: str | None,
+    body: str,
+) -> GmailPayloadView:
+    """Construct the would-be-sent payload. Always computes the base64
+    raw form so the audit drawer can show exactly what hits the wire."""
+    settings = get_settings()
+    delegated = settings.gmail_delegated_user or ""
+    configured = bool(settings.gmail_service_account_path and settings.gmail_delegated_user)
+    # Defensive — surface the user-meaningful subject even when the draft
+    # row was never created (e.g., dev-only inbound entry).
+    subj = subject or "(no subject)"
+    to = to_email or ""
+    # Local import keeps this module testable without google libs installed.
+    from app.services.email.gmail_client import build_message
+
+    built = build_message(to=to, subject=subj, body=body, from_email=delegated or None)
+    return GmailPayloadView(
+        from_email=built.from_email,
+        to_email=built.to_email,
+        subject=built.subject,
+        body=built.body,
+        raw_base64=built.raw_base64,
+        would_send_via="service-account-DWD" if configured else "(not configured)",
+    )
+
+
+async def load_entry_audit(
+    db: AsyncSession,
+    *,
+    loan_id: UUID,
+    entry_id: str,
+    viewer: User,
+) -> EntryAuditResponse:
+    """Return everything we know about a single thread entry — Message
+    row, matched EmailDraft, matched Activity, and the would-be Gmail
+    API payload (computed fresh; not cached).
+
+    `entry_id` is either a Message UUID or `draft:<EmailDraft UUID>` for
+    pending drafts. Super-admin / loan-exec only — caller enforces role.
+    """
+    if viewer.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise LenderThreadError(
+            "Only super_admin and loan_exec can view raw send audit."
+        )
+    loan = await _load_loan(db, loan_id)
+
+    # Case A: pending-draft entry
+    if entry_id.startswith("draft:"):
+        draft_uuid = UUID(entry_id.split(":", 1)[1])
+        draft = (
+            await db.execute(select(EmailDraft).where(EmailDraft.id == draft_uuid))
+        ).scalar_one_or_none()
+        if draft is None or draft.loan_id != loan.id:
+            raise LenderThreadError("Draft not found on this loan.")
+        gmail_view = _build_gmail_payload_view(
+            to_email=draft.to_email, subject=draft.subject, body=draft.body
+        )
+        return EntryAuditResponse(
+            entry_id=entry_id,
+            message=None,
+            email_draft=_email_draft_to_dict(draft),
+            activity=None,
+            gmail_payload=gmail_view,
+            send_status="saved",
+            send_note="Pending draft — not sent.",
+        )
+
+    # Case B: normal Message entry
+    try:
+        msg_uuid = UUID(entry_id)
+    except ValueError as exc:
+        raise LenderThreadError(f"Invalid entry_id: {entry_id!r}") from exc
+    msg = (
+        await db.execute(select(Message).where(Message.id == msg_uuid))
+    ).scalar_one_or_none()
+    if msg is None or msg.loan_id != loan.id:
+        raise LenderThreadError("Message not found on this loan.")
+
+    # Find matched draft + activity by 60s window.
+    draft_rows = (
+        await db.execute(
+            select(EmailDraft)
+            .where(EmailDraft.loan_id == loan.id)
+            .order_by(EmailDraft.created_at.asc())
+        )
+    ).scalars().all()
+    outbound_drafts = [d for d in draft_rows if d.status != EmailDraftStatus.PENDING]
+    _, matched_draft = _resolve_outbound_sender(msg, outbound_drafts)
+
+    activity_rows = (
+        await db.execute(
+            select(Activity)
+            .where(Activity.loan_id == loan.id)
+            .where(Activity.kind.in_(["lender_thread.replied", "lender_thread.ai_replied", "email.inbound"]))
+            .order_by(Activity.occurred_at.asc())
+        )
+    ).scalars().all()
+    matched_activity: Activity | None = None
+    best_delta = _SENDER_MATCH_WINDOW
+    for a in activity_rows:
+        if a.occurred_at is None:
+            continue
+        delta = abs(msg.sent_at - a.occurred_at)
+        if delta <= best_delta:
+            best_delta = delta
+            matched_activity = a
+
+    status, _ = _derive_send_status(matched_draft)
+    note: str | None = None
+    if matched_activity and matched_activity.payload:
+        n = matched_activity.payload.get("note")
+        note = str(n) if n else None
+
+    # Gmail payload — for inbound entries we still render what an OUTBOUND
+    # reply to this lender would look like, but flag it as a preview.
+    gmail_view: GmailPayloadView | None = None
+    if msg.from_role != MessageFrom.LENDER:
+        # Outbound — show exactly what we sent (or would send).
+        gmail_view = _build_gmail_payload_view(
+            to_email=matched_draft.to_email if matched_draft else None,
+            subject=matched_draft.subject if matched_draft else None,
+            body=msg.body,
+        )
+
+    return EntryAuditResponse(
+        entry_id=entry_id,
+        message=_message_to_dict(msg),
+        email_draft=_email_draft_to_dict(matched_draft) if matched_draft else None,
+        activity=_activity_to_dict(matched_activity) if matched_activity else None,
+        gmail_payload=gmail_view,
+        send_status=status,
+        send_note=note,
+    )
+
+
+def _message_to_dict(m: Message) -> dict[str, Any]:
+    return {
+        "id": str(m.id),
+        "from_role": str(m.from_role),
+        "body": m.body,
+        "is_draft": m.is_draft,
+        "is_system": m.is_system,
+        "sent_at": m.sent_at.isoformat() if m.sent_at else None,
+    }
+
+
+def _email_draft_to_dict(d: EmailDraft) -> dict[str, Any]:
+    return {
+        "id": str(d.id),
+        "to_email": d.to_email,
+        "cc_emails": d.cc_emails,
+        "bcc_emails": d.bcc_emails,
+        "subject": d.subject,
+        "body": d.body,
+        "status": str(d.status),
+        "actioned_by": d.actioned_by,
+        "sent_message_id": d.sent_message_id,
+        "triggered_by_kind": d.triggered_by_kind,
+        "triggered_by_payload": d.triggered_by_payload,
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+    }
+
+
+def _activity_to_dict(a: Activity) -> dict[str, Any]:
+    return {
+        "id": str(a.id),
+        "kind": a.kind,
+        "summary": a.summary,
+        "payload": a.payload,
+        "actor_label": a.actor_label,
+        "occurred_at": a.occurred_at.isoformat() if a.occurred_at else None,
+    }
+
+
+# --- Preview-before-send -----------------------------------------------------
+
+@dataclass
+class PreviewResponse:
+    mode: ReplyMode
+    to_email: str
+    subject: str
+    body: str
+    gmail_payload: GmailPayloadView
+    gmail_ready: bool
+    gmail_status_note: str
+
+
+async def preview_reply(
+    db: AsyncSession,
+    *,
+    loan_id: UUID,
+    actor: User,
+    mode: ReplyMode,
+    text: str,
+) -> PreviewResponse:
+    """Return exactly what would be transmitted if this reply were sent
+    NOW — without writing anything. For `instruct_ai`, this also runs
+    the LLM draft step so the operator can review the AI's output.
+
+    Same role gate as post_reply: super_admin + loan_exec only."""
+    if actor.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise LenderThreadError(
+            "Only super_admin and loan_exec can preview a lender reply."
+        )
+    if mode not in ("send_now", "instruct_ai", "save_draft"):
+        raise LenderThreadError(f"Unknown reply mode: {mode!r}")
+    if not text or not text.strip():
+        raise LenderThreadError("Reply text is required.")
+
+    loan = await _load_loan(db, loan_id)
+    if loan.lender_id is None or loan.lender is None:
+        raise LenderThreadError(
+            "No lender is connected to this loan. Connect a lender first."
+        )
+    lender: Lender = loan.lender
+    to_email = lender.submission_email or lender.contact_email
+    if not to_email:
+        raise LenderThreadError(
+            f"Lender '{lender.name}' has no submission_email or contact_email."
+        )
+
+    subject_base = f"Re: {loan.address}"
+    subject = inject_deal_id(subject_base, loan.deal_id)
+
+    if mode == "instruct_ai":
+        thread = await load_thread(db, loan_id=loan_id, viewer=actor)
+        thread_text = _format_thread_for_llm(thread.entries)
+        body = await _ai_draft_from_instruction(
+            instruction=text,
+            thread_text=thread_text,
+            deal_id=loan.deal_id,
+            address=loan.address,
+            lender_contact_name=lender.contact_name,
+        )
+    else:
+        body = text.strip()
+
+    gmail_view = _build_gmail_payload_view(
+        to_email=to_email, subject=subject, body=body
+    )
+    settings = get_settings()
+    gmail_ready = bool(settings.gmail_service_account_path and settings.gmail_delegated_user)
+    if gmail_ready:
+        status_note = f"Gmail ready — will send via {settings.gmail_delegated_user}."
+    else:
+        status_note = (
+            "Gmail not configured. The message will be saved locally with status "
+            "APPROVED but will NOT be delivered to the lender."
+        )
+
+    return PreviewResponse(
+        mode=mode,
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        gmail_payload=gmail_view,
+        gmail_ready=gmail_ready,
+        gmail_status_note=status_note,
+    )
 
 
 # ---------------------------------------------------------------------------

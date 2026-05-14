@@ -21,11 +21,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
+# google-api-python-client + google-auth are optional in this image —
+# they aren't pulled in via pyproject.toml today. Importing them at
+# module top would crash anywhere `build_message()` (the pure helper)
+# is used from environments that haven't installed them. Lazy-load
+# inside the functions that actually need network/auth.
 log = logging.getLogger(__name__)
 
 
@@ -50,7 +50,9 @@ class GmailNotConfigured(RuntimeError):
     """Raised when Gmail is invoked but no SA path is configured."""
 
 
-def _load_credentials(cfg: GmailConfig) -> service_account.Credentials:
+def _load_credentials(cfg: GmailConfig):
+    # Lazy imports — see module top comment.
+    from google.oauth2 import service_account
     if not cfg.service_account_path.exists():
         raise FileNotFoundError(f"Service account JSON not found at {cfg.service_account_path}")
     creds = service_account.Credentials.from_service_account_file(
@@ -69,6 +71,8 @@ def acquire_token(cfg: GmailConfig) -> dict[str, Any]:
     suitable for the connectivity test report (NEVER includes the token
     itself, which is a bearer credential).
     """
+    # Lazy imports — see module top comment.
+    from google.auth.transport.requests import Request
     creds = _load_credentials(cfg)
     creds.refresh(Request())
     return {
@@ -85,6 +89,8 @@ def acquire_token(cfg: GmailConfig) -> dict[str, Any]:
 
 def get_gmail_service(cfg: GmailConfig):
     """Return a Gmail API client. Caller decides which userId to query."""
+    # Lazy imports — see module top comment.
+    from googleapiclient.discovery import build
     creds = _load_credentials(cfg)
     # cache_discovery=False avoids the noisy ImportError warning in environments
     # without `oauth2client` installed (we use google-auth instead).
@@ -111,6 +117,51 @@ def list_labels(cfg: GmailConfig) -> list[dict[str, Any]]:
     return resp.get("labels", [])
 
 
+@dataclass(frozen=True)
+class BuiltMessage:
+    """Exact bytes that will be (or would be) sent to the Gmail API.
+
+    The audit drawer renders these without firing the network call, so
+    the operator can see the precise payload regardless of whether the
+    container is actually configured to deliver. `raw_base64` is the
+    RFC 5322 message URL-safe base64 encoded — that's exactly what the
+    Gmail API's `messages.send` accepts as the `raw` field.
+    """
+
+    from_email: str
+    to_email: str
+    subject: str
+    body: str
+    raw_base64: str
+
+
+def build_message(
+    *,
+    to: str,
+    subject: str,
+    body: str,
+    from_email: str | None,
+) -> BuiltMessage:
+    """Pure helper — constructs the EmailMessage + base64 raw form WITHOUT
+    sending. `from_email` is normally the GmailConfig.delegated_user but
+    is accepted explicitly so callers can render a 'what-would-be-sent'
+    preview even when Gmail isn't configured (no delegated_user yet)."""
+    msg = EmailMessage()
+    msg["To"] = to
+    if from_email:
+        msg["From"] = from_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    return BuiltMessage(
+        from_email=from_email or "",
+        to_email=to,
+        subject=subject,
+        body=body,
+        raw_base64=raw,
+    )
+
+
 def send_message(cfg: GmailConfig, *, to: str, subject: str, body: str) -> dict[str, Any]:
     """Tier-3: send a plaintext message via the delegated mailbox.
 
@@ -120,15 +171,11 @@ def send_message(cfg: GmailConfig, *, to: str, subject: str, body: str) -> dict[
     """
     if not cfg.delegated_user:
         raise GmailNotConfigured("GMAIL_DELEGATED_USER required to send mail")
-    msg = EmailMessage()
-    msg["To"] = to
-    msg["From"] = cfg.delegated_user
-    msg["Subject"] = subject
-    msg.set_content(body)
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
-
+    built = build_message(
+        to=to, subject=subject, body=body, from_email=cfg.delegated_user
+    )
     svc = get_gmail_service(cfg)
-    return svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return svc.users().messages().send(userId="me", body={"raw": built.raw_base64}).execute()
 
 
 # --- App integration --------------------------------------------------------
@@ -150,8 +197,9 @@ def gmail_config() -> GmailConfig | None:
     )
 
 
-def explain_http_error(err: HttpError) -> str:
-    """Render a googleapiclient HttpError into a single human-readable line."""
+def explain_http_error(err) -> str:
+    """Render a googleapiclient HttpError into a single human-readable line.
+    Accepts any exception type so callers don't need to import HttpError."""
     try:
         content = err.error_details if hasattr(err, "error_details") else None
         if content:

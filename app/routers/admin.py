@@ -61,6 +61,15 @@ class ConnectLenderHealth(BaseModel):
     eligible_loan_count: int
     active_lender_count: int
     connected_loan_count: int
+    gmail_can_send: bool
+
+
+class GmailTestResult(BaseModel):
+    ok: bool
+    tier: str  # "token" | "profile" | "labels" | "(not_configured)"
+    note: str
+    service_account_email: str | None = None
+    delegated_user: str | None = None
 
 
 @router.get("/connect-lender/health", response_model=ConnectLenderHealth)
@@ -151,6 +160,7 @@ async def connect_lender_health(
     # 4. Gmail config — required for outbound (and eventually inbound) mail.
     sa_path = settings.gmail_service_account_path
     delegated = settings.gmail_delegated_user
+    gmail_can_send = False
     if not sa_path or not delegated:
         checks.append(
             HealthCheck(
@@ -172,11 +182,13 @@ async def connect_lender_health(
             )
         )
     else:
+        gmail_can_send = True
         checks.append(
             HealthCheck(
                 name="Gmail outbound",
                 status="ok",
-                detail=f"Service-account JSON at {sa_path}; delegated user {delegated}.",
+                detail=f"Service-account JSON at {sa_path}; delegated user {delegated}. "
+                f"Hit POST /admin/gmail/test for a live connectivity probe.",
             )
         )
 
@@ -233,6 +245,82 @@ async def connect_lender_health(
         eligible_loan_count=connectable,
         active_lender_count=lender_active,
         connected_loan_count=connected,
+        gmail_can_send=gmail_can_send,
+    )
+
+
+@router.post("/gmail/test", response_model=GmailTestResult)
+async def gmail_test(user: CurrentUser) -> GmailTestResult:
+    """Live connectivity probe: acquire a Gmail access token via the
+    service account, then call users.getProfile to confirm domain-wide
+    delegation works for the delegated user. Super-admin only.
+
+    Returns success at the highest tier reached, so the operator can see
+    exactly where things fall over (key parse → token mint → DWD profile)."""
+    _require_super_admin(user)
+    settings = get_settings()
+    if not settings.gmail_service_account_path or not settings.gmail_delegated_user:
+        return GmailTestResult(
+            ok=False,
+            tier="(not_configured)",
+            note="GMAIL_SERVICE_ACCOUNT_PATH and/or GMAIL_DELEGATED_USER are unset.",
+            service_account_email=None,
+            delegated_user=settings.gmail_delegated_user or None,
+        )
+    if not Path(settings.gmail_service_account_path).expanduser().exists():
+        return GmailTestResult(
+            ok=False,
+            tier="(not_configured)",
+            note=f"Service-account JSON not found at {settings.gmail_service_account_path}.",
+            delegated_user=settings.gmail_delegated_user,
+        )
+
+    from app.services.email.gmail_client import (
+        acquire_token,
+        get_profile,
+        gmail_config,
+        explain_http_error,
+    )
+
+    cfg = gmail_config()
+    if cfg is None:
+        return GmailTestResult(
+            ok=False,
+            tier="(not_configured)",
+            note="gmail_config() returned None — service account path empty after expansion.",
+        )
+
+    # Tier 1 — token
+    try:
+        info = acquire_token(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return GmailTestResult(
+            ok=False,
+            tier="token",
+            note=f"Token acquisition failed: {exc}",
+            delegated_user=settings.gmail_delegated_user,
+        )
+    sa_email = info.get("service_account_email")
+
+    # Tier 2 — getProfile (proves DWD)
+    try:
+        profile = get_profile(cfg)
+    except Exception as exc:  # noqa: BLE001 — googleapiclient.HttpError or anything else
+        return GmailTestResult(
+            ok=False,
+            tier="profile",
+            note=f"getProfile failed: {explain_http_error(exc)}",
+            service_account_email=sa_email,
+            delegated_user=settings.gmail_delegated_user,
+        )
+
+    return GmailTestResult(
+        ok=True,
+        tier="profile",
+        note=f"Authenticated as {profile.get('emailAddress')} "
+        f"({profile.get('messagesTotal', 0)} msgs in mailbox).",
+        service_account_email=sa_email,
+        delegated_user=settings.gmail_delegated_user,
     )
 
 

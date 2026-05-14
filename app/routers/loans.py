@@ -45,8 +45,10 @@ from app.services.lender_send import LenderSendError, draft_lender_send
 from app.services.lender_thread import (
     LenderThreadError,
     ReplyMode,
+    load_entry_audit,
     load_thread,
     post_reply,
+    preview_reply,
     summarize_thread,
 )
 from app.services.loan_intake_automation import kickoff_loan
@@ -832,6 +834,44 @@ class LenderThreadEntryRead(BaseModel):
     is_ai_drafted: bool = False
     sent_message_id: str | None = None
     draft_id: str | None = None
+    # Round-2: Gmail delivery outcome surfaced per-entry.
+    send_status: str = "n/a"  # "sent" | "saved" | "failed" | "n/a"
+    send_note: str | None = None
+    to_email: str | None = None
+
+
+class GmailPayloadRead(BaseModel):
+    from_email: str
+    to_email: str
+    subject: str
+    body: str
+    raw_base64: str | None
+    would_send_via: str  # "service-account-DWD" | "(not configured)"
+
+
+class LenderThreadEntryAuditRead(BaseModel):
+    entry_id: str
+    message: dict | None
+    email_draft: dict | None
+    activity: dict | None
+    gmail_payload: GmailPayloadRead | None
+    send_status: str
+    send_note: str | None
+
+
+class LenderThreadPreviewPayload(BaseModel):
+    mode: str = Field(pattern="^(send_now|instruct_ai|save_draft)$")
+    text: str = Field(min_length=1)
+
+
+class LenderThreadPreviewResponse(BaseModel):
+    mode: str
+    to_email: str
+    subject: str
+    body: str
+    gmail_payload: GmailPayloadRead
+    gmail_ready: bool
+    gmail_status_note: str
 
 
 class LenderThreadResponse(BaseModel):
@@ -871,6 +911,20 @@ def _entry_to_read(entry) -> LenderThreadEntryRead:
         is_ai_drafted=entry.is_ai_drafted,
         sent_message_id=entry.sent_message_id,
         draft_id=entry.draft_id,
+        send_status=getattr(entry, "send_status", "n/a"),
+        send_note=getattr(entry, "send_note", None),
+        to_email=getattr(entry, "to_email", None),
+    )
+
+
+def _gmail_payload_to_read(view) -> GmailPayloadRead:
+    return GmailPayloadRead(
+        from_email=view.from_email,
+        to_email=view.to_email,
+        subject=view.subject,
+        body=view.body,
+        raw_base64=view.raw_base64,
+        would_send_via=view.would_send_via,
     )
 
 
@@ -962,6 +1016,81 @@ async def post_lender_thread_reply(
         mode=result.mode,
         note=result.note,
         entry=_entry_to_read(result.entry) if result.entry else None,
+    )
+
+
+@router.get(
+    "/{loan_id}/lender-thread/entry/{entry_id}/audit",
+    response_model=LenderThreadEntryAuditRead,
+)
+async def get_lender_thread_entry_audit(
+    loan_id: UUID,
+    entry_id: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderThreadEntryAuditRead:
+    """Return the raw DB rows + the would-be-sent Gmail payload for a
+    single thread entry. Super-admin and loan-exec only. Powers the
+    'Show details' audit drawer on each mailbox row."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only super_admin and loan_exec can view raw send audit.",
+        )
+    visibility_stmt = _scope_query(user, select(Loan.id).where(Loan.id == loan_id))
+    if (await db.execute(visibility_stmt)).scalar_one_or_none() is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    try:
+        audit = await load_entry_audit(db, loan_id=loan_id, entry_id=entry_id, viewer=user)
+    except LenderThreadError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return LenderThreadEntryAuditRead(
+        entry_id=audit.entry_id,
+        message=audit.message,
+        email_draft=audit.email_draft,
+        activity=audit.activity,
+        gmail_payload=_gmail_payload_to_read(audit.gmail_payload) if audit.gmail_payload else None,
+        send_status=audit.send_status,
+        send_note=audit.send_note,
+    )
+
+
+@router.post(
+    "/{loan_id}/lender-thread/preview",
+    response_model=LenderThreadPreviewResponse,
+)
+async def post_lender_thread_preview(
+    loan_id: UUID,
+    payload: LenderThreadPreviewPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderThreadPreviewResponse:
+    """Compute the exact payload that WOULD be sent if the operator
+    clicked Send Now (or Instruct AI). Writes NOTHING; safe to call
+    repeatedly. Powers the 'Preview before send' modal."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only super_admin and loan_exec can preview a lender reply.",
+        )
+    try:
+        result = await preview_reply(
+            db,
+            loan_id=loan_id,
+            actor=user,
+            mode=payload.mode,  # type: ignore[arg-type]
+            text=payload.text,
+        )
+    except LenderThreadError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return LenderThreadPreviewResponse(
+        mode=result.mode,
+        to_email=result.to_email,
+        subject=result.subject,
+        body=result.body,
+        gmail_payload=_gmail_payload_to_read(result.gmail_payload),
+        gmail_ready=result.gmail_ready,
+        gmail_status_note=result.gmail_status_note,
     )
 
 
