@@ -263,8 +263,17 @@ async def _ingest_one(
       - Message row → drives the LenderThread mailbox UI
       - EmailDraft  → drives the existing broker-approval queue
     """
+    from sqlalchemy.orm import selectinload as _selectinload
+
     loan = (
-        await db.execute(select(Loan).where(Loan.deal_id == parsed.deal_id))
+        await db.execute(
+            select(Loan)
+            # Eager-load broker so the push notification's
+            # `loan.broker.user_id` access doesn't trigger a lazy
+            # load in async context (raises MissingGreenlet).
+            .options(_selectinload(Loan.broker))
+            .where(Loan.deal_id == parsed.deal_id)
+        )
     ).scalar_one_or_none()
     if loan is None:
         log.info(
@@ -359,3 +368,42 @@ async def _ingest_one(
                 "(non-fatal; Message + orchestrator already persisted)",
                 gmail_id,
             )
+
+        # 4. Push notification to the loan's broker (NOT to the client —
+        # one-way mirror; client never sees raw lender mail).
+        # super_admin is omitted because they're the delegated Gmail
+        # mailbox owner and already get a native Gmail notification.
+        try:
+            await _notify_broker_of_inbound(loan=loan, parsed=parsed)
+        except Exception:
+            log.exception(
+                "inbound_poller: broker push notify failed for gmail_id=%s "
+                "(non-fatal)",
+                gmail_id,
+            )
+
+
+async def _notify_broker_of_inbound(*, loan: Loan, parsed: InboundEmail) -> None:
+    """Fire-and-forget FCM push to the loan's assigned broker so they
+    know a lender reply arrived without having to keep the platform
+    open. The broker doesn't get Gmail (the SA-delegated mailbox is
+    franco's), so without this they have no signal."""
+    if loan.broker is None or loan.broker.user_id is None:
+        return
+    deal_id = loan.deal_id or "(no deal id)"
+    snippet = (parsed.body or "").strip().replace("\n", " ")[:140]
+    # Local import — push service is allowed to be missing in dev.
+    try:
+        from app.services.push import fire_and_forget_push
+    except ImportError:
+        return
+    fire_and_forget_push(
+        loan.broker.user_id,
+        title=f"Lender reply on {deal_id}",
+        body=snippet or "(empty body)",
+        data={
+            "kind": "lender_inbound",
+            "loan_id": str(loan.id),
+            "deal_id": deal_id,
+        },
+    )

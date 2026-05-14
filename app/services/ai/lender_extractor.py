@@ -196,6 +196,21 @@ async def extract_and_persist(
         len(current["lender_extract_external"].get("action_items", [])),
         trigger,
     )
+
+    # Propagate to calendar + AI tasks. Non-fatal if anything inside
+    # the followup fails — the extract is already persisted and the
+    # UI will render it; the followup just creates calendar / cadence
+    # side effects.
+    try:
+        from app.services.lender_followup import propagate_extract
+
+        await propagate_extract(db, loan_id=loan.id, extract=extract)
+    except Exception:
+        log.exception(
+            "lender_extractor: followup propagation failed (non-fatal); "
+            "extract is persisted, calendar/tasks may be incomplete"
+        )
+
     return extract
 
 
