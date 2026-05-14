@@ -18,9 +18,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pydantic import BaseModel
+
 from app.db import get_db
 from app.deps import CurrentUser
-from app.enums import LoanType, Role
+from app.enums import LoanStage, LoanType, Role
 from app.models.lender import Lender
 from app.models.loan import Loan
 from app.schemas.lender import LenderCreate, LenderRead, LenderUpdate
@@ -77,6 +79,81 @@ async def create_lender(
     await db.commit()
     await db.refresh(row)
     return LenderRead.model_validate(row)
+
+
+class LenderLoanSummary(BaseModel):
+    id: UUID
+    deal_id: str
+    address: str
+    stage: str
+    type: str
+    connected: bool
+
+
+class LenderLoansResponse(BaseModel):
+    lender_id: UUID
+    lender_name: str
+    connected: list[LenderLoanSummary]
+    connectable: list[LenderLoanSummary]
+
+
+@router.get("/{lender_id}/loans", response_model=LenderLoansResponse)
+async def list_lender_loans(
+    lender_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderLoansResponse:
+    """List the loans associated with this lender — both those already
+    connected (loan.lender_id == lender_id) and those that COULD be
+    connected (lender_id null, stage PREQUALIFIED/COLLECTING_DOCS,
+    loan.type matches the lender's products array).
+
+    Drives the per-lender drilldown on the Super Admin Lenders tab,
+    giving the operator a direct path from 'this lender' to 'open the
+    loan and connect them'."""
+    _require_super_admin(user)
+    lender = (
+        await db.execute(select(Lender).where(Lender.id == lender_id))
+    ).scalar_one_or_none()
+    if lender is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lender not found")
+
+    connected_rows = (
+        await db.execute(
+            select(Loan).where(Loan.lender_id == lender_id).order_by(Loan.created_at.desc())
+        )
+    ).scalars().all()
+
+    product_filter = set(lender.products or [])
+    connectable_stmt = (
+        select(Loan)
+        .where(Loan.lender_id.is_(None))
+        .where(Loan.stage.in_([LoanStage.PREQUALIFIED, LoanStage.COLLECTING_DOCS]))
+        .order_by(Loan.created_at.desc())
+    )
+    connectable_rows = (await db.execute(connectable_stmt)).scalars().all()
+    if product_filter:
+        connectable_rows = [
+            l for l in connectable_rows
+            if (l.type.value if hasattr(l.type, "value") else str(l.type)) in product_filter
+        ]
+
+    def _summary(l: Loan, *, connected: bool) -> LenderLoanSummary:
+        return LenderLoanSummary(
+            id=l.id,
+            deal_id=l.deal_id,
+            address=l.address,
+            stage=l.stage.value if hasattr(l.stage, "value") else str(l.stage),
+            type=l.type.value if hasattr(l.type, "value") else str(l.type),
+            connected=connected,
+        )
+
+    return LenderLoansResponse(
+        lender_id=lender.id,
+        lender_name=lender.name,
+        connected=[_summary(l, connected=True) for l in connected_rows],
+        connectable=[_summary(l, connected=False) for l in connectable_rows],
+    )
 
 
 @router.get("/{lender_id}", response_model=LenderRead)

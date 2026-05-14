@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.routers import (
+    admin as admin_router,
     agent_tasks,
     agents,
     ai,
@@ -101,6 +102,7 @@ api_prefix = "/api/v1"
 for r in [
     meta.router,
     auth.router,
+    admin_router.router,
     loans.router,
     loan_participants.router,
     loan_summary.router,

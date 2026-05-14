@@ -42,6 +42,13 @@ from app.services.lender_connect import (
     disconnect_lender,
 )
 from app.services.lender_send import LenderSendError, draft_lender_send
+from app.services.lender_thread import (
+    LenderThreadError,
+    ReplyMode,
+    load_thread,
+    post_reply,
+    summarize_thread,
+)
 from app.services.loan_intake_automation import kickoff_loan
 from app.services.email.parser import inject_deal_id
 from app.services.hud_template import build_hud_draft
@@ -811,6 +818,150 @@ async def lender_send_endpoint(
         zip_s3_key=result.zip_s3_key,
         to_email=result.draft.to_email,
         subject=result.draft.subject,
+    )
+
+
+class LenderThreadEntryRead(BaseModel):
+    id: str
+    kind: str  # "inbound" | "outbound" | "ai_outbound" | "pending_draft"
+    sender_label: str
+    sender_role: str
+    sent_at: str
+    body: str
+    subject: str | None = None
+    is_ai_drafted: bool = False
+    sent_message_id: str | None = None
+    draft_id: str | None = None
+
+
+class LenderThreadResponse(BaseModel):
+    loan_id: str
+    lender_name: str | None
+    entries: list[LenderThreadEntryRead]
+
+
+class LenderThreadSummaryRead(BaseModel):
+    loan_id: str
+    headline: str
+    open_asks: list[str]
+    suggested_next_reply: str
+    message_count: int
+
+
+class LenderThreadReplyPayload(BaseModel):
+    mode: str = Field(pattern="^(send_now|instruct_ai|save_draft)$")
+    text: str = Field(min_length=1)
+
+
+class LenderThreadReplyResponse(BaseModel):
+    mode: str
+    note: str
+    entry: LenderThreadEntryRead | None
+
+
+def _entry_to_read(entry) -> LenderThreadEntryRead:
+    return LenderThreadEntryRead(
+        id=entry.id,
+        kind=entry.kind,
+        sender_label=entry.sender_label,
+        sender_role=entry.sender_role,
+        sent_at=entry.sent_at.isoformat(),
+        body=entry.body,
+        subject=entry.subject,
+        is_ai_drafted=entry.is_ai_drafted,
+        sent_message_id=entry.sent_message_id,
+        draft_id=entry.draft_id,
+    )
+
+
+@router.get("/{loan_id}/lender-thread", response_model=LenderThreadResponse)
+async def get_lender_thread(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderThreadResponse:
+    """Return the lender ↔ brokerage timeline for this loan.
+
+    Visible to anyone with access to the loan (the standard /loans
+    scope check applies via CurrentUser → role); PII is redacted
+    server-side for broker/client viewers."""
+    # Defense-in-depth: re-run the visibility scope used elsewhere.
+    visibility_stmt = _scope_query(user, select(Loan.id).where(Loan.id == loan_id))
+    visible_id = (await db.execute(visibility_stmt)).scalar_one_or_none()
+    if visible_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    try:
+        thread = await load_thread(db, loan_id=loan_id, viewer=user)
+    except LenderThreadError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return LenderThreadResponse(
+        loan_id=thread.loan_id,
+        lender_name=thread.lender_name,
+        entries=[_entry_to_read(e) for e in thread.entries],
+    )
+
+
+@router.get("/{loan_id}/lender-thread/summary", response_model=LenderThreadSummaryRead)
+async def get_lender_thread_summary(
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderThreadSummaryRead:
+    """Short 'what's happening on the lender side' mini-summary.
+    Distinct from the loan-level Living Profile — this one is scoped
+    to the lender conversation only and is regenerated on demand."""
+    visibility_stmt = _scope_query(user, select(Loan.id).where(Loan.id == loan_id))
+    visible_id = (await db.execute(visibility_stmt)).scalar_one_or_none()
+    if visible_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    try:
+        summary = await summarize_thread(db, loan_id=loan_id, viewer=user)
+    except LenderThreadError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return LenderThreadSummaryRead(
+        loan_id=summary.loan_id,
+        headline=summary.headline,
+        open_asks=summary.open_asks,
+        suggested_next_reply=summary.suggested_next_reply,
+        message_count=summary.message_count,
+    )
+
+
+@router.post("/{loan_id}/lender-thread/reply", response_model=LenderThreadReplyResponse)
+async def post_lender_thread_reply(
+    loan_id: UUID,
+    payload: LenderThreadReplyPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LenderThreadReplyResponse:
+    """Post a reply to the lender thread in one of three modes.
+
+    Super-admin and loan-exec only — no funding-team approval gate
+    on this surface (per Op direction). Modes:
+      send_now    — send via Gmail immediately
+      instruct_ai — AI writes the email from the operator's prompt and sends
+      save_draft  — drop into EmailDrafts(status=PENDING), no send
+    """
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only super_admin and loan_exec can post to the lender thread.",
+        )
+    try:
+        result = await post_reply(
+            db,
+            loan_id=loan_id,
+            actor=user,
+            mode=payload.mode,  # type: ignore[arg-type]
+            text=payload.text,
+        )
+    except LenderThreadError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    return LenderThreadReplyResponse(
+        mode=result.mode,
+        note=result.note,
+        entry=_entry_to_read(result.entry) if result.entry else None,
     )
 
 
