@@ -249,11 +249,22 @@ async def list_chat(
 
 
 # Per-mode allowed roles. CLIENT can only send `chat` (ignoring mode).
+def _is_human_takeover(mode: DealChatMode, role: Role) -> bool:
+    '''CHAT (super_admin/loan_exec) or LIVE_CHAT (broker/super_admin/loan_exec).
+    Both branches persist the message client-visible and pause the AI.'''
+    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        return True
+    if mode == DealChatMode.LIVE_CHAT and role in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        return True
+    return False
+
+
 _MODE_ALLOWED_ROLES: dict[DealChatMode, set[Role]] = {
     DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.CLIENT},
     DealChatMode.INSTRUCT: {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC},
     DealChatMode.BROKER_QUESTION: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
     DealChatMode.BROKER_SUGGESTION: {Role.BROKER},
+    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
 }
 
 
@@ -318,11 +329,11 @@ async def send_chat(
 
     # ── chat / broker_question ─────────────────────────────────────────
     is_broker_q = payload.mode == DealChatMode.BROKER_QUESTION
-    if payload.mode == DealChatMode.CHAT and user.role == Role.SUPER_ADMIN:
+    if _is_human_takeover(payload.mode, Role(user.role)):
         # Super-admin override: persist + pause AI for 1h, no auto-reply.
         msg = LoanChatMessage(
             loan_id=loan.id,
-            from_role=DealChatRole.SUPER_ADMIN,
+            from_role=(DealChatRole.BROKER if Role(user.role) == Role.BROKER else DealChatRole.SUPER_ADMIN),
             from_user_id=user.id,
             body=payload.body,
             client_visible=True,
@@ -334,8 +345,8 @@ async def send_chat(
                 loan_id=loan.id,
                 actor_id=user.id,
                 actor_label=user.email,
-                kind="ai.paused_by_super_admin",
-                summary=f"Super-admin sent manual reply; AI paused until {paused_until.isoformat()}",
+                kind=("ai.paused_by_broker" if Role(user.role) == Role.BROKER else "ai.paused_by_super_admin"),
+                summary=f"{user.email} ({user.role}) took over the chat; AI paused until {paused_until.isoformat()}",
             )
         )
         await db.flush()

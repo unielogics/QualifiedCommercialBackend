@@ -29,21 +29,14 @@ async def list_tasks(
         .order_by(AITask.priority, AITask.created_at.desc())
     )
     if user.role == Role.BROKER and user.broker is not None:
-        # Brokers see tasks tied to their own loans + firm-wide
-        # null-loan tasks. The `loan_id IS NULL` widening is
-        # intentional — today's null-loan AITasks are firm-wide
-        # alerts (credit-pull expiry, prequal review queues) that
-        # ALL operators including brokers should see. If we ever
-        # introduce broker-confidential null-loan tasks, add a
-        # `visible_to_role` field on AITask rather than tightening
-        # this filter; otherwise we'd hide legitimate work the
-        # broker needs.
+        # Strict isolation (product decision 2026-05-14): broker sees
+        # ONLY tasks tied to loans in their book. Firm-wide null-loan
+        # alerts belong to super_admin / loan_exec. Add a
+        # `visible_to_role` field on AITask if a specific firm-wide
+        # alert needs broker visibility in the future.
         stmt = stmt.where(
-            or_(
-                AITask.loan_id.is_(None),
-                AITask.loan_id.in_(
-                    select(Loan.id).where(Loan.broker_id == user.broker.id)
-                ),
+            AITask.loan_id.in_(
+                select(Loan.id).where(Loan.broker_id == user.broker.id)
             )
         )
     # SUPER_ADMIN / LOAN_EXEC keep firm-wide visibility (no extra

@@ -152,6 +152,7 @@ class AITaskSource(StrEnum):
     PIPELINE = "pipeline"
     RATES = "rates"
     BROKER_SUGGESTION = "broker_suggestion"
+    LIVE_CHAT = "live_chat"
 
 
 class DealChatRole(StrEnum):
@@ -160,6 +161,7 @@ class DealChatRole(StrEnum):
     AI = "ai"
     SUPER_ADMIN = "super_admin"
     BROKER_INTERNAL = "broker_internal"
+    BROKER = "broker"
     CLIENT = "client"
 
 
@@ -170,6 +172,7 @@ class DealChatMode(StrEnum):
     INSTRUCT = "instruct"
     BROKER_QUESTION = "broker_question"
     BROKER_SUGGESTION = "broker_suggestion"
+    LIVE_CHAT = "live_chat"
 
 
 class FeedbackOutputType(StrEnum):
