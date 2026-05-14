@@ -140,7 +140,11 @@ async def process_inbound(db: AsyncSession, email: InboundEmail) -> InboundResul
         Activity(
             loan_id=loan.id,
             actor_id=None,
-            actor_label=sender_role.value if sender_role else "unknown",
+            actor_label=(
+                sender_role.value
+                if sender_role is not None and hasattr(sender_role, "value")
+                else (str(sender_role) if sender_role is not None else "unknown")
+            ),
             kind="email.inbound",
             summary=f"Inbound email — {email.sender}: {email.subject[:120]}",
             payload={"subject": email.subject, "from": email.sender, "deal_id": email.deal_id},
@@ -154,7 +158,11 @@ async def process_inbound(db: AsyncSession, email: InboundEmail) -> InboundResul
     # Broker/Client/unknown: log only — outbound relay handled by their own UI actions.
     return InboundResult(
         loan_id=str(loan.id),
-        sender_role=sender_role.value if sender_role else "unknown",
+        sender_role=(
+            sender_role.value
+            if sender_role is not None and hasattr(sender_role, "value")
+            else (str(sender_role) if sender_role is not None else "unknown")
+        ),
         draft_id=None,
         task_id=None,
         note="Logged inbound activity (non-lender sender).",
@@ -285,4 +293,12 @@ async def send_approved_draft(db: AsyncSession, draft: EmailDraft, *, actor_labe
         )
     )
     await db.flush()
-    return {"sent_message_id": sent_id, "status": draft.status.value, "note": note}
+    return {
+        "sent_message_id": sent_id,
+        "status": (
+            draft.status.value
+            if hasattr(draft.status, "value")
+            else str(draft.status)
+        ),
+        "note": note,
+    }

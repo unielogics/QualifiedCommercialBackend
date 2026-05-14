@@ -157,6 +157,21 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Lender thread inbound poller. Every 60 seconds, pulls
+    # `is:unread subject:"[QC-"` from the delegated Gmail mailbox and
+    # writes Message(from_role=LENDER) rows so the LenderThread UI
+    # picks them up. Gated by USE_FAKE_INBOX=false + Gmail config
+    # present — otherwise no-ops. See inbound_poller.run_inbound_poll.
+    scheduler.add_job(
+        _wrap(job_lender_inbound_poll),
+        "interval",
+        seconds=60,
+        id="lender_inbound_poll",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -337,3 +352,13 @@ async def job_document_scan_drain() -> None:
                 log.exception("document_scan_drain: scan failed for %s", doc_id)
                 await db.rollback()
             await asyncio.sleep(0)
+
+
+async def job_lender_inbound_poll() -> None:
+    """Pull new lender-tagged emails from Gmail every 60s and append
+    them to the LenderThread mailbox. Single-instance assumption (one
+    container = one poller). Self-no-ops when USE_FAKE_INBOX=true or
+    when GMAIL_* env vars aren't set."""
+    from app.services.email.inbound_poller import run_inbound_poll
+
+    await run_inbound_poll()

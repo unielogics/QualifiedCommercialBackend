@@ -118,6 +118,12 @@ class ThreadResponse:
     loan_id: str
     lender_name: str | None
     entries: list[ThreadEntry]
+    # Round-3 (added 2026-05-14) — structured AI extract for the right-
+    # column to-do panel. Filtered server-side per viewer role:
+    # super_admin / loan_exec see the full extract; broker / client
+    # see only items tagged sensitivity='external'. None if no LLM
+    # has run yet or ANTHROPIC_API_KEY is unset.
+    lender_extract: dict[str, Any] | None = None
 
 
 @dataclass
@@ -370,10 +376,21 @@ async def load_thread(
         )
 
     entries.sort(key=lambda e: e.sent_at)
+
+    # Pick the right extract view based on viewer role:
+    #   super_admin / loan_exec → full lender_extract (internal + external)
+    #   broker / client          → externals-only view that drops sensitive items
+    profile = loan.living_profile or {}
+    if viewer.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        lender_extract = profile.get("lender_extract")
+    else:
+        lender_extract = profile.get("lender_extract_external")
+
     return ThreadResponse(
         loan_id=str(loan.id),
         lender_name=loan.lender.name if loan.lender else None,
         entries=entries,
+        lender_extract=lender_extract,
     )
 
 
@@ -734,6 +751,24 @@ async def post_reply(
     await db.flush()
     await db.refresh(msg)
     await db.refresh(draft)
+
+    # Refresh the structured AI extract (loans.living_profile.lender_extract)
+    # so the right-column to-do panel + the general AI chat both see
+    # our latest outbound commitments. Non-fatal — Message/EmailDraft
+    # already persisted above.
+    try:
+        from app.services.ai.lender_extractor import extract_and_persist
+
+        await extract_and_persist(
+            db,
+            loan_id=loan.id,
+            trigger=f"post_reply:{mode}",
+        )
+    except Exception:
+        log.exception(
+            "post_reply: lender_extractor failed (non-fatal); "
+            "outbound rows are already saved"
+        )
 
     derived_status, _ = _derive_send_status(draft)
     entry = ThreadEntry(

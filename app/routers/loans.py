@@ -878,6 +878,9 @@ class LenderThreadResponse(BaseModel):
     loan_id: str
     lender_name: str | None
     entries: list[LenderThreadEntryRead]
+    # Round-3: structured AI extract — per-viewer filtered. See
+    # app/services/lender_thread.load_thread for the role gate.
+    lender_extract: dict | None = None
 
 
 class LenderThreadSummaryRead(BaseModel):
@@ -952,6 +955,7 @@ async def get_lender_thread(
         loan_id=thread.loan_id,
         lender_name=thread.lender_name,
         entries=[_entry_to_read(e) for e in thread.entries],
+        lender_extract=thread.lender_extract,
     )
 
 

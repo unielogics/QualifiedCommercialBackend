@@ -179,6 +179,17 @@ async def assemble_loan_context(
     if activity_block:
         sections.append(f"## Recent Activity\n{activity_block}")
 
+    # Round-3 (2026-05-14) — lender-thread structured extract. Operator
+    # audiences see the full extract (internal + external); client and
+    # realtor audiences see only the externals-only filtered view that
+    # the lender_extractor already prepared on
+    # `loans.living_profile.lender_extract_external`. This is what
+    # lets the general AI answer "what's the lender waiting on?"
+    # without leaking internal commercial mechanics.
+    lender_block = _lender_extract_block(loan, audience=audience)
+    if lender_block:
+        sections.append(f"## Lender Thread Context\n{lender_block}")
+
     events_block = await _upcoming_events_block(db, loan.id, audience=audience)
     if events_block:
         sections.append(f"## Upcoming Events\n{events_block}")
@@ -856,3 +867,61 @@ async def _chat_history_block(
     if not rows:
         return ""
     return "\n".join(f"  {m.from_role}: {m.body}" for m in rows)
+
+
+def _lender_extract_block(loan: Loan, *, audience: Audience) -> str:
+    """Render the lender-thread structured extract for the system prompt.
+
+    Operator audiences (super_admin) get the full extract — internal
+    AND external action items. Broker (realtor) and client get the
+    externals-only filtered view that the extractor pre-computed on
+    `loans.living_profile.lender_extract_external`. The internal/
+    external split is the same load-bearing principle as the
+    pii_filter one-way mirror — items tagged internal stay internal.
+    """
+    profile = loan.living_profile or {}
+    if audience == "super_admin":
+        extract = profile.get("lender_extract") or {}
+    else:
+        # broker (realtor) AND client see the same softened view.
+        extract = profile.get("lender_extract_external") or {}
+    if not extract:
+        return ""
+
+    situation = (extract.get("current_situation") or "").strip()
+    items = extract.get("action_items") or []
+    status_changes = extract.get("status_changes") or []
+    if not (situation or items or status_changes):
+        return ""
+
+    lines: list[str] = []
+    if situation:
+        lines.append(f"Where we stand: {situation}")
+    if items:
+        lines.append("Open action items:")
+        for it in items[:12]:  # cap to keep token cost bounded
+            owner = it.get("owner", "?")
+            summary = (it.get("summary") or "").strip()
+            priority = it.get("priority", "med")
+            due = it.get("due_date")
+            sensitivity = it.get("sensitivity", "?")
+            extras: list[str] = []
+            if due:
+                extras.append(f"due {due}")
+            docs = it.get("requested_documents") or []
+            if docs:
+                extras.append("docs: " + ", ".join(docs[:3]))
+            amts = it.get("amounts") or []
+            if amts:
+                extras.append("amounts: " + ", ".join(amts[:3]))
+            tail = f" ({'; '.join(extras)})" if extras else ""
+            lines.append(
+                f"  - [{owner}, {priority}, {sensitivity}] {summary}{tail}"
+            )
+    if status_changes:
+        lines.append("Recent status changes:")
+        for sc in status_changes[:6]:
+            kind = sc.get("kind", "other")
+            summary = (sc.get("summary") or "").strip()
+            lines.append(f"  - {kind}: {summary}")
+    return "\n".join(lines)
