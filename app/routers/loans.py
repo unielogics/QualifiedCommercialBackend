@@ -838,6 +838,9 @@ class LenderThreadEntryRead(BaseModel):
     send_status: str = "n/a"  # "sent" | "saved" | "failed" | "n/a"
     send_note: str | None = None
     to_email: str | None = None
+    # Round-4: committed attachments on this entry. Empty list when
+    # there are none; download_urls are short-lived (1h).
+    attachments: list["LenderThreadAttachmentRead"] = []
 
 
 class GmailPayloadRead(BaseModel):
@@ -891,9 +894,43 @@ class LenderThreadSummaryRead(BaseModel):
     message_count: int
 
 
+class LenderThreadAttachmentRead(BaseModel):
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    source: str  # 'outbound_upload' | 'system_doc_ref' | 'inbound_lender'
+    direction: str  # 'outbound' | 'inbound'
+    document_id: str | None = None
+    download_url: str | None = None
+
+
+class AttachmentInitPayload(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    mime_type: str = Field(default="application/octet-stream", max_length=120)
+    size_bytes: int = Field(ge=1)
+
+
+class AttachmentInitResponse(BaseModel):
+    attachment_id: str
+    upload_url: str | None
+    s3_key: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+
+
+class AttachmentFromDocPayload(BaseModel):
+    document_id: UUID
+
+
 class LenderThreadReplyPayload(BaseModel):
     mode: str = Field(pattern="^(send_now|instruct_ai|save_draft)$")
     text: str = Field(min_length=1)
+    # Round-4: attachment refs to commit + send with this reply. IDs
+    # come from /attachment/upload-init (or /from-doc). Optional —
+    # backwards-compatible with round-3 reply payloads.
+    attachment_ids: list[UUID] = Field(default_factory=list)
 
 
 class LenderThreadReplyResponse(BaseModel):
@@ -917,6 +954,18 @@ def _entry_to_read(entry) -> LenderThreadEntryRead:
         send_status=getattr(entry, "send_status", "n/a"),
         send_note=getattr(entry, "send_note", None),
         to_email=getattr(entry, "to_email", None),
+        attachments=[
+            LenderThreadAttachmentRead(
+                id=a.id,
+                filename=a.filename,
+                mime_type=a.mime_type,
+                size_bytes=a.size_bytes,
+                source=a.source,
+                direction=a.direction,
+                download_url=a.download_url,
+            )
+            for a in (getattr(entry, "attachments", []) or [])
+        ],
     )
 
 
@@ -1012,6 +1061,7 @@ async def post_lender_thread_reply(
             actor=user,
             mode=payload.mode,  # type: ignore[arg-type]
             text=payload.text,
+            attachment_ids=payload.attachment_ids or None,
         )
     except LenderThreadError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -1096,6 +1146,176 @@ async def post_lender_thread_preview(
         gmail_ready=result.gmail_ready,
         gmail_status_note=result.gmail_status_note,
     )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Lender-thread attachments — composer + audit drawer
+# ────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/{loan_id}/lender-thread/attachment/upload-init",
+    response_model=AttachmentInitResponse,
+)
+async def lender_attachment_upload_init(
+    loan_id: UUID,
+    payload: AttachmentInitPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentInitResponse:
+    """Reserve a staged outbound attachment + presigned S3 PUT URL.
+    Super-admin / loan-exec only — the same gate as posting a reply."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only super_admin and loan_exec can attach files to the lender thread.",
+        )
+    from app.services.lender_attachments import AttachmentError, init_outbound_upload
+
+    try:
+        result = await init_outbound_upload(
+            db,
+            loan_id=loan_id,
+            filename=payload.filename,
+            mime_type=payload.mime_type,
+            size_bytes=payload.size_bytes,
+            uploaded_by=user.id,
+        )
+    except AttachmentError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    return AttachmentInitResponse(**result)
+
+
+class AttachmentReadOnly(BaseModel):
+    """Compact attachment shape used by upload-complete + from-doc.
+    The frontend stores these in its composer chip list."""
+
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    source: str
+
+
+@router.post(
+    "/{loan_id}/lender-thread/attachment/upload-complete",
+    response_model=AttachmentReadOnly,
+)
+async def lender_attachment_upload_complete(
+    loan_id: UUID,
+    attachment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentReadOnly:
+    """Browser calls this after the S3 PUT completes. We don't HEAD
+    the object (boto's signed PUT already enforces size+content-type
+    server-side), just mark the row ready-for-send and return its
+    metadata."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
+    from app.models.message_attachment import MessageAttachment
+
+    att = (
+        await db.execute(
+            select(MessageAttachment).where(
+                MessageAttachment.id == attachment_id,
+                MessageAttachment.loan_id == loan_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if att is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
+    # We don't flip status here; staged → committed flip happens when
+    # the reply handler commits attachments to a Message. This call
+    # is mainly for the future when we want to validate the upload
+    # actually succeeded (e.g., HEAD against S3).
+    return AttachmentReadOnly(
+        attachment_id=str(att.id),
+        filename=att.filename,
+        mime_type=att.mime_type,
+        size_bytes=att.size_bytes,
+        source=att.source,
+    )
+
+
+@router.post(
+    "/{loan_id}/lender-thread/attachment/from-doc",
+    response_model=AttachmentReadOnly,
+)
+async def lender_attachment_from_doc(
+    loan_id: UUID,
+    payload: AttachmentFromDocPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AttachmentReadOnly:
+    """Operator picked an existing loan Document to attach. We
+    re-reference its s3_key without duplicating bytes on S3."""
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
+    from app.services.lender_attachments import AttachmentError, from_existing_document
+
+    try:
+        att = await from_existing_document(
+            db,
+            loan_id=loan_id,
+            document_id=payload.document_id,
+            uploaded_by=user.id,
+        )
+    except AttachmentError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    return AttachmentReadOnly(
+        attachment_id=str(att.id),
+        filename=att.filename,
+        mime_type=att.mime_type,
+        size_bytes=att.size_bytes,
+        source=att.source,
+    )
+
+
+@router.get(
+    "/{loan_id}/lender-thread/attachment/{attachment_id}/download",
+    response_model=dict,
+)
+async def lender_attachment_download(
+    loan_id: UUID,
+    attachment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return a short-lived signed URL the browser can use to
+    download the attachment. Anyone with access to the loan can read
+    (visibility filter at /lender-thread already gates which
+    attachments are exposed)."""
+    visibility_stmt = _scope_query(user, select(Loan.id).where(Loan.id == loan_id))
+    if (await db.execute(visibility_stmt)).scalar_one_or_none() is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    from app.models.message_attachment import MessageAttachment
+    from app.services.lender_attachments import presign_download
+
+    att = (
+        await db.execute(
+            select(MessageAttachment).where(
+                MessageAttachment.id == attachment_id,
+                MessageAttachment.loan_id == loan_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if att is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
+    url = await presign_download(att)
+    if url is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "S3 not configured — cannot presign downloads.",
+        )
+    return {
+        "attachment_id": str(att.id),
+        "url": url,
+        "filename": att.filename,
+        "mime_type": att.mime_type,
+    }
 
 
 @router.post("/{loan_id}/disconnect-lender", response_model=LoanRead)

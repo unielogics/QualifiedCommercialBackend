@@ -56,7 +56,7 @@ approval gate). save_draft is permitted for the same two roles.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
@@ -94,6 +94,21 @@ class LenderThreadError(ValueError):
 
 
 @dataclass
+class ThreadEntryAttachment:
+    """Lightweight attachment ref attached to a ThreadEntry. The
+    download URL is short-lived (1 hour) and built fresh on each
+    /lender-thread call — the frontend should not cache it."""
+
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    source: str  # 'outbound_upload' | 'system_doc_ref' | 'inbound_lender'
+    direction: str  # 'outbound' | 'inbound'
+    download_url: str | None = None
+
+
+@dataclass
 class ThreadEntry:
     id: str
     kind: Literal["inbound", "outbound", "ai_outbound", "pending_draft"]
@@ -111,6 +126,9 @@ class ThreadEntry:
     send_status: Literal["sent", "saved", "failed", "n/a"] = "n/a"
     send_note: str | None = None
     to_email: str | None = None
+    # Round-4: attachments associated with this message (committed
+    # outbound uploads + inbound MIME parts pulled by the poller).
+    attachments: list[ThreadEntryAttachment] = field(default_factory=list)
 
 
 @dataclass
@@ -251,6 +269,44 @@ async def load_thread(
         )
     ).scalars().all()
 
+    # Pre-load all committed attachments on this loan in one shot,
+    # bucketed by message_id. Avoids N+1 lookups when the thread has
+    # many messages. The Message.attachments relationship has
+    # lazy="selectin" so .attachments on each msg works too — but
+    # this is one query for the whole thread, cheaper at scale.
+    from app.models.message_attachment import MessageAttachment as _MA
+    from app.services.lender_attachments import presign_download
+
+    att_rows = (
+        await db.execute(
+            select(_MA)
+            .where(_MA.loan_id == loan.id)
+            .where(_MA.status == "committed")
+            .order_by(_MA.created_at.asc())
+        )
+    ).scalars().all()
+    atts_by_msg: dict[UUID, list[_MA]] = {}
+    for a in att_rows:
+        if a.message_id is None:
+            continue
+        atts_by_msg.setdefault(a.message_id, []).append(a)
+
+    async def _build_attachments_for(msg_id: UUID) -> list[ThreadEntryAttachment]:
+        out: list[ThreadEntryAttachment] = []
+        for a in atts_by_msg.get(msg_id, []):
+            out.append(
+                ThreadEntryAttachment(
+                    id=str(a.id),
+                    filename=a.filename,
+                    mime_type=a.mime_type,
+                    size_bytes=a.size_bytes,
+                    source=a.source,
+                    direction=a.direction,
+                    download_url=await presign_download(a),
+                )
+            )
+        return out
+
     draft_rows = (
         await db.execute(
             select(EmailDraft)
@@ -312,6 +368,7 @@ async def load_thread(
                     sent_at=m.sent_at,
                     body=body,
                     send_status="n/a",
+                    attachments=await _build_attachments_for(m.id),
                 )
             )
         elif m.from_role == MessageFrom.AI:
@@ -331,6 +388,7 @@ async def load_thread(
                     send_status=status,
                     send_note=_note_for_msg(m),
                     to_email=draft.to_email if draft else None,
+                    attachments=await _build_attachments_for(m.id),
                 )
             )
         elif m.from_role == MessageFrom.BROKER:
@@ -349,6 +407,7 @@ async def load_thread(
                     send_status=status,
                     send_note=_note_for_msg(m),
                     to_email=draft.to_email if draft else None,
+                    attachments=await _build_attachments_for(m.id),
                 )
             )
         # MessageFrom.CLIENT is intentionally skipped — the lender thread
@@ -572,11 +631,17 @@ def _gmail_send_or_skip(
     to_email: str,
     subject: str,
     body: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, str]:
     """Call Gmail if DWD is configured; return (sent_message_id, note).
     Never raises — Gmail being unavailable should not roll back the
     user's reply intent. Falls through with (None, reason) so the
-    Message row still gets written for thread continuity in dev."""
+    Message row still gets written for thread continuity in dev.
+
+    `attachments` is the same shape build_message accepts:
+    [{filename, mime_type, data: bytes}, ...]. Caller materializes
+    these from MessageAttachment rows before invoking.
+    """
     settings = get_settings()
     if not (settings.gmail_service_account_path and settings.gmail_delegated_user):
         return (None, "Gmail not configured (SA path / delegated user) — message stored locally only.")
@@ -589,7 +654,13 @@ def _gmail_send_or_skip(
     if cfg is None:
         return (None, "Gmail config returned None — service account path empty.")
     try:
-        resp = send_message(cfg, to=to_email, subject=subject, body=body)
+        resp = send_message(
+            cfg,
+            to=to_email,
+            subject=subject,
+            body=body,
+            attachments=attachments,
+        )
         return (resp.get("id"), f"Sent via Gmail. message_id={resp.get('id')}")
     except Exception as exc:  # noqa: BLE001
         log.warning("lender_thread: Gmail send failed: %s", exc)
@@ -603,6 +674,7 @@ async def post_reply(
     actor: User,
     mode: ReplyMode,
     text: str,
+    attachment_ids: list[UUID] | None = None,
 ) -> ReplyResponse:
     if mode not in ("send_now", "instruct_ai", "save_draft"):
         raise LenderThreadError(f"Unknown reply mode: {mode!r}")
@@ -696,8 +768,32 @@ async def post_reply(
         actor_for_label = actor_label
         activity_kind = "lender_thread.replied"
 
+    # Materialize staged attachments (download from S3) so we can hand
+    # them to Gmail as MIME parts. We only do this for send_now /
+    # instruct_ai; save_draft already returned above without sending.
+    materialized_attachments: list[dict[str, Any]] = []
+    staged_atts = []
+    if attachment_ids:
+        from app.models.message_attachment import MessageAttachment as _MA
+        from app.services.lender_attachments import (
+            materialize_attachments_for_send,
+        )
+
+        staged_atts = (
+            await db.execute(
+                select(_MA).where(
+                    _MA.id.in_(attachment_ids),
+                    _MA.loan_id == loan.id,
+                )
+            )
+        ).scalars().all()
+        materialized_attachments = await materialize_attachments_for_send(staged_atts)
+
     sent_message_id, note = _gmail_send_or_skip(
-        to_email=to_email, subject=subject, body=body
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        attachments=materialized_attachments or None,
     )
     status = EmailDraftStatus.SENT if sent_message_id else EmailDraftStatus.APPROVED
     sent_at = datetime.now(timezone.utc)
@@ -751,6 +847,22 @@ async def post_reply(
     await db.flush()
     await db.refresh(msg)
     await db.refresh(draft)
+
+    # Commit staged attachments to this Message row. We've already
+    # materialized their bytes for the Gmail send above — this step
+    # is just flipping ownership pointers so the timeline + audit
+    # drawer can render them.
+    if attachment_ids:
+        from app.services.lender_attachments import (
+            commit_attachments_to_message,
+        )
+
+        await commit_attachments_to_message(
+            db,
+            loan_id=loan.id,
+            message_id=msg.id,
+            attachment_ids=attachment_ids,
+        )
 
     # Refresh the structured AI extract (loans.living_profile.lender_extract)
     # so the right-column to-do panel + the general AI chat both see

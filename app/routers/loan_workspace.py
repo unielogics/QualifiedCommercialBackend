@@ -66,6 +66,232 @@ from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
 from app.services.math import dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
+from app.models.client import Client as ClientModel
+
+
+# Phase 7.5 — Push fan-out helper for workspace chat.
+#
+# Mobile devices subscribe to FCM via `/devices/push-tokens` so the
+# borrower's phone gets a real-time signal when an operator / broker /
+# AI writes into the loan's workspace chat. Without this, the chat
+# silently lands in `loan_chat_messages` and the client never knows.
+#
+# Always best-effort: if FCM credentials aren't configured the call
+# is a no-op (see `_ensure_initialized` in app/services/push.py).
+def _notify_client(
+    *,
+    loan: Loan,
+    client_user_id: UUID | None,
+    actor_role: str,
+    body: str,
+) -> None:
+    if client_user_id is None:
+        # Lead-stage clients without a Clerk user can't receive pushes.
+        return
+    from app.services.push import fire_and_forget_push  # local import to avoid cycles
+    title = _push_title_for(actor_role)
+    preview = _trim_preview(body)
+    fire_and_forget_push(
+        client_user_id,
+        title=title,
+        body=preview,
+        data={
+            "kind": "loan_chat_message",
+            "loan_id": str(loan.id),
+        },
+    )
+
+
+def _push_title_for(actor_role: str) -> str:
+    if actor_role == DealChatRole.SUPER_ADMIN.value or actor_role == "loan_exec":
+        return "Your operator"
+    if actor_role == DealChatRole.BROKER.value or actor_role == "broker":
+        return "Your agent"
+    if actor_role == DealChatRole.AI.value or actor_role == "ai":
+        return "AI Assistant"
+    return "Loan update"
+
+
+def _trim_preview(body: str, max_chars: int = 100) -> str:
+    """Truncate on whitespace for clean previews on the lock screen."""
+    body = body.strip()
+    if len(body) <= max_chars:
+        return body
+    cut = body[: max_chars].rsplit(" ", 1)[0]
+    return f"{cut}…" if cut else body[: max_chars] + "…"
+
+
+# Phase 7.5.2 — Proactive AI re-engagement at pause expiry.
+#
+# When an operator/broker takeover sets `loan.ai_paused_until = now + 60min`,
+# we schedule a one-shot APScheduler job at that timestamp. The job loads
+# the loan + recent chat, calls the AI against that context, and posts a
+# follow-up message so the client sees the AI is back. Push fan-out is
+# part of the AI-reply path (same `_notify_client` call from
+# `_generate_ai_reply` further down), so the client gets a real-time
+# signal that the conversation has resumed.
+#
+# Job durability: APScheduler default is in-memory and loses jobs on
+# container restart. The simplest backstop is in `send_chat`'s regular
+# (non-takeover) branch: if `ai_paused_until` has expired AND no AI
+# message has posted since the pause started, the next client send
+# triggers a catch-up reply. Implementation of that fallback can land
+# in a follow-up if the scheduled-job path proves insufficient.
+def _schedule_resume_followup(*, loan_id: UUID, paused_until: datetime) -> None:
+    try:
+        from app.services.scheduler import scheduler
+        from datetime import timedelta
+        # Small jitter so we don't fire at the literal microsecond the
+        # pause clears — gives engagement.is_paused a chance to settle.
+        run_date = paused_until + timedelta(seconds=30)
+        scheduler.add_job(
+            _ai_followup_job,
+            "date",
+            run_date=run_date,
+            args=[str(loan_id)],
+            id=f"ai_followup_{loan_id}",
+            replace_existing=True,
+            misfire_grace_time=60 * 10,  # 10 min — survives brief restarts
+        )
+        log.info(
+            "loan_workspace.resume_followup_scheduled loan=%s run_date=%s",
+            loan_id, run_date.isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Best-effort — push notification has already gone out. The
+        # client can still see the operator's message; just no AI
+        # closing follow-up.
+        log.warning("loan_workspace.resume_followup_schedule_failed: %s", exc)
+
+
+async def _ai_followup_job(loan_id_str: str) -> None:
+    """One-shot APScheduler callback. Opens a fresh DB session, loads the
+    loan, and runs the AI against the current thread so it posts a
+    closing follow-up after the operator's takeover window ends."""
+    from app.db import SessionLocal
+    from uuid import UUID as _UUID
+
+    try:
+        loan_uuid = _UUID(loan_id_str)
+    except ValueError:
+        log.warning("_ai_followup_job: bad loan_id %r", loan_id_str)
+        return
+
+    async with SessionLocal() as db:
+        loan = (
+            await db.execute(select(Loan).where(Loan.id == loan_uuid))
+        ).scalar_one_or_none()
+        if loan is None:
+            log.info("_ai_followup_job: loan %s gone, skipping", loan_id_str)
+            return
+        # Only fire if the pause actually elapsed. Belt-and-suspenders
+        # against scheduler restarts that might re-fire the job.
+        if loan.ai_paused_until is not None and engagement.is_paused(loan):
+            log.info("_ai_followup_job: loan=%s still paused, skipping", loan_id_str)
+            return
+        # Generate a follow-up message. We don't have a "requesting user"
+        # in this auto-resume context — pass None and let
+        # _generate_ai_followup default to client audience.
+        ai_msg = await _generate_ai_followup(db, loan)
+        if ai_msg is None:
+            log.info("_ai_followup_job: loan=%s no follow-up emitted", loan_id_str)
+            return
+        db.add(
+            Activity(
+                loan_id=loan.id,
+                actor_id=None,
+                actor_label="ai",
+                kind="ai.auto_resumed_with_followup",
+                summary=f"AI auto-resumed and posted a follow-up after takeover ended",
+            )
+        )
+        await db.commit()
+        # Push notify the client so they discover the follow-up.
+        client = (
+            await db.execute(select(ClientModel).where(ClientModel.id == loan.client_id))
+        ).scalar_one_or_none()
+        _notify_client(
+            loan=loan,
+            client_user_id=getattr(client, "user_id", None),
+            actor_role="ai",
+            body=ai_msg.body,
+        )
+
+
+async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage | None:
+    """Like `_generate_ai_reply` but used for auto-resume after an
+    operator takeover. The system prompt nudges the AI to acknowledge
+    the operator's prior turn(s) and offer to take it from here."""
+    settings = get_settings()
+
+    # Recent chat for context (client-visible only — same view the
+    # borrower has).
+    history_stmt = (
+        select(LoanChatMessage)
+        .where(LoanChatMessage.loan_id == loan.id)
+        .where(LoanChatMessage.client_visible.is_(True))
+        .order_by(LoanChatMessage.created_at.desc())
+        .limit(20)
+    )
+    history = list((await db.execute(history_stmt)).scalars().all())
+    history.reverse()
+    if not history:
+        return None
+    # Don't double-fire: if the most recent message is already from the
+    # AI, the AI already followed up (manual resume + reply, or a prior
+    # auto-resume already fired). Skip.
+    if history[-1].from_role == DealChatRole.AI:
+        return None
+
+    turns = [
+        {
+            "role": "assistant" if m.from_role == DealChatRole.AI else "user",
+            "content": m.body,
+        }
+        for m in history
+    ]
+    system = (
+        "You are the Qualified Commercial Deal Workspace AI on a loan "
+        "that just came back online after a human operator (broker or "
+        "super_admin) took over the conversation briefly. Read the "
+        "recent exchange, acknowledge what the operator said in 1-2 "
+        "sentences, then offer to help the client from here. Be brief "
+        "and warm, not robotic. Do not repeat the operator's content "
+        "verbatim.\n\n"
+        + await assemble_loan_context(db, loan, audience="client")
+    )
+
+    if not settings.anthropic_api_key:
+        reply_text = "I'm back online — let me know how I can help from here."
+    else:
+        try:
+            client = get_client()
+            resp = await client.messages.create(
+                model=model_light(),
+                max_tokens=300,
+                system=system,
+                messages=turns,  # type: ignore[arg-type]
+            )
+            reply_text = "".join(
+                b.text for b in resp.content if getattr(b, "type", None) == "text"
+            ).strip()
+            if not reply_text:
+                reply_text = "I'm back — happy to help you with the next steps."
+        except Exception as exc:  # noqa: BLE001
+            log.warning("AI follow-up generation failed for loan %s: %s", loan.id, exc)
+            return None
+
+    msg = LoanChatMessage(
+        loan_id=loan.id,
+        from_role=DealChatRole.AI,
+        from_user_id=None,
+        body=reply_text,
+        client_visible=True,
+    )
+    db.add(msg)
+    await db.flush()
+    await db.refresh(msg)
+    return msg
 
 router = APIRouter(prefix="/loans/{loan_id}", tags=["workspace"])
 log = logging.getLogger(__name__)
@@ -330,10 +556,17 @@ async def send_chat(
     # ── chat / broker_question ─────────────────────────────────────────
     is_broker_q = payload.mode == DealChatMode.BROKER_QUESTION
     if _is_human_takeover(payload.mode, Role(user.role)):
-        # Super-admin override: persist + pause AI for 1h, no auto-reply.
+        # Operator / broker takeover: persist + pause AI for 1h, no AI auto-reply.
+        # Push the message preview to the client's mobile so they actually
+        # discover it (otherwise it sits silently in loan_chat_messages until
+        # the 15s mobile ChatPane poll lands — which they may never trigger).
+        actor_role = (
+            DealChatRole.BROKER if Role(user.role) == Role.BROKER
+            else DealChatRole.SUPER_ADMIN
+        )
         msg = LoanChatMessage(
             loan_id=loan.id,
-            from_role=(DealChatRole.BROKER if Role(user.role) == Role.BROKER else DealChatRole.SUPER_ADMIN),
+            from_role=actor_role,
             from_user_id=user.id,
             body=payload.body,
             client_visible=True,
@@ -351,6 +584,19 @@ async def send_chat(
         )
         await db.flush()
         await db.refresh(msg)
+
+        # Push fan-out + schedule the AI re-engagement at pause expiry.
+        client = (
+            await db.execute(select(ClientModel).where(ClientModel.id == loan.client_id))
+        ).scalar_one_or_none()
+        _notify_client(
+            loan=loan,
+            client_user_id=getattr(client, "user_id", None),
+            actor_role=actor_role.value,
+            body=payload.body,
+        )
+        _schedule_resume_followup(loan_id=loan.id, paused_until=paused_until)
+
         return ChatSendResponse(
             kind="message",
             message=ChatMessageRead.model_validate(msg),
@@ -481,6 +727,19 @@ async def _generate_ai_reply(
     db.add(ai_msg)
     await db.flush()
     await db.refresh(ai_msg)
+    # Push fan-out: the client's mobile gets a real-time signal that the
+    # AI replied. Skipped when the reply is broker-internal (Q&A) — that
+    # exchange isn't client-visible.
+    if client_visible:
+        client_row = (
+            await db.execute(select(ClientModel).where(ClientModel.id == loan.client_id))
+        ).scalar_one_or_none()
+        _notify_client(
+            loan=loan,
+            client_user_id=getattr(client_row, "user_id", None),
+            actor_role=DealChatRole.AI.value,
+            body=reply_text,
+        )
     return ai_msg
 
 

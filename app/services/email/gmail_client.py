@@ -141,17 +141,41 @@ def build_message(
     subject: str,
     body: str,
     from_email: str | None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> BuiltMessage:
     """Pure helper — constructs the EmailMessage + base64 raw form WITHOUT
     sending. `from_email` is normally the GmailConfig.delegated_user but
     is accepted explicitly so callers can render a 'what-would-be-sent'
-    preview even when Gmail isn't configured (no delegated_user yet)."""
+    preview even when Gmail isn't configured (no delegated_user yet).
+
+    `attachments` is an optional list of dicts with keys
+    `{filename: str, mime_type: str, data: bytes}`. When present
+    the message is built as multipart/mixed with the text body as
+    the first part and each attachment as a binary part.
+    """
     msg = EmailMessage()
     msg["To"] = to
     if from_email:
         msg["From"] = from_email
     msg["Subject"] = subject
     msg.set_content(body)
+    for att in attachments or []:
+        filename = att.get("filename") or "attachment"
+        mime_type = att.get("mime_type") or "application/octet-stream"
+        data = att.get("data") or b""
+        if not data:
+            continue
+        maintype, _, subtype = mime_type.partition("/")
+        if not maintype:
+            maintype, subtype = "application", "octet-stream"
+        if not subtype:
+            subtype = "octet-stream"
+        msg.add_attachment(
+            data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=filename,
+        )
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
     return BuiltMessage(
         from_email=from_email or "",
@@ -162,8 +186,16 @@ def build_message(
     )
 
 
-def send_message(cfg: GmailConfig, *, to: str, subject: str, body: str) -> dict[str, Any]:
-    """Tier-3: send a plaintext message via the delegated mailbox.
+def send_message(
+    cfg: GmailConfig,
+    *,
+    to: str,
+    subject: str,
+    body: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Tier-3: send a message via the delegated mailbox. Now supports
+    optional MIME attachments — same shape as build_message().
 
     Subject is left as-is — the QC deal-id injection happens at the call
     site (see app.services.email.parser.inject_deal_id) so this client
@@ -172,7 +204,11 @@ def send_message(cfg: GmailConfig, *, to: str, subject: str, body: str) -> dict[
     if not cfg.delegated_user:
         raise GmailNotConfigured("GMAIL_DELEGATED_USER required to send mail")
     built = build_message(
-        to=to, subject=subject, body=body, from_email=cfg.delegated_user
+        to=to,
+        subject=subject,
+        body=body,
+        from_email=cfg.delegated_user,
+        attachments=attachments,
     )
     svc = get_gmail_service(cfg)
     return svc.users().messages().send(userId="me", body={"raw": built.raw_base64}).execute()

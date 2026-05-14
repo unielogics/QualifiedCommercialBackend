@@ -13,6 +13,7 @@ from app.enums import MessageFrom
 
 if TYPE_CHECKING:
     from app.models.loan import Loan
+    from app.models.message_attachment import MessageAttachment
 
 
 class Message(Base):
@@ -31,3 +32,8 @@ class Message(Base):
     )
 
     loan: Mapped[Loan] = relationship(back_populates="messages")
+    attachments: Mapped[list[MessageAttachment]] = relationship(
+        back_populates="message",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )

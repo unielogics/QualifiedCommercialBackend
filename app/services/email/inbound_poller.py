@@ -141,7 +141,13 @@ async def run_inbound_poll() -> None:
                 continue
 
             try:
-                await _ingest_one(db, parsed=parsed, gmail_id=gmail_id)
+                await _ingest_one(
+                    db,
+                    parsed=parsed,
+                    gmail_id=gmail_id,
+                    gmail_svc=svc,
+                    detail=detail,
+                )
             except Exception:
                 log.exception("inbound_poller: ingest failed for gmail_id=%s", gmail_id)
                 # Continue — next tick will retry this one because no
@@ -247,11 +253,38 @@ def _decode_part(body: dict[str, Any]) -> str:
         return ""
 
 
+def _walk_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Find every MIME part with a filename. Returns a list of dicts
+    with {filename, mime_type, attachment_id, size_bytes}. The
+    attachment_id is the Gmail-side reference we need to pass to
+    users.messages.attachments.get to fetch the bytes."""
+    out: list[dict[str, Any]] = []
+    if not payload:
+        return out
+    filename = payload.get("filename") or ""
+    body = payload.get("body") or {}
+    attachment_id = body.get("attachmentId")
+    if filename and attachment_id:
+        out.append(
+            {
+                "filename": filename,
+                "mime_type": payload.get("mimeType") or "application/octet-stream",
+                "attachment_id": attachment_id,
+                "size_bytes": int(body.get("size") or 0),
+            }
+        )
+    for p in payload.get("parts", []) or []:
+        out.extend(_walk_attachments(p))
+    return out
+
+
 async def _ingest_one(
     db: AsyncSession,
     *,
     parsed: InboundEmail,
     gmail_id: str,
+    gmail_svc: Any = None,
+    detail: dict[str, Any] | None = None,
 ) -> None:
     """Persist a single inbound lender email.
 
@@ -339,6 +372,62 @@ async def _ingest_one(
             "inbound_poller: ingested gmail_id=%s into loan=%s as Message %s",
             gmail_id, loan.id, msg.id,
         )
+
+        # 1b. Extract attachments. Each attachment requires a separate
+        # users.messages.attachments.get call against Gmail to fetch
+        # the bytes (Gmail doesn't inline them by default beyond a
+        # few KB threshold). Persist via the lender_attachments
+        # service so the audit + UI surfaces pick them up.
+        if gmail_svc is not None and detail is not None:
+            try:
+                from app.services.lender_attachments import (
+                    decode_b64url,
+                    ingest_inbound_attachment,
+                )
+
+                refs = _walk_attachments(detail.get("payload", {}) or {})
+                for ref in refs:
+                    try:
+                        att_resp = (
+                            gmail_svc.users()
+                            .messages()
+                            .attachments()
+                            .get(
+                                userId="me",
+                                messageId=gmail_id,
+                                id=ref["attachment_id"],
+                            )
+                            .execute()
+                        )
+                        data_b64 = att_resp.get("data") or ""
+                        if not data_b64:
+                            continue
+                        await ingest_inbound_attachment(
+                            db,
+                            loan_id=loan.id,
+                            message_id=msg.id,
+                            gmail_id=gmail_id,
+                            filename=ref["filename"],
+                            mime_type=ref["mime_type"],
+                            data=decode_b64url(data_b64),
+                        )
+                    except Exception:
+                        log.exception(
+                            "inbound_poller: attachment fetch failed "
+                            "gmail_id=%s filename=%s (non-fatal)",
+                            gmail_id, ref.get("filename"),
+                        )
+                if refs:
+                    log.info(
+                        "inbound_poller: pulled %d attachment(s) for "
+                        "gmail_id=%s",
+                        len(refs), gmail_id,
+                    )
+            except Exception:
+                log.exception(
+                    "inbound_poller: attachment walk failed for gmail_id=%s",
+                    gmail_id,
+                )
 
     # 2. Always run the orchestrator so the existing broker-approval
     # EmailDraft + AITask flow stays consistent for callers that key
