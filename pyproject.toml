@@ -37,6 +37,8 @@ dependencies = [
     # the mobile can use raw FCM tokens (no Expo intermediary). Loads
     # the Firebase Admin service-account JSON from FIREBASE_CREDENTIALS_PATH.
     "firebase-admin>=6.5.0",
+    "google-api-python-client>=2.150",
+    "google-auth>=2.35",
 ]
 
 [project.optional-dependencies]
