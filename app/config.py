@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     gmail_pubsub_topic: str = ""
     use_fake_inbox: bool = True
 
+    # Firebase Cloud Messaging — path to the Firebase Admin SDK
+    # service-account JSON. Used by app/services/push.py to send
+    # FCM HTTPv1 messages to the mobile app. When empty, push.py
+    # logs a debug note and no-ops — useful for local dev where
+    # you don't want to wire FCM yet.
+    firebase_credentials_path: str = ""
+
     app_env: str = "development"
     log_level: str = "INFO"
 

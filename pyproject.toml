@@ -32,6 +32,11 @@ dependencies = [
     # PDF text extraction for agent knowledge documents (the Knowledge &
     # Voice section of /agent-settings/ai). See services/ai/knowledge.py.
     "pypdf>=5.0.0",
+    # Firebase Cloud Messaging — push notifications to the Android app
+    # via FCM HTTPv1. Replaces the previous Expo Push Service path so
+    # the mobile can use raw FCM tokens (no Expo intermediary). Loads
+    # the Firebase Admin service-account JSON from FIREBASE_CREDENTIALS_PATH.
+    "firebase-admin>=6.5.0",
 ]
 
 [project.optional-dependencies]

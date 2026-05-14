@@ -1,14 +1,20 @@
-"""Per-user push tokens (Expo).
+"""Per-user push tokens (FCM).
 
-The mobile app registers its Expo push token via POST /devices/push-tokens
+The mobile app registers its FCM device token via POST /devices/push-tokens
 after the borrower grants notification permission. `post_ai_message`
-fans these out via Expo's HTTP push API on every system-initiated AI
-message — kickoff opener, doc-reminder tier-1, scanner reaction,
+fans these out via Firebase Cloud Messaging on every system-initiated
+AI message — kickoff opener, doc-reminder tier-1, scanner reaction,
 anchor narration.
 
-`(user_id, token)` is unique — a device that re-registers (Expo
-sometimes rotates tokens) just upserts the timestamp. Tokens are
-removed when the user logs out / uninstalls (mobile sends DELETE).
+`(user_id, token)` is unique — a device that re-registers (FCM
+sometimes rotates tokens after app updates / cache clears) just
+upserts the row. Tokens are removed when the user logs out /
+uninstalls (mobile sends DELETE), or pruned by app/services/push.py
+when FCM reports `UNREGISTERED` / `INVALID_ARGUMENT`.
+
+History: this used to go through Expo Push Service; switched to
+direct FCM so the mobile can use raw FCM tokens without an Expo
+project as an intermediary.
 """
 
 from __future__ import annotations
@@ -41,10 +47,10 @@ class DeviceToken(TimestampMixin, Base):
         nullable=False,
         index=True,
     )
-    # Expo push token — `ExponentPushToken[xxx]` shape. Tokens are
-    # platform-agnostic at this layer; Expo's backend routes to FCM
-    # / APNS as needed.
+    # FCM device token — opaque ~150-char string from
+    # `getDevicePushTokenAsync()` on the mobile side.
     token: Mapped[str] = mapped_column(String(255), nullable=False)
-    # Always 'expo' for now; reserved so we can add 'web' (FCM)
-    # without a migration.
-    platform: Mapped[str] = mapped_column(String(16), nullable=False, default="expo")
+    # "device" = raw FCM token (current Android path). Reserved
+    # values: "expo" (legacy Expo Push token), "apns" (iOS direct,
+    # not yet implemented). Mobile sends the value it generated.
+    platform: Mapped[str] = mapped_column(String(16), nullable=False, default="device")

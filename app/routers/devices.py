@@ -1,7 +1,9 @@
 """Per-user push-token registration.
 
-Mobile (Expo) calls POST /devices/push-tokens after the borrower
-grants notification permission. We upsert by `(user_id, token)` so
+Mobile calls POST /devices/push-tokens after the borrower grants
+notification permission. The mobile generates an FCM device token
+via expo-notifications' `getDevicePushTokenAsync()` and POSTs it
+here with `platform="device"`. We upsert by `(user_id, token)` so
 re-registration on app reopen is idempotent. DELETE removes a token
 on logout / uninstall.
 """
@@ -25,7 +27,9 @@ log = logging.getLogger(__name__)
 
 class PushTokenRegisterRequest(BaseModel):
     token: str = Field(min_length=1, max_length=255)
-    platform: str = Field(default="expo", max_length=16)
+    # "device" = FCM raw token (the current Android default). "expo"
+    # kept as a legacy value for any client that still sends it.
+    platform: str = Field(default="device", max_length=16)
 
 
 class PushTokenDeregisterRequest(BaseModel):
@@ -57,13 +61,13 @@ async def register_push_token(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        existing.platform = payload.platform.strip() or "expo"
+        existing.platform = payload.platform.strip() or "device"
         await db.commit()
         return PushTokenAck()
     row = DeviceToken(
         user_id=user.id,
         token=payload.token.strip(),
-        platform=(payload.platform.strip() or "expo")[:16],
+        platform=(payload.platform.strip() or "device")[:16],
     )
     db.add(row)
     await db.commit()
