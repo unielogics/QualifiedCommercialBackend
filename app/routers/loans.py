@@ -11,7 +11,7 @@ from uuid import UUID
 
 log = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -215,12 +215,28 @@ async def list_required_documents(
 
 @router.get("/{loan_id}/todo", response_model=list[TodoItemRead])
 async def list_loan_todo(
-    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    loan_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    status_filter: str = Query("pending", alias="status"),
 ) -> list[TodoItemRead]:
-    """Client-facing To-Do for a loan, composed from existing data:
-    outstanding documents + upcoming calls + open agent/AI asks.
-    No new storage. Scoped by the loan's role-scope so a client only
-    ever sees their own loan."""
+    """The loan's To-Do, composed from existing data and STRICTLY
+    isolated to the caller's own files:
+
+      - documents the borrower owes on THIS loan
+      - calls on THIS loan visible to the caller (calendar audience
+        scope already excludes other people's / AI-internal events)
+      - agent/AI internal "asks": ONLY surfaced to SUPER_ADMIN /
+        LOAN_EXEC. Clients and brokers never see the internal AI-task
+        queue here — those are operator workflow items, not the
+        borrower's to-dos. (This is the noise the borrower was
+        seeing.)
+
+    `status` query param filters the whole list:
+      - "pending"  (default) → outstanding only
+      - "completed"          → finished only
+      - "all"                → both
+    """
     from datetime import datetime as _dt, timezone as _tz
 
     from app.models.document import Document as _Document
@@ -234,6 +250,13 @@ async def list_loan_todo(
     )
     from app.routers.calendar import _scope_calendar_for_audience
 
+    sf = (status_filter or "pending").lower()
+    if sf not in ("pending", "completed", "all"):
+        sf = "pending"
+    want_pending = sf in ("pending", "all")
+    want_completed = sf in ("completed", "all")
+    sees_internal = user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC)
+
     scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
     loan = (await db.execute(scope)).scalar_one_or_none()
     if loan is None:
@@ -241,39 +264,45 @@ async def list_loan_todo(
 
     out: list[TodoItemRead] = []
 
-    # Outstanding documents the borrower still owes.
-    docs = (
-        await db.execute(
-            select(_Document).where(
-                _Document.loan_id == loan_id,
-                _Document.status.in_([_DocStatus.REQUESTED, _DocStatus.PENDING]),
+    # Documents on THIS loan.
+    doc_statuses: list = []
+    if want_pending:
+        doc_statuses += [_DocStatus.REQUESTED, _DocStatus.PENDING]
+    if want_completed:
+        doc_statuses += [_DocStatus.RECEIVED, _DocStatus.VERIFIED]
+    if doc_statuses:
+        docs = (
+            await db.execute(
+                select(_Document).where(
+                    _Document.loan_id == loan_id,
+                    _Document.status.in_(doc_statuses),
+                )
             )
-        )
-    ).scalars().all()
-    for d in docs:
-        out.append(
-            TodoItemRead(
-                id=f"doc:{d.id}",
-                kind="document",
-                title=d.name or "Document requested",
-                subtitle="Upload requested",
-                status=str(d.status),
-                due_at=None,
-                deeplink=f"/loan/{loan_id}?tab=docs",
+        ).scalars().all()
+        for d in docs:
+            done = d.status in (_DocStatus.RECEIVED, _DocStatus.VERIFIED)
+            out.append(
+                TodoItemRead(
+                    id=f"doc:{d.id}",
+                    kind="document",
+                    title=d.name or "Document requested",
+                    subtitle="Uploaded" if done else "Upload requested",
+                    status=str(d.status),
+                    due_at=None,
+                    deeplink=f"/loan/{loan_id}?tab=docs",
+                )
             )
-        )
 
-    # Upcoming calls visible to this user on this loan.
+    # Calls on THIS loan, audience-scoped (clients never see AI-source
+    # or other clients' events — enforced by _scope_calendar_for_audience).
     now = _dt.now(_tz.utc)
-    cal_stmt = _scope_calendar_for_audience(
-        user,
-        select(_Cal).where(
-            _Cal.loan_id == loan_id,
-            _Cal.kind == _CalKind.CALL,
-            _Cal.status != _CalStatus.DONE,
-            _Cal.starts_at >= now,
-        ),
-    )
+    cal_where = [_Cal.loan_id == loan_id, _Cal.kind == _CalKind.CALL]
+    if sf == "pending":
+        cal_where += [_Cal.status != _CalStatus.DONE, _Cal.starts_at >= now]
+    elif sf == "completed":
+        cal_where += [_Cal.status == _CalStatus.DONE]
+    # "all" → no status/time narrowing (still loan + kind scoped)
+    cal_stmt = _scope_calendar_for_audience(user, select(_Cal).where(*cal_where))
     for ev in (await db.execute(cal_stmt)).scalars().all():
         out.append(
             TodoItemRead(
@@ -287,27 +316,35 @@ async def list_loan_todo(
             )
         )
 
-    # Open agent / AI asks tied to this loan.
-    tasks = (
-        await db.execute(
-            select(_AITask).where(
-                _AITask.loan_id == loan_id,
-                _AITask.status == _TaskStatus.PENDING,
-            )
-        )
-    ).scalars().all()
-    for tk in tasks:
-        out.append(
-            TodoItemRead(
-                id=f"task:{tk.id}",
-                kind="task",
-                title=tk.title or "Action needed",
-                subtitle=(tk.summary or None),
-                status=str(tk.status),
-                due_at=None,
-                deeplink=f"/loan/{loan_id}?tab=todo",
-            )
-        )
+    # Internal agent/AI asks — operators only. Never leaked to the
+    # borrower or the broker on the borrower's To-Do surface.
+    if sees_internal:
+        task_statuses: list = []
+        if want_pending:
+            task_statuses += [_TaskStatus.PENDING]
+        if want_completed:
+            task_statuses += [_TaskStatus.APPROVED, _TaskStatus.EXECUTED]
+        if task_statuses:
+            tasks = (
+                await db.execute(
+                    select(_AITask).where(
+                        _AITask.loan_id == loan_id,
+                        _AITask.status.in_(task_statuses),
+                    )
+                )
+            ).scalars().all()
+            for tk in tasks:
+                out.append(
+                    TodoItemRead(
+                        id=f"task:{tk.id}",
+                        kind="task",
+                        title=tk.title or "Action needed",
+                        subtitle=(tk.summary or None),
+                        status=str(tk.status),
+                        due_at=None,
+                        deeplink=f"/loan/{loan_id}?tab=todo",
+                    )
+                )
 
     return out
 
