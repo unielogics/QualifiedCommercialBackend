@@ -150,6 +150,10 @@ class LoanUpdate(BaseModel):
 class LoanRead(ORMModel):
     id: UUID
     deal_id: str
+    # Back-reference to the Deal this loan was promoted from (alembic
+    # 0048). Lets mobile / desktop route from a loan row to its (A)
+    # agent-chat surface.
+    source_deal_id: UUID | None = None
     client_id: UUID
     broker_id: UUID | None
     # Owner display name for the operator pipeline header — populated by

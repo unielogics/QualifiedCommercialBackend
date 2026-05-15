@@ -33,6 +33,7 @@ can see what was withheld without revealing content.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+log = logging.getLogger(__name__)
 
 from app.enums import (
     DealHandoffStatus,
@@ -313,6 +316,21 @@ async def promote_deal_to_loan(
     db.add(loan)
     await db.flush()
     await db.refresh(loan)
+
+    # Seed (L) loan_chat_messages with an AI-summarized handoff from the
+    # (A) deal-chat history. Best-effort — a failure here doesn't roll
+    # back the promotion; the funding team can still pick up the file,
+    # they just lose the pre-funding context summary.
+    try:
+        from app.services.handoff_seed_loan_from_deal_chat import (
+            seed_loan_chat_from_deal,
+        )
+
+        await seed_loan_chat_from_deal(db, deal=deal, loan=loan)
+    except Exception:  # noqa: BLE001 — best-effort
+        log.exception(
+            "seed_loan_chat_from_deal failed deal=%s loan=%s", deal.id, loan.id
+        )
 
     # Bootstrap loan-scoped CRS rows. Best-effort — failure here doesn't
     # roll back the promotion; bootstrap is idempotent and can be

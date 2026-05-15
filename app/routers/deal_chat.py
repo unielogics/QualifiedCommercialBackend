@@ -1,0 +1,313 @@
+"""Deal-scoped multi-party chat — the (A) thread.
+
+Same shape as routers/loan_workspace.send_chat but keyed on Deal
+instead of Loan. Broker, client, and AI all participate. Modes
+mirror the loan workspace surface: chat (client/operator takeover),
+live_chat (broker takeover), broker_question (private Q&A with AI),
+broker_suggestion (drafts an AI Inbox task), instruct (rule for AI).
+
+On promotion (services/handoff.promote_deal_to_loan) the full thread
+is summarized into a single broker_internal LoanChatMessage at the
+top of the new loan's workspace chat, so the funding team inherits
+the pre-funding history.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import defaultdict
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
+from app.db import get_db
+from app.deps import CurrentUser
+from app.enums import DealChatMode, DealChatRole, Role
+from app.models.activity import Activity
+from app.models.client import Client as ClientModel
+from app.models.deal import Deal
+from app.models.deal_chat_message import DealChatMessage
+from app.models.user import User
+from app.schemas.loan_workspace import (
+    ChatMessageRead,
+    ChatSendRequest,
+    ChatSendResponse,
+)
+from app.services.ai.anthropic_client import get_client, model_light
+from app.services.push import fire_and_forget_push
+
+log = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/deals/{deal_id}", tags=["deal-chat"])
+
+
+_MODE_ALLOWED_ROLES: dict[DealChatMode, set[Role]] = {
+    DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.CLIENT},
+    DealChatMode.INSTRUCT: {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC},
+    DealChatMode.BROKER_QUESTION: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
+    DealChatMode.BROKER_SUGGESTION: {Role.BROKER},
+    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
+}
+
+
+_chat_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def _load_deal(db: AsyncSession, deal_id: UUID, user: User) -> Deal:
+    """Load a deal, scoped by role.
+
+    - CLIENT: only their own deals (via client_id → user.client.id).
+    - BROKER: only deals assigned to them.
+    - SUPER_ADMIN / LOAN_EXEC: any.
+    """
+    stmt = select(Deal).where(Deal.id == deal_id)
+    if user.role == Role.CLIENT and user.client:
+        stmt = stmt.where(Deal.client_id == user.client.id)
+    elif user.role == Role.BROKER and user.broker:
+        stmt = stmt.where(Deal.assigned_agent_id == user.id)
+    deal = (await db.execute(stmt)).scalar_one_or_none()
+    if deal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
+    return deal
+
+
+def _is_human_takeover(mode: DealChatMode, role: Role) -> bool:
+    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        return True
+    if mode == DealChatMode.LIVE_CHAT and role in (
+        Role.BROKER,
+        Role.SUPER_ADMIN,
+        Role.LOAN_EXEC,
+    ):
+        return True
+    return False
+
+
+@router.get("/chat", response_model=list[ChatMessageRead])
+async def list_deal_chat(
+    deal_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[ChatMessageRead]:
+    await _load_deal(db, deal_id, user)
+    stmt = (
+        select(DealChatMessage)
+        .where(DealChatMessage.deal_id == deal_id)
+        .order_by(DealChatMessage.created_at.asc())
+    )
+    if user.role == Role.CLIENT:
+        stmt = stmt.where(DealChatMessage.client_visible.is_(True))
+    rows = (await db.execute(stmt)).scalars().all()
+    return [ChatMessageRead.model_validate(r) for r in rows]
+
+
+@router.post("/chat", response_model=ChatSendResponse, status_code=status.HTTP_201_CREATED)
+async def send_deal_chat(
+    deal_id: UUID,
+    payload: ChatSendRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ChatSendResponse:
+    """Mirror of loan_workspace.send_chat, deal-scoped.
+
+    INSTRUCT / BROKER_SUGGESTION are deferred to the post-promotion
+    surface for now (they reference loan_instructions and ai_tasks,
+    which are loan-scoped). Allowed modes on a Deal: CHAT, LIVE_CHAT,
+    BROKER_QUESTION.
+    """
+    deal = await _load_deal(db, deal_id, user)
+
+    if Role(user.role) not in _MODE_ALLOWED_ROLES[payload.mode]:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"Role {user.role} cannot use mode {payload.mode}",
+        )
+
+    if payload.mode in (DealChatMode.INSTRUCT, DealChatMode.BROKER_SUGGESTION):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Instructions and broker suggestions are only available after a deal is promoted to a loan.",
+        )
+
+    is_broker_q = payload.mode == DealChatMode.BROKER_QUESTION
+
+    if _is_human_takeover(payload.mode, Role(user.role)):
+        actor_role = (
+            DealChatRole.BROKER
+            if Role(user.role) == Role.BROKER
+            else DealChatRole.SUPER_ADMIN
+        )
+        msg = DealChatMessage(
+            deal_id=deal.id,
+            from_role=actor_role,
+            from_user_id=user.id,
+            body=payload.body,
+            client_visible=True,
+        )
+        db.add(msg)
+        # No per-deal AI pause column today; takeovers just persist
+        # client-visible. If/when you need a deal-level pause, add a
+        # column ai_paused_until on deals and mirror the loan logic.
+        # Activity table is keyed on loan_id / client_id (no deal_id
+        # column yet — see alembic 0035). Scope to client so the agent
+        # workspace activity feed picks it up.
+        db.add(
+            Activity(
+                client_id=deal.client_id,
+                actor_id=user.id,
+                actor_label=user.email,
+                kind=(
+                    "deal_chat.broker_takeover"
+                    if Role(user.role) == Role.BROKER
+                    else "deal_chat.operator_takeover"
+                ),
+                summary=f"{user.email} ({user.role}) took over deal {deal.title}",
+            )
+        )
+        await db.flush()
+        await db.refresh(msg)
+
+        # Push fan-out to the client.
+        client_row = (
+            await db.execute(select(ClientModel).where(ClientModel.id == deal.client_id))
+        ).scalar_one_or_none()
+        if client_row and client_row.user_id:
+            fire_and_forget_push(
+                client_row.user_id,
+                title=_push_title_for(actor_role.value),
+                body=payload.body[:100],
+                data={"kind": "deal_chat_message", "deal_id": str(deal.id)},
+            )
+
+        return ChatSendResponse(
+            kind="message",
+            message=ChatMessageRead.model_validate(msg),
+            paused_until=None,
+        )
+
+    # Client send (mode=chat) or broker_question (private Q&A with AI).
+    from_role = DealChatRole.BROKER_INTERNAL if is_broker_q else DealChatRole.CLIENT
+    client_visible = not is_broker_q
+    msg = DealChatMessage(
+        deal_id=deal.id,
+        from_role=from_role,
+        from_user_id=user.id,
+        body=payload.body,
+        client_visible=client_visible,
+    )
+    db.add(msg)
+    await db.flush()
+    await db.refresh(msg)
+
+    # AI auto-reply.
+    lock = _chat_locks[str(deal.id)]
+    async with lock:
+        ai_msg = await _generate_ai_reply(db, deal, user, client_visible=client_visible)
+
+    return ChatSendResponse(
+        kind="message",
+        message=ChatMessageRead.model_validate(msg),
+        ai_reply=ChatMessageRead.model_validate(ai_msg) if ai_msg else None,
+    )
+
+
+def _push_title_for(actor_role: str) -> str:
+    if actor_role in ("super_admin", "loan_exec"):
+        return "Your operator"
+    if actor_role == "broker":
+        return "Your agent"
+    if actor_role == "ai":
+        return "AI Assistant"
+    return "Deal update"
+
+
+async def _generate_ai_reply(
+    db: AsyncSession,
+    deal: Deal,
+    requesting_user: User,
+    *,
+    client_visible: bool,
+) -> DealChatMessage | None:
+    """Anthropic call mirroring loan_workspace._generate_ai_reply but
+    on a deal-scoped thread. Context is the deal's living_profile +
+    last 20 deal_chat_messages turns.
+    """
+    settings = get_settings()
+
+    history_stmt = (
+        select(DealChatMessage)
+        .where(DealChatMessage.deal_id == deal.id)
+        .order_by(DealChatMessage.created_at.desc())
+        .limit(20)
+    )
+    if requesting_user.role == Role.CLIENT:
+        history_stmt = history_stmt.where(DealChatMessage.client_visible.is_(True))
+    history = list((await db.execute(history_stmt)).scalars().all())
+    history.reverse()
+
+    turns = [
+        {
+            "role": "assistant" if m.from_role == DealChatRole.AI else "user",
+            "content": m.body,
+        }
+        for m in history
+    ]
+    if not turns or turns[-1]["role"] != "user":
+        return None
+
+    system = (
+        "You are the Qualified Commercial Deal Workspace AI, scoped to a "
+        "pre-funding deal. Stay focused on this single deal — buyer search, "
+        "seller listing, or investor purchase. Be concise (1-3 sentences "
+        "unless asked to expand). Help the agent nurture the lead.\n\n"
+        f"Deal: {deal.title} (type={deal.deal_type}, status={deal.status}).\n"
+        f"Address: {deal.address or 'TBD'} {deal.city or ''} {deal.state or ''}.\n"
+    )
+
+    if not settings.anthropic_api_key:
+        reply_text = "(stub) I would normally answer here once ANTHROPIC_API_KEY is set."
+    else:
+        try:
+            client = get_client()
+            resp = await client.messages.create(
+                model=model_light(),
+                max_tokens=500,
+                system=system,
+                messages=turns,  # type: ignore[arg-type]
+            )
+            reply_text = "".join(
+                b.text for b in resp.content if getattr(b, "type", None) == "text"
+            ).strip()
+            if not reply_text:
+                reply_text = "(no reply)"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Deal AI reply failed: %s", exc)
+            return None
+
+    ai_msg = DealChatMessage(
+        deal_id=deal.id,
+        from_role=DealChatRole.AI,
+        from_user_id=None,
+        body=reply_text,
+        client_visible=client_visible,
+    )
+    db.add(ai_msg)
+    await db.flush()
+    await db.refresh(ai_msg)
+
+    if client_visible:
+        client_row = (
+            await db.execute(select(ClientModel).where(ClientModel.id == deal.client_id))
+        ).scalar_one_or_none()
+        if client_row and client_row.user_id:
+            fire_and_forget_push(
+                client_row.user_id,
+                title="AI Assistant",
+                body=reply_text[:100],
+                data={"kind": "deal_chat_message", "deal_id": str(deal.id)},
+            )
+    return ai_msg

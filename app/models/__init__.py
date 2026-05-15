@@ -19,6 +19,7 @@ from app.models.client_property import ClientProperty  # noqa: F401
 from app.models.client_requirement_status import ClientRequirementStatus  # noqa: F401
 from app.models.credit_pull import CreditPull  # noqa: F401
 from app.models.deal import Deal  # noqa: F401
+from app.models.deal_chat_message import DealChatMessage  # noqa: F401
 from app.models.agent_task import AgentTask  # noqa: F401
 from app.models.device_token import DeviceToken  # noqa: F401
 from app.models.document import Document  # noqa: F401
