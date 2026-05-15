@@ -515,6 +515,50 @@ async def update_loan(
     for k, v in changes.items():
         setattr(loan, k, v)
 
+    # Broker-assignment cascade. A client relationship is owned by ONE
+    # broker — the client.broker_id is the source of truth. Reassigning
+    # a loan to a different broker (e.g. via the desktop
+    # MultiLoanReassignModal, which PATCHes loans only) must carry the
+    # client and the client's sibling loans with it, otherwise the
+    # relationship splits: loans owned by broker X while the Clients
+    # tab / "Message client" path (scoped by client.broker_id) still
+    # points at broker Y. That split is exactly the
+    # franco@unielogics.com bug. Keep everything under one broker.
+    if "broker_id" in changes and loan.client_id is not None:
+        new_broker_id = changes["broker_id"]
+        from app.models.client import Client as _Client
+
+        client_row = (
+            await db.execute(select(_Client).where(_Client.id == loan.client_id))
+        ).scalar_one_or_none()
+        if client_row is not None and client_row.broker_id != new_broker_id:
+            client_row.broker_id = new_broker_id
+            db.add(
+                Activity(
+                    client_id=client_row.id,
+                    actor_id=user.id,
+                    actor_label=user.email,
+                    kind="client.broker_reassigned",
+                    summary=(
+                        f"Client reassigned to broker {new_broker_id} "
+                        f"(cascaded from loan {loan.deal_id} reassignment)"
+                    ),
+                )
+            )
+        # Sibling loans for the same client move too, so the
+        # relationship isn't split across brokers.
+        sibling_loans = (
+            await db.execute(
+                select(Loan).where(
+                    Loan.client_id == loan.client_id,
+                    Loan.id != loan.id,
+                    Loan.broker_id != new_broker_id,
+                )
+            )
+        ).scalars().all()
+        for sib in sibling_loans:
+            sib.broker_id = new_broker_id
+
     # Diff-aware activity. Writes one row tagged either
     # `loan.criteria_changed` (operator-visible) or `loan.pricing_changed`
     # (internal-only) with structured before→after payload. Returns
