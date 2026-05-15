@@ -38,6 +38,7 @@ from app.schemas.loan_workspace import (
     ChatSendResponse,
 )
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.push import fire_and_forget_push
 
 log = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ async def list_deal_chat(
     if user.role == Role.CLIENT:
         stmt = stmt.where(DealChatMessage.client_visible.is_(True))
     rows = (await db.execute(stmt)).scalars().all()
-    return [ChatMessageRead.model_validate(r) for r in rows]
+    return await serialize_chat(db, list(rows))
 
 
 @router.post("/chat", response_model=ChatSendResponse, status_code=status.HTTP_201_CREATED)
@@ -185,7 +186,7 @@ async def send_deal_chat(
 
         return ChatSendResponse(
             kind="message",
-            message=ChatMessageRead.model_validate(msg),
+            message=await serialize_chat_one(db, msg),
             paused_until=None,
         )
 
@@ -210,8 +211,8 @@ async def send_deal_chat(
 
     return ChatSendResponse(
         kind="message",
-        message=ChatMessageRead.model_validate(msg),
-        ai_reply=ChatMessageRead.model_validate(ai_msg) if ai_msg else None,
+        message=await serialize_chat_one(db, msg),
+        ai_reply=await serialize_chat_one(db, ai_msg) if ai_msg else None,
     )
 
 

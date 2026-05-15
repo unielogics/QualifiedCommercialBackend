@@ -32,19 +32,39 @@ class InstructionCreate(BaseModel):
 # ── Chat ───────────────────────────────────────────────────────────────
 
 
+class ChatAttachmentRead(BaseModel):
+    document_id: UUID
+    name: str
+    mime: str | None = None
+    url: str | None = None
+
+
 class ChatMessageRead(ORMModel):
     id: UUID
-    loan_id: UUID
+    # Optional so the same schema serializes deal_chat_messages
+    # (keyed on deal_id, no loan_id).
+    loan_id: UUID | None = None
     from_role: DealChatRole
     from_user_id: UUID | None
+    # Resolved display name of the human sender (users.name, falling
+    # back to brokers.display_name). None for AI / unresolved — the
+    # frontend renders "Smart Assistant" for AI and the role word as
+    # the suffix.
+    from_name: str | None = None
     body: str
     client_visible: bool
     created_at: datetime
+    # Optional file attachment (alembic 0056). None for plain text.
+    attachment: ChatAttachmentRead | None = None
 
 
 class ChatSendRequest(BaseModel):
     body: str = Field(min_length=1, max_length=8000)
     mode: DealChatMode
+    # Optional document attachment (alembic 0056). The client uploads
+    # via /documents/upload-init→complete, then references the
+    # resulting document_id here so the note + file land in one turn.
+    attachment_document_id: UUID | None = None
 
 
 class ChatSendResponse(BaseModel):

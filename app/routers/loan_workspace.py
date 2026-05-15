@@ -61,6 +61,7 @@ from app.schemas.loan_workspace import (
     ScenarioRead,
     WorkspaceState,
 )
+from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.ai import engagement
 from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
@@ -377,7 +378,7 @@ async def get_workspace_state(
 
     return WorkspaceState(
         instructions=[InstructionRead.model_validate(i) for i in instructions],
-        chat_messages=[ChatMessageRead.model_validate(m) for m in chat_messages],
+        chat_messages=await serialize_chat(db, list(chat_messages)),
         scenarios=[ScenarioRead.model_validate(s) for s in scenarios],
         hud_lines=[HudLineRead.model_validate(h) for h in hud_lines],
         ai_paused_until=loan.ai_paused_until,
@@ -471,7 +472,7 @@ async def list_chat(
     if user.role == Role.CLIENT:
         stmt = stmt.where(LoanChatMessage.client_visible.is_(True))
     rows = (await db.execute(stmt)).scalars().all()
-    return [ChatMessageRead.model_validate(r) for r in rows]
+    return await serialize_chat(db, list(rows))
 
 
 # Per-mode allowed roles. CLIENT can only send `chat` (ignoring mode).
@@ -599,7 +600,7 @@ async def send_chat(
 
         return ChatSendResponse(
             kind="message",
-            message=ChatMessageRead.model_validate(msg),
+            message=await serialize_chat_one(db, msg),
             paused_until=paused_until,
         )
 
@@ -612,6 +613,7 @@ async def send_chat(
         from_user_id=user.id,
         body=payload.body,
         client_visible=client_visible,
+        attachment_document_id=payload.attachment_document_id,
     )
     db.add(msg)
     await db.flush()
@@ -622,7 +624,7 @@ async def send_chat(
         # Client send during pause — persist, no AI reply.
         return ChatSendResponse(
             kind="message",
-            message=ChatMessageRead.model_validate(msg),
+            message=await serialize_chat_one(db, msg),
             paused_until=loan.ai_paused_until,
         )
 
@@ -632,8 +634,8 @@ async def send_chat(
         ai_msg = await _generate_ai_reply(db, loan, user, client_visible=client_visible)
     return ChatSendResponse(
         kind="message",
-        message=ChatMessageRead.model_validate(msg),
-        ai_reply=ChatMessageRead.model_validate(ai_msg) if ai_msg else None,
+        message=await serialize_chat_one(db, msg),
+        ai_reply=await serialize_chat_one(db, ai_msg) if ai_msg else None,
     )
 
 

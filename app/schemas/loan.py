@@ -147,6 +147,19 @@ class LoanUpdate(BaseModel):
     longitude: float | None = None
 
 
+class TodoItemRead(BaseModel):
+    """A single client-facing to-do row. Composed from existing data
+    (documents / calendar / ai_tasks) — no new storage."""
+
+    id: str
+    kind: Literal["document", "call", "task"]
+    title: str
+    subtitle: str | None = None
+    status: str | None = None
+    due_at: str | None = None
+    deeplink: str | None = None
+
+
 class LoanRead(ORMModel):
     id: UUID
     deal_id: str

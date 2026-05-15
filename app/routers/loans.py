@@ -30,7 +30,7 @@ from app.schemas.document import (
     WorkflowDocRead,
     WorkflowRunResult,
 )
-from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition
+from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition, TodoItemRead
 from app.models.app_settings import AppSettings
 from app.services import calendar_emitter
 from app.services.activity_log import mark_loan_dirty
@@ -210,6 +210,105 @@ async def list_required_documents(
             days_since_requested=None,
         )
     )
+    return out
+
+
+@router.get("/{loan_id}/todo", response_model=list[TodoItemRead])
+async def list_loan_todo(
+    loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[TodoItemRead]:
+    """Client-facing To-Do for a loan, composed from existing data:
+    outstanding documents + upcoming calls + open agent/AI asks.
+    No new storage. Scoped by the loan's role-scope so a client only
+    ever sees their own loan."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    from app.models.document import Document as _Document
+    from app.models.event import CalendarEvent as _Cal
+    from app.models.ai_task import AITask as _AITask
+    from app.enums import (
+        DocStatus as _DocStatus,
+        CalendarEventKind as _CalKind,
+        CalendarEventStatus as _CalStatus,
+        AITaskStatus as _TaskStatus,
+    )
+    from app.routers.calendar import _scope_calendar_for_audience
+
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    out: list[TodoItemRead] = []
+
+    # Outstanding documents the borrower still owes.
+    docs = (
+        await db.execute(
+            select(_Document).where(
+                _Document.loan_id == loan_id,
+                _Document.status.in_([_DocStatus.REQUESTED, _DocStatus.PENDING]),
+            )
+        )
+    ).scalars().all()
+    for d in docs:
+        out.append(
+            TodoItemRead(
+                id=f"doc:{d.id}",
+                kind="document",
+                title=d.name or "Document requested",
+                subtitle="Upload requested",
+                status=str(d.status),
+                due_at=None,
+                deeplink=f"/loan/{loan_id}?tab=docs",
+            )
+        )
+
+    # Upcoming calls visible to this user on this loan.
+    now = _dt.now(_tz.utc)
+    cal_stmt = _scope_calendar_for_audience(
+        user,
+        select(_Cal).where(
+            _Cal.loan_id == loan_id,
+            _Cal.kind == _CalKind.CALL,
+            _Cal.status != _CalStatus.DONE,
+            _Cal.starts_at >= now,
+        ),
+    )
+    for ev in (await db.execute(cal_stmt)).scalars().all():
+        out.append(
+            TodoItemRead(
+                id=f"call:{ev.id}",
+                kind="call",
+                title=ev.title or "Scheduled call",
+                subtitle=ev.starts_at.strftime("%b %d, %I:%M %p"),
+                status=str(ev.status),
+                due_at=ev.starts_at.isoformat(),
+                deeplink=f"/loan/{loan_id}?tab=todo",
+            )
+        )
+
+    # Open agent / AI asks tied to this loan.
+    tasks = (
+        await db.execute(
+            select(_AITask).where(
+                _AITask.loan_id == loan_id,
+                _AITask.status == _TaskStatus.PENDING,
+            )
+        )
+    ).scalars().all()
+    for tk in tasks:
+        out.append(
+            TodoItemRead(
+                id=f"task:{tk.id}",
+                kind="task",
+                title=tk.title or "Action needed",
+                subtitle=(tk.summary or None),
+                status=str(tk.status),
+                due_at=None,
+                deeplink=f"/loan/{loan_id}?tab=todo",
+            )
+        )
+
     return out
 
 

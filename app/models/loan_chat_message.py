@@ -36,3 +36,8 @@ class LoanChatMessage(TimestampMixin, Base):
     )
     body: Mapped[str] = mapped_column(Text, nullable=False)
     client_visible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Optional file attachment (alembic 0056). Lets a client send a
+    # note + document in one chat turn.
+    attachment_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
