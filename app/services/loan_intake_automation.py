@@ -356,22 +356,35 @@ async def kickoff_loan(
 
     docs_created, tasks_created = await materialize_kickoff_items(db, loan, checklist)
 
-    # Post the property-intake opener so the borrower's per-loan
-    # AI thread starts with a useful AI message instead of being
-    # empty. Best-effort — never fail kickoff on a messaging hiccup.
-    try:
-        await _post_property_intake_opener(db, loan)
-    except Exception:  # noqa: BLE001
-        log.exception("kickoff_loan: property intake opener failed loan=%s", loan.deal_id)
+    # Delayed collection start (broker new-file modals only): if the
+    # loan's collection start is in the future, suppress the borrower-
+    # facing kickoff openers so outreach truly doesn't begin until
+    # then. Docs are still materialized (anchored to the start date);
+    # the daily reminder engine also gates on this. NULL/past start ⇒
+    # post immediately = current behavior for every other caller.
+    from datetime import date as _d
+    _outreach_held = (
+        loan.collection_starts_on is not None
+        and loan.collection_starts_on > _d.today()
+    )
 
-    # Conversational doc-list opener (Phase D). Drops a second
-    # message into the same thread listing the external items the
-    # borrower needs to upload, with up to 5 inline upload-CTAs.
-    # Skipped silently if no external docs were created.
-    try:
-        await _post_doc_collection_opener(db, loan)
-    except Exception:  # noqa: BLE001
-        log.exception("kickoff_loan: doc collection opener failed loan=%s", loan.deal_id)
+    if not _outreach_held:
+        # Post the property-intake opener so the borrower's per-loan
+        # AI thread starts with a useful AI message instead of being
+        # empty. Best-effort — never fail kickoff on a messaging hiccup.
+        try:
+            await _post_property_intake_opener(db, loan)
+        except Exception:  # noqa: BLE001
+            log.exception("kickoff_loan: property intake opener failed loan=%s", loan.deal_id)
+
+        # Conversational doc-list opener (Phase D). Drops a second
+        # message into the same thread listing the external items the
+        # borrower needs to upload, with up to 5 inline upload-CTAs.
+        # Skipped silently if no external docs were created.
+        try:
+            await _post_doc_collection_opener(db, loan)
+        except Exception:  # noqa: BLE001
+            log.exception("kickoff_loan: doc collection opener failed loan=%s", loan.deal_id)
 
     log.info(
         "kickoff_loan: loan=%s type=%s docs=%d tasks=%d total_in_checklist=%d",
@@ -611,6 +624,13 @@ async def evaluate_doc_reminders(
                 continue
             loan = await _get_loan(doc.loan_id)
             if loan is None:
+                continue
+            # Delayed collection start (broker new-file modals only):
+            # no reminders/outreach until the start date. Defensive —
+            # the future-dated requested_on already pushes due out;
+            # this also silences any heads-up window. NULL/past ⇒
+            # unchanged for every other loan.
+            if loan.collection_starts_on is not None and loan.collection_starts_on > today:
                 continue
             # Per-loan operator override (alembic 0022) wins over
             # both per-item and per-loan-type defaults — set via

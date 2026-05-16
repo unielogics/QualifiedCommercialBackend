@@ -116,7 +116,10 @@ async def _spawn_external_doc(
         name=name,
         checklist_key=checklist_key,
         status=DocStatus.REQUESTED,
-        requested_on=date.today(),
+        # Anchor to the loan's (possibly delayed) collection start so
+        # due dates + the reminder engine stay quiet until then.
+        # NULL collection_starts_on ⇒ today ⇒ current behavior.
+        requested_on=loan.collection_starts_on or date.today(),
     )
     db.add(doc)
     await db.flush()

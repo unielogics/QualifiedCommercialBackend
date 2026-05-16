@@ -142,6 +142,22 @@ async def submit_intake(
         ),
     )
 
+    # Delayed collection start (broker new-file modals only). When the
+    # broker delays outreach, anchor the loan's collection start in
+    # the future BEFORE kickoff so materialized docs anchor off it and
+    # the kickoff opener/reminders stay quiet until then. delay 0 /
+    # absent ⇒ collection_starts_on stays NULL ⇒ current behavior for
+    # every other caller.
+    _start_delay = (
+        payload.document_overrides.collection_start_delay_days
+        if payload.document_overrides is not None
+        else 0
+    )
+    if _start_delay and _start_delay > 0:
+        from datetime import date as _d, timedelta as _td
+        loan.collection_starts_on = _d.today() + _td(days=int(_start_delay))
+        await db.flush()
+
     # Doc collection automation: read the firm's checklist for this
     # loan type and auto-create the Document rows + calendar reminders.
     # Idempotent — re-submits don't duplicate. Safe even if the

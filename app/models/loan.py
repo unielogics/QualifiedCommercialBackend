@@ -185,6 +185,11 @@ class Loan(TimestampMixin, Base):
 
     close_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # Date document collection / AI outreach begins. NULL = started
+    # immediately at kickoff (current/default behavior). Set only when
+    # a broker new-file modal requests a delayed start.
+    collection_starts_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     # Source attribution / ownership (alembic 0029).
     #
     # source_attribution     direct_borrower | agent_referral | existing_client |

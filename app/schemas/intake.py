@@ -86,6 +86,11 @@ class IntakeDocumentOverrides(BaseModel):
     skip_names: list[str] = Field(default_factory=list)
     add_items: list["IntakeCustomDoc"] = Field(default_factory=list)
     due_offset_overrides: dict[str, int] = Field(default_factory=dict)
+    # Days to delay the start of document collection / AI outreach.
+    # 0 (default) = start immediately at kickoff = current behavior.
+    # Only the broker new-file modals send a non-zero value; every
+    # other caller keeps today's immediate behavior.
+    collection_start_delay_days: int = Field(default=0, ge=0)
 
 
 class IntakeCustomDoc(BaseModel):
