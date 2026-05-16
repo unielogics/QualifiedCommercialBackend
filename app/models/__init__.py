@@ -38,6 +38,7 @@ from app.models.loan_chat_message import LoanChatMessage  # noqa: F401
 from app.models.loan_instruction import LoanInstruction  # noqa: F401
 from app.models.loan_participant import LoanParticipant  # noqa: F401
 from app.models.loan_scenario import LoanScenario  # noqa: F401
+from app.models.fix_flip_scenario import FixFlipScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401

@@ -22,6 +22,7 @@ from app.routers import (
     clients,
     credit,
     deal_chat,
+    fix_flip,
     deal_secretary,
     deals,
     devices,
@@ -138,6 +139,7 @@ for r in [
     me.router,
     agents.router,
     deal_secretary.router,
+    fix_flip.router,
     pipeline_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)
