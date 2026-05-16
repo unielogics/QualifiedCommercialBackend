@@ -17,6 +17,7 @@ from app.models.client import Client  # noqa: F401
 from app.models.client_ai_plan import ClientAIPlan  # noqa: F401
 from app.models.client_property import ClientProperty  # noqa: F401
 from app.models.client_requirement_status import ClientRequirementStatus  # noqa: F401
+from app.models.closing_cost_tier import ClosingCostTier  # noqa: F401
 from app.models.credit_pull import CreditPull  # noqa: F401
 from app.models.deal import Deal  # noqa: F401
 from app.models.deal_chat_message import DealChatMessage  # noqa: F401
