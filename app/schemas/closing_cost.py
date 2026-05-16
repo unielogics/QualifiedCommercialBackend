@@ -13,7 +13,7 @@ class ClosingCostTierRead(ORMModel):
     from_amount: float | None = None
     to_amount: float | None = None
     percentage: float = 0
-    minimum_dollar: float = 0
+    percentage_no_construction: float = 0
     sort_order: int = 0
 
     created_at: datetime
@@ -24,7 +24,7 @@ class ClosingCostTierCreate(BaseModel):
     from_amount: float | None = Field(default=None, ge=0)
     to_amount: float | None = Field(default=None, ge=0)
     percentage: float = Field(default=0, ge=0, le=1)
-    minimum_dollar: float = Field(default=0, ge=0)
+    percentage_no_construction: float = Field(default=0, ge=0, le=1)
     sort_order: int = 0
 
 
@@ -32,7 +32,7 @@ class ClosingCostTierUpdate(BaseModel):
     from_amount: float | None = Field(default=None, ge=0)
     to_amount: float | None = Field(default=None, ge=0)
     percentage: float | None = Field(default=None, ge=0, le=1)
-    minimum_dollar: float | None = Field(default=None, ge=0)
+    percentage_no_construction: float | None = Field(default=None, ge=0, le=1)
     sort_order: int | None = None
 
 
