@@ -132,16 +132,28 @@ async def create_scenario(
     return FixFlipScenarioRead.model_validate(row)
 
 
+def _with_creator(
+    scenario: FixFlipScenario, name: str | None, email: str | None
+) -> FixFlipScenarioRead:
+    read = FixFlipScenarioRead.model_validate(scenario)
+    read.created_by_name = name
+    read.created_by_email = email
+    return read
+
+
 @router.get("/scenarios", response_model=list[FixFlipScenarioRead])
 async def list_scenarios(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[FixFlipScenarioRead]:
-    stmt = _scope(user, select(FixFlipScenario)).order_by(
-        FixFlipScenario.updated_at.desc()
+    # Join the creator so the operator system-wide runs table can show
+    # "who ran it" without a second round-trip.
+    base = select(FixFlipScenario, User.name, User.email).outerjoin(
+        User, FixFlipScenario.created_by == User.id
     )
-    rows = (await db.execute(stmt)).scalars().all()
-    return [FixFlipScenarioRead.model_validate(r) for r in rows]
+    stmt = _scope(user, base).order_by(FixFlipScenario.updated_at.desc())
+    rows = (await db.execute(stmt)).all()
+    return [_with_creator(s, name, email) for (s, name, email) in rows]
 
 
 @router.get("/scenarios/{scenario_id}", response_model=FixFlipScenarioRead)
@@ -151,7 +163,13 @@ async def get_scenario(
     db: AsyncSession = Depends(get_db),
 ) -> FixFlipScenarioRead:
     row = await _load_scoped(db, user, scenario_id)
-    return FixFlipScenarioRead.model_validate(row)
+    creator = (
+        await db.execute(
+            select(User.name, User.email).where(User.id == row.created_by)
+        )
+    ).first()
+    name, email = creator if creator else (None, None)
+    return _with_creator(row, name, email)
 
 
 @router.patch("/scenarios/{scenario_id}", response_model=FixFlipScenarioRead)

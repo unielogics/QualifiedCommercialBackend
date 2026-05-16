@@ -43,3 +43,7 @@ class FixFlipScenarioRead(ORMModel):
     deal_grade: str | None
     created_at: datetime
     updated_at: datetime
+    # Enrichment for the operator system-wide runs table (joined from
+    # users on created_by). Null for orphaned / deleted creators.
+    created_by_name: str | None = None
+    created_by_email: str | None = None

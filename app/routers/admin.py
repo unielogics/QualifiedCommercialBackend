@@ -19,7 +19,9 @@ Both endpoints are super-admin only.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,10 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, require_role
 from app.enums import LoanStage, Role
 from app.models.lender import Lender
 from app.models.loan import Loan
+from app.models.loan_scenario import LoanScenario
+from app.models.user import User
 from app.services.lender_thread import LenderThreadError, inject_inbound_lender_email
 
 log = logging.getLogger(__name__)
@@ -386,3 +390,67 @@ async def inject_lender_email(
         sent_at=msg.sent_at.isoformat(),
         note=f"Injected {len(payload.body)}-char body from {payload.from_email}.",
     )
+
+
+# ---------------------------------------------------------------------------
+# System-wide simulator runs — operator (super-admin + loan-exec) only
+# ---------------------------------------------------------------------------
+#
+# Loan scenarios are otherwise only reachable per-loan via
+# /loans/{loan_id}/scenarios. This is the cross-user firm-wide list that
+# backs the Simulate page's runs table for operators.
+
+
+class AdminLoanScenarioRead(BaseModel):
+    id: UUID
+    name: str
+    discount_points: float
+    loan_amount: float | None
+    base_rate: float | None
+    ltv: float | None
+    recalc_snapshot: dict[str, Any] | None
+    created_at: datetime
+    loan_id: UUID
+    loan_deal_id: str | None
+    loan_address: str | None
+    created_by_name: str | None
+    created_by_email: str | None
+
+
+@router.get("/loan-scenarios", response_model=list[AdminLoanScenarioRead])
+async def list_all_loan_scenarios(
+    _: User = Depends(require_role(Role.SUPER_ADMIN, Role.LOAN_EXEC)),
+    db: AsyncSession = Depends(get_db),
+) -> list[AdminLoanScenarioRead]:
+    rows = (
+        await db.execute(
+            select(
+                LoanScenario,
+                Loan.deal_id,
+                Loan.address,
+                User.name,
+                User.email,
+            )
+            .outerjoin(Loan, LoanScenario.loan_id == Loan.id)
+            .outerjoin(User, LoanScenario.created_by == User.id)
+            .order_by(LoanScenario.created_at.desc())
+        )
+    ).all()
+    return [
+        AdminLoanScenarioRead(
+            id=s.id,
+            name=s.name,
+            discount_points=float(s.discount_points or 0),
+            loan_amount=float(s.loan_amount) if s.loan_amount is not None else None,
+            base_rate=float(s.base_rate) if s.base_rate is not None else None,
+            ltv=float(s.ltv) if s.ltv is not None else None,
+            recalc_snapshot=s.recalc_snapshot,
+            created_at=s.created_at,
+            loan_id=s.loan_id,
+            loan_deal_id=deal_id,
+            loan_address=address,
+            created_by_name=name,
+            created_by_email=email,
+        )
+        for (s, deal_id, address, name, email) in rows
+    ]
