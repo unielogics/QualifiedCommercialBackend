@@ -595,6 +595,11 @@ Style:
 - Never share other clients' information. Borrowers can only see their own data.
 
 You can suggest actions ("you should upload your tax returns") but you never take real-world actions yourself. Operators handle approvals.
+
+Document collection protocol (STRICT):
+- NEVER explain how to upload. Do NOT write phrases like "go to the documents tab", "tap the paperclip", "use the vault", "upload it via...", or describe any UI steps. The chat renders a tap-to-upload control for you.
+- To collect ANY file, you MUST call the request_document_upload tool. The borrower uploads the file directly in this chat — it is scanned and classified automatically. Your prose only says WHAT you need and WHY it matters.
+- Ask for exactly ONE document per turn. Even if several are missing, request a single file, wait for it to come in and be reviewed, then ask for the next one. NEVER present a multi-item list of documents for the borrower to upload all at once — guide them one file at a time.
 """
 
 OPERATOR_SYSTEM_PROMPT = """Role: You are the Lead Fintech Orchestrator for Qualified Commercial. Your primary goal is to facilitate the closing of commercial real estate loans while protecting the firm's proprietary lender relationships.
@@ -691,6 +696,10 @@ Hard rules:
 - NEVER expose another client's data.
 - NEVER re-ask for a fact already in the packet's extracted_facts (unless the borrower volunteers a contradiction).
 - NEVER fire a state-changing action without a ChatAction the agent or borrower confirms.
+
+Document collection protocol (STRICT):
+- NEVER explain how to upload. Do NOT write "go to the documents tab", "tap the paperclip", "use the vault", "upload it via...", or any UI steps. The chat renders a tap-to-upload control for you.
+- To collect ANY file you MUST call the request_document_upload tool — exactly ONE document per turn. The borrower uploads it right here; it is scanned and classified automatically. Never list multiple documents for a bulk upload — collect one file, let it land, then ask for the next.
 """
 
 
@@ -1980,6 +1989,20 @@ async def append_thread_message(
         if "accumulated_actions" in locals() and accumulated_actions
         else None
     )
+    # Guided one-by-one collection: never surface more than a single
+    # upload_document prompt in one assistant turn even if the model
+    # asked for several. confirm_document_routing pairs (a Yes +
+    # "No, let me pick" upload) are left intact.
+    if persisted_actions:
+        seen_bare_upload = False
+        trimmed: list[dict] = []
+        for a in persisted_actions:
+            if a.get("kind") == "upload_document" and a.get("confirm") is not False:
+                if seen_bare_upload:
+                    continue
+                seen_bare_upload = True
+            trimmed.append(a)
+        persisted_actions = trimmed or None
     assistant_msg = AIChatMessage(
         thread_id=thread.id,
         role="assistant",

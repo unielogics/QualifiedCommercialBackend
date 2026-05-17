@@ -17,6 +17,7 @@ from app.deps import CurrentUser
 from app.enums import DocStatus, Role
 from app.models.activity import Activity
 from app.models.document import Document
+from app.models.document_analysis_result import DocumentAnalysisResult
 from app.models.loan import Loan
 from app.schemas.document import (
     DocumentCustomCreate,
@@ -67,6 +68,127 @@ async def list_documents(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
     rows = (await db.execute(stmt)).scalars().all()
     return [DocumentRead.model_validate(r) for r in rows]
+
+
+class DocAnalysisItem(BaseModel):
+    document_id: UUID
+    name: str
+    status: str
+    detected_type: str | None = None
+    confidence: float | None = None
+    ai_notes: str | None = None
+    ai_scan_status: str | None = None
+    issues: list[dict] = []
+
+
+class DocAnalysisSummary(BaseModel):
+    total: int
+    reviewed: int
+    flagged: int
+    conflicts: int
+    verdict: str  # "clean" | "needs_review" | "pending"
+    headline: str
+
+
+class DocAnalysisResponse(BaseModel):
+    summary: DocAnalysisSummary
+    documents: list[DocAnalysisItem]
+
+
+@router.get("/analysis", response_model=DocAnalysisResponse)
+async def documents_analysis(
+    loan_id: UUID | None = None,
+    client_id: UUID | None = None,
+    user: CurrentUser = None,
+    db: AsyncSession = Depends(get_db),
+) -> DocAnalysisResponse:
+    """Aggregate the AI's per-file underwriting read for a loan/client:
+    detected type + confidence + the AI's plain-language summary
+    (ai_notes) + any cross-document conflicts (name mismatches, low
+    balances, contradicting amounts). Backs the Documents-tab
+    'Underwriting summary'. Same scoping as GET /documents."""
+    stmt = select(Document).join(Loan, Loan.id == Document.loan_id)
+    if loan_id is not None:
+        stmt = stmt.where(Document.loan_id == loan_id)
+    if client_id is not None:
+        stmt = stmt.where(Loan.client_id == client_id)
+    if user.role == Role.CLIENT and user.client:
+        stmt = stmt.where(Loan.client_id == user.client.id)
+    elif user.role == Role.BROKER and user.broker:
+        stmt = stmt.where(Loan.broker_id == user.broker.id)
+    elif user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    docs = (await db.execute(stmt)).scalars().all()
+
+    # Latest analysis per document.
+    latest: dict[UUID, DocumentAnalysisResult] = {}
+    if docs:
+        doc_ids = [d.id for d in docs]
+        ares = (
+            await db.execute(
+                select(DocumentAnalysisResult)
+                .where(DocumentAnalysisResult.document_id.in_(doc_ids))
+                .order_by(DocumentAnalysisResult.analyzed_at.asc())
+            )
+        ).scalars().all()
+        for a in ares:
+            latest[a.document_id] = a  # asc order → last wins = newest
+
+    items: list[DocAnalysisItem] = []
+    conflicts = 0
+    flagged = 0
+    reviewed = 0
+    for d in docs:
+        st = d.status.value if hasattr(d.status, "value") else str(d.status)
+        if st == DocStatus.FLAGGED.value:
+            flagged += 1
+        a = latest.get(d.id)
+        issues = (a.issues if a and a.issues else []) or []
+        conflicts += len(issues)
+        if d.ai_scan_status == "scanned" or a is not None:
+            reviewed += 1
+        items.append(
+            DocAnalysisItem(
+                document_id=d.id,
+                name=d.name,
+                status=st,
+                detected_type=a.detected_document_type if a else None,
+                confidence=float(a.confidence) if a and a.confidence is not None else None,
+                ai_notes=d.ai_notes,
+                ai_scan_status=d.ai_scan_status,
+                issues=issues,
+            )
+        )
+
+    total = len(items)
+    if total == 0:
+        verdict, headline = "pending", "No documents uploaded yet."
+    elif reviewed == 0:
+        verdict, headline = "pending", f"{total} document(s) in — AI review in progress."
+    elif flagged == 0 and conflicts == 0:
+        verdict, headline = (
+            "clean",
+            f"All {reviewed} reviewed document(s) look consistent — no conflicts or red flags.",
+        )
+    else:
+        bits = []
+        if flagged:
+            bits.append(f"{flagged} flagged by the AI")
+        if conflicts:
+            bits.append(f"{conflicts} cross-document conflict(s) (e.g. name / amount mismatch)")
+        verdict, headline = "needs_review", " · ".join(bits) + " — review before funding."
+
+    return DocAnalysisResponse(
+        summary=DocAnalysisSummary(
+            total=total,
+            reviewed=reviewed,
+            flagged=flagged,
+            conflicts=conflicts,
+            verdict=verdict,
+            headline=headline,
+        ),
+        documents=items,
+    )
 
 
 @router.post("/request", response_model=DocumentRead, status_code=status.HTTP_201_CREATED)
