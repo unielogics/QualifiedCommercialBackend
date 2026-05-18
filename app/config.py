@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     database_url_sync: str = Field(default="postgresql+psycopg://qc:qc@localhost:5432/qc")
 
     # CORS
-    cors_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:19006"
+    cors_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:19006,https://qualifiedcommercial.com,https://www.qualifiedcommercial.com"
 
     # Clerk (auth)
     clerk_secret_key: str = ""

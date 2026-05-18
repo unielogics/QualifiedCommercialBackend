@@ -43,6 +43,7 @@ from app.routers import (
     meta,
     pipeline as pipeline_router,
     prequal,
+    public as public_router,
     rates,
     reports,
     search,
@@ -143,5 +144,6 @@ for r in [
     deal_secretary.router,
     fix_flip.router,
     pipeline_router.router,
+    public_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)
