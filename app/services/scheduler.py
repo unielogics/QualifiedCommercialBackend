@@ -130,6 +130,20 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Daily FRED pull — keeps fred_observations fresh so the app +
+    # dashboard "today's rates" and the public marketing program-page
+    # 30-day charts read live data. ~06:15 UTC (after US close).
+    scheduler.add_job(
+        _wrap(job_fred_refresh),
+        "cron",
+        hour=6,
+        minute=15,
+        id="fred_refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Doc-vision scan drain (alembic 0017). Every 2 min picks up
     # Documents flagged scan_dirty=True (set by upload-complete) and
     # runs them through Claude vision. Hard-capped at 8 docs per
@@ -294,6 +308,24 @@ async def job_pipeline_scan() -> None:
     from app.services.ai.pipeline_digest import scan_pipeline
 
     await scan_pipeline()
+
+
+async def job_fred_refresh() -> None:
+    """Daily pull of every tracked FRED series → upsert into
+    fred_observations. Powers the in-app 'today's rates' widgets and
+    the public program-page 30-day charts. No-ops (logs) if
+    FRED_API_KEY is unset."""
+    from app.db import SessionLocal
+    from app.services import fred as fred_service
+
+    async with SessionLocal() as db:
+        try:
+            summary = await fred_service.refresh_all(db)
+            await db.commit()
+            log.info("fred_refresh: %s", summary)
+        except Exception:
+            await db.rollback()
+            log.exception("fred_refresh: failed; rolled back")
 
 
 async def job_cadence_pass() -> None:
