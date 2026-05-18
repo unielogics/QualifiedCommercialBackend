@@ -30,6 +30,7 @@ new on the wire side.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -93,23 +94,185 @@ def _presign_doc(doc: Document) -> str | None:
         return None
 
 
-_BODY_SYSTEM_PROMPT = """You draft short, formal lender-submission emails for a commercial real estate brokerage.
+_BODY_SYSTEM_PROMPT = """You draft the introduction for a lender-submission email from a commercial real estate brokerage. The lender is seeing this file for the FIRST time and needs to catch up fast.
 
-Tone: institutional, polite, concise. No fluff, no marketing copy. The lender is busy.
-Length: 3 short paragraphs MAX, plus a bulleted list of file names.
+Tone: institutional, polite, concise. No fluff, no marketing copy, no hype. The lender is busy.
 
-You will be given:
-  - deal_id, property address, loan type, loan amount
-  - lender's primary contact name (may be null)
-  - delivery mode ('links' = individual download links, one per file;
-                   'zip' = one archive link)
-  - the list of file names being sent
+Write EXACTLY 2 to 3 short paragraphs that introduce the deal:
+  - ¶1: the asset (property type / address), the borrower's ask
+        (loan type + requested amount), and the headline figures.
+  - ¶2: the underwriting posture (LTV/LTC, DSCR, ARV, rate, risk /
+        deal health as provided) and the current status — what this
+        package establishes / where the file stands.
+  - ¶3 (only if there is genuine content): open items or the next
+        step. Omit this paragraph rather than padding it.
 
-Output ONLY the email body (plain text, no markdown headers, no
-subject line, no signature block — the system appends those). Do
-NOT invent additional documents or commit to anything beyond what's
-in the input.
+After the paragraphs, add a single line "Files included:" followed by
+a bulleted list of the file names provided.
+
+You will be given a structured CONTEXT block (deal facts, metrics,
+status narrative, per-document notes), the lender contact name (may be
+null), the delivery mode, and the file list.
+
+Hard rules:
+  - Use ONLY figures and facts present in the CONTEXT. Do NOT invent
+    or estimate documents, numbers, or commitments. If a metric is
+    absent, simply don't mention it.
+  - Do NOT include borrower PII (SSN, full credit detail / scores),
+    do NOT name any competing or other lenders, and do NOT relay
+    internal-only commentary. Keep it lender-appropriate.
+  - Output ONLY the email body (plain text, no markdown headers, no
+    subject line, no signature block — the system appends links and a
+    signature after your text).
 """
+
+
+def _fmt_pct(v: float | None) -> str | None:
+    """Stored as a 0–1 ratio (Numeric(6,4)) — render as a percent."""
+    if v is None:
+        return None
+    try:
+        return f"{float(v) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return None
+
+
+# Internal-only / borrower-sensitive vocabulary that must never reach a
+# lender-facing email. The cached `living_profile` (status + bottlenecks)
+# is operator-internal narrative and routinely embeds fraud/compliance
+# flags and PII cues — the LLM faithfully relays whatever it's given, so
+# we scrub deterministically at the single context chokepoint (this also
+# protects the no-AI fallback body, which embeds the same context).
+_SENSITIVE_RE = re.compile(
+    r"\b("
+    r"fraud|synthetic\s+identity|identity\s+theft|fcra|\bmla\b|ofac|"
+    r"sanction|sanctions|watchlist|blacklist|debarred|"
+    r"compliance\s+review|credit\s+lock|credit\s+score|credit\s+detail|"
+    r"\bfico\b|\bssn\b|social\s+security|date\s+of\s+birth|\bdob\b|"
+    r"\bkyc\b|\baml\b|\bsar\b|suspicious\s+activity|"
+    r"bankruptc|litigation|lawsuit|judgment\s+lien|broker\s+action"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _scrub_sensitive(text: str) -> str:
+    """Drop any segment (sentence / clause / line) that mentions
+    internal-only or borrower-sensitive terms. Conservative by design —
+    if a unit is even partly sensitive we remove the whole unit rather
+    than risk a partial leak. Returns '' when nothing survives."""
+    if not text:
+        return ""
+    # "Broker action:" begins an internal directive — cut it and
+    # everything after it before segmenting.
+    text = re.split(r"broker\s+action\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    segments = re.split(r"(?<=[.;!?])\s+|\n+", text)
+    kept = [
+        s.strip()
+        for s in segments
+        if s.strip() and not _SENSITIVE_RE.search(s)
+    ]
+    return " ".join(kept).strip()
+
+
+def _build_lender_context(loan: Loan, selected: list[Document]) -> str:
+    """Compact, plain-text catch-up context for the lender intro.
+
+    Pure (no I/O): `loan` and `loan.documents` are already loaded by
+    the caller. Sources only already-curated fields — loan financials,
+    the cached `living_profile`, and per-document AI scan notes — never
+    raw borrower documents/credit, so no borrower PII leaks. Every
+    field is emitted only when present, so a sparse loan still yields
+    coherent input.
+    """
+    lines: list[str] = []
+
+    loan_type = str(loan.type.value if hasattr(loan.type, "value") else loan.type)
+    prop_type = str(
+        loan.property_type.value
+        if hasattr(loan.property_type, "value")
+        else loan.property_type
+    )
+    lines.append("=== DEAL ===")
+    lines.append(f"deal_id: {loan.deal_id}")
+    lines.append(f"address: {loan.address}")
+    if prop_type:
+        lines.append(f"property_type: {prop_type}")
+    lines.append(f"loan_type: {loan_type}")
+    if loan.amount:
+        lines.append(f"requested_amount: ${float(loan.amount):,.0f}")
+
+    metrics: list[str] = []
+    if (ltv := _fmt_pct(loan.ltv)) is not None:
+        metrics.append(f"LTV {ltv}")
+    if (ltc := _fmt_pct(loan.ltc)) is not None:
+        metrics.append(f"LTC {ltc}")
+    if loan.arv:
+        metrics.append(f"ARV ${float(loan.arv):,.0f}")
+    if loan.dscr is not None:
+        metrics.append(f"DSCR {float(loan.dscr):.2f}x")
+    rate = loan.final_rate if loan.final_rate is not None else loan.base_rate
+    if rate is not None:
+        # Stored as a 0–1 ratio (Numeric(9,6)) — render as a percent.
+        metrics.append(f"rate {float(rate) * 100:.3f}%")
+    if loan.risk_score is not None:
+        metrics.append(f"risk_score {loan.risk_score}")
+    dh = loan.deal_health
+    dh = str(dh.value if hasattr(dh, "value") else dh) if dh is not None else None
+    if dh:
+        metrics.append(f"deal_health {dh}")
+    if metrics:
+        lines.append("=== UNDERWRITING METRICS ===")
+        lines.append("; ".join(metrics))
+
+    status_bits: list[str] = []
+    if loan.status_summary:
+        status_bits.append(str(loan.status_summary).strip())
+    lp = loan.living_profile if isinstance(loan.living_profile, dict) else {}
+    cur = lp.get("current_status")
+    if isinstance(cur, str) and cur.strip():
+        status_bits.append(cur.strip())
+    mkt = lp.get("market_context")
+    if isinstance(mkt, dict):
+        narr = mkt.get("narrative")
+        if isinstance(narr, str) and narr.strip():
+            status_bits.append(narr.strip())
+    if status_bits:
+        status_clean = _scrub_sensitive(" ".join(status_bits))
+        if status_clean:
+            lines.append("=== STATUS ===")
+            lines.append(status_clean[:1200])
+    bottlenecks = lp.get("bottlenecks")
+    if isinstance(bottlenecks, list) and bottlenecks:
+        open_items: list[str] = []
+        for b in bottlenecks:
+            if isinstance(b, str):
+                raw = b
+            elif isinstance(b, dict):
+                raw = b.get("label") or b.get("title") or b.get("detail") or ""
+            else:
+                raw = ""
+            cleaned = _scrub_sensitive(str(raw))
+            if cleaned:
+                open_items.append(f"  - {cleaned[:200]}")
+            if len(open_items) >= 3:
+                break
+        if open_items:
+            lines.append("=== OPEN ITEMS ===")
+            lines.extend(open_items)
+
+    doc_lines: list[str] = []
+    for d in selected[:20]:
+        name = d.name or f"doc-{str(d.id)[:8]}"
+        note = ""
+        if d.ai_scan_status == "scanned" and d.ai_notes:
+            note = _scrub_sensitive(" ".join(str(d.ai_notes).split()))[:240]
+        doc_lines.append(f"  - {name}: {note}" if note else f"  - {name}")
+    if doc_lines:
+        lines.append("=== DOCUMENTS IN THIS PACKAGE ===")
+        lines.extend(doc_lines)
+
+    return "\n".join(lines)
 
 
 async def _ai_draft_body(
@@ -121,17 +284,20 @@ async def _ai_draft_body(
     contact_name: str | None,
     delivery: Literal["links", "zip"],
     file_names: list[str],
+    context: str,
 ) -> str:
-    """Generates the email body via Haiku. Falls back to a
-    deterministic template when the API key is unset or the call
+    """Generates the lender-intro email body via Haiku from the
+    structured catch-up `context`. Falls back to a deterministic,
+    metric-aware template when the API key is unset or the call
     fails — we never block a send-draft on Anthropic."""
     settings = get_settings()
     file_list = "\n".join(f"  • {name}" for name in file_names) or "  (no files attached)"
     fallback = (
         f"{'Hi ' + contact_name + ',' if contact_name else 'Hello,'}\n\n"
-        f"Please find the submission package for {deal_id} — {address} attached "
+        f"Please find the submission package for {deal_id} — {address} "
         f"{'as a single archive' if delivery == 'zip' else 'via the download links below'}. "
-        f"Loan type: {loan_type}{f', amount ${loan_amount:,.0f}' if loan_amount else ''}.\n\n"
+        f"Loan type: {loan_type}{f', requested amount ${loan_amount:,.0f}' if loan_amount else ''}.\n\n"
+        f"Deal context for your review:\n{context}\n\n"
         f"Files included:\n{file_list}\n\n"
         f"Happy to provide anything else you need to move this forward.\n"
     )
@@ -141,19 +307,16 @@ async def _ai_draft_body(
         client = get_client()
         result = await client.messages.create(
             model=model_light(),
-            max_tokens=400,
+            max_tokens=700,
             system=_BODY_SYSTEM_PROMPT,
             messages=[
                 {
                     "role": "user",
                     "content": (
-                        f"deal_id: {deal_id}\n"
-                        f"address: {address}\n"
-                        f"loan_type: {loan_type}\n"
-                        f"loan_amount: {loan_amount}\n"
                         f"contact_name: {contact_name or '(unknown)'}\n"
-                        f"delivery: {delivery}\n"
-                        f"files:\n{file_list}\n"
+                        f"delivery: {delivery}\n\n"
+                        f"CONTEXT:\n{context}\n\n"
+                        f"FILES (use these exact names in the bulleted list):\n{file_list}\n"
                     ),
                 }
             ],
@@ -225,9 +388,10 @@ async def draft_lender_send(
         )
 
     # Filter requested doc_ids → only this loan's docs that are
-    # actually received/verified/approved (we don't want to send
-    # request-stubs to the lender).
-    valid_statuses = {DocStatus.RECEIVED, DocStatus.VERIFIED, DocStatus.APPROVED}
+    # actually received/verified (we don't want to send request-stubs
+    # to the lender). VERIFIED is the terminal good state — DocStatus
+    # has no APPROVED member.
+    valid_statuses = {DocStatus.RECEIVED, DocStatus.VERIFIED}
     docs_by_id = {d.id: d for d in loan.documents}
     selected: list[Document] = []
     for did in document_ids:
@@ -276,6 +440,7 @@ async def draft_lender_send(
             f"  {zip_result.download_url}"
         )
 
+    lender_context = _build_lender_context(loan, selected)
     ai_body = await _ai_draft_body(
         deal_id=loan.deal_id,
         address=loan.address,
@@ -284,6 +449,7 @@ async def draft_lender_send(
         contact_name=lender.contact_name,
         delivery=delivery,
         file_names=file_names,
+        context=lender_context,
     )
     full_body = f"{ai_body}\n\n{body_links_block}\n"
 
