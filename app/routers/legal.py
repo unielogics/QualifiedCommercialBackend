@@ -30,6 +30,10 @@ router = APIRouter(prefix="/legal", tags=["legal"])
 class AcceptRequest(BaseModel):
     terms_version: str = Field(min_length=1, max_length=32)
     privacy_version: str = Field(min_length=1, max_length=32)
+    # Funding/AI/Communications Disclosure was added in the v1.0 (2026-05-19)
+    # deploy. Optional so older clients can still POST {terms, privacy} —
+    # they just won't get the disclosure column populated.
+    disclosure_version: str | None = Field(default=None, max_length=32)
 
 
 class AcceptanceRead(ORMModel):
@@ -37,6 +41,7 @@ class AcceptanceRead(ORMModel):
     user_id: UUID
     terms_version: str
     privacy_version: str
+    disclosure_version: str | None
     ip_address: str | None
     user_agent: str | None
     created_at: datetime
@@ -72,6 +77,7 @@ async def accept(
         user_id=user.id,
         terms_version=body.terms_version,
         privacy_version=body.privacy_version,
+        disclosure_version=body.disclosure_version,
         ip_address=_client_ip(request),
         user_agent=(request.headers.get("user-agent") or "")[:512] or None,
     )
