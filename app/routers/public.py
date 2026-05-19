@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/public", tags=["public"])
 
 INVESTOR_INBOX = "franco@qualifiedcommercial.com"
+SUPPORT_INBOX = "support@qualifiedcommercial.com"
 
 # Best-effort in-memory throttle (single-instance deploy — see scheduler
 # note in app/services/scheduler.py). Maps client IP → last submit ts.
@@ -146,3 +147,101 @@ async def investor_inquiry(
     )
     await db.flush()
     return InvestorInquiryResult(ok=True)
+
+
+class SupportInquiry(BaseModel):
+    """Public /support contact form. Same defensive shape as the
+    investor inquiry — length caps + mandatory consent — plus an
+    explicit `email` field so the inbox can simply hit Reply (the
+    investor flow gates on phone instead)."""
+
+    full_name: str = Field(min_length=1, max_length=160)
+    email: str = Field(min_length=5, max_length=160)
+    phone: str | None = Field(default=None, max_length=40)
+    topic: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=1, max_length=4000)
+    consent: bool
+
+
+class SupportInquiryResult(BaseModel):
+    ok: bool
+
+
+@router.post("/support-inquiry", response_model=SupportInquiryResult)
+async def support_inquiry(
+    payload: SupportInquiry,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> SupportInquiryResult:
+    """Public /support contact form on qualifiedcommercial.com. Mirrors
+    `/public/investor-inquiry`: emails support@ via the existing Gmail
+    relay (best-effort), always logs an Activity row so the inquiry is
+    never lost when mail is misconfigured, enforces a 20-second per-IP
+    throttle to deter abuse."""
+    if payload.consent is not True:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Consent to be contacted is required.",
+        )
+    # Lightweight email sanity (no pydantic[email] dep — the recipient
+    # is a human, format errors surface on the reply path).
+    if "@" not in payload.email or "." not in payload.email:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A valid email is required so we can reply.",
+        )
+
+    ip = (request.client.host if request.client else "?") or "?"
+    now = time.monotonic()
+    last = _LAST_SUBMIT.get(ip)
+    if last is not None and (now - last) < _THROTTLE_SECONDS:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Please wait a moment before submitting again.",
+        )
+    _LAST_SUBMIT[ip] = now
+
+    subject = f"New support inquiry — {payload.full_name}"
+    mail_body = (
+        f"Name: {payload.full_name}\n"
+        f"Email: {payload.email}\n"
+        f"Phone: {payload.phone or '(not provided)'}\n"
+        f"Topic: {payload.topic}\n"
+        f"Subject: {payload.title}\n\n"
+        f"{payload.body}\n"
+    )
+
+    sent = False
+    try:
+        from app.services.email.gmail_client import gmail_config, send_message
+
+        cfg = gmail_config()
+        if cfg is not None:
+            send_message(cfg, to=SUPPORT_INBOX, subject=subject, body=mail_body)
+            sent = True
+        else:
+            log.warning("support-inquiry: gmail not configured — lead logged only")
+    except Exception:
+        log.exception("support-inquiry: email send failed — lead still logged")
+
+    db.add(
+        Activity(
+            loan_id=None,
+            actor_id=None,
+            actor_label="public",
+            kind="support.inquiry",
+            summary=f"Support inquiry from {payload.full_name} ({payload.topic})",
+            payload={
+                "full_name": payload.full_name,
+                "email": payload.email,
+                "phone": payload.phone,
+                "topic": payload.topic,
+                "title": payload.title,
+                "body": payload.body,
+                "emailed": sent,
+            },
+        )
+    )
+    await db.flush()
+    return SupportInquiryResult(ok=True)
