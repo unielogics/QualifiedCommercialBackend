@@ -38,6 +38,9 @@ router = APIRouter(prefix="/public", tags=["public"])
 
 INVESTOR_INBOX = "franco@qualifiedcommercial.com"
 SUPPORT_INBOX = "support@qualifiedcommercial.com"
+# Capital-partner applications notify both the founder (decisioning) and
+# the support inbox (intake / audit trail).
+CAPITAL_PARTNER_NOTIFY = ("franco@qualifiedcommercial.com", "support@qualifiedcommercial.com")
 
 # Best-effort in-memory throttle (single-instance deploy — see scheduler
 # note in app/services/scheduler.py). Maps client IP → last submit ts.
@@ -245,3 +248,265 @@ async def support_inquiry(
     )
     await db.flush()
     return SupportInquiryResult(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Capital partner (lender) application
+# ---------------------------------------------------------------------------
+#
+# Public "Become a Lending Partner" form at
+# qualifiedcommercial.com/lenders/apply. Persists to the dedicated
+# `capital_partner_applications` table (so super-admin can review +
+# approve/deny in QCDashboard), and emails franco@ + support@ to
+# notify the team that a new application is ready to review.
+
+
+class CapitalPartnerApplicationIn(BaseModel):
+    """Public lender-application submission. Long and intentionally
+    structured — we'd rather collect everything once than chase the
+    prospect twice. All numeric fields are nullable (some firms won't
+    publish hard underwriting boxes upfront)."""
+
+    # Company
+    company_name: str = Field(min_length=1, max_length=160)
+    legal_entity_type: str | None = Field(default=None, max_length=40)
+    formation_state: str | None = Field(default=None, max_length=40)
+    ein: str | None = Field(default=None, max_length=20)
+    years_in_business: int | None = Field(default=None, ge=0, le=200)
+    website: str | None = Field(default=None, max_length=240)
+
+    # Lending appetite
+    loan_types: list[str] = Field(default_factory=list, max_length=20)
+    loan_size_min: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    loan_size_max: int | None = Field(default=None, ge=0, le=10_000_000_000)
+    geographic_states: list[str] = Field(default_factory=list, max_length=60)
+    asset_classes: list[str] = Field(default_factory=list, max_length=20)
+
+    # Capital & volume
+    capital_source: str | None = Field(default=None, max_length=80)
+    aum_band: str | None = Field(default=None, max_length=40)
+    monthly_origination_band: str | None = Field(default=None, max_length=40)
+
+    # Underwriting box
+    max_ltv: float | None = Field(default=None, ge=0.0, le=1.5)
+    max_ltc: float | None = Field(default=None, ge=0.0, le=1.5)
+    min_dscr: float | None = Field(default=None, ge=0.0, le=10.0)
+    min_fico: int | None = Field(default=None, ge=300, le=900)
+    rate_range: str | None = Field(default=None, max_length=80)
+
+    # Contact + submission
+    contact_name: str = Field(min_length=1, max_length=160)
+    contact_title: str | None = Field(default=None, max_length=80)
+    contact_email: str = Field(min_length=5, max_length=320)
+    contact_phone: str | None = Field(default=None, max_length=40)
+    submission_email: str | None = Field(default=None, max_length=320)
+    submission_portal_url: str | None = Field(default=None, max_length=320)
+    average_response_time: str | None = Field(default=None, max_length=80)
+    notes: str | None = Field(default=None, max_length=4000)
+
+    consent: bool
+
+
+class CapitalPartnerApplicationResult(BaseModel):
+    ok: bool
+    id: str
+
+
+@router.post(
+    "/capital-partner-application",
+    response_model=CapitalPartnerApplicationResult,
+)
+async def capital_partner_application(
+    payload: CapitalPartnerApplicationIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> CapitalPartnerApplicationResult:
+    """Public "Become a Lending Partner" form. Persists to
+    capital_partner_applications (pending) and notifies the team."""
+    from app.models.capital_partner_application import CapitalPartnerApplication
+
+    if payload.consent is not True:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Consent to be contacted is required.",
+        )
+    if "@" not in payload.contact_email or "." not in payload.contact_email:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A valid contact email is required so we can reply.",
+        )
+
+    ip = (request.client.host if request.client else "?") or "?"
+    now = time.monotonic()
+    last = _LAST_SUBMIT.get(ip)
+    if last is not None and (now - last) < _THROTTLE_SECONDS:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Please wait a moment before submitting again.",
+        )
+    _LAST_SUBMIT[ip] = now
+
+    app_row = CapitalPartnerApplication(
+        company_name=payload.company_name,
+        legal_entity_type=payload.legal_entity_type,
+        formation_state=payload.formation_state,
+        ein=payload.ein,
+        years_in_business=payload.years_in_business,
+        website=payload.website,
+        loan_types=payload.loan_types,
+        loan_size_min=payload.loan_size_min,
+        loan_size_max=payload.loan_size_max,
+        geographic_states=payload.geographic_states,
+        asset_classes=payload.asset_classes,
+        capital_source=payload.capital_source,
+        aum_band=payload.aum_band,
+        monthly_origination_band=payload.monthly_origination_band,
+        max_ltv=payload.max_ltv,
+        max_ltc=payload.max_ltc,
+        min_dscr=payload.min_dscr,
+        min_fico=payload.min_fico,
+        rate_range=payload.rate_range,
+        contact_name=payload.contact_name,
+        contact_title=payload.contact_title,
+        contact_email=payload.contact_email,
+        contact_phone=payload.contact_phone,
+        submission_email=payload.submission_email,
+        submission_portal_url=payload.submission_portal_url,
+        average_response_time=payload.average_response_time,
+        notes=payload.notes,
+        status="pending",
+        consent=payload.consent,
+        ip_address=ip if ip != "?" else None,
+        user_agent=(request.headers.get("user-agent") or "")[:512] or None,
+    )
+    db.add(app_row)
+    await db.flush()
+    await db.refresh(app_row)
+
+    # Best-effort email notification to the founder + support inbox.
+    subject = f"New capital partner application — {payload.company_name}"
+    body_summary = _format_capital_partner_summary(payload, app_row.id)
+    sent_to: list[str] = []
+    try:
+        from app.services.email.gmail_client import gmail_config, send_message
+
+        cfg = gmail_config()
+        if cfg is not None:
+            for to_email in CAPITAL_PARTNER_NOTIFY:
+                try:
+                    send_message(cfg, to=to_email, subject=subject, body=body_summary)
+                    sent_to.append(to_email)
+                except Exception:
+                    log.exception(
+                        "capital-partner-application: send to %s failed", to_email
+                    )
+        else:
+            log.warning(
+                "capital-partner-application: gmail not configured — lead logged only"
+            )
+    except Exception:
+        log.exception("capital-partner-application: email send block failed")
+
+    # Audit-trail Activity row (paired with the dedicated DB row so the
+    # firehose log still shows every public submission).
+    db.add(
+        Activity(
+            loan_id=None,
+            actor_id=None,
+            actor_label="public",
+            kind="capital_partner.application",
+            summary=f"Capital partner application from {payload.company_name}",
+            payload={
+                "application_id": str(app_row.id),
+                "company_name": payload.company_name,
+                "contact_name": payload.contact_name,
+                "contact_email": payload.contact_email,
+                "loan_types": payload.loan_types,
+                "emailed_to": sent_to,
+            },
+        )
+    )
+    await db.flush()
+    return CapitalPartnerApplicationResult(ok=True, id=str(app_row.id))
+
+
+def _format_capital_partner_summary(
+    p: "CapitalPartnerApplicationIn", app_id: object
+) -> str:
+    """Render a plain-text email summary of an application. Operator
+    clicks the QCDashboard link at the bottom to review/approve/deny."""
+    lines: list[str] = [
+        f"Application ID: {app_id}",
+        "",
+        "--- Company ---",
+        f"Company: {p.company_name}",
+    ]
+    if p.legal_entity_type:
+        lines.append(f"Entity type: {p.legal_entity_type}")
+    if p.formation_state:
+        lines.append(f"Formation state: {p.formation_state}")
+    if p.years_in_business is not None:
+        lines.append(f"Years in business: {p.years_in_business}")
+    if p.website:
+        lines.append(f"Website: {p.website}")
+
+    lines += ["", "--- Lending appetite ---"]
+    lines.append(f"Loan types: {', '.join(p.loan_types) or '(unspecified)'}")
+    if p.loan_size_min is not None or p.loan_size_max is not None:
+        lo = f"${p.loan_size_min:,.0f}" if p.loan_size_min is not None else "?"
+        hi = f"${p.loan_size_max:,.0f}" if p.loan_size_max is not None else "?"
+        lines.append(f"Loan size: {lo} – {hi}")
+    lines.append(
+        f"States: {', '.join(p.geographic_states) or '(unspecified)'}"
+    )
+    lines.append(
+        f"Asset classes: {', '.join(p.asset_classes) or '(unspecified)'}"
+    )
+
+    lines += ["", "--- Capital & volume ---"]
+    if p.capital_source:
+        lines.append(f"Capital source: {p.capital_source}")
+    if p.aum_band:
+        lines.append(f"AUM band: {p.aum_band}")
+    if p.monthly_origination_band:
+        lines.append(f"Monthly origination band: {p.monthly_origination_band}")
+
+    box_bits: list[str] = []
+    if p.max_ltv is not None:
+        box_bits.append(f"max LTV {p.max_ltv * 100:.1f}%")
+    if p.max_ltc is not None:
+        box_bits.append(f"max LTC {p.max_ltc * 100:.1f}%")
+    if p.min_dscr is not None:
+        box_bits.append(f"min DSCR {p.min_dscr:.2f}x")
+    if p.min_fico is not None:
+        box_bits.append(f"min FICO {p.min_fico}")
+    if p.rate_range:
+        box_bits.append(f"rates {p.rate_range}")
+    if box_bits:
+        lines += ["", "--- Underwriting box ---", "; ".join(box_bits)]
+
+    lines += [
+        "",
+        "--- Contact ---",
+        f"Name: {p.contact_name}",
+    ]
+    if p.contact_title:
+        lines.append(f"Title: {p.contact_title}")
+    lines.append(f"Email: {p.contact_email}")
+    if p.contact_phone:
+        lines.append(f"Phone: {p.contact_phone}")
+    if p.submission_email:
+        lines.append(f"Submission email: {p.submission_email}")
+    if p.submission_portal_url:
+        lines.append(f"Submission portal: {p.submission_portal_url}")
+    if p.average_response_time:
+        lines.append(f"Average response time: {p.average_response_time}")
+    if p.notes:
+        lines += ["", "--- Notes ---", p.notes]
+
+    lines += [
+        "",
+        "Review in QCDashboard:",
+        f"  https://app.qualifiedcommercial.com/admin/capital-partner-applications/{app_id}",
+    ]
+    return "\n".join(lines)

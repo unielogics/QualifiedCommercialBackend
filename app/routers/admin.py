@@ -33,6 +33,10 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser, require_role
 from app.enums import LoanStage, Role
+from app.models.capital_partner_application import (
+    APPLICATION_STATUSES,
+    CapitalPartnerApplication,
+)
 from app.models.lender import Lender
 from app.models.loan import Loan
 from app.models.loan_scenario import LoanScenario
@@ -454,3 +458,229 @@ async def list_all_loan_scenarios(
         )
         for (s, deal_id, address, name, email) in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Capital partner applications — review queue + decision endpoints.
+#
+# Public submissions land in `capital_partner_applications` via
+# POST /public/capital-partner-application (see app/routers/public.py).
+# Super-admin reviews from QCDashboard /admin/capital-partner-applications.
+# Approval optionally promotes the row into a real `lenders` entry so
+# the team can immediately route deals to the new partner.
+# ---------------------------------------------------------------------------
+
+
+class CapitalPartnerAppListRow(BaseModel):
+    id: UUID
+    company_name: str
+    contact_name: str
+    contact_email: str
+    loan_types: list[str]
+    geographic_states: list[str]
+    monthly_origination_band: str | None
+    status: str
+    reviewed_at: datetime | None
+    promoted_lender_id: UUID | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CapitalPartnerAppRead(BaseModel):
+    id: UUID
+    # Company
+    company_name: str
+    legal_entity_type: str | None
+    formation_state: str | None
+    ein: str | None
+    years_in_business: int | None
+    website: str | None
+    # Lending appetite
+    loan_types: list[str]
+    loan_size_min: int | None
+    loan_size_max: int | None
+    geographic_states: list[str]
+    asset_classes: list[str]
+    # Capital & volume
+    capital_source: str | None
+    aum_band: str | None
+    monthly_origination_band: str | None
+    # Underwriting box
+    max_ltv: float | None
+    max_ltc: float | None
+    min_dscr: float | None
+    min_fico: int | None
+    rate_range: str | None
+    # Contact
+    contact_name: str
+    contact_title: str | None
+    contact_email: str
+    contact_phone: str | None
+    submission_email: str | None
+    submission_portal_url: str | None
+    average_response_time: str | None
+    notes: str | None
+    # Review state
+    status: str
+    review_notes: str | None
+    reviewed_by_id: UUID | None
+    reviewed_at: datetime | None
+    promoted_lender_id: UUID | None
+    # Audit
+    ip_address: str | None
+    user_agent: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CapitalPartnerDecisionPayload(BaseModel):
+    decision: str  # "approved" | "denied"
+    review_notes: str | None = Field(default=None, max_length=4000)
+    # Approval-only: when true, copy the application into a real
+    # `lenders` table row so the team can immediately route deals.
+    promote_to_lender: bool = False
+
+
+def _to_lender_products(loan_types: list[str]) -> list[str]:
+    """Loose normalisation of the application's free-form loan_types
+    list to the dropdown values used by the existing Lender.products
+    field. Unknown entries are passed through (operator can edit
+    later in the lender roster)."""
+    keep = []
+    for t in loan_types or []:
+        if not isinstance(t, str):
+            continue
+        s = t.strip().lower().replace("&", "and").replace(" ", "_").replace("-", "_")
+        if s and s not in keep:
+            keep.append(s)
+    return keep
+
+
+@router.get(
+    "/capital-partner-applications",
+    response_model=list[CapitalPartnerAppListRow],
+)
+async def list_capital_partner_applications(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    status_filter: str | None = None,
+) -> list[CapitalPartnerAppListRow]:
+    """Lender-application queue. Defaults to newest-first; pass
+    `?status_filter=pending` to narrow the list."""
+    _require_super_admin(user)
+    stmt = select(CapitalPartnerApplication).order_by(
+        CapitalPartnerApplication.created_at.desc()
+    )
+    if status_filter:
+        if status_filter not in APPLICATION_STATUSES:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Unknown status_filter: {status_filter!r}",
+            )
+        stmt = stmt.where(CapitalPartnerApplication.status == status_filter)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [CapitalPartnerAppListRow.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/capital-partner-applications/{app_id}",
+    response_model=CapitalPartnerAppRead,
+)
+async def get_capital_partner_application(
+    app_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CapitalPartnerAppRead:
+    """Full detail view for a single application."""
+    _require_super_admin(user)
+    row = (
+        await db.execute(
+            select(CapitalPartnerApplication).where(
+                CapitalPartnerApplication.id == app_id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application not found")
+    return CapitalPartnerAppRead.model_validate(row)
+
+
+@router.post(
+    "/capital-partner-applications/{app_id}/decision",
+    response_model=CapitalPartnerAppRead,
+)
+async def decide_capital_partner_application(
+    app_id: UUID,
+    payload: CapitalPartnerDecisionPayload,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CapitalPartnerAppRead:
+    """Approve or deny an application. On approval, optionally promote
+    the row into a real `lenders` entry so the team can route deals
+    immediately. Returns the updated application."""
+    _require_super_admin(user)
+    if payload.decision not in ("approved", "denied"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "decision must be 'approved' or 'denied'.",
+        )
+    row = (
+        await db.execute(
+            select(CapitalPartnerApplication).where(
+                CapitalPartnerApplication.id == app_id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application not found")
+    if row.status != "pending":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Application is already {row.status}. Re-deciding is not supported.",
+        )
+
+    row.status = payload.decision
+    row.review_notes = payload.review_notes
+    row.reviewed_by_id = user.id
+    row.reviewed_at = datetime.now(tz=row.created_at.tzinfo)
+
+    if payload.decision == "approved" and payload.promote_to_lender:
+        # Only promote if a lender with the same name doesn't already
+        # exist — operator can manually deduplicate later.
+        existing = (
+            await db.execute(
+                select(Lender).where(
+                    func.lower(Lender.name) == row.company_name.strip().lower()
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            lender = Lender(
+                name=row.company_name.strip(),
+                submission_email=row.submission_email or row.contact_email,
+                contact_name=row.contact_name,
+                contact_email=row.contact_email,
+                contact_phone=row.contact_phone,
+                contact_title=row.contact_title,
+                products=_to_lender_products(list(row.loan_types or [])),
+                notes=(
+                    f"Auto-promoted from capital partner application {row.id}.\n"
+                    + (row.notes or "")
+                ).strip(),
+                is_active=True,
+            )
+            db.add(lender)
+            await db.flush()
+            await db.refresh(lender)
+            row.promoted_lender_id = lender.id
+        else:
+            row.promoted_lender_id = existing.id
+
+    await db.flush()
+    await db.refresh(row)
+    return CapitalPartnerAppRead.model_validate(row)

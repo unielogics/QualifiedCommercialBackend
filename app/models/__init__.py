@@ -13,6 +13,10 @@ from app.models.ai_task import AITask  # noqa: F401
 from app.models.ai_task_assignment import AITaskAssignment  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
+from app.models.capital_partner_application import (  # noqa: F401
+    APPLICATION_STATUSES,
+    CapitalPartnerApplication,
+)
 from app.models.client import Client  # noqa: F401
 from app.models.client_ai_plan import ClientAIPlan  # noqa: F401
 from app.models.client_property import ClientProperty  # noqa: F401
