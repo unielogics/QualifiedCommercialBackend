@@ -86,9 +86,14 @@ def _fetch_s3_object_bytes(s3_key: str) -> bytes:
     return obj["Body"].read()
 
 
-def _delete_s3_object(s3_key: str) -> None:
+def _delete_s3_object(s3_key: str | None) -> None:
     """Hard-delete the S3 object. Called from the soft-delete endpoint —
-    keeping the row but cleaning up the bytes is the friendly compromise."""
+    keeping the row but cleaning up the bytes is the friendly compromise.
+
+    No-ops on NULL s3_key (pasted-text notes have no S3 object — their
+    body lives in `parsed_text` directly)."""
+    if not s3_key:
+        return
     import boto3
 
     settings = get_settings()

@@ -55,8 +55,10 @@ class AIKnowledgeDocument(TimestampMixin, Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # S3 key under the configured bucket — namespaced by agent so a
-    # rogue listing call can't see another agent's docs.
-    s3_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    # rogue listing call can't see another agent's docs. Nullable
+    # (alembic 0065) because pasted-text notes have no S3 object —
+    # their body lives in parsed_text directly.
+    s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
     # Extracted plain text. Truncated to ~200k chars on the parse
     # path — agents won't paste novels and the prompt has its own

@@ -867,6 +867,71 @@ async def ai_knowledge_upload_complete(
     )
 
 
+# ── Pasted knowledge — text in the textarea, no S3 upload ───────────
+
+
+class _KnowledgePasteRequest(BaseModel):
+    filename: str
+    text: str
+
+
+@router.post("/ai-knowledge/paste", response_model=_KnowledgeDocumentOut)
+async def ai_knowledge_paste(
+    payload: _KnowledgePasteRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> _KnowledgeDocumentOut:
+    """Add a pasted-text knowledge note (no S3 object). Body of the note
+    lives in `parsed_text` directly. Classified by Haiku the same way an
+    uploaded PDF is, so the Knowledge UI shows a summary either way."""
+    if user.role != Role.BROKER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
+
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Empty pasted note."
+        )
+
+    from app.models.ai_knowledge_document import AIKnowledgeDocument
+    from app.services.ai.ai_agent import classify_knowledge_document
+
+    # Cap to the same window the parser uses so an enormous paste can't
+    # blow out the AI context.
+    MAX = 200_000
+    if len(text) > MAX:
+        text = text[:MAX]
+
+    doc = AIKnowledgeDocument(
+        id=uuid.uuid4(),
+        agent_user_id=user.id,
+        filename=(payload.filename or "Note").strip()[:255] or "Note",
+        content_type="text/plain",
+        size_bytes=len(text.encode("utf-8")),
+        s3_key=None,
+        parsed_text=text,
+        status="ready",
+    )
+    db.add(doc)
+    await db.flush()
+    # Run the same classifier as the upload path so doc_type / summary /
+    # key_facts are populated for the AI Agent builder's knowledge list.
+    try:
+        await classify_knowledge_document(db, doc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("paste classify failed for %s: %s", doc.id, exc)
+    await db.commit()
+    return _KnowledgeDocumentOut(
+        id=doc.id,
+        filename=doc.filename,
+        content_type=doc.content_type,
+        size_bytes=doc.size_bytes,
+        status=doc.status,
+        error=doc.error,
+        created_at=doc.created_at,
+    )
+
+
 @router.get("/ai-knowledge", response_model=list[_KnowledgeDocumentOut])
 async def list_ai_knowledge(
     user: CurrentUser,

@@ -686,17 +686,15 @@ async def post_training_turn(
             {"role": m.role if m.role in ("user", "assistant") else "user", "content": m.content}
             for m in history
         ]
+        # Context-aware system prompt — pulls goal, knowledge summaries,
+        # and targeting rules so the coach asks gap-filling questions
+        # instead of generic ones.
+        system_text = await svc.training_system_prompt(db, agent)
         result = await run(
             convo,
             tier="light",
-            max_tokens=600,
-            system=(
-                "You are a friendly real-estate sales consultant interviewing an "
-                "agent to learn their product, market, offer, common objections, "
-                f"and tone for an AI worker called '{agent.name}'. Ask ONE focused "
-                "question at a time. Be concise and warm. After you have enough, "
-                "tell the agent they can finish the training."
-            ),
+            max_tokens=700,
+            system=system_text,
         )
         text = svc._text_of(result)
         if text:

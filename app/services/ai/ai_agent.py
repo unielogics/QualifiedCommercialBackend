@@ -228,16 +228,23 @@ async def step_states(db: AsyncSession, agent: AIAgent) -> dict[str, str]:
     states["targeting"] = (
         "done" if targeting and targeting.include_rules else "missing"
     )
-    states["training"] = "done" if training_done else "missing"
+    # Step 5 (Training Studio) now embeds playbook + showing-guide
+    # generation inline — it's "done" only when the chat is complete
+    # AND both synthesized artifacts are approved.
+    playbook_ok = bool(playbook and playbook.approval_status == "approved")
+    guide_ok = bool(guide and guide.approval_status == "approved")
+    if training_done and playbook_ok and guide_ok:
+        states["training"] = "done"
+    elif training_done or playbook or guide:
+        states["training"] = "attention"
+    else:
+        states["training"] = "missing"
+    # Kept for the activation gate so blockers stay specific.
     states["playbook"] = (
-        "done"
-        if playbook and playbook.approval_status == "approved"
-        else ("attention" if playbook else "missing")
+        "done" if playbook_ok else ("attention" if playbook else "missing")
     )
     states["showing_guide"] = (
-        "done"
-        if guide and guide.approval_status == "approved"
-        else ("attention" if guide else "missing")
+        "done" if guide_ok else ("attention" if guide else "missing")
     )
     # Step 8 is done when the broker has set exit rules AND linked a
     # voice profile. The follow-up cadence itself is the AI's job.
@@ -516,6 +523,66 @@ async def _system_prompt(db: AsyncSession, agent: AIAgent) -> str:
         "rates, or promises. Output JSON only when asked."
     )
     return "\n\n".join(parts)
+
+
+async def training_system_prompt(db: AsyncSession, agent: AIAgent) -> str:
+    """The Training Studio coach prompt — context-aware. Loads everything
+    the broker has already configured (goal, knowledge summaries,
+    targeting rules) and instructs the coach to challenge the broker
+    with 5-10 targeted questions, filling gaps rather than restating
+    the context back."""
+    sections: list[str] = []
+
+    sections.append(
+        f"You are a senior real-estate sales consultant interviewing the "
+        f"broker about the AI worker they're building, called \"{agent.name}\" "
+        f"({agent.kind.replace('_', ' ')})."
+    )
+
+    if agent.audience:
+        sections.append(f"AUDIENCE: {agent.audience}")
+
+    goal = (
+        await db.execute(select(AIAgentGoal).where(AIAgentGoal.ai_agent_id == agent.id))
+    ).scalar_one_or_none()
+    if goal:
+        g: list[str] = []
+        if goal.primary_goal:
+            g.append(f"GOAL: {goal.primary_goal}")
+        if goal.primary_cta:
+            g.append(f"PRIMARY CTA: {goal.primary_cta}")
+        if goal.handoff_triggers:
+            g.append(f"HAND OFF WHEN: {goal.handoff_triggers}")
+        if g:
+            sections.append("\n".join(g))
+
+    targeting = (
+        await db.execute(
+            select(AIAgentTargeting).where(AIAgentTargeting.ai_agent_id == agent.id)
+        )
+    ).scalar_one_or_none()
+    if targeting and (targeting.include_rules or targeting.exclude_rules):
+        sections.append(
+            "TARGETING — "
+            f"domain={targeting.domain} include={targeting.include_rules} "
+            f"exclude={targeting.exclude_rules}"
+        )
+
+    docs = await _agent_knowledge(db, agent.id)
+    kb = _knowledge_block(docs)
+    if kb:
+        sections.append(kb[:6000])
+
+    sections.append(
+        "Your job: CHALLENGE the broker with 5–10 targeted, specific "
+        "questions that fill the gaps in the context above (offer details, "
+        "tone, objection handling, what a great vs a bad lead looks like, "
+        "edge cases). Ask ONE question at a time. Be warm but pointed — "
+        "don't restate what they already gave you. When you have enough "
+        "to write a strong playbook, tell them they can finish the "
+        "training."
+    )
+    return "\n\n".join(sections)
 
 
 async def compose_message(
