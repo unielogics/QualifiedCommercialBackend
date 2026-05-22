@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -73,3 +73,16 @@ class AIKnowledgeDocument(TimestampMixin, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # ---- AI-Agent classifier output (alembic 0063) ----
+    # Filled by a Haiku classifier on the parse-complete path. Lets the
+    # AI Agent builder surface "what is this file" + inject a compact
+    # summary (instead of the full parsed_text) into outbound-composer
+    # prompts. All nullable — account-wide knowledge predating the
+    # classifier simply has these unset.
+    doc_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    """e.g. product_overview | faq | pricing | case_study | bio | other."""
+    key_facts: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    """Short bullet list of the load-bearing facts in the document."""
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """One-paragraph plain-language summary for prompt injection."""

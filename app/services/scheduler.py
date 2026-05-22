@@ -219,6 +219,39 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # AI Agents (alembic 0063). Three additive jobs — none touch the
+    # existing cadence engine. Synthesis drain (heavy Sonnet playbook /
+    # showing-guide generation) every 2 min; targeting re-evaluation
+    # hourly; the outreach pass every 30 min. All self-no-op when no
+    # AI Agent is active.
+    scheduler.add_job(
+        _wrap(job_ai_agent_synthesis_drain),
+        "interval",
+        minutes=2,
+        id="ai_agent_synthesis_drain",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _wrap(job_ai_agent_targeting_pass),
+        "interval",
+        hours=1,
+        id="ai_agent_targeting_pass",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        _wrap(job_ai_agent_pass),
+        "interval",
+        minutes=30,
+        id="ai_agent_pass",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -448,3 +481,239 @@ async def job_reengagement_pass() -> None:
     from app.services.ai.reengagement import run_reengagement_pass
 
     await run_reengagement_pass()
+
+
+# ── AI Agents — the broker's configurable AI workers (alembic 0063) ──
+
+
+async def job_ai_agent_synthesis_drain() -> None:
+    """Heavy-AI synthesis drain. Every 2 min, picks AI-Agent playbooks
+    + showing guides flagged `generation_status='generating'` and runs
+    the Sonnet synthesis. Hard-capped per tick to bound spend. Mirrors
+    job_document_scan_drain. Self-no-ops with nothing pending."""
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models.ai_agent import AIAgent, AIAgentPlaybook, AIAgentShowingGuide
+    from app.services.ai.ai_agent import generate_playbook, generate_showing_guide
+
+    async with SessionLocal() as db:
+        playbooks = (
+            await db.execute(
+                select(AIAgentPlaybook)
+                .where(AIAgentPlaybook.generation_status == "generating")
+                .limit(4)
+            )
+        ).scalars().all()
+        guides = (
+            await db.execute(
+                select(AIAgentShowingGuide)
+                .where(AIAgentShowingGuide.generation_status == "generating")
+                .limit(4)
+            )
+        ).scalars().all()
+        if not playbooks and not guides:
+            return
+        log.info(
+            "ai_agent_synthesis_drain: %d playbooks, %d guides",
+            len(playbooks), len(guides),
+        )
+        for pb in playbooks:
+            try:
+                agent = await db.get(AIAgent, pb.ai_agent_id)
+                if agent is not None:
+                    await generate_playbook(db, agent)
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("ai_agent_synthesis_drain: playbook %s failed", pb.id)
+                await db.rollback()
+        for g in guides:
+            try:
+                agent = await db.get(AIAgent, g.ai_agent_id)
+                if agent is not None:
+                    await generate_showing_guide(db, agent)
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("ai_agent_synthesis_drain: guide %s failed", g.id)
+                await db.rollback()
+
+
+async def job_ai_agent_targeting_pass() -> None:
+    """Hourly. Re-evaluates each active AI Agent's targeting rules
+    against the broker's current pipeline + clients, enrolling new
+    matches into ai_agent_leads and retiring stale ones. Separate from
+    the cadence engine — touches only ai_agent_leads."""
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.enums import AIAgentStatus
+    from app.models.ai_agent import AIAgent
+    from app.services.ai.ai_agent import run_targeting
+
+    async with SessionLocal() as db:
+        agents = (
+            await db.execute(
+                select(AIAgent).where(AIAgent.status == AIAgentStatus.ACTIVE)
+            )
+        ).scalars().all()
+        if not agents:
+            return
+        for agent in agents:
+            try:
+                result = await run_targeting(db, agent)
+                await db.commit()
+                if result.get("enrolled") or result.get("retired"):
+                    log.info(
+                        "ai_agent_targeting_pass: agent=%s enrolled=%s retired=%s",
+                        agent.id, result["enrolled"], result["retired"],
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception("ai_agent_targeting_pass: agent %s failed", agent.id)
+                await db.rollback()
+
+
+async def job_ai_agent_pass() -> None:
+    """Every 30 min — the AI Agent outreach engine. For each active AI
+    Agent, walks its due `ai_agent_leads`, composes a touchpoint
+    message, and either drafts it (draft-first / warm-up) or sends it
+    (auto). Honors per-agent cadence + exit rules. Separate job from
+    the existing cadence engine — scoped only to ai_agent_leads."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.enums import AIAgentStatus
+    from app.models.ai_agent import (
+        AIAgent,
+        AIAgentExitRules,
+        AIAgentLead,
+        AIAgentMessage,
+    )
+    from app.models.client import Client
+    from app.services.ai.ai_agent import compose_message, touchpoint_for_attempt
+
+    now = datetime.now(timezone.utc)
+    PER_TICK = 25  # bound Anthropic spend per pass
+
+    async with SessionLocal() as db:
+        agents = (
+            await db.execute(
+                select(AIAgent).where(AIAgent.status == AIAgentStatus.ACTIVE)
+            )
+        ).scalars().all()
+        if not agents:
+            return
+
+        processed = 0
+        for agent in agents:
+            if processed >= PER_TICK:
+                break
+            exit_rules = (
+                await db.execute(
+                    select(AIAgentExitRules).where(
+                        AIAgentExitRules.ai_agent_id == agent.id
+                    )
+                )
+            ).scalar_one_or_none()
+            max_attempts = exit_rules.max_email_attempts if exit_rules else 5
+            max_days = exit_rules.max_days_in_sequence if exit_rules else 14
+            cadence = agent.cadence or [0]
+
+            leads = (
+                await db.execute(
+                    select(AIAgentLead)
+                    .where(AIAgentLead.ai_agent_id == agent.id)
+                    .where(AIAgentLead.status == "active")
+                    .where(
+                        (AIAgentLead.next_action_at.is_(None))
+                        | (AIAgentLead.next_action_at <= now)
+                    )
+                    .limit(PER_TICK - processed)
+                )
+            ).scalars().all()
+
+            for lead in leads:
+                processed += 1
+                try:
+                    # Exit-rule checks.
+                    enrolled = lead.enrolled_at or lead.created_at or now
+                    if (
+                        lead.attempts_made >= max_attempts
+                        or lead.attempts_made >= len(cadence)
+                        or (now - enrolled) > timedelta(days=max_days)
+                    ):
+                        lead.status = "exited"
+                        continue
+
+                    client = await db.get(Client, lead.client_id)
+                    if client is None:
+                        lead.status = "exited"
+                        continue
+
+                    tp = touchpoint_for_attempt(agent, lead.attempts_made)
+                    composed = await compose_message(
+                        db, agent, client=client, touchpoint_key=tp
+                    )
+                    # Auto-send only when fully active (not warm-up).
+                    auto = agent.send_mode == "auto" and not agent.warmup_mode
+                    msg_status = "draft"
+                    sent_at = None
+                    provider_id = None
+                    if auto:
+                        sent_ok, provider_id = await _ai_agent_send_email(
+                            client.email, composed["subject"], composed["body"]
+                        )
+                        msg_status = "sent" if sent_ok else "draft"
+                        sent_at = now if sent_ok else None
+
+                    db.add(
+                        AIAgentMessage(
+                            ai_agent_id=agent.id,
+                            lead_id=lead.id,
+                            client_id=client.id,
+                            touchpoint_key=tp,
+                            channel="email",
+                            subject=composed["subject"][:300],
+                            body=composed["body"],
+                            status=msg_status,
+                            sent_at=sent_at,
+                            provider_message_id=provider_id,
+                        )
+                    )
+                    lead.attempts_made += 1
+                    lead.last_outbound_at = now
+                    # Schedule the next touchpoint, or retire.
+                    if lead.attempts_made >= len(cadence):
+                        lead.next_action_at = None
+                    else:
+                        gap = max(
+                            1,
+                            cadence[lead.attempts_made]
+                            - cadence[lead.attempts_made - 1],
+                        )
+                        lead.next_action_at = now + timedelta(days=gap)
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    log.exception("ai_agent_pass: lead %s failed", lead.id)
+                    await db.rollback()
+                await asyncio.sleep(0)
+
+
+async def _ai_agent_send_email(
+    to_email: str | None, subject: str, body: str
+) -> tuple[bool, str | None]:
+    """Best-effort SES send for an auto-send AI Agent. Returns
+    (sent, provider_message_id). No-ops gracefully when SES isn't
+    configured or there's no recipient."""
+    if not (to_email or "").strip():
+        return False, None
+    try:
+        from app.services.email.ses_client import send_email
+
+        result = send_email(to_email=to_email, subject=subject, body_text=body)
+        return bool(result.ok), result.message_id
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ai_agent send_email failed: %s", exc)
+        return False, None

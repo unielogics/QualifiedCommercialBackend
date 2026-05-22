@@ -517,3 +517,65 @@ class AgentTaskStatus(StrEnum):
     WAITING = "waiting"
     DONE = "done"
     CANCELLED = "cancelled"
+
+
+# ── AI Agents — the broker's configurable AI workers (alembic 0063) ──
+#
+# A broker builds named AI Agents through an 11-step builder. Each
+# agent is trained, given a playbook, assigned a slice of the broker's
+# existing pipeline/clients via targeting rules, tested, and launched.
+# Distinct from `Broker` (the human agent) and from `AITask` (a single
+# pending action). See the plan file for the full mental model.
+
+
+class AIAgentStatus(StrEnum):
+    """Lifecycle of one AI Agent through the builder + activation gate."""
+    DRAFT = "draft"
+    NEEDS_TRAINING = "needs_training"
+    TRAINING_IN_PROGRESS = "training_in_progress"
+    NEEDS_REVIEW = "needs_review"
+    READY_TO_ACTIVATE = "ready_to_activate"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    ARCHIVED = "archived"
+
+
+class AIAgentKind(StrEnum):
+    """Workflow preset — pre-fills goal/cadence defaults. `custom` is
+    fully free-form."""
+    BUYER_NURTURE = "buyer_nurture"
+    SELLER_FOLLOWUP = "seller_followup"
+    PAST_CLIENT = "past_client"
+    INVESTOR_OUTREACH = "investor_outreach"
+    OPEN_HOUSE = "open_house"
+    REVIEW_REQUEST = "review_request"
+    CUSTOM = "custom"
+
+
+class AIAgentSendMode(StrEnum):
+    """Per-agent send governance. `auto` requires warm-up complete
+    before it can be enabled."""
+    DRAFT_FIRST = "draft_first"
+    AUTO = "auto"
+
+
+class AIAgentPersonaMode(StrEnum):
+    """How the AI Agent introduces itself in outbound messages."""
+    VIRTUAL_SECRETARY = "virtual_secretary"   # "[Name], virtual secretary for ..."
+    AGENT_PERSONA = "agent_persona"           # speaks in the broker's own voice
+
+
+class AIAgentDomain(StrEnum):
+    """Which existing QC surface the targeting engine draws people from."""
+    PIPELINE = "pipeline"   # deals / loan files
+    CLIENTS = "clients"     # the clients tab
+    BOTH = "both"
+
+
+class AIAgentLeadStatus(StrEnum):
+    """State of one enrolled contact within an AI Agent's roster."""
+    PENDING_REVIEW = "pending_review"
+    ACTIVE = "active"
+    REPLIED = "replied"
+    HANDED_OFF = "handed_off"
+    EXITED = "exited"

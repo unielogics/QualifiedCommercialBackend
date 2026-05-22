@@ -1,6 +1,21 @@
 """ORM models — single import surface so Alembic autogenerate sees everything."""
 
 from app.models.activity import Activity  # noqa: F401
+from app.models.ai_agent import (  # noqa: F401
+    AIAgent,
+    AIAgentExitRules,
+    AIAgentGoal,
+    AIAgentKnowledgeLink,
+    AIAgentLead,
+    AIAgentMessage,
+    AIAgentPlaybook,
+    AIAgentSampleMessage,
+    AIAgentShowingGuide,
+    AIAgentTargeting,
+    AIAgentTestScenario,
+    AIAgentTrainingMessage,
+    AIAgentTrainingSession,
+)
 from app.models.ai_audit_event import AIAuditEvent  # noqa: F401
 from app.models.ai_cadence_rule import AICadenceRule  # noqa: F401
 from app.models.ai_chat_thread import AIChatMessage, AIChatThread  # noqa: F401

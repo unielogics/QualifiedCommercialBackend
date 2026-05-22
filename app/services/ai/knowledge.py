@@ -127,6 +127,16 @@ async def parse_document_inline(
         log.exception("knowledge.parse_failed doc=%s", doc.id)
     await db.flush()
 
+    # Classify the document so the AI Agent builder can show "what is
+    # this file" + inject a compact summary. Best-effort, never raises.
+    if doc.status == "ready":
+        try:
+            from app.services.ai.ai_agent import classify_knowledge_document
+
+            await classify_knowledge_document(db, doc)
+        except Exception:  # noqa: BLE001
+            log.warning("knowledge.classify_skipped doc=%s", doc.id)
+
 
 async def load_agent_knowledge(
     db: AsyncSession,
