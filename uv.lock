@@ -8,6 +8,20 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "aioapns"
+version = "4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h2" },
+    { name = "pyjwt" },
+    { name = "pyopenssl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/39/51/1ce93531e9267e24151e659cf96a284506f5ba661bf09728a933c7437456/aioapns-4.0.tar.gz", hash = "sha256:3715faabf3fa6c0240e7637f4427d88d08afdcceb0dcfb956c6d09b6f49427f8", size = 14315, upload-time = "2025-04-14T12:37:24.817Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9a/d0/da627f8349894a2941ca09fcaaf354d5038fc264e46275dce8fef5b839aa/aioapns-4.0-py3-none-any.whl", hash = "sha256:54bf57c14079f5643e3f458a75e4a31aaedd622be5c358f3efd5fd4aec831d0f", size = 14618, upload-time = "2025-04-14T12:37:22.77Z" },
+]
+
+[[package]]
 name = "aiosqlite"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1824,6 +1838,19 @@ crypto = [
 ]
 
 [[package]]
+name = "pyopenssl"
+version = "26.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/51/27a5ad5f939d08f690a326ef9582cda7140555180db71695f6fb747d6a36/pyopenssl-26.2.0.tar.gz", hash = "sha256:8c6fcecd1183a7fc897548dfe388b0cdb7f37e018200d8409cf33959dbe35387", size = 182195, upload-time = "2026-05-04T23:06:09.72Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/b8/a0e2790ae249d6f38c9f66de7a211621a7ab2650217bcd04e1262f578a56/pyopenssl-26.2.0-py3-none-any.whl", hash = "sha256:4f9d971bc5298b8bc1fab282803da04bf000c755d4ad9d99b52de2569ca19a70", size = 55823, upload-time = "2026-05-04T23:06:08.395Z" },
+]
+
+[[package]]
 name = "pyparsing"
 version = "3.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2003,6 +2030,7 @@ name = "qcbackend"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aioapns" },
     { name = "alembic" },
     { name = "anthropic" },
     { name = "apscheduler" },
@@ -2040,6 +2068,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aioapns", specifier = ">=3.1" },
     { name = "aiosqlite", marker = "extra == 'dev'", specifier = ">=0.20.0" },
     { name = "alembic", specifier = ">=1.14.0" },
     { name = "anthropic", specifier = ">=0.40.0" },
