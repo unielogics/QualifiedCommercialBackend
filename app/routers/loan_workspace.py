@@ -261,6 +261,13 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
         "verbatim.\n\n"
         + await assemble_loan_context(db, loan, audience="client")
     )
+    # Operator training layer (Nurture AI chat). Additive.
+    from app.services.ai.task_training import (
+        load_task_config as _load_tc,
+        render_training_block as _render_tb,
+    )
+
+    system += _render_tb(await _load_tc(db, "nurture_chat"))
 
     if not settings.anthropic_api_key:
         reply_text = "I'm back online — let me know how I can help from here."
@@ -697,6 +704,11 @@ async def _generate_ai_reply(
         "this single loan. Be concise — 1-3 sentences unless asked to expand.\n\n"
         + await assemble_loan_context(db, loan, audience=audience)
     )
+    # Operator training layer — borrower-facing chat only. Additive.
+    if audience == "client":
+        from app.services.ai.task_training import load_task_config, render_training_block
+
+        system += render_training_block(await load_task_config(db, "nurture_chat"))
 
     if not settings.anthropic_api_key:
         # Stub when no key — keep the workspace usable in dev.

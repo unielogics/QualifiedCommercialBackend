@@ -864,3 +864,211 @@ def _serialize_cadence(r: AICadenceRule) -> CadenceRuleOut:
         message_template=r.message_template, visibility=r.visibility,
         is_active=r.is_active, requires_ai_owner=r.requires_ai_owner,
     )
+
+
+# ── AI training — per-task instructions + tone, and corrections review ──
+#
+# The "train the AI" interface. Config is stored on the funding
+# 'communication' playbook rules.task_training JSONB (same row as the
+# firm AI identity). Each AI task composes its prompt as
+#   <base prompt in code> + render_training_block(config)
+# so unconfigured tasks behave byte-identically to before. v1 exposes
+# the three borrower-facing task types (see task_training.TASK_KEYS).
+
+
+class AiTaskConfigItem(BaseModel):
+    task_key: str
+    label: str
+    instructions: str = ""
+    tone: str = ""
+    dos: list[str] = []
+    donts: list[str] = []
+    examples: list[str] = []
+
+
+class AiTaskConfigsOut(BaseModel):
+    tasks: list[AiTaskConfigItem]
+
+
+class AiTaskConfigSave(BaseModel):
+    instructions: str = ""
+    tone: str = ""
+    dos: list[str] = []
+    donts: list[str] = []
+    examples: list[str] = []
+
+
+class AiTrainingExampleAdd(BaseModel):
+    text: str
+
+
+class AiTrainingFeedbackItem(BaseModel):
+    kind: str  # "rating" | "correction"
+    output_type: str | None
+    loan_id: UUID | None
+    text: str
+    created_at: datetime
+
+
+def _ai_task_item(task_key: str, cfg: dict) -> AiTaskConfigItem:
+    from app.services.ai.task_training import TASK_LABELS
+
+    return AiTaskConfigItem(
+        task_key=task_key,
+        label=TASK_LABELS.get(task_key, task_key),
+        instructions=cfg.get("instructions", "") or "",
+        tone=cfg.get("tone", "") or "",
+        dos=list(cfg.get("dos") or []),
+        donts=list(cfg.get("donts") or []),
+        examples=list(cfg.get("examples") or []),
+    )
+
+
+@router.get("/ai-training/tasks", response_model=AiTaskConfigsOut)
+async def get_ai_training_tasks(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> AiTaskConfigsOut:
+    """All trainable AI task configs for the training control panel."""
+    _require_admin(user)
+    from app.services.ai.task_training import TASK_KEYS, load_all_task_configs
+
+    configs = await load_all_task_configs(db)
+    return AiTaskConfigsOut(
+        tasks=[_ai_task_item(k, configs.get(k, {})) for k in TASK_KEYS]
+    )
+
+
+async def _save_ai_task_config(
+    db: AsyncSession, user, task_key: str, entry: dict
+) -> None:
+    """Write one task's config into the funding communication playbook
+    rules.task_training JSONB + audit it."""
+    pb = await _ensure_funding_meta_playbook_async(db, user, "communication")
+    rules = dict(pb.rules or {})
+    training = dict(rules.get("task_training") or {})
+    entry = dict(entry)
+    entry["updated_by"] = str(user.id)
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    training[task_key] = entry
+    rules["task_training"] = training
+    old = pb.rules
+    pb.rules = rules
+    await record_event(
+        db, event_type="playbook_edited", actor_type="user", actor_id=user.id,
+        playbook_id=pb.id, old_value=old,
+        new_value={"task_training": {task_key: entry}},
+    )
+    await db.flush()
+
+
+@router.put("/ai-training/tasks/{task_key}", response_model=AiTaskConfigItem)
+async def put_ai_training_task(
+    task_key: str,
+    payload: AiTaskConfigSave,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AiTaskConfigItem:
+    """Save the instructions + tone for one AI task type."""
+    _require_admin(user)
+    from app.services.ai.task_training import TASK_KEYS
+
+    if task_key not in TASK_KEYS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown task_key {task_key!r}")
+    entry = {
+        "instructions": (payload.instructions or "").strip()[:4000],
+        "tone": (payload.tone or "").strip()[:1000],
+        "dos": [d.strip() for d in payload.dos if d.strip()][:30],
+        "donts": [d.strip() for d in payload.donts if d.strip()][:30],
+        "examples": [e.strip() for e in payload.examples if e.strip()][:30],
+    }
+    await _save_ai_task_config(db, user, task_key, entry)
+    return _ai_task_item(task_key, entry)
+
+
+@router.post("/ai-training/tasks/{task_key}/examples", response_model=AiTaskConfigItem)
+async def add_ai_training_example(
+    task_key: str,
+    payload: AiTrainingExampleAdd,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AiTaskConfigItem:
+    """Append one example phrasing to a task (the corrections-review
+    'use as example' action)."""
+    _require_admin(user)
+    from app.services.ai.task_training import TASK_KEYS, load_all_task_configs
+
+    if task_key not in TASK_KEYS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown task_key {task_key!r}")
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "example text is empty")
+    current = (await load_all_task_configs(db)).get(task_key, {})
+    examples = list(current.get("examples") or [])
+    if text not in examples:
+        examples.append(text)
+    entry = {
+        "instructions": current.get("instructions", "") or "",
+        "tone": current.get("tone", "") or "",
+        "dos": list(current.get("dos") or []),
+        "donts": list(current.get("donts") or []),
+        "examples": examples[:30],
+    }
+    await _save_ai_task_config(db, user, task_key, entry)
+    return _ai_task_item(task_key, entry)
+
+
+@router.get("/ai-training/feedback", response_model=list[AiTrainingFeedbackItem])
+async def get_ai_training_feedback(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    limit: int = 60,
+) -> list[AiTrainingFeedbackItem]:
+    """Recent operator signal that should drive training — thumbs-down
+    ratings (with comments) + super-admin corrections to AI turns."""
+    _require_admin(user)
+    from app.enums import FeedbackRating
+    from app.models.ai_feedback import AIFeedback
+    from app.models.ai_modify_correction import AIModifyCorrection
+
+    limit = max(1, min(limit, 200))
+    items: list[AiTrainingFeedbackItem] = []
+
+    fb = (
+        await db.execute(
+            select(AIFeedback)
+            .where(AIFeedback.rating == FeedbackRating.DOWN.value)
+            .order_by(AIFeedback.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    for f in fb:
+        items.append(
+            AiTrainingFeedbackItem(
+                kind="rating",
+                output_type=str(getattr(f.output_type, "value", f.output_type)),
+                loan_id=f.loan_id,
+                text=(f.comment or "(thumbs-down, no comment)"),
+                created_at=f.created_at,
+            )
+        )
+
+    corr = (
+        await db.execute(
+            select(AIModifyCorrection)
+            .order_by(AIModifyCorrection.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    for c in corr:
+        items.append(
+            AiTrainingFeedbackItem(
+                kind="correction",
+                output_type=None,
+                loan_id=c.loan_id,
+                text=c.correction,
+                created_at=c.created_at,
+            )
+        )
+
+    items.sort(key=lambda x: x.created_at, reverse=True)
+    return items[:limit]

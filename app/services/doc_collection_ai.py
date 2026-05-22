@@ -207,12 +207,27 @@ async def compose_collection_nudge(ctx: DocCollectionContext) -> str:
         Compose the message body."""
     ).strip()
 
+    # Operator training layer (AI training interface). Additive — when
+    # nothing is configured for this task, render returns "" and the
+    # prompt is byte-identical to the hardcoded SYSTEM_PROMPT.
+    training_block = ""
+    try:
+        from app.db import SessionLocal
+        from app.services.ai.task_training import load_task_config, render_training_block
+
+        async with SessionLocal() as _tdb:
+            training_block = render_training_block(
+                await load_task_config(_tdb, "doc_collection_nudge")
+            )
+    except Exception:  # noqa: BLE001
+        training_block = ""
+
     try:
         client = get_client()
         result = await client.messages.create(
             model=model_light(),
             max_tokens=220,
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_PROMPT + training_block,
             messages=[{"role": "user", "content": user_prompt}],
         )
         text = "".join(
