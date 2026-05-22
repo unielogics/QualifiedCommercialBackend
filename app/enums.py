@@ -367,6 +367,7 @@ class OutreachChannel(StrEnum):
     PORTAL = "portal"
     EMAIL = "email"
     SMS = "sms"
+    WHATSAPP = "whatsapp"
     VOICE = "voice"
 
 

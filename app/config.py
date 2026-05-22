@@ -112,6 +112,16 @@ class Settings(BaseSettings):
     apns_bundle_id: str = "com.qualifiedcommercial.mobile"
     apns_use_sandbox: bool = True
 
+    # AWS SES — used for AI re-engagement email (auto-send, nurture-grade
+    # deliverability), distinct from the Gmail transport used for
+    # operational lender mail. Auth is the EC2 instance role (no keys);
+    # the role needs ses:SendEmail. When ses_from_address is empty the
+    # SES path no-ops silently — the re-engagement engine still runs,
+    # the email rung just logs "dormant".
+    ses_region: str = "us-east-1"
+    ses_from_address: str = ""
+    ses_configuration_set: str = ""
+
     app_env: str = "development"
     log_level: str = "INFO"
 

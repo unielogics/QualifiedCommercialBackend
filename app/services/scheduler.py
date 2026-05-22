@@ -204,6 +204,21 @@ def start_scheduler() -> None:
         next_run_time=datetime.now(timezone.utc) + _timedelta(seconds=10),
     )
 
+    # AI re-engagement escalation. Hourly: walks active loans and, for
+    # any borrower who's gone quiet on a time-sensitive file, escalates
+    # outreach (email auto-send via SES; SMS/WhatsApp draft-first).
+    # Self-no-ops without an Anthropic key; email rung dormant until
+    # SES is configured. See app/services/ai/reengagement.
+    scheduler.add_job(
+        _wrap(job_reengagement_pass),
+        "interval",
+        hours=1,
+        id="reengagement_pass",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -422,3 +437,14 @@ async def job_gmail_watch_renew() -> None:
     from app.services.email.gmail_push import register_gmail_watch
 
     register_gmail_watch()
+
+
+async def job_reengagement_pass() -> None:
+    """Hourly AI re-engagement pass — escalates outreach to email /
+    SMS / WhatsApp for borrowers who've gone quiet on a time-sensitive
+    file. Self-no-ops without an Anthropic key; the email rung is
+    dormant until SES is configured. See
+    app/services/ai/reengagement.run_reengagement_pass."""
+    from app.services.ai.reengagement import run_reengagement_pass
+
+    await run_reengagement_pass()
