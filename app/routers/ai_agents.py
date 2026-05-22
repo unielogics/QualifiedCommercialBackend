@@ -28,6 +28,7 @@ from app.enums import (
     AIAgentPersonaMode,
     AIAgentSendMode,
     AIAgentStatus,
+    ClientStage,
     Role,
 )
 from app.models.ai_agent import (
@@ -486,6 +487,114 @@ async def list_leads(
         }
         for lead, client in rows
     ]
+
+
+# ── Step 11 helper: warm-up contact enrollment ──────────────────────
+
+
+def _enter_warmup(agent: AIAgent) -> None:
+    """Selecting/creating a warm-up contact flips the agent into active
+    warm-up mode — the AI starts working the delegated contacts; the
+    broker can leave and come back to review + activate."""
+    if agent.status not in (AIAgentStatus.ACTIVE, AIAgentStatus.ARCHIVED):
+        agent.status = AIAgentStatus.ACTIVE
+        agent.warmup_mode = True
+        if agent.activated_at is None:
+            agent.activated_at = _now()
+
+
+async def _enroll_lead(db: AsyncSession, agent: AIAgent, client_id: uuid.UUID) -> bool:
+    """Enroll one client as an active lead. Returns True if newly added."""
+    existing = (
+        await db.execute(
+            select(AIAgentLead)
+            .where(AIAgentLead.ai_agent_id == agent.id)
+            .where(AIAgentLead.client_id == client_id)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.status in ("exited", "handed_off"):
+            existing.status = "active"
+            existing.next_action_at = _now()
+        return False
+    db.add(
+        AIAgentLead(
+            ai_agent_id=agent.id,
+            client_id=client_id,
+            status="active",
+            next_action_at=_now(),
+        )
+    )
+    return True
+
+
+class AssignLeadsIn(BaseModel):
+    client_ids: list[uuid.UUID]
+
+
+class CreateWarmupContactIn(BaseModel):
+    name: str
+    email: str
+    phone: str | None = None
+
+
+@router.post("/{agent_id}/leads/assign")
+async def assign_leads(
+    agent_id: uuid.UUID,
+    payload: AssignLeadsIn,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delegate one or more existing clients to this agent as warm-up
+    contacts. Flips the agent into warm-up mode."""
+    agent = await _agent_or_404(db, user, agent_id)
+    added = 0
+    for cid in payload.client_ids:
+        client = await db.get(Client, cid)
+        if client is None or client.broker_id != agent.broker_id:
+            continue
+        if await _enroll_lead(db, agent, cid):
+            added += 1
+    if payload.client_ids:
+        _enter_warmup(agent)
+    await db.commit()
+    return {"assigned": added}
+
+
+@router.post("/{agent_id}/leads/create")
+async def create_warmup_contact(
+    agent_id: uuid.UUID,
+    payload: CreateWarmupContactIn,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a brand-new contact and delegate it to this agent for
+    warm-up. Reuses an existing client when the email already matches."""
+    agent = await _agent_or_404(db, user, agent_id)
+    email = (payload.email or "").strip()
+    client: Client | None = None
+    if email:
+        client = (
+            await db.execute(
+                select(Client)
+                .where(Client.broker_id == agent.broker_id)
+                .where(func.lower(Client.email) == email.lower())
+            )
+        ).scalars().first()
+    if client is None:
+        client = Client(
+            name=payload.name.strip()[:160] or "New contact",
+            email=email or None,
+            phone=(payload.phone or None),
+            broker_id=agent.broker_id,
+            stage=ClientStage.LEAD,
+        )
+        db.add(client)
+        await db.flush()
+    await _enroll_lead(db, agent, client.id)
+    _enter_warmup(agent)
+    await db.commit()
+    return {"client_id": str(client.id), "name": client.name}
 
 
 # ── Step 5: Training Studio ─────────────────────────────────────────
