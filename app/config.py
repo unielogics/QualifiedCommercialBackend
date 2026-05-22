@@ -78,10 +78,30 @@ class Settings(BaseSettings):
 
     # Firebase Cloud Messaging — path to the Firebase Admin SDK
     # service-account JSON. Used by app/services/push.py to send
-    # FCM HTTPv1 messages to the mobile app. When empty, push.py
-    # logs a debug note and no-ops — useful for local dev where
-    # you don't want to wire FCM yet.
+    # FCM HTTPv1 messages to the ANDROID app (qcmobile). When empty,
+    # push.py logs a debug note and no-ops — useful for local dev
+    # where you don't want to wire FCM yet.
     firebase_credentials_path: str = ""
+
+    # Apple Push Notification service (APNs) — token-based (.p8) auth
+    # for the iOS app (qcmobile-ios). push.py sends iOS device tokens
+    # directly to APNs, parallel to the Android FCM path; routing is
+    # by the device row's `platform` ("ios" → APNs, else → FCM).
+    # When apns_key_path is empty the iOS branch no-ops silently,
+    # exactly like the FCM gate above.
+    #   apns_key_path    AuthKey_XXXX.p8 from the Apple Developer
+    #                    portal (Keys → APNs). Gitignored.
+    #   apns_key_id      the 10-char Key ID for that key
+    #   apns_team_id     Apple Developer Team ID
+    #   apns_bundle_id   app bundle id == APNs topic
+    #   apns_use_sandbox True for dev-client builds, False for
+    #                    TestFlight / App Store (production APNs).
+    #                    Wrong environment = silent non-delivery.
+    apns_key_path: str = ""
+    apns_key_id: str = ""
+    apns_team_id: str = ""
+    apns_bundle_id: str = "com.qualifiedcommercial.mobile"
+    apns_use_sandbox: bool = True
 
     app_env: str = "development"
     log_level: str = "INFO"

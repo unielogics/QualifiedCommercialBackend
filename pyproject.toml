@@ -39,6 +39,10 @@ dependencies = [
     "firebase-admin>=6.5.0",
     "google-api-python-client>=2.150",
     "google-auth>=2.35",
+    # Apple Push Notification service — token-based (.p8) sender for
+    # the iOS app (qcmobile-ios). push.py routes iOS device tokens
+    # here, parallel to the Android firebase-admin path.
+    "aioapns>=3.1",
 ]
 
 [project.optional-dependencies]

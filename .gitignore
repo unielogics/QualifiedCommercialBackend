@@ -13,6 +13,10 @@ qualifiedcommercial-*.json
 google-credentials.json
 gcp-*.json
 
+# Apple APNs auth key — never commit
+*.p8
+AuthKey_*.p8
+
 # Python
 __pycache__/
 *.py[cod]
