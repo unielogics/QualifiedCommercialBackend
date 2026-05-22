@@ -73,7 +73,16 @@ class Settings(BaseSettings):
     # Legacy OAuth knobs — kept so future end-user OAuth path is still available
     gmail_oauth_client_id: str = ""
     gmail_oauth_client_secret: str = ""
+    # Gmail Pub/Sub push — real-time inbound. When `gmail_pubsub_topic`
+    # is set (projects/<proj>/topics/<topic>) the app registers a
+    # users.watch() on the delegated mailbox's INBOX; Gmail then pushes
+    # to that topic, the Pub/Sub subscription POSTs /webhooks/gmail, and
+    # we run an immediate inbound poll. `gmail_push_token` is the shared
+    # secret carried in the webhook URL (?token=) — pushes that don't
+    # match are rejected. Empty topic => push disabled, the 60s poller
+    # still runs as the fallback.
     gmail_pubsub_topic: str = ""
+    gmail_push_token: str = ""
     use_fake_inbox: bool = True
 
     # Firebase Cloud Messaging — path to the Firebase Admin SDK

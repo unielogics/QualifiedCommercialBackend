@@ -46,6 +46,7 @@ from app.routers import (
     public as public_router,
     rates,
     reports,
+    webhooks as webhooks_router,
     search,
     settings as settings_router,
     users,
@@ -145,5 +146,6 @@ for r in [
     fix_flip.router,
     pipeline_router.router,
     public_router.router,
+    webhooks_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)

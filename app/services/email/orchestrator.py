@@ -266,11 +266,17 @@ async def send_approved_draft(db: AsyncSession, draft: EmailDraft, *, actor_labe
             note = "Gmail config missing; draft marked as approved but not sent."
         else:
             try:
-                # Real Gmail send. The Gmail API doesn't accept a separate BCC
-                # field — bcc_emails are appended to a Bcc header by EmailMessage.
-                # For simplicity here we send to the To recipient only; CC/BCC
-                # support lands when the EmailMessage helper grows it.
-                resp = send_message(cfg, to=draft.to_email, subject=draft.subject, body=draft.body)
+                # Real Gmail send. cc_emails / bcc_emails are carried as
+                # Cc / Bcc headers in the raw MIME — Gmail delivers to all
+                # three (the Bcc header is stripped from the delivered copy).
+                resp = send_message(
+                    cfg,
+                    to=draft.to_email,
+                    subject=draft.subject,
+                    body=draft.body,
+                    cc=list(draft.cc_emails or []),
+                    bcc=list(draft.bcc_emails or []),
+                )
                 sent_id = resp.get("id")
                 note = f"Sent via Gmail. message_id={sent_id}"
             except Exception as exc:  # noqa: BLE001

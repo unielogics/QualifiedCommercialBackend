@@ -186,6 +186,24 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Gmail Pub/Sub watch renewal. A users.watch() registration expires
+    # after ~7 days; we re-register every 24h (and once ~10s after
+    # startup, so a fresh deploy re-arms push immediately). No-ops when
+    # GMAIL_PUBSUB_TOPIC isn't set — the 60s poller above is the
+    # fallback. See app/services/email/gmail_push.register_gmail_watch.
+    from datetime import timedelta as _timedelta
+
+    scheduler.add_job(
+        _wrap(job_gmail_watch_renew),
+        "interval",
+        hours=24,
+        id="gmail_watch_renew",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        next_run_time=datetime.now(timezone.utc) + _timedelta(seconds=10),
+    )
+
     scheduler.start()
     log.info("scheduler started with %d jobs", len(scheduler.get_jobs()))
 
@@ -394,3 +412,13 @@ async def job_lender_inbound_poll() -> None:
     from app.services.email.inbound_poller import run_inbound_poll
 
     await run_inbound_poll()
+
+
+async def job_gmail_watch_renew() -> None:
+    """Re-register the Gmail Pub/Sub watch (expires ~7 days). Runs
+    every 24h + once ~10s after startup. Self-no-ops when
+    GMAIL_PUBSUB_TOPIC isn't set or Gmail isn't configured — the 60s
+    inbound poller remains the fallback either way."""
+    from app.services.email.gmail_push import register_gmail_watch
+
+    register_gmail_watch()

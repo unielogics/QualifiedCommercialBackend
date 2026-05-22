@@ -141,6 +141,8 @@ def build_message(
     subject: str,
     body: str,
     from_email: str | None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> BuiltMessage:
     """Pure helper — constructs the EmailMessage + base64 raw form WITHOUT
@@ -155,6 +157,15 @@ def build_message(
     """
     msg = EmailMessage()
     msg["To"] = to
+    # Cc / Bcc headers in the raw MIME — Gmail's messages.send delivers
+    # to all three. The Bcc header is stripped from the delivered copy
+    # by Gmail but the recipients still receive it.
+    cc_clean = [a.strip() for a in (cc or []) if a and a.strip()]
+    bcc_clean = [a.strip() for a in (bcc or []) if a and a.strip()]
+    if cc_clean:
+        msg["Cc"] = ", ".join(cc_clean)
+    if bcc_clean:
+        msg["Bcc"] = ", ".join(bcc_clean)
     if from_email:
         msg["From"] = from_email
     msg["Subject"] = subject
@@ -192,10 +203,13 @@ def send_message(
     to: str,
     subject: str,
     body: str,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Tier-3: send a message via the delegated mailbox. Now supports
-    optional MIME attachments — same shape as build_message().
+    """Tier-3: send a message via the delegated mailbox. Supports
+    optional Cc / Bcc recipients and MIME attachments — same shape as
+    build_message().
 
     Subject is left as-is — the QC deal-id injection happens at the call
     site (see app.services.email.parser.inject_deal_id) so this client
@@ -208,6 +222,8 @@ def send_message(
         subject=subject,
         body=body,
         from_email=cfg.delegated_user,
+        cc=cc,
+        bcc=bcc,
         attachments=attachments,
     )
     svc = get_gmail_service(cfg)

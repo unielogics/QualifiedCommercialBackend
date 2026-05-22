@@ -25,6 +25,7 @@ rather drop a message than re-process it 1000 times).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import email
 import logging
@@ -62,11 +63,26 @@ _GMAIL_SEARCH_QUERY = 'subject:"[QC-" newer_than:7d in:inbox'
 _BATCH_LIMIT = 25
 
 
-async def run_inbound_poll() -> None:
-    """Single-tick poller entry point. Used by apscheduler.
+# Serializes every inbound poll — the 60s scheduler tick AND the
+# webhook-triggered polls (app/routers/webhooks.py) share this lock so
+# two polls can never run concurrently and double-ingest a message in
+# the window between one poll's messages.list and its Activity commit.
+_poll_lock = asyncio.Lock()
 
-    Idempotent — relies on Gmail's UNREAD label to skip already-processed
-    messages. Safe to invoke manually for testing."""
+
+async def run_inbound_poll() -> None:
+    """Serialized poll entry point. Used by apscheduler and the Gmail
+    push webhook. Only one poll runs at a time; a concurrent caller
+    waits (pushes are infrequent, so the wait is bounded and cheap)."""
+    async with _poll_lock:
+        await _run_inbound_poll_impl()
+
+
+async def _run_inbound_poll_impl() -> None:
+    """Single-tick poller body.
+
+    Idempotent — dedups already-processed messages via the Activity
+    log. Safe to invoke manually for testing."""
     settings = get_settings()
     if settings.use_fake_inbox:
         log.debug("inbound_poller: USE_FAKE_INBOX=true; skipping real Gmail pull")
