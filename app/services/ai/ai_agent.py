@@ -35,12 +35,12 @@ from app.models.ai_agent import (
     AIAgentLead,
     AIAgentMessage,
     AIAgentPlaybook,
-    AIAgentSampleMessage,
     AIAgentShowingGuide,
     AIAgentTargeting,
     AIAgentTestScenario,
     AIAgentTrainingMessage,
     AIAgentTrainingSession,
+    AIVoiceProfile,
 )
 from app.models.ai_knowledge_document import AIKnowledgeDocument
 from app.models.client import Client
@@ -217,8 +217,6 @@ async def step_states(db: AsyncSession, agent: AIAgent) -> dict[str, str]:
         ).scalar()
         or 0
     )
-    sample_n = await _count(AIAgentSampleMessage)
-
     states: dict[str, str] = {}
     states["basics"] = "done" if (agent.name and agent.kind) else "missing"
     states["goal"] = (
@@ -241,8 +239,13 @@ async def step_states(db: AsyncSession, agent: AIAgent) -> dict[str, str]:
         if guide and guide.approval_status == "approved"
         else ("attention" if guide else "missing")
     )
+    # Step 8 is done when the broker has set exit rules AND linked a
+    # voice profile. The follow-up cadence itself is the AI's job.
+    has_voice = agent.voice_profile_id is not None
     states["followups"] = (
-        "done" if exit_rules and sample_n > 0 else ("attention" if exit_rules else "missing")
+        "done"
+        if exit_rules and has_voice
+        else ("attention" if exit_rules or has_voice else "missing")
     )
     states["test"] = "done" if test_n > 0 else "attention"  # optional
     states["launch"] = (
@@ -491,23 +494,22 @@ async def _system_prompt(db: AsyncSession, agent: AIAgent) -> str:
     if kb:
         parts.append(kb)
 
-    # Sample messages — the broker's own phrasing/style.
-    samples = list(
-        (
-            await db.execute(
-                select(AIAgentSampleMessage).where(
-                    AIAgentSampleMessage.ai_agent_id == agent.id
+    # Voice & tone — the broker's reusable tonality baseline.
+    if agent.voice_profile_id is not None:
+        vp = await db.get(AIVoiceProfile, agent.voice_profile_id)
+        if vp is not None and isinstance(vp.templates, dict):
+            lines = []
+            for key, body in vp.templates.items():
+                if not body:
+                    continue
+                label = key.replace("_", " ").upper()
+                lines.append(f"[{label}]\n{body}")
+            if lines:
+                parts.append(
+                    "VOICE & TONE — match how this broker actually writes "
+                    "to clients (style references, not literal scripts):\n"
+                    + "\n\n".join(lines)
                 )
-            )
-        ).scalars().all()
-    )
-    if samples:
-        s = "\n".join(
-            f"[{m.touchpoint_key}] {m.sample_text}" for m in samples
-        )
-        parts.append(
-            "SAMPLE MESSAGES — match this agent's voice and approach:\n" + s
-        )
 
     parts.append(
         "Write concise, warm, professional outreach. Never invent facts, "

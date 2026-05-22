@@ -39,12 +39,12 @@ from app.models.ai_agent import (
     AIAgentLead,
     AIAgentMessage,
     AIAgentPlaybook,
-    AIAgentSampleMessage,
     AIAgentShowingGuide,
     AIAgentTargeting,
     AIAgentTestScenario,
     AIAgentTrainingMessage,
     AIAgentTrainingSession,
+    AIVoiceProfile,
 )
 from app.models.ai_knowledge_document import AIKnowledgeDocument
 from app.models.broker import Broker
@@ -94,6 +94,7 @@ def _ser_agent(agent: AIAgent) -> dict[str, Any]:
         "warmup_mode": agent.warmup_mode,
         "max_followups": agent.max_followups,
         "cadence": agent.cadence,
+        "voice_profile_id": str(agent.voice_profile_id) if agent.voice_profile_id else None,
         "last_tested_at": agent.last_tested_at.isoformat() if agent.last_tested_at else None,
         "activated_at": agent.activated_at.isoformat() if agent.activated_at else None,
         "created_at": agent.created_at.isoformat() if agent.created_at else None,
@@ -127,6 +128,7 @@ class AgentPatch(BaseModel):
     send_mode: str | None = None
     max_followups: int | None = None
     cadence: list[int] | None = None
+    voice_profile_id: uuid.UUID | None = None
 
 
 @router.get("")
@@ -218,6 +220,11 @@ async def patch_agent(
         agent.max_followups = max(0, min(20, payload.max_followups))
     if payload.cadence is not None:
         agent.cadence = [int(x) for x in payload.cadence][:20]
+    if payload.voice_profile_id is not None:
+        vp = await db.get(AIVoiceProfile, payload.voice_profile_id)
+        if vp is None or vp.broker_id != agent.broker_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Voice profile not found.")
+        agent.voice_profile_id = vp.id
     await db.commit()
     return _ser_agent(agent)
 
@@ -918,72 +925,6 @@ async def put_exit_rules(
     row.max_email_attempts = max(1, min(50, payload.max_email_attempts))
     row.max_no_reply_followups = max(0, min(50, payload.max_no_reply_followups))
     row.max_days_in_sequence = max(1, min(365, payload.max_days_in_sequence))
-    await db.commit()
-    return {"ok": True}
-
-
-class SampleMessageIn(BaseModel):
-    touchpoint_key: str
-    channel: str = "email"
-    sample_text: str
-
-
-@router.get("/{agent_id}/sample-messages")
-async def list_sample_messages(
-    agent_id: uuid.UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
-):
-    agent = await _agent_or_404(db, user, agent_id)
-    rows = list(
-        (
-            await db.execute(
-                select(AIAgentSampleMessage)
-                .where(AIAgentSampleMessage.ai_agent_id == agent.id)
-                .order_by(AIAgentSampleMessage.created_at)
-            )
-        ).scalars().all()
-    )
-    return [
-        {
-            "id": str(r.id),
-            "touchpoint_key": r.touchpoint_key,
-            "channel": r.channel,
-            "sample_text": r.sample_text,
-        }
-        for r in rows
-    ]
-
-
-@router.post("/{agent_id}/sample-messages", status_code=status.HTTP_201_CREATED)
-async def add_sample_message(
-    agent_id: uuid.UUID,
-    payload: SampleMessageIn,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-):
-    agent = await _agent_or_404(db, user, agent_id)
-    row = AIAgentSampleMessage(
-        ai_agent_id=agent.id,
-        touchpoint_key=payload.touchpoint_key.strip()[:40] or "intro",
-        channel=payload.channel.strip()[:16] or "email",
-        sample_text=payload.sample_text[:8000],
-    )
-    db.add(row)
-    await db.commit()
-    return {"id": str(row.id)}
-
-
-@router.delete("/{agent_id}/sample-messages/{sample_id}")
-async def delete_sample_message(
-    agent_id: uuid.UUID,
-    sample_id: uuid.UUID,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-):
-    agent = await _agent_or_404(db, user, agent_id)
-    row = await db.get(AIAgentSampleMessage, sample_id)
-    if row is None or row.ai_agent_id != agent.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sample not found.")
-    await db.delete(row)
     await db.commit()
     return {"ok": True}
 

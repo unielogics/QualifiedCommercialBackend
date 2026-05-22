@@ -9,12 +9,12 @@ from app.models.ai_agent import (  # noqa: F401
     AIAgentLead,
     AIAgentMessage,
     AIAgentPlaybook,
-    AIAgentSampleMessage,
     AIAgentShowingGuide,
     AIAgentTargeting,
     AIAgentTestScenario,
     AIAgentTrainingMessage,
     AIAgentTrainingSession,
+    AIVoiceProfile,
 )
 from app.models.ai_audit_event import AIAuditEvent  # noqa: F401
 from app.models.ai_cadence_rule import AICadenceRule  # noqa: F401

@@ -20,7 +20,8 @@ Mental model — one `AIAgent` row + one table per builder step:
   Step 5  Training Studio     → ai_agent_training_sessions / _messages
   Step 6  Playbook            → ai_agent_playbooks
   Step 7  Showing Guide       → ai_agent_showing_guides
-  Step 8  Follow-ups + Exit   → ai_agent_exit_rules / ai_agent_sample_messages
+  Step 8  Voice & Exit        → ai_agent_exit_rules + ai_voice_profiles (the
+                                 named, reusable tonality templates)
   Step 9  Test Scenarios      → ai_agent_test_scenarios
   Steps 10-11 (Launch / Warm-up) are computed from the gate + status.
 
@@ -125,7 +126,18 @@ class AIAgent(TimestampMixin, Base):
         JSONB, nullable=False, default=lambda: list(DEFAULT_CADENCE),
         server_default="[0, 2, 5, 8, 12]",
     )
-    """Day offsets from enrollment for each touchpoint."""
+    """Default day offsets the engine uses between touchpoints. Not
+    user-configurable in the builder — follow-up timing is the AI's
+    job. The broker only controls when to STOP (exit rules)."""
+
+    voice_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("ai_voice_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    """Link to a reusable AIVoiceProfile — the broker's tonality
+    baseline (how they greet, how they ask for late items, etc.).
+    One profile can be shared across many AI agents."""
 
     last_tested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -452,29 +464,44 @@ class AIAgentExitRules(TimestampMixin, Base):
     )
 
 
-class AIAgentSampleMessage(TimestampMixin, Base):
-    """Sample phrasings the broker supplies per touchpoint so the AI
-    learns their approach/style. Fed into playbook generation + the
-    per-pass composer."""
+class AIVoiceProfile(TimestampMixin, Base):
+    """A reusable, named tonality baseline.
 
-    __tablename__ = "ai_agent_sample_messages"
+    The broker writes a handful of templates (greeting, asking for a
+    late item, communicating "under contract", etc.) once — and then
+    attaches the same profile to any AI Agent. The composer injects
+    them as a "voice & tone" block in the system prompt so every
+    outbound message matches the broker's style.
+
+    Stored at broker scope (not per AI Agent) so it can be linked to
+    many agents and renamed/reused freely."""
+
+    __tablename__ = "ai_voice_profiles"
 
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    ai_agent_id: Mapped[uuid.UUID] = mapped_column(
+    broker_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
-        ForeignKey("ai_agents.id", ondelete="CASCADE"),
+        ForeignKey("brokers.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    touchpoint_key: Mapped[str] = mapped_column(String(40), nullable=False)
-    """intro | followup_1 | followup_2 | followup_3 | breakup |
-    doc_nudge | review_request | reply_handling …"""
-    channel: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="email", server_default="email"
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
     )
-    sample_text: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    """Display name — e.g. "My friendly buyer voice"."""
+
+    templates: Mapped[dict[str, str]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    """{situation_key: body} — the situation_key is from the small
+    catalog the UI exposes (greeting | due_soon | late_item |
+    under_contract | check_in). Empty/missing keys are simply omitted
+    from the prompt."""
 
 
 class AIAgentTestScenario(TimestampMixin, Base):
