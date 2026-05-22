@@ -12,6 +12,7 @@ page, not this one.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -915,3 +916,176 @@ async def delete_ai_knowledge(
     await db.flush()
     _delete_s3_object(doc.s3_key)
     return {"ok": True}
+
+
+# ── Borrower file pipeline — GET /me/files ─────────────────────────────
+#
+# The single merged list behind the client-side /pipeline table. Unions
+# the caller's Deals (agent-stage working files) + Loans (funding files)
+# into one deduped row set, each carrying a unified status:
+#
+#   re_working  — an un-promoted Deal (the agent is still working it)
+#   in_funding  — a Loan that hasn't funded yet
+#   funded      — a funded Loan
+#   lost        — a Deal marked lost
+#
+# A promoted Deal is represented by its Loan only (the Deal row is
+# skipped) so a file never appears twice. Borrower-only — operators use
+# the operator pipeline.
+
+
+_LOAN_STAGE_LABELS: dict[str, str] = {
+    "prequalified": "Pre-qualified",
+    "collecting_docs": "Collecting documents",
+    "lender_connected": "Lender connected",
+    "processing": "In processing",
+    "closing": "Closing",
+    "funded": "Funded",
+}
+_DEAL_STATUS_LABELS: dict[str, str] = {
+    "open": "New",
+    "active": "Active",
+    "paused": "Paused",
+    "won": "Won",
+    "lost": "Lost",
+    "promoted": "In funding",
+}
+
+
+def _enum_str(v: object) -> str:
+    return str(getattr(v, "value", v) or "")
+
+
+def _ai_oneliner(living_profile: object, fallback: str | None) -> str | None:
+    """Pull the AI's plain-English current-status line off a
+    living_profile JSONB blob, falling back to status_summary/summary."""
+    text: str | None = None
+    if isinstance(living_profile, dict):
+        cur = living_profile.get("current_status")
+        if isinstance(cur, str) and cur.strip():
+            text = cur.strip()
+    if not text and isinstance(fallback, str) and fallback.strip():
+        text = fallback.strip()
+    if not text:
+        return None
+    return text if len(text) <= 200 else text[:197] + "…"
+
+
+class MyFileRow(BaseModel):
+    """One row in the borrower's file pipeline table."""
+
+    id: str  # uuid of the backing record (deal or loan)
+    kind: str  # "deal" | "loan"
+    ref: str  # human label — loan deal_id ("L-1234") or the deal title
+    status: str  # re_working | in_funding | funded | lost
+    stage_detail: str  # human-readable stage
+    address: str | None
+    city: str | None
+    loan_type: str | None
+    amount: float | None
+    ai_status: str | None  # living_profile.current_status one-liner
+    updated_at: datetime
+    # The modal loads loan-backed tabs when loan_uuid is set, else
+    # deal-backed tabs. A promoted file carries both.
+    deal_uuid: str | None
+    loan_uuid: str | None
+
+
+@router.get("/files", response_model=list[MyFileRow])
+async def my_files(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[MyFileRow]:
+    """Deduped union of the borrower's Deals + Loans for the client-side
+    /pipeline table. Borrower-only."""
+    if user.role != Role.CLIENT or user.client is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "The file pipeline is a borrower view.",
+        )
+
+    from app.models.client_property import ClientProperty
+    from app.models.deal import Deal
+    from app.models.loan import Loan
+
+    client_id = user.client.id
+
+    loans = (
+        await db.execute(
+            select(Loan)
+            .where(Loan.client_id == client_id)
+            .order_by(Loan.updated_at.desc())
+        )
+    ).scalars().all()
+
+    # Only un-promoted deals — a promoted deal is covered by its Loan row.
+    deals = (
+        await db.execute(
+            select(Deal).where(
+                Deal.client_id == client_id,
+                Deal.promoted_loan_id.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    prop_ids = [d.property_id for d in deals if d.property_id]
+    props: dict = {}
+    if prop_ids:
+        props = {
+            p.id: p
+            for p in (
+                await db.execute(
+                    select(ClientProperty).where(ClientProperty.id.in_(prop_ids))
+                )
+            ).scalars().all()
+        }
+
+    rows: list[MyFileRow] = []
+
+    for ln in loans:
+        stage = _enum_str(ln.stage)
+        funded = stage == "funded"
+        rows.append(
+            MyFileRow(
+                id=str(ln.id),
+                kind="loan",
+                ref=ln.deal_id,
+                status="funded" if funded else "in_funding",
+                stage_detail=_LOAN_STAGE_LABELS.get(stage, stage.replace("_", " ").title() or "In funding"),
+                address=ln.address,
+                city=ln.city,
+                loan_type=_enum_str(ln.type) or None,
+                amount=float(ln.amount) if ln.amount is not None else None,
+                ai_status=_ai_oneliner(ln.living_profile, ln.status_summary),
+                updated_at=ln.updated_at,
+                deal_uuid=str(ln.source_deal_id) if ln.source_deal_id else None,
+                loan_uuid=str(ln.id),
+            )
+        )
+
+    for d in deals:
+        prop = props.get(d.property_id) if d.property_id else None
+        status_val = "lost" if d.status == "lost" else "re_working"
+        amount = None
+        if prop is not None:
+            amt = prop.target_price or prop.list_price or prop.sold_price
+            amount = float(amt) if amt is not None else None
+        rows.append(
+            MyFileRow(
+                id=str(d.id),
+                kind="deal",
+                ref=d.title or "Working file",
+                status=status_val,
+                stage_detail=_DEAL_STATUS_LABELS.get(d.status, d.status.title()),
+                address=prop.address if prop else None,
+                city=prop.city if prop else None,
+                loan_type=d.deal_type or None,
+                amount=amount,
+                ai_status=_ai_oneliner(d.living_profile, d.summary),
+                updated_at=d.updated_at,
+                deal_uuid=str(d.id),
+                loan_uuid=None,
+            )
+        )
+
+    rows.sort(key=lambda r: r.updated_at, reverse=True)
+    return rows
