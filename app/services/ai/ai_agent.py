@@ -347,19 +347,57 @@ async def _matching_clients(
         stmt = stmt.where(Client.funded_count >= int(min_funded))
 
     # Pipeline-domain filters — join through Deal so the broker can
-    # target by deal shape (e.g. all buyer-side open deals).
+    # target by deal shape. The legacy `deal_statuses` key is supported
+    # for backward compat; the new semantic toggles are the surface UI:
+    #   - newly_added: deal created in the last 14 days.
+    #   - did_not_close: deal status == lost.
+    #   - no_ai_assigned: no current AI agent lead working this deal.
+    #   - min_days_in_pipeline: deal opened at least N days ago.
     deal_types = inc.get("deal_types")
     deal_statuses = inc.get("deal_statuses")
-    if (isinstance(deal_types, list) and deal_types) or (
-        isinstance(deal_statuses, list) and deal_statuses
-    ):
+    newly_added = bool(inc.get("newly_added"))
+    did_not_close = bool(inc.get("did_not_close"))
+    no_ai_assigned = bool(inc.get("no_ai_assigned"))
+    min_days_in_pipeline = inc.get("min_days_in_pipeline")
+    use_deal_join = (
+        (isinstance(deal_types, list) and deal_types)
+        or (isinstance(deal_statuses, list) and deal_statuses)
+        or newly_added
+        or did_not_close
+        or no_ai_assigned
+        or (isinstance(min_days_in_pipeline, (int, float)) and min_days_in_pipeline > 0)
+    )
+    if use_deal_join:
+        from datetime import datetime, timedelta, timezone
+
         from app.models.deal import Deal
 
+        now = datetime.now(timezone.utc)
         deal_stmt = select(Deal.client_id).where(Deal.client_id == Client.id)
         if isinstance(deal_types, list) and deal_types:
             deal_stmt = deal_stmt.where(Deal.deal_type.in_(deal_types))
         if isinstance(deal_statuses, list) and deal_statuses:
             deal_stmt = deal_stmt.where(Deal.status.in_(deal_statuses))
+        if newly_added:
+            deal_stmt = deal_stmt.where(Deal.created_at >= now - timedelta(days=14))
+        if did_not_close:
+            deal_stmt = deal_stmt.where(Deal.status == "lost")
+        if isinstance(min_days_in_pipeline, (int, float)) and min_days_in_pipeline > 0:
+            deal_stmt = deal_stmt.where(
+                Deal.created_at <= now - timedelta(days=int(min_days_in_pipeline))
+            )
+        if no_ai_assigned:
+            # No active ai-agent lead currently working this deal.
+            assigned = (
+                select(AIAgentLead.deal_id)
+                .where(AIAgentLead.deal_id == Deal.id)
+                .where(
+                    AIAgentLead.status.in_(
+                        ["pending_review", "active", "paused", "replied"]
+                    )
+                )
+            )
+            deal_stmt = deal_stmt.where(~assigned.exists())
         stmt = stmt.where(deal_stmt.exists())
 
     # Exclude: skip clients actively in the loan process.

@@ -139,6 +139,17 @@ class AIAgent(TimestampMixin, Base):
     baseline (how they greet, how they ask for late items, etc.).
     One profile can be shared across many AI agents."""
 
+    # Default-agent flags (alembic 0067). The broker can star ONE agent
+    # per slot — the New Deal modal auto-picks it when creating a buyer
+    # or seller deal. Only meaningful on kind=new_deal_buyer /
+    # new_deal_seller agents; the set-default endpoint enforces this.
+    is_default_new_deal_buyer: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    is_default_new_deal_seller: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     last_tested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

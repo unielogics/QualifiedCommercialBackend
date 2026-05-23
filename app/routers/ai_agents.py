@@ -95,6 +95,8 @@ def _ser_agent(agent: AIAgent) -> dict[str, Any]:
         "max_followups": agent.max_followups,
         "cadence": agent.cadence,
         "voice_profile_id": str(agent.voice_profile_id) if agent.voice_profile_id else None,
+        "is_default_new_deal_buyer": bool(agent.is_default_new_deal_buyer),
+        "is_default_new_deal_seller": bool(agent.is_default_new_deal_seller),
         "last_tested_at": agent.last_tested_at.isoformat() if agent.last_tested_at else None,
         "activated_at": agent.activated_at.isoformat() if agent.activated_at else None,
         "created_at": agent.created_at.isoformat() if agent.created_at else None,
@@ -1298,5 +1300,71 @@ async def pause_agent(
 ):
     agent = await _agent_or_404(db, user, agent_id)
     agent.status = AIAgentStatus.PAUSED
+    await db.commit()
+    return _ser_agent(agent)
+
+
+class SetDefaultIn(BaseModel):
+    slot: str  # "new_deal_buyer" | "new_deal_seller"
+    on: bool = True
+
+
+@router.post("/{agent_id}/set-default")
+async def set_default(
+    agent_id: uuid.UUID,
+    payload: SetDefaultIn,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Star one agent as the broker's default for a new-deal slot. Only
+    `kind in (new_deal_buyer, new_deal_seller)` agents can be set; the
+    slot must match the kind. Setting one agent clears any previous
+    holder for that slot."""
+    agent = await _agent_or_404(db, user, agent_id)
+    slot = payload.slot
+    if slot not in ("new_deal_buyer", "new_deal_seller"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Invalid slot: {slot}"
+        )
+    expected_kind = slot
+    if agent.kind != expected_kind:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"This agent's workflow ({agent.kind}) doesn't match the "
+            f"{slot} slot — only {expected_kind} agents can be set as "
+            "the default here.",
+        )
+
+    column = (
+        AIAgent.is_default_new_deal_buyer
+        if slot == "new_deal_buyer"
+        else AIAgent.is_default_new_deal_seller
+    )
+
+    if payload.on:
+        # Clear any prior holder in this broker's roster, then flip ours on.
+        peers = (
+            await db.execute(
+                select(AIAgent)
+                .where(AIAgent.broker_id == agent.broker_id)
+                .where(AIAgent.id != agent.id)
+                .where(column.is_(True))
+            )
+        ).scalars().all()
+        for p in peers:
+            if slot == "new_deal_buyer":
+                p.is_default_new_deal_buyer = False
+            else:
+                p.is_default_new_deal_seller = False
+        if slot == "new_deal_buyer":
+            agent.is_default_new_deal_buyer = True
+        else:
+            agent.is_default_new_deal_seller = True
+    else:
+        if slot == "new_deal_buyer":
+            agent.is_default_new_deal_buyer = False
+        else:
+            agent.is_default_new_deal_seller = False
+
     await db.commit()
     return _ser_agent(agent)

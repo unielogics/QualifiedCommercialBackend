@@ -542,7 +542,15 @@ class AIAgentStatus(StrEnum):
 
 class AIAgentKind(StrEnum):
     """Workflow preset — pre-fills goal/cadence defaults. `custom` is
-    fully free-form."""
+    fully free-form.
+
+    new_deal_buyer / new_deal_seller are the two "this agent
+    actually works a brand-new transaction" kinds — they can be
+    flagged as the broker's default for the New Deal modal so the
+    right one is auto-picked when a new buyer / seller deal is
+    created."""
+    NEW_DEAL_BUYER = "new_deal_buyer"
+    NEW_DEAL_SELLER = "new_deal_seller"
     BUYER_NURTURE = "buyer_nurture"
     SELLER_FOLLOWUP = "seller_followup"
     PAST_CLIENT = "past_client"
