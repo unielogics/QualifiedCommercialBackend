@@ -641,6 +641,92 @@ async def get_training(
     }
 
 
+@router.post("/{agent_id}/training/start")
+async def start_training(
+    agent_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Kick the coach off without making the broker speak first.
+
+    Generates the AI's opening turn — a brief greeting plus the first
+    targeted question — using the same context-aware system prompt the
+    Training chat uses for follow-up turns. Idempotent: if the session
+    already has any messages, returns the current transcript without
+    generating a new opener."""
+    agent = await _agent_or_404(db, user, agent_id)
+
+    session = (
+        await db.execute(
+            select(AIAgentTrainingSession)
+            .where(AIAgentTrainingSession.ai_agent_id == agent.id)
+            .where(AIAgentTrainingSession.completed_at.is_(None))
+            .order_by(AIAgentTrainingSession.created_at.desc())
+        )
+    ).scalars().first()
+    if session is None:
+        session = AIAgentTrainingSession(ai_agent_id=agent.id)
+        db.add(session)
+        await db.flush()
+
+    existing = list(
+        (
+            await db.execute(
+                select(AIAgentTrainingMessage)
+                .where(AIAgentTrainingMessage.session_id == session.id)
+                .order_by(AIAgentTrainingMessage.created_at)
+            )
+        ).scalars().all()
+    )
+    if existing:
+        return {
+            "session_id": str(session.id),
+            "kicked_off": False,
+            "messages": [{"role": m.role, "content": m.content} for m in existing],
+        }
+
+    # Generate the AI's opening turn.
+    reply = (
+        "Hi — let's calibrate this AI agent. To start: who is the absolute "
+        "best-fit client this should reach, and what's the single message "
+        "you'd most want it to land?"
+    )
+    try:
+        from app.services.ai.orchestrator import run
+
+        system_text = await svc.training_system_prompt(db, agent)
+        result = await run(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Begin the interview now. Greet me briefly and ask "
+                        "your first targeted question — exactly one question, "
+                        "tied to a specific gap or detail from the context."
+                    ),
+                }
+            ],
+            tier="light",
+            max_tokens=600,
+            system=system_text,
+        )
+        text = svc._text_of(result)
+        if text:
+            reply = text
+    except Exception as exc:  # noqa: BLE001
+        log.warning("training kickoff failed: %s", exc)
+
+    db.add(
+        AIAgentTrainingMessage(
+            session_id=session.id, role="assistant", content=reply
+        )
+    )
+    if agent.status == AIAgentStatus.DRAFT:
+        agent.status = AIAgentStatus.TRAINING_IN_PROGRESS
+    await db.commit()
+    return {"session_id": str(session.id), "kicked_off": True, "reply": reply}
+
+
 @router.post("/{agent_id}/training/messages")
 async def post_training_turn(
     agent_id: uuid.UUID,
