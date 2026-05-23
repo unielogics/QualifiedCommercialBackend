@@ -496,6 +496,63 @@ async def list_leads(
     ]
 
 
+async def _lead_or_404(
+    db: AsyncSession, user, agent_id: uuid.UUID, lead_id: uuid.UUID
+) -> AIAgentLead:
+    """Find a lead and verify it belongs to a broker-scoped agent."""
+    agent = await _agent_or_404(db, user, agent_id)
+    lead = await db.get(AIAgentLead, lead_id)
+    if lead is None or lead.ai_agent_id != agent.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lead not found.")
+    return lead
+
+
+@router.post("/{agent_id}/leads/{lead_id}/pause")
+async def pause_lead(
+    agent_id: uuid.UUID,
+    lead_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop the cadence pass from working this lead. The row stays so
+    the broker can resume later."""
+    lead = await _lead_or_404(db, user, agent_id, lead_id)
+    lead.status = "paused"
+    await db.commit()
+    return {"ok": True, "status": lead.status}
+
+
+@router.post("/{agent_id}/leads/{lead_id}/resume")
+async def resume_lead(
+    agent_id: uuid.UUID,
+    lead_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resume a previously paused (or exited / handed-off) lead. The
+    next cadence pass picks it up immediately."""
+    lead = await _lead_or_404(db, user, agent_id, lead_id)
+    lead.status = "active"
+    lead.next_action_at = _now()
+    await db.commit()
+    return {"ok": True, "status": lead.status}
+
+
+@router.delete("/{agent_id}/leads/{lead_id}")
+async def remove_lead(
+    agent_id: uuid.UUID,
+    lead_id: uuid.UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retire a lead — the row stays for audit but the cadence pass
+    never picks it up again."""
+    lead = await _lead_or_404(db, user, agent_id, lead_id)
+    lead.status = "exited"
+    await db.commit()
+    return {"ok": True, "status": lead.status}
+
+
 # ── Step 11 helper: warm-up contact enrollment ──────────────────────
 
 
@@ -510,8 +567,16 @@ def _enter_warmup(agent: AIAgent) -> None:
             agent.activated_at = _now()
 
 
-async def _enroll_lead(db: AsyncSession, agent: AIAgent, client_id: uuid.UUID) -> bool:
-    """Enroll one client as an active lead. Returns True if newly added."""
+async def _enroll_lead(
+    db: AsyncSession,
+    agent: AIAgent,
+    client_id: uuid.UUID,
+    *,
+    deal_id: uuid.UUID | None = None,
+) -> bool:
+    """Enroll one client as an active lead. Returns True if newly added.
+    If an existing exited/handed-off/paused row is present, it's flipped
+    back to active and rescheduled."""
     existing = (
         await db.execute(
             select(AIAgentLead)
@@ -520,14 +585,18 @@ async def _enroll_lead(db: AsyncSession, agent: AIAgent, client_id: uuid.UUID) -
         )
     ).scalar_one_or_none()
     if existing is not None:
-        if existing.status in ("exited", "handed_off"):
+        if existing.status in ("exited", "handed_off", "paused"):
             existing.status = "active"
             existing.next_action_at = _now()
+        # If the caller passed a fresher deal_id, attach it to the row.
+        if deal_id is not None and existing.deal_id != deal_id:
+            existing.deal_id = deal_id
         return False
     db.add(
         AIAgentLead(
             ai_agent_id=agent.id,
             client_id=client_id,
+            deal_id=deal_id,
             status="active",
             next_action_at=_now(),
         )
@@ -537,6 +606,10 @@ async def _enroll_lead(db: AsyncSession, agent: AIAgent, client_id: uuid.UUID) -
 
 class AssignLeadsIn(BaseModel):
     client_ids: list[uuid.UUID]
+    # When set, every enrolled lead gets this deal_id stamped on it —
+    # used by the right-click "Assign AI agent" path on a pipeline
+    # funding-file card.
+    deal_id: uuid.UUID | None = None
 
 
 class CreateWarmupContactIn(BaseModel):
@@ -560,7 +633,7 @@ async def assign_leads(
         client = await db.get(Client, cid)
         if client is None or client.broker_id != agent.broker_id:
             continue
-        if await _enroll_lead(db, agent, cid):
+        if await _enroll_lead(db, agent, cid, deal_id=payload.deal_id):
             added += 1
     if payload.client_ids:
         _enter_warmup(agent)

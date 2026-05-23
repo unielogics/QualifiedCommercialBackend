@@ -213,6 +213,50 @@ async def get_client(client_id: UUID, user: CurrentUser, db: AsyncSession = Depe
     return ClientRead.model_validate(d)
 
 
+@router.get("/{client_id}/ai-agents")
+async def get_client_ai_agents(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """The AI Agents currently assigned to this client. Drives the
+    Active-agent strip on the client detail page (Pause / Resume /
+    Remove). Excludes already-exited leads."""
+    from app.models.ai_agent import AIAgent, AIAgentLead
+
+    client = (await db.execute(_scope(user, select(Client).where(Client.id == client_id)))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+
+    rows = list(
+        (
+            await db.execute(
+                select(AIAgentLead, AIAgent)
+                .join(AIAgent, AIAgent.id == AIAgentLead.ai_agent_id)
+                .where(AIAgentLead.client_id == client_id)
+                .where(AIAgentLead.status != "exited")
+                .order_by(AIAgentLead.enrolled_at.desc())
+            )
+        ).all()
+    )
+    return [
+        {
+            "lead_id": str(lead.id),
+            "ai_agent_id": str(agent.id),
+            "name": agent.name,
+            "ai_display_name": agent.ai_display_name,
+            "kind": agent.kind,
+            "status": lead.status,
+            "deal_id": str(lead.deal_id) if lead.deal_id else None,
+            "attempts_made": lead.attempts_made,
+            "last_outbound_at": lead.last_outbound_at.isoformat()
+            if lead.last_outbound_at
+            else None,
+        }
+        for lead, agent in rows
+    ]
+
+
 # ── Unified workspace aggregate (Phase 2) ────────────────────────────
 #
 # Single round-trip that backs the new /clients/[id]/workspace UI.

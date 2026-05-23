@@ -123,6 +123,12 @@ class Client(TimestampMixin, Base):
     )
     source_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    # Preferred language (alembic 0066). The AI composer reads this and
+    # writes outbound messages in the client's language. Free-form
+    # string (the UI offers a dropdown): English, Spanish, Portuguese,
+    # Mandarin, French, Other.
+    language: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
     # Per-lead context captured by the New Lead wizard (alembic 0025).
     # Free-shape JSONB so the wizard can evolve without migrations.
     # Buyer leads: target price range, area, property type, timeline.

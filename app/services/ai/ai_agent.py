@@ -331,9 +331,36 @@ async def _matching_clients(
     if isinstance(ctypes, list) and ctypes:
         stmt = stmt.where(Client.client_type.in_(ctypes))
 
+    # Preferred-language targeting (alembic 0066).
+    langs = inc.get("languages")
+    if isinstance(langs, list) and langs:
+        stmt = stmt.where(Client.language.in_(langs))
+
     # never-closed / closed-long-ago targeting
     if inc.get("never_closed") is True:
         stmt = stmt.where((Client.funded_count == 0) | (Client.funded_count.is_(None)))
+
+    # "Number of past closed deals" — funded_count is the closest
+    # signal we currently track per client.
+    min_funded = inc.get("min_funded_count")
+    if isinstance(min_funded, (int, float)) and min_funded > 0:
+        stmt = stmt.where(Client.funded_count >= int(min_funded))
+
+    # Pipeline-domain filters — join through Deal so the broker can
+    # target by deal shape (e.g. all buyer-side open deals).
+    deal_types = inc.get("deal_types")
+    deal_statuses = inc.get("deal_statuses")
+    if (isinstance(deal_types, list) and deal_types) or (
+        isinstance(deal_statuses, list) and deal_statuses
+    ):
+        from app.models.deal import Deal
+
+        deal_stmt = select(Deal.client_id).where(Deal.client_id == Client.id)
+        if isinstance(deal_types, list) and deal_types:
+            deal_stmt = deal_stmt.where(Deal.deal_type.in_(deal_types))
+        if isinstance(deal_statuses, list) and deal_statuses:
+            deal_stmt = deal_stmt.where(Deal.status.in_(deal_statuses))
+        stmt = stmt.where(deal_stmt.exists())
 
     # Exclude: skip clients actively in the loan process.
     if exc.get("skip_in_loan_process") is True:
@@ -603,6 +630,14 @@ async def compose_message(
         ctx.append(f"PIPELINE STAGE: {client.stage}")
     if client and client.living_summary:
         ctx.append(f"FILE SUMMARY: {client.living_summary}")
+    # Honor the client's preferred language (alembic 0066). The model
+    # gets a direct, top-of-context directive so it writes the body in
+    # that language regardless of which language the system prompt
+    # itself is written in.
+    if client and getattr(client, "language", None):
+        lang = (client.language or "").strip()
+        if lang and lang.lower() not in {"english", "en", "en-us"}:
+            ctx.append(f"LANGUAGE: Write this message in {lang}.")
     if extra_context:
         ctx.append(extra_context)
 

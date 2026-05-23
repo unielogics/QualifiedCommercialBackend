@@ -576,6 +576,7 @@ class AIAgentLeadStatus(StrEnum):
     """State of one enrolled contact within an AI Agent's roster."""
     PENDING_REVIEW = "pending_review"
     ACTIVE = "active"
+    PAUSED = "paused"
     REPLIED = "replied"
     HANDED_OFF = "handed_off"
     EXITED = "exited"

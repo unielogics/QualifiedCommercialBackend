@@ -72,6 +72,51 @@ async def get_deal(
     return DealOut.model_validate(deal)
 
 
+@router.get("/deals/{deal_id}/ai-agents")
+async def get_deal_ai_agents(
+    deal_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """The AI Agents currently assigned to this deal. Drives the
+    Active-agent strip on the deal / file view (Pause / Resume /
+    Remove). Excludes already-exited leads."""
+    from app.models.ai_agent import AIAgent, AIAgentLead
+
+    deal = await db.get(Deal, deal_id)
+    if deal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
+    await _load_client_or_404(deal.client_id, user, db)
+
+    rows = list(
+        (
+            await db.execute(
+                select(AIAgentLead, AIAgent)
+                .join(AIAgent, AIAgent.id == AIAgentLead.ai_agent_id)
+                .where(AIAgentLead.deal_id == deal_id)
+                .where(AIAgentLead.status != "exited")
+                .order_by(AIAgentLead.enrolled_at.desc())
+            )
+        ).all()
+    )
+    return [
+        {
+            "lead_id": str(lead.id),
+            "ai_agent_id": str(agent.id),
+            "name": agent.name,
+            "ai_display_name": agent.ai_display_name,
+            "kind": agent.kind,
+            "status": lead.status,
+            "client_id": str(lead.client_id),
+            "attempts_made": lead.attempts_made,
+            "last_outbound_at": lead.last_outbound_at.isoformat()
+            if lead.last_outbound_at
+            else None,
+        }
+        for lead, agent in rows
+    ]
+
+
 @router.get("/clients/{client_id}/deals", response_model=list[DealOut])
 async def list_deals(
     client_id: UUID,

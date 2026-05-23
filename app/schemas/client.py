@@ -19,7 +19,7 @@ _LeadSource = Literal[
     "existing_database",
     "other",
 ]
-_LeadTemperature = Literal["hot", "warm", "nurture"]
+_LeadTemperature = Literal["new", "hot", "warm", "cold", "nurture"]
 _FinancingSupportNeeded = Literal["yes", "maybe", "no", "unknown"]
 _ContactPermission = Literal[
     "send_invite_now",
@@ -62,6 +62,9 @@ class ClientCreate(BaseModel):
     originating_agent_id: UUID | None = None
     current_agent_id: UUID | None = None
     source_channel: str | None = None
+    # Preferred language — the AI composer uses this to write outbound
+    # messages in the client's language when set.
+    language: str | None = None
     # Lead-funnel fields (alembic 0024). Defaults to 'lead' when
     # not specified — agents creating clients via the
     # LeadsPipelineView "+ Add Lead" button leave these to default.
@@ -126,6 +129,7 @@ class ClientUpdate(BaseModel):
     originating_agent_id: UUID | None = None
     current_agent_id: UUID | None = None
     source_channel: str | None = None
+    language: str | None = None
 
 
 class ClientSelfUpdate(BaseModel):
@@ -183,6 +187,7 @@ class ClientRead(ORMModel):
     lead_promotion_status: _LeadPromotionStatus = "not_ready"
     originating_agent_id: UUID | None = None
     current_agent_id: UUID | None = None
+    language: str | None = None
     source_channel: str | None = None
     # Realtor Client Intelligence Profile (alembic 0030). Free-shape
     # JSONB written by the Realtor AI. Surfaced here so the Client
