@@ -280,15 +280,24 @@ async def _llm_profile(
     except Exception:  # noqa: BLE001
         extra_context = ""
 
-    system_prompt = SUMMARIZER_SYSTEM + ("\n\n" + extra_context if extra_context else "")
+    # Keep the system prompt STABLE (cacheable) and push the volatile
+    # per-loan context into the user message — otherwise the cached
+    # prefix changes every call (loan ids, FRED rates, activity) and we
+    # get ~0% cache hits. With this split the SUMMARIZER_SYSTEM prefix
+    # caches across all loans.
+    user_content = "Generate the Living Loan Profile JSON for this deal:\n\n" + json.dumps(payload, indent=2)
+    if extra_context:
+        user_content += "\n\nLOAN CONTEXT:\n" + extra_context
 
     try:
         client = get_client()
         resp = await client.messages.create(
             model=model_light(),
             max_tokens=600,
-            system=system_prompt,
-            messages=[{"role": "user", "content": "Generate the Living Loan Profile JSON for this deal:\n\n" + json.dumps(payload, indent=2)}],
+            system=[
+                {"type": "text", "text": SUMMARIZER_SYSTEM, "cache_control": {"type": "ephemeral"}}
+            ],
+            messages=[{"role": "user", "content": user_content}],
         )
         from app.services.ai.orchestrator import record_usage
 

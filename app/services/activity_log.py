@@ -40,7 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# Don't re-summarize a single loan more than once per this window —
+# a chatty loan was triggering ~20 redundant Living-Profile rebuilds a
+# day. The dirty flag stays set so it still refreshes once the window
+# passes (or sooner if forced elsewhere).
+MIN_RESUMMARIZE_MINUTES = 60
 from typing import Any
 from uuid import UUID
 
@@ -125,12 +131,21 @@ async def drain_summary_dirty(*, limit: int = 20) -> int:
             )
         ).scalars().all()
 
+        now = datetime.now(timezone.utc)
         for loan in rows:
             # Engagement gate — don't burn LLM tokens on paused loans.
             # `is_paused` is sync; takes the loan instance directly.
             if engagement.is_paused(loan):
                 loan.summary_dirty = False
                 loan.summary_refreshed_at = datetime.now(timezone.utc)
+                continue
+
+            # Throttle: skip if summarized within the window. Leave the
+            # dirty flag SET so it refreshes once the window passes — no
+            # LLM call burned in the meantime.
+            if loan.summary_refreshed_at and (
+                now - loan.summary_refreshed_at
+            ) < timedelta(minutes=MIN_RESUMMARIZE_MINUTES):
                 continue
 
             try:

@@ -35,11 +35,16 @@ from app.services.ai.agent_settings import load_agent_cadence_rules
 
 log = logging.getLogger(__name__)
 
-# Per-document and aggregate budgets. Generous — the AI context layer
-# has plenty of room and we'd rather pass the whole agent FAQ than
-# clip the last paragraph of a 2-page product sheet.
+# Per-document parse cap (what we store in parsed_text). The PROMPT
+# injection no longer ships full parsed_text — it ships the compact
+# per-doc summary (see load_agent_knowledge) — so the live token budget
+# is far smaller than this storage cap.
 MAX_DOC_CHARS = 12_000
-MAX_TOTAL_CHARS = 32_000
+# Aggregate cap on the injected knowledge block. Lowered from 32k now
+# that we inject summaries, not whole documents.
+MAX_TOTAL_CHARS = 6_000
+# Fallback truncation for docs with no classifier summary yet.
+_FALLBACK_DOC_CHARS = 800
 
 
 def extract_text_from_bytes(content_type: str, body: bytes) -> str:
@@ -183,12 +188,20 @@ async def load_agent_knowledge(
         )
     ).scalars().all()
     for doc in docs:
-        if not doc.parsed_text:
-            continue
-        snippet = doc.parsed_text
-        if len(snippet) > MAX_DOC_CHARS:
-            snippet = snippet[:MAX_DOC_CHARS]
-        parts.append(f"### {doc.filename}\n{snippet}")
+        # Prefer the Haiku-generated compact summary + key facts (a few
+        # hundred chars) over the full parsed_text. This is the single
+        # biggest per-prompt token saving — the AI reads the digest, not
+        # the whole library. Fall back to truncated parsed_text only for
+        # docs that predate the classifier (no summary yet).
+        if doc.summary:
+            body = doc.summary.strip()
+            kf = doc.key_facts if isinstance(doc.key_facts, list) else None
+            if kf:
+                body += "\nKey facts: " + "; ".join(str(f) for f in kf[:8])
+            parts.append(f"### {doc.filename}\n{body}")
+        elif doc.parsed_text:
+            snippet = doc.parsed_text[:_FALLBACK_DOC_CHARS]
+            parts.append(f"### {doc.filename}\n{snippet}")
 
     if not parts:
         return ""
