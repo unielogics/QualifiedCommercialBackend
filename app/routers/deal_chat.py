@@ -280,6 +280,13 @@ async def _generate_ai_reply(
                 system=system,
                 messages=turns,  # type: ignore[arg-type]
             )
+            from app.services.ai.orchestrator import record_usage
+
+            await record_usage(
+                model_light(),
+                resp.usage,
+                {"activity": "deal_chat", "deal_id": deal.id, "client_id": deal.client_id},
+            )
             reply_text = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()

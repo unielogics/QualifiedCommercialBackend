@@ -280,6 +280,13 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
                 system=system,
                 messages=turns,  # type: ignore[arg-type]
             )
+            from app.services.ai.orchestrator import record_usage
+
+            await record_usage(
+                model_light(),
+                resp.usage,
+                {"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
+            )
             reply_text = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
@@ -721,6 +728,13 @@ async def _generate_ai_reply(
                 max_tokens=500,
                 system=system,
                 messages=turns,  # type: ignore[arg-type]
+            )
+            from app.services.ai.orchestrator import record_usage
+
+            await record_usage(
+                model_light(),
+                resp.usage,
+                {"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
             )
             reply_text = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"

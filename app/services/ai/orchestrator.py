@@ -12,12 +12,15 @@ behavior on the same loan over time.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from anthropic.types import MessageParam
 
 from app.services.ai.anthropic_client import get_client, model_heavy, model_light
 from app.services.ai.tools import TOOL_SCHEMAS, TOOLS
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM = (
     "You are the Qualified Commercial AI assistant — an institutional underwriting "
@@ -32,6 +35,56 @@ def _model_for(tier: Tier) -> str:
     return model_heavy() if tier == "heavy" else model_light()
 
 
+async def record_usage(model: str, usage: Any, meta: dict[str, Any] | None) -> None:
+    """Best-effort token-ledger write. Never raises into the caller — a
+    failed insert must not break an AI response."""
+    if usage is None:
+        return
+    try:
+        from app.constants_pricing import compute_cost
+        from app.db import SessionLocal
+        from app.models.ai_token_usage import AITokenUsage
+
+        u = usage if isinstance(usage, dict) else usage.model_dump()
+        inp = int(u.get("input_tokens") or 0)
+        out = int(u.get("output_tokens") or 0)
+        cread = int(u.get("cache_read_input_tokens") or 0)
+        cwrite = int(u.get("cache_creation_input_tokens") or 0)
+        m = meta or {}
+
+        def _uid(key: str):
+            v = m.get(key)
+            return str(v) if v else None
+
+        cost = compute_cost(
+            model,
+            input_tokens=inp,
+            output_tokens=out,
+            cache_read_tokens=cread,
+            cache_creation_tokens=cwrite,
+        )
+        async with SessionLocal() as db:
+            db.add(
+                AITokenUsage(
+                    model=model,
+                    activity=str(m.get("activity") or "other")[:48],
+                    loan_id=_uid("loan_id"),
+                    deal_id=_uid("deal_id"),
+                    client_id=_uid("client_id"),
+                    ai_agent_id=_uid("ai_agent_id"),
+                    broker_id=_uid("broker_id"),
+                    input_tokens=inp,
+                    cache_read_tokens=cread,
+                    cache_creation_tokens=cwrite,
+                    output_tokens=out,
+                    cost_usd=cost,
+                )
+            )
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("token-usage ledger write failed: %s", exc)
+
+
 async def run(
     messages: list[MessageParam],
     *,
@@ -40,9 +93,13 @@ async def run(
     max_tokens: int = 1024,
     enable_tools: bool = False,
     cache_system: bool = True,
+    meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Single-shot completion. If `enable_tools=True`, runs the tool loop until
-    the model returns a `text`-terminated stop reason."""
+    the model returns a `text`-terminated stop reason.
+
+    `meta` tags the call for the token-usage ledger:
+    {activity, loan_id, deal_id, client_id, ai_agent_id, broker_id}."""
     client = get_client()
     model = _model_for(tier)
     sys_block = (
@@ -62,6 +119,7 @@ async def run(
         if enable_tools:
             kwargs["tools"] = TOOL_SCHEMAS
         resp = await client.messages.create(**kwargs)
+        await record_usage(model, resp.usage, meta)
 
         if resp.stop_reason != "tool_use" or not enable_tools:
             return {

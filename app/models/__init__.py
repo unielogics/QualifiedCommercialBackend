@@ -25,6 +25,7 @@ from app.models.ai_modify_correction import AIModifyCorrection  # noqa: F401
 from app.models.ai_outreach_event import AIOutreachEvent  # noqa: F401
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate  # noqa: F401
 from app.models.ai_task import AITask  # noqa: F401
+from app.models.ai_token_usage import AITokenUsage  # noqa: F401
 from app.models.ai_task_assignment import AITaskAssignment  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401

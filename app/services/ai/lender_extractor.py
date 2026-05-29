@@ -280,6 +280,9 @@ async def _call_llm(transcript: str) -> dict[str, Any] | None:
             system=_EXTRACT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": transcript}],
         )
+        from app.services.ai.orchestrator import record_usage
+
+        await record_usage(model_heavy(), resp.usage, {"activity": "lender_extract"})
         text = "".join(
             b.text for b in resp.content if getattr(b, "type", None) == "text"
         ).strip()

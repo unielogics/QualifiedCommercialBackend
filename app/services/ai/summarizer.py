@@ -290,6 +290,13 @@ async def _llm_profile(
             system=system_prompt,
             messages=[{"role": "user", "content": "Generate the Living Loan Profile JSON for this deal:\n\n" + json.dumps(payload, indent=2)}],
         )
+        from app.services.ai.orchestrator import record_usage
+
+        await record_usage(
+            model_light(),
+            resp.usage,
+            {"activity": "summarizer", "loan_id": loan.id, "broker_id": loan.broker_id},
+        )
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]

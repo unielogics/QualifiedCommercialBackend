@@ -128,6 +128,13 @@ async def compose_reengagement_message(
             system=system,
             messages=[{"role": "user", "content": context}],
         )
+        from app.services.ai.orchestrator import record_usage
+
+        await record_usage(
+            model_light(),
+            result.usage,
+            {"activity": "reengagement", "loan_id": loan.id, "broker_id": loan.broker_id},
+        )
         text = "".join(
             b.text for b in result.content if getattr(b, "type", None) == "text"
         ).strip()

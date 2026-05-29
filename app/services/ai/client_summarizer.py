@@ -365,6 +365,13 @@ async def refresh_client_summary(
                     }
                 ],
             )
+            from app.services.ai.orchestrator import record_usage
+
+            await record_usage(
+                model_light(),
+                result.usage,
+                {"activity": "client_summary", "client_id": client.id},
+            )
             raw = "".join(
                 block.text for block in result.content
                 if getattr(block, "type", None) == "text"

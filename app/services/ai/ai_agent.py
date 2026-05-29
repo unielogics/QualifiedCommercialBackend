@@ -153,6 +153,7 @@ async def classify_knowledge_document(
             tier="light",
             max_tokens=700,
             system="You classify documents. Output strict JSON only.",
+            meta={"activity": "knowledge_classify"},
         )
         data = _extract_json(_text_of(result))
         if data:
@@ -695,6 +696,12 @@ async def compose_message(
             tier="light",
             max_tokens=900,
             system=system,
+            meta={
+                "activity": "ai_agent_compose",
+                "ai_agent_id": agent.id,
+                "broker_id": agent.broker_id,
+                "client_id": client.id if client else None,
+            },
         )
         data = _extract_json(_text_of(result))
         body = (data.get("body") or "").strip()
@@ -788,6 +795,11 @@ async def generate_playbook(db: AsyncSession, agent: AIAgent) -> None:
                 "You are a senior real-estate sales strategist. Produce a "
                 "precise, actionable playbook as strict JSON. No prose."
             ),
+            meta={
+                "activity": "playbook_synthesis",
+                "ai_agent_id": agent.id,
+                "broker_id": agent.broker_id,
+            },
         )
         data = _extract_json(_text_of(result))
         if not data:
@@ -844,6 +856,11 @@ async def generate_showing_guide(db: AsyncSession, agent: AIAgent) -> None:
                 "You are a senior real-estate agent coach. Produce a precise "
                 "discovery + showing playbook as strict JSON. No prose."
             ),
+            meta={
+                "activity": "showing_guide",
+                "ai_agent_id": agent.id,
+                "broker_id": agent.broker_id,
+            },
         )
         data = _extract_json(_text_of(result))
         if not data:

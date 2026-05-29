@@ -14,13 +14,13 @@ edits don't disrupt in-flight deals.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -1072,3 +1072,214 @@ async def get_ai_training_feedback(
 
     items.sort(key=lambda x: x.created_at, reverse=True)
     return items[:limit]
+
+
+# ── Token-usage reporting (super-admin) ─────────────────────────────
+#
+# Reads the append-only ai_token_usage ledger written by
+# orchestrator.record_usage. Powers /admin/token-usage in QCDashboard:
+# spend per file / AI agent / activity / broker / model, over time.
+
+
+def _usage_window(from_date: str | None, to_date: str | None) -> tuple[datetime, datetime]:
+    """Parse optional ISO dates → [start, end). Defaults to last 30 days."""
+    now = datetime.now(timezone.utc)
+    end = now
+    start = now - timedelta(days=30)
+    try:
+        if to_date:
+            end = datetime.fromisoformat(to_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        if from_date:
+            start = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    return start, end
+
+
+@router.get("/token-usage/summary")
+async def token_usage_summary(
+    user: CurrentUser,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(user)
+    from app.models.ai_token_usage import AITokenUsage as U
+
+    start, end = _usage_window(from_date, to_date)
+    row = (
+        await db.execute(
+            select(
+                func.count().label("calls"),
+                func.coalesce(func.sum(U.input_tokens), 0),
+                func.coalesce(func.sum(U.output_tokens), 0),
+                func.coalesce(func.sum(U.cache_read_tokens), 0),
+                func.coalesce(func.sum(U.cache_creation_tokens), 0),
+                func.coalesce(func.sum(U.cost_usd), 0),
+            )
+            .where(U.created_at >= start)
+            .where(U.created_at < end)
+        )
+    ).one()
+    calls, inp, out, cread, cwrite, cost = row
+    cached_input = int(cread) + int(cwrite)
+    total_input = int(inp) + cached_input
+    cache_hit_pct = round(100.0 * cached_input / total_input, 1) if total_input else 0.0
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "calls": int(calls),
+        "input_tokens": int(inp),
+        "output_tokens": int(out),
+        "cache_read_tokens": int(cread),
+        "cache_creation_tokens": int(cwrite),
+        "total_tokens": total_input + int(out),
+        "cache_hit_pct": cache_hit_pct,
+        "cost_usd": float(cost),
+    }
+
+
+@router.get("/token-usage/breakdown")
+async def token_usage_breakdown(
+    user: CurrentUser,
+    dimension: Literal["activity", "model", "agent", "broker", "file"] = "activity",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(user)
+    from app.models.ai_agent import AIAgent
+    from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.broker import Broker
+    from app.models.deal import Deal
+    from app.models.loan import Loan
+    from app.models.user import User
+
+    start, end = _usage_window(from_date, to_date)
+
+    # Which column groups the rows, and whether we drop NULL keys.
+    col = {
+        "activity": U.activity,
+        "model": U.model,
+        "agent": U.ai_agent_id,
+        "broker": U.broker_id,
+        "file": U.loan_id,  # funding files; deals folded in below
+    }[dimension]
+
+    async def _agg(group_col, where_extra=None):
+        stmt = (
+            select(
+                group_col.label("key"),
+                func.count().label("calls"),
+                func.coalesce(func.sum(U.input_tokens + U.cache_read_tokens + U.cache_creation_tokens), 0),
+                func.coalesce(func.sum(U.output_tokens), 0),
+                func.coalesce(func.sum(U.cost_usd), 0),
+            )
+            .where(U.created_at >= start)
+            .where(U.created_at < end)
+            .group_by(group_col)
+        )
+        if where_extra is not None:
+            stmt = stmt.where(where_extra)
+        return list((await db.execute(stmt)).all())
+
+    rows: list[dict[str, Any]] = []
+
+    if dimension in ("activity", "model"):
+        for key, calls, toks, out, cost in await _agg(col):
+            rows.append({"key": str(key), "label": str(key or "—"),
+                         "calls": int(calls), "tokens": int(toks),
+                         "output_tokens": int(out), "cost_usd": float(cost)})
+
+    elif dimension == "agent":
+        raw = await _agg(U.ai_agent_id, U.ai_agent_id.is_not(None))
+        ids = [r[0] for r in raw]
+        names = {}
+        if ids:
+            for a in (await db.execute(select(AIAgent.id, AIAgent.name).where(AIAgent.id.in_(ids)))).all():
+                names[a[0]] = a[1]
+        for key, calls, toks, out, cost in raw:
+            rows.append({"key": str(key), "label": names.get(key, "(deleted agent)"),
+                         "calls": int(calls), "tokens": int(toks),
+                         "output_tokens": int(out), "cost_usd": float(cost)})
+
+    elif dimension == "broker":
+        raw = await _agg(U.broker_id, U.broker_id.is_not(None))
+        ids = [r[0] for r in raw]
+        names = {}
+        if ids:
+            q = (
+                select(Broker.id, User.name)
+                .join(User, User.id == Broker.user_id, isouter=True)
+                .where(Broker.id.in_(ids))
+            )
+            for b in (await db.execute(q)).all():
+                names[b[0]] = b[1] or "Agent"
+        for key, calls, toks, out, cost in raw:
+            rows.append({"key": str(key), "label": names.get(key, "(unknown)"),
+                         "calls": int(calls), "tokens": int(toks),
+                         "output_tokens": int(out), "cost_usd": float(cost)})
+
+    else:  # file = loans + deals
+        loan_raw = await _agg(U.loan_id, U.loan_id.is_not(None))
+        deal_raw = await _agg(U.deal_id, U.deal_id.is_not(None))
+        loan_ids = [r[0] for r in loan_raw]
+        deal_ids = [r[0] for r in deal_raw]
+        loan_lbl, deal_lbl = {}, {}
+        if loan_ids:
+            for l in (await db.execute(select(Loan.id, Loan.deal_id, Loan.address).where(Loan.id.in_(loan_ids)))).all():
+                loan_lbl[l[0]] = (l[1] or "loan") + (f" · {l[2]}" if l[2] else "")
+        if deal_ids:
+            for d in (await db.execute(select(Deal.id, Deal.title).where(Deal.id.in_(deal_ids)))).all():
+                deal_lbl[d[0]] = d[1] or "deal"
+        for key, calls, toks, out, cost in loan_raw:
+            rows.append({"key": f"loan:{key}", "label": loan_lbl.get(key, "(loan)"),
+                         "kind": "loan", "id": str(key), "calls": int(calls),
+                         "tokens": int(toks), "output_tokens": int(out), "cost_usd": float(cost)})
+        for key, calls, toks, out, cost in deal_raw:
+            rows.append({"key": f"deal:{key}", "label": deal_lbl.get(key, "(deal)"),
+                         "kind": "deal", "id": str(key), "calls": int(calls),
+                         "tokens": int(toks), "output_tokens": int(out), "cost_usd": float(cost)})
+
+    rows.sort(key=lambda r: r["cost_usd"], reverse=True)
+    return rows[: max(1, min(200, limit))]
+
+
+@router.get("/token-usage/timeseries")
+async def token_usage_timeseries(
+    user: CurrentUser,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(user)
+    from app.models.ai_token_usage import AITokenUsage as U
+
+    start, end = _usage_window(from_date, to_date)
+    bucket = func.date_trunc("day", U.created_at).label("day")
+    raw = (
+        await db.execute(
+            select(
+                bucket,
+                func.count().label("calls"),
+                func.coalesce(func.sum(U.input_tokens + U.cache_read_tokens + U.cache_creation_tokens), 0),
+                func.coalesce(func.sum(U.output_tokens), 0),
+                func.coalesce(func.sum(U.cost_usd), 0),
+            )
+            .where(U.created_at >= start)
+            .where(U.created_at < end)
+            .group_by(bucket)
+            .order_by(bucket)
+        )
+    ).all()
+    return [
+        {
+            "day": day.date().isoformat() if hasattr(day, "date") else str(day),
+            "calls": int(calls),
+            "tokens": int(toks),
+            "output_tokens": int(out),
+            "cost_usd": float(cost),
+        }
+        for day, calls, toks, out, cost in raw
+    ]
