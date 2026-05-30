@@ -239,24 +239,40 @@ async def _generate_ai_reply(
     """
     settings = get_settings()
 
+    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW, maybe_rollup as _chat_rollup
+
     history_stmt = (
         select(DealChatMessage)
         .where(DealChatMessage.deal_id == deal.id)
-        .order_by(DealChatMessage.created_at.desc())
-        .limit(20)
+        .order_by(DealChatMessage.created_at.asc())
+        .limit(200)
     )
     if requesting_user.role == Role.CLIENT:
         history_stmt = history_stmt.where(DealChatMessage.client_visible.is_(True))
     history = list((await db.execute(history_stmt)).scalars().all())
-    history.reverse()
 
-    turns = [
-        {
-            "role": "assistant" if m.from_role == DealChatRole.AI else "user",
-            "content": m.body,
-        }
-        for m in history
-    ]
+    def _role(m):
+        return "assistant" if m.from_role == DealChatRole.AI else "user"
+
+    window = history[-_CHAT_WINDOW:] if history else []
+    older = history[: max(0, len(history) - _CHAT_WINDOW)]
+    older_pairs = [(_role(m), m.body or "") for m in older]
+    profile = dict(deal.living_profile) if isinstance(deal.living_profile, dict) else {}
+    prev_summary = profile.get("chat_summary")
+    prev_count = int(profile.get("chat_summary_count") or 0)
+    new_summary, new_count = await _chat_rollup(
+        older_pairs, prev_summary, prev_count,
+        meta={"deal_id": deal.id, "client_id": deal.client_id},
+    )
+    if new_summary != prev_summary or new_count != prev_count:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        profile["chat_summary"] = new_summary
+        profile["chat_summary_count"] = new_count
+        deal.living_profile = profile
+        flag_modified(deal, "living_profile")
+
+    turns = [{"role": _role(m), "content": m.body} for m in window]
     if not turns or turns[-1]["role"] != "user":
         return None
 
@@ -268,27 +284,26 @@ async def _generate_ai_reply(
         f"Deal: {deal.title} (type={deal.deal_type}, status={deal.status}).\n"
         f"Address: {deal.address or 'TBD'} {deal.city or ''} {deal.state or ''}.\n"
     )
+    if new_summary:
+        system += "\n\nPRIOR CONVERSATION SUMMARY:\n" + new_summary
 
     if not settings.anthropic_api_key:
         reply_text = "(stub) I would normally answer here once ANTHROPIC_API_KEY is set."
     else:
         try:
-            client = get_client()
-            resp = await client.messages.create(
-                model=model_light(),
+            from app.services.ai.orchestrator import run as orchestrator_run
+
+            result = await orchestrator_run(
+                turns,  # type: ignore[arg-type]
+                tier="light",
                 max_tokens=500,
                 system=system,
-                messages=turns,  # type: ignore[arg-type]
-            )
-            from app.services.ai.orchestrator import record_usage
-
-            await record_usage(
-                model_light(),
-                resp.usage,
-                {"activity": "deal_chat", "deal_id": deal.id, "client_id": deal.client_id},
+                meta={"activity": "deal_chat", "deal_id": deal.id, "client_id": deal.client_id},
             )
             reply_text = "".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
+                b.get("text", "")
+                for b in result.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
             if not reply_text:
                 reply_text = "(no reply)"

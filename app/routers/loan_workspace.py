@@ -225,43 +225,57 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
     the operator's prior turn(s) and offer to take it from here."""
     settings = get_settings()
 
-    # Recent chat for context (client-visible only — same view the
-    # borrower has).
+    # Recent chat (client-visible only) — windowed to WINDOW turns.
+    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW, maybe_rollup as _chat_rollup
+
     history_stmt = (
         select(LoanChatMessage)
         .where(LoanChatMessage.loan_id == loan.id)
         .where(LoanChatMessage.client_visible.is_(True))
-        .order_by(LoanChatMessage.created_at.desc())
-        .limit(20)
+        .order_by(LoanChatMessage.created_at.asc())
+        .limit(200)
     )
     history = list((await db.execute(history_stmt)).scalars().all())
-    history.reverse()
     if not history:
         return None
     # Don't double-fire: if the most recent message is already from the
-    # AI, the AI already followed up (manual resume + reply, or a prior
-    # auto-resume already fired). Skip.
+    # AI, the AI already followed up. Skip.
     if history[-1].from_role == DealChatRole.AI:
         return None
 
-    turns = [
-        {
-            "role": "assistant" if m.from_role == DealChatRole.AI else "user",
-            "content": m.body,
-        }
-        for m in history
-    ]
+    def _role(m):
+        return "assistant" if m.from_role == DealChatRole.AI else "user"
+
+    window = history[-_CHAT_WINDOW:]
+    older = history[: max(0, len(history) - _CHAT_WINDOW)]
+    older_pairs = [(_role(m), m.body or "") for m in older]
+    profile = dict(loan.living_profile) if isinstance(loan.living_profile, dict) else {}
+    prev_summary = profile.get("chat_summary")
+    prev_count = int(profile.get("chat_summary_count") or 0)
+    new_summary, new_count = await _chat_rollup(
+        older_pairs, prev_summary, prev_count,
+        meta={"loan_id": loan.id, "broker_id": loan.broker_id},
+    )
+    if new_summary != prev_summary or new_count != prev_count:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        profile["chat_summary"] = new_summary
+        profile["chat_summary_count"] = new_count
+        loan.living_profile = profile
+        flag_modified(loan, "living_profile")
+
+    turns = [{"role": _role(m), "content": m.body} for m in window]
     system = (
         "You are the Qualified Commercial Deal Workspace AI on a loan "
-        "that just came back online after a human operator (broker or "
-        "super_admin) took over the conversation briefly. Read the "
-        "recent exchange, acknowledge what the operator said in 1-2 "
-        "sentences, then offer to help the client from here. Be brief "
-        "and warm, not robotic. Do not repeat the operator's content "
+        "that just came back online after a human operator took over the "
+        "conversation briefly. Read the recent exchange, acknowledge what "
+        "the operator said in 1-2 sentences, then offer to help the client "
+        "from here. Be brief and warm. Do not repeat the operator's content "
         "verbatim.\n\n"
         + await assemble_loan_context(db, loan, audience="client")
     )
-    # Operator training layer (Nurture AI chat). Additive.
+    if new_summary:
+        system += "\n\nPRIOR CONVERSATION SUMMARY:\n" + new_summary
     from app.services.ai.task_training import (
         load_task_config as _load_tc,
         render_training_block as _render_tb,
@@ -273,22 +287,19 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
         reply_text = "I'm back online — let me know how I can help from here."
     else:
         try:
-            client = get_client()
-            resp = await client.messages.create(
-                model=model_light(),
+            from app.services.ai.orchestrator import run as orchestrator_run
+
+            result = await orchestrator_run(
+                turns,  # type: ignore[arg-type]
+                tier="light",
                 max_tokens=300,
                 system=system,
-                messages=turns,  # type: ignore[arg-type]
-            )
-            from app.services.ai.orchestrator import record_usage
-
-            await record_usage(
-                model_light(),
-                resp.usage,
-                {"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
+                meta={"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
             )
             reply_text = "".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
+                b.get("text", "")
+                for b in result.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
             if not reply_text:
                 reply_text = "I'm back — happy to help you with the next steps."
@@ -684,33 +695,63 @@ async def _generate_ai_reply(
         )
         return None
 
-    # Recent chat history → message turns for the LLM.
+    # Full conversation in ascending order (capped so an enormous
+    # thread can't dominate the rollup query). The recent WINDOW is
+    # sent verbatim; everything older folds into a rolling summary.
+    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW, maybe_rollup as _chat_rollup
+
     history_stmt = (
         select(LoanChatMessage)
         .where(LoanChatMessage.loan_id == loan.id)
-        .order_by(LoanChatMessage.created_at.desc())
-        .limit(20)
+        .order_by(LoanChatMessage.created_at.asc())
+        .limit(200)
     )
     if audience == "client":
         history_stmt = history_stmt.where(LoanChatMessage.client_visible.is_(True))
     history = list((await db.execute(history_stmt)).scalars().all())
-    history.reverse()
 
-    turns = [
-        {
-            "role": "assistant" if m.from_role == DealChatRole.AI else "user",
-            "content": m.body,
-        }
-        for m in history
-    ]
+    def _role(m):
+        return "assistant" if m.from_role == DealChatRole.AI else "user"
+
+    window = history[-_CHAT_WINDOW:] if history else []
+    older = history[: max(0, len(history) - _CHAT_WINDOW)]
+    older_pairs = [(_role(m), m.body or "") for m in older]
+
+    # Living-profile-stored rolling summary (no migration — JSONB).
+    profile = dict(loan.living_profile) if isinstance(loan.living_profile, dict) else {}
+    prev_summary = profile.get("chat_summary")
+    prev_count = int(profile.get("chat_summary_count") or 0)
+    new_summary, new_count = await _chat_rollup(
+        older_pairs,
+        prev_summary,
+        prev_count,
+        meta={"loan_id": loan.id, "broker_id": loan.broker_id},
+    )
+    if new_summary != prev_summary or new_count != prev_count:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        profile["chat_summary"] = new_summary
+        profile["chat_summary_count"] = new_count
+        loan.living_profile = profile
+        flag_modified(loan, "living_profile")
+
+    turns = [{"role": _role(m), "content": m.body} for m in window]
     if not turns or turns[-1]["role"] != "user":
         return None  # nothing to reply to
 
+    # Build the stable system block. Caching depends on this being
+    # byte-identical across rapid follow-up turns within the same
+    # conversation — orchestrator.run wraps it with cache_control.
     system = (
         "You are the Qualified Commercial Deal Workspace AI. Stay scoped to "
         "this single loan. Be concise — 1-3 sentences unless asked to expand.\n\n"
         + await assemble_loan_context(db, loan, audience=audience)
     )
+    if new_summary:
+        system += (
+            "\n\nPRIOR CONVERSATION SUMMARY (older turns folded in):\n"
+            + new_summary
+        )
     # Operator training layer — borrower-facing chat only. Additive.
     if audience == "client":
         from app.services.ai.task_training import load_task_config, render_training_block
@@ -722,22 +763,23 @@ async def _generate_ai_reply(
         reply_text = "(stub) I would normally answer here once ANTHROPIC_API_KEY is set."
     else:
         try:
-            client = get_client()
-            resp = await client.messages.create(
-                model=model_light(),
+            from app.services.ai.orchestrator import run as orchestrator_run
+
+            result = await orchestrator_run(
+                turns,  # type: ignore[arg-type]
+                tier="light",
                 max_tokens=500,
                 system=system,
-                messages=turns,  # type: ignore[arg-type]
-            )
-            from app.services.ai.orchestrator import record_usage
-
-            await record_usage(
-                model_light(),
-                resp.usage,
-                {"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
+                meta={
+                    "activity": "loan_chat",
+                    "loan_id": loan.id,
+                    "broker_id": loan.broker_id,
+                },
             )
             reply_text = "".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
+                b.get("text", "")
+                for b in result.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
             if not reply_text:
                 reply_text = "(no reply)"
