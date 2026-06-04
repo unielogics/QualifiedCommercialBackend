@@ -41,8 +41,10 @@ from app.models.document import Document
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
+from app.scoping import scope_client_query, scope_loan_query
 from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
+from app.services.ai.usage import tracked_messages_create
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 log = logging.getLogger(__name__)
@@ -227,12 +229,13 @@ COMPLETE_PROPERTY_INTAKE_TOOL = {
 # Cap CTAs per assistant message so the chat doesn't turn into a
 # wall of buttons. The remainder is always visible in the vault.
 _MAX_ACTIONS_PER_MESSAGE = 5
+_MAX_CHAT_HISTORY_MESSAGES = 18
 
 # Hard cap on tool-use round-trips per send-message. A multi-fact
 # borrower reply ("3 beds, 2 baths, 1500 sqft, built 1998") might
 # trigger 1-2 tool calls; this is a safety valve, not the steady
 # state.
-_TOOL_USE_MAX_ITERATIONS = 5
+_TOOL_USE_MAX_ITERATIONS = 3
 
 
 async def _execute_property_intake_tool(
@@ -806,12 +809,9 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
         if client.tier and client.tier != "standard":
             lines.append(f"Client tier: {client.tier}")
 
-    # Loans on file — operators see all loans they're attached to;
-    # borrowers see their own. We let SQL scope it via `client_id`
-    # for borrowers.
-    loans_stmt = select(Loan).order_by(Loan.created_at.desc()).limit(8)
-    if user.role == Role.CLIENT and client is not None:
-        loans_stmt = loans_stmt.where(Loan.client_id == client.id)
+    # Loans on file — role-scoped so brokers and borrowers only feed
+    # their own book into account-wide chat.
+    loans_stmt = scope_loan_query(user, select(Loan)).order_by(Loan.created_at.desc()).limit(8)
     loans = (await db.execute(loans_stmt)).scalars().all()
     if loans:
         lines.append("")
@@ -1015,17 +1015,23 @@ async def chat(
         else "super_admin"
     )
     if payload.loan_id is not None:
-        loan = await db.get(Loan, payload.loan_id)
+        loan = (
+            await db.execute(
+                scope_loan_query(user, select(Loan).where(Loan.id == payload.loan_id))
+            )
+        ).scalar_one_or_none()
         if loan is not None:
             context_block = await assemble_loan_context(
                 db, loan, audience=audience_value,  # type: ignore[arg-type]
             ) or None
     else:
-        # Re-fetch user with client eagerly loaded so we can read
-        # client.fico without lazy-loading inside the async session.
+        # Re-fetch scope relationships so account context can apply
+        # client/broker visibility without lazy-loading in async code.
         user_with_client = (
             await db.execute(
-                select(User).options(selectinload(User.client)).where(User.id == user.id)
+                select(User)
+                .options(selectinload(User.client), selectinload(User.broker))
+                .where(User.id == user.id)
             )
         ).scalar_one()
         context_block = await _build_account_context(db, user_with_client)
@@ -1057,8 +1063,15 @@ async def chat(
         system += "\n\n" + context_block
 
     try:
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="chat",
+            client=client,
             model=model_light(),
+            user_id=user.id,
+            broker_id=user.broker.id if user.broker else None,
+            client_id=user.client.id if user.client else None,
+            loan_id=payload.loan_id,
             max_tokens=700,
             system=system,
             messages=[{"role": m.role, "content": m.content} for m in payload.messages],
@@ -1260,6 +1273,47 @@ def _thread_read(thread: AIChatThread) -> AIChatThreadRead:
     return base
 
 
+async def _load_scoped_loan(
+    db: AsyncSession,
+    loan_id: UUID,
+    user: User,
+) -> Loan:
+    loan = (
+        await db.execute(
+            scope_loan_query(user, select(Loan).where(Loan.id == loan_id))
+        )
+    ).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    return loan
+
+
+async def _load_scoped_client(
+    db: AsyncSession,
+    client_id: UUID,
+    user: User,
+) -> Client:
+    client = (
+        await db.execute(
+            scope_client_query(user, select(Client).where(Client.id == client_id))
+        )
+    ).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    return client
+
+
+async def _assert_thread_scope_allowed(
+    db: AsyncSession,
+    thread: AIChatThread,
+    user: User,
+) -> None:
+    if thread.loan_id is not None:
+        await _load_scoped_loan(db, thread.loan_id, user)
+    if thread.client_id is not None:
+        await _load_scoped_client(db, thread.client_id, user)
+
+
 async def _load_thread_for_user(
     db: AsyncSession, thread_id: UUID, user: User
 ) -> AIChatThread:
@@ -1276,6 +1330,7 @@ async def _load_thread_for_user(
     if thread is None or thread.user_id != user.id:
         # Don't leak existence — same response for not-found / not-owned.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found")
+    await _assert_thread_scope_allowed(db, thread, user)
     return thread
 
 
@@ -1350,21 +1405,17 @@ async def find_or_create_chat_thread(
     thread = (await db.execute(stmt)).scalars().first()
 
     if thread is not None:
+        await _assert_thread_scope_allowed(db, thread, user)
         return _thread_read(thread)
 
     # Lazy-create. The partial unique idxs (alembic 0017 + 0018 +
     # 0030) enforce one canonical thread per (user, scope). On race,
     # the second INSERT raises IntegrityError; we catch + refetch.
     if payload.loan_id is not None:
-        loan = await db.get(Loan, payload.loan_id)
-        if loan is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+        loan = await _load_scoped_loan(db, payload.loan_id, user)
         title = f"{loan.deal_id} — {loan.address[:80]}"
     elif payload.client_id is not None:
-        from app.models.client import Client as _Client
-        client = await db.get(_Client, payload.client_id)
-        if client is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+        client = await _load_scoped_client(db, payload.client_id, user)
         title = f"Lead — {client.name[:80]}"
     else:
         title = "Account questions"
@@ -1654,11 +1705,10 @@ async def append_thread_message(
         else "super_admin"
     )
     if effective_loan_id is not None:
-        loan = await db.get(Loan, effective_loan_id)
-        if loan is not None:
-            context_block = await assemble_loan_context(
-                db, loan, audience=thread_audience,  # type: ignore[arg-type]
-            ) or None
+        loan = await _load_scoped_loan(db, effective_loan_id, user)
+        context_block = await assemble_loan_context(
+            db, loan, audience=thread_audience,  # type: ignore[arg-type]
+        ) or None
     elif thread.client_id is not None:
         # Client-scoped thread. Two flavors:
         #   phase=lending → Lending AI gets the LendingHandoffPacket
@@ -1746,20 +1796,26 @@ async def append_thread_message(
     else:
         user_with_client = (
             await db.execute(
-                select(User).options(selectinload(User.client)).where(User.id == user.id)
+                select(User)
+                .options(selectinload(User.client), selectinload(User.broker))
+                .where(User.id == user.id)
             )
         ).scalar_one()
         context_block = await _build_account_context(db, user_with_client)
 
-    # 3. Replay full history (already includes the user msg we just
-    #    flushed) into the model.
+    # 3. Replay only recent history (already includes the user msg we
+    #    just flushed) into the model. Full-thread replay makes every
+    #    long-running broker/client conversation progressively more
+    #    expensive; persistent facts belong in the scoped context blocks.
     history_rows = (
         await db.execute(
             select(AIChatMessage)
             .where(AIChatMessage.thread_id == thread.id)
-            .order_by(AIChatMessage.created_at.asc())
+            .order_by(AIChatMessage.created_at.desc())
+            .limit(_MAX_CHAT_HISTORY_MESSAGES)
         )
     ).scalars().all()
+    history_rows = list(reversed(history_rows))
     api_messages = [{"role": m.role, "content": m.body} for m in history_rows]
 
     settings = get_settings()
@@ -1859,7 +1915,17 @@ async def append_thread_message(
                 }
                 if tools:
                     kwargs["tools"] = tools
-                result = await client.messages.create(**kwargs)
+                result = await tracked_messages_create(
+                    db,
+                    feature="ai_thread_chat",
+                    client=client,
+                    user_id=user.id,
+                    broker_id=user.broker.id if user.broker else None,
+                    client_id=thread.client_id or (user.client.id if user.client else None),
+                    loan_id=effective_loan_id,
+                    thread_id=thread.id,
+                    **kwargs,
+                )
                 # Extract any text the model emitted in this turn —
                 # we'll concatenate text fragments across iterations
                 # (model usually responds with text + tool_use blocks).

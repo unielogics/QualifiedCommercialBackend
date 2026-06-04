@@ -19,7 +19,7 @@ Both endpoints are super-admin only.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -33,6 +33,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser, require_role
 from app.enums import LoanStage, Role
+from app.models.ai_usage_event import AIUsageEvent
 from app.models.capital_partner_application import (
     APPLICATION_STATUSES,
     CapitalPartnerApplication,
@@ -42,6 +43,7 @@ from app.models.loan import Loan
 from app.models.loan_scenario import LoanScenario
 from app.models.user import User
 from app.services.lender_thread import LenderThreadError, inject_inbound_lender_email
+from app.services.ai.usage import load_ai_spend_settings
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,184 @@ class GmailTestResult(BaseModel):
     note: str
     service_account_email: str | None = None
     delegated_user: str | None = None
+
+
+class AIUsageBucket(BaseModel):
+    key: str
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: float
+
+
+class AIUsageSummary(BaseModel):
+    day_start: datetime
+    total_calls: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_estimated_cost_usd: float
+    alert_level: str
+    daily_warning_usd: float
+    daily_critical_usd: float
+    avg_client_file_warning_usd: float
+    avg_client_file_critical_usd: float
+    avg_cost_per_client_usd: float
+    avg_cost_per_loan_file_usd: float
+    chat_enabled: bool
+    automations_enabled: bool
+    document_scanning_enabled: bool
+    summaries_enabled: bool
+    lender_ai_enabled: bool
+    by_category: list[AIUsageBucket]
+    by_feature: list[AIUsageBucket]
+    by_client: list[AIUsageBucket]
+    by_loan_file: list[AIUsageBucket]
+    top_calls: list[dict[str, Any]]
+
+
+def _today_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _money(value: Any) -> float:
+    return round(float(value or 0), 6)
+
+
+@router.get("/ai-usage/today", response_model=AIUsageSummary)
+async def ai_usage_today(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AIUsageSummary:
+    _require_super_admin(user)
+    spend_settings = await load_ai_spend_settings(db)
+    start = _today_start()
+
+    total_row = (
+        await db.execute(
+            select(
+                func.count(AIUsageEvent.id),
+                func.coalesce(func.sum(AIUsageEvent.input_tokens), 0),
+                func.coalesce(func.sum(AIUsageEvent.output_tokens), 0),
+                func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0),
+            ).where(AIUsageEvent.created_at >= start)
+        )
+    ).one()
+
+    async def buckets(column) -> list[AIUsageBucket]:
+        rows = (
+            await db.execute(
+                select(
+                    column,
+                    func.count(AIUsageEvent.id),
+                    func.coalesce(func.sum(AIUsageEvent.input_tokens), 0),
+                    func.coalesce(func.sum(AIUsageEvent.output_tokens), 0),
+                    func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0),
+                )
+                .where(AIUsageEvent.created_at >= start)
+                .group_by(column)
+                .order_by(func.coalesce(func.sum(AIUsageEvent.estimated_cost_usd), 0).desc())
+            )
+        ).all()
+        return [
+            AIUsageBucket(
+                key=str(key or "unscoped"),
+                calls=int(calls or 0),
+                input_tokens=int(input_tokens or 0),
+                output_tokens=int(output_tokens or 0),
+                estimated_cost_usd=_money(cost),
+            )
+            for key, calls, input_tokens, output_tokens, cost in rows
+        ]
+
+    distinct_clients = int((
+        await db.execute(
+            select(func.count(func.distinct(AIUsageEvent.client_id))).where(
+                AIUsageEvent.created_at >= start,
+                AIUsageEvent.client_id.is_not(None),
+            )
+        )
+    ).scalar_one() or 0)
+    distinct_loans = int((
+        await db.execute(
+            select(func.count(func.distinct(AIUsageEvent.loan_id))).where(
+                AIUsageEvent.created_at >= start,
+                AIUsageEvent.loan_id.is_not(None),
+            )
+        )
+    ).scalar_one() or 0)
+    total_cost = _money(total_row[3])
+    avg_client = _money(total_cost / distinct_clients) if distinct_clients else 0.0
+    avg_loan = _money(total_cost / distinct_loans) if distinct_loans else 0.0
+    alert_level = "ok"
+    if (
+        spend_settings.daily_critical_usd > 0
+        and total_cost >= spend_settings.daily_critical_usd
+    ) or (
+        spend_settings.avg_client_file_critical_usd > 0
+        and avg_loan >= spend_settings.avg_client_file_critical_usd
+    ):
+        alert_level = "critical"
+    elif (
+        spend_settings.daily_warning_usd > 0
+        and total_cost >= spend_settings.daily_warning_usd
+    ) or (
+        spend_settings.avg_client_file_warning_usd > 0
+        and avg_loan >= spend_settings.avg_client_file_warning_usd
+    ):
+        alert_level = "warning"
+
+    top_rows = (
+        await db.execute(
+            select(AIUsageEvent)
+            .where(AIUsageEvent.created_at >= start)
+            .order_by(AIUsageEvent.estimated_cost_usd.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+
+    return AIUsageSummary(
+        day_start=start,
+        total_calls=int(total_row[0] or 0),
+        total_input_tokens=int(total_row[1] or 0),
+        total_output_tokens=int(total_row[2] or 0),
+        total_estimated_cost_usd=total_cost,
+        alert_level=alert_level,
+        daily_warning_usd=spend_settings.daily_warning_usd,
+        daily_critical_usd=spend_settings.daily_critical_usd,
+        avg_client_file_warning_usd=spend_settings.avg_client_file_warning_usd,
+        avg_client_file_critical_usd=spend_settings.avg_client_file_critical_usd,
+        avg_cost_per_client_usd=avg_client,
+        avg_cost_per_loan_file_usd=avg_loan,
+        chat_enabled=spend_settings.chat_enabled,
+        automations_enabled=spend_settings.automations_enabled,
+        document_scanning_enabled=spend_settings.document_scanning_enabled,
+        summaries_enabled=spend_settings.summaries_enabled,
+        lender_ai_enabled=spend_settings.lender_ai_enabled,
+        by_category=await buckets(AIUsageEvent.category),
+        by_feature=await buckets(AIUsageEvent.feature),
+        by_client=(await buckets(AIUsageEvent.client_id))[:20],
+        by_loan_file=(await buckets(AIUsageEvent.loan_id))[:20],
+        top_calls=[
+            {
+                "id": str(row.id),
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "feature": row.feature,
+                "category": row.category,
+                "model": row.model,
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+                "estimated_cost_usd": _money(row.estimated_cost_usd),
+                "user_id": str(row.user_id) if row.user_id else None,
+                "broker_id": str(row.broker_id) if row.broker_id else None,
+                "client_id": str(row.client_id) if row.client_id else None,
+                "loan_id": str(row.loan_id) if row.loan_id else None,
+                "thread_id": str(row.thread_id) if row.thread_id else None,
+                "metadata": row.metadata_json,
+            }
+            for row in top_rows
+        ],
+    )
 
 
 @router.get("/connect-lender/health", response_model=ConnectLenderHealth)

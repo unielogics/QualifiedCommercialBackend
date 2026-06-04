@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.enums import AITaskPriority, AITaskSource, AITaskStatus
 from app.models.ai_audit_event import AIAuditEvent
 from app.models.ai_cadence_rule import AICadenceRule
-from app.models.ai_playbook import AICollectionRequirement
+from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
 from app.models.ai_task import AITask
 from app.models.ai_task_assignment import AITaskAssignment
 from app.models.client import Client
@@ -113,6 +113,22 @@ async def _load_active_rules(db: AsyncSession) -> list[AICadenceRule]:
     return list(rows)
 
 
+async def _rule_agent_owner_id(db: AsyncSession, rule: AICadenceRule) -> UUID | None:
+    """Return the broker user id for agent-owned cadence rules."""
+    if rule.playbook_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(AIPlaybookTemplate.owner_type, AIPlaybookTemplate.owner_id)
+            .where(AIPlaybookTemplate.id == rule.playbook_id)
+        )
+    ).first()
+    if row is None:
+        return None
+    owner_type, owner_id = row
+    return owner_id if owner_type == "agent" else None
+
+
 # ── Per-rule evaluation ────────────────────────────────────────────
 
 
@@ -129,7 +145,7 @@ async def _evaluate_rule(db: AsyncSession, rule: AICadenceRule) -> list[dict[str
       • draft_first      → downgrade auto_send_reminder → draft_message
       • portal_auto+     → proceed
     Legacy rules with requires_ai_owner=False keep today's behavior."""
-    targets = await _eligible_targets(db, rule)
+    targets = await _eligible_targets(db, rule, agent_id=await _rule_agent_owner_id(db, rule))
     results: list[dict[str, Any]] = []
     for t in targets:
         # AI Deal Secretary gate.
@@ -444,15 +460,23 @@ async def _eligible_targets(
         # than condition.days_unresponsive days. Cheap proxy.
         days = int(cond.get("days_unresponsive", 5))
         cutoff = now - timedelta(days=days)
-        plans = (await db.execute(
+        q = (
             select(ClientAIPlan, Client)
             .join(Client, Client.id == ClientAIPlan.client_id)
             .where(ClientAIPlan.computed_at <= cutoff)
-        )).all()
+        )
+        if client_id:
+            q = q.where(Client.id == client_id)
+        if agent_id:
+            from app.models.broker import Broker
+            broker = (await db.execute(select(Broker).where(Broker.user_id == agent_id))).scalar_one_or_none()
+            if broker:
+                q = q.where(Client.broker_id == broker.id)
+            else:
+                return []
+        plans = (await db.execute(q)).all()
         out2: list[dict[str, Any]] = []
         for plan_row, client in plans:
-            if client_id and client.id != client_id:
-                continue
             out2.append({
                 "client_id": client.id,
                 "client_name": client.name,

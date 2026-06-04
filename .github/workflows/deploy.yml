@@ -59,10 +59,14 @@ jobs:
             --parameters '{"commands":[
               "set -e",
               "docker pull '"${{ env.IMAGE }}:${{ github.sha }}"'",
+              "if docker image inspect qcbackend:current >/dev/null 2>&1; then docker tag qcbackend:current qcbackend:previous; fi",
+              "docker run --rm --env-file /etc/qcbackend.env -v /etc/qcbackend/gmail-sa.json:/etc/qcbackend/gmail-sa.json:ro -v /etc/qcbackend/firebase-sa.json:/etc/qcbackend/firebase-sa.json:ro -v /etc/qcbackend/apns-key.p8:/etc/qcbackend/apns-key.p8:ro '"${{ env.IMAGE }}:${{ github.sha }}"' sh -lc '\''cd /app && .venv/bin/python -m alembic upgrade head'\''",
               "docker tag '"${{ env.IMAGE }}:${{ github.sha }}"' qcbackend:current",
               "systemctl restart qcbackend || systemctl start qcbackend",
-              "sleep 5",
-              "systemctl is-active qcbackend"
+              "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/ready && exit 0; sleep 2; done",
+              "journalctl -u qcbackend --no-pager -n 120",
+              "if docker image inspect qcbackend:previous >/dev/null 2>&1; then docker tag qcbackend:previous qcbackend:current && systemctl restart qcbackend && for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/ready && echo rolled-back-to-previous && exit 1; sleep 2; done; fi",
+              "exit 1"
             ]}' \
             --query Command.CommandId --output text)
           echo "Command ID: $CMD_ID"

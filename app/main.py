@@ -6,8 +6,10 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.config import get_settings
+from app.db import SessionLocal
 from app.routers import (
     admin as admin_router,
     agent_tasks,
@@ -102,6 +104,20 @@ async def shutdown() -> None:
 @app.get("/", tags=["health"])
 async def root() -> dict[str, str]:
     return {"status": "ok", "service": "qcbackend", "env": settings.app_env}
+
+
+@app.get("/health", tags=["health"])
+async def health() -> dict[str, str]:
+    """Liveness: process is up. Does not touch dependencies."""
+    return {"status": "ok", "service": "qcbackend", "env": settings.app_env}
+
+
+@app.get("/ready", tags=["health"])
+async def ready() -> dict[str, str]:
+    """Readiness: process is up and can reach Postgres."""
+    async with SessionLocal() as db:
+        await db.execute(text("SELECT 1"))
+    return {"status": "ready", "service": "qcbackend", "database": "ok"}
 
 
 # Mount all routers under /api/v1

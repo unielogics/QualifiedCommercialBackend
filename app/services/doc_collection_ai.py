@@ -33,6 +33,8 @@ import logging
 import textwrap
 from dataclasses import dataclass
 from datetime import date
+
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Literal
 
 from app.config import get_settings
@@ -40,6 +42,7 @@ from app.models.client import Client
 from app.models.document import Document
 from app.models.loan import Loan
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +167,7 @@ Style rules:
 Output ONLY the message body. No preamble, no quotes, no signoff, no surrounding markdown."""
 
 
-async def compose_collection_nudge(ctx: DocCollectionContext) -> str:
+async def compose_collection_nudge(db: AsyncSession, ctx: DocCollectionContext) -> str:
     """Generate a natural-sounding chat message for this scenario.
     Falls back to a templated message if Anthropic is unavailable
     or returns an empty reply."""
@@ -224,8 +227,13 @@ async def compose_collection_nudge(ctx: DocCollectionContext) -> str:
 
     try:
         client = get_client()
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="doc_collection_chat",
+            client=client,
             model=model_light(),
+            loan_id=ctx.loan.id,
+            client_id=ctx.loan.client_id,
             max_tokens=220,
             system=SYSTEM_PROMPT + training_block,
             messages=[{"role": "user", "content": user_prompt}],

@@ -66,6 +66,7 @@ from app.models.document import Document
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 from app.services.credit_summary import fico_tier, tier_max_ltv
 
 log = logging.getLogger(__name__)
@@ -350,8 +351,14 @@ async def refresh_client_summary(
     else:
         anthropic = get_client()
         try:
-            result = await anthropic.messages.create(
+            result = await tracked_messages_create(
+                db,
+                feature="client_summary",
+                client=anthropic,
                 model=model_light(),
+                user_id=client.user_id,
+                broker_id=client.broker_id,
+                client_id=client.id,
                 max_tokens=900,
                 system=CLIENT_SUMMARIZER_SYSTEM,
                 messages=[

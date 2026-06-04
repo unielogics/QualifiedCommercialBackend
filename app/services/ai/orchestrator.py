@@ -16,9 +16,11 @@ import logging
 from typing import Any, Literal
 
 from anthropic.types import MessageParam
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.ai.anthropic_client import get_client, model_heavy, model_light
 from app.services.ai.tools import TOOL_SCHEMAS, TOOLS
+from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +96,8 @@ async def run(
     enable_tools: bool = False,
     cache_system: bool = True,
     meta: dict[str, Any] | None = None,
+    db: AsyncSession | None = None,
+    feature: str = "orchestrator_chat",
 ) -> dict[str, Any]:
     """Single-shot completion. If `enable_tools=True`, runs the tool loop until
     the model returns a `text`-terminated stop reason.
@@ -118,7 +122,16 @@ async def run(
         }
         if enable_tools:
             kwargs["tools"] = TOOL_SCHEMAS
-        resp = await client.messages.create(**kwargs)
+        if db is not None:
+            resp = await tracked_messages_create(
+                db,
+                feature=feature,
+                client=client,
+                metadata=meta,
+                **kwargs,
+            )
+        else:
+            resp = await client.messages.create(**kwargs)
         await record_usage(model, resp.usage, meta)
 
         if resp.stop_reason != "tool_use" or not enable_tools:
@@ -156,10 +169,12 @@ async def chat(
     *,
     tier: Tier = "light",
     enable_tools: bool = True,
+    db: AsyncSession | None = None,
 ) -> dict[str, Any]:
     """Convenience for a single-turn chat (used by AIRail + IntakeScreen)."""
     return await run(
         [{"role": "user", "content": user_message}],
         tier=tier,
         enable_tools=enable_tools,
+        db=db,
     )

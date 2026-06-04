@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     anthropic_model_heavy: str = "claude-sonnet-4-6"
     anthropic_model_light: str = "claude-haiku-4-5"
 
+    # Estimated Anthropic prices per 1M tokens, used for local cost
+    # attribution. Alert thresholds live in AppSettings.ai_spend so
+    # super-admins can tune them from the dashboard.
+    ai_pricing_light_input_per_mtok: float = 0.80
+    ai_pricing_light_output_per_mtok: float = 4.00
+    ai_pricing_heavy_input_per_mtok: float = 3.00
+    ai_pricing_heavy_output_per_mtok: float = 15.00
+
     # AWS
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""

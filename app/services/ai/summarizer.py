@@ -39,6 +39,7 @@ from app.models.document import Document
 from app.models.loan import Loan
 from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.context import assemble_loan_context, get_market_pulse
+from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -291,8 +292,13 @@ async def _llm_profile(
 
     try:
         client = get_client()
-        resp = await client.messages.create(
+        resp = await tracked_messages_create(
+            db,
+            feature="loan_summary",
+            client=client,
             model=model_light(),
+            client_id=loan.client_id,
+            loan_id=loan.id,
             max_tokens=600,
             system=[
                 {"type": "text", "text": SUMMARIZER_SYSTEM, "cache_control": {"type": "ephemeral"}}

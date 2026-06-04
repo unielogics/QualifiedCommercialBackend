@@ -85,6 +85,26 @@ class AICadence(BaseModel):
     confidence_floor_default: float = 0.80  # 0..1
 
 
+# --- Section: AI spend monitoring ----------------------------------------
+
+class AISpendSettings(BaseModel):
+    """Super-admin managed AI spend policy.
+
+    Thresholds are alert-only by default. Manual emergency switches can
+    pause categories, but crossing a threshold never shuts down agent
+    workflows by itself.
+    """
+    daily_warning_usd: float = 10.0
+    daily_critical_usd: float = 25.0
+    avg_client_file_warning_usd: float = 1.50
+    avg_client_file_critical_usd: float = 3.00
+    chat_enabled: bool = True
+    automations_enabled: bool = True
+    document_scanning_enabled: bool = True
+    summaries_enabled: bool = True
+    lender_ai_enabled: bool = True
+
+
 # --- Section: referrals --------------------------------------------------
 
 class ReferralSettings(BaseModel):
@@ -237,6 +257,7 @@ class AppSettingsData(BaseModel):
         default_factory=lambda: dict(_DEFAULT_TRANSACTION_CHECKLISTS)
     )
     ai_cadence: AICadence = Field(default_factory=AICadence)
+    ai_spend: AISpendSettings = Field(default_factory=AISpendSettings)
     referrals: ReferralSettings = Field(default_factory=ReferralSettings)
     pricing: PricingSettings = Field(default_factory=PricingSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
@@ -255,6 +276,7 @@ class AppSettingsUpdate(BaseModel):
     checklists: dict[str, LoanTypeChecklist] | None = None
     transaction_checklists: dict[str, LoanTypeChecklist] | None = None
     ai_cadence: AICadence | None = None
+    ai_spend: AISpendSettings | None = None
     referrals: ReferralSettings | None = None
     pricing: PricingSettings | None = None
     security: SecuritySettings | None = None

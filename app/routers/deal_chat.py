@@ -38,6 +38,7 @@ from app.schemas.loan_workspace import (
     ChatSendResponse,
 )
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.push import fire_and_forget_push
 
@@ -296,6 +297,8 @@ async def _generate_ai_reply(
             result = await orchestrator_run(
                 turns,  # type: ignore[arg-type]
                 tier="light",
+                db=db,
+                feature="deal_chat",
                 max_tokens=500,
                 system=system,
                 meta={"activity": "deal_chat", "deal_id": deal.id, "client_id": deal.client_id},

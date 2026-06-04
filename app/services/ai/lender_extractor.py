@@ -67,6 +67,7 @@ from app.models.email_draft import EmailDraft
 from app.models.loan import Loan
 from app.models.message import Message
 from app.services.ai.anthropic_client import get_client, model_heavy, model_light
+from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ async def extract_and_persist(
     if not transcript.strip():
         return None
 
-    extract = await _call_llm(transcript)
+    extract = await _call_llm(db, transcript, loan=loan)
     if extract is None:
         return None
 
@@ -266,7 +267,7 @@ def _format_transcript(
     return "\n\n".join(line for _, line in events)
 
 
-async def _call_llm(transcript: str) -> dict[str, Any] | None:
+async def _call_llm(db: AsyncSession, transcript: str, *, loan: Loan) -> dict[str, Any] | None:
     """Run the heavy model over the transcript. Falls back to None on
     any failure — callers leave loans.living_profile.lender_extract
     untouched in that case so the UI continues showing the last good
@@ -274,8 +275,13 @@ async def _call_llm(transcript: str) -> dict[str, Any] | None:
     settings = get_settings()
     try:
         client = get_client()
-        resp = await client.messages.create(
+        resp = await tracked_messages_create(
+            db,
+            feature="lender_extract",
+            client=client,
             model=model_heavy(),
+            loan_id=loan.id,
+            client_id=loan.client_id,
             max_tokens=1500,
             system=_EXTRACT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": transcript}],

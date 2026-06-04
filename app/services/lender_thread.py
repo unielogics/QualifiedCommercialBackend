@@ -76,6 +76,7 @@ from app.models.message import Message
 from app.models.user import User
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 from app.services.email.parser import inject_deal_id
 from app.services.email.pii_filter import RedactionContext, redact_text
 
@@ -535,8 +536,12 @@ async def summarize_thread(
     transcript = _format_thread_for_llm(thread.entries)
     try:
         client = get_client()
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="lender_thread_subject",
+            client=client,
             model=model_light(),
+            loan_id=loan_id,
             max_tokens=400,
             system=_SUMMARY_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": transcript}],
@@ -583,6 +588,9 @@ You are writing TO the lender on behalf of the brokerage."""
 
 async def _ai_draft_from_instruction(
     *,
+    db: AsyncSession,
+    loan_id: UUID,
+    client_id: UUID | None,
     instruction: str,
     thread_text: str,
     deal_id: str,
@@ -600,8 +608,13 @@ async def _ai_draft_from_instruction(
         return fallback
     try:
         client = get_client()
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="lender_thread_reply",
+            client=client,
             model=model_light(),
+            loan_id=loan_id,
+            client_id=client_id,
             max_tokens=500,
             system=_INSTRUCT_SYSTEM_PROMPT,
             messages=[
@@ -753,6 +766,9 @@ async def post_reply(
         thread = await load_thread(db, loan_id=loan_id, viewer=actor)
         thread_text = _format_thread_for_llm(thread.entries)
         body = await _ai_draft_from_instruction(
+            db=db,
+            loan_id=loan.id,
+            client_id=loan.client_id,
             instruction=text,
             thread_text=thread_text,
             deal_id=loan.deal_id,
@@ -1159,6 +1175,9 @@ async def preview_reply(
         thread = await load_thread(db, loan_id=loan_id, viewer=actor)
         thread_text = _format_thread_for_llm(thread.entries)
         body = await _ai_draft_from_instruction(
+            db=db,
+            loan_id=loan.id,
+            client_id=loan.client_id,
             instruction=text,
             thread_text=thread_text,
             deal_id=loan.deal_id,

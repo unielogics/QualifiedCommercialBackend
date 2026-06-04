@@ -32,6 +32,7 @@ from app.models.deal_chat_message import DealChatMessage
 from app.models.loan import Loan
 from app.models.loan_chat_message import LoanChatMessage
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -99,8 +100,14 @@ async def seed_loan_chat_from_deal(
     else:
         try:
             client = get_client()
-            resp = await client.messages.create(
+            resp = await tracked_messages_create(
+                db,
+                feature="handoff_seed",
+                client=client,
                 model=model_light(),
+                loan_id=loan.id,
+                client_id=loan.client_id,
+                metadata={"deal_id": str(deal.id)},
                 max_tokens=600,
                 messages=[{"role": "user", "content": summary_prompt}],
             )

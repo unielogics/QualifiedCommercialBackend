@@ -129,6 +129,10 @@ ExecStartPre=-/usr/bin/docker rm qcbackend
 ExecStart=/usr/bin/docker run --rm --name qcbackend \\
   -p 127.0.0.1:8000:8000 \\
   --env-file ${ENV_FILE} \\
+  --health-cmd="python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/ready\", timeout=3).read()'" \\
+  --health-interval=30s \\
+  --health-timeout=5s \\
+  --health-retries=3 \\
   ${LOCAL_TAG}
 ExecStop=/usr/bin/docker stop qcbackend
 

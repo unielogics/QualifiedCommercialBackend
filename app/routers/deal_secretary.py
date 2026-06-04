@@ -942,10 +942,17 @@ async def infer_playbook_dependencies(
     user_prompt = f"Playbook: {pb.name} ({pb.playbook_type}, product_key={pb.product_key})\n\nTasks:\n{items_block}"
 
     from app.services.ai.anthropic_client import get_client, model_light
+    from app.services.ai.usage import tracked_messages_create
     client = get_client()
     try:
-        resp = await client.messages.create(
+        resp = await tracked_messages_create(
+            db,
+            feature="deal_secretary",
+            client=client,
             model=model_light(),
+            user_id=user.id,
+            broker_id=user.broker.id if user.broker else None,
+            metadata={"playbook_id": str(playbook_id)},
             max_tokens=4000,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],

@@ -57,6 +57,7 @@ from app.models.document import Document
 from app.models.loan import Loan
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.anthropic_client import get_client, model_heavy
+from app.services.ai.usage import tracked_messages_create
 from app.services.loan_intake_automation import _checklist_for, _coerce_settings
 
 log = logging.getLogger(__name__)
@@ -383,8 +384,14 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
 
     try:
         client = get_client()
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="document_scan",
+            client=client,
             model=model_heavy(),
+            client_id=loan.client_id,
+            loan_id=loan.id,
+            metadata={"document_id": str(doc.id), "content_type": ct},
             max_tokens=900,
             system=_VISION_SYSTEM,
             messages=[

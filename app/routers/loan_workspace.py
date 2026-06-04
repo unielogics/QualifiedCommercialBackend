@@ -65,6 +65,7 @@ from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.ai import engagement
 from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
+from app.services.ai.usage import tracked_messages_create
 from app.services.math import dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
 from app.models.client import Client as ClientModel
@@ -292,6 +293,8 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
             result = await orchestrator_run(
                 turns,  # type: ignore[arg-type]
                 tier="light",
+                db=db,
+                feature="loan_workspace_chat",
                 max_tokens=300,
                 system=system,
                 meta={"activity": "loan_chat", "loan_id": loan.id, "broker_id": loan.broker_id},
@@ -768,6 +771,8 @@ async def _generate_ai_reply(
             result = await orchestrator_run(
                 turns,  # type: ignore[arg-type]
                 tier="light",
+                db=db,
+                feature="loan_workspace_chat",
                 max_tokens=500,
                 system=system,
                 meta={

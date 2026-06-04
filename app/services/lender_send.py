@@ -48,6 +48,7 @@ from app.models.email_draft import EmailDraft
 from app.models.lender import Lender
 from app.models.loan import Loan
 from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.usage import tracked_messages_create
 from app.services.document_zip import DocumentZipError, package_documents
 
 log = logging.getLogger(__name__)
@@ -276,7 +277,10 @@ def _build_lender_context(loan: Loan, selected: list[Document]) -> str:
 
 
 async def _ai_draft_body(
+    db: AsyncSession,
     *,
+    loan_id: UUID | None,
+    client_id: UUID | None,
     deal_id: str,
     address: str,
     loan_type: str,
@@ -305,8 +309,13 @@ async def _ai_draft_body(
         return fallback
     try:
         client = get_client()
-        result = await client.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="lender_send",
+            client=client,
             model=model_light(),
+            loan_id=loan_id,
+            client_id=client_id,
             max_tokens=700,
             system=_BODY_SYSTEM_PROMPT,
             messages=[
@@ -442,6 +451,9 @@ async def draft_lender_send(
 
     lender_context = _build_lender_context(loan, selected)
     ai_body = await _ai_draft_body(
+        db,
+        loan_id=loan.id,
+        client_id=loan.client_id,
         deal_id=loan.deal_id,
         address=loan.address,
         loan_type=str(loan.type.value if hasattr(loan.type, "value") else loan.type),

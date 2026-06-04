@@ -683,7 +683,7 @@ async def evaluate_doc_reminders(
                 close_date=loan.close_date,
                 borrower_first_name=first_name_of(loan.client),
             )
-            body = await compose_collection_nudge(ctx)
+            body = await compose_collection_nudge(db, ctx)
             actions = [
                 {
                     "kind": "upload_document",
