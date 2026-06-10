@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -240,6 +240,8 @@ class LoanRead(ORMModel):
     status_summary: str | None = None
     deal_health: DealHealth = DealHealth.ON_TRACK
     living_profile: LivingLoanProfile | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class PropertyUpdate(BaseModel):
