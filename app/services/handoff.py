@@ -54,6 +54,7 @@ from app.enums import (
     LoanType,
 )
 from app.models.activity import Activity
+from app.models.agent_task import AgentTask
 from app.models.ai_chat_thread import AIChatMessage, AIChatThread
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
@@ -136,6 +137,23 @@ def _filter_visibility(
     return kept, excluded
 
 
+def _agent_task_handoff_item(task: AgentTask) -> dict[str, Any]:
+    return {
+        "id": str(task.id),
+        "requirement_key": f"agent_task:{task.id}",
+        "label": task.title,
+        "description": task.description,
+        "category": task.category,
+        "visibility": task.visibility,
+        "owner_type": task.owner_type,
+        "status": task.status,
+        "priority": task.priority,
+        "due_at": task.due_at.isoformat() if task.due_at else None,
+        "notes": task.notes,
+        "source": "agent_task",
+    }
+
+
 async def _build_baseline_snapshot(
     db: AsyncSession,
     *,
@@ -194,6 +212,20 @@ async def _build_baseline_snapshot(
     verified_filtered, facts_excluded = _filter_visibility(
         verified_facts, handoff_includes_team_notes=handoff_includes_team_notes
     )
+    task_rows = list(
+        (
+            await db.execute(
+                select(AgentTask)
+                .where(AgentTask.client_id == client.id)
+                .where(AgentTask.deal_id == deal.id)
+                .order_by(AgentTask.due_at.asc().nulls_last(), AgentTask.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    raw_task_items = [_agent_task_handoff_item(task) for task in task_rows]
+    task_filtered, task_excluded = _filter_visibility(
+        raw_task_items, handoff_includes_team_notes=handoff_includes_team_notes
+    )
 
     # Internal custom_instructions never surfaces in baseline.
     safe_instructions = None
@@ -202,12 +234,13 @@ async def _build_baseline_snapshot(
         # plan didn't explicitly mark it internal.
         safe_instructions = custom_instructions
 
-    excluded_total = miss_excluded + facts_excluded
+    excluded_total = miss_excluded + facts_excluded + task_excluded
     snapshot = {
         "realtor_profile": realtor_profile,
         "verified_facts": verified_filtered,
         "missing_lending_items": missing_filtered,
         "document_refs": document_refs,
+        "agent_tasks": task_filtered,
         "recommended_lending_path": {
             "deal_type": deal.deal_type,
             "side": deal.side,
@@ -274,6 +307,14 @@ async def promote_deal_to_loan(
     if snapshot["missing_lending_items"]:
         handoff_summary_parts.append(
             f"{len(snapshot['missing_lending_items'])} item(s) still needed for lending."
+        )
+    open_handoff_tasks = [
+        t for t in snapshot.get("agent_tasks", [])
+        if t.get("status") not in {"done", "cancelled"}
+    ]
+    if open_handoff_tasks:
+        handoff_summary_parts.append(
+            f"{len(open_handoff_tasks)} realtor-side task(s) marked funding-visible."
         )
     if notes:
         handoff_summary_parts.append(notes)
@@ -372,6 +413,16 @@ async def promote_deal_to_loan(
     # Prefer our deal-aware handoff_summary over the generic one the
     # builder composes from realtor_profile alone.
     packet_payload["handoff_summary"] = handoff_summary
+    packet_payload["realtor_summary"] = {
+        **(packet_payload.get("realtor_summary") or {}),
+        "funding_visible_agent_tasks": snapshot.get("agent_tasks", []),
+    }
+    existing_missing = list(packet_payload.get("missing_lending_items") or [])
+    for task in open_handoff_tasks:
+        label = str(task.get("label") or task.get("requirement_key") or "").strip()
+        if label and label not in existing_missing:
+            existing_missing.append(label)
+    packet_payload["missing_lending_items"] = existing_missing
     # Link the packet to the new loan up front so audit queries can
     # find it without a roundtrip through PrequalRequest.
     packet_payload["loan_id"] = loan.id
@@ -438,6 +489,21 @@ async def promote_deal_to_loan(
     if realtor_thread is not None and realtor_thread.phase is None:
         realtor_thread.phase = "realtor"
 
+    # Stop realtor-side AI outreach for this client/deal now that the
+    # funding workflow owns the file.
+    try:
+        from app.services.ai.ai_agent import mark_leads_handed_off_for_deal
+
+        await mark_leads_handed_off_for_deal(
+            db,
+            client_id=client.id,
+            deal_id=deal.id,
+            loan_id=loan.id,
+            actor_id=getattr(user, "id", None),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("AI-agent handoff transition failed deal=%s loan=%s", deal.id, loan.id)
+
     # Mark the deal promoted.
     deal.handoff_status = DealHandoffStatus.PROMOTED.value
     deal.status = DealStatus.PROMOTED.value
@@ -459,6 +525,7 @@ async def promote_deal_to_loan(
                 "funding_file_kind": funding_file_kind,
                 "handoff_includes_team_notes": handoff_includes_team_notes,
                 "excluded_visibility_filtered": excluded_count,
+                "funding_visible_agent_task_count": len(snapshot.get("agent_tasks", [])),
             },
         )
     )

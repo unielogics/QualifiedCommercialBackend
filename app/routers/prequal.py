@@ -9,7 +9,7 @@ Endpoint surface:
   POST   /prequal-requests                        borrower, ALSO spawns a Loan stub
   GET    /loans/{loan_id}/prequal-requests       per-loan list (scoped)
   GET    /me/prequal-requests                    borrower's own list
-  GET    /admin/prequal-requests                 firm-wide queue (operator-only)
+  GET    /admin/prequal-requests                 funding queue (broker-scoped or firm-wide)
   PUT    /admin/prequal-requests/{id}/approve    render PDF + flip status
   PUT    /admin/prequal-requests/{id}/reject     flip status with required reason
 
@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -157,13 +157,17 @@ async def _spawn_loan_from_approved_request(
     loan_type_enum = _loan_type_to_enum(request.loan_type)
     loan_purpose = _loan_purpose_for(request.loan_type)
 
-    # Look up the requesting user → client.
+    # Look up the requesting user -> client. Manual requests may carry a
+    # linked client_id while requester_id still points at the operator.
     user = (
         await db.execute(
             select(User).options(selectinload(User.client)).where(User.id == request.requester_id)
         )
     ).scalar_one_or_none()
-    if user is None or user.client is None:
+    client = user.client if user is not None and user.client is not None else None
+    if client is None and request.client_id is not None:
+        client = await db.get(Client, request.client_id)
+    if client is None:
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Cannot promote prequal — requester has no client record.",
@@ -171,8 +175,8 @@ async def _spawn_loan_from_approved_request(
 
     loan = Loan(
         deal_id=_gen_deal_id(),
-        client_id=user.client.id,
-        broker_id=getattr(user.client, "broker_id", None),
+        client_id=client.id,
+        broker_id=getattr(client, "broker_id", None),
         address=request.target_property_address,
         property_type=PropertyType.SFR,
         type=loan_type_enum,
@@ -232,14 +236,20 @@ async def _spawn_loan_from_approved_request(
 
 
 def _scope_loan_for_borrower(loan: Loan, user) -> bool:
-    """Borrower can only act on their own loans."""
+    """Borrowers and brokers can only act on loans they own/represent."""
     if user.role == Role.CLIENT and user.client:
         return loan.client_id == user.client.id
+    if user.role == Role.BROKER and user.broker:
+        return loan.broker_id == user.broker.id
+    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+
+
+def _can_manage_prequal_queue(user) -> bool:
     return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER}
 
 
-def _is_operator(user) -> bool:
-    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER}
+def _can_underwrite_prequal(user) -> bool:
+    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 
 
 async def _create_request(
@@ -376,6 +386,8 @@ async def submit_prequal_spawn(
     Auto-approval (Phase 5) runs after creation — request flips to
     `approved` immediately when the math is clean (FICO floor, LTV
     cap, tier check, loan ceiling all pass)."""
+    if user.role != Role.CLIENT or user.client is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Client account required")
     req = await _create_request(None, payload, user, db)
     # Auto-approval runs in the background scheduler tick, not inline —
     # see submit_prequal_for_loan note above.
@@ -430,7 +442,7 @@ class AdminManualCreditOverride(BaseModel):
 
 
 class AdminPrequalCreate(PrequalRequestCreate):
-    """Super-admin / underwriter manually creates a prequal on behalf
+    """Broker or funding operator manually creates a prequal on behalf
     of a borrower. Mandatory client_id; optional manual_credit_override
     so the LTV math has FICO + portfolio context when no real
     CreditSummary exists yet."""
@@ -448,31 +460,36 @@ async def admin_create_manual_prequal(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PrequalRequestRead:
-    """Manual prequalification creation — operator-only. Lands as
+    """Manual prequalification creation for brokers and funding operators. Lands as
     `pending` and is picked up by the existing PrequalReviewModal
     approve / decline flow.
 
     Why this exists: the borrower-facing POST /prequal-requests
-    requires user.client. Super-admins on a borrower's behalf can't
+    requires user.client. Brokers/operators acting on a borrower's behalf can't
     use that path because the prequal needs to be parented to the
     Client row, not the operator. This endpoint stamps client_id
     explicitly and stashes manual_credit_override JSONB the approve
     path reads when no real CreditSummary is on file."""
-    if not _is_operator(user):
+    if not _can_manage_prequal_queue(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
 
     # Confirm the client exists.
     client = await db.get(Client, payload.client_id)
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    if user.role == Role.BROKER:
+        if user.broker is None or client.broker_id != user.broker.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot create prequal for this client")
 
     # Build via _create_request (loan is None — the manual flow doesn't
     # spawn a Loan up front; one is created on offer-accepted just like
     # the borrower path).
     req = await _create_request(None, payload, user, db)
 
-    # Stamp the admin-only fields the borrower path doesn't carry.
+    # Stamp the manual-flow fields the borrower path doesn't carry.
     req.client_id = payload.client_id
+    if client.user_id is not None:
+        req.requester_id = client.user_id
     if payload.manual_credit_override is not None:
         req.manual_credit_override = payload.manual_credit_override.model_dump()
     await db.flush()
@@ -488,9 +505,21 @@ async def list_admin_prequal_queue(
 ) -> list[PrequalRequestRead]:
     """Firm-wide queue. Default sort: PENDING first, then by closing date
     (NULLS-last) so urgent ones float to the top."""
-    if not _is_operator(user):
+    if not _can_manage_prequal_queue(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
     stmt = select(PrequalRequest).options(selectinload(PrequalRequest.loan))
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Broker profile required")
+        broker_client_ids = select(Client.id).where(Client.broker_id == user.broker.id)
+        broker_loan_ids = select(Loan.id).where(Loan.broker_id == user.broker.id)
+        stmt = stmt.where(
+            or_(
+                PrequalRequest.client_id.in_(broker_client_ids),
+                PrequalRequest.loan_id.in_(broker_loan_ids),
+                PrequalRequest.requester_id == user.id,
+            )
+        )
     if status_filter in {"pending", "approved", "rejected"}:
         stmt = stmt.where(PrequalRequest.status == status_filter)
     # Pending floats first; within a status group, oldest-closing-first
@@ -745,8 +774,8 @@ async def approve_prequal_request(
     """Manual operator approval. Auto-approval (system-driven, when
     the math is clean at submit time) goes through `_apply_approval`
     directly from `submit_prequal_*` handlers — see Phase 5."""
-    if not _is_operator(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    if not _can_underwrite_prequal(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter role required")
 
     req = await db.get(PrequalRequest, request_id)
     if req is None:
@@ -801,8 +830,8 @@ async def revise_prequal_request(
     offer_declined / rejected) are deliberately excluded — those need
     their own flows (spawned-Loan update on accept; brand-new request
     otherwise) and are out of scope for this endpoint."""
-    if not _is_operator(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    if not _can_underwrite_prequal(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter role required")
 
     source = await db.get(PrequalRequest, request_id)
     if source is None:
@@ -920,8 +949,8 @@ async def reject_prequal_request(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PrequalRequestRead:
-    if not _is_operator(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    if not _can_underwrite_prequal(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter role required")
 
     req = await db.get(PrequalRequest, request_id)
     if req is None:
@@ -974,10 +1003,10 @@ async def _load_request_for_outcome(
     req = await db.get(PrequalRequest, request_id)
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
-    # Borrower can only act on their own; operators on any.
+    # Borrower can only act on their own; underwriting roles on any.
     if user.role == Role.CLIENT and req.requester_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot act on this request")
-    if not (user.role == Role.CLIENT or _is_operator(user)):
+    if not (user.role == Role.CLIENT or _can_underwrite_prequal(user)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
     if req.status != "approved":
         raise HTTPException(

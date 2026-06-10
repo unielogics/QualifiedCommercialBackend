@@ -17,7 +17,10 @@ promote_deal_to_loan when composing baseline_profile_snapshot.
 
 from __future__ import annotations
 
-from app.services.handoff import _filter_visibility
+import uuid
+
+from app.models.agent_task import AgentTask
+from app.services.handoff import _agent_task_handoff_item, _filter_visibility
 
 
 def test_funding_visible_always_kept():
@@ -113,3 +116,28 @@ def test_non_dict_entries_ignored():
     assert [k["requirement_key"] for k in kept] == ["k1"]
     # Non-dict entries don't bump the excluded count — they're invalid input.
     assert excluded == 0
+
+
+def test_agent_task_handoff_item_shape():
+    task_id = uuid.uuid4()
+    task = AgentTask(
+        id=task_id,
+        client_id=uuid.uuid4(),
+        deal_id=uuid.uuid4(),
+        title="Confirm access instructions",
+        description="Gate code and lockbox note",
+        category="funding_prep",
+        visibility="funding_visible",
+        owner_type="human",
+        status="open",
+        priority="high",
+        notes="Listing agent confirmed by text.",
+    )
+
+    item = _agent_task_handoff_item(task)
+
+    assert item["id"] == str(task_id)
+    assert item["requirement_key"] == f"agent_task:{task_id}"
+    assert item["label"] == "Confirm access instructions"
+    assert item["source"] == "agent_task"
+    assert item["visibility"] == "funding_visible"

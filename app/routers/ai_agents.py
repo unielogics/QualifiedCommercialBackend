@@ -133,6 +133,13 @@ class AgentPatch(BaseModel):
     voice_profile_id: uuid.UUID | None = None
 
 
+class InboundReplyIn(BaseModel):
+    from_email: str
+    body: str
+    subject: str | None = None
+    provider_message_id: str | None = None
+
+
 @router.get("")
 async def list_agents(user: CurrentUser, db: AsyncSession = Depends(get_db)):
     broker = await _broker_for(db, user)
@@ -183,6 +190,35 @@ async def create_agent(
     await db.flush()
     await db.commit()
     return _ser_agent(agent)
+
+
+@router.post("/inbound-reply")
+async def record_inbound_reply(
+    payload: InboundReplyIn,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+):
+    """Transport-neutral inbound reply hook for AI Agents.
+
+    Today this is primarily an operator/test hook. SES/Gmail inbound can
+    call the same service when that transport is provisioned.
+    """
+    if user.role not in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    broker_id: uuid.UUID | None = None
+    if user.role == Role.BROKER:
+        broker = await _broker_for(db, user)
+        broker_id = broker.id
+    result = await svc.handle_inbound_reply(
+        db,
+        from_email=payload.from_email,
+        body=payload.body,
+        subject=payload.subject,
+        provider_message_id=payload.provider_message_id,
+        broker_id=broker_id,
+    )
+    await db.commit()
+    return result
 
 
 @router.get("/{agent_id}")
@@ -784,6 +820,9 @@ async def start_training(
             tier="light",
             max_tokens=600,
             system=system_text,
+            db=db,
+            feature="ai_agent_training",
+            meta={"activity": "ai_agent_training", "ai_agent_id": agent.id, "broker_id": agent.broker_id},
         )
         text = svc._text_of(result)
         if text:
@@ -856,6 +895,9 @@ async def post_training_turn(
             tier="light",
             max_tokens=700,
             system=system_text,
+            db=db,
+            feature="ai_agent_training",
+            meta={"activity": "ai_agent_training", "ai_agent_id": agent.id, "broker_id": agent.broker_id},
         )
         text = svc._text_of(result)
         if text:
@@ -1147,6 +1189,9 @@ async def run_test(
             tier="light",
             max_tokens=800,
             system=system,
+            db=db,
+            feature="ai_agent_test",
+            meta={"activity": "ai_agent_test", "ai_agent_id": agent.id, "broker_id": agent.broker_id},
         )
         reply = svc._text_of(result)
     except Exception as exc:  # noqa: BLE001

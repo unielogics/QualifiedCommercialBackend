@@ -23,10 +23,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import AIAgentStatus, ClientStage
+from app.models.activity import Activity
 from app.models.ai_agent import (
     AIAgent,
     AIAgentExitRules,
@@ -79,6 +80,60 @@ def _extract_json(raw: str) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _reply_decision_from_text(
+    *,
+    body: str,
+    goal: AIAgentGoal | None = None,
+) -> tuple[str, str]:
+    """Cheap deterministic reply classifier.
+
+    Returns (lead_status, reason). LLM classification can refine this later,
+    but this covers the important lifecycle guard without making inbound
+    processing dependent on a paid provider call.
+    """
+    text = (body or "").strip().lower()
+    if not text:
+        return "replied", "empty_reply"
+
+    negative_markers = (
+        "stop",
+        "unsubscribe",
+        "don't contact",
+        "do not contact",
+        "not interested",
+        "no thanks",
+        "remove me",
+    )
+    if any(marker in text for marker in negative_markers):
+        return "handed_off", "opt_out_or_negative_reply"
+
+    positive_markers = (
+        "call me",
+        "schedule",
+        "book",
+        "ready",
+        "interested",
+        "let's talk",
+        "lets talk",
+        "show me",
+        "tour",
+        "offer",
+        "prequal",
+        "pre-qual",
+        "loan",
+        "financing",
+    )
+    if any(marker in text for marker in positive_markers):
+        return "handed_off", "qualified_or_actionable_reply"
+
+    for trigger in (goal.handoff_triggers if goal else []) or []:
+        trig = str(trigger or "").strip().lower()
+        if trig and trig in text:
+            return "handed_off", "matched_configured_handoff_trigger"
+
+    return "replied", "reply_needs_agent_review"
 
 
 def touchpoint_for_attempt(agent: AIAgent, attempt_index: int) -> str:
@@ -153,7 +208,9 @@ async def classify_knowledge_document(
             tier="light",
             max_tokens=700,
             system="You classify documents. Output strict JSON only.",
-            meta={"activity": "knowledge_classify"},
+            db=db,
+            feature="ai_agent_knowledge_classify",
+            meta={"activity": "knowledge_classify", "ai_agent_id": doc.agent_user_id},
         )
         data = _extract_json(_text_of(result))
         if data:
@@ -696,6 +753,8 @@ async def compose_message(
             tier="light",
             max_tokens=900,
             system=system,
+            db=db,
+            feature="ai_agent_compose",
             meta={
                 "activity": "ai_agent_compose",
                 "ai_agent_id": agent.id,
@@ -795,6 +854,8 @@ async def generate_playbook(db: AsyncSession, agent: AIAgent) -> None:
                 "You are a senior real-estate sales strategist. Produce a "
                 "precise, actionable playbook as strict JSON. No prose."
             ),
+            db=db,
+            feature="ai_agent_playbook_synthesis",
             meta={
                 "activity": "playbook_synthesis",
                 "ai_agent_id": agent.id,
@@ -856,6 +917,8 @@ async def generate_showing_guide(db: AsyncSession, agent: AIAgent) -> None:
                 "You are a senior real-estate agent coach. Produce a precise "
                 "discovery + showing playbook as strict JSON. No prose."
             ),
+            db=db,
+            feature="ai_agent_showing_guide",
             meta={
                 "activity": "showing_guide",
                 "ai_agent_id": agent.id,
@@ -874,3 +937,130 @@ async def generate_showing_guide(db: AsyncSession, agent: AIAgent) -> None:
         guide.generation_status = "failed"
         guide.generation_error = str(exc)[:500]
     await db.flush()
+
+
+async def mark_leads_handed_off_for_deal(
+    db: AsyncSession,
+    *,
+    client_id: UUID,
+    deal_id: UUID,
+    loan_id: UUID | None = None,
+    actor_id: UUID | None = None,
+) -> int:
+    """Stop realtor-side AI outreach when a deal becomes a funding file.
+
+    We stop both deal-scoped leads and client-scoped leads for this client.
+    The latter prevents a generic nurture agent from continuing to message
+    the borrower while underwriting is taking over.
+    """
+    rows = list(
+        (
+            await db.execute(
+                select(AIAgentLead)
+                .join(AIAgent, AIAgent.id == AIAgentLead.ai_agent_id)
+                .where(AIAgentLead.client_id == client_id)
+                .where(or_(AIAgentLead.deal_id == deal_id, AIAgentLead.deal_id.is_(None)))
+                .where(AIAgentLead.status.in_(["pending_review", "active", "paused", "replied"]))
+            )
+        ).scalars().all()
+    )
+    for lead in rows:
+        lead.status = "handed_off"
+        lead.next_action_at = None
+    if rows:
+        db.add(
+            Activity(
+                client_id=client_id,
+                loan_id=loan_id,
+                actor_id=actor_id,
+                actor_label="system",
+                kind="ai_agent.handed_off",
+                summary=f"Stopped {len(rows)} realtor AI agent lead(s) for funding handoff.",
+                payload={
+                    "deal_id": str(deal_id),
+                    "lead_ids": [str(row.id) for row in rows],
+                },
+            )
+        )
+    await db.flush()
+    return len(rows)
+
+
+async def handle_inbound_reply(
+    db: AsyncSession,
+    *,
+    from_email: str,
+    body: str,
+    subject: str | None = None,
+    provider_message_id: str | None = None,
+    broker_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Match an inbound reply to the broker AI-agent lead and stop cadence.
+
+    This is transport-agnostic so SES inbound, Gmail inbound, or an admin
+    injected test can all call the same state transition. Matching is by
+    client email and most recent active/replied lead for that client.
+    """
+    email = (from_email or "").strip().lower()
+    if not email:
+        return {"matched": False, "reason": "missing_from_email"}
+
+    client_stmt = select(Client).where(func.lower(Client.email) == email)
+    if broker_id is not None:
+        client_stmt = client_stmt.where(Client.broker_id == broker_id)
+    client = (await db.execute(client_stmt.limit(1))).scalar_one_or_none()
+    if client is None:
+        return {"matched": False, "reason": "client_not_found"}
+
+    row = (
+        await db.execute(
+            select(AIAgentLead, AIAgent)
+            .join(AIAgent, AIAgent.id == AIAgentLead.ai_agent_id)
+            .where(AIAgentLead.client_id == client.id)
+            .where(AIAgentLead.status.in_(["pending_review", "active", "paused", "replied"]))
+            .order_by(AIAgentLead.last_outbound_at.desc().nulls_last(), AIAgentLead.enrolled_at.desc())
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return {"matched": False, "reason": "active_lead_not_found", "client_id": str(client.id)}
+
+    lead, agent = row
+    goal = (
+        await db.execute(select(AIAgentGoal).where(AIAgentGoal.ai_agent_id == agent.id))
+    ).scalar_one_or_none()
+    status, reason = _reply_decision_from_text(body=body, goal=goal)
+    lead.status = status
+    lead.next_action_at = None
+
+    db.add(
+        Activity(
+            client_id=client.id,
+            actor_id=agent.owner_user_id,
+            actor_label="client",
+            kind="ai_agent.reply_received",
+            summary=(
+                f"Reply received for AI Agent '{agent.name}' "
+                f"({status.replace('_', ' ')})."
+            )[:512],
+            payload={
+                "ai_agent_id": str(agent.id),
+                "lead_id": str(lead.id),
+                "deal_id": str(lead.deal_id) if lead.deal_id else None,
+                "from_email": from_email,
+                "subject": subject,
+                "provider_message_id": provider_message_id,
+                "decision": status,
+                "reason": reason,
+            },
+        )
+    )
+    await db.flush()
+    return {
+        "matched": True,
+        "client_id": str(client.id),
+        "ai_agent_id": str(agent.id),
+        "lead_id": str(lead.id),
+        "status": status,
+        "reason": reason,
+    }

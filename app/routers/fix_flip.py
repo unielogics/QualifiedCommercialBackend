@@ -59,25 +59,36 @@ async def _assert_can_attach(
         if (await db.execute(stmt)).scalar_one_or_none() is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this client")
     if deal_id is not None:
-        stmt = select(Deal.id).where(Deal.id == deal_id)
+        stmt = select(Deal).where(Deal.id == deal_id)
         if user.role == Role.CLIENT and user.client:
             stmt = stmt.where(Deal.client_id == user.client.id)
         elif user.role == Role.BROKER:
-            stmt = stmt.where(Deal.assigned_agent_id == user.id)
+            client_subq = select(Client.id).where(Client.broker_id == user.broker.id) if user.broker else None
+            if client_subq is None:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this deal")
+            stmt = stmt.where(Deal.client_id.in_(client_subq))
         else:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this deal")
-        if (await db.execute(stmt)).scalar_one_or_none() is None:
+        deal = (await db.execute(stmt)).scalar_one_or_none()
+        if deal is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this deal")
+        if client_id is not None and deal.client_id != client_id:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Deal is not attached to that client")
     if loan_id is not None:
-        stmt = select(Loan.id).where(Loan.id == loan_id)
+        stmt = select(Loan).where(Loan.id == loan_id)
         if user.role == Role.CLIENT and user.client:
             stmt = stmt.where(Loan.client_id == user.client.id)
         elif user.role == Role.BROKER and user.broker:
             stmt = stmt.where(Loan.broker_id == user.broker.id)
         else:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this loan")
-        if (await db.execute(stmt)).scalar_one_or_none() is None:
+        loan = (await db.execute(stmt)).scalar_one_or_none()
+        if loan is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Cannot attach this loan")
+        if client_id is not None and loan.client_id != client_id:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Loan is not attached to that client")
+        if deal_id is not None and loan.deal_id != deal_id:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Loan is not attached to that deal")
 
 
 def _scope(user: User, stmt):
