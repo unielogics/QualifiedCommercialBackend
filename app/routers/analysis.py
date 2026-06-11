@@ -57,6 +57,24 @@ def _is_operator(user) -> bool:
     return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 
 
+def _has_property_intelligence_scope(payload: PropertyIntelligenceLookupRequest) -> bool:
+    return any((payload.client_id, payload.deal_id, payload.loan_id))
+
+
+def _enforce_property_lookup_access(user, payload: PropertyIntelligenceLookupRequest) -> None:
+    if _is_operator(user):
+        return
+    if user.role not in {Role.BROKER, Role.CLIENT}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Property intelligence is not available to this role")
+    if payload.force_refresh:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only operators can force-refresh property intelligence")
+    if not _has_property_intelligence_scope(payload):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Link a client, deal, or loan before running property intelligence",
+        )
+
+
 def _actor_label(user) -> str:
     role = getattr(user, "role", None)
     return role.value if hasattr(role, "value") else str(role or "user")
@@ -424,6 +442,7 @@ async def property_lookup(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PropertyIntelligenceSnapshotRead:
+    _enforce_property_lookup_access(user, payload)
     await _validate_links(
         db,
         user,
