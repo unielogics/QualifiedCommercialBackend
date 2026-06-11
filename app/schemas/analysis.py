@@ -21,6 +21,8 @@ class ProviderSettingsRead(BaseModel):
     google_maps_ios_key_configured: bool = False
     google_maps_android_key_configured: bool = False
     google_maps_mobile_key_configured: bool = False
+    rentcast_api_key: str | None = None
+    google_server_api_key: str | None = None
     google_maps_browser_key: str | None = None
     google_maps_ios_key: str | None = None
     google_maps_android_key: str | None = None

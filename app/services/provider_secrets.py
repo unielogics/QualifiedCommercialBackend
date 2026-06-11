@@ -144,7 +144,7 @@ async def runtime_settings(db: AsyncSession) -> ProviderRuntimeSettings:
     )
 
 
-async def provider_settings_status(db: AsyncSession) -> dict[str, Any]:
+async def provider_settings_status(db: AsyncSession, *, include_secret_values: bool = False) -> dict[str, Any]:
     runtime = await runtime_settings(db)
     return {
         "rentcast_configured": bool(runtime.rentcast_api_key),
@@ -153,10 +153,12 @@ async def provider_settings_status(db: AsyncSession) -> dict[str, Any]:
         "google_maps_ios_key_configured": bool(runtime.google_maps_ios_key),
         "google_maps_android_key_configured": bool(runtime.google_maps_android_key),
         "google_maps_mobile_key_configured": bool(runtime.google_maps_mobile_key),
-        "google_maps_browser_key": None,
-        "google_maps_ios_key": None,
-        "google_maps_android_key": None,
-        "google_maps_mobile_key": None,
+        "rentcast_api_key": runtime.rentcast_api_key if include_secret_values else None,
+        "google_server_api_key": runtime.google_server_api_key if include_secret_values else None,
+        "google_maps_browser_key": runtime.google_maps_browser_key if include_secret_values else None,
+        "google_maps_ios_key": runtime.google_maps_ios_key if include_secret_values else None,
+        "google_maps_android_key": runtime.google_maps_android_key if include_secret_values else None,
+        "google_maps_mobile_key": runtime.google_maps_mobile_key if include_secret_values else None,
         "property_analysis_ai_enabled": runtime.property_analysis_ai_enabled,
         "property_intelligence_cache_ttl_hours": runtime.property_intelligence_cache_ttl_hours,
     }

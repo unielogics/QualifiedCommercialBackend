@@ -325,7 +325,7 @@ async def get_provider_settings(
 ) -> ProviderSettingsRead:
     if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
-    return ProviderSettingsRead(**await provider_settings_status(db))
+    return ProviderSettingsRead(**await provider_settings_status(db, include_secret_values=user.role == Role.SUPER_ADMIN))
 
 
 @property_router.patch(
@@ -372,7 +372,7 @@ async def update_provider_settings(
             )
         )
     await db.flush()
-    return ProviderSettingsRead(**await provider_settings_status(db))
+    return ProviderSettingsRead(**await provider_settings_status(db, include_secret_values=True))
 
 
 @property_router.post("/address/autocomplete", response_model=list[AddressSuggestion])
