@@ -60,11 +60,13 @@ async def compute_funnel(
     db: AsyncSession,
     *,
     broker_id: UUID | None,
+    broker_ids: list[UUID] | None = None,
 ) -> FunnelMetricsRead:
     """Compute the 8 funnel KPIs for one broker (or firm-wide).
 
-    `broker_id=None` → firm-wide (super-admin path).
+    `broker_id=None, broker_ids=None` → firm-wide (super-admin path).
     `broker_id=<uuid>` → scoped to that broker's clients.
+    `broker_ids=[]` → empty portfolio.
 
     Single async session, batched into a few aggregate queries to
     keep latency bounded as a broker's book grows.
@@ -75,6 +77,10 @@ async def compute_funnel(
 
     # Base scope: filter Client by broker (or unfiltered for super).
     def _scope(stmt):
+        if broker_ids is not None:
+            if not broker_ids:
+                return stmt.where(Client.broker_id.in_([]))
+            return stmt.where(Client.broker_id.in_(broker_ids))
         if broker_id is not None:
             return stmt.where(Client.broker_id == broker_id)
         return stmt
@@ -124,7 +130,9 @@ async def compute_funnel(
         select(func.count(func.distinct(Loan.client_id)))
         .where(Loan.stage != LoanStage.PREQUALIFIED.value)  # post-prequal
     )
-    if broker_id is not None:
+    if broker_ids is not None:
+        prequal_clients_stmt = prequal_clients_stmt.where(Loan.broker_id.in_(broker_ids))
+    elif broker_id is not None:
         prequal_clients_stmt = prequal_clients_stmt.where(Loan.broker_id == broker_id)
     # The "stage != prequalified" filter actually means we count loans
     # that have advanced PAST the initial prequalified state. Use the
@@ -150,7 +158,9 @@ async def compute_funnel(
         .join(Client, Client.id == Loan.client_id)
         .where(Loan.stage != LoanStage.PREQUALIFIED.value)
     )
-    if broker_id is not None:
+    if broker_ids is not None:
+        velocity_l2p_stmt = velocity_l2p_stmt.where(Loan.broker_id.in_(broker_ids))
+    elif broker_id is not None:
         velocity_l2p_stmt = velocity_l2p_stmt.where(Loan.broker_id == broker_id)
     avg_l2p, n_l2p = (
         await db.execute(velocity_l2p_stmt)
@@ -164,7 +174,9 @@ async def compute_funnel(
         select(Loan.id, Loan.created_at)
         .where(Loan.stage == LoanStage.FUNDED.value)
     )
-    if broker_id is not None:
+    if broker_ids is not None:
+        funded_loans_stmt = funded_loans_stmt.where(Loan.broker_id.in_(broker_ids))
+    elif broker_id is not None:
         funded_loans_stmt = funded_loans_stmt.where(Loan.broker_id == broker_id)
     funded_loans = (await db.execute(funded_loans_stmt)).all()
 

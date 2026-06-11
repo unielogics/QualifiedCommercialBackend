@@ -77,5 +77,6 @@ from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noq
 from app.models.provider_secret import ProviderSecret  # noqa: F401
 from app.models.provider_usage_event import ProviderUsageEvent  # noqa: F401
 from app.models.rate_sheet import RateSheetEntry  # noqa: F401
+from app.models.regional_manager import RegionalManagerAgent  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401

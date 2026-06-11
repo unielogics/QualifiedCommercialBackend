@@ -69,6 +69,7 @@ from app.services.ai.usage import tracked_messages_create
 from app.services.math import dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
 from app.models.client import Client as ClientModel
+from app.scoping import scope_loan_query
 
 
 # Phase 7.5 — Push fan-out helper for workspace chat.
@@ -335,11 +336,7 @@ _chat_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 async def _load_loan(db: AsyncSession, loan_id: UUID, user: User) -> Loan:
     """Load a loan, scoped by role (mirrors loans.py _scope_query)."""
-    stmt = select(Loan).where(Loan.id == loan_id)
-    if user.role == Role.CLIENT and user.client:
-        stmt = stmt.where(Loan.client_id == user.client.id)
-    elif user.role == Role.BROKER and user.broker:
-        stmt = stmt.where(Loan.broker_id == user.broker.id)
+    stmt = scope_loan_query(user, select(Loan).where(Loan.id == loan_id))
     loan = (await db.execute(stmt)).scalar_one_or_none()
     if loan is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
@@ -507,19 +504,19 @@ async def list_chat(
 def _is_human_takeover(mode: DealChatMode, role: Role) -> bool:
     '''CHAT (super_admin/loan_exec) or LIVE_CHAT (broker/super_admin/loan_exec).
     Both branches persist the message client-visible and pause the AI.'''
-    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER):
         return True
-    if mode == DealChatMode.LIVE_CHAT and role in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if mode == DealChatMode.LIVE_CHAT and role in (Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER):
         return True
     return False
 
 
 _MODE_ALLOWED_ROLES: dict[DealChatMode, set[Role]] = {
-    DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.CLIENT},
+    DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.CLIENT},
     DealChatMode.INSTRUCT: {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC},
     DealChatMode.BROKER_QUESTION: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
     DealChatMode.BROKER_SUGGESTION: {Role.BROKER},
-    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
+    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER},
 }
 
 

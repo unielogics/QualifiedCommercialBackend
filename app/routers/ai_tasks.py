@@ -12,6 +12,7 @@ from app.enums import AITaskStatus, Role
 from app.models.activity import Activity
 from app.models.ai_task import AITask
 from app.models.loan import Loan
+from app.scoping import regional_manager_broker_ids_subquery
 from app.schemas.ai_task import AITaskDecision, AITaskRead
 
 router = APIRouter(prefix="/ai-tasks", tags=["ai-tasks"])
@@ -39,6 +40,12 @@ async def list_tasks(
                 select(Loan.id).where(Loan.broker_id == user.broker.id)
             )
         )
+    if user.role == Role.REGIONAL_MANAGER:
+        stmt = stmt.where(
+            AITask.loan_id.in_(
+                select(Loan.id).where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+            )
+        )
     # SUPER_ADMIN / LOAN_EXEC keep firm-wide visibility (no extra
     # filter beyond the PENDING gate).
     rows = (await db.execute(stmt)).scalars().all()
@@ -52,7 +59,7 @@ async def decide(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AITaskRead:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator action only")
     task = await db.get(AITask, task_id)
     if task is None:

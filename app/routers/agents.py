@@ -28,12 +28,13 @@ from app.enums import Role
 from app.schemas.agent_metrics import FunnelMetricsRead, NextActionRead
 from app.services.lead_funnel import compute_funnel
 from app.services.next_actions import compute_next_actions
+from app.scoping import regional_manager_broker_ids_subquery
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 log = logging.getLogger(__name__)
 
 
-def _broker_scope_or_403(user) -> "UUID | None":
+async def _broker_scope_or_403(user, db: AsyncSession) -> tuple["UUID | None", list["UUID"] | None]:
     """Resolves the calling user to a broker_id (None = firm-wide).
     Raises 403 for borrowers — these endpoints are operator-only."""
     if user.role == Role.CLIENT:
@@ -46,9 +47,12 @@ def _broker_scope_or_403(user) -> "UUID | None":
             # firm-wide rather than 500-ing; super-admin can fix the
             # data later.
             log.warning("agent metrics: BROKER user %s has no broker row", user.id)
-            return None
-        return user.broker.id
-    return None  # SUPER_ADMIN, LOAN_EXEC see firm-wide
+            return None, []
+        return user.broker.id, None
+    if user.role == Role.REGIONAL_MANAGER:
+        rows = (await db.execute(regional_manager_broker_ids_subquery(user))).scalars().all()
+        return None, list(rows)
+    return None, None  # SUPER_ADMIN, LOAN_EXEC see firm-wide
 
 
 @router.get("/me/funnel", response_model=FunnelMetricsRead)
@@ -56,8 +60,8 @@ async def get_my_funnel(
     user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> FunnelMetricsRead:
     """Lead-funnel KPIs for the dashboard. Scoped by role."""
-    broker_id = _broker_scope_or_403(user)
-    return await compute_funnel(db, broker_id=broker_id)
+    broker_id, broker_ids = await _broker_scope_or_403(user, db)
+    return await compute_funnel(db, broker_id=broker_id, broker_ids=broker_ids)
 
 
 @router.get("/me/next-actions", response_model=list[NextActionRead])
@@ -71,5 +75,5 @@ async def get_my_next_actions(
     row). Null-loan `pending_task` items have no client_id and ride
     alongside without affecting dedup.
     """
-    broker_id = _broker_scope_or_403(user)
-    return await compute_next_actions(db, broker_id=broker_id)
+    broker_id, broker_ids = await _broker_scope_or_403(user, db)
+    return await compute_next_actions(db, broker_id=broker_id, broker_ids=broker_ids)

@@ -114,6 +114,8 @@ async def list_tasks(
             | (AgentTask.created_by == user.id)
             | (AgentTask.assigned_user_id == user.id)
         )
+    elif user.role == Role.REGIONAL_MANAGER:
+        stmt = stmt.where(AgentTask.visibility != "agent_private")
 
     rows = (
         await db.execute(stmt.order_by(AgentTask.due_at.asc().nulls_last(), AgentTask.created_at.desc()))
@@ -132,7 +134,7 @@ async def create_task(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AgentTaskOut:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     await _load_client_or_404(client_id, user, db)
     task = AgentTask(
@@ -154,7 +156,7 @@ async def update_task(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AgentTaskOut:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     await _load_client_or_404(client_id, user, db)
     task = (
@@ -181,7 +183,7 @@ async def delete_task(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     await _load_client_or_404(client_id, user, db)
     task = (
@@ -222,7 +224,7 @@ async def promote_to_ai(
       - task.owner_type != 'ai' (caller must set ownership first)
       - task.ai_assignment_id already set (idempotent — return existing)
     """
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     await _load_client_or_404(client_id, user, db)
 

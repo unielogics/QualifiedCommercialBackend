@@ -19,6 +19,7 @@ from app.models.activity import Activity
 from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
 from app.models.loan import Loan
+from app.scoping import scope_loan_query
 from app.schemas.document import (
     DocumentCustomCreate,
     DocumentPatch,
@@ -35,12 +36,11 @@ from app.services.ai.vector_store import log_event as vector_log
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-def _scope_loan(user, loan: Loan) -> bool:
-    if user.role == Role.CLIENT and user.client and loan.client_id == user.client.id:
-        return True
-    if user.role == Role.BROKER and user.broker and loan.broker_id == user.broker.id:
-        return True
-    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+async def _can_access_loan(user, loan_id: UUID, db: AsyncSession) -> bool:
+    visible = (
+        await db.execute(scope_loan_query(user, select(Loan.id).where(Loan.id == loan_id)))
+    ).scalar_one_or_none()
+    return visible is not None
 
 
 @router.get("", response_model=list[DocumentRead])
@@ -60,12 +60,9 @@ async def list_documents(
         # Filter across all of a client's loans without round-tripping the
         # loan list first.
         stmt = stmt.where(Loan.client_id == client_id)
-    if user.role == Role.CLIENT and user.client:
-        stmt = stmt.where(Loan.client_id == user.client.id)
-    elif user.role == Role.BROKER and user.broker:
-        stmt = stmt.where(Loan.broker_id == user.broker.id)
-    elif user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+    if user.role not in {Role.CLIENT, Role.BROKER, Role.REGIONAL_MANAGER, Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    stmt = scope_loan_query(user, stmt)
     rows = (await db.execute(stmt)).scalars().all()
     return [DocumentRead.model_validate(r) for r in rows]
 
@@ -112,12 +109,9 @@ async def documents_analysis(
         stmt = stmt.where(Document.loan_id == loan_id)
     if client_id is not None:
         stmt = stmt.where(Loan.client_id == client_id)
-    if user.role == Role.CLIENT and user.client:
-        stmt = stmt.where(Loan.client_id == user.client.id)
-    elif user.role == Role.BROKER and user.broker:
-        stmt = stmt.where(Loan.broker_id == user.broker.id)
-    elif user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+    if user.role not in {Role.CLIENT, Role.BROKER, Role.REGIONAL_MANAGER, Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    stmt = scope_loan_query(user, stmt)
     docs = (await db.execute(stmt)).scalars().all()
 
     # Latest analysis per document.
@@ -195,10 +189,10 @@ async def documents_analysis(
 async def request_document(
     payload: DocumentRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DocumentRead:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Clients cannot request docs")
     loan = await db.get(Loan, payload.loan_id)
-    if loan is None:
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     doc = Document(
         loan_id=loan.id,
@@ -256,9 +250,11 @@ async def upload_init(
     and operators can re-categorize later. The vision scanner skips
     these uncategorized legacy uploads.
     """
+    if user.role == Role.REGIONAL_MANAGER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Regional managers cannot upload documents")
     settings = get_settings()
     loan = await db.get(Loan, payload.loan_id)
-    if loan is None:
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
 
     s3_key = f"loans/{loan.deal_id}/{uuid4()}-{payload.name}"
@@ -361,12 +357,14 @@ async def upload_complete(
 
     Idempotent — re-calling on an already-received doc is a no-op
     (won't re-queue the scan)."""
+    if user.role == Role.REGIONAL_MANAGER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Regional managers cannot upload documents")
     doc = await db.get(Document, payload.document_id)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     loan = await db.get(Loan, doc.loan_id)
-    if loan is None or not _scope_loan(user, loan):
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     already_received = doc.status in (DocStatus.RECEIVED, DocStatus.VERIFIED)
@@ -459,9 +457,9 @@ async def patch_document(
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
     loan = await db.get(Loan, doc.loan_id)
-    if loan is None or not _scope_loan(user, loan):
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         # Borrowers can't reschedule their own collection — that's
         # an operator workflow lever.
         raise HTTPException(
@@ -550,11 +548,13 @@ async def route_document(
     Idempotent — calling twice with the same key is a no-op the
     second time.
     """
+    if user.role == Role.REGIONAL_MANAGER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Regional managers cannot route documents")
     doc = await db.get(Document, document_id)
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
     loan = await db.get(Loan, doc.loan_id)
-    if loan is None or not _scope_loan(user, loan):
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     target_key = (payload.checklist_key or "").strip() or None
@@ -685,7 +685,7 @@ async def mark_document_verified(
     if doc is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
     loan = await db.get(Loan, doc.loan_id)
-    if loan is None or not _scope_loan(user, loan):
+    if loan is None or not await _can_access_loan(user, loan.id, db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     old = doc.status

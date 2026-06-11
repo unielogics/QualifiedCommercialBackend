@@ -19,6 +19,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import LOAN_STAGE_ORDER, LoanStage, Role
 from app.models.loan import Loan
+from app.scoping import scope_loan_query
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -49,11 +50,7 @@ class DashboardReport(BaseModel):
 
 
 def _scope(user, stmt):
-    if user.role == Role.CLIENT and user.client:
-        return stmt.where(Loan.client_id == user.client.id)
-    if user.role == Role.BROKER and user.broker:
-        return stmt.where(Loan.broker_id == user.broker.id)
-    return stmt
+    return scope_loan_query(user, stmt)
 
 
 @router.get("/dashboard", response_model=DashboardReport)

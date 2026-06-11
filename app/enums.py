@@ -11,6 +11,7 @@ from enum import StrEnum
 
 class Role(StrEnum):
     SUPER_ADMIN = "super_admin"
+    REGIONAL_MANAGER = "regional_manager"
     BROKER = "broker"
     LOAN_EXEC = "loan_exec"
     CLIENT = "client"

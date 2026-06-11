@@ -38,7 +38,7 @@ from app.schemas.analysis import (
 )
 from app.schemas.prequal import PrequalRequestRead
 from app.schemas.settings import AppSettingsData
-from app.scoping import scope_client_query, scope_loan_query
+from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services.analysis_reports import generate_analysis_report
 from app.services.property_intelligence import (
     google_autocomplete,
@@ -161,6 +161,17 @@ async def _require_deal_access(db: AsyncSession, user, deal_id: UUID | None) -> 
         return deal
     if user.role == Role.BROKER and user.broker is not None and client is not None and client.broker_id == user.broker.id:
         return deal
+    if user.role == Role.REGIONAL_MANAGER and client is not None:
+        visible = (
+            await db.execute(
+                select(Client.id).where(
+                    Client.id == client.id,
+                    Client.broker_id.in_(regional_manager_broker_ids_subquery(user)),
+                )
+            )
+        ).scalar_one_or_none()
+        if visible is not None:
+            return deal
     raise HTTPException(status.HTTP_403_FORBIDDEN, "Deal is not visible to this user")
 
 
@@ -203,6 +214,17 @@ def _scope_analysis_query(user, stmt):
                 AnalysisRun.created_by_id == user.id,
                 AnalysisRun.client_id.in_(broker_client_ids),
                 AnalysisRun.loan_id.in_(broker_loan_ids),
+            )
+        )
+    if user.role == Role.REGIONAL_MANAGER:
+        broker_ids = regional_manager_broker_ids_subquery(user)
+        client_ids = select(Client.id).where(Client.broker_id.in_(broker_ids))
+        loan_ids = select(Loan.id).where(Loan.broker_id.in_(broker_ids))
+        return stmt.where(
+            or_(
+                AnalysisRun.created_by_id == user.id,
+                AnalysisRun.client_id.in_(client_ids),
+                AnalysisRun.loan_id.in_(loan_ids),
             )
         )
     return stmt
@@ -555,8 +577,8 @@ async def update_analysis_run(
     db: AsyncSession = Depends(get_db),
 ) -> AnalysisRunRead:
     row = await _load_analysis_run(db, user, run_id)
-    if user.role == Role.CLIENT:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Client users cannot edit analysis runs")
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This role cannot edit analysis runs")
     data = payload.model_dump(exclude_unset=True)
     if not data:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No updates supplied")
@@ -601,8 +623,8 @@ async def share_analysis_to_client(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ShareAnalysisResponse:
-    if user.role == Role.CLIENT:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Client users cannot share analysis runs")
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This role cannot share analysis runs")
     row = await _load_analysis_run(db, user, run_id)
     if row.client_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Link an owned client before sharing this analysis")

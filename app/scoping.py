@@ -20,11 +20,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import false as sql_false
+from sqlalchemy import false as sql_false, or_, select
 
 from app.enums import Role
+from app.models.broker import Broker
 from app.models.client import Client
 from app.models.loan import Loan
+from app.models.regional_manager import RegionalManagerAgent
 
 if TYPE_CHECKING:
     from sqlalchemy.sql import Select
@@ -40,6 +42,8 @@ def scope_client_query(user, stmt: "Select") -> "Select":
         if user.broker is None:
             return stmt.where(sql_false())
         return stmt.where(Client.broker_id == user.broker.id)
+    if user.role == Role.REGIONAL_MANAGER:
+        return stmt.where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     return stmt
 
 
@@ -57,7 +61,22 @@ def scope_loan_query(user, stmt: "Select") -> "Select":
         if user.broker is None:
             return stmt.where(sql_false())
         return stmt.where(Loan.broker_id == user.broker.id)
+    if user.role == Role.REGIONAL_MANAGER:
+        return stmt.where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     return stmt
+
+
+def regional_manager_broker_ids_subquery(user):
+    """Broker ids visible to a regional manager.
+
+    Includes the manager's own Broker row, if one exists, plus brokers owned by
+    linked portfolio agents. Empty membership naturally yields no rows except
+    the manager's own book.
+    """
+    linked_agent_users = select(RegionalManagerAgent.agent_user_id).where(
+        RegionalManagerAgent.manager_user_id == user.id
+    )
+    return select(Broker.id).where(or_(Broker.user_id == user.id, Broker.user_id.in_(linked_agent_users)))
 
 
 # Funding files are stored on the Loan table (Loan IS the FundingFile —
@@ -70,4 +89,5 @@ __all__ = [
     "scope_client_query",
     "scope_loan_query",
     "scope_funding_query",
+    "regional_manager_broker_ids_subquery",
 ]

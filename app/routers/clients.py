@@ -15,6 +15,7 @@ from app.enums import AITaskPriority, AITaskSource, AITaskStatus, Role
 from app.models.ai_task import AITask
 from app.models.client import Client
 from app.models.prequal_request import PrequalRequest
+from app.scoping import scope_client_query
 from app.schemas.client import ClientCreate, ClientRead, ClientSelfUpdate, ClientUpdate
 from app.services.ai.client_summarizer import refresh_client_summary
 
@@ -32,20 +33,7 @@ class LivingProfileRead(BaseModel):
 
 
 def _scope(user, stmt):
-    """Defense-in-depth: when role is CLIENT/BROKER but the linked record
-    is missing, force ``where(False)`` so the gate never silently leaks
-    every record. Without this an orphaned broker user (no Broker row)
-    fell through and saw every client in the firm."""
-    from sqlalchemy import false as sql_false
-    if user.role == Role.CLIENT:
-        if user.client is None:
-            return stmt.where(sql_false())
-        return stmt.where(Client.id == user.client.id)
-    if user.role == Role.BROKER:
-        if user.broker is None:
-            return stmt.where(sql_false())
-        return stmt.where(Client.broker_id == user.broker.id)
-    return stmt
+    return scope_client_query(user, stmt)
 
 
 @router.get("", response_model=list[ClientRead])
@@ -176,7 +164,7 @@ async def refresh_client_living_profile(
     db: AsyncSession = Depends(get_db),
 ) -> LivingProfileRead:
     """Operator-triggered manual refresh of a specific client's profile."""
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
     stmt = _scope(user, select(Client).where(Client.id == client_id))
     client = (await db.execute(stmt)).scalar_one_or_none()
@@ -471,6 +459,7 @@ async def get_client_workspace(
 
     # Permissions — server-computed from the calling user's role + ownership.
     is_admin = user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+    is_regional_manager = user.role == Role.REGIONAL_MANAGER
     is_broker = user.role == Role.BROKER and user.broker is not None and client.broker_id == user.broker.id
     is_client_self = user.role == Role.CLIENT and user.client is not None and user.client.id == client.id
 
@@ -481,7 +470,7 @@ async def get_client_workspace(
         can_create_funding_files=bool(is_admin),
         can_assign_ai=bool(is_broker or is_admin),
         can_edit_client_fields=bool(is_broker or is_admin or is_client_self),
-        can_view_funding_tab=bool(is_broker or is_admin),
+        can_view_funding_tab=bool(is_broker or is_admin or is_regional_manager),
     )
 
     # Recommended tab — pick based on role + state when caller didn't
@@ -560,7 +549,7 @@ async def get_client_workspace(
 async def create_client(
     payload: ClientCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ClientRead:
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     data = payload.model_dump()
     # Brokers never get to assign ownership — even if they send
@@ -593,7 +582,7 @@ async def update_client(
     from datetime import datetime as _dt, timezone as _tz
     from app.enums import ClientStage as _CS
 
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     stmt = _scope(user, select(Client).where(Client.id == client_id))
     client = (await db.execute(stmt)).scalar_one_or_none()
@@ -680,7 +669,7 @@ async def request_prequalification(
 ) -> PrequalHandoffResponse:
     """Hand a lead off to the funding team. Creates a PrequalRequest
     + AITask. Agent-only — must own the client."""
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Borrowers can't trigger prequal handoffs")
 
     client = (
@@ -1372,7 +1361,7 @@ async def send_intake_link(
     from app.models.activity import Activity
     from app.config import get_settings
 
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
     client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
     if client is None:

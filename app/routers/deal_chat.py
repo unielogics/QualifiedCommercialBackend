@@ -41,6 +41,7 @@ from app.services.ai.anthropic_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.push import fire_and_forget_push
+from app.scoping import regional_manager_broker_ids_subquery
 
 log = logging.getLogger(__name__)
 
@@ -48,11 +49,11 @@ router = APIRouter(prefix="/deals/{deal_id}", tags=["deal-chat"])
 
 
 _MODE_ALLOWED_ROLES: dict[DealChatMode, set[Role]] = {
-    DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.CLIENT},
+    DealChatMode.CHAT: {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.CLIENT},
     DealChatMode.INSTRUCT: {Role.SUPER_ADMIN, Role.BROKER, Role.LOAN_EXEC},
     DealChatMode.BROKER_QUESTION: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
     DealChatMode.BROKER_SUGGESTION: {Role.BROKER},
-    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC},
+    DealChatMode.LIVE_CHAT: {Role.BROKER, Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER},
 }
 
 
@@ -71,6 +72,12 @@ async def _load_deal(db: AsyncSession, deal_id: UUID, user: User) -> Deal:
         stmt = stmt.where(Deal.client_id == user.client.id)
     elif user.role == Role.BROKER and user.broker:
         stmt = stmt.where(Deal.assigned_agent_id == user.id)
+    elif user.role == Role.REGIONAL_MANAGER:
+        stmt = stmt.where(
+            Deal.client_id.in_(
+                select(ClientModel.id).where(ClientModel.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+            )
+        )
     deal = (await db.execute(stmt)).scalar_one_or_none()
     if deal is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
@@ -78,12 +85,13 @@ async def _load_deal(db: AsyncSession, deal_id: UUID, user: User) -> Deal:
 
 
 def _is_human_takeover(mode: DealChatMode, role: Role) -> bool:
-    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if mode == DealChatMode.CHAT and role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER):
         return True
     if mode == DealChatMode.LIVE_CHAT and role in (
         Role.BROKER,
         Role.SUPER_ADMIN,
         Role.LOAN_EXEC,
+        Role.REGIONAL_MANAGER,
     ):
         return True
     return False

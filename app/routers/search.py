@@ -16,6 +16,7 @@ from app.models.client import Client
 from app.models.document import Document
 from app.models.loan import Loan
 from app.models.message import Message
+from app.scoping import regional_manager_broker_ids_subquery
 from app.schemas.search import GroupedResults, SearchResult
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -38,6 +39,10 @@ async def search(
     if user.role == Role.BROKER and user.broker:
         loan_filter.append(Loan.broker_id == user.broker.id)
         client_filter.append(Client.broker_id == user.broker.id)
+    if user.role == Role.REGIONAL_MANAGER:
+        broker_ids = regional_manager_broker_ids_subquery(user)
+        loan_filter.append(Loan.broker_id.in_(broker_ids))
+        client_filter.append(Client.broker_id.in_(broker_ids))
     if user.role == Role.CLIENT and user.client:
         loan_filter.append(Loan.client_id == user.client.id)
         client_filter.append(Client.id == user.client.id)

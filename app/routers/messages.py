@@ -11,6 +11,7 @@ from app.deps import CurrentUser
 from app.enums import MessageFrom, Role
 from app.models.loan import Loan
 from app.models.message import Message
+from app.scoping import scope_loan_query
 from app.schemas.message import MessageCreate, MessageRead
 from app.ws import channel
 
@@ -21,6 +22,11 @@ router = APIRouter(prefix="/messages", tags=["messages"])
 async def list_messages(
     loan_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[MessageRead]:
+    visible = (
+        await db.execute(scope_loan_query(user, select(Loan.id).where(Loan.id == loan_id)))
+    ).scalar_one_or_none()
+    if visible is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     stmt = select(Message).where(Message.loan_id == loan_id).order_by(Message.sent_at)
     rows = (await db.execute(stmt)).scalars().all()
     return [MessageRead.model_validate(r) for r in rows]
@@ -31,7 +37,10 @@ async def send_message(
     payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> MessageRead:
     loan = await db.get(Loan, payload.loan_id)
-    if loan is None:
+    visible = (
+        await db.execute(scope_loan_query(user, select(Loan.id).where(Loan.id == payload.loan_id)))
+    ).scalar_one_or_none()
+    if loan is None or visible is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
     msg = Message(
         loan_id=loan.id,

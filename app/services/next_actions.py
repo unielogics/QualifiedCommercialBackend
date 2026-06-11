@@ -68,6 +68,7 @@ async def compute_next_actions(
     db: AsyncSession,
     *,
     broker_id: UUID | None,
+    broker_ids: list[UUID] | None = None,
 ) -> list[NextActionRead]:
     """Scan the four sources, dedupe by client, rank, cap at 8."""
     now = datetime.now(timezone.utc)
@@ -81,7 +82,9 @@ async def compute_next_actions(
     stale_stmt = select(Client).where(
         Client.stage.in_([ClientStage.LEAD, ClientStage.CONTACTED])
     )
-    if broker_id is not None:
+    if broker_ids is not None:
+        stale_stmt = stale_stmt.where(Client.broker_id.in_(broker_ids))
+    elif broker_id is not None:
         stale_stmt = stale_stmt.where(Client.broker_id == broker_id)
     stale_clients = (await db.execute(stale_stmt)).scalars().all()
     for c in stale_clients:
@@ -118,7 +121,9 @@ async def compute_next_actions(
     from app.models.app_settings import AppSettings
 
     loans_stmt = select(Loan)
-    if broker_id is not None:
+    if broker_ids is not None:
+        loans_stmt = loans_stmt.where(Loan.broker_id.in_(broker_ids))
+    elif broker_id is not None:
         loans_stmt = loans_stmt.where(Loan.broker_id == broker_id)
     loans = (await db.execute(loans_stmt)).scalars().all()
     loan_by_id = {ln.id: ln for ln in loans}
@@ -211,7 +216,13 @@ async def compute_next_actions(
 
     # ── Source 4: pending_task — AITask PENDING for broker's loans ──
     task_stmt = select(AITask).where(AITask.status == AITaskStatus.PENDING)
-    if broker_id is not None:
+    if broker_ids is not None:
+        task_stmt = task_stmt.where(
+            AITask.loan_id.in_(
+                select(Loan.id).where(Loan.broker_id.in_(broker_ids))
+            )
+        )
+    elif broker_id is not None:
         task_stmt = task_stmt.where(
             or_(
                 AITask.loan_id.is_(None),

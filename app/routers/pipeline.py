@@ -30,6 +30,7 @@ from app.models.client import Client
 from app.models.client_requirement_status import ClientRequirementStatus
 from app.models.deal import Deal
 from app.models.loan import Loan
+from app.scoping import regional_manager_broker_ids_subquery
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -87,6 +88,8 @@ async def client_summary(
         if user.broker is None:
             return []
         visible_stmt = visible_stmt.where(Client.broker_id == user.broker.id)
+    elif user.role == Role.REGIONAL_MANAGER:
+        visible_stmt = visible_stmt.where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     visible_ids = {row[0] for row in (await db.execute(visible_stmt)).all()}
     if not visible_ids:
         return []

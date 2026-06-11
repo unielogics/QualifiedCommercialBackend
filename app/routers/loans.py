@@ -22,6 +22,7 @@ from app.enums import AmortizationStyle, LoanStage, LoanType, LoanPurpose, Messa
 from app.models.activity import Activity
 from app.models.loan import Loan
 from app.models.message import Message
+from app.scoping import scope_loan_query
 from app.schemas.activity import ActivityRead
 from app.schemas.document import (
     DocumentCustomCreate,
@@ -67,23 +68,8 @@ def _gen_deal_id() -> str:
 
 
 def _scope_query(user, stmt):
-    """Borrower sees only their own loans; broker sees their assigned loans;
-    super_admin sees everything; loan_exec sees everything (UW).
-
-    Defense-in-depth: when role is CLIENT or BROKER but the linked record
-    (user.client / user.broker) is missing, we return ``where(False)`` to
-    force the gate to fire — never silently fall through to "see everything".
-    """
-    from sqlalchemy import false as sql_false
-    if user.role == Role.CLIENT:
-        if user.client is None:
-            return stmt.where(sql_false())
-        return stmt.where(Loan.client_id == user.client.id)
-    if user.role == Role.BROKER:
-        if user.broker is None:
-            return stmt.where(sql_false())
-        return stmt.where(Loan.broker_id == user.broker.id)
-    return stmt
+    """Compatibility shim for routers that import loans._scope_query."""
+    return scope_loan_query(user, stmt)
 
 
 @router.get("", response_model=list[LoanRead])
@@ -482,7 +468,7 @@ async def create_custom_document(
     from app.models.document import Document as _Document
     from app.enums import DocStatus as _DocStatus
 
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Borrowers cannot add custom docs"
         )
@@ -543,7 +529,7 @@ async def run_loan_doc_reminders(
     per-(doc, scenario) dedup — already-fired scenarios stay quiet).
     Returns the per-scenario count for the toast.
     """
-    if user.role == Role.CLIENT:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Borrowers cannot manually run reminders"
         )

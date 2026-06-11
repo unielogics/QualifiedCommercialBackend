@@ -31,6 +31,7 @@ from app.models.activity import Activity
 from app.models.event import CalendarEvent
 from app.models.loan import Loan
 from app.models.user import User
+from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.schemas.event import (
     CalendarEventCreate,
     CalendarEventRead,
@@ -56,10 +57,21 @@ def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
             CalendarEvent.loan_id.in_(loans_subq),
             CalendarEvent.source != CalendarEventSource.AI,
         )
-    # BROKER / LOAN_EXEC — see all loans they're attached to. We don't
-    # have a Broker.assigned_loans relationship today; surface
-    # everything except client-owned loans they're not on. For now,
-    # operators see all loans + loanless rows.
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            return stmt.where(CalendarEvent.id == None)  # noqa: E711
+        loans_subq = select(Loan.id).where(Loan.broker_id == user.broker.id)
+        return stmt.where(
+            (CalendarEvent.loan_id.in_(loans_subq))
+            | ((CalendarEvent.loan_id == None) & (CalendarEvent.owner_user_id == user.id))  # noqa: E711
+        )
+    if user.role == Role.REGIONAL_MANAGER:
+        loans_subq = select(Loan.id).where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+        return stmt.where(
+            (CalendarEvent.loan_id.in_(loans_subq))
+            | ((CalendarEvent.loan_id == None) & (CalendarEvent.owner_user_id == user.id))  # noqa: E711
+        )
+    # LOAN_EXEC keeps firm-wide operator visibility.
     return stmt
 
 
@@ -93,6 +105,12 @@ async def create_event(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> CalendarEventRead:
+    if payload.loan_id is not None:
+        visible = (
+            await db.execute(scope_loan_query(user, select(Loan.id).where(Loan.id == payload.loan_id)))
+        ).scalar_one_or_none()
+        if visible is None:
+            raise HTTPException(http_status.HTTP_403_FORBIDDEN, "Cannot access this loan")
     ev = CalendarEvent(**payload.model_dump(), source=CalendarEventSource.MANUAL)
     db.add(ev)
     await db.flush()
@@ -194,8 +212,8 @@ async def delete_event(
     """Hard delete. Operator-only. Prefer marking status='cancelled'
     via PATCH for anything that should retain audit trail — DELETE is
     the trapdoor for typos and demo cleanup."""
-    if user.role == Role.CLIENT:
-        raise HTTPException(http_status.HTTP_403_FORBIDDEN, "Borrowers cannot delete events")
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
+        raise HTTPException(http_status.HTTP_403_FORBIDDEN, "This role cannot delete events")
     ev = await _load_for_mutation(event_id, user, db)
     db.add(
         Activity(
