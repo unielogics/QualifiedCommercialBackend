@@ -19,6 +19,7 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:19006,https://qualifiedcommercial.com,https://www.qualifiedcommercial.com"
+    frontend_app_url: str = "http://localhost:3000"
 
     # Clerk (auth)
     clerk_secret_key: str = ""
@@ -65,6 +66,14 @@ class Settings(BaseSettings):
 
     # RentCast
     rentcast_api_key: str = ""
+
+    # Provider secrets
+    # Super-admin managed provider keys are encrypted before they are stored
+    # in Postgres. In production, set provider_secrets_kms_key_id so EC2 IAM
+    # can use AWS KMS. Local/dev falls back to Fernet with this key or a
+    # deterministic dev key derived from existing app secrets.
+    provider_secrets_kms_key_id: str = ""
+    provider_secrets_encryption_key: str = ""
 
     # FRED (Federal Reserve Economic Data) — daily index pull
     # Get a key at https://fred.stlouisfed.org/docs/api/api_key.html

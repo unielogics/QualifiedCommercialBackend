@@ -14,6 +14,7 @@ class Role(StrEnum):
     BROKER = "broker"
     LOAN_EXEC = "loan_exec"
     CLIENT = "client"
+    LENDER = "lender"
 
 
 class PropertyType(StrEnum):

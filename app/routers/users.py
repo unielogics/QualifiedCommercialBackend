@@ -48,12 +48,12 @@ class UserPatch(BaseModel):
 async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
     """List every operator-team user. Super-admin only.
 
-    Excludes CLIENT-role users (Team is the operator team) and soft-deleted rows.
+    Excludes CLIENT/LENDER users (Team is the operator team) and soft-deleted rows.
     """
     rows = (
         await db.execute(
             select(User)
-            .where(User.role != Role.CLIENT, User.deleted_at.is_(None))
+            .where(User.role.notin_([Role.CLIENT, Role.LENDER]), User.deleted_at.is_(None))
             .order_by(User.name)
         )
     ).scalars().all()

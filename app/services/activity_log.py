@@ -248,6 +248,9 @@ _KIND_VISIBILITY: dict[str, str] = {
     "prequal.revised": CLIENT_VISIBLE,
     "prequal.rejected": CLIENT_VISIBLE,
     "prequal.offer_accepted": CLIENT_VISIBLE,
+    "analysis.created": OPERATOR_VISIBLE,
+    "analysis.shared_to_client": CLIENT_VISIBLE,
+    "analysis.prequal_requested": CLIENT_VISIBLE,
     # Intake
     "intake.submitted": CLIENT_VISIBLE,
     # Misc

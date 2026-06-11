@@ -134,6 +134,12 @@ class PrequalRequest(TimestampMixin, Base):
         nullable=True,
         unique=True,
     )
+    source_analysis_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("analysis_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # Relationships
     loan: Mapped[Loan | None] = relationship(back_populates="prequal_requests")

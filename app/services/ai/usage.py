@@ -33,6 +33,7 @@ LENDER_FEATURES = {
     "handoff_seed",
     "deal_secretary",
 }
+PROPERTY_FEATURES = {"property_analysis"}
 
 
 class AIBudgetExceeded(RuntimeError):
@@ -48,6 +49,8 @@ def feature_category(feature: str) -> str:
         return "document_scan"
     if feature in LENDER_FEATURES:
         return "lender_ai"
+    if feature in PROPERTY_FEATURES:
+        return "property_analysis"
     return "automation"
 
 

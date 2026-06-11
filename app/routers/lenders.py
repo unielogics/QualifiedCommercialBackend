@@ -35,6 +35,11 @@ def _require_super_admin(user) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
 
 
+def _require_lender_read(user) -> None:
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Internal funding role required")
+
+
 @router.get("", response_model=list[LenderRead])
 async def list_lenders(
     user: CurrentUser,
@@ -45,7 +50,7 @@ async def list_lenders(
     """List lenders. `product` filters to lenders whose `products`
     array contains that LoanType (used by the Connect-Lender
     dropdown). `active_only=True` hides soft-deleted rows."""
-    _require_super_admin(user)
+    _require_lender_read(user)
     stmt = select(Lender).order_by(Lender.name.asc())
     if active_only:
         stmt = stmt.where(Lender.is_active.is_(True))
@@ -61,7 +66,7 @@ async def create_lender(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> LenderRead:
-    _require_super_admin(user)
+    _require_lender_read(user)
     # Pydantic enums serialize to their value via model_dump(); JSONB
     # column expects a list of strings.
     data = payload.model_dump()
@@ -111,7 +116,7 @@ async def list_lender_loans(
     Drives the per-lender drilldown on the Super Admin Lenders tab,
     giving the operator a direct path from 'this lender' to 'open the
     loan and connect them'."""
-    _require_super_admin(user)
+    _require_lender_read(user)
     lender = (
         await db.execute(select(Lender).where(Lender.id == lender_id))
     ).scalar_one_or_none()

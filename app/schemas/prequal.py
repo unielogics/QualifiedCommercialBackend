@@ -142,4 +142,5 @@ class PrequalRequestRead(ORMModel):
     # 1 for originals, 2/3/... for each successive Updated Version.
     parent_prequal_request_id: UUID | None = None
     superseded_by_id: UUID | None = None
+    source_analysis_run_id: UUID | None = None
     version_num: int = 1

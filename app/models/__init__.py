@@ -29,6 +29,7 @@ from app.models.ai_token_usage import AITokenUsage  # noqa: F401
 from app.models.ai_task_assignment import AITaskAssignment  # noqa: F401
 from app.models.ai_usage_event import AIUsageEvent  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
+from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
 from app.models.capital_partner_application import (  # noqa: F401
     APPLICATION_STATUSES,
@@ -53,6 +54,14 @@ from app.models.hud import HudLineItem  # noqa: F401
 from app.models.hud_share_link import HudShareLink  # noqa: F401
 from app.models.legal_acceptance import LegalAcceptance  # noqa: F401
 from app.models.lender import Lender  # noqa: F401
+from app.models.lender_package import (  # noqa: F401
+    LenderPackage,
+    LenderPackageDocument,
+    LenderPackageEvent,
+    LenderPackageRecipient,
+    LenderTerm,
+    LenderUser,
+)
 from app.models.lender_spread import LenderSpread  # noqa: F401
 from app.models.lending_handoff_packet import LendingHandoffPacket  # noqa: F401
 from app.models.loan import Loan  # noqa: F401
@@ -64,6 +73,9 @@ from app.models.fix_flip_scenario import FixFlipScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
+from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
+from app.models.provider_secret import ProviderSecret  # noqa: F401
+from app.models.provider_usage_event import ProviderUsageEvent  # noqa: F401
 from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401

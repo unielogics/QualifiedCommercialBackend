@@ -105,6 +105,16 @@ class AISpendSettings(BaseModel):
     lender_ai_enabled: bool = True
 
 
+class PropertyIntelligenceSettings(BaseModel):
+    """Provider-backed property intelligence controls.
+
+    Secrets live in provider_secrets; these are safe non-secret toggles
+    that can be carried in the normal settings blob.
+    """
+    ai_report_enabled: bool = True
+    cache_ttl_hours: int = Field(default=24, ge=1, le=720)
+
+
 # --- Section: referrals --------------------------------------------------
 
 class ReferralSettings(BaseModel):
@@ -264,6 +274,7 @@ class AppSettingsData(BaseModel):
     simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
     letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
     prequal_auto_approval: PrequalAutoApprovalSettings = Field(default_factory=PrequalAutoApprovalSettings)
+    property_intelligence: PropertyIntelligenceSettings = Field(default_factory=PropertyIntelligenceSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -283,6 +294,7 @@ class AppSettingsUpdate(BaseModel):
     simulator: SimulatorSettings | None = None
     letterhead: LetterheadSettings | None = None
     prequal_auto_approval: PrequalAutoApprovalSettings | None = None
+    property_intelligence: PropertyIntelligenceSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------
