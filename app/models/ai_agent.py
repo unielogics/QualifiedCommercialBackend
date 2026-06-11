@@ -7,7 +7,7 @@ pipeline + clients via targeting rules (never bulk import), tested in
 a warm-up playground, and launched.
 
 This module is purely additive — it does not touch the existing
-cadence engine, AI Inbox, or per-client `realtor_profile`. A live AI
+cadence engine, Elara Inbox, or per-client `realtor_profile`. A live AI
 Agent runs on its own scheduler job (`job_ai_agent_pass`) scoped only
 to that agent's `ai_agent_leads`.
 

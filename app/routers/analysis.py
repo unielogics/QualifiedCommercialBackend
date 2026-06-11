@@ -517,6 +517,9 @@ async def list_analysis_runs(
     client_id: UUID | None = Query(None),
     loan_id: UUID | None = Query(None),
     product: str | None = Query(None),
+    tool_source: str | None = Query(None),
+    updated_since: datetime | None = Query(None),
+    limit: int = Query(100, ge=1, le=200),
 ) -> list[AnalysisRunRead]:
     stmt = _scope_analysis_query(user, select(AnalysisRun))
     if client_id is not None:
@@ -527,7 +530,11 @@ async def list_analysis_runs(
         stmt = stmt.where(AnalysisRun.loan_id == loan_id)
     if product:
         stmt = stmt.where(AnalysisRun.product == product)
-    rows = (await db.execute(stmt.order_by(AnalysisRun.updated_at.desc()))).scalars().all()
+    if tool_source:
+        stmt = stmt.where(AnalysisRun.tool_source == tool_source)
+    if updated_since is not None:
+        stmt = stmt.where(AnalysisRun.updated_at >= updated_since)
+    rows = (await db.execute(stmt.order_by(AnalysisRun.updated_at.desc()).limit(limit))).scalars().all()
     return [_to_read(r) for r in rows]
 
 

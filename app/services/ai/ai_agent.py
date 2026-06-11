@@ -12,7 +12,7 @@ Powers the broker's 11-step AI Agent builder + the live engine:
 
 Everything here is best-effort: AI calls that fail fall back to safe
 templated behavior and never raise into the request path. This module
-never touches the existing cadence engine / AI Inbox.
+never touches the existing cadence engine / Elara Inbox.
 """
 
 from __future__ import annotations

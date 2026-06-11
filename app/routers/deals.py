@@ -167,7 +167,7 @@ async def create_deal(
     await db.refresh(deal)
 
     # Bootstrap the realtor-phase ClientAIPlan + CRS rows scoped to
-    # this deal so the AI Secretary tab on /deals/[id] has content
+    # this deal so Elara tab on /deals/[id] has content
     # the moment the agent lands. Best-effort — failure here logs but
     # doesn't roll back deal creation (operator can repair later via
     # the wizard or the future repair endpoint).

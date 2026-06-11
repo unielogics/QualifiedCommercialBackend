@@ -173,7 +173,7 @@ def sending_control_to_outreach_mode(value: str | None) -> str:
     if value == "ask_before_sending":
         # Still an inbox draft, but flagged for per-message approval.
         # The cadence engine treats this identically to draft_first
-        # (always inbox-first); the per-message UX in AI Inbox is
+        # (always inbox-first); the per-message UX in Elara Inbox is
         # what surfaces the approval prompt.
         return "draft_first"
     # "draft_only" (default) and anything unrecognised → safest mode.

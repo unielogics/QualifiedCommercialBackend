@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from typing import Any
 from datetime import datetime, timezone
@@ -117,6 +118,8 @@ def _to_read(req: PrequalRequest) -> PrequalRequestRead:
         pdf_url = prequal_pdf.presign_get(req.pdf_s3_key, settings=settings)
     base = PrequalRequestRead.model_validate(req).model_dump()
     base["pdf_url"] = pdf_url
+    client = req.__dict__.get("client")
+    base["client_name"] = client.name if client is not None else None
     return PrequalRequestRead(**base)
 
 
@@ -507,7 +510,7 @@ async def list_admin_prequal_queue(
     (NULLS-last) so urgent ones float to the top."""
     if not _can_manage_prequal_queue(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
-    stmt = select(PrequalRequest).options(selectinload(PrequalRequest.loan))
+    stmt = select(PrequalRequest).options(selectinload(PrequalRequest.loan), selectinload(PrequalRequest.client))
     if user.role == Role.BROKER:
         if user.broker is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Broker profile required")

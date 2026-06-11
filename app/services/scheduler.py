@@ -397,7 +397,7 @@ async def job_fred_refresh() -> None:
 async def job_cadence_pass() -> None:
     """Phase 5 — walk ai_cadence_rules every 30 min and fire
     eligible actions. Draft-first: borrower-facing messages always
-    queue as AI Inbox drafts, not direct sends, unless the rule
+    queue as Elara Inbox drafts, not direct sends, unless the rule
     explicitly opts into auto-send."""
     from app.db import SessionLocal
     from app.services.ai.cadence_engine import run_cadence_pass

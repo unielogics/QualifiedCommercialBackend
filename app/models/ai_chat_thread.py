@@ -1,11 +1,11 @@
 """Persisted AI Underwriter conversation threads.
 
-The standalone "Intelligent Underwriter" chat (mobile FAB / desktop
+The standalone "Elara" chat (mobile FAB / desktop
 topbar icon) used to live entirely in component state — close the
 panel and history was gone. This module holds the thread + message
 tables that back a real conversation history per user.
 
-Distinct from `loan_chat_messages` (per-deal Co-pilot rail, scoped
+Distinct from `loan_chat_messages` (per-deal Elara rail, scoped
 to a loan) and from `messages` (email / SMS to borrowers). This is
 the user's personal AI conversation surface, not tied to any one
 loan.

@@ -131,7 +131,7 @@ async def dispatch_portal(
         return event
 
     try:
-        # Post the AI message to the borrower's loan-scoped thread.
+        # Post Elara message to the borrower's loan-scoped thread.
         message = await post_ai_message(
             db,
             user_id=client.user_id,
@@ -458,7 +458,7 @@ def _can_spam_footer(to_email: str) -> str:
     """Auto-appended unsubscribe footer for borrower-facing emails."""
     return (
         "\n\n---\n"
-        "Qualified Commercial · You can manage how the AI Assistant contacts you "
+        "Qualified Commercial · You can manage how Elara contacts you "
         "from your borrower portal. Reply STOP to opt out of automated emails."
     )
 

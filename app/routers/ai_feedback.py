@@ -1,6 +1,6 @@
 """AI feedback router — thumbs/comments on AI outputs.
 
-This pass exercises only the `ai_task` output type from the AI Inbox UI,
+This pass exercises only the `ai_task` output type from Elara Inbox UI,
 but the table + endpoints are polymorphic so chat replies, email drafts,
 and Living Loan File summaries can light up later without a schema change.
 """

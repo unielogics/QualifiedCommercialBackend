@@ -109,6 +109,8 @@ class PrequalRequestRead(ORMModel):
     # spawn the Loan.
     loan_id: UUID | None
     requester_id: UUID
+    client_id: UUID | None = None
+    client_name: str | None = None
     target_property_address: str
     purchase_price: float
     requested_loan_amount: float

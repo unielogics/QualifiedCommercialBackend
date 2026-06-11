@@ -28,6 +28,7 @@ from app.db import Base
 from app.models._mixins import TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.client import Client
     from app.models.loan import Loan
     from app.models.user import User
 
@@ -142,6 +143,7 @@ class PrequalRequest(TimestampMixin, Base):
     )
 
     # Relationships
+    client: Mapped[Client | None] = relationship(foreign_keys=[client_id])
     loan: Mapped[Loan | None] = relationship(back_populates="prequal_requests")
     requester: Mapped[User] = relationship(foreign_keys=[requester_id])
     reviewer: Mapped[User | None] = relationship(foreign_keys=[reviewed_by])

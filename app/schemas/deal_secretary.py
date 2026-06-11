@@ -95,7 +95,7 @@ class FileSettings(BaseModel):
 
     `outreach_mode` is the prominent toggle at the top of the workbench:
       off              — nothing sends; AI may still track + draft.
-      draft_first      — drafts land in AI Inbox; human reviews/sends.
+      draft_first      — drafts land in Elara Inbox; human reviews/sends.
       portal_auto      — portal sends auto; email/SMS still draft-first.
       portal_email     — portal + email auto; SMS still draft-first.
       portal_email_sms — everything auto (consent + quiet hours still apply).

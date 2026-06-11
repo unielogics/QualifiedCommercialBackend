@@ -50,7 +50,7 @@ def test_borrower_loan_scoped_thread() -> None:
 
 
 def test_agent_account_wide_thread_runs_realtor() -> None:
-    """Agent's AI Secretary (no thread scope) runs as Realtor AI by default."""
+    """Agent's Elara (no thread scope) runs as Realtor AI by default."""
     assert _system_prompt_for(FakeUser(Role.BROKER), None) == REALTOR_SYSTEM_PROMPT
 
 

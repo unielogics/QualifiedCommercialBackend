@@ -1,6 +1,6 @@
-"""AI co-pilot chat router.
+"""Elara chat router.
 
-Powers the AIRail Chat tab. Uses Claude Haiku via the existing Anthropic
+Powers ElaraRail Chat tab. Uses Claude Haiku via the existing Anthropic
 client when a key is configured; falls back to a deterministic stub
 otherwise.
 
@@ -73,7 +73,7 @@ class ChatResponse(BaseModel):
 
 # ── Property-intake tool (Phase C) ─────────────────────────────────────
 #
-# When a loan-scoped chat thread is open, the AI gets ONE tool —
+# When a loan-scoped chat thread is open, Elara gets ONE tool —
 # update_loan_property_details. The intake opener message
 # (kicked off in loan_intake_automation.py) asks the borrower
 # about beds / baths / sqft / year built / units / rent / taxes /
@@ -116,7 +116,7 @@ _PROPERTY_INTAKE_FIELDS = {
 
 # ── Conversational doc-collector tools (Phase B) ───────────────────────
 #
-# These three tools let the AI act like a secretary chasing the file:
+# These three tools let Elara act like a secretary chasing the file:
 # every reply can carry up to 5 buttons the borrower taps to jump
 # straight into the right upload sheet. The tool handlers don't
 # write much state — they accumulate ChatAction dicts which the
@@ -171,7 +171,7 @@ PROPOSE_CALENDAR_EVENT_TOOL = {
         "Propose a calendar event for this loan when the conversation "
         "establishes a scheduled need — a call, an inspection, a "
         "document deadline, a closing milestone. The proposal is "
-        "queued as an AITask in the AI Inbox; a human approves it "
+        "queued as an AITask in Elara Inbox; a human approves it "
         "before it appears on anyone's calendar. NEVER create an "
         "event without explicit context: a date/time the user "
         "mentioned, or a deadline the file structure requires. If "
@@ -206,7 +206,7 @@ PROPOSE_CALENDAR_EVENT_TOOL = {
             },
             "description": {
                 "type": "string",
-                "description": "1-3 sentences of context the human approver will see in the AI Inbox.",
+                "description": "1-3 sentences of context the human approver will see in Elara Inbox.",
             },
         },
         "required": ["kind", "title", "starts_at"],
@@ -245,13 +245,13 @@ async def _execute_property_intake_tool(
     loan_id: UUID,
     tool_input: dict,
 ) -> dict:
-    """Validate + persist the AI's tool call. Returns a small JSON
-    object the AI sees as the tool_result content.
+    """Validate + persist Elara's tool call. Returns a small JSON
+    object Elara sees as the tool_result content.
 
     Privilege check: the tool ONLY writes to a loan the calling
     user has scope on. CLIENT users must own the loan via their
     client record; operators (BROKER / SUPER_ADMIN / LOAN_EXEC)
-    pass through. Anything else → no-op + tell the AI."""
+    pass through. Anything else → no-op + tell Elara."""
     loan = await db.get(Loan, loan_id)
     if loan is None:
         return {"ok": False, "error": "loan_not_found"}
@@ -424,14 +424,14 @@ async def _execute_propose_calendar_event_tool(
     tool_input: dict,
     accumulated_actions: list[dict],
 ) -> dict:
-    """Queue a calendar-event proposal as an AITask in the AI Inbox.
+    """Queue a calendar-event proposal as an AITask in Elara Inbox.
 
     Never creates the CalendarEvent directly — a human approves the
     AITask via the existing /ai-tasks/{id}/decision flow, which is
     where the materialization should live (a follow-up to wire that
     handler is tracked in the audit log).
 
-    The AI sees these tasks in subsequent conversations because the
+    Elara sees these tasks in subsequent conversations because the
     operator chat context already exposes pending AITasks, so it
     won't propose the same event twice in a row.
     """
@@ -496,10 +496,10 @@ async def _execute_propose_calendar_event_tool(
     )
     await db.flush()
 
-    # Surface a CTA so the operator can jump into the AI Inbox.
+    # Surface a CTA so the operator can jump into Elara Inbox.
     accumulated_actions.append({
         "kind": "open_ai_inbox",
-        "label": "Review in AI Inbox",
+        "label": "Review in Elara Inbox",
         "task_id": str(task.id),
         "confirm": False,
     })
@@ -545,7 +545,7 @@ async def _execute_complete_property_intake_tool(
 def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
     last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
     if not last_user:
-        return "What would you like to look at first — the pipeline, an AI Inbox task, or a specific loan?"
+        return "What would you like to look at first — the pipeline, an Elara Inbox task, or a specific loan?"
     body = (
         f"(Dev mode — no ANTHROPIC_API_KEY set.) "
         f"You asked: \"{last_user[:120]}{'…' if len(last_user) > 120 else ''}\". "
@@ -560,13 +560,13 @@ def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
 # ── Role-aware system prompts ──────────────────────────────────────────
 #
 # Two different framings — one for operators (the Lead Fintech
-# Orchestrator persona), one for borrowers (the AI Intelligent
+# Orchestrator persona), one for borrowers (Elara Intelligent
 # Underwriter assistant). The chat endpoint picks the right one based
 # on the authenticated user's role; the borrower never sees the
 # operator's "you do not finalize commitments" wording, and the
 # operator never sees the borrower-friendly framing.
 
-CLIENT_SYSTEM_PROMPT = """Role: You are the AI Intelligent Underwriter at Qualified Commercial — a borrower-facing concierge.
+CLIENT_SYSTEM_PROMPT = """Role: You are Elara at Qualified Commercial — a borrower-facing concierge.
 
 You always know exactly who you are talking to. Below this prompt the system appends a SCOPE block:
   - SCOPE: account-wide conversation
@@ -626,11 +626,11 @@ Style:
 - Cite concrete values when present (deal IDs, doc names, stage). Never invent identifiers.
 - If you do not have data, say so plainly and suggest where the operator can find it.
 
-Constraint: Do not engage in casual conversation. Every message must drive the loan toward "Clear to Close." You NEVER take real-world actions yourself — every concrete action (sending mail, requesting docs, transitioning stages, repricing) must be approved by the operator via the AI Inbox or Drafts queue.
+Constraint: Do not engage in casual conversation. Every message must drive the loan toward "Clear to Close." You NEVER take real-world actions yourself — every concrete action (sending mail, requesting docs, transitioning stages, repricing) must be approved by the operator via Elara Inbox or Drafts queue.
 """
 
 
-REALTOR_SYSTEM_PROMPT = """Role: You are the AI Real Estate Assistant for Qualified Commercial agents. You sit alongside the agent throughout the relationship and transaction stage of every lead — from intake through agreements through showings through finance-readiness. You are NOT an underwriter. You do not quote rates, terms, or pricing. The Bank/Lending AI takes over once a buyer is finance-ready and the agent fires the handoff.
+REALTOR_SYSTEM_PROMPT = """Role: You are Elara for Qualified Commercial agents. You sit alongside the agent throughout the relationship and transaction stage of every lead — from intake through agreements through showings through finance-readiness. You are NOT an underwriter. You do not quote rates, terms, or pricing. The Bank/Lending AI takes over once a buyer is finance-ready and the agent fires the handoff.
 
 You read + write a Realtor Client Intelligence Profile every turn. The profile carries: client_type (buyer | seller | buyer_and_seller | unknown), relationship_stage, intent_summary, buyer_profile (target_property_type, target_location, target_budget, purchase_timeline, financing_needed, buyer_agreement_status, ...), seller_profile (property_address, desired_list_price, listing_agreement_status, cma_status, photos_status, occupancy_status, ...), known_facts, missing_facts (what's still unknown), open_tasks, next_best_question, next_best_action, readiness_score.
 
@@ -666,7 +666,7 @@ Hard rules:
 """
 
 
-LENDING_AI_SYSTEM_PROMPT = """Role: You are the Lending Intake + Loan Intelligence Assistant for Qualified Commercial. You take over from the Realtor AI once the agent fires "Ready for Lending." You are NOT a lender — you don't quote rates, terms, or pricing. You don't promise approval. You collect the lending-side facts the funding team needs to move from a quote to a loan.
+LENDING_AI_SYSTEM_PROMPT = """Role: You are Elara for Qualified Commercial. You take over from the Realtor AI once the agent fires "Ready for Lending." You are NOT a lender — you don't quote rates, terms, or pricing. You don't promise approval. You collect the lending-side facts the funding team needs to move from a quote to a loan.
 
 You operate on a Lending Handoff Packet the Realtor AI handed you. The packet contains: realtor_summary (intent + relationship_stage at handoff), extracted_facts (what the agent already told the realtor AI: client name, target property type, location, budget, timeline, financing_needed, etc.), missing_lending_items (the lending-side gaps you need to close — borrower_entity_type, credit_authorization, liquidity_docs, property_address, rent_or_income_details, experience_tier), uploaded_document_refs (files already collected, with relevant_to_lending tag), recommended_lending_path (loan_type_guess, urgency, rationale), and visibility_rules (which facts the borrower can see vs internal-only).
 
@@ -675,7 +675,7 @@ Goals:
 2. Close lending-side gaps one at a time. Walk the missing_lending_items list, prioritize by urgency, ask the next question conversationally.
 3. Verify documents already uploaded. When uploaded_document_refs has a relevant_to_lending=true entry, surface it ("I see you uploaded the purchase agreement — let me confirm the terms").
 4. Identify conflicts. If a fact in extracted_facts disagrees with a fresh borrower answer, surface the discrepancy + ask which is current.
-5. Hand the agent + funding team a clean prequal package. The AI Inbox sees what's pending; the operator queue picks up the formal review.
+5. Hand the agent + funding team a clean prequal package. Elara Inbox sees what's pending; the operator queue picks up the formal review.
 
 Tools (invoke as you learn things — same safety pattern as the Realtor AI):
 - Mirror profile updates onto the same Client.realtor_profile / extracted_facts so the agent sees consistent state across phases.
@@ -707,7 +707,7 @@ Document collection protocol (STRICT):
 
 
 def _system_prompt_for(user: User, thread: AIChatThread | None = None) -> str:
-    """Pick the framing the AI should adopt for this caller + thread
+    """Pick the framing Elara should adopt for this caller + thread
     scope. Borrowers always get the concierge tone scoped to their own
     data. Operators split based on thread phase + scope:
 
@@ -739,22 +739,22 @@ def _system_prompt_for(user: User, thread: AIChatThread | None = None) -> str:
 
 # ── Account-wide context (no loan_id) ──────────────────────────────────
 #
-# Built when the AI Intelligent Underwriter is invoked without a loan
+# Built when Elara is invoked without a loan
 # scope (mobile dashboard / calendar FAB, desktop topbar chat). Gives
 # the LLM enough to answer "what's my credit score?" and "what's next
 # on my account?" without hallucinating.
 
 
 async def _build_account_context(db: AsyncSession, user: User) -> str:
-    """Render the per-account context block — everything the AI needs
+    """Render the per-account context block — everything Elara needs
     to answer questions like 'what's my FICO?' or 'which docs are
     overdue?' without making things up.
 
     Always emits a non-empty block — even when the user has no client
-    record yet, the AI gets the user's identity and role."""
+    record yet, Elara gets the user's identity and role."""
     lines: list[str] = ["=== ACCOUNT CONTEXT ==="]
 
-    # Scope marker first — the AI should know it's operating
+    # Scope marker first — Elara should know it's operating
     # account-wide (not loan- or quote-scoped) before it reads
     # anything else.
     lines.append("SCOPE: account-wide conversation (no loan or quote in scope).")
@@ -763,7 +763,7 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
         "look up. Treat everything in this block as authoritative."
     )
 
-    # Identity + role + DB keys — the AI should never have to ask the
+    # Identity + role + DB keys — Elara should never have to ask the
     # user who they are or guess at their database key.
     role_label = {
         Role.CLIENT: "Borrower (Client)",
@@ -898,7 +898,7 @@ async def _build_account_context(db: AsyncSession, user: User) -> str:
 def _render_plan_block(plan, audience: str = "agent") -> str | None:
     """Render `client_ai_plan` as a system-prompt context section.
 
-    Phase 4: this block is what tells the AI which requirements are
+    Phase 4: this block is what tells Elara which requirements are
     active for THIS client/deal — including agent overrides and
     per-client custom instructions. Trumps the raw missing_facts walk
     of the legacy realtor_profile path.
@@ -953,7 +953,7 @@ def _render_plan_block(plan, audience: str = "agent") -> str | None:
     lines.append(
         "\nUse this block as your active checklist. Honor agent custom "
         "instructions verbatim. Skip any item in WAIVED. Walk OPEN "
-        "REQUIRED ITEMS one at a time, prioritizing the AI NEXT-BEST "
+        "REQUIRED ITEMS one at a time, prioritizing Elara NEXT-BEST "
         "QUESTION when present. Do NOT re-ask for items already in "
         "verified/uploaded status."
     )
@@ -1003,10 +1003,10 @@ async def chat(
     # Two context branches:
     #   1. loan_id supplied → assemble per-loan context (instructions,
     #      scenarios, HUD, feedback, recent activity). Same as before.
-    #   2. loan_id is None  → assemble account-wide context so the AI
+    #   2. loan_id is None  → assemble account-wide context so Elara
     #      knows WHO is asking, their role, their credit, their loans,
     #      their docs, their prequals. This is the path the new AI
-    #      Intelligent Underwriter chat (mobile FAB / desktop topbar)
+    #      Elara chat (mobile FAB / desktop topbar)
     #      hits, and was previously starved of context.
     context_block: str | None = None
     audience_value: str = (
@@ -1140,7 +1140,7 @@ class ChatAction(BaseModel):
     - upload_document          → opens vault upload pre-targeted at
                                  `document_id` (preferred) or
                                  `checklist_key` (fallback)
-    - confirm_document_routing → for an orphan upload the AI is
+    - confirm_document_routing → for an orphan upload Elara is
                                  proposing to file under
                                  `checklist_key` (or `document_id`
                                  of an existing REQUESTED row)
@@ -1160,7 +1160,7 @@ class ChatAction(BaseModel):
 
 class ChatAttachment(BaseModel):
     """A file riding on a chat message. Borrower uploads ride on the
-    user's send turn (paperclip composer); the AI inspects them via
+    user's send turn (paperclip composer); Elara inspects them via
     the synchronous vision scan and proposes routing in its reply."""
 
     document_id: str
@@ -1216,7 +1216,7 @@ class AIChatSendRequest(BaseModel):
     # Document IDs returned from /attachments/upload-init that should
     # ride on this user message. Backend flips them PENDING→RECEIVED,
     # runs vision scan, persists attachment metadata on the user msg,
-    # and feeds the scan suggestion into the AI's context.
+    # and feeds the scan suggestion into Elara's context.
     attachment_tokens: list[UUID] | None = None
 
 
@@ -1514,7 +1514,7 @@ async def chat_attachment_upload_init(
     chat composer. Creates a PENDING `is_other=True` Document on the
     thread's loan; the next /message send (with this id in
     `attachment_tokens`) flips it RECEIVED, runs the vision scan,
-    and lets the AI propose a routing.
+    and lets Elara propose a routing.
 
     Account-wide threads can't accept attachments — there's no loan
     to attach the doc to. 400 in that case."""
@@ -1582,11 +1582,11 @@ async def append_thread_message(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AIChatSendResponse:
-    """Append the user's turn, call the AI with full thread history +
+    """Append the user's turn, call Elara with full thread history +
     fresh context, persist the assistant reply.
 
     Context is rebuilt on every send (account- or loan-level) so the
-    AI sees the latest credit / docs / loan state, not whatever was
+    Elara sees the latest credit / docs / loan state, not whatever was
     cached when the thread was created. History is what's persisted;
     context is ephemeral.
     """
@@ -1720,7 +1720,7 @@ async def append_thread_message(
 
         # Phase 4: rebuild the ClientAIPlan up front. The plan rolls up
         # platform + funding + agent + per-client-override layers into
-        # the active list the AI should chase. Failures here MUST NOT
+        # the active list Elara should chase. Failures here MUST NOT
         # block the chat turn — fall back to the legacy context blocks
         # below if the rebuild errors out.
         plan_block: str | None = None
@@ -1882,7 +1882,7 @@ async def append_thread_message(
         loop_messages: list[dict] = [
             {"role": m["role"], "content": m["content"]} for m in api_messages
         ]
-        # Inject attachment context into the final user turn so the AI
+        # Inject attachment context into the final user turn so Elara
         # sees the scan results without polluting the persisted
         # message body. Wrapped in [SYSTEM] markers so the model
         # knows it's metadata, not borrower-typed text.

@@ -5,7 +5,7 @@ render "Full Name (Agent)" / "Full Name (Operator)" and "Smart
 Assistant" for AI. We resolve from_user_id → users.name, falling back
 to brokers.display_name when the user's name is blank. AI rows
 (from_user_id is None) resolve to None and the frontend shows
-"Smart Assistant".
+"Elara".
 
 Batched (one users query + one brokers query) to avoid N+1 across a
 whole thread.

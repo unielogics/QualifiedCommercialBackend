@@ -66,7 +66,7 @@ log = logging.getLogger(__name__)
 #   - internal_action: short tag for operator UI (only on internal)
 #
 # Internal items (Appraisal, Title, Insurance Binder, PFS) live in
-# the operator AI Inbox — borrower never sees them in the vault.
+# the operator Elara Inbox — borrower never sees them in the vault.
 _DEFAULT_DOCS_BY_TYPE: dict[str, list[DocChecklistItem]] = {
     "dscr": [
         # ── External: borrower-supplied at intake ────────────────

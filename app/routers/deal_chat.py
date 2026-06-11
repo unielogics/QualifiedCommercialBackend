@@ -4,7 +4,7 @@ Same shape as routers/loan_workspace.send_chat but keyed on Deal
 instead of Loan. Broker, client, and AI all participate. Modes
 mirror the loan workspace surface: chat (client/operator takeover),
 live_chat (broker takeover), broker_question (private Q&A with AI),
-broker_suggestion (drafts an AI Inbox task), instruct (rule for AI).
+broker_suggestion (drafts an Elara Inbox task), instruct (rule for AI).
 
 On promotion (services/handoff.promote_deal_to_loan) the full thread
 is summarized into a single broker_internal LoanChatMessage at the
@@ -223,7 +223,7 @@ def _push_title_for(actor_role: str) -> str:
     if actor_role == "broker":
         return "Your agent"
     if actor_role == "ai":
-        return "AI Assistant"
+        return "Elara"
     return "Deal update"
 
 
@@ -332,7 +332,7 @@ async def _generate_ai_reply(
         if client_row and client_row.user_id:
             fire_and_forget_push(
                 client_row.user_id,
-                title="AI Assistant",
+                title="Elara",
                 body=reply_text[:100],
                 data={"kind": "deal_chat_message", "deal_id": str(deal.id)},
             )

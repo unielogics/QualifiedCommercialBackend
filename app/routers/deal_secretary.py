@@ -1125,7 +1125,7 @@ class CustomTaskCreate(BaseModel):
     Example: "follow up about tenant leaving on the 1st" or "confirm
     with client when construction is finished". The row lands as a
     real ClientRequirementStatus with source='client_custom' so it
-    shows on the AI Secretary timeline alongside playbook tasks
+    shows on Elara timeline alongside playbook tasks
     and can be assigned to AI or Human just like anything else."""
     label: str
     owner_type: TaskOwnerTypeLiteral = "human"
@@ -1320,7 +1320,7 @@ async def start_ai_secretary(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> StartResponse:
-    """One-click "Start AI Secretary" — the user-facing primitive that
+    """One-click "Start Elara" — the user-facing primitive that
     makes the AI actually begin contacting the borrower.
 
     Atomically:
@@ -1480,7 +1480,7 @@ async def pause_ai_secretary(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> FileSettings:
-    """One-click "Pause AI Secretary" — sets outreach_mode to 'off'.
+    """One-click "Pause Elara" — sets outreach_mode to 'off'.
     The AI keeps tracking the plan but stops sending anything until
     /start (or a manual mode flip) re-engages it."""
     loan = await _resolve_loan_and_gate(loan_id, user, db)

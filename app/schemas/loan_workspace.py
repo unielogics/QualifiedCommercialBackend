@@ -48,7 +48,7 @@ class ChatMessageRead(ORMModel):
     from_user_id: UUID | None
     # Resolved display name of the human sender (users.name, falling
     # back to brokers.display_name). None for AI / unresolved — the
-    # frontend renders "Smart Assistant" for AI and the role word as
+    # frontend renders "Elara" for AI and the role word as
     # the suffix.
     from_name: str | None = None
     body: str
@@ -73,7 +73,7 @@ class ChatSendResponse(BaseModel):
       - kind='message'      → a real chat turn was persisted (`message`),
                               and optionally an AI auto-reply (`ai_reply`).
       - kind='instruction'  → an instruction was created instead.
-      - kind='ai_task'      → a broker_suggestion was filed in the AI Inbox.
+      - kind='ai_task'      → a broker_suggestion was filed in Elara Inbox.
     """
     kind: str
     message: ChatMessageRead | None = None

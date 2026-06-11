@@ -323,7 +323,7 @@ def _build_handoff_summary(
 ) -> str:
     """Plain-English summary the Lending AI sees as "the agent's
     handoff narrative." 5-line max, structured so it's parseable by
-    a human glancing at the AI Inbox."""
+    a human glancing at Elara Inbox."""
     lines = [
         f"Client: {client.name}" + (f" ({client.email})" if client.email else ""),
         f"Type: {client_type}",

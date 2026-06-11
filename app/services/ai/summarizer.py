@@ -1,4 +1,4 @@
-"""'Pocket Assistant' — the Lead Fintech Orchestrator summarizer.
+"""'Elara' — the Lead Fintech Orchestrator summarizer.
 
 Every time a loan-touching activity lands (loan.created, doc.received,
 message.inbound, stage_change, etc.), call `refresh_summary(loan_id)` to
@@ -13,7 +13,7 @@ Outputs the 4-section profile defined in the AI brief:
   4. NEXT ACTIONS    — split into [AI ACTION] + [BROKER ACTION]
 
 The market context is grounded in the live FRED feed (services/fred.py)
-so the 'Pocket Assistant' can warn brokers proactively when rates move against
+so the 'Elara' can warn brokers proactively when rates move against
 them — the same number the dashboard widget renders.
 
 Uses Claude Haiku — cheap, fast, perfect for this short summarization. When
@@ -44,7 +44,7 @@ from app.services.ai.usage import tracked_messages_create
 log = logging.getLogger(__name__)
 
 SUMMARIZER_SYSTEM = """### ROLE
-You are the "Pocket Assistant," the Lead Fintech Orchestrator at Qualified Commercial. Your mission is to provide high-level deal oversight, identify market risks, and drive loans to completion.
+You are the "Elara," the Lead Fintech Orchestrator at Qualified Commercial. Your mission is to provide high-level deal oversight, identify market risks, and drive loans to completion.
 
 ### DATA CONTEXT PROVIDED
 1. **Activity Log:** Recent emails, uploads, and system events.
@@ -273,7 +273,7 @@ async def _llm_profile(
 
     # Append the unified loan context (instructions + feedback + scenarios +
     # AI-modify corrections + market pulse). This is what makes operator
-    # feedback bend the next summary AND gives the 'Pocket Assistant' the live
+    # feedback bend the next summary AND gives the 'Elara' the live
     # FRED data to warn about rate pressure.
     extra_context = ""
     try:

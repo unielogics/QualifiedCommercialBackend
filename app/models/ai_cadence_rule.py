@@ -5,7 +5,7 @@ on a trigger event (`requirement_missing`, `closing_date_near`, etc.)
 when its condition is met + the wait period has elapsed.
 
 Default behavior is **draft-first**: `approval_required=True` means
-the action shows up in AI Inbox for the agent to review, not as an
+the action shows up in Elara Inbox for the agent to review, not as an
 auto-sent message. Auto-send is opt-in per rule (`approval_required=False`)
 and only safe for unambiguous internal recipients.
 """

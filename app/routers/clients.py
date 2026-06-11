@@ -647,13 +647,13 @@ async def update_client(
 # When the agent has nurtured a lead enough that they want the firm's
 # funding team to look at it, they fire this endpoint (either via the
 # "Ready for Prequalification" button on /clients/[id] or through a
-# tool the AI Secretary calls on their behalf). It:
+# tool Elara calls on their behalf). It:
 #
 #   1. Validates the lead has the minimum fields the funding team
 #      needs to triage (name, email, side-specific price, address).
 #   2. Creates a PrequalRequest from `Client.lead_intake` so the
 #      existing `/admin/prequal-requests` queue picks it up.
-#   3. Spawns an AITask in the funding-team queue so AI Inbox surfaces
+#   3. Spawns an AITask in the funding-team queue so Elara Inbox surfaces
 #      it for whoever's on triage that day.
 #   4. Stamps `client.lead_promotion_status = "agent_requested_review"`.
 #
@@ -773,7 +773,7 @@ async def request_prequalification(
     db.add(prequal)
     await db.flush()
 
-    # Notify the funding team via AI Inbox — picks up alongside other
+    # Notify the funding team via Elara Inbox — picks up alongside other
     # pipeline tasks. loan_id is NULL (firm-wide alert) so super-admin
     # / underwriter see it via the null-loan-task widening rule.
     db.add(
@@ -968,7 +968,7 @@ async def _spawn_realtor_action_task(
     payload: dict | None = None,
 ) -> AITask:
     """Common spawner — every Realtor ChatAction confirm-endpoint
-    drops one of these into the agent's AI Inbox so the actual side
+    drops one of these into the agent's Elara Inbox so the actual side
     effect (sending the buyer agreement, scheduling picture day,
     etc.) is queued for the operator's approval."""
     task = AITask(
@@ -1019,7 +1019,7 @@ async def send_buyer_agreement(
             f"reminder."
         ),
     )
-    # Mirror onto the realtor_profile so the AI sees the status update.
+    # Mirror onto the realtor_profile so Elara sees the status update.
     if client.realtor_profile:
         bp = client.realtor_profile.get("buyer_profile") or {}
         bp["buyer_agreement_status"] = "sent"
@@ -1611,7 +1611,7 @@ async def add_agent_note(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Append a free-form note to the client's realtor_profile.known_facts
-    with source=agent. The Realtor AI sees this on the next chat turn
+    with source=agent. The Realtor Elara sees this on the next chat turn
     via apply_profile_patch's known_fact merge."""
     if user.role != Role.BROKER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")

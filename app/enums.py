@@ -330,7 +330,7 @@ class EmailDraftStatus(StrEnum):
 
 class RequirementCategory(StrEnum):
     """Single closed taxonomy used by Settings, the Deal Secretary picker,
-    pipeline filters, and AI Inbox source chips. No free-text categories
+    pipeline filters, and Elara Inbox source chips. No free-text categories
     anywhere in the system — adding a category is a code change.
 
     Old `category` values on AICollectionRequirement (fact / document /
@@ -380,7 +380,7 @@ class OutreachMode(StrEnum):
     action — see cadence_engine._evaluate_rule().
 
     - off              : nothing sends; AI may still track + draft internally
-    - draft_first      : drafts land in AI Inbox; agent reviews + sends manually
+    - draft_first      : drafts land in Elara Inbox; agent reviews + sends manually
     - portal_auto      : portal messages auto-send; email/SMS still draft-first
     - portal_email     : portal + email auto-send; SMS still draft-first
     - portal_email_sms : everything auto-sends (consent + quiet hours still apply)
@@ -405,7 +405,7 @@ class OutreachEventStatus(StrEnum):
     """Lifecycle states for one row in ai_outreach_events.
 
     `scheduled` is the queued-but-not-yet-fired state. `drafted` lands in
-    AI Inbox. `blocked_by_*` are the legibly-failed states that explain
+    Elara Inbox. `blocked_by_*` are the legibly-failed states that explain
     why nothing went out — important for debugging cadence gating."""
     SCHEDULED = "scheduled"
     DRAFTED = "drafted"

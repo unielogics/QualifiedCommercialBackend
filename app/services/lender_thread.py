@@ -22,7 +22,7 @@ Sender label resolution for the thread response:
 
   * LENDER  → loan.lender.name (or "The Lender" if hide_identity and
               viewer is broker/client)
-  * AI      → "AI Assistant" + (the actor who instructed it if known)
+  * AI      → "Elara" + (the actor who instructed it if known)
   * BROKER  → matched EmailDraft.actioned_by within ±60s, else
               "Internal team"
 
@@ -379,7 +379,7 @@ async def load_thread(
                 ThreadEntry(
                     id=str(m.id),
                     kind="ai_outbound",
-                    sender_label=f"AI · {sender_label}" if sender_label != "Internal team" else "AI Assistant",
+                    sender_label=f"AI · {sender_label}" if sender_label != "Internal team" else "Elara",
                     sender_role="ai",
                     sent_at=m.sent_at,
                     body=body,

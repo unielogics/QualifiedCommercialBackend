@@ -4,7 +4,7 @@ The borrower-facing chat needs to feel like a human secretary, not
 a cron job. This module classifies each outstanding Document into
 one of five collection scenarios based on how close it is to its
 due date, and composes a unique conversational chat message via
-Anthropic Haiku — the AI sees the borrower's first name, the
+Anthropic Haiku — Elara sees the borrower's first name, the
 specific docs in focus, what's already been submitted, and the
 loan's close date, then writes a short message in our concierge
 voice.
@@ -149,7 +149,7 @@ def first_name_of(client: Client | None) -> str | None:
     return first
 
 
-SYSTEM_PROMPT = """You are the AI Intelligent Underwriter at Qualified Commercial — a borrower-facing concierge helping a borrower complete the documents needed to fund their commercial real estate loan. You are gentle, warm, and conversational. Never demanding or robotic. You're the human-feeling secretary chasing paperwork.
+SYSTEM_PROMPT = """You are Elara at Qualified Commercial — a borrower-facing concierge helping a borrower complete the documents needed to fund their commercial real estate loan. You are gentle, warm, and conversational. Never demanding or robotic. You're the human-feeling secretary chasing paperwork.
 
 Generate a SHORT chat message asking for documents — 1-3 sentences, max ~60 words.
 
@@ -261,7 +261,7 @@ async def compose_collection_nudge(db: AsyncSession, ctx: DocCollectionContext) 
 
 def _fallback_template(ctx: DocCollectionContext) -> str:
     """Deterministic fallback when Haiku is unavailable. Less
-    natural than the AI version, but keeps the system functional
+    natural thElara version, but keeps the system functional
     when Anthropic is down."""
     name = ctx.borrower_first_name or "there"
     if len(ctx.focus_docs) == 1:

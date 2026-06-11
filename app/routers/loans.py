@@ -1300,7 +1300,7 @@ async def post_lender_thread_preview(
     db: AsyncSession = Depends(get_db),
 ) -> LenderThreadPreviewResponse:
     """Compute the exact payload that WOULD be sent if the operator
-    clicked Send Now (or Instruct AI). Writes NOTHING; safe to call
+    clicked Send Now (or Instruct Elara). Writes NOTHING; safe to call
     repeatedly. Powers the 'Preview before send' modal."""
     if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         raise HTTPException(

@@ -2,7 +2,7 @@
 
 Every route is scoped to `Role.BROKER` and to the caller's own
 `broker_id`. This router is purely additive — it does not touch the
-existing AI Inbox, cadence engine, or any other account type.
+existing Elara Inbox, cadence engine, or any other account type.
 
 See `app/services/ai/ai_agent.py` for gate evaluation, targeting,
 heavy synthesis, and the message composer.

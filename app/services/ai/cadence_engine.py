@@ -5,7 +5,7 @@ rule's trigger is currently true + the wait window has elapsed +
 nothing equivalent has been actioned recently, and:
 
   - draft_message       → creates an AITask with the proposed draft.
-                          Default. Agent reviews + sends from AI Inbox.
+                          Default. Agent reviews + sends from Elara Inbox.
   - create_task         → opens an AITask of a specific shape.
   - escalate            → high-priority AITask + (optionally)
                           flips lead_promotion_status / loan flag.
@@ -302,7 +302,7 @@ async def _resolve_ai_owner_gate(
 
     # Consult the file-level OutreachMode for borrower-visible rules.
     # Internal-only rules (visibility='internal' / 'agent') bypass the
-    # mode gate — they always draft to the AI Inbox.
+    # mode gate — they always draft to Elara Inbox.
     if rule.visibility != "borrower":
         return rule.action_type
 
@@ -570,7 +570,7 @@ async def _handle_draft_message(
     target: dict[str, Any],
 ) -> dict[str, Any]:
     """Draft-first default. Creates an AITask the agent reviews +
-    sends from AI Inbox. Never sends to the borrower directly."""
+    sends from Elara Inbox. Never sends to the borrower directly."""
     msg = _compose_assignment_message(rule, target)
     task = AITask(
         loan_id=target.get("loan_id"),
@@ -730,7 +730,7 @@ async def _handle_auto_send_reminder(
         )
         last_event_id = event.id
 
-    # We still create a tiny AITask so the AI Inbox shows the action
+    # We still create a tiny AITask so Elara Inbox shows the action
     # for auditability — the actual outbound already fired above.
     task = AITask(
         loan_id=loan_id,

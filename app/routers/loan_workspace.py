@@ -110,7 +110,7 @@ def _push_title_for(actor_role: str) -> str:
     if actor_role == DealChatRole.BROKER.value or actor_role == "broker":
         return "Your agent"
     if actor_role == DealChatRole.AI.value or actor_role == "ai":
-        return "AI Assistant"
+        return "Elara"
     return "Loan update"
 
 
@@ -608,7 +608,7 @@ async def send_chat(
                 actor_id=user.id,
                 actor_label=user.email,
                 kind=("ai.paused_by_broker" if Role(user.role) == Role.BROKER else "ai.paused_by_super_admin"),
-                summary=f"{user.email} ({user.role}) took over the chat; AI paused until {paused_until.isoformat()}",
+                summary=f"{user.email} ({user.role}) took over the chat; Elara paused until {paused_until.isoformat()}",
             )
         )
         await db.flush()
