@@ -343,6 +343,8 @@ async def update_provider_settings(
         "rentcast_api_key",
         "google_server_api_key",
         "google_maps_browser_key",
+        "google_maps_ios_key",
+        "google_maps_android_key",
         "google_maps_mobile_key",
     ):
         value = data.pop(key, None)

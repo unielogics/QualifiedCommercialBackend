@@ -17,6 +17,8 @@ SECRET_KEYS = {
     "rentcast_api_key",
     "google_server_api_key",
     "google_maps_browser_key",
+    "google_maps_ios_key",
+    "google_maps_android_key",
     "google_maps_mobile_key",
 }
 
@@ -26,6 +28,8 @@ class ProviderRuntimeSettings:
     rentcast_api_key: str | None
     google_server_api_key: str | None
     google_maps_browser_key: str | None
+    google_maps_ios_key: str | None
+    google_maps_android_key: str | None
     google_maps_mobile_key: str | None
     property_analysis_ai_enabled: bool
     property_intelligence_cache_ttl_hours: int
@@ -132,6 +136,8 @@ async def runtime_settings(db: AsyncSession) -> ProviderRuntimeSettings:
         rentcast_api_key=await get_secret(db, "rentcast_api_key") or settings.rentcast_api_key or None,
         google_server_api_key=await get_secret(db, "google_server_api_key") or None,
         google_maps_browser_key=await get_secret(db, "google_maps_browser_key") or None,
+        google_maps_ios_key=await get_secret(db, "google_maps_ios_key") or None,
+        google_maps_android_key=await get_secret(db, "google_maps_android_key") or None,
         google_maps_mobile_key=await get_secret(db, "google_maps_mobile_key") or None,
         property_analysis_ai_enabled=pi.ai_report_enabled,
         property_intelligence_cache_ttl_hours=pi.cache_ttl_hours,
@@ -144,8 +150,12 @@ async def provider_settings_status(db: AsyncSession) -> dict[str, Any]:
         "rentcast_configured": bool(runtime.rentcast_api_key),
         "google_server_configured": bool(runtime.google_server_api_key),
         "google_maps_browser_key_configured": bool(runtime.google_maps_browser_key),
+        "google_maps_ios_key_configured": bool(runtime.google_maps_ios_key),
+        "google_maps_android_key_configured": bool(runtime.google_maps_android_key),
         "google_maps_mobile_key_configured": bool(runtime.google_maps_mobile_key),
         "google_maps_browser_key": runtime.google_maps_browser_key,
+        "google_maps_ios_key": runtime.google_maps_ios_key,
+        "google_maps_android_key": runtime.google_maps_android_key,
         "google_maps_mobile_key": runtime.google_maps_mobile_key,
         "property_analysis_ai_enabled": runtime.property_analysis_ai_enabled,
         "property_intelligence_cache_ttl_hours": runtime.property_intelligence_cache_ttl_hours,

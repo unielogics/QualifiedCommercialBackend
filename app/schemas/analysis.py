@@ -18,8 +18,12 @@ class ProviderSettingsRead(BaseModel):
     rentcast_configured: bool
     google_server_configured: bool
     google_maps_browser_key_configured: bool
-    google_maps_mobile_key_configured: bool
+    google_maps_ios_key_configured: bool = False
+    google_maps_android_key_configured: bool = False
+    google_maps_mobile_key_configured: bool = False
     google_maps_browser_key: str | None = None
+    google_maps_ios_key: str | None = None
+    google_maps_android_key: str | None = None
     google_maps_mobile_key: str | None = None
     property_analysis_ai_enabled: bool = True
     property_intelligence_cache_ttl_hours: int = 24
@@ -29,6 +33,8 @@ class ProviderSettingsUpdate(BaseModel):
     rentcast_api_key: str | None = None
     google_server_api_key: str | None = None
     google_maps_browser_key: str | None = None
+    google_maps_ios_key: str | None = None
+    google_maps_android_key: str | None = None
     google_maps_mobile_key: str | None = None
     property_analysis_ai_enabled: bool | None = None
     property_intelligence_cache_ttl_hours: int | None = Field(default=None, ge=1, le=720)
