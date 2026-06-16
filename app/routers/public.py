@@ -21,14 +21,23 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
+from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
+from app.models.broker import Broker
+from app.models.event import CalendarEvent
+from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
+from app.schemas.broker_settings import AgentBookingSettings, AgentSettingsData
 from app.schemas.fred import FredSeriesSummary
 from app.services import fred as fred_service
 
@@ -248,6 +257,292 @@ async def support_inquiry(
     )
     await db.flush()
     return SupportInquiryResult(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Public broker booking page
+# ---------------------------------------------------------------------------
+
+
+class PublicBookingSlot(BaseModel):
+    starts_at: datetime
+    label: str
+    date_label: str
+
+
+class PublicBookingProfile(BaseModel):
+    slug: str
+    agent_name: str
+    title: str
+    intro: str
+    primary_color: str
+    background_color: str
+    duration_min: int
+    timezone: str
+    slots: list[PublicBookingSlot]
+
+
+class PublicBookingCreate(BaseModel):
+    starts_at: datetime
+    full_name: str = Field(min_length=1, max_length=160)
+    email: str = Field(min_length=5, max_length=320)
+    phone: str | None = Field(default=None, max_length=40)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class PublicBookingCreateResult(BaseModel):
+    ok: bool
+    event_id: str
+
+
+@router.get("/booking/{slug}", response_model=PublicBookingProfile)
+async def public_booking_profile(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+) -> PublicBookingProfile:
+    broker, user, booking = await _load_public_booking(db, slug)
+    slots = await _available_booking_slots(db, broker, booking)
+    return PublicBookingProfile(
+        slug=booking.slug or slug,
+        agent_name=broker.display_name or user.name or "Qualified Commercial",
+        title=booking.title or f"Book a meeting with {broker.display_name or user.name or 'Qualified Commercial'}",
+        intro=booking.intro or "Choose a time that works for you. You will receive a confirmation after booking.",
+        primary_color=booking.primary_color,
+        background_color=booking.background_color,
+        duration_min=booking.duration_min,
+        timezone=booking.timezone,
+        slots=slots,
+    )
+
+
+@router.post("/booking/{slug}", response_model=PublicBookingCreateResult)
+async def public_booking_create(
+    slug: str,
+    payload: PublicBookingCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> PublicBookingCreateResult:
+    if "@" not in payload.email or "." not in payload.email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A valid email is required.")
+
+    ip = (request.client.host if request.client else "?") or "?"
+    now = time.monotonic()
+    last = _LAST_SUBMIT.get(ip)
+    if last is not None and (now - last) < _THROTTLE_SECONDS:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Please wait a moment before submitting again.",
+        )
+    _LAST_SUBMIT[ip] = now
+
+    broker, user, booking = await _load_public_booking(db, slug)
+    starts_at = _to_utc_minute(payload.starts_at)
+    slots = await _available_booking_slots(db, broker, booking)
+    valid_slot = any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots)
+    if not valid_slot:
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+
+    who = f"{payload.full_name} <{payload.email}>"
+    description = (
+        "Booked from the agent public booking page.\n"
+        f"Name: {payload.full_name}\n"
+        f"Email: {payload.email}\n"
+        f"Phone: {payload.phone or '(not provided)'}\n\n"
+        f"Notes:\n{payload.notes or '(none)'}"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=f"Booked call: {payload.full_name}",
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.AUTO,
+        owner_user_id=broker.user_id,
+        external_ref_kind="public_booking",
+        external_ref_id=str(uuid.uuid4()),
+    )
+    db.add(ev)
+    await db.flush()
+
+    db.add(
+        Activity(
+            loan_id=None,
+            actor_id=None,
+            actor_label="public",
+            kind="calendar.public_booking",
+            summary=f"Public booking created for {broker.display_name}: {payload.full_name}",
+            payload={
+                "event_id": str(ev.id),
+                "broker_id": str(broker.id),
+                "broker_user_id": str(broker.user_id),
+                "invitee_name": payload.full_name,
+                "invitee_email": payload.email,
+                "starts_at": starts_at.isoformat(),
+                "duration_min": booking.duration_min,
+                "source": "public_booking_page",
+            },
+        )
+    )
+
+    _notify_agent_of_booking(user, broker, payload, starts_at, booking)
+    await db.flush()
+    return PublicBookingCreateResult(ok=True, event_id=str(ev.id))
+
+
+async def _load_public_booking(
+    db: AsyncSession,
+    slug: str,
+) -> tuple[Broker, User, AgentBookingSettings]:
+    rows = (
+        await db.execute(
+            select(Broker, User)
+            .join(User, Broker.user_id == User.id)
+            .where(User.deleted_at.is_(None))
+        )
+    ).all()
+    for broker, user in rows:
+        try:
+            data = AgentSettingsData.model_validate(broker.settings_data or {})
+        except Exception:
+            log.warning("public-booking: broker settings failed validation for %s", broker.id)
+            continue
+        booking = data.booking
+        if booking and booking.enabled and booking.slug == slug:
+            return broker, user, booking
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Booking page not found.")
+
+
+async def _available_booking_slots(
+    db: AsyncSession,
+    broker: Broker,
+    booking: AgentBookingSettings,
+) -> list[PublicBookingSlot]:
+    tz = _booking_tz(booking.timezone)
+    now_local = datetime.now(tz)
+    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 15)
+    window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    busy_rows = (
+        await db.execute(
+            select(CalendarEvent)
+            .where(
+                CalendarEvent.owner_user_id == broker.user_id,
+                CalendarEvent.status != CalendarEventStatus.CANCELLED,
+                CalendarEvent.starts_at >= now_local.astimezone(timezone.utc),
+                CalendarEvent.starts_at <= window_end_local.astimezone(timezone.utc),
+            )
+            .order_by(CalendarEvent.starts_at)
+        )
+    ).scalars().all()
+    busy = [
+        (
+            ev.starts_at.astimezone(tz),
+            ev.starts_at.astimezone(tz) + timedelta(minutes=max(15, ev.duration_min or booking.duration_min)),
+        )
+        for ev in busy_rows
+    ]
+
+    start_min = _parse_hhmm(booking.start_time)
+    end_min = _parse_hhmm(booking.end_time)
+    duration = timedelta(minutes=booking.duration_min)
+    slots: list[PublicBookingSlot] = []
+
+    for offset in range(15):
+        day = now_local.date() + timedelta(days=offset)
+        if _js_weekday(day) not in booking.available_days:
+            continue
+        day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=tz)
+        day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=tz)
+        cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
+        cursor = _round_up_to_step(cursor, 15)
+        while cursor + duration <= day_end:
+            slot_end = cursor + duration
+            if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
+                starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                slots.append(
+                    PublicBookingSlot(
+                        starts_at=starts_utc,
+                        label=_slot_time_label(cursor),
+                        date_label=_slot_date_label(cursor),
+                    )
+                )
+                if len(slots) >= 80:
+                    return slots
+            cursor += duration
+    return slots
+
+
+def _booking_tz(name: str) -> tzinfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        try:
+            return ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            return timezone.utc
+
+
+def _parse_hhmm(value: str) -> int:
+    hours, minutes = [int(part) for part in value.split(":")]
+    return hours * 60 + minutes
+
+
+def _js_weekday(day) -> int:
+    return (day.weekday() + 1) % 7
+
+
+def _round_up_to_step(value: datetime, step_min: int) -> datetime:
+    value = value.replace(second=0, microsecond=0)
+    minute = value.minute
+    remainder = minute % step_min
+    if remainder:
+        value += timedelta(minutes=step_min - remainder)
+    return value
+
+
+def _slot_time_label(value: datetime) -> str:
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def _slot_date_label(value: datetime) -> str:
+    return f"{value.strftime('%a, %b')} {value.day}"
+
+
+def _to_utc_minute(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _notify_agent_of_booking(
+    user: User,
+    broker: Broker,
+    payload: PublicBookingCreate,
+    starts_at: datetime,
+    booking: AgentBookingSettings,
+) -> None:
+    try:
+        from app.services.email.gmail_client import gmail_config, send_message
+
+        cfg = gmail_config()
+        if cfg is None:
+            return
+        tz = _booking_tz(booking.timezone)
+        when = starts_at.astimezone(tz).strftime("%A, %B %d at %I:%M %p %Z")
+        body = (
+            f"New booking for {broker.display_name}\n\n"
+            f"When: {when}\n"
+            f"Duration: {booking.duration_min} minutes\n"
+            f"Name: {payload.full_name}\n"
+            f"Email: {payload.email}\n"
+            f"Phone: {payload.phone or '(not provided)'}\n\n"
+            f"Notes:\n{payload.notes or '(none)'}\n"
+        )
+        send_message(cfg, to=user.email, subject=f"New booked call — {payload.full_name}", body=body)
+    except Exception:
+        log.exception("public-booking: agent notification failed")
 
 
 # ---------------------------------------------------------------------------

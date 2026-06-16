@@ -83,6 +83,45 @@ class AgentLetterhead(BaseModel):
     headshot_s3_key: str | None = None
 
 
+class AgentBookingSettings(BaseModel):
+    """Public booking-page configuration owned by the broker.
+
+    Stored inside broker.settings_data so agents can turn their page on,
+    personalize branding, and set a simple weekly availability window
+    without a schema migration. Weekdays follow JavaScript convention:
+    Sunday=0, Monday=1, ... Saturday=6.
+    """
+
+    enabled: bool = False
+    slug: str | None = Field(default=None, min_length=3, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    title: str | None = Field(default=None, max_length=140)
+    intro: str | None = Field(default=None, max_length=600)
+    primary_color: str = Field(default="#5eead4", pattern=r"^#[0-9A-Fa-f]{6}$")
+    background_color: str = Field(default="#05070d", pattern=r"^#[0-9A-Fa-f]{6}$")
+    duration_min: int = Field(default=30, ge=15, le=180)
+    timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
+    available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    start_time: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
+    end_time: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
+
+    @model_validator(mode="after")
+    def _validate_booking_window(self) -> "AgentBookingSettings":
+        days = sorted(set(self.available_days))
+        if any(day < 0 or day > 6 for day in days):
+            raise ValueError("available_days must use 0=Sunday through 6=Saturday")
+        self.available_days = days
+
+        start_h, start_m = [int(x) for x in self.start_time.split(":")]
+        end_h, end_m = [int(x) for x in self.end_time.split(":")]
+        start = start_h * 60 + start_m
+        end = end_h * 60 + end_m
+        if start_h > 23 or end_h > 23 or start_m > 59 or end_m > 59:
+            raise ValueError("start_time and end_time must be valid HH:MM values")
+        if end - start < self.duration_min:
+            raise ValueError("Booking end time must allow at least one meeting slot")
+        return self
+
+
 class AgentSettingsData(BaseModel):
     """Full per-broker settings blob. Lives on
     `brokers.settings_data` (JSONB). Every field has sensible
@@ -97,6 +136,8 @@ class AgentSettingsData(BaseModel):
     cadence: AgentCadenceOverride | None = None
     # Personal identity / letterhead.
     letterhead: AgentLetterhead | None = None
+    # Public booking page configuration.
+    booking: AgentBookingSettings | None = None
 
     @model_validator(mode="before")
     @classmethod

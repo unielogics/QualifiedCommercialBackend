@@ -94,6 +94,25 @@ async def put_broker_settings(
                     f"checklist[{key}].extra_items[{it.name!r}].side "
                     f"must be buyer | seller | both"
                 )
+    if payload.booking and payload.booking.enabled:
+        if not payload.booking.slug:
+            errors.append("booking.slug is required when the booking page is enabled")
+        else:
+            rows = (
+                await db.execute(
+                    select(Broker.id, Broker.settings_data).where(Broker.id != broker.id)
+                )
+            ).all()
+            for other_id, raw_settings in rows:
+                try:
+                    other = AgentSettingsData.model_validate(raw_settings or {})
+                except Exception:
+                    continue
+                if other.booking and other.booking.enabled and other.booking.slug == payload.booking.slug:
+                    errors.append(
+                        f"booking slug {payload.booking.slug!r} is already used by another agent"
+                    )
+                    break
     if errors:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
