@@ -56,3 +56,14 @@ class CalendarEventRead(ORMModel):
     owner_user_id: UUID | None = None
     external_ref_kind: str | None = None
     external_ref_id: str | None = None
+
+
+class CalendarActivityItem(BaseModel):
+    id: UUID
+    loan_id: UUID | None
+    client_id: UUID | None
+    kind: str
+    summary: str
+    actor_label: str | None = None
+    occurred_at: datetime
+    payload: dict | None = None

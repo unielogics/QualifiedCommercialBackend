@@ -21,22 +21,25 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import Select, select
+from sqlalchemy import Select, false as sql_false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
+from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.loan import Loan
 from app.models.user import User
 from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.schemas.event import (
+    CalendarActivityItem,
     CalendarEventCreate,
     CalendarEventRead,
     CalendarEventUpdate,
 )
+from app.services.activity_log import filter_payload_for_audience, is_visible_to
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
@@ -79,24 +82,89 @@ def _actor_label(user: User) -> str:
     return user.role.value if hasattr(user.role, "value") else str(user.role)
 
 
+def _scope_activity_for_audience(user: User, stmt: Select) -> Select:
+    if user.role == Role.CLIENT:
+        if user.client is None:
+            return stmt.where(sql_false())
+        loans_subq = select(Loan.id).where(Loan.client_id == user.client.id)
+        return stmt.where(or_(Activity.client_id == user.client.id, Activity.loan_id.in_(loans_subq)))
+    if user.role == Role.BROKER:
+        if user.broker is None:
+            return stmt.where(sql_false())
+        loans_subq = select(Loan.id).where(Loan.broker_id == user.broker.id)
+        clients_subq = select(Client.id).where(Client.broker_id == user.broker.id)
+        return stmt.where(or_(Activity.client_id.in_(clients_subq), Activity.loan_id.in_(loans_subq)))
+    if user.role == Role.REGIONAL_MANAGER:
+        broker_ids = regional_manager_broker_ids_subquery(user)
+        loans_subq = select(Loan.id).where(Loan.broker_id.in_(broker_ids))
+        clients_subq = select(Client.id).where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+        return stmt.where(or_(Activity.client_id.in_(clients_subq), Activity.loan_id.in_(loans_subq)))
+    return stmt
+
+
 @router.get("", response_model=list[CalendarEventRead])
 async def list_events(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     days: int = 30,
     include_cancelled: bool = False,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to_: datetime | None = Query(default=None, alias="to"),
 ) -> list[CalendarEventRead]:
-    horizon = datetime.now(timezone.utc) + timedelta(days=days)
+    horizon = to_ or (datetime.now(timezone.utc) + timedelta(days=days))
     stmt = (
         select(CalendarEvent)
         .where(CalendarEvent.starts_at <= horizon)
         .order_by(CalendarEvent.starts_at)
     )
+    if from_ is not None:
+        stmt = stmt.where(CalendarEvent.starts_at >= from_)
     if not include_cancelled:
         stmt = stmt.where(CalendarEvent.status != CalendarEventStatus.CANCELLED)
     stmt = _scope_calendar_for_audience(user, stmt)
     rows = (await db.execute(stmt)).scalars().all()
     return [CalendarEventRead.model_validate(r) for r in rows]
+
+
+@router.get("/activity", response_model=list[CalendarActivityItem])
+async def list_calendar_activity(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    days: int = 30,
+    from_: datetime | None = Query(default=None, alias="from"),
+    to_: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=100, ge=1, le=250),
+) -> list[CalendarActivityItem]:
+    horizon = to_ or datetime.now(timezone.utc)
+    start = from_ or (horizon - timedelta(days=days))
+    stmt = (
+        select(Activity)
+        .where(Activity.occurred_at >= start, Activity.occurred_at <= horizon)
+        .order_by(Activity.occurred_at.desc())
+        # Fetch extra before Python-level audience filtering so a page with
+        # internal rows still has enough borrower-visible activity.
+        .limit(min(limit * 3, 500))
+    )
+    rows = (await db.execute(_scope_activity_for_audience(user, stmt))).scalars().all()
+    safe: list[CalendarActivityItem] = []
+    for row in rows:
+        if not is_visible_to(row.kind, "client"):
+            continue
+        safe.append(
+            CalendarActivityItem(
+                id=row.id,
+                loan_id=row.loan_id,
+                client_id=row.client_id,
+                kind=row.kind,
+                summary=row.summary or "",
+                actor_label=row.actor_label,
+                occurred_at=row.occurred_at,
+                payload=filter_payload_for_audience(row.payload, kind=row.kind, audience="client"),
+            )
+        )
+        if len(safe) >= limit:
+            break
+    return safe
 
 
 @router.post("", response_model=CalendarEventRead)
