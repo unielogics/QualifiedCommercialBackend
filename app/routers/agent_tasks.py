@@ -145,6 +145,14 @@ async def create_task(
     db.add(task)
     await db.flush()
     await db.refresh(task)
+    try:
+        from app.services.notifications import notify_agent_task_assigned
+
+        await notify_agent_task_assigned(db, task=task, actor=user, changed=False)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("agent task create notification failed task=%s", task.id)
     return AgentTaskOut.model_validate(task)
 
 
@@ -166,6 +174,10 @@ async def update_task(
     ).scalar_one_or_none()
     if task is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
+    old_assigned_user_id = task.assigned_user_id
+    old_due_at = task.due_at
+    old_priority = task.priority
+    old_title = task.title
     data = payload.model_dump(exclude_unset=True)
     if data.get("status") == "done" and task.completed_at is None:
         task.completed_at = datetime.now(timezone.utc)
@@ -173,6 +185,24 @@ async def update_task(
         setattr(task, k, v)
     await db.flush()
     await db.refresh(task)
+    should_notify = (
+        task.assigned_user_id is not None
+        and (
+            task.assigned_user_id != old_assigned_user_id
+            or task.due_at != old_due_at
+            or task.priority != old_priority
+            or task.title != old_title
+        )
+    )
+    if should_notify:
+        try:
+            from app.services.notifications import notify_agent_task_assigned
+
+            await notify_agent_task_assigned(db, task=task, actor=user, changed=True)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).exception("agent task update notification failed task=%s", task.id)
     return AgentTaskOut.model_validate(task)
 
 

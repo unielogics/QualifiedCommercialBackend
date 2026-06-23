@@ -194,6 +194,14 @@ async def create_event(
     )
     await db.flush()
     await db.refresh(ev)
+    try:
+        from app.services.notifications import notify_calendar_event
+
+        await notify_calendar_event(db, event=ev, actor=user, changed=False)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("calendar create notification failed event=%s", ev.id)
     return CalendarEventRead.model_validate(ev)
 
 
@@ -268,6 +276,14 @@ async def update_event(
     )
     await db.flush()
     await db.refresh(ev)
+    try:
+        from app.services.notifications import notify_calendar_event
+
+        await notify_calendar_event(db, event=ev, actor=user, changed=True)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("calendar update notification failed event=%s", ev.id)
     return CalendarEventRead.model_validate(ev)
 
 

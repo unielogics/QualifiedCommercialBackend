@@ -31,6 +31,17 @@ from app.models.ai_usage_event import AIUsageEvent  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
+from app.models.bucket import (  # noqa: F401
+    Bucket,
+    BucketActivityLog,
+    BucketDocumentTemplate,
+    BucketFile,
+    BucketFileAnnotation,
+    BucketNote,
+    BucketRequestedDocument,
+    BucketShare,
+    BucketUploadLink,
+)
 from app.models.capital_partner_application import (  # noqa: F401
     APPLICATION_STATUSES,
     CapitalPartnerApplication,
@@ -72,6 +83,7 @@ from app.models.loan_scenario import LoanScenario  # noqa: F401
 from app.models.fix_flip_scenario import FixFlipScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
 from app.models.provider_secret import ProviderSecret  # noqa: F401

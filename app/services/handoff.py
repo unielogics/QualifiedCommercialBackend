@@ -533,6 +533,12 @@ async def promote_deal_to_loan(
     await db.flush()
     await db.refresh(deal)
     await db.refresh(loan)
+    try:
+        from app.services.notifications import notify_funding_handoff
+
+        await notify_funding_handoff(db, loan=loan, client=client, actor=user)
+    except Exception:  # noqa: BLE001
+        log.exception("funding handoff notification failed deal=%s loan=%s", deal.id, loan.id)
 
     return PromoteResult(
         loan=loan,

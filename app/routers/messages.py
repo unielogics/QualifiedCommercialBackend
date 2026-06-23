@@ -51,6 +51,15 @@ async def send_message(
     db.add(msg)
     await db.flush()
     await db.refresh(msg)
+    try:
+        from app.services.notifications import notify_message_sent
+
+        role_value = msg.from_role.value if hasattr(msg.from_role, "value") else str(msg.from_role)
+        await notify_message_sent(db, loan=loan, from_role=role_value, actor=user)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("message notification failed loan=%s message=%s", loan.id, msg.id)
     await channel.broadcast(loan.deal_id, {"kind": "message", "message": MessageRead.model_validate(msg).model_dump(mode="json")})
     return MessageRead.model_validate(msg)
 

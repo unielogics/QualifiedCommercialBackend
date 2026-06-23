@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"
     s3_bucket: str = "qc-documents-dev"
+    buckets_s3_prefix: str = "buckets/prod"
+    buckets_kms_key_id: str = ""
 
     # iSoftpull
     # Two-key auth: public key identifies the account; private key authenticates

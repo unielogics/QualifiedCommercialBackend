@@ -418,6 +418,13 @@ async def upload_complete(
             )
 
     await mark_loan_dirty(db, loan.id)
+    if not already_received:
+        try:
+            from app.services.notifications import notify_document_uploaded
+
+            await notify_document_uploaded(db, loan=loan, document_name=doc.name, actor=user)
+        except Exception:  # noqa: BLE001
+            log.exception("upload_complete: notification failed loan=%s doc=%s", loan.deal_id, doc.id)
     await db.flush()
     await db.refresh(doc)
     return DocumentRead.model_validate(doc)
