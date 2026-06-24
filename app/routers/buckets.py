@@ -509,6 +509,137 @@ async def create_admin_note(
     return note
 
 
+@router.post("/admin/{bucket_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def admin_upload_init(
+    bucket_id: UUID,
+    payload: BucketFileUploadInit,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    await _load_bucket_or_404(db, bucket_id)
+    req = None
+    if payload.requested_document_id:
+        req = await db.get(BucketRequestedDocument, payload.requested_document_id)
+        if req is None or req.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
+    _, prefix, _ = _bucket_storage_config()
+    safe = _safe_filename(payload.file_name)
+    requested_doc_condition = (
+        BucketFile.requested_document_id == payload.requested_document_id
+        if payload.requested_document_id
+        else BucketFile.requested_document_id.is_(None)
+    )
+    existing_file = (
+        await db.execute(
+            select(BucketFile)
+            .where(
+                BucketFile.bucket_id == bucket_id,
+                BucketFile.upload_link_id.is_(None),
+                BucketFile.file_name == payload.file_name,
+                BucketFile.size_bytes == payload.size_bytes,
+                requested_doc_condition,
+                BucketFile.status == "uploading",
+            )
+            .order_by(BucketFile.created_at.desc())
+        )
+    ).scalars().first()
+    if existing_file:
+        upload_url, headers = _upload_url(existing_file.s3_key, payload.content_type)
+        return BucketFileUploadInitResponse(file_id=existing_file.id, upload_url=upload_url, s3_key=existing_file.s3_key, required_headers=headers)
+    if req is not None and not req.allow_multiple_files:
+        existing_for_doc = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.bucket_id == bucket_id,
+                    BucketFile.requested_document_id == req.id,
+                    BucketFile.status.in_(("uploading", "uploaded")),
+                )
+            )
+        ).scalars().first()
+        if existing_for_doc is not None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document only allows one file")
+    file_id = uuid4()
+    s3_key = f"{prefix}/admin-uploads/{bucket_id}/{file_id}-{safe}"
+    file = BucketFile(
+        id=file_id,
+        bucket_id=bucket_id,
+        requested_document_id=payload.requested_document_id,
+        upload_link_id=None,
+        file_name=payload.file_name,
+        s3_key=s3_key,
+        content_type=payload.content_type,
+        size_bytes=payload.size_bytes,
+        uploaded_by_name=payload.uploader_name,
+        uploaded_by_email=str(payload.uploader_email) if payload.uploader_email else None,
+        status="uploading",
+    )
+    db.add(file)
+    await _log(
+        db,
+        bucket_id,
+        "admin_file_upload_started",
+        actor_name=user.name,
+        actor_role=user.role,
+        target_type="file",
+        target_id=str(file.id),
+        detail=f"{payload.file_name} for {payload.uploader_name}",
+    )
+    await db.commit()
+    upload_url, headers = _upload_url(s3_key, payload.content_type)
+    return BucketFileUploadInitResponse(file_id=file.id, upload_url=upload_url, s3_key=s3_key, required_headers=headers)
+
+
+@router.post("/admin/{bucket_id}/files/complete", response_model=BucketFileRead)
+async def admin_upload_complete(
+    bucket_id: UUID,
+    payload: BucketUploadComplete,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    file = await db.get(BucketFile, payload.file_id)
+    if file is None or file.bucket_id != bucket_id or file.upload_link_id is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if file.status == "uploaded":
+        return file
+    file.status = "uploaded"
+    if file.requested_document_id:
+        req = await db.get(BucketRequestedDocument, file.requested_document_id)
+        if req:
+            req.status = "uploaded"
+    if payload.note:
+        db.add(
+            BucketNote(
+                bucket_id=bucket_id,
+                author_name=user.name or user.email or "Super Admin",
+                author_role=user.role,
+                visibility="admin",
+                content=payload.note,
+            )
+        )
+    await _log(
+        db,
+        bucket_id,
+        "admin_file_uploaded",
+        actor_name=user.name,
+        actor_role=user.role,
+        target_type="file",
+        target_id=str(file.id),
+        detail=f"{file.file_name} for {file.uploaded_by_name or 'client'}",
+    )
+    try:
+        from app.services.notifications import notify_bucket_file_uploaded
+
+        await notify_bucket_file_uploaded(db, bucket=bucket, file=file)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", bucket_id, file.id)
+    await db.commit()
+    await db.refresh(file)
+    return file
+
+
 @router.get("/admin/{bucket_id}/files/{file_id}/url", response_model=BucketFileUrl)
 async def admin_file_url(
     bucket_id: UUID,
