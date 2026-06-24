@@ -245,6 +245,7 @@ class BucketShareRead(ORMModel):
     view_count: int
     download_count: int
     created_at: datetime
+    files: list[BucketFileRead] = []
     share_url: str | None = None
     passcode: str | None = None
 
@@ -253,7 +254,14 @@ class BucketSharePatch(BaseModel):
     can_download: bool | None = None
     can_add_notes: bool | None = None
     can_upload: bool | None = None
+    expires_at: datetime | None = None
+    file_ids: list[UUID] | None = None
     status: str | None = None
+
+
+class BucketSharePasscodeResetRead(BaseModel):
+    share: BucketShareRead
+    passcode: str
 
 
 class BucketShareAccessRequest(BaseModel):

@@ -57,6 +57,7 @@ from app.schemas.bucket import (
     BucketShareCreate,
     BucketShareFileRead,
     BucketShareInfoRead,
+    BucketSharePasscodeResetRead,
     BucketSharePatch,
     BucketShareRead,
     BucketSharedNoteCreate,
@@ -321,6 +322,37 @@ def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], 
     )
 
 
+def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketShareRead:
+    data = BucketShareRead.model_validate(share)
+    data.share_url = _public_url(f"/buckets/share/{share.token}")
+    data.passcode = passcode
+    return data
+
+
+def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
+    data = BucketDetail.model_validate(bucket)
+    data.shares = [_share_read(share) for share in bucket.shares]
+    return data
+
+
+async def _uploaded_bucket_files(db: AsyncSession, bucket_id: UUID, file_ids: list[UUID]) -> list[BucketFile]:
+    unique_ids = list(dict.fromkeys(file_ids))
+    if not unique_ids:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "At least one uploaded file must be selected")
+    files = (
+        await db.execute(
+            select(BucketFile).where(
+                BucketFile.bucket_id == bucket_id,
+                BucketFile.id.in_(unique_ids),
+                BucketFile.status == "uploaded",
+            )
+        )
+    ).scalars().all()
+    if len(files) != len(unique_ids):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected files must be uploaded files in this bucket")
+    return files
+
+
 @router.get("/templates", response_model=list[BucketTemplateRead])
 async def list_templates(
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
@@ -375,8 +407,9 @@ async def get_bucket(
     bucket_id: UUID,
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
-) -> Bucket:
-    return await _load_bucket_detail_or_404(db, bucket_id)
+) -> BucketDetail:
+    bucket = await _load_bucket_detail_or_404(db, bucket_id)
+    return _bucket_detail_read(bucket)
 
 
 @router.get("/admin/{bucket_id}/activity", response_model=BucketActivityPage)
@@ -538,18 +571,7 @@ async def create_share(
     db: AsyncSession = Depends(get_db),
 ) -> BucketShareRead:
     await _load_bucket_or_404(db, bucket_id)
-    file_ids = list(dict.fromkeys(payload.file_ids))
-    files = (
-        await db.execute(
-            select(BucketFile).where(
-                BucketFile.bucket_id == bucket_id,
-                BucketFile.id.in_(file_ids),
-                BucketFile.status == "uploaded",
-            )
-        )
-    ).scalars().all()
-    if len(files) != len(file_ids):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected files must be uploaded files in this bucket")
+    files = await _uploaded_bucket_files(db, bucket_id, payload.file_ids)
     passcode = payload.passcode or _generate_passcode()
     share = BucketShare(
         bucket_id=bucket_id,
@@ -570,10 +592,7 @@ async def create_share(
     await _log(db, bucket_id, "share_created", request=request, user=user, target_type="share", target_id=str(share.id), detail=share.recipient_name)
     await db.commit()
     await db.refresh(share)
-    data = BucketShareRead.model_validate(share)
-    data.share_url = _public_url(f"/buckets/share/{share.token}")
-    data.passcode = passcode
-    return data
+    return _share_read(share, passcode=passcode)
 
 
 @router.patch("/admin/{bucket_id}/shares/{share_id}", response_model=BucketShareRead)
@@ -584,19 +603,58 @@ async def patch_share(
     request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
-) -> BucketShare:
-    share = await db.get(BucketShare, share_id)
+) -> BucketShareRead:
+    share = (
+        await db.execute(
+            select(BucketShare)
+            .where(BucketShare.id == share_id)
+            .options(selectinload(BucketShare.files))
+        )
+    ).scalar_one_or_none()
     if share is None or share.bucket_id != bucket_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share not found")
     changes = []
     for field in payload.model_fields_set:
-        changes.append(f"{field}={getattr(payload, field)}")
-        setattr(share, field, getattr(payload, field))
+        value = getattr(payload, field)
+        if field == "file_ids":
+            files = await _uploaded_bucket_files(db, bucket_id, value or [])
+            share.files = files
+            changes.append(f"files={len(files)}")
+            continue
+        if field == "status" and value not in ("active", "revoked"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Share status must be active or revoked")
+        changes.append(f"{field}={value}")
+        setattr(share, field, value)
     action = "share_status_changed" if "status" in payload.model_fields_set else "share_updated"
     await _log(db, bucket_id, action, request=request, user=user, target_type="share", target_id=str(share.id), detail=", ".join(changes) or None)
     await db.commit()
     await db.refresh(share)
-    return share
+    return _share_read(share)
+
+
+@router.post("/admin/{bucket_id}/shares/{share_id}/regenerate-passcode", response_model=BucketSharePasscodeResetRead)
+async def regenerate_share_passcode(
+    bucket_id: UUID,
+    share_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketSharePasscodeResetRead:
+    share = (
+        await db.execute(
+            select(BucketShare)
+            .where(BucketShare.id == share_id)
+            .options(selectinload(BucketShare.files))
+        )
+    ).scalar_one_or_none()
+    if share is None or share.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Share not found")
+    passcode = _generate_passcode()
+    share.passcode_hash = _hash_passcode(passcode)
+    await _log(db, bucket_id, "share_passcode_regenerated", request=request, user=user, target_type="share", target_id=str(share.id), detail=share.recipient_name)
+    await db.commit()
+    await db.refresh(share)
+    return BucketSharePasscodeResetRead(share=_share_read(share, passcode=passcode), passcode=passcode)
 
 
 @router.post("/admin/{bucket_id}/notes", response_model=BucketNoteRead)
