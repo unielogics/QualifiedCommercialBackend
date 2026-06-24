@@ -941,7 +941,7 @@ async def infer_playbook_dependencies(
     )
     user_prompt = f"Playbook: {pb.name} ({pb.playbook_type}, product_key={pb.product_key})\n\nTasks:\n{items_block}"
 
-    from app.services.ai.anthropic_client import get_client, model_light
+    from app.services.ai.bedrock_client import get_client, model_light
     from app.services.ai.usage import tracked_messages_create
     client = get_client()
     try:

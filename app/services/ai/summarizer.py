@@ -17,7 +17,7 @@ so the 'Elara' can warn brokers proactively when rates move against
 them — the same number the dashboard widget renders.
 
 Uses Claude Haiku — cheap, fast, perfect for this short summarization. When
-ANTHROPIC_API_KEY is unset we fall back to a deterministic heuristic so the
+AWS_BEARER_TOKEN_BEDROCK is unset we fall back to a deterministic heuristic so the
 UI is never empty.
 """
 
@@ -37,7 +37,7 @@ from app.enums import DealHealth, DocStatus
 from app.models.activity import Activity
 from app.models.document import Document
 from app.models.loan import Loan
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.context import assemble_loan_context, get_market_pulse
 from app.services.ai.usage import tracked_messages_create
 
@@ -154,7 +154,7 @@ def _stub_profile(
     docs: list[Document],
     market_pulse: dict | None,
 ) -> dict[str, Any]:
-    """Deterministic fallback when no Anthropic key is configured."""
+    """Deterministic fallback when no Bedrock key is configured."""
     pending = [d.name for d in docs if d.status in (DocStatus.PENDING, DocStatus.REQUESTED, DocStatus.FLAGGED)]
     flagged = [d.name for d in docs if d.status == DocStatus.FLAGGED]
     last_activity = activities[0].summary if activities else "No activity yet."
@@ -245,7 +245,7 @@ async def _llm_profile(
     """Call Anthropic with the assembled context. Returns the parsed JSON
     profile or None if anything fails (caller falls back to the stub)."""
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return None
     payload: dict[str, Any] = {
         "loan": {

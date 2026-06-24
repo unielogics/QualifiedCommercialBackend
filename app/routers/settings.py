@@ -34,6 +34,7 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 # we never accumulate orphaned files. Server-side encryption stays on
 # (AES256) since this is the firm's signing image.
 SIGNATURE_S3_KEY = "firm_settings/letterhead_signature.png"
+AI_MASTER_SWITCH_OWNER_EMAIL = "franco@qualifiedcommercial.com"
 
 
 async def _get_or_create(db: AsyncSession) -> AppSettings:
@@ -75,6 +76,14 @@ async def update_settings(
     patch = payload.model_dump(mode="json", exclude_none=True)
     if not patch:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No settings sections supplied.")
+    if "ai_spend" in patch and "master_enabled" in patch["ai_spend"]:
+        current_master = bool(_coerce(row.data).ai_spend.master_enabled)
+        next_master = bool(patch["ai_spend"]["master_enabled"])
+        if current_master != next_master and (user.email or "").lower() != AI_MASTER_SWITCH_OWNER_EMAIL:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only franco@qualifiedcommercial.com can change the AI master switch.",
+            )
     current.update(patch)
 
     row.data = current

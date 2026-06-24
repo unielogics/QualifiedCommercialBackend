@@ -66,7 +66,7 @@ from app.enums import MessageFrom
 from app.models.email_draft import EmailDraft
 from app.models.loan import Loan
 from app.models.message import Message
-from app.services.ai.anthropic_client import get_client, model_heavy, model_light
+from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
@@ -132,8 +132,8 @@ async def extract_and_persist(
     the current thread state.
     """
     settings = get_settings()
-    if not settings.anthropic_api_key:
-        log.debug("lender_extractor: ANTHROPIC_API_KEY missing — skipping")
+    if not settings.ai_provider_enabled:
+        log.debug("lender_extractor: AWS_BEARER_TOKEN_BEDROCK missing — skipping")
         return None
 
     loan = (

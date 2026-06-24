@@ -103,6 +103,7 @@ class AIUsageSummary(BaseModel):
     avg_client_file_critical_usd: float
     avg_cost_per_client_usd: float
     avg_cost_per_loan_file_usd: float
+    master_enabled: bool
     chat_enabled: bool
     automations_enabled: bool
     document_scanning_enabled: bool
@@ -229,6 +230,7 @@ async def ai_usage_today(
         avg_client_file_critical_usd=spend_settings.avg_client_file_critical_usd,
         avg_cost_per_client_usd=avg_client,
         avg_cost_per_loan_file_usd=avg_loan,
+        master_enabled=spend_settings.master_enabled,
         chat_enabled=spend_settings.chat_enabled,
         automations_enabled=spend_settings.automations_enabled,
         document_scanning_enabled=spend_settings.document_scanning_enabled,
@@ -401,15 +403,15 @@ async def connect_lender_health(
             )
         )
 
-    # 6. Anthropic key — the lender-thread mini-summary + instruct_ai
+    # 6. Bedrock key — the lender-thread mini-summary + instruct_ai
     # reply both fall back to deterministic text when absent, so this is
     # only a warning.
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         checks.append(
             HealthCheck(
                 name="AI summaries",
                 status="warn",
-                detail="ANTHROPIC_API_KEY unset — thread summaries fall back to deterministic text.",
+                detail="AWS_BEARER_TOKEN_BEDROCK unset — thread summaries fall back to deterministic text.",
             )
         )
     else:
@@ -417,7 +419,7 @@ async def connect_lender_health(
             HealthCheck(
                 name="AI summaries",
                 status="ok",
-                detail=f"Anthropic key present; using {settings.anthropic_model_light}.",
+                detail=f"Bedrock key present; using {settings.bedrock_model_light}.",
             )
         )
 

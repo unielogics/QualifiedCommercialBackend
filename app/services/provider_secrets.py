@@ -40,7 +40,7 @@ def _fernet() -> Fernet:
     raw = (
         settings.provider_secrets_encryption_key
         or settings.clerk_secret_key
-        or settings.anthropic_api_key
+        or settings.aws_bearer_token_bedrock
         or "qualified-commercial-local-provider-secret-key"
     )
     if raw.startswith("gAAAA") or len(raw) == 44:

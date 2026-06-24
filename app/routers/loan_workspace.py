@@ -63,7 +63,7 @@ from app.schemas.loan_workspace import (
 )
 from app.services.chat_names import serialize_chat, serialize_chat_one
 from app.services.ai import engagement
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
 from app.services.ai.usage import tracked_messages_create
 from app.services.math import dscr as dscr_calc
@@ -285,7 +285,7 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
 
     system += _render_tb(await _load_tc(db, "nurture_chat"))
 
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         reply_text = "I'm back online — let me know how I can help from here."
     else:
         try:
@@ -758,9 +758,9 @@ async def _generate_ai_reply(
 
         system += render_training_block(await load_task_config(db, "nurture_chat"))
 
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         # Stub when no key — keep the workspace usable in dev.
-        reply_text = "(stub) I would normally answer here once ANTHROPIC_API_KEY is set."
+        reply_text = "(stub) I would normally answer here once AWS_BEARER_TOKEN_BEDROCK is set."
     else:
         try:
             from app.services.ai.orchestrator import run as orchestrator_run

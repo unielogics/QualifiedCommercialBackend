@@ -7,7 +7,7 @@ Status of each external service.
 | Integration | Status | Notes |
 |---|---|---|
 | Clerk (auth) | ✅ prod live | `clerk.qualifiedcommercial.com`. Backend verifies via JWKS. |
-| Anthropic (AI) | ✅ wired & verified | Sonnet 4.6 + Haiku 4.5. Tool-use loop verified end-to-end. |
+| AWS Bedrock Claude (AI) | ✅ wired | Heavy + light Claude tiers through Bedrock Runtime. Tool-use loop stays native. |
 | AWS account 156041400244 | ✅ provisioned | VPC, EC2, RDS, Secrets Manager, IAM roles, OIDC, Route 53. |
 | AWS Amplify (desktop hosting) | ⏳ awaiting console click | `unielogics/QCDashboard` → `app.qualifiedcommercial.com`. See `DEPLOY.md`. |
 | GitHub Actions deploy | ⏳ awaiting 3 settings | Need `AWS_DEPLOY_ROLE_ARN` secret + `AWS_REGION` + `EC2_INSTANCE_ID` variables on QualifiedCommercialBackend repo. |
@@ -17,7 +17,7 @@ Status of each external service.
 | EAS (mobile) | ⏳ awaiting Expo login | `unielogics/QCMobile`. Apple/Google accounts needed for store distribution. |
 | Gmail Pub/Sub | 🛑 deferred | Local fake inbox covers the air-gap logic until prod. |
 | Pinecone | ❌ replaced | Using pgvector (architecture constraint #1). |
-| OpenAI | ❌ replaced | Using Anthropic only (architecture constraint #3). |
+| OpenAI | ❌ replaced | Using AWS Bedrock Claude only (architecture constraint #3). |
 | Vercel | ❌ replaced | Switched to AWS Amplify (architecture constraint #9). |
 
 ## Prod credentials still needed

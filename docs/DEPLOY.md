@@ -158,6 +158,6 @@ ssh ubuntu@54.157.222.116 "sudo /etc/cron.daily/qcbackend-refresh-env"
 - **Caddy logs (TLS / 4xx / 5xx):** `journalctl -u caddy -f`
 - **RDS metrics:** RDS console → `qualifiedcommercial` → Monitoring tab
 - **Amplify logs:** Amplify console → app → Hosting → Build/Deploy logs
-- **Anthropic spend:** console.anthropic.com → Usage
+- **Bedrock spend:** AWS Cost Explorer / Bedrock usage, filter on the Qualified Commercial account/project tags
 - **Cost watch:** AWS Cost Explorer, filter on tag `Project=qualified-commercial`
-- **Security:** rotate `ANTHROPIC_API_KEY` and Clerk `sk_live_*` every 90 days, update via terraform
+- **Security:** rotate `AWS_BEARER_TOKEN_BEDROCK` and Clerk `sk_live_*` every 90 days, update via terraform

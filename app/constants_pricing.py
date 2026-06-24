@@ -1,10 +1,10 @@
 """Per-model token pricing (USD per 1M tokens) + cost computation.
 
-EDITABLE — update these to match your actual Anthropic contract. The
+EDITABLE — update these to match your actual Bedrock contract. The
 defaults mirror public Sonnet / Haiku tier list pricing; unknown model
 names fall back by tier keyword, then to the Sonnet tier (conservative).
 
-Anthropic `usage` reports four buckets that are priced differently:
+Claude `usage` reports four buckets that are priced differently:
   - input_tokens          : fresh (non-cached) input        → "input"
   - cache_creation_*       : tokens written into the cache    → "cache_write"
   - cache_read_*           : tokens served from the cache     → "cache_read"
@@ -23,7 +23,19 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.30,
         "output": 15.00,
     },
+    "us.anthropic.claude-sonnet-4-6": {
+        "input": 3.00,
+        "cache_write": 3.75,
+        "cache_read": 0.30,
+        "output": 15.00,
+    },
     "claude-haiku-4-5": {
+        "input": 0.80,
+        "cache_write": 1.00,
+        "cache_read": 0.08,
+        "output": 4.00,
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
         "input": 0.80,
         "cache_write": 1.00,
         "cache_read": 0.08,

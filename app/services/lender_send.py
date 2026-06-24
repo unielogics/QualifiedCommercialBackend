@@ -47,7 +47,7 @@ from app.models.document import Document
 from app.models.email_draft import EmailDraft
 from app.models.lender import Lender
 from app.models.loan import Loan
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.document_zip import DocumentZipError, package_documents
 
@@ -305,7 +305,7 @@ async def _ai_draft_body(
         f"Files included:\n{file_list}\n\n"
         f"Happy to provide anything else you need to move this forward.\n"
     )
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return fallback
     try:
         client = get_client()

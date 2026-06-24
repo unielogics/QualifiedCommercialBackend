@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # env_ignore_empty: skip shell vars set to empty string so .env wins.
-    # Without this, an exported but-blank ANTHROPIC_API_KEY shadows .env.
+    # Without this, an exported but-blank provider key shadows .env.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", env_ignore_empty=True)
 
     # Database
@@ -26,12 +26,13 @@ class Settings(BaseSettings):
     clerk_jwks_url: str = ""
     clerk_issuer: str = ""
 
-    # Anthropic
-    anthropic_api_key: str = ""
-    anthropic_model_heavy: str = "claude-sonnet-4-6"
-    anthropic_model_light: str = "claude-haiku-4-5"
+    # AWS Bedrock AI
+    aws_bearer_token_bedrock: str = ""
+    bedrock_region: str = ""
+    bedrock_model_heavy: str = "us.anthropic.claude-sonnet-4-6"
+    bedrock_model_light: str = "anthropic.claude-haiku-4-5-20251001-v1:0"
 
-    # Estimated Anthropic prices per 1M tokens, used for local cost
+    # Estimated Bedrock Claude prices per 1M tokens, used for local cost
     # attribution. Alert thresholds live in AppSettings.ai_spend so
     # super-admins can tune them from the dashboard.
     ai_pricing_light_input_per_mtok: float = 0.80
@@ -147,6 +148,14 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def bedrock_runtime_region(self) -> str:
+        return self.bedrock_region or self.aws_region
+
+    @property
+    def ai_provider_enabled(self) -> bool:
+        return bool(self.aws_bearer_token_bedrock)
 
 
 @lru_cache

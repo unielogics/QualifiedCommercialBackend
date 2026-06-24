@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.property_intelligence import PropertyIntelligenceSnapshot
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.provider_secrets import runtime_settings
 
@@ -137,7 +137,7 @@ async def generate_analysis_report(
     )
     runtime = await runtime_settings(db)
     settings = get_settings()
-    if not runtime.property_analysis_ai_enabled or not settings.anthropic_api_key:
+    if not runtime.property_analysis_ai_enabled or not settings.ai_provider_enabled:
         return base, sanitize_report(base)
     prompt_payload = {
         "property": snapshot.address if snapshot else {},

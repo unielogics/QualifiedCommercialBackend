@@ -18,7 +18,7 @@ class AIUsageEvent(TimestampMixin, Base):
     )
     feature: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="anthropic")
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="bedrock")
     model: Mapped[str] = mapped_column(String(120), nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

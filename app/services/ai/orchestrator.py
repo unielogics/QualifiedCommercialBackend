@@ -1,4 +1,4 @@
-"""Native Anthropic tool-use orchestration.
+"""Native Bedrock Claude tool-use orchestration.
 
 Routes simple tasks to Haiku, complex ones to Sonnet, runs the tool-use loop
 inline (no LangChain). Prompt caching is on by default.
@@ -15,12 +15,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from anthropic.types import MessageParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.ai.anthropic_client import get_client, model_heavy, model_light
+from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.tools import TOOL_SCHEMAS, TOOLS
-from app.services.ai.usage import tracked_messages_create
+from app.services.ai.usage import assert_ai_allowed_global, tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +87,7 @@ async def record_usage(model: str, usage: Any, meta: dict[str, Any] | None) -> N
 
 
 async def run(
-    messages: list[MessageParam],
+    messages: list[dict[str, Any]],
     *,
     tier: Tier = "light",
     system: str = DEFAULT_SYSTEM,
@@ -112,7 +111,7 @@ async def run(
         else system
     )
 
-    convo: list[MessageParam] = list(messages)
+    convo: list[dict[str, Any]] = list(messages)
     while True:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -131,6 +130,7 @@ async def run(
                 **kwargs,
             )
         else:
+            await assert_ai_allowed_global(feature=feature)
             resp = await client.messages.create(**kwargs)
         await record_usage(model, resp.usage, meta)
 

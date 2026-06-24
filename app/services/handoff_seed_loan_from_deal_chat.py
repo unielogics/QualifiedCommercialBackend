@@ -31,7 +31,7 @@ from app.models.deal import Deal
 from app.models.deal_chat_message import DealChatMessage
 from app.models.loan import Loan
 from app.models.loan_chat_message import LoanChatMessage
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
@@ -92,9 +92,9 @@ async def seed_loan_chat_from_deal(
     )
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         body = (
-            "Pre-funding handoff (stub — ANTHROPIC_API_KEY unset):\n\n"
+            "Pre-funding handoff (stub — AWS_BEARER_TOKEN_BEDROCK unset):\n\n"
             f"{transcript[:1500]}"
         )
     else:

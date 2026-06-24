@@ -75,7 +75,7 @@ from app.models.loan_participant import LoanParticipant
 from app.models.message import Message
 from app.models.user import User
 from app.services.activity_log import mark_loan_dirty
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.email.parser import inject_deal_id
 from app.services.email.pii_filter import RedactionContext, redact_text
@@ -141,7 +141,7 @@ class ThreadResponse:
     # column to-do panel. Filtered server-side per viewer role:
     # super_admin / loan_exec see the full extract; broker / client
     # see only items tagged sensitivity='external'. None if no LLM
-    # has run yet or ANTHROPIC_API_KEY is unset.
+    # has run yet or AWS_BEARER_TOKEN_BEDROCK is unset.
     lender_extract: dict[str, Any] | None = None
 
 
@@ -513,7 +513,7 @@ async def summarize_thread(
         )
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         # Deterministic fallback — first inbound + last inbound + count.
         first_inbound = next((e for e in thread.entries if e.kind == "inbound"), None)
         last_inbound = next(
@@ -604,7 +604,7 @@ async def _ai_draft_from_instruction(
         f"{instruction.strip()}\n\n"
         f"Re: {deal_id} — {address}.\n"
     )
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return fallback
     try:
         client = get_client()

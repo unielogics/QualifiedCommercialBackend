@@ -41,7 +41,7 @@ from app.config import get_settings
 from app.models.client import Client
 from app.models.document import Document
 from app.models.loan import Loan
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 
 log = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ async def compose_collection_nudge(db: AsyncSession, ctx: DocCollectionContext) 
     Falls back to a templated message if Anthropic is unavailable
     or returns an empty reply."""
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return _fallback_template(ctx)
 
     first_name = ctx.borrower_first_name or "there"

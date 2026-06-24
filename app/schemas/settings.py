@@ -98,6 +98,7 @@ class AISpendSettings(BaseModel):
     daily_critical_usd: float = 25.0
     avg_client_file_warning_usd: float = 1.50
     avg_client_file_critical_usd: float = 3.00
+    master_enabled: bool = True
     chat_enabled: bool = True
     automations_enabled: bool = True
     document_scanning_enabled: bool = True

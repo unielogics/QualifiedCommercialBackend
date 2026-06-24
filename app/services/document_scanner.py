@@ -56,7 +56,7 @@ from app.models.app_settings import AppSettings
 from app.models.document import Document
 from app.models.loan import Loan
 from app.services.activity_log import mark_loan_dirty
-from app.services.ai.anthropic_client import get_client, model_heavy
+from app.services.ai.bedrock_client import get_client, model_heavy
 from app.services.ai.usage import tracked_messages_create
 from app.services.loan_intake_automation import _checklist_for, _coerce_settings
 
@@ -375,10 +375,10 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
     user_text = "\n".join(user_prompt_parts)
 
     # 3. Vision call
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         doc.ai_scan_status = "failed"
         doc.scan_dirty = False
-        doc.ai_notes = "ANTHROPIC_API_KEY not configured — vision scan skipped."
+        doc.ai_notes = "AWS_BEARER_TOKEN_BEDROCK not configured — vision scan skipped."
         await db.flush()
         return ScanResult(notes=doc.ai_notes)
 

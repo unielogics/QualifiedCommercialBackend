@@ -113,8 +113,8 @@ async def run_reengagement_pass() -> None:
     borrower has gone quiet on a time-sensitive file. Self-isolating —
     one bad loan never blocks the rest of the batch."""
     settings = get_settings()
-    if not settings.anthropic_api_key:
-        log.debug("reengagement: no anthropic key; skipping")
+    if not settings.ai_provider_enabled:
+        log.debug("reengagement: no Bedrock key; skipping")
         return
 
     async with SessionLocal() as db:

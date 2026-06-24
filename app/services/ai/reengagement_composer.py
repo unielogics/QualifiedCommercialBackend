@@ -95,7 +95,7 @@ async def compose_reengagement_message(
     given channel. Subject is "" for SMS / WhatsApp."""
     settings = get_settings()
     link = _deep_link(loan)
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return _fallback(loan, client, channel, reason)
 
     lp = loan.living_profile if isinstance(loan.living_profile, dict) else {}
@@ -119,11 +119,18 @@ async def compose_reengagement_message(
     )
 
     try:
-        from app.services.ai.anthropic_client import get_client, model_light
+        from app.services.ai.bedrock_client import get_client, model_light
+        from app.services.ai.usage import tracked_messages_create
 
-        clt = get_client()
-        result = await clt.messages.create(
+        result = await tracked_messages_create(
+            db,
+            feature="reengagement",
+            client=get_client(),
             model=model_light(),
+            loan_id=loan.id,
+            broker_id=loan.broker_id,
+            client_id=loan.client_id,
+            metadata={"activity": "reengagement", "channel": channel},
             max_tokens=500,
             system=system,
             messages=[{"role": "user", "content": context}],

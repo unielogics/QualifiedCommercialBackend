@@ -65,7 +65,7 @@ from app.models.credit_pull import CreditPull
 from app.models.document import Document
 from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import tracked_messages_create
 from app.services.credit_summary import fico_tier, tier_max_ltv
 
@@ -327,7 +327,7 @@ async def refresh_client_summary(
     fresh state without re-reading.
 
     Falls back to a placeholder profile (and still updates
-    refreshed_at) on Anthropic failure or when the API key is unset
+    refreshed_at) on Bedrock failure or when the API key is unset
     — frontends shouldn't have to deal with a null living_profile.
     """
     client = (
@@ -344,17 +344,17 @@ async def refresh_client_summary(
     settings = get_settings()
 
     profile: ClientLivingProfile
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         profile = _empty_profile(
             "Account summary will populate once the AI key is configured."
         )
     else:
-        anthropic = get_client()
+        bedrock = get_client()
         try:
             result = await tracked_messages_create(
                 db,
                 feature="client_summary",
-                client=anthropic,
+                client=bedrock,
                 model=model_light(),
                 user_id=client.user_id,
                 broker_id=client.broker_id,
@@ -396,7 +396,7 @@ async def refresh_client_summary(
                     "Couldn't parse the AI response. We'll retry on the next refresh."
                 )
         except Exception as exc:  # noqa: BLE001
-            log.warning("client_summarizer: client=%s Anthropic failed: %s", client_id, exc)
+            log.warning("client_summarizer: client=%s Bedrock call failed: %s", client_id, exc)
             profile = _empty_profile(
                 "Account summary is temporarily unavailable. Try again in a few minutes."
             )

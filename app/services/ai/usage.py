@@ -123,6 +123,8 @@ async def assert_ai_allowed(
     settings = await load_ai_spend_settings(db)
     category = feature_category(feature)
 
+    if not settings.master_enabled:
+        raise AIBudgetExceeded("AI system is disabled by the master switch")
     if category == "chat" and not settings.chat_enabled:
         raise AIBudgetExceeded("AI chat is disabled in Super Admin AI spend settings")
     if category != "chat" and not settings.automations_enabled:
@@ -135,6 +137,13 @@ async def assert_ai_allowed(
         raise AIBudgetExceeded("Lender AI is disabled in Super Admin AI spend settings")
 
     return category
+
+
+async def assert_ai_allowed_global(*, feature: str) -> str:
+    from app.db import SessionLocal
+
+    async with SessionLocal() as db:
+        return await assert_ai_allowed(db, feature=feature)
 
 
 async def record_ai_usage(
@@ -155,7 +164,7 @@ async def record_ai_usage(
     event = AIUsageEvent(
         feature=feature,
         category=category,
-        provider="anthropic",
+        provider="bedrock",
         model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,

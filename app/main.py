@@ -90,8 +90,8 @@ async def startup() -> None:
             "CLERK_SECRET_KEY is unset — running in DEV auth mode (every request "
             "treated as a seeded super_admin). Set CLERK_SECRET_KEY before prod."
         )
-    if not settings.anthropic_api_key:
-        log.warning("ANTHROPIC_API_KEY is unset — AI orchestrator will fail when invoked.")
+    if not settings.ai_provider_enabled:
+        log.warning("AWS_BEARER_TOKEN_BEDROCK is unset — Bedrock AI calls will fail when invoked.")
 
     # Start the in-process APScheduler. See app/services/scheduler.py
     # for the SINGLE-INSTANCE assumption — must move to AWS EventBridge

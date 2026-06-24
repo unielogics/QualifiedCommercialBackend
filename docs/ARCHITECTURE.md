@@ -13,8 +13,8 @@ Locked-in constraints. Do not change without explicit user approval.
 ## Architecture constraints
 
 1. **Vector store = Postgres + pgvector** (NOT Pinecone). Same `vector_store.log_event(deal_id, ...)` interface. Runs in the same Docker compose as the relational DB.
-2. **AI orchestration = native Anthropic tool-use** (NOT LangChain). Plain Python functions registered with the SDK. RAG is a thin custom layer.
-3. **Models = `claude-sonnet-4-6` (heavy) + `claude-haiku-4-5` (light)** with prompt caching enabled from day one. NO multi-provider router.
+2. **AI orchestration = native Bedrock Claude tool-use** (NOT LangChain). Plain Python functions registered with the Bedrock adapter. RAG is a thin custom layer.
+3. **Models = Bedrock Claude heavy + light tiers** with `BEDROCK_MODEL_HEAVY` for complex document/reasoning work and `BEDROCK_MODEL_LIGHT` for chat, summaries, routing, and JSON formatting. NO multi-provider router.
 4. **Email = local fake inbox first**, real Gmail Pub/Sub last. Build deal-ID regex + parser + air-gap routing logic against a mock inbox.
 5. **Auth = Clerk** (NOT roll-our-own JWT). Roles: `super_admin`, `broker`, `loan_exec`, `client`.
 6. **Enums single source of truth = backend `enums.py`** → codegen TypeScript types via `datamodel-code-generator`. Both frontends import from generated `lib/enums.generated.ts`.

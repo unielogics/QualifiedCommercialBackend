@@ -42,7 +42,7 @@ from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
 from app.scoping import scope_client_query, scope_loan_query
-from app.services.ai.anthropic_client import get_client, model_light
+from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
 from app.services.ai.usage import tracked_messages_create
 
@@ -547,7 +547,7 @@ def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
     if not last_user:
         return "What would you like to look at first — the pipeline, an Elara Inbox task, or a specific loan?"
     body = (
-        f"(Dev mode — no ANTHROPIC_API_KEY set.) "
+        f"(Dev mode — no AWS_BEARER_TOKEN_BEDROCK set.) "
         f"You asked: \"{last_user[:120]}{'…' if len(last_user) > 120 else ''}\". "
     )
     if loan_context:
@@ -1037,7 +1037,7 @@ async def chat(
         context_block = await _build_account_context(db, user_with_client)
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         return ChatResponse(
             reply=_stub_reply(payload.messages, context_block),
             model="stub",
@@ -1083,7 +1083,7 @@ async def chat(
             reply_text = "(No reply.)"
         return ChatResponse(reply=reply_text, model=result.model, used_stub=False)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Anthropic call failed (%s) — falling back to stub", exc)
+        log.warning("Bedrock call failed (%s) — falling back to stub", exc)
         return ChatResponse(
             reply=_stub_reply(payload.messages, context_block),
             model="stub",
@@ -1601,7 +1601,7 @@ async def append_thread_message(
         )
 
     # 1. Persist the user's message immediately so the panel can
-    #    optimistic-render or recover after an Anthropic failure.
+    #    optimistic-render or recover after an Bedrock failure.
     now = datetime.now(timezone.utc)
     user_msg = AIChatMessage(
         thread_id=thread.id,
@@ -1819,7 +1819,7 @@ async def append_thread_message(
     api_messages = [{"role": m.role, "content": m.body} for m in history_rows]
 
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.ai_provider_enabled:
         reply_text = _stub_reply(
             [ChatTurn(role=m.role, content=m.body) for m in history_rows],
             context_block,
@@ -2042,7 +2042,7 @@ async def append_thread_message(
             if not reply_text:
                 reply_text = "(No reply.)"
         except Exception as exc:  # noqa: BLE001
-            log.warning("Anthropic call failed in thread %s: %s", thread.id, exc)
+            log.warning("Bedrock call failed in thread %s: %s", thread.id, exc)
             reply_text = _stub_reply(
                 [ChatTurn(role=m.role, content=m.body) for m in history_rows],
                 context_block,
