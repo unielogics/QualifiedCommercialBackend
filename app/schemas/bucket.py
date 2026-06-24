@@ -14,6 +14,7 @@ class BucketTemplateRead(ORMModel):
     category: str | None
     description: str | None
     required: bool
+    allow_multiple_files: bool
     is_active: bool
 
 
@@ -22,6 +23,7 @@ class BucketRequestedDocumentCreate(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     description: str | None = None
     required: bool = True
+    allow_multiple_files: bool = False
     is_custom: bool = False
     save_to_library: bool = False
 
@@ -34,6 +36,7 @@ class BucketRequestedDocumentRead(ORMModel):
     category: str | None
     description: str | None
     required: bool
+    allow_multiple_files: bool
     status: str
     is_custom: bool
 

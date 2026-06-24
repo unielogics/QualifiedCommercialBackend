@@ -59,6 +59,7 @@ class BucketDocumentTemplate(TimestampMixin, Base):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    allow_multiple_files: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
 
@@ -76,6 +77,7 @@ class BucketRequestedDocument(TimestampMixin, Base):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    allow_multiple_files: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="requested", server_default="requested")
     is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 

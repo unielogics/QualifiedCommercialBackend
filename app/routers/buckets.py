@@ -362,9 +362,16 @@ async def add_requested_document(
                 category=payload.category,
                 description=payload.description,
                 required=payload.required,
+                allow_multiple_files=payload.allow_multiple_files,
             )
             db.add(existing)
             await db.flush()
+        else:
+            same_category = (existing.category or "") == (payload.category or "")
+            if same_category:
+                existing.description = payload.description if payload.description is not None else existing.description
+                existing.required = payload.required
+                existing.allow_multiple_files = payload.allow_multiple_files
         template_id = existing.id
     doc = BucketRequestedDocument(
         bucket_id=bucket_id,
@@ -373,6 +380,7 @@ async def add_requested_document(
         category=payload.category,
         description=payload.description,
         required=payload.required,
+        allow_multiple_files=payload.allow_multiple_files,
         is_custom=payload.is_custom,
     )
     db.add(doc)
@@ -614,6 +622,8 @@ async def request_upload_init(
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
         if req is None or req.bucket_id != link.bucket_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
+    else:
+        req = None
     _, prefix, _ = _bucket_storage_config()
     safe = _safe_filename(payload.file_name)
     existing_conditions = [
@@ -637,6 +647,18 @@ async def request_upload_init(
     if existing_file:
         upload_url, headers = _upload_url(existing_file.s3_key, payload.content_type)
         return BucketFileUploadInitResponse(file_id=existing_file.id, upload_url=upload_url, s3_key=existing_file.s3_key, required_headers=headers)
+    if req is not None and not req.allow_multiple_files:
+        existing_for_doc = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.bucket_id == link.bucket_id,
+                    BucketFile.requested_document_id == req.id,
+                    BucketFile.status.in_(("uploading", "uploaded")),
+                )
+            )
+        ).scalars().first()
+        if existing_for_doc is not None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document only allows one file")
     file_id = uuid4()
     s3_key = f"{prefix}/uploads/{link.bucket_id}/{file_id}-{safe}"
     file = BucketFile(
