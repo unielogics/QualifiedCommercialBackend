@@ -219,12 +219,19 @@ class BucketActivityLog(Base):
     bucket_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     actor_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    actor_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     actor_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     target_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
     target_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     bucket: Mapped[Bucket] = relationship(back_populates="activity")
+    actor_user: Mapped[User | None] = relationship(foreign_keys=[actor_user_id])

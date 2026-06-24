@@ -9,10 +9,11 @@ from uuid import UUID, uuid4
 
 import boto3
 from botocore.config import Config
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import get_settings
 from app.db import get_db
@@ -31,6 +32,7 @@ from app.models.bucket import (
 )
 from app.models.user import User
 from app.schemas.bucket import (
+    BucketActivityPage,
     BucketActivityRead,
     BucketCreate,
     BucketDetail,
@@ -58,6 +60,7 @@ from app.schemas.bucket import (
     BucketSharePatch,
     BucketShareRead,
     BucketSharedNoteCreate,
+    BucketSharedDownloadCreate,
     BucketTemplateRead,
     BucketUploadComplete,
     BucketUploadLinkCreate,
@@ -142,27 +145,59 @@ def _is_active(status_value: str, expires_at: datetime | None) -> bool:
     return True
 
 
+def _client_ip(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()[:80] or None
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()[:80] or None
+    return request.client.host[:80] if request.client else None
+
+
+def _user_agent(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    value = request.headers.get("user-agent")
+    return value[:500] if value else None
+
+
 async def _log(
     db: AsyncSession,
     bucket_id: UUID,
     action: str,
     *,
+    request: Request | None = None,
+    user: User | None = None,
+    actor_user_id: UUID | None = None,
     actor_name: str | None = None,
+    actor_email: str | None = None,
     actor_role: str | None = None,
     target_type: str | None = None,
     target_id: str | None = None,
     detail: str | None = None,
 ) -> None:
+    if user is not None:
+        actor_user_id = user.id
+        actor_name = actor_name if actor_name is not None else user.name
+        actor_email = actor_email if actor_email is not None else user.email
+        actor_role = actor_role if actor_role is not None else user.role
     db.add(
         BucketActivityLog(
             id=uuid4(),
             bucket_id=bucket_id,
+            actor_user_id=actor_user_id,
             actor_name=actor_name,
+            actor_email=actor_email,
             actor_role=actor_role,
             action=action,
             target_type=target_type,
             target_id=target_id,
             detail=detail,
+            ip_address=_client_ip(request),
+            user_agent=_user_agent(request),
             created_at=_now(),
         )
     )
@@ -178,12 +213,25 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
                 selectinload(Bucket.files),
                 selectinload(Bucket.shares).selectinload(BucketShare.files),
                 selectinload(Bucket.notes),
-                selectinload(Bucket.activity),
             )
         )
     ).scalar_one_or_none()
     if bucket is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket not found")
+    return bucket
+
+
+async def _load_bucket_detail_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    activity = (
+        await db.execute(
+            select(BucketActivityLog)
+            .where(BucketActivityLog.bucket_id == bucket_id)
+            .order_by(BucketActivityLog.created_at.desc())
+            .limit(12)
+        )
+    ).scalars().all()
+    set_committed_value(bucket, "activity", activity)
     return bucket
 
 
@@ -309,13 +357,14 @@ async def list_buckets(
 @router.post("", response_model=BucketRead)
 async def create_bucket(
     payload: BucketCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> Bucket:
     bucket = Bucket(**payload.model_dump(), created_by_id=user.id)
     db.add(bucket)
     await db.flush()
-    await _log(db, bucket.id, "bucket_created", actor_name=user.name, actor_role=user.role, detail=bucket.name)
+    await _log(db, bucket.id, "bucket_created", request=request, user=user, detail=bucket.name)
     await db.commit()
     await db.refresh(bucket)
     return bucket
@@ -327,19 +376,76 @@ async def get_bucket(
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> Bucket:
-    return await _load_bucket_or_404(db, bucket_id)
+    return await _load_bucket_detail_or_404(db, bucket_id)
+
+
+@router.get("/admin/{bucket_id}/activity", response_model=BucketActivityPage)
+async def list_bucket_activity(
+    bucket_id: UUID,
+    limit: int = Query(default=12, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    action: str | None = None,
+    actor_role: str | None = None,
+    target_type: str | None = None,
+    q: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketActivityPage:
+    await _load_bucket_or_404(db, bucket_id)
+    filters = [BucketActivityLog.bucket_id == bucket_id]
+    if action:
+        filters.append(BucketActivityLog.action == action)
+    if actor_role:
+        filters.append(BucketActivityLog.actor_role == actor_role)
+    if target_type:
+        filters.append(BucketActivityLog.target_type == target_type)
+    if date_from:
+        filters.append(BucketActivityLog.created_at >= date_from)
+    if date_to:
+        filters.append(BucketActivityLog.created_at <= date_to)
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                BucketActivityLog.action.ilike(pattern),
+                BucketActivityLog.actor_name.ilike(pattern),
+                BucketActivityLog.actor_email.ilike(pattern),
+                BucketActivityLog.detail.ilike(pattern),
+                BucketActivityLog.target_type.ilike(pattern),
+            )
+        )
+
+    total = (await db.execute(select(func.count()).select_from(BucketActivityLog).where(*filters))).scalar_one()
+    items = (
+        await db.execute(
+            select(BucketActivityLog)
+            .where(*filters)
+            .order_by(BucketActivityLog.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars().all()
+    return BucketActivityPage(
+        items=[BucketActivityRead.model_validate(item) for item in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.delete("/admin/{bucket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_bucket(
     bucket_id: UUID,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     bucket = await _load_bucket_or_404(db, bucket_id)
     bucket.archived_at = _now()
     bucket.status = "archived"
-    await _log(db, bucket_id, "bucket_deleted", actor_name=user.name, actor_role=user.role, detail=bucket.name)
+    await _log(db, bucket_id, "bucket_deleted", request=request, user=user, detail=bucket.name)
     await db.commit()
 
 
@@ -347,6 +453,7 @@ async def delete_bucket(
 async def add_requested_document(
     bucket_id: UUID,
     payload: BucketRequestedDocumentCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketRequestedDocument:
@@ -385,7 +492,7 @@ async def add_requested_document(
     )
     db.add(doc)
     await db.flush()
-    await _log(db, bucket_id, "requested_document_added", actor_name=user.name, actor_role=user.role, target_type="requested_document", target_id=str(doc.id), detail=doc.name)
+    await _log(db, bucket_id, "requested_document_added", request=request, user=user, target_type="requested_document", target_id=str(doc.id), detail=doc.name)
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -395,6 +502,7 @@ async def add_requested_document(
 async def create_upload_link(
     bucket_id: UUID,
     payload: BucketUploadLinkCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketUploadLinkRead:
@@ -412,7 +520,7 @@ async def create_upload_link(
     )
     db.add(link)
     await db.flush()
-    await _log(db, bucket_id, "upload_link_created", actor_name=user.name, actor_role=user.role, target_type="upload_link", target_id=str(link.id), detail=link.recipient_name)
+    await _log(db, bucket_id, "upload_link_created", request=request, user=user, target_type="upload_link", target_id=str(link.id), detail=link.recipient_name)
     await db.commit()
     await db.refresh(link)
     data = BucketUploadLinkRead.model_validate(link)
@@ -425,6 +533,7 @@ async def create_upload_link(
 async def create_share(
     bucket_id: UUID,
     payload: BucketShareCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketShareRead:
@@ -458,7 +567,7 @@ async def create_share(
     share.files = files
     db.add(share)
     await db.flush()
-    await _log(db, bucket_id, "share_created", actor_name=user.name, actor_role=user.role, target_type="share", target_id=str(share.id), detail=share.recipient_name)
+    await _log(db, bucket_id, "share_created", request=request, user=user, target_type="share", target_id=str(share.id), detail=share.recipient_name)
     await db.commit()
     await db.refresh(share)
     data = BucketShareRead.model_validate(share)
@@ -472,15 +581,19 @@ async def patch_share(
     bucket_id: UUID,
     share_id: UUID,
     payload: BucketSharePatch,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketShare:
     share = await db.get(BucketShare, share_id)
     if share is None or share.bucket_id != bucket_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share not found")
+    changes = []
     for field in payload.model_fields_set:
+        changes.append(f"{field}={getattr(payload, field)}")
         setattr(share, field, getattr(payload, field))
-    await _log(db, bucket_id, "share_updated", actor_name=user.name, actor_role=user.role, target_type="share", target_id=str(share.id))
+    action = "share_status_changed" if "status" in payload.model_fields_set else "share_updated"
+    await _log(db, bucket_id, action, request=request, user=user, target_type="share", target_id=str(share.id), detail=", ".join(changes) or None)
     await db.commit()
     await db.refresh(share)
     return share
@@ -490,6 +603,7 @@ async def patch_share(
 async def create_admin_note(
     bucket_id: UUID,
     payload: BucketNoteCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketNote:
@@ -503,7 +617,7 @@ async def create_admin_note(
     )
     db.add(note)
     await db.flush()
-    await _log(db, bucket_id, "note_created", actor_name=user.name, actor_role=user.role, target_type="note", target_id=str(note.id), detail=note.visibility)
+    await _log(db, bucket_id, "note_created", request=request, user=user, target_type="note", target_id=str(note.id), detail=note.visibility)
     await db.commit()
     await db.refresh(note)
     return note
@@ -513,6 +627,7 @@ async def create_admin_note(
 async def admin_upload_init(
     bucket_id: UUID,
     payload: BucketFileUploadInit,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
@@ -521,6 +636,8 @@ async def admin_upload_init(
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
         if req is None or req.bucket_id != bucket_id:
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document mismatch")
+            await db.commit()
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
     _, prefix, _ = _bucket_storage_config()
     safe = _safe_filename(payload.file_name)
@@ -557,6 +674,8 @@ async def admin_upload_init(
             )
         ).scalars().first()
         if existing_for_doc is not None:
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(req.id), detail="single file document already has a file")
+            await db.commit()
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document only allows one file")
     file_id = uuid4()
     s3_key = f"{prefix}/admin-uploads/{bucket_id}/{file_id}-{safe}"
@@ -578,8 +697,8 @@ async def admin_upload_init(
         db,
         bucket_id,
         "admin_file_upload_started",
-        actor_name=user.name,
-        actor_role=user.role,
+        request=request,
+        user=user,
         target_type="file",
         target_id=str(file.id),
         detail=f"{payload.file_name} for {payload.uploader_name}",
@@ -593,12 +712,15 @@ async def admin_upload_init(
 async def admin_upload_complete(
     bucket_id: UUID,
     payload: BucketUploadComplete,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
     bucket = await _load_bucket_or_404(db, bucket_id)
     file = await db.get(BucketFile, payload.file_id)
     if file is None or file.bucket_id != bucket_id or file.upload_link_id is not None:
+        await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")
+        await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.status == "uploaded":
         return file
@@ -621,8 +743,8 @@ async def admin_upload_complete(
         db,
         bucket_id,
         "admin_file_uploaded",
-        actor_name=user.name,
-        actor_role=user.role,
+        request=request,
+        user=user,
         target_type="file",
         target_id=str(file.id),
         detail=f"{file.file_name} for {file.uploaded_by_name or 'client'}",
@@ -644,6 +766,7 @@ async def admin_upload_complete(
 async def admin_file_url(
     bucket_id: UUID,
     file_id: UUID,
+    request: Request,
     download: bool = False,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
@@ -652,7 +775,7 @@ async def admin_file_url(
     if file is None or file.bucket_id != bucket_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     disposition = "attachment" if download else "inline"
-    await _log(db, bucket_id, "file_download_url_created" if download else "file_preview_url_created", actor_name=user.name, actor_role=user.role, target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, bucket_id, "file_download_url_created" if download else "file_preview_url_created", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
     return BucketFileUrl(url=_download_url(file.s3_key, disposition=disposition), expires_in=900)
 
@@ -661,6 +784,7 @@ async def admin_file_url(
 async def admin_file_review(
     bucket_id: UUID,
     file_id: UUID,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileReviewRead:
@@ -668,7 +792,7 @@ async def admin_file_review(
     if file is None or file.bucket_id != bucket_id or file.status != "uploaded":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     annotations = await _file_annotations(db, bucket_id, file_id)
-    await _log(db, bucket_id, "file_review_opened", actor_name=user.name, actor_role=user.role, target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, bucket_id, "file_review_opened", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
     return _review_response(file, annotations)
 
@@ -678,6 +802,7 @@ async def create_admin_file_annotation(
     bucket_id: UUID,
     file_id: UUID,
     payload: BucketFileAnnotationCreate,
+    request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileAnnotation:
@@ -698,7 +823,7 @@ async def create_admin_file_annotation(
     )
     db.add(annotation)
     await db.flush()
-    await _log(db, bucket_id, "file_annotation_created", actor_name=user.name, actor_role=user.role, target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, bucket_id, "file_annotation_created", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
     await db.refresh(annotation)
     return annotation
@@ -720,15 +845,16 @@ async def request_link_info(token: str, db: AsyncSession = Depends(get_db)) -> B
 async def request_link_access(
     token: str,
     payload: BucketRequestAccessRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketRequestAccessRead:
     link = await _load_upload_link_or_404(db, token)
     _require_upload_passcode(link)
     if not _verify_passcode(payload.passcode, link.passcode_hash):
-        await _log(db, link.bucket_id, "upload_passcode_failed", actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+        await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
-    await _log(db, link.bucket_id, "upload_link_accessed", actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    await _log(db, link.bucket_id, "upload_link_accessed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
     await db.commit()
     return BucketRequestAccessRead(
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
@@ -743,15 +869,20 @@ async def request_link_access(
 async def request_upload_init(
     token: str,
     payload: BucketFileUploadInit,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
     link = await _load_upload_link_or_404(db, token)
     _require_upload_passcode(link)
     if not _verify_passcode(payload.passcode or "", link.passcode_hash):
+        await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=payload.uploader_name or link.recipient_name, actor_email=str(payload.uploader_email) if payload.uploader_email else link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail=payload.file_name)
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
         if req is None or req.bucket_id != link.bucket_id:
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document mismatch")
+            await db.commit()
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
     else:
         req = None
@@ -789,6 +920,8 @@ async def request_upload_init(
             )
         ).scalars().first()
         if existing_for_doc is not None:
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="requested_document", target_id=str(req.id), detail="single file document already has a file")
+            await db.commit()
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document only allows one file")
     file_id = uuid4()
     s3_key = f"{prefix}/uploads/{link.bucket_id}/{file_id}-{safe}"
@@ -806,7 +939,7 @@ async def request_upload_init(
         status="uploading",
     )
     db.add(file)
-    await _log(db, link.bucket_id, "file_upload_started", actor_name=payload.uploader_name, actor_role="uploader", target_type="file", target_id=str(file.id), detail=payload.file_name)
+    await _log(db, link.bucket_id, "file_upload_started", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="file", target_id=str(file.id), detail=payload.file_name)
     await db.commit()
     upload_url, headers = _upload_url(s3_key, payload.content_type)
     return BucketFileUploadInitResponse(file_id=file.id, upload_url=upload_url, s3_key=s3_key, required_headers=headers)
@@ -816,11 +949,14 @@ async def request_upload_init(
 async def request_upload_complete(
     token: str,
     payload: BucketUploadComplete,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
     link = await _load_upload_link_or_404(db, token)
     file = await db.get(BucketFile, payload.file_id)
     if file is None or file.bucket_id != link.bucket_id or file.upload_link_id != link.id:
+        await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")
+        await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.status == "uploaded":
         return file
@@ -840,7 +976,7 @@ async def request_upload_complete(
                 content=payload.note,
             )
         )
-    await _log(db, link.bucket_id, "file_uploaded", actor_name=file.uploaded_by_name or link.recipient_name, actor_role="uploader", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, link.bucket_id, "file_uploaded", request=request, actor_name=file.uploaded_by_name or link.recipient_name, actor_email=file.uploaded_by_email or link.recipient_email, actor_role="uploader", target_type="file", target_id=str(file.id), detail=file.file_name)
     try:
         from app.services.notifications import notify_bucket_file_uploaded
 
@@ -858,11 +994,12 @@ async def request_upload_complete(
 async def share_access(
     token: str,
     payload: BucketShareAccessRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketShareAccessRead:
     share = await _load_share_or_404(db, token)
     if not _verify_passcode(payload.passcode, share.passcode_hash):
-        await _log(db, share.bucket_id, "share_passcode_failed", actor_name=share.recipient_name, actor_role="shared_user", target_type="share", target_id=str(share.id))
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id))
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
     share.last_accessed_at = _now()
@@ -876,7 +1013,7 @@ async def share_access(
             item.download_url = _download_url(file.s3_key, disposition="attachment")
         files.append(item)
     notes = [n for n in share.bucket.notes if n.visibility == "shared" or share.can_see_internal_notes]
-    await _log(db, share.bucket_id, "share_accessed", actor_name=share.recipient_name, actor_role="shared_user", target_type="share", target_id=str(share.id))
+    await _log(db, share.bucket_id, "share_accessed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id))
     await db.commit()
     share_out = BucketShareRead.model_validate(share)
     share_out.share_url = _public_url(f"/buckets/share/{share.token}")
@@ -905,20 +1042,53 @@ async def shared_file_review(
     token: str,
     file_id: UUID,
     payload: BucketShareAccessRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileReviewRead:
     share = await _load_share_or_404(db, token)
     if not share.can_preview:
+        await _log(db, share.bucket_id, "shared_file_review_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="preview disabled")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Preview is disabled for this share")
     if not _verify_passcode(payload.passcode, share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="file review")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
     file = _file_belongs_to_share(share, file_id)
     if file is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     annotations = await _file_annotations(db, share.bucket_id, file_id)
-    await _log(db, share.bucket_id, "shared_file_review_opened", actor_name=share.recipient_name, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, share.bucket_id, "shared_file_review_opened", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
     return _review_response(file, annotations, preview=share.can_preview)
+
+
+@router.post("/share/{token}/files/{file_id}/download", response_model=BucketFileUrl)
+async def shared_file_download(
+    token: str,
+    file_id: UUID,
+    payload: BucketSharedDownloadCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUrl:
+    share = await _load_share_or_404(db, token)
+    if not _verify_passcode(payload.passcode, share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="download")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
+    file = _file_belongs_to_share(share, file_id)
+    if file is None:
+        await _log(db, share.bucket_id, "shared_file_download_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="file not shared")
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if not share.can_download:
+        await _log(db, share.bucket_id, "shared_file_download_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Download is disabled for this share")
+    share.download_count += 1
+    await _log(db, share.bucket_id, "shared_file_download_requested", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await db.commit()
+    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
 
 
 @router.post("/share/{token}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)
@@ -926,14 +1096,21 @@ async def create_shared_file_annotation(
     token: str,
     file_id: UUID,
     payload: BucketFileAnnotationCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileAnnotation:
     share = await _load_share_or_404(db, token)
     if not share.can_preview:
+        await _log(db, share.bucket_id, "shared_file_annotation_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="preview disabled")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Preview is disabled for this share")
     if not share.can_add_notes:
+        await _log(db, share.bucket_id, "shared_file_annotation_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="notes disabled")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Notes are disabled for this share")
     if not _verify_passcode(payload.passcode or "", share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file_id), detail="annotation")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
     file = _file_belongs_to_share(share, file_id)
     if file is None:
@@ -953,7 +1130,7 @@ async def create_shared_file_annotation(
     )
     db.add(annotation)
     await db.flush()
-    await _log(db, share.bucket_id, "shared_file_annotation_created", actor_name=share.recipient_name, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await _log(db, share.bucket_id, "shared_file_annotation_created", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
     await db.refresh(annotation)
     return annotation
@@ -963,12 +1140,17 @@ async def create_shared_file_annotation(
 async def create_shared_note(
     token: str,
     payload: BucketSharedNoteCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketNote:
     share = await _load_share_or_404(db, token)
     if not share.can_add_notes:
+        await _log(db, share.bucket_id, "shared_note_denied", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="note", target_id=str(share.id), detail="notes disabled")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Notes are disabled for this share")
     if not _verify_passcode(payload.passcode, share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="note", target_id=str(share.id), detail="shared note")
+        await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
     note = BucketNote(
         bucket_id=share.bucket_id,
@@ -980,7 +1162,7 @@ async def create_shared_note(
     )
     db.add(note)
     await db.flush()
-    await _log(db, share.bucket_id, "shared_note_created", actor_name=share.recipient_name, actor_role="shared_user", target_type="note", target_id=str(note.id))
+    await _log(db, share.bucket_id, "shared_note_created", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="note", target_id=str(note.id))
     await db.commit()
     await db.refresh(note)
     return note

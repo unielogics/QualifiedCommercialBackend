@@ -290,6 +290,10 @@ class BucketSharedNoteCreate(BaseModel):
     content: str = Field(min_length=1)
 
 
+class BucketSharedDownloadCreate(BaseModel):
+    passcode: str
+
+
 class BucketNoteRead(ORMModel):
     id: UUID
     bucket_id: UUID
@@ -305,10 +309,21 @@ class BucketNoteRead(ORMModel):
 class BucketActivityRead(ORMModel):
     id: UUID
     bucket_id: UUID
+    actor_user_id: UUID | None
     actor_name: str | None
+    actor_email: str | None
     actor_role: str | None
     action: str
     target_type: str | None
     target_id: str | None
     detail: str | None
+    ip_address: str | None
+    user_agent: str | None
     created_at: datetime
+
+
+class BucketActivityPage(BaseModel):
+    items: list[BucketActivityRead]
+    total: int
+    limit: int
+    offset: int
