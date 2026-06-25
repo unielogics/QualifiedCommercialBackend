@@ -85,6 +85,7 @@ variable "secret_payload" {
       BEDROCK_MODEL_HEAVY      us.anthropic.claude-sonnet-4-6
       BEDROCK_MODEL_LIGHT      us.anthropic.claude-haiku-4-5-20251001-v1:0
       S3_BUCKET             qc-documents-prod
+      BUCKETS_KMS_KEY_ID    arn:aws:kms:<region>:<account>:key/<key-id>
       USE_FAKE_INBOX        true
       APP_ENV               production
       LOG_LEVEL             INFO

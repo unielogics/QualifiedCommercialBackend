@@ -67,13 +67,20 @@ systemctl enable --now caddy
 systemctl reload caddy
 
 echo "==> Pull secrets from AWS Secrets Manager → ${ENV_FILE}"
-aws secretsmanager get-secret-value \
-  --secret-id "${SECRET_ID}" \
-  --region "${REGION}" \
-  --query SecretString --output text \
-| jq -r 'to_entries[] | "\(.key)=\(.value)"' > "${ENV_FILE}"
-chmod 600 "${ENV_FILE}"
-chown root:root "${ENV_FILE}"
+cat > /usr/local/bin/qcbackend-refresh-env <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+aws secretsmanager get-secret-value \\
+  --secret-id "${SECRET_ID}" \\
+  --region "${REGION}" \\
+  --query SecretString --output text \\
+| jq -r 'to_entries[] | "\\(.key)=\\(.value)"' > "${ENV_FILE}.new"
+chmod 600 "${ENV_FILE}.new"
+chown root:root "${ENV_FILE}.new"
+mv "${ENV_FILE}.new" "${ENV_FILE}"
+EOF
+chmod +x /usr/local/bin/qcbackend-refresh-env
+/usr/local/bin/qcbackend-refresh-env
 
 # ---------- One-time DB bootstrap on RDS ----------
 echo "==> Ensure 'qc' database + pgvector extension exist on RDS"
@@ -126,6 +133,7 @@ Restart=always
 RestartSec=5
 ExecStartPre=-/usr/bin/docker stop qcbackend
 ExecStartPre=-/usr/bin/docker rm qcbackend
+ExecStartPre=/usr/local/bin/qcbackend-refresh-env
 ExecStart=/usr/bin/docker run --rm --name qcbackend \\
   -p 127.0.0.1:8000:8000 \\
   --env-file ${ENV_FILE} \\
@@ -148,15 +156,11 @@ echo "==> Daily refresh of secrets from Secrets Manager (in case you rotate)"
 cat > /etc/cron.daily/qcbackend-refresh-env <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-aws secretsmanager get-secret-value \\
-  --secret-id "${SECRET_ID}" --region "${REGION}" --query SecretString --output text \\
-  | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "${ENV_FILE}.new"
-if ! cmp -s "${ENV_FILE}.new" "${ENV_FILE}"; then
-  mv "${ENV_FILE}.new" "${ENV_FILE}"
-  chmod 600 "${ENV_FILE}"
+/usr/local/bin/qcbackend-refresh-env
+if ! cmp -s "${ENV_FILE}" "${ENV_FILE}.last-restarted" 2>/dev/null; then
+  cp "${ENV_FILE}" "${ENV_FILE}.last-restarted"
   systemctl restart qcbackend
 fi
-rm -f "${ENV_FILE}.new"
 EOF
 chmod +x /etc/cron.daily/qcbackend-refresh-env
 

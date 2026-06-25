@@ -54,20 +54,38 @@ resource "aws_iam_role_policy" "qcbackend_s3" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "s3:PutObject",
-        "s3:PutObjectAcl",
-        "s3:GetObject",
-        "s3:DeleteObject",
-        "s3:ListBucket"
-      ]
-      Resource = [
-        "arn:aws:s3:::qc-documents-*",
-        "arn:aws:s3:::qc-documents-*/*"
-      ]
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:PutObjectAcl",
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::qc-documents-*",
+          "arn:aws:s3:::qc-documents-*/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "arn:aws:kms:${var.aws_region}:${data.aws_caller_identity.current.account_id}:key/*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "s3.${var.aws_region}.amazonaws.com"
+          }
+        }
+      }
+    ]
   })
 }
 
@@ -98,6 +116,19 @@ resource "aws_iam_role_policy" "qcbackend_bedrock" {
           "bedrock:GetInferenceProfile",
           "bedrock:ListInferenceProfiles",
           "bedrock:ListFoundationModels"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "aws-marketplace:ViewSubscriptions",
+          "aws-marketplace:Subscribe",
+          "bedrock:PutUseCaseForModelAccess",
+          "bedrock:ListFoundationModelAgreementOffers",
+          "bedrock:CreateFoundationModelAgreement",
+          "bedrock:GetFoundationModelAvailability",
+          "bedrock:GetFoundationModel"
         ]
         Resource = "*"
       }

@@ -46,6 +46,7 @@ Push to QualifiedCommercialBackend@main
   → GitHub Actions builds image → pushes to GHCR
   → assumes qcbackend-github-deploy role via OIDC
   → SSM Send-Command on EC2: docker pull → docker tag → systemctl restart qcbackend
+  → systemd refreshes /etc/qcbackend.env from Secrets Manager before starting the container
   → live in ~3 min
 ```
 
