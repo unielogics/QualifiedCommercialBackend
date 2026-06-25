@@ -759,8 +759,8 @@ async def _generate_ai_reply(
         system += render_training_block(await load_task_config(db, "nurture_chat"))
 
     if not settings.ai_provider_enabled:
-        # Stub when no key — keep the workspace usable in dev.
-        reply_text = "(stub) I would normally answer here once AWS_BEARER_TOKEN_BEDROCK is set."
+        # Stub when Bedrock is disabled — keep the workspace usable in dev.
+        reply_text = "(stub) I would normally answer here once Bedrock is enabled."
     else:
         try:
             from app.services.ai.orchestrator import run as orchestrator_run

@@ -41,6 +41,12 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "cache_read": 0.08,
         "output": 4.00,
     },
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+        "input": 0.80,
+        "cache_write": 1.00,
+        "cache_read": 0.08,
+        "output": 4.00,
+    },
 }
 
 _SONNET = MODEL_PRICING["claude-sonnet-4-6"]

@@ -160,4 +160,4 @@ ssh ubuntu@54.157.222.116 "sudo /etc/cron.daily/qcbackend-refresh-env"
 - **Amplify logs:** Amplify console → app → Hosting → Build/Deploy logs
 - **Bedrock spend:** AWS Cost Explorer / Bedrock usage, filter on the Qualified Commercial account/project tags
 - **Cost watch:** AWS Cost Explorer, filter on tag `Project=qualified-commercial`
-- **Security:** rotate `AWS_BEARER_TOKEN_BEDROCK` and Clerk `sk_live_*` every 90 days, update via terraform
+- **Security:** Bedrock runs through the EC2 IAM role by default; rotate Clerk `sk_live_*` and any optional provider API keys every 90 days via Terraform.

@@ -71,6 +71,40 @@ resource "aws_iam_role_policy" "qcbackend_s3" {
   })
 }
 
+resource "aws_iam_role_policy" "qcbackend_bedrock" {
+  name = "qcbackend-bedrock"
+  role = aws_iam_role.qcbackend_instance.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:Converse",
+          "bedrock:ConverseStream"
+        ]
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/anthropic.*",
+          "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+          "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:application-inference-profile/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:GetInferenceProfile",
+          "bedrock:ListInferenceProfiles",
+          "bedrock:ListFoundationModels"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # SSM Session Manager + patch agent — lets us shell into the box without SSH keys.
 resource "aws_iam_role_policy_attachment" "qcbackend_ssm" {
   role       = aws_iam_role.qcbackend_instance.name

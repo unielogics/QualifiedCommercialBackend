@@ -547,13 +547,13 @@ def _stub_reply(messages: list[ChatTurn], loan_context: str | None) -> str:
     if not last_user:
         return "What would you like to look at first — the pipeline, an Elara Inbox task, or a specific loan?"
     body = (
-        f"(Dev mode — no AWS_BEARER_TOKEN_BEDROCK set.) "
+        f"(Dev mode — Bedrock provider disabled.) "
         f"You asked: \"{last_user[:120]}{'…' if len(last_user) > 120 else ''}\". "
     )
     if loan_context:
         body += "I'd open the deal file, check open doc requests + the most recent activity, then summarize the single bottleneck for the broker."
     else:
-        body += "Once a key is configured, I'll answer with a real reply scoped to your active loans."
+        body += "Once Bedrock is enabled, I'll answer with a real reply scoped to your active loans."
     return body
 
 

@@ -91,7 +91,10 @@ async def startup() -> None:
             "treated as a seeded super_admin). Set CLERK_SECRET_KEY before prod."
         )
     if not settings.ai_provider_enabled:
-        log.warning("AWS_BEARER_TOKEN_BEDROCK is unset — Bedrock AI calls will fail when invoked.")
+        log.warning(
+            "Bedrock AI is disabled — set BEDROCK_ENABLED=true for IAM auth "
+            "or AWS_BEARER_TOKEN_BEDROCK for bearer-token auth."
+        )
 
     # Start the in-process APScheduler. See app/services/scheduler.py
     # for the SINGLE-INSTANCE assumption — must move to AWS EventBridge

@@ -297,7 +297,7 @@ async def _generate_ai_reply(
         system += "\n\nPRIOR CONVERSATION SUMMARY:\n" + new_summary
 
     if not settings.ai_provider_enabled:
-        reply_text = "(stub) I would normally answer here once AWS_BEARER_TOKEN_BEDROCK is set."
+        reply_text = "(stub) I would normally answer here once Bedrock is enabled."
     else:
         try:
             from app.services.ai.orchestrator import run as orchestrator_run

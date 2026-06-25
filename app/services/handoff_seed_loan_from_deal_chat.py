@@ -94,7 +94,7 @@ async def seed_loan_chat_from_deal(
     settings = get_settings()
     if not settings.ai_provider_enabled:
         body = (
-            "Pre-funding handoff (stub — AWS_BEARER_TOKEN_BEDROCK unset):\n\n"
+            "Pre-funding handoff (stub — Bedrock provider disabled):\n\n"
             f"{transcript[:1500]}"
         )
     else:

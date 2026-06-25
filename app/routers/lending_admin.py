@@ -1076,9 +1076,10 @@ async def get_ai_training_feedback(
 
 # ── Token-usage reporting (super-admin) ─────────────────────────────
 #
-# Reads the append-only ai_token_usage ledger written by
-# orchestrator.record_usage. Powers /admin/token-usage in QCDashboard:
-# spend per file / AI agent / activity / broker / model, over time.
+# Reads both AI ledgers:
+# - ai_token_usage: legacy Anthropic/orchestrator token rows
+# - ai_usage_events: current Bedrock tracked usage rows
+# Powers /admin/token-usage in QCDashboard over time.
 
 
 def _usage_window(from_date: str | None, to_date: str | None) -> tuple[datetime, datetime]:
@@ -1104,10 +1105,11 @@ async def token_usage_summary(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(user)
+    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
 
     start, end = _usage_window(from_date, to_date)
-    row = (
+    legacy_row = (
         await db.execute(
             select(
                 func.count().label("calls"),
@@ -1121,14 +1123,31 @@ async def token_usage_summary(
             .where(U.created_at < end)
         )
     ).one()
-    calls, inp, out, cread, cwrite, cost = row
+    bedrock_row = (
+        await db.execute(
+            select(
+                func.count().label("calls"),
+                func.coalesce(func.sum(E.input_tokens), 0),
+                func.coalesce(func.sum(E.output_tokens), 0),
+                func.coalesce(func.sum(E.estimated_cost_usd), 0),
+            )
+            .where(E.created_at >= start)
+            .where(E.created_at < end)
+        )
+    ).one()
+    calls = int(legacy_row[0] or 0) + int(bedrock_row[0] or 0)
+    inp = int(legacy_row[1] or 0) + int(bedrock_row[1] or 0)
+    out = int(legacy_row[2] or 0) + int(bedrock_row[2] or 0)
+    cread = int(legacy_row[3] or 0)
+    cwrite = int(legacy_row[4] or 0)
+    cost = float(legacy_row[5] or 0) + float(bedrock_row[3] or 0)
     cached_input = int(cread) + int(cwrite)
     total_input = int(inp) + cached_input
     cache_hit_pct = round(100.0 * cached_input / total_input, 1) if total_input else 0.0
     return {
         "from": start.isoformat(),
         "to": end.isoformat(),
-        "calls": int(calls),
+        "calls": calls,
         "input_tokens": int(inp),
         "output_tokens": int(out),
         "cache_read_tokens": int(cread),
@@ -1150,6 +1169,7 @@ async def token_usage_breakdown(
 ):
     _require_admin(user)
     from app.models.ai_agent import AIAgent
+    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
     from app.models.broker import Broker
     from app.models.deal import Deal
@@ -1184,15 +1204,84 @@ async def token_usage_breakdown(
             stmt = stmt.where(where_extra)
         return list((await db.execute(stmt)).all())
 
+    async def _agg_events(group_col, where_extra=None):
+        stmt = (
+            select(
+                group_col.label("key"),
+                func.count().label("calls"),
+                func.coalesce(func.sum(E.input_tokens), 0),
+                func.coalesce(func.sum(E.output_tokens), 0),
+                func.coalesce(func.sum(E.estimated_cost_usd), 0),
+            )
+            .where(E.created_at >= start)
+            .where(E.created_at < end)
+            .group_by(group_col)
+        )
+        if where_extra is not None:
+            stmt = stmt.where(where_extra)
+        return list((await db.execute(stmt)).all())
+
+    def merge_row(
+        bucket: dict[str, dict[str, Any]],
+        *,
+        key: str,
+        label: str,
+        calls: int,
+        tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+        kind: str | None = None,
+        row_id: str | None = None,
+    ) -> None:
+        row = bucket.setdefault(
+            key,
+            {
+                "key": key,
+                "label": label,
+                "calls": 0,
+                "tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        row["calls"] += calls
+        row["tokens"] += tokens
+        row["output_tokens"] += output_tokens
+        row["cost_usd"] += cost_usd
+        if kind is not None:
+            row["kind"] = kind
+        if row_id is not None:
+            row["id"] = row_id
+
     rows: list[dict[str, Any]] = []
 
     if dimension in ("activity", "model"):
+        merged: dict[str, dict[str, Any]] = {}
         for key, calls, toks, out, cost in await _agg(col):
-            rows.append({"key": str(key), "label": str(key or "—"),
-                         "calls": int(calls), "tokens": int(toks),
-                         "output_tokens": int(out), "cost_usd": float(cost)})
+            merge_row(
+                merged,
+                key=f"{dimension}:{key or '—'}",
+                label=str(key or "—"),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        event_col = E.feature if dimension == "activity" else E.model
+        for key, calls, toks, out, cost in await _agg_events(event_col):
+            merge_row(
+                merged,
+                key=f"{dimension}:{key or '—'}",
+                label=str(key or "—"),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        rows.extend(merged.values())
 
     elif dimension == "agent":
+        merged: dict[str, dict[str, Any]] = {}
         raw = await _agg(U.ai_agent_id, U.ai_agent_id.is_not(None))
         ids = [r[0] for r in raw]
         names = {}
@@ -1200,13 +1289,22 @@ async def token_usage_breakdown(
             for a in (await db.execute(select(AIAgent.id, AIAgent.name).where(AIAgent.id.in_(ids)))).all():
                 names[a[0]] = a[1]
         for key, calls, toks, out, cost in raw:
-            rows.append({"key": str(key), "label": names.get(key, "(deleted agent)"),
-                         "calls": int(calls), "tokens": int(toks),
-                         "output_tokens": int(out), "cost_usd": float(cost)})
+            merge_row(
+                merged,
+                key=str(key),
+                label=names.get(key, "(deleted agent)"),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        rows.extend(merged.values())
 
     elif dimension == "broker":
+        merged: dict[str, dict[str, Any]] = {}
         raw = await _agg(U.broker_id, U.broker_id.is_not(None))
-        ids = [r[0] for r in raw]
+        event_raw = await _agg_events(E.broker_id, E.broker_id.is_not(None))
+        ids = [r[0] for r in raw] + [r[0] for r in event_raw]
         names = {}
         if ids:
             q = (
@@ -1217,14 +1315,33 @@ async def token_usage_breakdown(
             for b in (await db.execute(q)).all():
                 names[b[0]] = b[1] or "Agent"
         for key, calls, toks, out, cost in raw:
-            rows.append({"key": str(key), "label": names.get(key, "(unknown)"),
-                         "calls": int(calls), "tokens": int(toks),
-                         "output_tokens": int(out), "cost_usd": float(cost)})
+            merge_row(
+                merged,
+                key=str(key),
+                label=names.get(key, "(unknown)"),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        for key, calls, toks, out, cost in event_raw:
+            merge_row(
+                merged,
+                key=str(key),
+                label=names.get(key, "(unknown)"),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        rows.extend(merged.values())
 
     else:  # file = loans + deals
+        merged: dict[str, dict[str, Any]] = {}
         loan_raw = await _agg(U.loan_id, U.loan_id.is_not(None))
+        event_loan_raw = await _agg_events(E.loan_id, E.loan_id.is_not(None))
         deal_raw = await _agg(U.deal_id, U.deal_id.is_not(None))
-        loan_ids = [r[0] for r in loan_raw]
+        loan_ids = [r[0] for r in loan_raw] + [r[0] for r in event_loan_raw]
         deal_ids = [r[0] for r in deal_raw]
         loan_lbl, deal_lbl = {}, {}
         if loan_ids:
@@ -1234,13 +1351,42 @@ async def token_usage_breakdown(
             for d in (await db.execute(select(Deal.id, Deal.title).where(Deal.id.in_(deal_ids)))).all():
                 deal_lbl[d[0]] = d[1] or "deal"
         for key, calls, toks, out, cost in loan_raw:
-            rows.append({"key": f"loan:{key}", "label": loan_lbl.get(key, "(loan)"),
-                         "kind": "loan", "id": str(key), "calls": int(calls),
-                         "tokens": int(toks), "output_tokens": int(out), "cost_usd": float(cost)})
+            merge_row(
+                merged,
+                key=f"loan:{key}",
+                label=loan_lbl.get(key, "(loan)"),
+                kind="loan",
+                row_id=str(key),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        for key, calls, toks, out, cost in event_loan_raw:
+            merge_row(
+                merged,
+                key=f"loan:{key}",
+                label=loan_lbl.get(key, "(loan)"),
+                kind="loan",
+                row_id=str(key),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
         for key, calls, toks, out, cost in deal_raw:
-            rows.append({"key": f"deal:{key}", "label": deal_lbl.get(key, "(deal)"),
-                         "kind": "deal", "id": str(key), "calls": int(calls),
-                         "tokens": int(toks), "output_tokens": int(out), "cost_usd": float(cost)})
+            merge_row(
+                merged,
+                key=f"deal:{key}",
+                label=deal_lbl.get(key, "(deal)"),
+                kind="deal",
+                row_id=str(key),
+                calls=int(calls),
+                tokens=int(toks),
+                output_tokens=int(out),
+                cost_usd=float(cost),
+            )
+        rows.extend(merged.values())
 
     rows.sort(key=lambda r: r["cost_usd"], reverse=True)
     return rows[: max(1, min(200, limit))]
@@ -1254,14 +1400,15 @@ async def token_usage_timeseries(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(user)
+    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
 
     start, end = _usage_window(from_date, to_date)
-    bucket = func.date_trunc("day", U.created_at).label("day")
-    raw = (
+    legacy_bucket = func.date_trunc("day", U.created_at).label("day")
+    legacy_raw = (
         await db.execute(
             select(
-                bucket,
+                legacy_bucket,
                 func.count().label("calls"),
                 func.coalesce(func.sum(U.input_tokens + U.cache_read_tokens + U.cache_creation_tokens), 0),
                 func.coalesce(func.sum(U.output_tokens), 0),
@@ -1269,17 +1416,39 @@ async def token_usage_timeseries(
             )
             .where(U.created_at >= start)
             .where(U.created_at < end)
-            .group_by(bucket)
-            .order_by(bucket)
+            .group_by(legacy_bucket)
         )
     ).all()
+    event_bucket = func.date_trunc("day", E.created_at).label("day")
+    event_raw = (
+        await db.execute(
+            select(
+                event_bucket,
+                func.count().label("calls"),
+                func.coalesce(func.sum(E.input_tokens), 0),
+                func.coalesce(func.sum(E.output_tokens), 0),
+                func.coalesce(func.sum(E.estimated_cost_usd), 0),
+            )
+            .where(E.created_at >= start)
+            .where(E.created_at < end)
+            .group_by(event_bucket)
+        )
+    ).all()
+    merged: dict[str, dict[str, Any]] = {}
+    for day, calls, toks, out, cost in [*legacy_raw, *event_raw]:
+        key = day.date().isoformat() if hasattr(day, "date") else str(day)
+        row = merged.setdefault(
+            key,
+            {"day": key, "calls": 0, "tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        )
+        row["calls"] += int(calls)
+        row["tokens"] += int(toks)
+        row["output_tokens"] += int(out)
+        row["cost_usd"] += float(cost)
     return [
         {
-            "day": day.date().isoformat() if hasattr(day, "date") else str(day),
-            "calls": int(calls),
-            "tokens": int(toks),
-            "output_tokens": int(out),
-            "cost_usd": float(cost),
+            **row,
+            "cost_usd": round(float(row["cost_usd"]), 6),
         }
-        for day, calls, toks, out, cost in raw
+        for row in sorted(merged.values(), key=lambda item: item["day"])
     ]

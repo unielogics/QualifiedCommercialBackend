@@ -378,7 +378,7 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
     if not settings.ai_provider_enabled:
         doc.ai_scan_status = "failed"
         doc.scan_dirty = False
-        doc.ai_notes = "AWS_BEARER_TOKEN_BEDROCK not configured — vision scan skipped."
+        doc.ai_notes = "Bedrock provider disabled — vision scan skipped."
         await db.flush()
         return ScanResult(notes=doc.ai_notes)
 

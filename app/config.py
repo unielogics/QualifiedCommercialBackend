@@ -27,10 +27,11 @@ class Settings(BaseSettings):
     clerk_issuer: str = ""
 
     # AWS Bedrock AI
+    bedrock_enabled: bool = False
     aws_bearer_token_bedrock: str = ""
     bedrock_region: str = ""
     bedrock_model_heavy: str = "us.anthropic.claude-sonnet-4-6"
-    bedrock_model_light: str = "anthropic.claude-haiku-4-5-20251001-v1:0"
+    bedrock_model_light: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     # Estimated Bedrock Claude prices per 1M tokens, used for local cost
     # attribution. Alert thresholds live in AppSettings.ai_spend so
@@ -155,7 +156,7 @@ class Settings(BaseSettings):
 
     @property
     def ai_provider_enabled(self) -> bool:
-        return bool(self.aws_bearer_token_bedrock)
+        return self.bedrock_enabled or bool(self.aws_bearer_token_bedrock)
 
 
 @lru_cache

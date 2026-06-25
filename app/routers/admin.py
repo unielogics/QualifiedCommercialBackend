@@ -403,15 +403,15 @@ async def connect_lender_health(
             )
         )
 
-    # 6. Bedrock key — the lender-thread mini-summary + instruct_ai
-    # reply both fall back to deterministic text when absent, so this is
+    # 6. Bedrock provider — the lender-thread mini-summary + instruct_ai
+    # reply both fall back to deterministic text when disabled, so this is
     # only a warning.
     if not settings.ai_provider_enabled:
         checks.append(
             HealthCheck(
                 name="AI summaries",
                 status="warn",
-                detail="AWS_BEARER_TOKEN_BEDROCK unset — thread summaries fall back to deterministic text.",
+                detail="Bedrock provider disabled — thread summaries fall back to deterministic text.",
             )
         )
     else:
@@ -419,7 +419,7 @@ async def connect_lender_health(
             HealthCheck(
                 name="AI summaries",
                 status="ok",
-                detail=f"Bedrock key present; using {settings.bedrock_model_light}.",
+                detail=f"Bedrock provider enabled; using {settings.bedrock_model_light}.",
             )
         )
 
