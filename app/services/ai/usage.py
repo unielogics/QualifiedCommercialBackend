@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -93,6 +94,28 @@ def _metadata_uuid(metadata: dict[str, Any] | None, key: str) -> UUID | None:
         return None
 
 
+def json_safe_metadata(value: Any) -> Any:
+    """Return a JSONB-safe copy of provider metadata.
+
+    SQLAlchemy's JSONB encoder does not serialize UUID/datetime/Decimal
+    objects. Keep this central so AI call sites can pass domain objects
+    without breaking the transaction used by the caller.
+    """
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(k): json_safe_metadata(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [json_safe_metadata(v) for v in value]
+    return str(value)
+
+
 def _day_start() -> datetime:
     now = datetime.now(timezone.utc)
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -174,7 +197,7 @@ async def record_ai_usage(
         client_id=client_id,
         loan_id=loan_id,
         thread_id=thread_id,
-        metadata_json=metadata,
+        metadata_json=json_safe_metadata(metadata),
     )
     db.add(event)
     await db.flush()
