@@ -877,13 +877,14 @@ async def delete_admin_file(
             .where(
                 BucketFile.id == file_id,
                 BucketFile.bucket_id == bucket_id,
-                BucketFile.deleted_at.is_(None),
             )
             .options(selectinload(BucketFile.shares))
         )
     ).scalar_one_or_none()
     if file is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if file.deleted_at is not None:
+        return
 
     file.deleted_at = _now()
     file.deleted_by_user_id = user.id
