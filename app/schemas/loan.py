@@ -360,8 +360,8 @@ class RecalcResponse(BaseModel):
     # Total interest over the full term (fully-amortizing) or 12 months
     # (IO ballpark, for in-page summary stats).
     total_interest: float | None = None
-    # Total cash required at close: pricing + lender_fees + reserves -
-    # the construction holdback (which the borrower doesn't wire day-1).
+    # Total cash required at close: equity/down-payment gap + HUD/settlement
+    # costs + discount points + extra fees/reserves - construction holdback.
     total_cash_to_close: float | None = None
     # Effective monthly debt service used in DSCR (PITIA after vacancy /
     # expense ratio applied). Surfaced so the UI can show how the inputs

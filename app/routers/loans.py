@@ -58,6 +58,7 @@ from app.services.hud_template import build_hud_draft
 from app.services.lender_matrix import validate_loan
 from app.services.math import compute_loan_amount, dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
+from app.services.math.cash_to_close import borrower_equity_required, total_cash_to_close as compute_total_cash_to_close
 from app.services.math.sizing import SizingResult
 
 router = APIRouter(prefix="/loans", tags=["loans"])
@@ -1669,10 +1670,9 @@ async def recalc(
         broker_origination_dollars=quote.broker_origination_dollars,
     )
 
-    # Cash-to-close = pricing cash (origination + discount) + flat lender
-    # fees + required reserves, less the day-1 construction holdback
-    # (borrower doesn't wire the holdback at close; it's reserved by the
-    # lender and drawn over the rehab schedule).
+    # Full cash-to-close = equity/down-payment gap + settlement/HUD total +
+    # discount points + any extra lender fees/reserves, less day-1
+    # construction holdback (borrower doesn't wire the holdback at close).
     lender_fees = (
         payload.lender_fees if payload.lender_fees is not None else float(loan.lender_fees or 0)
     )
@@ -1687,8 +1687,19 @@ async def recalc(
         else float(loan.construction_holdback_pct or 0)
     )
     holdback_dollars = amount * max(0.0, min(1.0, construction_holdback_pct))
-    total_cash_to_close = round(
-        quote.cash_to_close_pricing + lender_fees + reserves_required - holdback_dollars, 2
+    borrower_equity = borrower_equity_required(
+        sizing=sizing,
+        purpose=payload.purpose or loan.purpose,
+        amount=amount,
+        arv=arv_for_sizing,
+    )
+    total_cash_to_close = compute_total_cash_to_close(
+        borrower_equity=borrower_equity,
+        hud_total=hud.total,
+        discount_dollars=quote.discount_dollars,
+        lender_fees=lender_fees,
+        reserves_required=reserves_required,
+        construction_holdback=holdback_dollars,
     )
 
     # Total interest over the life of the loan (fully amortizing) or one
@@ -1780,6 +1791,17 @@ async def free_calc(payload: FreeCalcRequest, _: GatedUser) -> RecalcResponse:
         loan_type=LoanType(payload.type),
         broker_origination_dollars=quote.broker_origination_dollars,
     )
+    borrower_equity = borrower_equity_required(
+        sizing=sizing,
+        purpose=payload.purpose,
+        amount=amount,
+        arv=payload.arv,
+    )
+    total_cash_to_close = compute_total_cash_to_close(
+        borrower_equity=borrower_equity,
+        hud_total=hud.total,
+        discount_dollars=quote.discount_dollars,
+    )
 
     # Validate against fresh sizing when we have it. Caps below are still
     # advisory in /calc (no loan record to lock down) but they're surfaced
@@ -1806,4 +1828,5 @@ async def free_calc(payload: FreeCalcRequest, _: GatedUser) -> RecalcResponse:
         warnings=warnings,
         loan_amount=amount,
         sizing=_sizing_to_breakdown(sizing) if sizing else None,
+        total_cash_to_close=total_cash_to_close,
     )

@@ -30,6 +30,9 @@ from app.enums import (
     DealChatRole,
     FeedbackOutputType,
     FeedbackRating,
+    LoanType,
+    LoanPurpose,
+    PropertyType,
     Role,
 )
 from app.models.activity import Activity
@@ -68,6 +71,8 @@ from app.services.ai.context import Audience, assemble_loan_context
 from app.services.ai.usage import tracked_messages_create
 from app.services.math import dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
+from app.services.math.cash_to_close import borrower_equity_required, total_cash_to_close as compute_total_cash_to_close
+from app.services.hud_template import build_hud_draft
 from app.models.client import Client as ClientModel
 from app.scoping import scope_loan_query
 
@@ -945,11 +950,30 @@ async def save_scenario(
             annual_insurance,
             monthly_hoa,
         )
+    hud = build_hud_draft(
+        loan_amount=amount,
+        property_type=PropertyType(loan.property_type),
+        loan_type=LoanType(loan.type),
+        broker_origination_dollars=quote.broker_origination_dollars,
+    )
+    borrower_equity = borrower_equity_required(
+        sizing=None,
+        purpose=LoanPurpose(loan.purpose) if loan.purpose else None,
+        amount=amount,
+        arv=float(loan.arv) if loan.arv else None,
+    )
+    total_cash = compute_total_cash_to_close(
+        borrower_equity=borrower_equity,
+        hud_total=hud.total,
+        discount_dollars=quote.discount_dollars,
+    )
     snapshot = {
         "final_rate": quote.final_rate,
         "monthly_pi": pi,
         "dscr": dscr_val,
-        "cash_to_close_pricing": quote.broker_origination_dollars,
+        "cash_to_close_pricing": quote.cash_to_close_pricing,
+        "hud_total": hud.total,
+        "total_cash_to_close": total_cash,
     }
 
     scenario = LoanScenario(
