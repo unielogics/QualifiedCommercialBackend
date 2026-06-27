@@ -168,6 +168,9 @@ class BucketFileRead(ORMModel):
     uploaded_by_name: str | None
     uploaded_by_email: str | None
     status: str
+    deleted_at: datetime | None = None
+    deleted_by_user_id: UUID | None = None
+    delete_storage_status: str | None = None
     created_at: datetime
     updated_at: datetime
 

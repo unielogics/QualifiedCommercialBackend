@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from botocore.config import Config
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, with_loader_criteria
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import get_settings
@@ -69,6 +70,7 @@ from app.schemas.bucket import (
 )
 
 router = APIRouter(prefix="/buckets", tags=["buckets"])
+logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -214,6 +216,7 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
                 selectinload(Bucket.files),
                 selectinload(Bucket.shares).selectinload(BucketShare.files),
                 selectinload(Bucket.notes),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
     ).scalar_one_or_none()
@@ -259,6 +262,7 @@ async def _load_share_or_404(db: AsyncSession, token: str) -> BucketShare:
             .options(
                 selectinload(BucketShare.files),
                 selectinload(BucketShare.bucket).selectinload(Bucket.notes),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
     ).scalar_one_or_none()
@@ -297,6 +301,36 @@ def _download_url(s3_key: str, *, disposition: str = "inline", ttl: int = 900) -
     )
 
 
+def _delete_s3_object(s3_key: str) -> str:
+    bucket, _, _ = _bucket_storage_config()
+    try:
+        _s3_client().delete_object(Bucket=bucket, Key=s3_key)
+    except Exception:  # noqa: BLE001
+        logger.exception("bucket file S3 delete failed key=%s", s3_key)
+        return "delete_failed"
+    return "deleted"
+
+
+async def _recalculate_requested_document_status(db: AsyncSession, requested_document_id: UUID | None) -> None:
+    if requested_document_id is None:
+        return
+    req = await db.get(BucketRequestedDocument, requested_document_id)
+    if req is None:
+        return
+    active_uploaded = (
+        await db.execute(
+            select(func.count())
+            .select_from(BucketFile)
+            .where(
+                BucketFile.requested_document_id == requested_document_id,
+                BucketFile.status == "uploaded",
+                BucketFile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    req.status = "uploaded" if active_uploaded else "requested"
+
+
 async def _file_annotations(db: AsyncSession, bucket_id: UUID, file_id: UUID) -> list[BucketFileAnnotation]:
     return (
         await db.execute(
@@ -309,7 +343,7 @@ async def _file_annotations(db: AsyncSession, bucket_id: UUID, file_id: UUID) ->
 
 def _file_belongs_to_share(share: BucketShare, file_id: UUID) -> BucketFile | None:
     for file in share.files:
-        if file.id == file_id and file.status == "uploaded":
+        if file.id == file_id and file.status == "uploaded" and file.deleted_at is None:
             return file
     return None
 
@@ -324,6 +358,7 @@ def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], 
 
 def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketShareRead:
     data = BucketShareRead.model_validate(share)
+    data.files = [file for file in data.files if file.status == "uploaded" and file.deleted_at is None]
     data.share_url = _public_url(f"/buckets/share/{share.token}")
     data.passcode = passcode
     return data
@@ -331,6 +366,7 @@ def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketSha
 
 def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     data = BucketDetail.model_validate(bucket)
+    data.files = [file for file in data.files if file.deleted_at is None]
     data.shares = [_share_read(share) for share in bucket.shares]
     return data
 
@@ -345,6 +381,7 @@ async def _uploaded_bucket_files(db: AsyncSession, bucket_id: UUID, file_ids: li
                 BucketFile.bucket_id == bucket_id,
                 BucketFile.id.in_(unique_ids),
                 BucketFile.status == "uploaded",
+                BucketFile.deleted_at.is_(None),
             )
         )
     ).scalars().all()
@@ -376,7 +413,10 @@ async def list_buckets(
         await db.execute(
             select(Bucket)
             .where(Bucket.archived_at.is_(None))
-            .options(selectinload(Bucket.files))
+            .options(
+                selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
             .order_by(Bucket.updated_at.desc())
         )
     ).scalars().all()
@@ -714,6 +754,7 @@ async def admin_upload_init(
                 BucketFile.size_bytes == payload.size_bytes,
                 requested_doc_condition,
                 BucketFile.status == "uploading",
+                BucketFile.deleted_at.is_(None),
             )
             .order_by(BucketFile.created_at.desc())
         )
@@ -728,6 +769,7 @@ async def admin_upload_init(
                     BucketFile.bucket_id == bucket_id,
                     BucketFile.requested_document_id == req.id,
                     BucketFile.status.in_(("uploading", "uploaded")),
+                    BucketFile.deleted_at.is_(None),
                 )
             )
         ).scalars().first()
@@ -776,7 +818,7 @@ async def admin_upload_complete(
 ) -> BucketFile:
     bucket = await _load_bucket_or_404(db, bucket_id)
     file = await db.get(BucketFile, payload.file_id)
-    if file is None or file.bucket_id != bucket_id or file.upload_link_id is not None:
+    if file is None or file.bucket_id != bucket_id or file.upload_link_id is not None or file.deleted_at is not None:
         await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")
         await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
@@ -820,6 +862,47 @@ async def admin_upload_complete(
     return file
 
 
+@router.delete("/admin/{bucket_id}/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_admin_file(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await _load_bucket_or_404(db, bucket_id)
+    file = (
+        await db.execute(
+            select(BucketFile)
+            .where(
+                BucketFile.id == file_id,
+                BucketFile.bucket_id == bucket_id,
+                BucketFile.deleted_at.is_(None),
+            )
+            .options(selectinload(BucketFile.shares))
+        )
+    ).scalar_one_or_none()
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+
+    file.deleted_at = _now()
+    file.deleted_by_user_id = user.id
+    file.delete_storage_status = _delete_s3_object(file.s3_key)
+    file.shares.clear()
+    await _recalculate_requested_document_status(db, file.requested_document_id)
+    await _log(
+        db,
+        bucket_id,
+        "file_deleted",
+        request=request,
+        user=user,
+        target_type="file",
+        target_id=str(file.id),
+        detail=f"{file.file_name} | storage={file.delete_storage_status}",
+    )
+    await db.commit()
+
+
 @router.get("/admin/{bucket_id}/files/{file_id}/url", response_model=BucketFileUrl)
 async def admin_file_url(
     bucket_id: UUID,
@@ -830,7 +913,7 @@ async def admin_file_url(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUrl:
     file = await db.get(BucketFile, file_id)
-    if file is None or file.bucket_id != bucket_id:
+    if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     disposition = "attachment" if download else "inline"
     await _log(db, bucket_id, "file_download_url_created" if download else "file_preview_url_created", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
@@ -847,7 +930,7 @@ async def admin_file_review(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileReviewRead:
     file = await db.get(BucketFile, file_id)
-    if file is None or file.bucket_id != bucket_id or file.status != "uploaded":
+    if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     annotations = await _file_annotations(db, bucket_id, file_id)
     await _log(db, bucket_id, "file_review_opened", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
@@ -865,7 +948,7 @@ async def create_admin_file_annotation(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileAnnotation:
     file = await db.get(BucketFile, file_id)
-    if file is None or file.bucket_id != bucket_id or file.status != "uploaded":
+    if file is None or file.bucket_id != bucket_id or file.status != "uploaded" or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     annotation = BucketFileAnnotation(
         bucket_id=bucket_id,
@@ -952,6 +1035,7 @@ async def request_upload_init(
         BucketFile.file_name == payload.file_name,
         BucketFile.size_bytes == payload.size_bytes,
         BucketFile.status.in_(("uploading", "uploaded")),
+        BucketFile.deleted_at.is_(None),
     ]
     if payload.requested_document_id:
         existing_conditions.append(BucketFile.requested_document_id == payload.requested_document_id)
@@ -974,6 +1058,7 @@ async def request_upload_init(
                     BucketFile.bucket_id == link.bucket_id,
                     BucketFile.requested_document_id == req.id,
                     BucketFile.status.in_(("uploading", "uploaded")),
+                    BucketFile.deleted_at.is_(None),
                 )
             )
         ).scalars().first()
@@ -1012,7 +1097,7 @@ async def request_upload_complete(
 ) -> BucketFile:
     link = await _load_upload_link_or_404(db, token)
     file = await db.get(BucketFile, payload.file_id)
-    if file is None or file.bucket_id != link.bucket_id or file.upload_link_id != link.id:
+    if file is None or file.bucket_id != link.bucket_id or file.upload_link_id != link.id or file.deleted_at is not None:
         await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="file", target_id=str(payload.file_id), detail="complete failed: file not found")
         await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
@@ -1064,6 +1149,8 @@ async def share_access(
     share.view_count += 1
     files = []
     for file in share.files:
+        if file.status != "uploaded" or file.deleted_at is not None:
+            continue
         item = BucketShareFileRead.model_validate(file)
         if share.can_preview:
             item.preview_url = _download_url(file.s3_key, disposition="inline")
@@ -1073,8 +1160,7 @@ async def share_access(
     notes = [n for n in share.bucket.notes if n.visibility == "shared" or share.can_see_internal_notes]
     await _log(db, share.bucket_id, "share_accessed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id))
     await db.commit()
-    share_out = BucketShareRead.model_validate(share)
-    share_out.share_url = _public_url(f"/buckets/share/{share.token}")
+    share_out = _share_read(share)
     return BucketShareAccessRead(
         bucket=BucketRead.model_validate(share.bucket),
         share=share_out,
