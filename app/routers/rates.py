@@ -24,7 +24,11 @@ class RateSKU(BaseModel):
     rate: float          # e.g. 7.500 (% as a number)
     points: float
     term: str            # e.g. "30 yr", "12 mo"
+    credit_tier: str = "Base"
     min_fico: int
+    max_fico: int | None = None
+    min_loan_amount: float = 0
+    max_loan_amount: float | None = None
     max_ltv: float       # 0..1
     delta_bps: int       # change vs yesterday
 
@@ -36,7 +40,11 @@ class RateSKUCreate(BaseModel):
     rate: float = Field(gt=0)
     points: float = Field(ge=0)
     term: str = Field(default="", max_length=32)
+    credit_tier: str = Field(default="Base", min_length=1, max_length=80)
     min_fico: int = Field(ge=300, le=850)
+    max_fico: int | None = Field(default=None, ge=300, le=850)
+    min_loan_amount: float = Field(default=0, ge=0)
+    max_loan_amount: float | None = Field(default=None, gt=0)
     max_ltv: float = Field(gt=0, le=1)
     delta_bps: int = 0
 
@@ -47,7 +55,11 @@ class RateSKUUpdate(BaseModel):
     rate: float | None = Field(default=None, gt=0)
     points: float | None = Field(default=None, ge=0)
     term: str | None = Field(default=None, max_length=32)
+    credit_tier: str | None = Field(default=None, min_length=1, max_length=80)
     min_fico: int | None = Field(default=None, ge=300, le=850)
+    max_fico: int | None = Field(default=None, ge=300, le=850)
+    min_loan_amount: float | None = Field(default=None, ge=0)
+    max_loan_amount: float | None = Field(default=None, gt=0)
     max_ltv: float | None = Field(default=None, gt=0, le=1)
     delta_bps: int | None = None
 
@@ -105,7 +117,11 @@ def _row_to_read(row: RateSheetEntry) -> RateSKU:
         rate=_rate_from_db(row.base_rate),
         points=float(row.points or 0),
         term=_term_from_months(row.term_months),
+        credit_tier=row.credit_tier or "Base",
         min_fico=int(row.min_fico or 680),
+        max_fico=int(row.max_fico) if row.max_fico is not None else None,
+        min_loan_amount=float(row.min_loan_amount or 0),
+        max_loan_amount=float(row.max_loan_amount) if row.max_loan_amount is not None else None,
         max_ltv=float(row.max_ltv or 0),
         delta_bps=int(row.delta_bps or 0),
     )
@@ -118,11 +134,32 @@ def _seed_row(rate: RateSKU) -> RateSheetEntry:
         label=rate.label,
         base_rate=_rate_to_db(rate.rate),
         points=rate.points,
+        credit_tier=rate.credit_tier,
         min_fico=rate.min_fico,
+        max_fico=rate.max_fico,
+        min_loan_amount=rate.min_loan_amount,
+        max_loan_amount=rate.max_loan_amount,
         delta_bps=rate.delta_bps,
         max_ltv=rate.max_ltv,
         term_months=_term_to_months(rate.term),
     )
+
+
+def _validate_bands(
+    *,
+    min_fico: int | None,
+    max_fico: int | None,
+    min_loan_amount: float | None,
+    max_loan_amount: float | None,
+) -> None:
+    if max_fico is not None and min_fico is not None and max_fico < min_fico:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Max FICO must be greater than or equal to Min FICO")
+    if (
+        max_loan_amount is not None
+        and min_loan_amount is not None
+        and max_loan_amount < min_loan_amount
+    ):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Max loan amount must be greater than or equal to Min loan amount")
 
 
 async def _ensure_rates_seeded(db: AsyncSession) -> None:
@@ -151,7 +188,12 @@ async def list_rates(
     await _ensure_rates_seeded(db)
     rows = (
         await db.execute(
-            select(RateSheetEntry).order_by(RateSheetEntry.loan_type.asc(), RateSheetEntry.sku.asc())
+            select(RateSheetEntry).order_by(
+                RateSheetEntry.loan_type.asc(),
+                RateSheetEntry.min_loan_amount.asc(),
+                RateSheetEntry.min_fico.asc(),
+                RateSheetEntry.sku.asc(),
+            )
         )
     ).scalars().all()
     return [_row_to_read(row) for row in rows]
@@ -174,13 +216,23 @@ async def create_rate(
     ).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Rate SKU already exists")
+    _validate_bands(
+        min_fico=payload.min_fico,
+        max_fico=payload.max_fico,
+        min_loan_amount=payload.min_loan_amount,
+        max_loan_amount=payload.max_loan_amount,
+    )
     row = RateSheetEntry(
         sku=sku,
         loan_type=payload.loan_type,
         label=payload.label.strip(),
         base_rate=_rate_to_db(payload.rate),
         points=payload.points,
+        credit_tier=payload.credit_tier.strip(),
         min_fico=payload.min_fico,
+        max_fico=payload.max_fico,
+        min_loan_amount=payload.min_loan_amount,
+        max_loan_amount=payload.max_loan_amount,
         delta_bps=payload.delta_bps,
         max_ltv=payload.max_ltv,
         term_months=_term_to_months(payload.term),
@@ -208,6 +260,16 @@ async def update_rate(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate SKU not found")
     data = payload.model_dump(exclude_unset=True)
+    next_min_fico = data.get("min_fico", row.min_fico)
+    next_max_fico = data.get("max_fico", row.max_fico)
+    next_min_amount = data.get("min_loan_amount", row.min_loan_amount)
+    next_max_amount = data.get("max_loan_amount", row.max_loan_amount)
+    _validate_bands(
+        min_fico=next_min_fico,
+        max_fico=next_max_fico,
+        min_loan_amount=float(next_min_amount or 0),
+        max_loan_amount=float(next_max_amount) if next_max_amount is not None else None,
+    )
     if "label" in data and data["label"] is not None:
         row.label = data["label"].strip()
     if "loan_type" in data and data["loan_type"] is not None:
@@ -218,8 +280,16 @@ async def update_rate(
         row.points = data["points"]
     if "term" in data and data["term"] is not None:
         row.term_months = _term_to_months(data["term"])
+    if "credit_tier" in data and data["credit_tier"] is not None:
+        row.credit_tier = data["credit_tier"].strip()
     if "min_fico" in data and data["min_fico"] is not None:
         row.min_fico = data["min_fico"]
+    if "max_fico" in data:
+        row.max_fico = data["max_fico"]
+    if "min_loan_amount" in data and data["min_loan_amount"] is not None:
+        row.min_loan_amount = data["min_loan_amount"]
+    if "max_loan_amount" in data:
+        row.max_loan_amount = data["max_loan_amount"]
     if "max_ltv" in data and data["max_ltv"] is not None:
         row.max_ltv = data["max_ltv"]
     if "delta_bps" in data and data["delta_bps"] is not None:
