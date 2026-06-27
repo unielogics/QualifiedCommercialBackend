@@ -20,6 +20,8 @@ class RateSheetEntry(TimestampMixin, Base):
     loan_type: Mapped[LoanType] = mapped_column(String(32), nullable=False)
     label: Mapped[str] = mapped_column(String(160), nullable=False)
     base_rate: Mapped[float] = mapped_column(Numeric(7, 6), nullable=False)
+    points: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0, server_default="0")
+    min_fico: Mapped[int] = mapped_column(Integer, nullable=False, default=680, server_default="680")
     delta_bps: Mapped[int] = mapped_column(Integer, default=0)
     max_ltv: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
     term_months: Mapped[int | None] = mapped_column(Integer, nullable=True)

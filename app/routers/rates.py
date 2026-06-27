@@ -1,17 +1,18 @@
-"""Rate sheet — exposes the operator-facing SKU list.
-
-Today the rate sheet is a curated set of synthetic SKUs. When market data
-ingestion lands (Pricing agent), this endpoint will read from a pricing
-table populated by the daily rate-sheet pull.
-"""
+"""Rate sheet — operator-facing SKU list with super-admin CRUD."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+import re
 
-from app.deps import GatedUser
-from app.enums import LoanType
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_db
+from app.deps import CurrentUser, GatedUser, require_role
+from app.enums import LoanType, Role
+from app.models.rate_sheet import RateSheetEntry
 
 router = APIRouter(prefix="/rates", tags=["rates"])
 
@@ -28,7 +29,30 @@ class RateSKU(BaseModel):
     delta_bps: int       # change vs yesterday
 
 
-# Synthetic rate sheet — replace with DB-backed table when pricing service ships.
+class RateSKUCreate(BaseModel):
+    id: str = Field(min_length=2, max_length=64)
+    label: str = Field(min_length=2, max_length=160)
+    loan_type: LoanType
+    rate: float = Field(gt=0)
+    points: float = Field(ge=0)
+    term: str = Field(default="", max_length=32)
+    min_fico: int = Field(ge=300, le=850)
+    max_ltv: float = Field(gt=0, le=1)
+    delta_bps: int = 0
+
+
+class RateSKUUpdate(BaseModel):
+    label: str | None = Field(default=None, min_length=2, max_length=160)
+    loan_type: LoanType | None = None
+    rate: float | None = Field(default=None, gt=0)
+    points: float | None = Field(default=None, ge=0)
+    term: str | None = Field(default=None, max_length=32)
+    min_fico: int | None = Field(default=None, ge=300, le=850)
+    max_ltv: float | None = Field(default=None, gt=0, le=1)
+    delta_bps: int | None = None
+
+
+# Seed defaults kept for credit-summary matching and first-run DB backfill.
 _RATES: list[RateSKU] = [
     RateSKU(id="R-DSCR-30Y-75",  label="DSCR 30Y · 75 LTV",  loan_type=LoanType.DSCR,         rate=7.500, points=1.5,  term="30 yr", min_fico=680, max_ltv=0.75, delta_bps=-8),
     RateSKU(id="R-DSCR-30Y-80",  label="DSCR 30Y · 80 LTV",  loan_type=LoanType.DSCR,         rate=7.625, points=1.25, term="30 yr", min_fico=700, max_ltv=0.80, delta_bps=-5),
@@ -41,9 +65,185 @@ _RATES: list[RateSKU] = [
 ]
 
 
+def _rate_to_db(rate: float) -> float:
+    """Store as decimal in DB while API/UI use percent values."""
+    return rate / 100 if rate > 1 else rate
+
+
+def _rate_from_db(rate: object) -> float:
+    value = float(rate or 0)
+    return value * 100 if value <= 1 else value
+
+
+def _term_to_months(term: str | None) -> int | None:
+    raw = (term or "").strip().lower()
+    if not raw:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)", raw)
+    if not match:
+        return None
+    value = float(match.group(1))
+    if "yr" in raw or "year" in raw:
+        return int(round(value * 12))
+    return int(round(value))
+
+
+def _term_from_months(months: int | None) -> str:
+    if not months:
+        return ""
+    if months % 12 == 0:
+        years = months // 12
+        return f"{years} yr"
+    return f"{months} mo"
+
+
+def _row_to_read(row: RateSheetEntry) -> RateSKU:
+    return RateSKU(
+        id=row.sku,
+        label=row.label,
+        loan_type=LoanType(row.loan_type),
+        rate=_rate_from_db(row.base_rate),
+        points=float(row.points or 0),
+        term=_term_from_months(row.term_months),
+        min_fico=int(row.min_fico or 680),
+        max_ltv=float(row.max_ltv or 0),
+        delta_bps=int(row.delta_bps or 0),
+    )
+
+
+def _seed_row(rate: RateSKU) -> RateSheetEntry:
+    return RateSheetEntry(
+        sku=rate.id,
+        loan_type=rate.loan_type,
+        label=rate.label,
+        base_rate=_rate_to_db(rate.rate),
+        points=rate.points,
+        min_fico=rate.min_fico,
+        delta_bps=rate.delta_bps,
+        max_ltv=rate.max_ltv,
+        term_months=_term_to_months(rate.term),
+    )
+
+
+async def _ensure_rates_seeded(db: AsyncSession) -> None:
+    rows = (await db.execute(select(RateSheetEntry))).scalars().all()
+    if rows and any(str(row.sku).startswith("R-") for row in rows):
+        return
+
+    # The old seed used short demo SKUs (FF-90, DSCR-80, ...). There was no
+    # admin editor before this endpoint, so replace that demo set with the
+    # current operating rate sheet the UI has been showing from code.
+    if rows:
+        await db.execute(delete(RateSheetEntry))
+    for rate in _RATES:
+        db.add(_seed_row(rate))
+    await db.flush()
+
+
 @router.get("", response_model=list[RateSKU])
-async def list_rates(_: GatedUser) -> list[RateSKU]:
+async def list_rates(
+    _: GatedUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[RateSKU]:
     """Authenticated. CLIENT role gated behind a valid soft credit pull —
     see deps.require_valid_credit_pull. Internal roles (broker, loan_exec,
     super_admin) bypass."""
-    return _RATES
+    await _ensure_rates_seeded(db)
+    rows = (
+        await db.execute(
+            select(RateSheetEntry).order_by(RateSheetEntry.loan_type.asc(), RateSheetEntry.sku.asc())
+        )
+    ).scalars().all()
+    return [_row_to_read(row) for row in rows]
+
+
+@router.post(
+    "",
+    response_model=RateSKU,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def create_rate(
+    payload: RateSKUCreate,
+    _: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RateSKU:
+    sku = payload.id.strip().upper()
+    existing = (
+        await db.execute(select(RateSheetEntry).where(RateSheetEntry.sku == sku))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Rate SKU already exists")
+    row = RateSheetEntry(
+        sku=sku,
+        loan_type=payload.loan_type,
+        label=payload.label.strip(),
+        base_rate=_rate_to_db(payload.rate),
+        points=payload.points,
+        min_fico=payload.min_fico,
+        delta_bps=payload.delta_bps,
+        max_ltv=payload.max_ltv,
+        term_months=_term_to_months(payload.term),
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+    return _row_to_read(row)
+
+
+@router.patch(
+    "/{sku}",
+    response_model=RateSKU,
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def update_rate(
+    sku: str,
+    payload: RateSKUUpdate,
+    _: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RateSKU:
+    row = (
+        await db.execute(select(RateSheetEntry).where(RateSheetEntry.sku == sku.upper()))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate SKU not found")
+    data = payload.model_dump(exclude_unset=True)
+    if "label" in data and data["label"] is not None:
+        row.label = data["label"].strip()
+    if "loan_type" in data and data["loan_type"] is not None:
+        row.loan_type = data["loan_type"]
+    if "rate" in data and data["rate"] is not None:
+        row.base_rate = _rate_to_db(data["rate"])
+    if "points" in data and data["points"] is not None:
+        row.points = data["points"]
+    if "term" in data and data["term"] is not None:
+        row.term_months = _term_to_months(data["term"])
+    if "min_fico" in data and data["min_fico"] is not None:
+        row.min_fico = data["min_fico"]
+    if "max_ltv" in data and data["max_ltv"] is not None:
+        row.max_ltv = data["max_ltv"]
+    if "delta_bps" in data and data["delta_bps"] is not None:
+        row.delta_bps = data["delta_bps"]
+    await db.flush()
+    await db.refresh(row)
+    return _row_to_read(row)
+
+
+@router.delete(
+    "/{sku}",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def delete_rate(
+    sku: str,
+    _: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    row = (
+        await db.execute(select(RateSheetEntry).where(RateSheetEntry.sku == sku.upper()))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate SKU not found")
+    await db.delete(row)
+    await db.flush()
+    return {"status": "deleted"}
