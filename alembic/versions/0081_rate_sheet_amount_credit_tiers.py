@@ -18,6 +18,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    op.alter_column(
+        "alembic_version",
+        "version_num",
+        existing_type=sa.String(length=32),
+        type_=sa.String(length=255),
+        existing_nullable=False,
+    )
     op.add_column("rate_sheet", sa.Column("max_fico", sa.Integer(), nullable=True))
     op.add_column(
         "rate_sheet",
