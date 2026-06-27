@@ -33,11 +33,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
-from app.models.broker import Broker
+from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
-from app.schemas.broker_settings import AgentBookingSettings, AgentSettingsData
 from app.schemas.fred import FredSeriesSummary
 from app.services import fred as fred_service
 
@@ -260,8 +259,29 @@ async def support_inquiry(
 
 
 # ---------------------------------------------------------------------------
-# Public broker booking page
+# Public booking page
 # ---------------------------------------------------------------------------
+
+
+def _booking_asset_get_url(s3_key: str | None) -> str | None:
+    if not s3_key:
+        return None
+    from app.config import get_settings as get_app_config
+
+    cfg = get_app_config()
+    if not cfg.s3_bucket:
+        return None
+    import boto3
+
+    try:
+        return boto3.client("s3", region_name=cfg.aws_region).generate_presigned_url(
+            "get_object",
+            Params={"Bucket": cfg.s3_bucket, "Key": s3_key},
+            ExpiresIn=3600,
+        )
+    except Exception:
+        log.exception("public-booking: failed to sign booking image key=%s", s3_key)
+        return None
 
 
 class PublicBookingSlot(BaseModel):
@@ -273,12 +293,16 @@ class PublicBookingSlot(BaseModel):
 class PublicBookingProfile(BaseModel):
     slug: str
     agent_name: str
+    host_name: str
+    host_role: str
     title: str
     intro: str
     primary_color: str
     background_color: str
     duration_min: int
     timezone: str
+    logo_url: str | None = None
+    profile_photo_url: str | None = None
     slots: list[PublicBookingSlot]
 
 
@@ -300,17 +324,22 @@ async def public_booking_profile(
     slug: str,
     db: AsyncSession = Depends(get_db),
 ) -> PublicBookingProfile:
-    broker, user, booking = await _load_public_booking(db, slug)
-    slots = await _available_booking_slots(db, broker, booking)
+    user, booking = await _load_public_booking(db, slug)
+    slots = await _available_booking_slots(db, user, booking)
+    host_name = user.name or "Qualified Commercial"
     return PublicBookingProfile(
         slug=booking.slug or slug,
-        agent_name=broker.display_name or user.name or "Qualified Commercial",
-        title=booking.title or f"Book a meeting with {broker.display_name or user.name or 'Qualified Commercial'}",
+        agent_name=host_name,
+        host_name=host_name,
+        host_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        title=booking.title or f"Book a meeting with {host_name}",
         intro=booking.intro or "Choose a time that works for you. You will receive a confirmation after booking.",
         primary_color=booking.primary_color,
         background_color=booking.background_color,
         duration_min=booking.duration_min,
         timezone=booking.timezone,
+        logo_url=_booking_asset_get_url(booking.logo_s3_key),
+        profile_photo_url=_booking_asset_get_url(booking.profile_photo_s3_key),
         slots=slots,
     )
 
@@ -335,9 +364,9 @@ async def public_booking_create(
         )
     _LAST_SUBMIT[ip] = now
 
-    broker, user, booking = await _load_public_booking(db, slug)
+    user, booking = await _load_public_booking(db, slug)
     starts_at = _to_utc_minute(payload.starts_at)
-    slots = await _available_booking_slots(db, broker, booking)
+    slots = await _available_booking_slots(db, user, booking)
     valid_slot = any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots)
     if not valid_slot:
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
@@ -360,7 +389,7 @@ async def public_booking_create(
         duration_min=booking.duration_min,
         status=CalendarEventStatus.PENDING,
         source=CalendarEventSource.AUTO,
-        owner_user_id=broker.user_id,
+        owner_user_id=user.id,
         external_ref_kind="public_booking",
         external_ref_id=str(uuid.uuid4()),
     )
@@ -373,11 +402,10 @@ async def public_booking_create(
             actor_id=None,
             actor_label="public",
             kind="calendar.public_booking",
-            summary=f"Public booking created for {broker.display_name}: {payload.full_name}",
+            summary=f"Public booking created for {user.name or user.email}: {payload.full_name}",
             payload={
                 "event_id": str(ev.id),
-                "broker_id": str(broker.id),
-                "broker_user_id": str(broker.user_id),
+                "host_user_id": str(user.id),
                 "invitee_name": payload.full_name,
                 "invitee_email": payload.email,
                 "starts_at": starts_at.isoformat(),
@@ -387,7 +415,7 @@ async def public_booking_create(
         )
     )
 
-    _notify_agent_of_booking(user, broker, payload, starts_at, booking)
+    _notify_host_of_booking(user, payload, starts_at, booking)
     await db.flush()
     return PublicBookingCreateResult(ok=True, event_id=str(ev.id))
 
@@ -395,30 +423,27 @@ async def public_booking_create(
 async def _load_public_booking(
     db: AsyncSession,
     slug: str,
-) -> tuple[Broker, User, AgentBookingSettings]:
-    rows = (
+) -> tuple[User, BookingSettings]:
+    row = (
         await db.execute(
-            select(Broker, User)
-            .join(User, Broker.user_id == User.id)
-            .where(User.deleted_at.is_(None))
+            select(User, BookingSettings)
+            .join(BookingSettings, BookingSettings.user_id == User.id)
+            .where(
+                User.deleted_at.is_(None),
+                BookingSettings.enabled.is_(True),
+                BookingSettings.slug == slug,
+            )
         )
-    ).all()
-    for broker, user in rows:
-        try:
-            data = AgentSettingsData.model_validate(broker.settings_data or {})
-        except Exception:
-            log.warning("public-booking: broker settings failed validation for %s", broker.id)
-            continue
-        booking = data.booking
-        if booking and booking.enabled and booking.slug == slug:
-            return broker, user, booking
+    ).first()
+    if row:
+        return row[0], row[1]
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Booking page not found.")
 
 
 async def _available_booking_slots(
     db: AsyncSession,
-    broker: Broker,
-    booking: AgentBookingSettings,
+    user: User,
+    booking: BookingSettings,
 ) -> list[PublicBookingSlot]:
     tz = _booking_tz(booking.timezone)
     now_local = datetime.now(tz)
@@ -428,7 +453,7 @@ async def _available_booking_slots(
         await db.execute(
             select(CalendarEvent)
             .where(
-                CalendarEvent.owner_user_id == broker.user_id,
+                CalendarEvent.owner_user_id == user.id,
                 CalendarEvent.status != CalendarEventStatus.CANCELLED,
                 CalendarEvent.starts_at >= now_local.astimezone(timezone.utc),
                 CalendarEvent.starts_at <= window_end_local.astimezone(timezone.utc),
@@ -516,12 +541,11 @@ def _to_utc_minute(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
-def _notify_agent_of_booking(
+def _notify_host_of_booking(
     user: User,
-    broker: Broker,
     payload: PublicBookingCreate,
     starts_at: datetime,
-    booking: AgentBookingSettings,
+    booking: BookingSettings,
 ) -> None:
     try:
         from app.services.email.gmail_client import gmail_config, send_message
@@ -531,8 +555,9 @@ def _notify_agent_of_booking(
             return
         tz = _booking_tz(booking.timezone)
         when = starts_at.astimezone(tz).strftime("%A, %B %d at %I:%M %p %Z")
+        host_name = user.name or user.email
         body = (
-            f"New booking for {broker.display_name}\n\n"
+            f"New booking for {host_name}\n\n"
             f"When: {when}\n"
             f"Duration: {booking.duration_min} minutes\n"
             f"Name: {payload.full_name}\n"
@@ -542,7 +567,7 @@ def _notify_agent_of_booking(
         )
         send_message(cfg, to=user.email, subject=f"New booked call — {payload.full_name}", body=body)
     except Exception:
-        log.exception("public-booking: agent notification failed")
+        log.exception("public-booking: host notification failed")
 
 
 # ---------------------------------------------------------------------------

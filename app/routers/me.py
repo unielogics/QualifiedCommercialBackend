@@ -12,6 +12,8 @@ page, not this one.
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 from datetime import datetime
 from typing import Literal
 
@@ -24,7 +26,14 @@ from app.config import get_settings as get_app_config
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
+from app.models.booking_settings import BookingSettings
 from app.models.broker import Broker
+from app.schemas.booking_settings import (
+    BookingAssetUploadInitRequest,
+    BookingAssetUploadInitResponse,
+    UserBookingSettingsRead,
+    UserBookingSettingsUpdate,
+)
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
 
 router = APIRouter(prefix="/me", tags=["me"])
@@ -35,6 +44,202 @@ async def _broker_for_user(db: AsyncSession, user_id) -> Broker | None:
     return (
         await db.execute(select(Broker).where(Broker.user_id == user_id))
     ).scalar_one_or_none()
+
+
+def _normalize_booking_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug[:64].strip("-")
+
+
+async def _unique_booking_slug(db: AsyncSession, seed: str, user_id) -> str:
+    base = _normalize_booking_slug(seed) or "booking"
+    candidate = base
+    suffix = 2
+    while True:
+        existing = (
+            await db.execute(
+                select(BookingSettings.id).where(
+                    BookingSettings.slug == candidate,
+                    BookingSettings.user_id != user_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            return candidate
+        trim = 64 - len(f"-{suffix}")
+        candidate = f"{base[:trim].rstrip('-')}-{suffix}"
+        suffix += 1
+
+
+async def _get_or_create_booking_settings(db: AsyncSession, user: CurrentUser) -> BookingSettings:
+    row = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == user.id))
+    ).scalar_one_or_none()
+    if row is not None:
+        return row
+    slug = await _unique_booking_slug(db, user.name or user.email or "booking", user.id)
+    row = BookingSettings(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        enabled=False,
+        slug=slug,
+        title=None,
+        intro=None,
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+    return row
+
+
+def _booking_asset_s3_key(user_id, asset: Literal["logo", "profile-photo"]) -> str:
+    filename = "logo.png" if asset == "logo" else "profile-photo.png"
+    return f"booking/{user_id}/{filename}"
+
+
+def _presigned_get_url(s3_key: str | None) -> str | None:
+    if not s3_key:
+        return None
+    cfg = get_app_config()
+    if not cfg.s3_bucket:
+        return None
+    import boto3
+
+    s3 = boto3.client("s3", region_name=cfg.aws_region)
+    try:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": cfg.s3_bucket, "Key": s3_key},
+            ExpiresIn=3600,
+        )
+    except Exception:
+        log.exception("booking-settings: failed to sign image key=%s", s3_key)
+        return None
+
+
+def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
+    return UserBookingSettingsRead(
+        id=str(row.id),
+        user_id=str(row.user_id),
+        enabled=row.enabled,
+        slug=row.slug,
+        title=row.title,
+        intro=row.intro,
+        primary_color=row.primary_color,
+        background_color=row.background_color,
+        duration_min=row.duration_min,
+        timezone=row.timezone,
+        available_days=row.available_days or [1, 2, 3, 4, 5],
+        start_time=row.start_time,
+        end_time=row.end_time,
+        logo_s3_key=row.logo_s3_key,
+        profile_photo_s3_key=row.profile_photo_s3_key,
+        logo_url=_presigned_get_url(row.logo_s3_key),
+        profile_photo_url=_presigned_get_url(row.profile_photo_s3_key),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get("/booking-settings", response_model=UserBookingSettingsRead)
+async def get_booking_settings(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UserBookingSettingsRead:
+    row = await _get_or_create_booking_settings(db, user)
+    await db.commit()
+    await db.refresh(row)
+    return _booking_settings_read(row)
+
+
+@router.put("/booking-settings", response_model=UserBookingSettingsRead)
+async def put_booking_settings(
+    payload: UserBookingSettingsUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UserBookingSettingsRead:
+    row = await _get_or_create_booking_settings(db, user)
+    if payload.enabled and not payload.slug:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "booking.slug is required when the booking page is enabled")
+    if payload.slug:
+        existing = (
+            await db.execute(
+                select(BookingSettings.id).where(
+                    BookingSettings.slug == payload.slug,
+                    BookingSettings.user_id != user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"booking slug {payload.slug!r} is already used")
+
+    row.enabled = payload.enabled
+    row.slug = payload.slug
+    row.title = payload.title
+    row.intro = payload.intro
+    row.primary_color = payload.primary_color
+    row.background_color = payload.background_color
+    row.duration_min = payload.duration_min
+    row.timezone = payload.timezone
+    row.available_days = payload.available_days
+    row.start_time = payload.start_time
+    row.end_time = payload.end_time
+    row.logo_s3_key = payload.logo_s3_key
+    row.profile_photo_s3_key = payload.profile_photo_s3_key
+
+    await db.commit()
+    await db.refresh(row)
+    return _booking_settings_read(row)
+
+
+async def _booking_asset_upload_init(
+    *,
+    payload: BookingAssetUploadInitRequest,
+    user: CurrentUser,
+    asset: Literal["logo", "profile-photo"],
+) -> BookingAssetUploadInitResponse:
+    s3_key = _booking_asset_s3_key(user.id, asset)
+    cfg = get_app_config()
+    if not cfg.s3_bucket:
+        return BookingAssetUploadInitResponse(s3_key=s3_key, upload_url=None)
+
+    import boto3
+
+    s3 = boto3.client("s3", region_name=cfg.aws_region)
+    try:
+        upload_url = s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": cfg.s3_bucket,
+                "Key": s3_key,
+                "ContentType": payload.content_type,
+                "ServerSideEncryption": "AES256",
+            },
+            ExpiresIn=300,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Could not mint booking image upload URL: {exc}",
+        ) from exc
+    return BookingAssetUploadInitResponse(s3_key=s3_key, upload_url=upload_url)
+
+
+@router.post("/booking-settings/logo/upload-init", response_model=BookingAssetUploadInitResponse)
+async def booking_logo_upload_init(
+    payload: BookingAssetUploadInitRequest,
+    user: CurrentUser,
+) -> BookingAssetUploadInitResponse:
+    return await _booking_asset_upload_init(payload=payload, user=user, asset="logo")
+
+
+@router.post("/booking-settings/profile-photo/upload-init", response_model=BookingAssetUploadInitResponse)
+async def booking_profile_photo_upload_init(
+    payload: BookingAssetUploadInitRequest,
+    user: CurrentUser,
+) -> BookingAssetUploadInitResponse:
+    return await _booking_asset_upload_init(payload=payload, user=user, asset="profile-photo")
 
 
 @router.get("/broker-settings", response_model=AgentSettingsRead)
