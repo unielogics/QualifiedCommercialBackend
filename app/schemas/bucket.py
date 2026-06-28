@@ -109,6 +109,11 @@ class BucketUploadLinkRead(ORMModel):
     passcode: str | None = None
 
 
+class BucketUploadLinkPasscodeResetRead(BaseModel):
+    upload_link: BucketUploadLinkRead
+    passcode: str
+
+
 class BucketRequestBucketRead(BaseModel):
     name: str
     client_name: str | None = None

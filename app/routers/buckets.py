@@ -79,6 +79,7 @@ from app.schemas.bucket import (
     BucketTemplateRead,
     BucketUploadComplete,
     BucketUploadLinkCreate,
+    BucketUploadLinkPasscodeResetRead,
     BucketUploadLinkRead,
 )
 from app.services.bucket_ai import (
@@ -385,11 +386,18 @@ def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketSha
     return data
 
 
+def _upload_link_read(link: BucketUploadLink, *, passcode: str | None = None) -> BucketUploadLinkRead:
+    data = BucketUploadLinkRead.model_validate(link)
+    data.upload_url = _public_url(f"/buckets/request/{link.token}")
+    data.passcode = passcode
+    return data
+
+
 def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     data = BucketDetail.model_validate(bucket)
     data.files = [file for file in data.files if file.deleted_at is None]
     data.upload_links = [
-        link for link in data.upload_links
+        _upload_link_read(link) for link in bucket.upload_links
         if link.status == "active" and (link.expires_at is None or link.expires_at > _now())
     ]
     data.shares = [_share_read(share) for share in bucket.shares]
@@ -837,10 +845,7 @@ async def create_upload_link(
     await _log(db, bucket_id, "upload_link_created", request=request, user=user, target_type="upload_link", target_id=str(link.id), detail=link.recipient_name)
     await db.commit()
     await db.refresh(link)
-    data = BucketUploadLinkRead.model_validate(link)
-    data.upload_url = _public_url(f"/buckets/request/{link.token}")
-    data.passcode = passcode
-    return data
+    return _upload_link_read(link, passcode=passcode)
 
 
 @router.post("/admin/{bucket_id}/shares", response_model=BucketShareRead)
@@ -940,6 +945,34 @@ async def regenerate_share_passcode(
     await db.commit()
     await db.refresh(share)
     return BucketSharePasscodeResetRead(share=_share_read(share, passcode=passcode), passcode=passcode)
+
+
+@router.post("/admin/{bucket_id}/upload-links/{link_id}/regenerate-passcode", response_model=BucketUploadLinkPasscodeResetRead)
+async def regenerate_upload_link_passcode(
+    bucket_id: UUID,
+    link_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketUploadLinkPasscodeResetRead:
+    link = await db.get(BucketUploadLink, link_id)
+    if link is None or link.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload link not found")
+    passcode = _generate_passcode()
+    link.passcode_hash = _hash_passcode(passcode)
+    await _log(
+        db,
+        bucket_id,
+        "upload_link_passcode_regenerated",
+        request=request,
+        user=user,
+        target_type="upload_link",
+        target_id=str(link.id),
+        detail=link.recipient_name,
+    )
+    await db.commit()
+    await db.refresh(link)
+    return BucketUploadLinkPasscodeResetRead(upload_link=_upload_link_read(link, passcode=passcode), passcode=passcode)
 
 
 @router.post("/admin/{bucket_id}/notes", response_model=BucketNoteRead)
