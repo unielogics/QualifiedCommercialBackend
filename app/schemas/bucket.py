@@ -132,6 +132,20 @@ class BucketRequestAccessRequest(BaseModel):
     passcode: str = Field(min_length=1, max_length=80)
 
 
+class BucketRequestUploadedFileRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    requested_document_id: UUID | None
+    file_name: str
+    content_type: str
+    size_bytes: int
+    uploaded_by_name: str | None
+    uploaded_by_email: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class BucketRequestAccessRead(BaseModel):
     bucket: BucketRequestBucketRead
     recipient_name: str
@@ -140,6 +154,8 @@ class BucketRequestAccessRead(BaseModel):
     can_use_ai_chat: bool = True
     can_view_ai_tasks: bool = True
     requested_documents: list[BucketRequestedDocumentRead]
+    files: list[BucketRequestUploadedFileRead] = []
+    ai_summary: dict | None = None
 
 
 class BucketFileUploadInit(BaseModel):

@@ -64,6 +64,7 @@ from app.schemas.bucket import (
     BucketRequestAccessRequest,
     BucketRequestBucketRead,
     BucketRequestInfoRead,
+    BucketRequestUploadedFileRead,
     BucketRequestedDocumentCreate,
     BucketRequestedDocumentRead,
     BucketShareAccessRead,
@@ -87,6 +88,7 @@ from app.services.bucket_ai import (
     latest_review,
     log_bucket_ai_activity,
     share_visible_summary,
+    upload_link_visible_summary,
     visible_action_items,
 )
 
@@ -272,7 +274,11 @@ async def _load_upload_link_or_404(db: AsyncSession, token: str) -> BucketUpload
         await db.execute(
             select(BucketUploadLink)
             .where(BucketUploadLink.token == token)
-            .options(selectinload(BucketUploadLink.bucket).selectinload(Bucket.requested_documents))
+            .options(
+                selectinload(BucketUploadLink.bucket).selectinload(Bucket.requested_documents),
+                selectinload(BucketUploadLink.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
         )
     ).scalar_one_or_none()
     if link is None or not _is_active(link.status, link.expires_at):
@@ -689,11 +695,11 @@ async def create_ai_action_item(
         if share is None or share.bucket_id != bucket_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected share does not belong to this bucket")
     if payload.route == "uploader":
-        if payload.upload_link_id is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select an uploader for this task")
-        link = await db.get(BucketUploadLink, payload.upload_link_id)
-        if link is None or link.bucket_id != bucket_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected uploader does not belong to this bucket")
+        if payload.upload_link_id is not None:
+            link = await db.get(BucketUploadLink, payload.upload_link_id)
+            if link is None or link.bucket_id != bucket_id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected uploader does not belong to this bucket")
+        payload.share_id = None
     if payload.route == "admin":
         payload.upload_link_id = None
         payload.share_id = None
@@ -1281,6 +1287,12 @@ async def request_link_access(
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     await _log(db, link.bucket_id, "upload_link_accessed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    files = sorted(
+        (file for file in link.bucket.files if file.status == "uploaded" and file.deleted_at is None),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
+    review = await latest_review(db, link.bucket_id)
     await db.commit()
     return BucketRequestAccessRead(
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
@@ -1290,6 +1302,8 @@ async def request_link_access(
         can_use_ai_chat=link.can_use_ai_chat,
         can_view_ai_tasks=link.can_view_ai_tasks,
         requested_documents=[BucketRequestedDocumentRead.model_validate(d) for d in link.bucket.requested_documents],
+        files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
+        ai_summary=upload_link_visible_summary(review, link.bucket),
     )
 
 

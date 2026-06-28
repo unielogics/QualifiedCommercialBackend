@@ -10,7 +10,7 @@ from uuid import UUID
 
 import boto3
 from pypdf import PdfReader
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,6 +21,7 @@ from app.models.bucket import (
     BucketAIActionItem,
     BucketAIMessage,
     BucketAIReview,
+    BucketDocumentTemplate,
     BucketFile,
     BucketNote,
     BucketRequestedDocument,
@@ -69,6 +70,8 @@ Rules:
 - External users cannot update saved bucket instructions directly.
 - If an external user asks for something actionable, create proposed_action_items for super-admin approval.
 - For admin users, proposed_context_patch may include deal_type, documentation_level, collateral_type, loan_purpose, underwriting_focus, or custom_instructions when the admin asks to update instructions.
+- For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for shared-reviewer tasks, and "admin" for internal Qualified Commercial tasks.
+- When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
 - Keep answers concise and operational.
 """
 
@@ -327,6 +330,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         review.result = result
         review.status = "completed"
         review.completed_at = _now()
+        await _create_review_recommendation_actions(db, bucket=bucket, review=review, result=result)
         await log_bucket_ai_activity(db, bucket.id, "ai_review_completed", target_type="ai_review", target_id=str(review.id), detail=bucket.name)
     except Exception as exc:  # noqa: BLE001
         log.exception("bucket_ai: review failed review=%s", review.id)
@@ -375,6 +379,54 @@ def share_visible_summary(review: BucketAIReview | None, share: BucketShare) -> 
     return {
         "summary": f"{len(visible_names)} shared file{'' if len(visible_names) == 1 else 's'} available for review.",
         "per_file_summaries": per_file,
+        "missing_or_incomplete_items": _visible_review_items(review.result.get("missing_or_incomplete_items") or [], visible_names),
+        "discrepancies": _visible_review_items(review.result.get("discrepancies") or [], visible_names),
+        "blocked_files": _visible_review_items(review.result.get("blocked_files") or [], visible_names),
+    }
+
+
+def _visible_review_items(items: Any, visible_names: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    visible: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_files = item.get("files")
+        named_files = {str(value) for value in raw_files} if isinstance(raw_files, list) else set()
+        file_name = str(item.get("file_name") or "")
+        if named_files and not named_files.intersection(visible_names):
+            continue
+        if file_name and file_name not in visible_names:
+            continue
+        visible.append(item)
+    return visible
+
+
+def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -> dict[str, Any] | None:
+    if review is None or not isinstance(review.result, dict):
+        return None
+    active_files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    active_names = {file.file_name for file in active_files}
+    active_ids = {str(file.id) for file in active_files}
+    result = review.result
+    per_file = [
+        item for item in result.get("per_file_summaries", []) or []
+        if isinstance(item, dict)
+        and (str(item.get("file_id") or "") in active_ids or str(item.get("file_name") or "") in active_names)
+    ]
+    available = [
+        item for item in result.get("available_documents", []) or []
+        if isinstance(item, dict) and (not item.get("file_name") or str(item.get("file_name")) in active_names)
+    ]
+    return {
+        "summary": result.get("executive_summary") or result.get("summary") or f"{len(active_files)} uploaded file{'' if len(active_files) == 1 else 's'} available.",
+        "available_documents": available,
+        "missing_or_incomplete_items": result.get("missing_or_incomplete_items") or [],
+        "proof_of_funds_financial_collateral_gaps": result.get("proof_of_funds_financial_collateral_gaps") or [],
+        "per_file_summaries": per_file,
+        "blocked_files": result.get("blocked_files") or [],
+        "skipped_files": result.get("skipped_files") or [],
     }
 
 
@@ -393,7 +445,14 @@ async def visible_action_items(
     if route:
         stmt = stmt.where(BucketAIActionItem.route == route)
     if upload_link_id:
-        stmt = stmt.where(BucketAIActionItem.upload_link_id == upload_link_id)
+        stmt = stmt.where(
+            or_(
+                BucketAIActionItem.upload_link_id == upload_link_id,
+                BucketAIActionItem.upload_link_id.is_(None),
+            )
+            if route == "uploader"
+            else BucketAIActionItem.upload_link_id == upload_link_id
+        )
     if share_id:
         stmt = stmt.where(BucketAIActionItem.share_id == share_id)
     return (await db.execute(stmt.order_by(BucketAIActionItem.created_at.desc()))).scalars().all()
@@ -455,7 +514,7 @@ async def create_chat_reply(
         )
         db.add(assistant)
         await db.flush()
-        proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share)
+        proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, user=user)
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_message_created", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=message[:180])
         return [user_row, assistant], proposals
     except Exception as exc:  # noqa: BLE001
@@ -495,22 +554,35 @@ async def _chat_context(
     if audience == "admin":
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id)
+        templates = (
+            await db.execute(
+                select(BucketDocumentTemplate)
+                .where(BucketDocumentTemplate.is_active.is_(True))
+                .order_by(BucketDocumentTemplate.category, BucketDocumentTemplate.name)
+                .limit(250)
+            )
+        ).scalars().all()
         return {
             **base,
             "ai_context": bucket.ai_context or {},
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
+            "document_template_library": [_template_context(template) for template in templates],
             "files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
             "notes": [_note_context(note) for note in bucket.notes],
             "latest_review": review.result if review else None,
             "action_items": [_task_context(task) for task in tasks],
+            "instructions": "When the admin asks for tasks or document requests, use the template library where it fits. If no template matches, create a custom action item with route uploader/admin/share.",
         }
     if upload_link is not None:
+        review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
         return {
             **base,
             "recipient_name": upload_link.recipient_name,
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
-            "instructions": "Help the uploader understand what is still needed and how to submit files. Do not discuss admin notes or shares.",
+            "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
+            "visible_summary": upload_link_visible_summary(review, bucket),
+            "instructions": "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. Do not discuss admin notes or shares. External users cannot change saved AI instructions.",
             "approved_tasks": [_task_context(task) for task in tasks],
         }
     if share is not None:
@@ -538,11 +610,13 @@ async def _create_proposals(
     audience: str,
     upload_link: BucketUploadLink | None,
     share: BucketShare | None,
+    user: User | None = None,
 ) -> list[BucketAIActionItem]:
     raw_items = parsed.get("proposed_action_items")
     if not isinstance(raw_items, list):
         return []
     created: list[BucketAIActionItem] = []
+    auto_approve = audience == "admin"
     for raw in raw_items[:5]:
         if not isinstance(raw, dict):
             continue
@@ -553,23 +627,100 @@ async def _create_proposals(
         route = str(raw.get("route") or ("share" if share else "uploader" if upload_link else "admin")).strip()
         if route not in {"admin", "uploader", "share"}:
             route = "admin"
+        if route == "share" and share is None and audience == "admin":
+            route = "admin"
+        approved_at = _now() if auto_approve else None
         item = BucketAIActionItem(
             bucket_id=bucket.id,
             source_message_id=source_message.id,
             upload_link_id=upload_link.id if route == "uploader" and upload_link else None,
             share_id=share.id if route == "share" and share else None,
-            status="proposed",
+            status="approved" if auto_approve else "proposed",
             route=route,
             title=title[:220],
             instructions=instructions,
             rationale=str(raw.get("rationale") or "")[:2000] or None,
             created_by="ai",
+            created_by_user_id=user.id if user else None,
+            approved_by_user_id=user.id if approved_at and user else None,
+            approved_at=approved_at,
         )
         db.add(item)
         created.append(item)
     if created:
         await db.flush()
-        await log_bucket_ai_activity(db, bucket.id, "ai_action_proposed", actor_name="Bucket AI", actor_role=audience, target_type="ai_action_item", detail=f"{len(created)} proposed")
+        await log_bucket_ai_activity(
+            db,
+            bucket.id,
+            "ai_action_created" if auto_approve else "ai_action_proposed",
+            user=user if auto_approve else None,
+            actor_name="Bucket AI" if not auto_approve else None,
+            actor_role=audience,
+            target_type="ai_action_item",
+            detail=f"{len(created)} {'created' if auto_approve else 'proposed'}",
+        )
+    return created
+
+
+async def _create_review_recommendation_actions(
+    db: AsyncSession,
+    *,
+    bucket: Bucket,
+    review: BucketAIReview,
+    result: dict[str, Any],
+) -> list[BucketAIActionItem]:
+    raw_items = result.get("recommended_next_document_requests")
+    if not isinstance(raw_items, list):
+        return []
+    existing_titles = {
+        title.lower()
+        for title in (
+            await db.execute(
+                select(BucketAIActionItem.title).where(
+                    BucketAIActionItem.bucket_id == bucket.id,
+                    BucketAIActionItem.status.in_(("proposed", "approved")),
+                )
+            )
+        ).scalars().all()
+    }
+    created: list[BucketAIActionItem] = []
+    for raw in raw_items[:8]:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()
+        instructions = str(raw.get("instructions") or raw.get("detail") or "").strip()
+        if not title or not instructions or title.lower() in existing_titles:
+            continue
+        route = str(raw.get("route") or "admin").strip()
+        if route not in {"admin", "uploader", "share"}:
+            route = "admin"
+        if route == "share":
+            route = "admin"
+        item = BucketAIActionItem(
+            bucket_id=bucket.id,
+            source_message_id=None,
+            status="proposed",
+            route=route,
+            title=title[:220],
+            instructions=instructions,
+            rationale=str(raw.get("rationale") or "Recommended by the latest AI underwriting review.")[:2000],
+            created_by="ai",
+        )
+        db.add(item)
+        created.append(item)
+        existing_titles.add(title.lower())
+    if created:
+        await db.flush()
+        await log_bucket_ai_activity(
+            db,
+            bucket.id,
+            "ai_action_proposed",
+            actor_name="Bucket AI",
+            actor_role="system",
+            target_type="ai_review",
+            target_id=str(review.id),
+            detail=f"{len(created)} review recommendations",
+        )
     return created
 
 
@@ -593,6 +744,17 @@ def _file_context(file: BucketFile) -> dict[str, Any]:
         "size_bytes": file.size_bytes,
         "requested_document_id": str(file.requested_document_id) if file.requested_document_id else None,
         "uploaded_by_name": file.uploaded_by_name,
+    }
+
+
+def _template_context(template: BucketDocumentTemplate) -> dict[str, Any]:
+    return {
+        "id": str(template.id),
+        "name": template.name,
+        "category": template.category,
+        "description": template.description,
+        "required": template.required,
+        "allow_multiple_files": template.allow_multiple_files,
     }
 
 
