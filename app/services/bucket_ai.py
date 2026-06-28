@@ -358,10 +358,20 @@ async def drain_bucket_ai_reviews(db: AsyncSession, *, limit: int = 3) -> int:
 
 
 async def latest_review(db: AsyncSession, bucket_id: UUID) -> BucketAIReview | None:
-    return (
+    completed = (
         await db.execute(
             select(BucketAIReview)
             .where(BucketAIReview.bucket_id == bucket_id, BucketAIReview.status == "completed")
+            .order_by(BucketAIReview.completed_at.desc().nulls_last(), BucketAIReview.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if completed is not None:
+        return completed
+    return (
+        await db.execute(
+            select(BucketAIReview)
+            .where(BucketAIReview.bucket_id == bucket_id, BucketAIReview.result.is_not(None))
             .order_by(BucketAIReview.completed_at.desc().nulls_last(), BucketAIReview.created_at.desc())
             .limit(1)
         )
@@ -404,11 +414,42 @@ def _visible_review_items(items: Any, visible_names: set[str]) -> list[dict[str,
 
 
 def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -> dict[str, Any] | None:
-    if review is None or not isinstance(review.result, dict):
-        return None
     active_files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
     active_names = {file.file_name for file in active_files}
     active_ids = {str(file.id) for file in active_files}
+    if review is None or not isinstance(review.result, dict):
+        missing_docs = [
+            {
+                "title": doc.name,
+                "detail": doc.description or "This requested document has not been marked received yet.",
+                "priority": "high" if doc.required else "medium",
+                "category": doc.category,
+            }
+            for doc in bucket.requested_documents
+            if doc.status != "uploaded"
+        ]
+        return {
+            "summary": "Qualified Commercial has prepared this file room. AI analysis uses the super-admin bucket inputs, uploaded files, and any completed underwriting review.",
+            "review_status": review.status if review else "not_started",
+            "review_error": review.error if review else None,
+            "ai_context": bucket.ai_context or {},
+            "available_documents": [
+                {
+                    "file_id": str(file.id),
+                    "file_name": file.file_name,
+                    "document_type": file.content_type,
+                    "summary": f"Uploaded by {file.uploaded_by_name or file.uploaded_by_email or 'Qualified Commercial'}.",
+                }
+                for file in active_files
+            ],
+            "missing_or_incomplete_items": missing_docs,
+            "discrepancies": [],
+            "underwriter_questions": [],
+            "proof_of_funds_financial_collateral_gaps": [],
+            "per_file_summaries": [],
+            "blocked_files": [],
+            "skipped_files": [],
+        }
     result = review.result
     per_file = [
         item for item in result.get("per_file_summaries", []) or []
