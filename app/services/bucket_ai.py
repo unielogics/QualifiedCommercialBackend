@@ -421,8 +421,12 @@ def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -
     ]
     return {
         "summary": result.get("executive_summary") or result.get("summary") or f"{len(active_files)} uploaded file{'' if len(active_files) == 1 else 's'} available.",
+        "ai_context": bucket.ai_context or {},
+        "review_completed_at": review.completed_at.isoformat() if review.completed_at else None,
         "available_documents": available,
         "missing_or_incomplete_items": result.get("missing_or_incomplete_items") or [],
+        "discrepancies": result.get("discrepancies") or [],
+        "underwriter_questions": result.get("underwriter_questions") or [],
         "proof_of_funds_financial_collateral_gaps": result.get("proof_of_funds_financial_collateral_gaps") or [],
         "per_file_summaries": per_file,
         "blocked_files": result.get("blocked_files") or [],
