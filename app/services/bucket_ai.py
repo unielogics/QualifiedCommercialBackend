@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from io import BytesIO
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 import boto3
+from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -141,6 +143,26 @@ def _content_block(media_type: str, raw: bytes) -> dict[str, Any]:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
 
 
+def _blocked_pdf_reason(raw: bytes) -> str | None:
+    try:
+        reader = PdfReader(BytesIO(raw), strict=False)
+        return "password_protected" if reader.is_encrypted else None
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc).lower()
+        if "encrypt" in message or "password" in message:
+            return "password_protected"
+        return None
+
+
+def _skip_file(file: BucketFile, reason: str, explanation: str) -> dict[str, str]:
+    return {
+        "file_id": str(file.id),
+        "file_name": file.file_name,
+        "reason": reason,
+        "explanation": explanation,
+    }
+
+
 async def log_bucket_ai_activity(
     db: AsyncSession,
     bucket_id: UUID,
@@ -240,20 +262,32 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
 
     attached = 0
     skipped: list[dict[str, str]] = []
+    blocked_files: list[dict[str, str]] = []
     for file in files:
         if attached >= MAX_REVIEW_ATTACHMENTS:
-            skipped.append({"file_name": file.file_name, "reason": "attachment limit"})
+            skipped.append(_skip_file(file, "attachment_limit", "The AI review reached the attachment limit, so this file was reviewed by metadata only."))
             continue
         fetched = _fetch_file(file)
         if fetched is None:
-            skipped.append({"file_name": file.file_name, "reason": "could not fetch file"})
+            skipped.append(_skip_file(file, "fetch_failed", "The system could not retrieve this file from storage for AI review."))
             continue
         raw, content_type = fetched
         if len(raw) > MAX_FILE_BYTES:
-            skipped.append({"file_name": file.file_name, "reason": "file too large for AI review"})
+            skipped.append(_skip_file(file, "too_large", "The file is larger than the current AI review limit and was reviewed by metadata only."))
             continue
         media = _media_type(content_type, file.file_name)
         if media:
+            if media == "application/pdf":
+                blocked_reason = _blocked_pdf_reason(raw)
+                if blocked_reason == "password_protected":
+                    blocked = _skip_file(
+                        file,
+                        "password_protected",
+                        "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+                    )
+                    blocked_files.append(blocked)
+                    skipped.append(blocked)
+                    continue
             content.append({"type": "text", "text": f"File {file.id}: {file.file_name}"})
             content.append(_content_block(media, raw))
             attached += 1
@@ -264,10 +298,12 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             content.append({"type": "text", "text": f"File {file.id}: {file.file_name}\n\n{snippet}"})
             attached += 1
             continue
-        skipped.append({"file_name": file.file_name, "reason": "unsupported content type; metadata only"})
+        skipped.append(_skip_file(file, "unsupported_content_type", "This file type is not directly attached to the AI model yet and was reviewed by metadata only."))
 
     if skipped:
         content.append({"type": "text", "text": "Files not attached to model: " + json.dumps(skipped)})
+    if blocked_files:
+        content.append({"type": "text", "text": "Files requiring action before AI can read them: " + json.dumps(blocked_files)})
 
     try:
         model = model_heavy()
@@ -283,7 +319,12 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         )
         review.provider = "bedrock"
         review.model = getattr(resp, "model", None) or model
-        review.result = _json_or_fallback(_text_from_response(resp), "executive_summary")
+        result = _json_or_fallback(_text_from_response(resp), "executive_summary")
+        if blocked_files:
+            result["blocked_files"] = blocked_files
+        if skipped:
+            result["skipped_files"] = skipped
+        review.result = result
         review.status = "completed"
         review.completed_at = _now()
         await log_bucket_ai_activity(db, bucket.id, "ai_review_completed", target_type="ai_review", target_id=str(review.id), detail=bucket.name)
