@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, func
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -33,6 +33,7 @@ class Bucket(TimestampMixin, Base):
     client_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
     purpose: Mapped[str | None] = mapped_column(String(255), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="collecting_documents")
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -49,6 +50,9 @@ class Bucket(TimestampMixin, Base):
     shares: Mapped[list[BucketShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     notes: Mapped[list[BucketNote]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     activity: Mapped[list[BucketActivityLog]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    ai_reviews: Mapped[list[BucketAIReview]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    ai_messages: Mapped[list[BucketAIMessage]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    ai_action_items: Mapped[list[BucketAIActionItem]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
 
 
 class BucketDocumentTemplate(TimestampMixin, Base):
@@ -99,6 +103,8 @@ class BucketUploadLink(TimestampMixin, Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     allow_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     allow_multiple_sessions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_use_ai_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_view_ai_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     passcode_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -185,6 +191,10 @@ class BucketShare(TimestampMixin, Base):
     can_add_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     can_upload: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     can_see_internal_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    can_use_ai_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_view_ai_summary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_view_ai_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_propose_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -240,3 +250,110 @@ class BucketActivityLog(Base):
 
     bucket: Mapped[Bucket] = relationship(back_populates="activity")
     actor_user: Mapped[User | None] = relationship(foreign_keys=[actor_user_id])
+
+
+class BucketAIReview(Base):
+    __tablename__ = "bucket_ai_reviews"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued", server_default="queued")
+    context_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    file_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    bucket: Mapped[Bucket] = relationship(back_populates="ai_reviews")
+    requested_by: Mapped[User | None] = relationship(foreign_keys=[requested_by_user_id])
+
+
+class BucketAIMessage(Base):
+    __tablename__ = "bucket_ai_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    upload_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_upload_links.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    share_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    audience: Mapped[str] = mapped_column(String(24), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    author_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_context_patch: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    bucket: Mapped[Bucket] = relationship(back_populates="ai_messages")
+    upload_link: Mapped[BucketUploadLink | None] = relationship()
+    share: Mapped[BucketShare | None] = relationship()
+    user: Mapped[User | None] = relationship(foreign_keys=[user_id])
+
+
+class BucketAIActionItem(Base):
+    __tablename__ = "bucket_ai_action_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_ai_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    upload_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_upload_links.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    share_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    requested_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_requested_documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="proposed", server_default="proposed")
+    route: Mapped[str] = mapped_column(String(24), nullable=False, default="admin", server_default="admin")
+    title: Mapped[str] = mapped_column(String(220), nullable=False)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(24), nullable=False, default="ai", server_default="ai")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    bucket: Mapped[Bucket] = relationship(back_populates="ai_action_items")
+    source_message: Mapped[BucketAIMessage | None] = relationship()
+    upload_link: Mapped[BucketUploadLink | None] = relationship()
+    share: Mapped[BucketShare | None] = relationship()
+    file: Mapped[BucketFile | None] = relationship()
+    requested_document: Mapped[BucketRequestedDocument | None] = relationship()
+    created_by_user: Mapped[User | None] = relationship(foreign_keys=[created_by_user_id])
+    approved_by_user: Mapped[User | None] = relationship(foreign_keys=[approved_by_user_id])

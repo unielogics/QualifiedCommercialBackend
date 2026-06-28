@@ -35,6 +35,9 @@ from app.models.broker import Broker  # noqa: F401
 from app.models.bucket import (  # noqa: F401
     Bucket,
     BucketActivityLog,
+    BucketAIActionItem,
+    BucketAIMessage,
+    BucketAIReview,
     BucketDocumentTemplate,
     BucketFile,
     BucketFileAnnotation,

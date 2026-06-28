@@ -23,6 +23,9 @@ from app.enums import Role
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
+    BucketAIActionItem,
+    BucketAIMessage,
+    BucketAIReview,
     BucketDocumentTemplate,
     BucketFile,
     BucketFileAnnotation,
@@ -35,6 +38,15 @@ from app.models.user import User
 from app.schemas.bucket import (
     BucketActivityPage,
     BucketActivityRead,
+    BucketAIActionItemPatch,
+    BucketAIActionItemRead,
+    BucketAIChatMessageCreate,
+    BucketAIChatResponse,
+    BucketAIContextPatch,
+    BucketAIMessageRead,
+    BucketAIReviewCreate,
+    BucketAIReviewRead,
+    BucketAISummaryRead,
     BucketCreate,
     BucketDetail,
     BucketFileRead,
@@ -67,6 +79,13 @@ from app.schemas.bucket import (
     BucketUploadComplete,
     BucketUploadLinkCreate,
     BucketUploadLinkRead,
+)
+from app.services.bucket_ai import (
+    create_chat_reply,
+    latest_review,
+    log_bucket_ai_activity,
+    share_visible_summary,
+    visible_action_items,
 )
 
 router = APIRouter(prefix="/buckets", tags=["buckets"])
@@ -508,6 +527,161 @@ async def list_bucket_activity(
     )
 
 
+@router.get("/admin/{bucket_id}/ai-reviews", response_model=list[BucketAIReviewRead])
+async def list_ai_reviews(
+    bucket_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIReview]:
+    await _load_bucket_or_404(db, bucket_id)
+    return (
+        await db.execute(
+            select(BucketAIReview)
+            .where(BucketAIReview.bucket_id == bucket_id)
+            .order_by(BucketAIReview.created_at.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+
+
+@router.post("/admin/{bucket_id}/ai-reviews", response_model=BucketAIReviewRead)
+async def queue_ai_review(
+    bucket_id: UUID,
+    payload: BucketAIReviewCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIReview:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    context_patch = payload.context.model_dump(exclude_none=True) if payload.context else {}
+    if context_patch:
+        bucket.ai_context = {**(bucket.ai_context or {}), **context_patch}
+    active_files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    review = BucketAIReview(
+        bucket_id=bucket_id,
+        requested_by_user_id=user.id,
+        status="queued",
+        context_snapshot=bucket.ai_context or {},
+        file_ids=[str(file.id) for file in active_files],
+        provider="bedrock",
+    )
+    db.add(review)
+    await db.flush()
+    await _log(db, bucket_id, "ai_review_queued", request=request, user=user, target_type="ai_review", target_id=str(review.id), detail=f"{len(active_files)} files")
+    await db.commit()
+    await db.refresh(review)
+    return review
+
+
+@router.get("/admin/{bucket_id}/ai-reviews/{review_id}", response_model=BucketAIReviewRead)
+async def get_ai_review(
+    bucket_id: UUID,
+    review_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIReview:
+    review = await db.get(BucketAIReview, review_id)
+    if review is None or review.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI review not found")
+    return review
+
+
+@router.get("/admin/{bucket_id}/ai-chat", response_model=list[BucketAIMessageRead])
+async def list_admin_ai_chat(
+    bucket_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIMessage]:
+    await _load_bucket_or_404(db, bucket_id)
+    return (
+        await db.execute(
+            select(BucketAIMessage)
+            .where(BucketAIMessage.bucket_id == bucket_id, BucketAIMessage.audience == "admin")
+            .order_by(BucketAIMessage.created_at.asc())
+            .limit(100)
+        )
+    ).scalars().all()
+
+
+@router.post("/admin/{bucket_id}/ai-chat", response_model=BucketAIChatResponse)
+async def admin_ai_chat(
+    bucket_id: UUID,
+    payload: BucketAIChatMessageCreate,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIChatResponse:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    messages, proposals = await create_chat_reply(
+        db,
+        bucket=bucket,
+        audience="admin",
+        message=payload.message,
+        actor_name=user.name or user.email,
+        user=user,
+    )
+    await db.commit()
+    return BucketAIChatResponse(
+        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        proposed_action_items=[BucketAIActionItemRead.model_validate(item) for item in proposals],
+    )
+
+
+@router.post("/admin/{bucket_id}/ai-context/apply", response_model=BucketDetail)
+async def apply_ai_context(
+    bucket_id: UUID,
+    payload: BucketAIContextPatch,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketDetail:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    patch = payload.model_dump(exclude_none=True)
+    bucket.ai_context = {**(bucket.ai_context or {}), **patch}
+    await _log(db, bucket_id, "ai_context_updated", request=request, user=user, target_type="bucket", target_id=str(bucket_id), detail=", ".join(patch.keys()))
+    await db.commit()
+    await db.refresh(bucket)
+    return _bucket_detail_read(bucket)
+
+
+@router.get("/admin/{bucket_id}/ai-action-items", response_model=list[BucketAIActionItemRead])
+async def list_ai_action_items(
+    bucket_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    await _load_bucket_or_404(db, bucket_id)
+    return await visible_action_items(db, bucket_id)
+
+
+@router.patch("/admin/{bucket_id}/ai-action-items/{item_id}", response_model=BucketAIActionItemRead)
+async def patch_ai_action_item(
+    bucket_id: UUID,
+    item_id: UUID,
+    payload: BucketAIActionItemPatch,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIActionItem:
+    item = await db.get(BucketAIActionItem, item_id)
+    if item is None or item.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI action item not found")
+    changes: list[str] = []
+    for field in payload.model_fields_set:
+        value = getattr(payload, field)
+        setattr(item, field, value)
+        changes.append(field)
+    if "status" in payload.model_fields_set:
+        if item.status == "approved" and item.approved_at is None:
+            item.approved_at = _now()
+            item.approved_by_user_id = user.id
+        if item.status == "completed" and item.completed_at is None:
+            item.completed_at = _now()
+    await _log(db, bucket_id, f"ai_action_{item.status}", request=request, user=user, target_type="ai_action_item", target_id=str(item.id), detail=", ".join(changes) or item.title)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
 @router.delete("/admin/{bucket_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_bucket(
     bucket_id: UUID,
@@ -589,6 +763,8 @@ async def create_upload_link(
         expires_at=payload.expires_at,
         allow_notes=payload.allow_notes,
         allow_multiple_sessions=payload.allow_multiple_sessions,
+        can_use_ai_chat=payload.can_use_ai_chat,
+        can_view_ai_tasks=payload.can_view_ai_tasks,
         passcode_hash=_hash_passcode(passcode),
     )
     db.add(link)
@@ -624,6 +800,10 @@ async def create_share(
         can_add_notes=payload.can_add_notes,
         can_upload=payload.can_upload,
         can_see_internal_notes=payload.can_see_internal_notes,
+        can_use_ai_chat=payload.can_use_ai_chat,
+        can_view_ai_summary=payload.can_view_ai_summary,
+        can_view_ai_tasks=payload.can_view_ai_tasks,
+        can_propose_tasks=payload.can_propose_tasks,
         expires_at=payload.expires_at,
     )
     share.files = files
@@ -1003,6 +1183,8 @@ async def request_link_access(
         recipient_name=link.recipient_name,
         recipient_email=link.recipient_email,
         allow_notes=link.allow_notes,
+        can_use_ai_chat=link.can_use_ai_chat,
+        can_view_ai_tasks=link.can_view_ai_tasks,
         requested_documents=[BucketRequestedDocumentRead.model_validate(d) for d in link.bucket.requested_documents],
     )
 
@@ -1134,6 +1316,53 @@ async def request_upload_complete(
     return file
 
 
+@router.get("/request/{token}/ai-tasks", response_model=list[BucketAIActionItemRead])
+async def request_ai_tasks(
+    token: str,
+    request: Request,
+    passcode: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    link = await _load_upload_link_or_404(db, token)
+    if not link.can_view_ai_tasks:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI tasks are disabled for this upload link")
+    if not _verify_passcode(passcode, link.passcode_hash):
+        await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail="ai tasks")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    return await visible_action_items(db, link.bucket_id, route="uploader", upload_link_id=link.id, approved_only=True)
+
+
+@router.post("/request/{token}/ai-chat", response_model=BucketAIChatResponse)
+async def request_ai_chat(
+    token: str,
+    payload: BucketAIChatMessageCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIChatResponse:
+    link = await _load_upload_link_or_404(db, token)
+    if not link.can_use_ai_chat:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI chat is disabled for this upload link")
+    if not _verify_passcode(payload.passcode or "", link.passcode_hash):
+        await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail="ai chat")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    bucket = await _load_bucket_or_404(db, link.bucket_id)
+    messages, proposals = await create_chat_reply(
+        db,
+        bucket=bucket,
+        audience="uploader",
+        message=payload.message,
+        actor_name=link.recipient_name,
+        upload_link=link,
+    )
+    await db.commit()
+    return BucketAIChatResponse(
+        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        proposed_action_items=[BucketAIActionItemRead.model_validate(item) for item in proposals],
+    )
+
+
 @router.post("/share/{token}/access", response_model=BucketShareAccessRead)
 async def share_access(
     token: str,
@@ -1159,6 +1388,8 @@ async def share_access(
             item.download_url = _download_url(file.s3_key, disposition="attachment")
         files.append(item)
     notes = [n for n in share.bucket.notes if n.visibility == "shared" or share.can_see_internal_notes]
+    review = await latest_review(db, share.bucket_id)
+    tasks = await visible_action_items(db, share.bucket_id, route="share", share_id=share.id, approved_only=True) if share.can_view_ai_tasks else []
     await _log(db, share.bucket_id, "share_accessed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id))
     await db.commit()
     share_out = _share_read(share)
@@ -1167,6 +1398,8 @@ async def share_access(
         share=share_out,
         files=files,
         notes=[BucketNoteRead.model_validate(n) for n in notes],
+        ai_summary=share_visible_summary(review, share) if share.can_view_ai_summary else None,
+        ai_tasks=[BucketAIActionItemRead.model_validate(item) for item in tasks],
     )
 
 
@@ -1179,6 +1412,77 @@ async def share_info(token: str, db: AsyncSession = Depends(get_db)) -> BucketSh
         recipient_email=share.recipient_email,
         can_download=share.can_download,
         can_add_notes=share.can_add_notes,
+        can_use_ai_chat=share.can_use_ai_chat,
+        can_view_ai_summary=share.can_view_ai_summary,
+        can_view_ai_tasks=share.can_view_ai_tasks,
+        can_propose_tasks=share.can_propose_tasks,
+    )
+
+
+@router.get("/share/{token}/ai-summary", response_model=BucketAISummaryRead)
+async def share_ai_summary(
+    token: str,
+    request: Request,
+    passcode: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAISummaryRead:
+    share = await _load_share_or_404(db, token)
+    if not share.can_view_ai_summary:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI summary is disabled for this share")
+    if not _verify_passcode(passcode, share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id), detail="ai summary")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
+    return BucketAISummaryRead(summary=share_visible_summary(await latest_review(db, share.bucket_id), share))
+
+
+@router.get("/share/{token}/ai-tasks", response_model=list[BucketAIActionItemRead])
+async def share_ai_tasks(
+    token: str,
+    request: Request,
+    passcode: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    share = await _load_share_or_404(db, token)
+    if not share.can_view_ai_tasks:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI tasks are disabled for this share")
+    if not _verify_passcode(passcode, share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id), detail="ai tasks")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
+    return await visible_action_items(db, share.bucket_id, route="share", share_id=share.id, approved_only=True)
+
+
+@router.post("/share/{token}/ai-chat", response_model=BucketAIChatResponse)
+async def share_ai_chat(
+    token: str,
+    payload: BucketAIChatMessageCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIChatResponse:
+    share = await _load_share_or_404(db, token)
+    if not share.can_use_ai_chat:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI chat is disabled for this share")
+    if not _verify_passcode(payload.passcode or "", share.passcode_hash):
+        await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id), detail="ai chat")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
+    messages, proposals = await create_chat_reply(
+        db,
+        bucket=share.bucket,
+        audience="shared_user",
+        message=payload.message,
+        actor_name=share.recipient_name,
+        share=share,
+    )
+    if not share.can_propose_tasks:
+        for item in proposals:
+            await db.delete(item)
+        proposals = []
+    await db.commit()
+    return BucketAIChatResponse(
+        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        proposed_action_items=[BucketAIActionItemRead.model_validate(item) for item in proposals],
     )
 
 

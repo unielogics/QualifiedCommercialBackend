@@ -158,6 +158,16 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    scheduler.add_job(
+        _wrap(job_bucket_ai_review_drain),
+        "interval",
+        minutes=1,
+        id="bucket_ai_review_drain",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Cadence engine (Phase 5, alembic 0032). Every 30 min walks
     # ai_cadence_rules + spawns draft messages / tasks / escalations.
     # Draft-first by default — auto-send is opt-in per rule.
@@ -450,6 +460,21 @@ async def job_document_scan_drain() -> None:
                 log.exception("document_scan_drain: scan failed for %s", doc_id)
                 await db.rollback()
             await asyncio.sleep(0)
+
+
+async def job_bucket_ai_review_drain() -> None:
+    """Run manually queued bucket AI reviews outside the request path."""
+    from app.db import SessionLocal
+    from app.services.bucket_ai import drain_bucket_ai_reviews
+
+    async with SessionLocal() as db:
+        try:
+            count = await drain_bucket_ai_reviews(db, limit=3)
+            if count:
+                log.info("bucket_ai_review_drain: processed=%d", count)
+        except Exception:
+            await db.rollback()
+            log.exception("bucket_ai_review_drain: failed; rolled back")
 
 
 async def job_lender_inbound_poll() -> None:

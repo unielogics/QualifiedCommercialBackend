@@ -66,6 +66,7 @@ class BucketRead(ORMModel):
 
 
 class BucketDetail(BucketRead):
+    ai_context: dict | None = None
     requested_documents: list[BucketRequestedDocumentRead] = []
     files: list[BucketFileRead] = []
     shares: list[BucketShareRead] = []
@@ -79,6 +80,8 @@ class BucketUploadLinkCreate(BaseModel):
     expires_at: datetime | None = None
     allow_notes: bool = True
     allow_multiple_sessions: bool = True
+    can_use_ai_chat: bool = True
+    can_view_ai_tasks: bool = True
     passcode: str | None = Field(default=None, max_length=80)
 
     @field_validator("recipient_email", mode="before")
@@ -96,6 +99,8 @@ class BucketUploadLinkRead(ORMModel):
     expires_at: datetime | None
     allow_notes: bool
     allow_multiple_sessions: bool
+    can_use_ai_chat: bool
+    can_view_ai_tasks: bool
     status: str
     completed_at: datetime | None
     created_at: datetime
@@ -126,6 +131,8 @@ class BucketRequestAccessRead(BaseModel):
     recipient_name: str
     recipient_email: str | None
     allow_notes: bool
+    can_use_ai_chat: bool = True
+    can_view_ai_tasks: bool = True
     requested_documents: list[BucketRequestedDocumentRead]
 
 
@@ -223,6 +230,10 @@ class BucketShareCreate(BaseModel):
     can_add_notes: bool = True
     can_upload: bool = False
     can_see_internal_notes: bool = False
+    can_use_ai_chat: bool = True
+    can_view_ai_summary: bool = True
+    can_view_ai_tasks: bool = True
+    can_propose_tasks: bool = True
     expires_at: datetime | None = None
 
     @field_validator("recipient_email", mode="before")
@@ -242,6 +253,10 @@ class BucketShareRead(ORMModel):
     can_add_notes: bool
     can_upload: bool
     can_see_internal_notes: bool
+    can_use_ai_chat: bool
+    can_view_ai_summary: bool
+    can_view_ai_tasks: bool
+    can_propose_tasks: bool
     status: str
     expires_at: datetime | None
     last_accessed_at: datetime | None
@@ -257,6 +272,10 @@ class BucketSharePatch(BaseModel):
     can_download: bool | None = None
     can_add_notes: bool | None = None
     can_upload: bool | None = None
+    can_use_ai_chat: bool | None = None
+    can_view_ai_summary: bool | None = None
+    can_view_ai_tasks: bool | None = None
+    can_propose_tasks: bool | None = None
     expires_at: datetime | None = None
     file_ids: list[UUID] | None = None
     status: str | None = None
@@ -277,6 +296,10 @@ class BucketShareInfoRead(BaseModel):
     recipient_email: str | None
     can_download: bool
     can_add_notes: bool
+    can_use_ai_chat: bool = True
+    can_view_ai_summary: bool = True
+    can_view_ai_tasks: bool = True
+    can_propose_tasks: bool = True
 
 
 class BucketShareFileRead(BucketFileRead):
@@ -289,6 +312,8 @@ class BucketShareAccessRead(BaseModel):
     share: BucketShareRead
     files: list[BucketShareFileRead]
     notes: list[BucketNoteRead]
+    ai_summary: dict | None = None
+    ai_tasks: list[BucketAIActionItemRead] = []
 
 
 class BucketNoteCreate(BaseModel):
@@ -338,3 +363,98 @@ class BucketActivityPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class BucketAIContextPatch(BaseModel):
+    deal_type: str | None = Field(default=None, max_length=160)
+    documentation_level: str | None = Field(default=None, max_length=120)
+    collateral_type: str | None = Field(default=None, max_length=160)
+    loan_purpose: str | None = Field(default=None, max_length=180)
+    underwriting_focus: str | None = Field(default=None, max_length=1200)
+    custom_instructions: str | None = Field(default=None, max_length=2500)
+
+
+class BucketAIReviewCreate(BaseModel):
+    context: BucketAIContextPatch | None = None
+
+
+class BucketAIReviewRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    requested_by_user_id: UUID | None
+    status: str
+    context_snapshot: dict | None
+    file_ids: list | None
+    provider: str | None
+    model: str | None
+    result: dict | None
+    error: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BucketAIChatMessageCreate(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    passcode: str | None = Field(default=None, max_length=80)
+
+
+class BucketAIMessageRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    upload_link_id: UUID | None
+    share_id: UUID | None
+    user_id: UUID | None
+    audience: str
+    role: str
+    author_name: str | None
+    content: str
+    proposed_context_patch: dict | None
+    metadata_json: dict | None
+    provider: str | None
+    model: str | None
+    created_at: datetime
+
+
+class BucketAIChatResponse(BaseModel):
+    messages: list[BucketAIMessageRead]
+    proposed_action_items: list[BucketAIActionItemRead] = []
+
+
+class BucketAIActionItemRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    source_message_id: UUID | None
+    upload_link_id: UUID | None
+    share_id: UUID | None
+    file_id: UUID | None
+    requested_document_id: UUID | None
+    status: str
+    route: str
+    title: str
+    instructions: str
+    rationale: str | None
+    created_by: str
+    created_by_user_id: UUID | None
+    approved_by_user_id: UUID | None
+    approved_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BucketAIActionItemPatch(BaseModel):
+    status: str | None = Field(default=None, pattern="^(proposed|approved|rejected|completed)$")
+    route: str | None = Field(default=None, pattern="^(admin|uploader|share)$")
+    upload_link_id: UUID | None = None
+    share_id: UUID | None = None
+    file_id: UUID | None = None
+    requested_document_id: UUID | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=220)
+    instructions: str | None = Field(default=None, min_length=1)
+    rationale: str | None = None
+
+
+class BucketAISummaryRead(BaseModel):
+    summary: dict | None = None
