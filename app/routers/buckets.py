@@ -100,7 +100,13 @@ def _now() -> datetime:
 
 def _public_url(path: str) -> str:
     settings = get_settings()
-    base = getattr(settings, "frontend_app_url", "https://app.qualifiedcommercial.com").rstrip("/")
+    base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
+    if settings.app_env.lower() == "production" and (
+        not base or "localhost" in base or "127.0.0.1" in base or base.startswith("http://")
+    ):
+        base = "https://app.qualifiedcommercial.com"
+    if not base:
+        base = "https://app.qualifiedcommercial.com"
     return f"{base}{path}"
 
 
