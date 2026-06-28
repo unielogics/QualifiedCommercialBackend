@@ -69,6 +69,7 @@ class BucketDetail(BucketRead):
     ai_context: dict | None = None
     requested_documents: list[BucketRequestedDocumentRead] = []
     files: list[BucketFileRead] = []
+    upload_links: list[BucketUploadLinkRead] = []
     shares: list[BucketShareRead] = []
     notes: list[BucketNoteRead] = []
     activity: list[BucketActivityRead] = []
@@ -442,6 +443,18 @@ class BucketAIActionItemRead(ORMModel):
     completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class BucketAIActionItemCreate(BaseModel):
+    status: str = Field(default="approved", pattern="^(proposed|approved|rejected|completed)$")
+    route: str = Field(default="admin", pattern="^(admin|uploader|share)$")
+    upload_link_id: UUID | None = None
+    share_id: UUID | None = None
+    file_id: UUID | None = None
+    requested_document_id: UUID | None = None
+    title: str = Field(min_length=1, max_length=220)
+    instructions: str = Field(min_length=1)
+    rationale: str | None = None
 
 
 class BucketAIActionItemPatch(BaseModel):

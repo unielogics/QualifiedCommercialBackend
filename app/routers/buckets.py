@@ -38,6 +38,7 @@ from app.models.user import User
 from app.schemas.bucket import (
     BucketActivityPage,
     BucketActivityRead,
+    BucketAIActionItemCreate,
     BucketAIActionItemPatch,
     BucketAIActionItemRead,
     BucketAIChatMessageCreate,
@@ -233,6 +234,7 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
             .options(
                 selectinload(Bucket.requested_documents),
                 selectinload(Bucket.files),
+                selectinload(Bucket.upload_links),
                 selectinload(Bucket.shares).selectinload(BucketShare.files),
                 selectinload(Bucket.notes),
                 with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
@@ -386,6 +388,10 @@ def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketSha
 def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     data = BucketDetail.model_validate(bucket)
     data.files = [file for file in data.files if file.deleted_at is None]
+    data.upload_links = [
+        link for link in data.upload_links
+        if link.status == "active" and (link.expires_at is None or link.expires_at > _now())
+    ]
     data.shares = [_share_read(share) for share in bucket.shares]
     return data
 
@@ -651,6 +657,65 @@ async def list_ai_action_items(
 ) -> list[BucketAIActionItem]:
     await _load_bucket_or_404(db, bucket_id)
     return await visible_action_items(db, bucket_id)
+
+
+@router.post("/admin/{bucket_id}/ai-action-items", response_model=BucketAIActionItemRead)
+async def create_ai_action_item(
+    bucket_id: UUID,
+    payload: BucketAIActionItemCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIActionItem:
+    await _load_bucket_or_404(db, bucket_id)
+    if payload.route == "share":
+        if payload.share_id is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a share recipient for this task")
+        share = await db.get(BucketShare, payload.share_id)
+        if share is None or share.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected share does not belong to this bucket")
+    if payload.route == "uploader":
+        if payload.upload_link_id is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select an uploader for this task")
+        link = await db.get(BucketUploadLink, payload.upload_link_id)
+        if link is None or link.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected uploader does not belong to this bucket")
+    if payload.route == "admin":
+        payload.upload_link_id = None
+        payload.share_id = None
+
+    approved_at = _now() if payload.status in ("approved", "completed") else None
+    item = BucketAIActionItem(
+        bucket_id=bucket_id,
+        status=payload.status,
+        route=payload.route,
+        upload_link_id=payload.upload_link_id,
+        share_id=payload.share_id,
+        file_id=payload.file_id,
+        requested_document_id=payload.requested_document_id,
+        title=payload.title.strip(),
+        instructions=payload.instructions.strip(),
+        rationale=payload.rationale,
+        created_by="admin",
+        created_by_user_id=user.id,
+        approved_by_user_id=user.id if approved_at else None,
+        approved_at=approved_at,
+        completed_at=_now() if payload.status == "completed" else None,
+    )
+    db.add(item)
+    await _log(
+        db,
+        bucket_id,
+        "ai_action_created",
+        request=request,
+        user=user,
+        target_type="ai_action_item",
+        target_id=str(item.id),
+        detail=f"{item.route}: {item.title}",
+    )
+    await db.commit()
+    await db.refresh(item)
+    return item
 
 
 @router.patch("/admin/{bucket_id}/ai-action-items/{item_id}", response_model=BucketAIActionItemRead)
