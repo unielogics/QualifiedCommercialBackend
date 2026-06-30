@@ -147,31 +147,43 @@ def _content_block(media_type: str, raw: bytes) -> dict[str, Any]:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
 
 
-def _pdf_skip_reason(raw: bytes) -> tuple[str, str] | None:
+def _pdf_review_metadata(raw: bytes) -> tuple[int | None, tuple[str, str] | None]:
     try:
         reader = PdfReader(BytesIO(raw), strict=False)
         if reader.is_encrypted:
             return (
-                "password_protected",
-                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+                None,
+                (
+                    "password_protected",
+                    "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+                ),
             )
         page_count = len(reader.pages)
         if page_count > MAX_PDF_PAGES:
             return (
-                "too_many_pdf_pages",
-                f"This PDF has {page_count} pages. Bedrock accepts PDFs up to {MAX_PDF_PAGES} pages, so this file was reviewed by metadata only.",
+                page_count,
+                (
+                    "too_many_pdf_pages",
+                    f"This PDF has {page_count} pages. Bedrock accepts PDFs up to {MAX_PDF_PAGES} pages, so this file was reviewed by metadata only.",
+                ),
             )
-        return None
+        return page_count, None
     except Exception as exc:  # noqa: BLE001
         message = str(exc).lower()
         if "encrypt" in message or "password" in message:
             return (
-                "password_protected",
-                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+                None,
+                (
+                    "password_protected",
+                    "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+                ),
             )
         return (
-            "pdf_parse_failed",
-            "The system could not inspect this PDF safely before AI review, so it was reviewed by metadata only.",
+            None,
+            (
+                "pdf_parse_failed",
+                "The system could not inspect this PDF safely before AI review, so it was reviewed by metadata only.",
+            ),
         )
 
 
@@ -282,6 +294,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     ]
 
     attached = 0
+    attached_pdf_pages = 0
     skipped: list[dict[str, str]] = []
     blocked_files: list[dict[str, str]] = []
     for file in files:
@@ -299,7 +312,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         media = _media_type(content_type, file.file_name)
         if media:
             if media == "application/pdf":
-                pdf_skip = _pdf_skip_reason(raw)
+                page_count, pdf_skip = _pdf_review_metadata(raw)
                 if pdf_skip:
                     reason, explanation = pdf_skip
                     skipped_file = _skip_file(file, reason, explanation)
@@ -307,6 +320,16 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
                         blocked_files.append(skipped_file)
                     skipped.append(skipped_file)
                     continue
+                if page_count is not None and attached_pdf_pages + page_count > MAX_PDF_PAGES:
+                    skipped.append(
+                        _skip_file(
+                            file,
+                            "pdf_page_budget_exceeded",
+                            f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only.",
+                        )
+                    )
+                    continue
+                attached_pdf_pages += page_count or 0
             content.append({"type": "text", "text": f"File {file.id}: {file.file_name}"})
             content.append(_content_block(media, raw))
             attached += 1
