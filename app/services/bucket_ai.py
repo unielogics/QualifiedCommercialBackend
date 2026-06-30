@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
+MAX_PDF_PAGES = 100
 
 REVIEW_SYSTEM = """You are a senior commercial lending underwriter reviewing a secure document bucket.
 
@@ -146,15 +147,32 @@ def _content_block(media_type: str, raw: bytes) -> dict[str, Any]:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
 
 
-def _blocked_pdf_reason(raw: bytes) -> str | None:
+def _pdf_skip_reason(raw: bytes) -> tuple[str, str] | None:
     try:
         reader = PdfReader(BytesIO(raw), strict=False)
-        return "password_protected" if reader.is_encrypted else None
+        if reader.is_encrypted:
+            return (
+                "password_protected",
+                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+            )
+        page_count = len(reader.pages)
+        if page_count > MAX_PDF_PAGES:
+            return (
+                "too_many_pdf_pages",
+                f"This PDF has {page_count} pages. Bedrock accepts PDFs up to {MAX_PDF_PAGES} pages, so this file was reviewed by metadata only.",
+            )
+        return None
     except Exception as exc:  # noqa: BLE001
         message = str(exc).lower()
         if "encrypt" in message or "password" in message:
-            return "password_protected"
-        return None
+            return (
+                "password_protected",
+                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+            )
+        return (
+            "pdf_parse_failed",
+            "The system could not inspect this PDF safely before AI review, so it was reviewed by metadata only.",
+        )
 
 
 def _skip_file(file: BucketFile, reason: str, explanation: str) -> dict[str, str]:
@@ -281,15 +299,13 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         media = _media_type(content_type, file.file_name)
         if media:
             if media == "application/pdf":
-                blocked_reason = _blocked_pdf_reason(raw)
-                if blocked_reason == "password_protected":
-                    blocked = _skip_file(
-                        file,
-                        "password_protected",
-                        "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
-                    )
-                    blocked_files.append(blocked)
-                    skipped.append(blocked)
+                pdf_skip = _pdf_skip_reason(raw)
+                if pdf_skip:
+                    reason, explanation = pdf_skip
+                    skipped_file = _skip_file(file, reason, explanation)
+                    if reason == "password_protected":
+                        blocked_files.append(skipped_file)
+                    skipped.append(skipped_file)
                     continue
             content.append({"type": "text", "text": f"File {file.id}: {file.file_name}"})
             content.append(_content_block(media, raw))
