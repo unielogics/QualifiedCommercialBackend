@@ -53,6 +53,7 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 }
 
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
+Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 12 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; per_file_summaries <= 20 items; recommended_next_document_requests <= 12 items. Keep each item detail/summary under 260 characters. Prioritize critical underwriting issues over exhaustive document recaps.
 """
 
 CHAT_SYSTEM = """You are the Bucket AI assistant for a secure Qualified Commercial document room.
