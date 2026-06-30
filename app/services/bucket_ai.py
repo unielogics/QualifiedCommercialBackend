@@ -48,12 +48,12 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
   "discrepancies": [{"title": "...", "detail": "...", "files": ["..."]}],
   "underwriter_questions": [{"question": "...", "route": "admin|uploader|share", "reason": "..."}],
   "proof_of_funds_financial_collateral_gaps": [{"title": "...", "detail": "..."}],
-  "per_file_summaries": [{"file_id": "...", "file_name": "...", "summary": "...", "red_flags": ["..."]}],
-  "recommended_next_document_requests": [{"title": "...", "instructions": "...", "route": "admin|uploader|share", "rationale": "..."}]
+  "recommended_next_document_requests": [{"title": "...", "instructions": "...", "route": "admin|uploader|share", "rationale": "..."}],
+  "per_file_summaries": [{"file_id": "...", "file_name": "...", "summary": "...", "red_flags": ["..."]}]
 }
 
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
-Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 12 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; per_file_summaries <= 20 items; recommended_next_document_requests <= 12 items. Keep each item detail/summary under 260 characters. Prioritize critical underwriting issues over exhaustive document recaps.
+Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items. Keep each item detail/summary under 220 characters. Never list every file. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and requested next actions over exhaustive document recaps.
 """
 
 CHAT_SYSTEM = """You are the Bucket AI assistant for a secure Qualified Commercial document room.
@@ -97,12 +97,37 @@ def _strip_code_fence(text: str) -> str:
     return cleaned.strip()
 
 
+def _without_optional_json_tail(text: str) -> str | None:
+    cleaned = _strip_code_fence(text)
+    if not cleaned.startswith("{"):
+        return None
+    optional_tail_keys = ("per_file_summaries", "available_documents")
+    for key in optional_tail_keys:
+        idx = cleaned.find(f'"{key}"')
+        if idx <= 0:
+            continue
+        prefix = cleaned[:idx].rstrip()
+        if prefix.endswith(":"):
+            continue
+        prefix = prefix.rstrip(", \n\r\t")
+        if not prefix.endswith("{"):
+            return prefix + "\n}"
+    return None
+
+
 def _json_or_fallback(text: str, fallback_key: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(_strip_code_fence(text))
-        return parsed if isinstance(parsed, dict) else {fallback_key: text}
-    except json.JSONDecodeError:
-        return {fallback_key: text}
+    cleaned = _strip_code_fence(text)
+    candidates = [cleaned]
+    salvaged = _without_optional_json_tail(cleaned)
+    if salvaged:
+        candidates.append(salvaged)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else {fallback_key: text}
+        except json.JSONDecodeError:
+            continue
+    return {fallback_key: text}
 
 
 def _s3_client():
