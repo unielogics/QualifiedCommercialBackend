@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import base64
+import csv
 import json
 import logging
-from io import BytesIO
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from io import BytesIO, StringIO
 from typing import Any
 from uuid import UUID
 
 import boto3
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +40,12 @@ log = logging.getLogger(__name__)
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
 MAX_PDF_PAGES = 100
+MAX_TEXT_FILE_CHARS = 16000
+MAX_SPREADSHEET_SHEETS = 6
+MAX_SPREADSHEET_ROWS = 80
+MAX_SPREADSHEET_COLS = 30
+MAX_SPREADSHEET_TEXT_CHARS = 24000
+MAX_CELL_CHARS = 200
 
 REVIEW_SYSTEM = """You are a senior commercial lending underwriter reviewing a secure document bucket.
 
@@ -79,7 +88,7 @@ Rules:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _text_from_response(resp: Any) -> str:
@@ -213,6 +222,206 @@ def _pdf_review_metadata(raw: bytes) -> tuple[int | None, tuple[str, str] | None
         )
 
 
+def _is_xlsx_file(content_type: str, file_name: str) -> bool:
+    lower = f"{content_type} {file_name}".lower()
+    return (
+        file_name.lower().endswith(".xlsx")
+        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in lower
+    )
+
+
+def _is_legacy_xls_file(file_name: str) -> bool:
+    return file_name.lower().endswith(".xls")
+
+
+def _is_csv_file(content_type: str, file_name: str) -> bool:
+    lower = f"{content_type} {file_name}".lower()
+    return file_name.lower().endswith(".csv") or "text/csv" in lower or "application/csv" in lower
+
+
+def _compact_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if len(text) > MAX_CELL_CHARS:
+        return text[: MAX_CELL_CHARS - 1] + "…"
+    return text
+
+
+def _trim_empty_tail(values: list[str]) -> list[str]:
+    trimmed = list(values)
+    while trimmed and not trimmed[-1]:
+        trimmed.pop()
+    return trimmed
+
+
+def _decode_tabular_text(raw: bytes) -> tuple[str, str]:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
+def _extract_csv_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[str, str] | None]:
+    try:
+        decoded, encoding = _decode_tabular_text(raw)
+        sample = decoded[:4096]
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel
+        rows: list[list[str]] = []
+        truncated_rows = False
+        truncated_cols = False
+        for index, row in enumerate(csv.reader(StringIO(decoded), dialect)):
+            if index >= MAX_SPREADSHEET_ROWS:
+                truncated_rows = True
+                break
+            if len(row) > MAX_SPREADSHEET_COLS:
+                truncated_cols = True
+            compacted = [_compact_cell(value) for value in row[:MAX_SPREADSHEET_COLS]]
+            rows.append(_trim_empty_tail(compacted))
+        if not rows:
+            return None, ("csv_parse_failed", "This CSV did not contain readable rows for AI review.")
+        payload = {
+            "file_id": str(file.id),
+            "file_name": file.file_name,
+            "type": "csv_table",
+            "encoding": encoding,
+            "rows_sampled": len(rows),
+            "columns_sampled_limit": MAX_SPREADSHEET_COLS,
+            "warnings": [
+                warning
+                for warning in (
+                    f"Only the first {MAX_SPREADSHEET_ROWS} rows were included." if truncated_rows else None,
+                    f"Only the first {MAX_SPREADSHEET_COLS} columns were included." if truncated_cols else None,
+                )
+                if warning
+            ],
+            "rows": rows,
+        }
+        return json.dumps(payload, default=str, ensure_ascii=False), None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bucket_ai: CSV parse failed file=%s: %s", file.id, exc)
+        return None, ("csv_parse_failed", "The system could not parse this CSV safely, so it was reviewed by metadata only.")
+
+
+def _extract_xlsx_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[str, str] | None]:
+    values_wb = None
+    formulas_wb = None
+    try:
+        values_wb = load_workbook(BytesIO(raw), read_only=True, data_only=True)
+        formulas_wb = load_workbook(BytesIO(raw), read_only=True, data_only=False)
+        visible_sheet_names = [
+            sheet_name
+            for sheet_name in formulas_wb.sheetnames
+            if getattr(formulas_wb[sheet_name], "sheet_state", "visible") == "visible"
+        ]
+        workbook_warnings: list[str] = []
+        if not visible_sheet_names:
+            return None, ("spreadsheet_parse_failed", "This workbook does not contain visible sheets for AI review.")
+        if len(visible_sheet_names) > MAX_SPREADSHEET_SHEETS:
+            workbook_warnings.append(f"Only the first {MAX_SPREADSHEET_SHEETS} visible sheets were included.")
+
+        sheets: list[dict[str, Any]] = []
+        for sheet_name in visible_sheet_names[:MAX_SPREADSHEET_SHEETS]:
+            formula_ws = formulas_wb[sheet_name]
+            value_ws = values_wb[sheet_name]
+            max_row = formula_ws.max_row or 0
+            max_col = formula_ws.max_column or 0
+            sheet_warnings: list[str] = []
+            if max_row == 0 or max_col == 0:
+                sheet_warnings.append("Sheet appears empty.")
+                sheets.append(
+                    {
+                        "name": sheet_name,
+                        "dimensions": {"rows": max_row, "columns": max_col},
+                        "warnings": sheet_warnings,
+                        "rows": [],
+                        "formulas": [],
+                    }
+                )
+                continue
+            if max_row > MAX_SPREADSHEET_ROWS:
+                sheet_warnings.append(f"Only the first {MAX_SPREADSHEET_ROWS} rows were included.")
+            if max_col > MAX_SPREADSHEET_COLS:
+                sheet_warnings.append(f"Only the first {MAX_SPREADSHEET_COLS} columns were included.")
+
+            rows: list[list[str]] = []
+            formulas: list[dict[str, str]] = []
+            formula_iter = formula_ws.iter_rows(
+                max_row=min(max_row, MAX_SPREADSHEET_ROWS),
+                max_col=min(max_col, MAX_SPREADSHEET_COLS),
+            )
+            value_iter = value_ws.iter_rows(
+                max_row=min(max_row, MAX_SPREADSHEET_ROWS),
+                max_col=min(max_col, MAX_SPREADSHEET_COLS),
+            )
+            for row_index, (formula_row, value_row) in enumerate(zip(formula_iter, value_iter, strict=False), start=1):
+                compacted: list[str] = []
+                has_value = False
+                for col_index, (formula_cell, value_cell) in enumerate(zip(formula_row, value_row, strict=False), start=1):
+                    formula_value = formula_cell.value
+                    cached_value = value_cell.value
+                    display_value = cached_value if cached_value is not None else formula_value
+                    compacted.append(_compact_cell(display_value))
+                    if display_value is not None:
+                        has_value = True
+                    if isinstance(formula_value, str) and formula_value.startswith("=") and len(formulas) < 20:
+                        formulas.append(
+                            {
+                                "cell": f"{get_column_letter(col_index)}{row_index}",
+                                "formula": _compact_cell(formula_value),
+                                "cached_value": _compact_cell(cached_value),
+                            }
+                        )
+                trimmed = _trim_empty_tail(compacted)
+                if has_value and trimmed:
+                    rows.append(trimmed)
+            if formulas and len(formulas) >= 20:
+                sheet_warnings.append("Only the first 20 formulas were included.")
+            sheets.append(
+                {
+                    "name": sheet_name,
+                    "dimensions": {"rows": max_row, "columns": max_col},
+                    "warnings": sheet_warnings,
+                    "rows": rows,
+                    "formulas": formulas,
+                }
+            )
+
+        payload = {
+            "file_id": str(file.id),
+            "file_name": file.file_name,
+            "type": "xlsx_workbook",
+            "sheet_names": formulas_wb.sheetnames,
+            "visible_sheets_included": [sheet["name"] for sheet in sheets],
+            "warnings": workbook_warnings,
+            "sheets": sheets,
+        }
+        return json.dumps(payload, default=str, ensure_ascii=False), None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bucket_ai: XLSX parse failed file=%s: %s", file.id, exc)
+        return None, ("spreadsheet_parse_failed", "The system could not parse this workbook safely, so it was reviewed by metadata only.")
+    finally:
+        for workbook in (values_wb, formulas_wb):
+            if workbook is not None:
+                try:
+                    workbook.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _limit_structured_text(text: str, remaining_chars: int) -> tuple[str | None, bool]:
+    if remaining_chars <= 0:
+        return None, True
+    if len(text) <= remaining_chars:
+        return text, False
+    return text[:remaining_chars], True
+
+
 def _skip_file(file: BucketFile, reason: str, explanation: str) -> dict[str, str]:
     return {
         "file_id": str(file.id),
@@ -321,6 +530,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
 
     attached = 0
     attached_pdf_pages = 0
+    spreadsheet_text_chars = 0
     skipped: list[dict[str, str]] = []
     blocked_files: list[dict[str, str]] = []
     for file in files:
@@ -334,6 +544,51 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         raw, content_type = fetched
         if len(raw) > MAX_FILE_BYTES:
             skipped.append(_skip_file(file, "too_large", "The file is larger than the current AI review limit and was reviewed by metadata only."))
+            continue
+        if _is_xlsx_file(content_type, file.file_name):
+            extracted, parse_skip = _extract_xlsx_text(file, raw)
+            if parse_skip:
+                reason, explanation = parse_skip
+                skipped.append(_skip_file(file, reason, explanation))
+                continue
+            limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
+            if limited is None:
+                skipped.append(_skip_file(file, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this workbook was reviewed by metadata only."))
+                continue
+            spreadsheet_text_chars += len(limited)
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"Spreadsheet file {file.id}: {file.file_name}\nExtracted workbook/table data for underwriting review:\n\n{limited}",
+                }
+            )
+            if truncated:
+                skipped.append(_skip_file(file, "spreadsheet_too_large", "Only the first part of this workbook could be included before the spreadsheet text budget was reached."))
+            attached += 1
+            continue
+        if _is_legacy_xls_file(file.file_name):
+            skipped.append(_skip_file(file, "legacy_spreadsheet_unsupported", "Legacy .xls files are not supported by the current AI spreadsheet parser. Upload an .xlsx or CSV export."))
+            continue
+        if _is_csv_file(content_type, file.file_name):
+            extracted, parse_skip = _extract_csv_text(file, raw)
+            if parse_skip:
+                reason, explanation = parse_skip
+                skipped.append(_skip_file(file, reason, explanation))
+                continue
+            limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
+            if limited is None:
+                skipped.append(_skip_file(file, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this CSV was reviewed by metadata only."))
+                continue
+            spreadsheet_text_chars += len(limited)
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"CSV file {file.id}: {file.file_name}\nExtracted table data for underwriting review:\n\n{limited}",
+                }
+            )
+            if truncated:
+                skipped.append(_skip_file(file, "spreadsheet_too_large", "Only the first part of this CSV could be included before the spreadsheet text budget was reached."))
+            attached += 1
             continue
         media = _media_type(content_type, file.file_name)
         if media:
@@ -356,13 +611,15 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
                     )
                     continue
                 attached_pdf_pages += page_count or 0
-            content.append({"type": "text", "text": f"File {file.id}: {file.file_name}"})
+                content.append({"type": "text", "text": f"PDF file {file.id}: {file.file_name}"})
+            else:
+                content.append({"type": "text", "text": f"Image file {file.id}: {file.file_name} ({media}) attached for visual underwriting review."})
             content.append(_content_block(media, raw))
             attached += 1
             continue
         lower = f"{content_type} {file.file_name}".lower()
         if "text/" in lower or file.file_name.lower().endswith((".txt", ".csv", ".md", ".log")):
-            snippet = raw[:16000].decode("utf-8", errors="replace")
+            snippet = raw[:MAX_TEXT_FILE_CHARS].decode("utf-8", errors="replace")
             content.append({"type": "text", "text": f"File {file.id}: {file.file_name}\n\n{snippet}"})
             attached += 1
             continue
