@@ -40,7 +40,7 @@ MAX_PDF_PAGES = 100
 
 REVIEW_SYSTEM = """You are a senior commercial lending underwriter reviewing a secure document bucket.
 
-Return ONLY JSON in this shape:
+Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 {
   "executive_summary": "short plain-English summary",
   "available_documents": [{"file_name": "...", "document_type": "...", "summary": "..."}],
@@ -355,7 +355,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             client=get_client(),
             model=model,
             metadata={"bucket_id": str(bucket.id), "bucket_ai_review_id": str(review.id)},
-            max_tokens=2500,
+            max_tokens=6000,
             system=REVIEW_SYSTEM,
             messages=[{"role": "user", "content": content}],
         )
