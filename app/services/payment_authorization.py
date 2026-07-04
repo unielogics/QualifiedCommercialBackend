@@ -20,7 +20,7 @@ from app.models.user import User
 
 log = logging.getLogger(__name__)
 
-PAYMENT_AUTH_DOCUMENT_VERSION = "2026-07-04"
+PAYMENT_AUTH_DOCUMENT_VERSION = "2026-07-04-3"
 
 
 def payment_authorization_document() -> str:
@@ -42,6 +42,13 @@ Qualified Commercial may collect funds from me and remit payment to third-party 
 or service providers for approved services. Charges will appear under QC - Qualified
 Commercial LLC. The system will prompt for payments that require approval before they are
 charged, and I may contact my agent or loan underwriter with questions about a charge.
+I acknowledge that authorized expenses incurred for my file, including third-party vendor
+costs, credit-related costs, inspections, appraisals, and other funding-file costs, remain
+my responsibility even if the loan does not close. I agree not to initiate an improper
+chargeback, card dispute, reversal, or payment challenge for charges that match this
+authorization and were actually incurred or paid for my file. Any billing question or
+dispute should be raised directly with Qualified Commercial first so the charge can be
+reviewed against the signed authorization, vendor records, and file activity.
 
 I consent to use electronic records and electronic signatures under the U.S. E-SIGN Act
 and UETA. I understand my typed legal name, checkbox acknowledgments, drawn signature,
@@ -52,6 +59,8 @@ payment authorization, or funding-file processing.
 
 Qualified Commercial does not store raw card numbers, CVC/CVV, magnetic stripe data, or
 full card payloads in its systems. Card details are collected and tokenized by Stripe.
+Qualified Commercial stores only Stripe references, card brand, last four digits,
+expiration, billing snapshot, and authorization audit records.
 """.strip()
 
 

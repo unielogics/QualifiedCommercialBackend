@@ -33,6 +33,18 @@ router = APIRouter(prefix="/credit", tags=["credit"])
 log = logging.getLogger(__name__)
 
 
+def _role_value(user) -> str:
+    return str(getattr(user.role, "value", user.role))
+
+
+def _has_role(user, role: Role) -> bool:
+    return _role_value(user) == role.value
+
+
+def _has_any_role(user, roles: tuple[Role, ...]) -> bool:
+    return _role_value(user) in {role.value for role in roles}
+
+
 def _client_id_for(user) -> str | None:
     return user.client.id if user.client else None
 
@@ -73,7 +85,7 @@ async def current(
         the pulled FICO + parsed report on the loan Credit panel.
       • client_id=<uuid> + borrower role mismatch → 403.
     """
-    if user.role == Role.CLIENT:
+    if _has_role(user, Role.CLIENT):
         # Normal app surfaces poll /credit/current to decide whether to show
         # locked or unlocked credit UI. Missing payment authorization should
         # not break app rendering; the actual bureau pull and credit summary
@@ -93,12 +105,12 @@ async def current(
             UUID(client_id)
         except ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "client_id must be a UUID or 'self'")
-        if user.role == Role.CLIENT:
+        if _has_role(user, Role.CLIENT):
             own = _client_id_for(user)
             if str(own) != client_id:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Borrowers can only fetch their own credit")
             target_cid = own
-        elif user.role == Role.BROKER:
+        elif _has_role(user, Role.BROKER):
             # Scope check — broker can only see pulls for their own
             # clients. Same gate the rest of the agent surface uses.
             from app.models.client import Client as _Client
@@ -142,9 +154,9 @@ async def pull_access(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> CreditPullAccessRead:
-    if user.role != Role.CLIENT:
+    if not _has_role(user, Role.CLIENT):
         return CreditPullAccessRead(
-            role=user.role.value,
+            role=_role_value(user),
             requires_payment_authorization=False,
             payment_authorized=True,
             can_run_credit=True,
@@ -152,7 +164,7 @@ async def pull_access(
     authorized = await client_has_completed_payment_authorization(db, user)
     has_client = user.client is not None
     return CreditPullAccessRead(
-        role=user.role.value,
+        role=_role_value(user),
         requires_payment_authorization=True,
         payment_authorized=authorized,
         can_run_credit=authorized and has_client,
@@ -419,9 +431,9 @@ def _allowed_to_view_report(viewer, pull: CreditPull) -> bool:
     intelligence verdict. The HTML report is an internal artifact for
     underwriters/brokers/admins only.
     """
-    if viewer.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if _has_any_role(viewer, (Role.SUPER_ADMIN, Role.LOAN_EXEC)):
         return True
-    if viewer.role == Role.BROKER and viewer.broker:
+    if _has_role(viewer, Role.BROKER) and viewer.broker:
         return True  # broker scoping by client_id can be tightened later
     return False
 
@@ -532,9 +544,9 @@ def _scraped_from_pull(pull: CreditPull) -> ScrapedReport | None:
 
 def _viewer_can_see_pull(viewer, pull: CreditPull) -> bool:
     """Operator: any pull. Borrower: their own client_id only."""
-    if viewer.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER):
+    if _has_any_role(viewer, (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER)):
         return True
-    if viewer.role == Role.CLIENT and viewer.client and viewer.client.id == pull.client_id:
+    if _has_role(viewer, Role.CLIENT) and viewer.client and viewer.client.id == pull.client_id:
         return True
     return False
 
@@ -547,7 +559,7 @@ async def parsed_report(
 ) -> dict:
     """Operator-only structured report. Full ScrapedReport dump — every
     field iSoftPull surfaced, ready to render in the super-admin UI."""
-    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER):
+    if not _has_any_role(user, (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only")
     pull = await db.get(CreditPull, pull_id)
     if pull is None:

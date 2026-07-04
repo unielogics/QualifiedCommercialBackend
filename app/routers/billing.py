@@ -42,14 +42,26 @@ from app.services.stripe_billing import StripeBillingError, StripeConfigError
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 
+def _role_value(user) -> str:
+    return str(getattr(user.role, "value", user.role))
+
+
+def _has_role(user, role: Role) -> bool:
+    return _role_value(user) == role.value
+
+
+def _has_any_role(user, roles: tuple[Role, ...]) -> bool:
+    return _role_value(user) in {role.value for role in roles}
+
+
 def _require_client(user) -> Client:
-    if user.role != Role.CLIENT or not user.client:
+    if not _has_role(user, Role.CLIENT) or not user.client:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Client profile required")
     return user.client
 
 
 def _require_operator(user) -> None:
-    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if not _has_any_role(user, (Role.SUPER_ADMIN, Role.LOAN_EXEC)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator access required")
 
 
@@ -63,12 +75,13 @@ def _document_read() -> PaymentAuthorizationDocumentRead:
 
 async def _status_payload(db: AsyncSession, user) -> PaymentAuthorizationStatusRead:
     settings = get_settings()
-    client = user.client if user.role == Role.CLIENT else None
+    is_client = _has_role(user, Role.CLIENT)
+    client = user.client if is_client else None
     latest = None
     method = None
     certificate_url = None
     authorized = True
-    if user.role == Role.CLIENT:
+    if is_client:
         authorized = await pa.client_has_completed_payment_authorization(db, user)
         if client is not None:
             latest = await pa.latest_authorization(db, user_id=user.id, client_id=client.id)
@@ -76,8 +89,8 @@ async def _status_payload(db: AsyncSession, user) -> PaymentAuthorizationStatusR
             if latest:
                 certificate_url = pa.presign_private_s3_object(latest.certificate_s3_key)
     return PaymentAuthorizationStatusRead(
-        role=user.role.value,
-        requires_authorization=user.role == Role.CLIENT,
+        role=_role_value(user),
+        requires_authorization=is_client,
         authorized=authorized,
         client_id=client.id if client else None,
         latest_authorization=PaymentAuthorizationRead.model_validate(latest) if latest else None,
@@ -194,13 +207,18 @@ async def start_payment_authorization(
 ) -> PaymentAuthorizationStartResponse:
     client = _require_client(user)
     latest = await pa.latest_authorization(db, user_id=user.id, client_id=client.id)
-    if latest is None or latest.status not in ("started", "active"):
+    current_hash = pa.payment_authorization_hash()
+    if (
+        latest is None
+        or latest.status not in ("started", "active")
+        or (latest.status == "started" and latest.document_hash != current_hash)
+    ):
         latest = PaymentAuthorization(
             user_id=user.id,
             client_id=client.id,
             status="started",
             document_version=pa.PAYMENT_AUTH_DOCUMENT_VERSION,
-            document_hash=pa.payment_authorization_hash(),
+            document_hash=current_hash,
             ip_address=pa.client_ip(request),
             user_agent=(request.headers.get("user-agent") or "")[:512] or None,
         )
@@ -238,13 +256,16 @@ async def create_setup_intent(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Payment authorization not found")
     if auth is None:
         auth = await pa.latest_authorization(db, user_id=user.id, client_id=client.id)
+    current_hash = pa.payment_authorization_hash()
+    if auth is not None and auth.status == "started" and auth.document_hash != current_hash:
+        auth = None
     if auth is None or auth.status not in ("started", "active"):
         auth = PaymentAuthorization(
             user_id=user.id,
             client_id=client.id,
             status="started",
             document_version=pa.PAYMENT_AUTH_DOCUMENT_VERSION,
-            document_hash=pa.payment_authorization_hash(),
+            document_hash=current_hash,
             ip_address=pa.client_ip(request),
             user_agent=(request.headers.get("user-agent") or "")[:512] or None,
         )
@@ -458,7 +479,7 @@ async def list_expenses(
     db: AsyncSession = Depends(get_db),
     client_id: UUID | None = Query(default=None),
 ) -> ExpenseListResponse:
-    if user.role == Role.CLIENT:
+    if _has_role(user, Role.CLIENT):
         client = _require_client(user)
         target_client_id = client.id
     else:

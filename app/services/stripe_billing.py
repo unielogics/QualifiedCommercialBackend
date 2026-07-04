@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -32,12 +33,14 @@ async def _stripe_request(
     data: dict[str, Any] | list[tuple[str, Any]] | None = None,
 ) -> dict[str, Any]:
     key = _secret_key()
+    encoded = urlencode(data or {}).encode("utf-8")
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.request(
             method,
             f"{STRIPE_API_BASE}{path}",
             auth=(key, ""),
-            data=data,
+            content=encoded,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
     if resp.status_code >= 400:
         try:
