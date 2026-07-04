@@ -25,6 +25,7 @@ from app.schemas.billing import (
     ClientPaymentMethodRead,
     ExpenseChargeResponse,
     ExpenseListResponse,
+    PaymentAuthorizationClientSummaryRead,
     PaymentAuthorizationCompleteRequest,
     PaymentAuthorizationCompleteResponse,
     PaymentAuthorizationDocumentRead,
@@ -86,12 +87,97 @@ async def _status_payload(db: AsyncSession, user) -> PaymentAuthorizationStatusR
     )
 
 
+async def _client_status_payload(db: AsyncSession, client: Client) -> PaymentAuthorizationStatusRead:
+    settings = get_settings()
+    latest = await pa.latest_authorization(db, client_id=client.id)
+    method = await pa.active_payment_method(db, client_id=client.id)
+    certificate_url = pa.presign_private_s3_object(latest.certificate_s3_key) if latest else None
+    authorized = bool(
+        latest
+        and latest.status == "active"
+        and latest.stripe_payment_method_id
+        and method is not None
+        and method.status == "active"
+    )
+    return PaymentAuthorizationStatusRead(
+        role=Role.CLIENT.value,
+        requires_authorization=True,
+        authorized=authorized,
+        client_id=client.id,
+        latest_authorization=PaymentAuthorizationRead.model_validate(latest) if latest else None,
+        payment_method=ClientPaymentMethodRead.model_validate(method) if method else None,
+        certificate_url=certificate_url,
+        stripe_publishable_key=settings.stripe_publishable_key or None,
+    )
+
+
+def _client_summary_row(
+    client: Client,
+    latest: PaymentAuthorization | None,
+    method: ClientPaymentMethod | None,
+) -> PaymentAuthorizationClientSummaryRead:
+    authorized = bool(
+        latest
+        and latest.status == "active"
+        and latest.stripe_payment_method_id
+        and method is not None
+        and method.status == "active"
+    )
+    return PaymentAuthorizationClientSummaryRead(
+        client_id=client.id,
+        client_name=client.name,
+        client_email=client.email,
+        authorized=authorized,
+        authorization_status=latest.status if latest else None,
+        signed_at=latest.signed_at if latest else None,
+        completed_at=latest.completed_at if latest else None,
+        card_status=method.status if method else None,
+        card_brand=method.brand if method else None,
+        card_last4=method.last4 if method else None,
+        card_exp_month=method.exp_month if method else None,
+        card_exp_year=method.exp_year if method else None,
+    )
+
+
 @router.get("/payment-authorization/status", response_model=PaymentAuthorizationStatusRead)
 async def payment_authorization_status(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PaymentAuthorizationStatusRead:
     return await _status_payload(db, user)
+
+
+@router.get("/clients/payment-authorizations", response_model=list[PaymentAuthorizationClientSummaryRead])
+async def list_client_payment_authorizations(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[PaymentAuthorizationClientSummaryRead]:
+    _require_operator(user)
+    clients = (
+        await db.execute(
+            select(Client)
+            .order_by(Client.name.asc())
+        )
+    ).scalars().all()
+    rows: list[PaymentAuthorizationClientSummaryRead] = []
+    for client in clients:
+        latest = await pa.latest_authorization(db, client_id=client.id)
+        method = await pa.active_payment_method(db, client_id=client.id)
+        rows.append(_client_summary_row(client, latest, method))
+    return rows
+
+
+@router.get("/clients/{client_id}/payment-authorization/status", response_model=PaymentAuthorizationStatusRead)
+async def client_payment_authorization_status(
+    client_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentAuthorizationStatusRead:
+    _require_operator(user)
+    client = await db.get(Client, client_id)
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+    return await _client_status_payload(db, client)
 
 
 @router.get("/payment-authorization/document", response_model=PaymentAuthorizationDocumentRead)

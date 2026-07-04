@@ -76,6 +76,21 @@ class PaymentAuthorizationStatusRead(BaseModel):
     stripe_publishable_key: str | None = None
 
 
+class PaymentAuthorizationClientSummaryRead(BaseModel):
+    client_id: UUID
+    client_name: str
+    client_email: str | None
+    authorized: bool
+    authorization_status: str | None = None
+    signed_at: datetime | None = None
+    completed_at: datetime | None = None
+    card_status: str | None = None
+    card_brand: str | None = None
+    card_last4: str | None = None
+    card_exp_month: int | None = None
+    card_exp_year: int | None = None
+
+
 class PaymentAuthorizationStartResponse(BaseModel):
     authorization: PaymentAuthorizationRead
     document: PaymentAuthorizationDocumentRead
