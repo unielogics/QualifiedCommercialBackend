@@ -74,7 +74,18 @@ async def current(
       • client_id=<uuid> + borrower role mismatch → 403.
     """
     if user.role == Role.CLIENT:
-        await require_payment_authorized_for_credit(db, user)
+        # Normal app surfaces poll /credit/current to decide whether to show
+        # locked or unlocked credit UI. Missing payment authorization should
+        # not break app rendering; the actual bureau pull and credit summary
+        # endpoints remain protected below.
+        authorized = await client_has_completed_payment_authorization(db, user)
+        if not authorized:
+            log.info(
+                "GET /credit/current user=%s role=%s -> null (payment authorization required)",
+                user.email,
+                user.role,
+            )
+            return None
     target_cid: str | None
     if client_id and client_id != "self":
         from uuid import UUID
