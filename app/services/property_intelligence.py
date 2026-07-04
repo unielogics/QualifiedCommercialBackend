@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -17,6 +18,7 @@ RENTCAST_BASE = "https://api.rentcast.io/v1"
 GOOGLE_PLACES_BASE = "https://places.googleapis.com/v1"
 GOOGLE_GEOCODE_BASE = "https://maps.googleapis.com/maps/api/geocode/json"
 FEMA_NFHL_LAYER = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
+logger = logging.getLogger(__name__)
 
 
 def normalize_address(address: AddressParts | dict[str, Any]) -> str:
@@ -74,22 +76,29 @@ async def google_autocomplete(db: AsyncSession, input_text: str, session_token: 
     }
     if session_token:
         body["sessionToken"] = session_token
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        resp = await client.post(
-            f"{GOOGLE_PLACES_BASE}/places:autocomplete",
-            headers={"X-Goog-Api-Key": settings.google_server_api_key},
-            json=body,
-        )
-    resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                f"{GOOGLE_PLACES_BASE}/places:autocomplete",
+                headers={"X-Goog-Api-Key": settings.google_server_api_key},
+                json=body,
+            )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Google address autocomplete failed: %s", exc)
+        return []
     out: list[dict[str, Any]] = []
     for raw in resp.json().get("suggestions", []) or []:
         place = raw.get("placePrediction") or {}
         text = place.get("text") or {}
         main = text.get("text") or ""
+        place_id = str(place.get("placeId") or place.get("place") or "")
+        if place_id.startswith("places/"):
+            place_id = place_id.split("/", 1)[1]
         if main:
             out.append(
                 {
-                    "place_id": str(place.get("placeId") or place.get("place") or ""),
+                    "place_id": place_id,
                     "text": main,
                     "secondary_text": None,
                 }
@@ -127,37 +136,41 @@ async def google_resolve(
     settings = await runtime_settings(db)
     if not settings.google_server_api_key:
         return AddressParts(full=address), None
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        if place_id:
-            resp = await client.get(
-                f"{GOOGLE_PLACES_BASE}/places/{place_id}",
-                params={"sessionToken": session_token} if session_token else None,
-                headers={
-                    "X-Goog-Api-Key": settings.google_server_api_key,
-                    "X-Goog-FieldMask": "id,formattedAddress,location,addressComponents,displayName",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            formatted = data.get("formattedAddress") or address or ""
-            parts = _address_from_google_components(data.get("addressComponents") or [], formatted)
-            loc = data.get("location") or {}
-            parts.latitude = loc.get("latitude")
-            parts.longitude = loc.get("longitude")
-            return parts, data
-        if address:
-            resp = await client.get(GOOGLE_GEOCODE_BASE, params={"address": address, "key": settings.google_server_api_key})
-            resp.raise_for_status()
-            data = resp.json()
-            first = (data.get("results") or [None])[0]
-            if not first:
-                return AddressParts(full=address), data
-            formatted = first.get("formatted_address") or address
-            parts = _address_from_google_components(first.get("address_components") or [], formatted)
-            loc = (first.get("geometry") or {}).get("location") or {}
-            parts.latitude = loc.get("lat")
-            parts.longitude = loc.get("lng")
-            return parts, first
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            if place_id:
+                normalized_place_id = place_id.split("/", 1)[1] if place_id.startswith("places/") else place_id
+                resp = await client.get(
+                    f"{GOOGLE_PLACES_BASE}/places/{normalized_place_id}",
+                    params={"sessionToken": session_token} if session_token else None,
+                    headers={
+                        "X-Goog-Api-Key": settings.google_server_api_key,
+                        "X-Goog-FieldMask": "id,formattedAddress,location,addressComponents,displayName",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                formatted = data.get("formattedAddress") or address or ""
+                parts = _address_from_google_components(data.get("addressComponents") or [], formatted)
+                loc = data.get("location") or {}
+                parts.latitude = loc.get("latitude")
+                parts.longitude = loc.get("longitude")
+                return parts, data
+            if address:
+                resp = await client.get(GOOGLE_GEOCODE_BASE, params={"address": address, "key": settings.google_server_api_key})
+                resp.raise_for_status()
+                data = resp.json()
+                first = (data.get("results") or [None])[0]
+                if not first:
+                    return AddressParts(full=address), data
+                formatted = first.get("formatted_address") or address
+                parts = _address_from_google_components(first.get("address_components") or [], formatted)
+                loc = (first.get("geometry") or {}).get("location") or {}
+                parts.latitude = loc.get("lat")
+                parts.longitude = loc.get("lng")
+                return parts, first
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Google address resolve failed: %s", exc)
     return AddressParts(full=address), None
 
 
