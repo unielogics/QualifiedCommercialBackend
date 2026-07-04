@@ -250,6 +250,29 @@ async def get_current_user(
                         "older rows still hold credit pulls / docs / loans and need manual merge.",
                         email, len(adoptable),
                     )
+            else:
+                from app.services.payment_authorization import primary_super_admin
+
+                owner = await primary_super_admin(db)
+                client = _Client(
+                    user_id=user.id,
+                    name=name or email.split("@")[0],
+                    email=email,
+                    originating_agent_id=owner.id if owner else None,
+                    current_agent_id=owner.id if owner else None,
+                    source_channel="self_signup",
+                    client_experience_mode="self_directed",
+                    client_experience_mode_reason="self_signup_super_admin_assigned",
+                    client_experience_mode_locked_by="firm",
+                )
+                db.add(client)
+                await db.flush()
+                log.info(
+                    "Auto-created Client id=%s for self-signup email=%s assigned_owner=%s",
+                    client.id,
+                    email,
+                    owner.email if owner else None,
+                )
             # Re-fetch with the relationship eagerly loaded so downstream
             # `user.client` accesses don't trigger a lazy-load. A freshly
             # added User without a Client row would still need the eager
@@ -388,6 +411,9 @@ async def require_valid_credit_pull(
 
     if user.role != Role.CLIENT:
         return user
+    from app.services.payment_authorization import require_payment_authorized_for_credit
+
+    await require_payment_authorized_for_credit(db, user)
     cid = user.client.id if user.client else None
     if cid is None:
         raise HTTPException(

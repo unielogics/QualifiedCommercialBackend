@@ -71,6 +71,7 @@ class BucketDetail(BucketRead):
     files: list[BucketFileRead] = []
     upload_links: list[BucketUploadLinkRead] = []
     shares: list[BucketShareRead] = []
+    vendor_access: list[BucketVendorAccessRead] = []
     notes: list[BucketNoteRead] = []
     activity: list[BucketActivityRead] = []
 
@@ -224,6 +225,7 @@ class BucketFileAnnotationRead(ORMModel):
     bucket_id: UUID
     file_id: UUID
     share_id: UUID | None
+    vendor_access_id: UUID | None = None
     page_number: int
     x: float
     y: float
@@ -308,6 +310,89 @@ class BucketSharePasscodeResetRead(BaseModel):
     passcode: str
 
 
+class BucketVendorRead(ORMModel):
+    id: UUID
+    email: EmailStr | str
+    name: str
+    role: str
+    created_at: datetime | None = None
+
+
+class BucketVendorAccessCreate(BaseModel):
+    vendor_user_id: UUID | None = None
+    vendor_name: str | None = Field(default=None, max_length=180)
+    vendor_email: EmailStr | None = None
+    file_scope: str = Field(default="all_active", pattern="^(all_active|selected)$")
+    file_ids: list[UUID] = []
+    can_preview: bool = True
+    can_download: bool = False
+    can_add_notes: bool = True
+    can_see_internal_notes: bool = False
+    can_use_ai_chat: bool = True
+    can_view_ai_summary: bool = True
+    can_view_ai_tasks: bool = True
+    can_propose_tasks: bool = True
+    expires_at: datetime | None = None
+
+    @field_validator("vendor_email", mode="before")
+    @classmethod
+    def empty_vendor_email_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class BucketVendorAccessPatch(BaseModel):
+    status: str | None = Field(default=None, pattern="^(active|revoked)$")
+    expires_at: datetime | None = None
+    file_scope: str | None = Field(default=None, pattern="^(all_active|selected)$")
+    file_ids: list[UUID] | None = None
+    can_preview: bool | None = None
+    can_download: bool | None = None
+    can_add_notes: bool | None = None
+    can_see_internal_notes: bool | None = None
+    can_use_ai_chat: bool | None = None
+    can_view_ai_summary: bool | None = None
+    can_view_ai_tasks: bool | None = None
+    can_propose_tasks: bool | None = None
+
+
+class BucketVendorAccessRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    vendor_user_id: UUID
+    vendor_name: str | None = None
+    vendor_email: str | None = None
+    status: str
+    expires_at: datetime | None
+    file_scope: str
+    can_preview: bool
+    can_download: bool
+    can_add_notes: bool
+    can_see_internal_notes: bool
+    can_use_ai_chat: bool
+    can_view_ai_summary: bool
+    can_view_ai_tasks: bool
+    can_propose_tasks: bool
+    last_accessed_at: datetime | None
+    view_count: int
+    download_count: int
+    created_at: datetime
+    updated_at: datetime
+    files: list[BucketFileRead] = []
+
+
+class BucketVendorBucketRead(BucketRead):
+    vendor_access: BucketVendorAccessRead
+
+
+class BucketVendorAccessReadResponse(BaseModel):
+    bucket: BucketRead
+    vendor_access: BucketVendorAccessRead
+    files: list[BucketShareFileRead]
+    notes: list[BucketNoteRead]
+    ai_summary: dict | None = None
+    ai_tasks: list[BucketAIActionItemRead] = []
+
+
 class BucketShareAccessRequest(BaseModel):
     passcode: str
 
@@ -356,6 +441,7 @@ class BucketNoteRead(ORMModel):
     id: UUID
     bucket_id: UUID
     share_id: UUID | None
+    vendor_access_id: UUID | None = None
     author_name: str
     author_role: str
     visibility: str
@@ -427,6 +513,7 @@ class BucketAIMessageRead(ORMModel):
     bucket_id: UUID
     upload_link_id: UUID | None
     share_id: UUID | None
+    vendor_access_id: UUID | None = None
     user_id: UUID | None
     audience: str
     role: str
@@ -450,6 +537,7 @@ class BucketAIActionItemRead(ORMModel):
     source_message_id: UUID | None
     upload_link_id: UUID | None
     share_id: UUID | None
+    vendor_access_id: UUID | None = None
     file_id: UUID | None
     requested_document_id: UUID | None
     status: str
@@ -468,9 +556,10 @@ class BucketAIActionItemRead(ORMModel):
 
 class BucketAIActionItemCreate(BaseModel):
     status: str = Field(default="approved", pattern="^(proposed|approved|rejected|completed)$")
-    route: str = Field(default="admin", pattern="^(admin|uploader|share)$")
+    route: str = Field(default="admin", pattern="^(admin|uploader|share|vendor)$")
     upload_link_id: UUID | None = None
     share_id: UUID | None = None
+    vendor_access_id: UUID | None = None
     file_id: UUID | None = None
     requested_document_id: UUID | None = None
     title: str = Field(min_length=1, max_length=220)
@@ -480,9 +569,10 @@ class BucketAIActionItemCreate(BaseModel):
 
 class BucketAIActionItemPatch(BaseModel):
     status: str | None = Field(default=None, pattern="^(proposed|approved|rejected|completed)$")
-    route: str | None = Field(default=None, pattern="^(admin|uploader|share)$")
+    route: str | None = Field(default=None, pattern="^(admin|uploader|share|vendor)$")
     upload_link_id: UUID | None = None
     share_id: UUID | None = None
+    vendor_access_id: UUID | None = None
     file_id: UUID | None = None
     requested_document_id: UUID | None = None
     title: str | None = Field(default=None, min_length=1, max_length=220)

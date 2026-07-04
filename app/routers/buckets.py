@@ -33,6 +33,7 @@ from app.models.bucket import (
     BucketRequestedDocument,
     BucketShare,
     BucketUploadLink,
+    BucketVendorAccess,
 )
 from app.models.user import User
 from app.schemas.bucket import (
@@ -82,13 +83,21 @@ from app.schemas.bucket import (
     BucketUploadLinkCreate,
     BucketUploadLinkPasscodeResetRead,
     BucketUploadLinkRead,
+    BucketVendorAccessCreate,
+    BucketVendorAccessPatch,
+    BucketVendorAccessRead,
+    BucketVendorAccessReadResponse,
+    BucketVendorBucketRead,
+    BucketVendorRead,
 )
+from app.services import clerk as clerk_service
 from app.services.bucket_ai import (
     create_chat_reply,
     latest_review,
     log_bucket_ai_activity,
     share_visible_summary,
     upload_link_visible_summary,
+    vendor_visible_summary,
     visible_action_items,
 )
 
@@ -245,6 +254,8 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
                 selectinload(Bucket.files),
                 selectinload(Bucket.upload_links),
                 selectinload(Bucket.shares).selectinload(BucketShare.files),
+                selectinload(Bucket.vendor_access).selectinload(BucketVendorAccess.vendor),
+                selectinload(Bucket.vendor_access).selectinload(BucketVendorAccess.files),
                 selectinload(Bucket.notes),
                 with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
@@ -303,6 +314,29 @@ async def _load_share_or_404(db: AsyncSession, token: str) -> BucketShare:
     if share is None or not _is_active(share.status, share.expires_at):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
     return share
+
+
+async def _load_vendor_access_or_404(db: AsyncSession, bucket_id: UUID, user: User) -> BucketVendorAccess:
+    access = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(
+                BucketVendorAccess.bucket_id == bucket_id,
+                BucketVendorAccess.vendor_user_id == user.id,
+            )
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.notes),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.requested_documents),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if access is None or access.bucket.archived_at is not None or not _is_active(access.status, access.expires_at):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vendor bucket access not found or inactive")
+    return access
 
 
 def _upload_url(s3_key: str, content_type: str) -> tuple[str, dict[str, str]]:
@@ -382,6 +416,18 @@ def _file_belongs_to_share(share: BucketShare, file_id: UUID) -> BucketFile | No
     return None
 
 
+def _vendor_access_files(access: BucketVendorAccess) -> list[BucketFile]:
+    source = access.bucket.files if access.file_scope == "all_active" else access.files
+    return [file for file in source if file.status == "uploaded" and file.deleted_at is None]
+
+
+def _file_belongs_to_vendor_access(access: BucketVendorAccess, file_id: UUID) -> BucketFile | None:
+    for file in _vendor_access_files(access):
+        if file.id == file_id:
+            return file
+    return None
+
+
 def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], *, preview: bool = True) -> BucketFileReviewRead:
     return BucketFileReviewRead(
         file=BucketFileRead.model_validate(file),
@@ -405,6 +451,14 @@ def _upload_link_read(link: BucketUploadLink, *, passcode: str | None = None) ->
     return data
 
 
+def _vendor_access_read(access: BucketVendorAccess) -> BucketVendorAccessRead:
+    data = BucketVendorAccessRead.model_validate(access)
+    data.vendor_name = access.vendor.name if access.vendor else None
+    data.vendor_email = access.vendor.email if access.vendor else None
+    data.files = [BucketFileRead.model_validate(file) for file in _vendor_access_files(access)]
+    return data
+
+
 def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     data = BucketDetail.model_validate(bucket)
     data.files = [file for file in data.files if file.deleted_at is None]
@@ -413,6 +467,7 @@ def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
         if link.status == "active" and (link.expires_at is None or link.expires_at > _now())
     ]
     data.shares = [_share_read(share) for share in bucket.shares]
+    data.vendor_access = [_vendor_access_read(access) for access in bucket.vendor_access]
     return data
 
 
@@ -433,6 +488,79 @@ async def _uploaded_bucket_files(db: AsyncSession, bucket_id: UUID, file_ids: li
     if len(files) != len(unique_ids):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected files must be uploaded files in this bucket")
     return files
+
+
+async def _vendor_user_from_payload(
+    db: AsyncSession,
+    *,
+    vendor_user_id: UUID | None,
+    vendor_name: str | None,
+    vendor_email: str | None,
+    send_invite: bool = True,
+) -> User:
+    if vendor_user_id is not None:
+        user = await db.get(User, vendor_user_id)
+        if user is None or user.deleted_at is not None or user.role != Role.VENDOR:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected user must be an active vendor")
+        if send_invite:
+            await clerk_service.invite_user(
+                email=user.email,
+                name=user.name,
+                role=Role.VENDOR,
+                redirect_url=_public_url("/vendor/buckets"),
+            )
+        return user
+    if not vendor_email or not vendor_name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Vendor name and email are required")
+    normalized = vendor_email.lower().strip()
+    user = (await db.execute(select(User).where(User.email == normalized))).scalar_one_or_none()
+    if user is not None and user.deleted_at is None and user.role != Role.VENDOR:
+        raise HTTPException(status.HTTP_409_CONFLICT, "That email belongs to a non-vendor user")
+    created_or_reactivated = False
+    if user is None:
+        user = User(email=normalized, name=vendor_name.strip(), role=Role.VENDOR, clerk_id=None)
+        db.add(user)
+        created_or_reactivated = True
+    else:
+        user.name = vendor_name.strip() or user.name
+        user.role = Role.VENDOR
+        if user.deleted_at is not None:
+            user.deleted_at = None
+            user.clerk_id = None
+            created_or_reactivated = True
+    await db.flush()
+    if send_invite:
+        await clerk_service.invite_user(
+            email=normalized,
+            name=user.name,
+            role=Role.VENDOR,
+            redirect_url=_public_url("/vendor/buckets"),
+        )
+    elif created_or_reactivated:
+        await db.flush()
+    return user
+
+
+def _vendor_file_ids(access: BucketVendorAccess) -> list[UUID]:
+    return [file.id for file in _vendor_access_files(access)]
+
+
+async def _apply_vendor_access_file_scope(
+    db: AsyncSession,
+    access: BucketVendorAccess,
+    bucket_id: UUID,
+    *,
+    file_scope: str,
+    file_ids: list[UUID] | None,
+) -> None:
+    if file_scope not in {"all_active", "selected"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Vendor file scope must be all_active or selected")
+    access.file_scope = file_scope
+    if file_scope == "all_active":
+        access.files = []
+        return
+    files = await _uploaded_bucket_files(db, bucket_id, file_ids or [])
+    access.files = files
 
 
 @router.get("/templates", response_model=list[BucketTemplateRead])
@@ -485,6 +613,44 @@ async def create_bucket(
     await db.commit()
     await db.refresh(bucket)
     return bucket
+
+
+@router.get("/admin/vendors", response_model=list[BucketVendorRead])
+async def list_bucket_vendors(
+    q: str | None = None,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[User]:
+    filters = [User.role == Role.VENDOR, User.deleted_at.is_(None)]
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        filters.append(or_(User.name.ilike(pattern), User.email.ilike(pattern)))
+    return (
+        await db.execute(
+            select(User)
+            .where(*filters)
+            .order_by(User.name.asc(), User.email.asc())
+            .limit(100)
+        )
+    ).scalars().all()
+
+
+@router.post("/admin/vendors", response_model=BucketVendorRead, status_code=status.HTTP_201_CREATED)
+async def invite_bucket_vendor(
+    payload: BucketVendorAccessCreate,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    vendor = await _vendor_user_from_payload(
+        db,
+        vendor_user_id=payload.vendor_user_id,
+        vendor_name=payload.vendor_name,
+        vendor_email=str(payload.vendor_email) if payload.vendor_email else None,
+        send_invite=True,
+    )
+    await db.commit()
+    await db.refresh(vendor)
+    return vendor
 
 
 @router.get("/admin/{bucket_id}", response_model=BucketDetail)
@@ -694,15 +860,27 @@ async def create_ai_action_item(
         share = await db.get(BucketShare, payload.share_id)
         if share is None or share.bucket_id != bucket_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected share does not belong to this bucket")
+        payload.upload_link_id = None
+        payload.vendor_access_id = None
+    if payload.route == "vendor":
+        if payload.vendor_access_id is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a vendor for this task")
+        access = await db.get(BucketVendorAccess, payload.vendor_access_id)
+        if access is None or access.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected vendor access does not belong to this bucket")
+        payload.upload_link_id = None
+        payload.share_id = None
     if payload.route == "uploader":
         if payload.upload_link_id is not None:
             link = await db.get(BucketUploadLink, payload.upload_link_id)
             if link is None or link.bucket_id != bucket_id:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected uploader does not belong to this bucket")
         payload.share_id = None
+        payload.vendor_access_id = None
     if payload.route == "admin":
         payload.upload_link_id = None
         payload.share_id = None
+        payload.vendor_access_id = None
 
     approved_at = _now() if payload.status in ("approved", "completed") else None
     item = BucketAIActionItem(
@@ -711,6 +889,7 @@ async def create_ai_action_item(
         route=payload.route,
         upload_link_id=payload.upload_link_id,
         share_id=payload.share_id,
+        vendor_access_id=payload.vendor_access_id,
         file_id=payload.file_id,
         requested_document_id=payload.requested_document_id,
         title=payload.title.strip(),
@@ -755,6 +934,33 @@ async def patch_ai_action_item(
         value = getattr(payload, field)
         setattr(item, field, value)
         changes.append(field)
+    if item.route == "share":
+        if item.share_id is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a share recipient for this task")
+        share = await db.get(BucketShare, item.share_id)
+        if share is None or share.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected share does not belong to this bucket")
+        item.upload_link_id = None
+        item.vendor_access_id = None
+    elif item.route == "vendor":
+        if item.vendor_access_id is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Select a vendor for this task")
+        access = await db.get(BucketVendorAccess, item.vendor_access_id)
+        if access is None or access.bucket_id != bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected vendor access does not belong to this bucket")
+        item.upload_link_id = None
+        item.share_id = None
+    elif item.route == "uploader":
+        if item.upload_link_id is not None:
+            link = await db.get(BucketUploadLink, item.upload_link_id)
+            if link is None or link.bucket_id != bucket_id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected uploader does not belong to this bucket")
+        item.share_id = None
+        item.vendor_access_id = None
+    else:
+        item.upload_link_id = None
+        item.share_id = None
+        item.vendor_access_id = None
     if "status" in payload.model_fields_set:
         if item.status == "approved" and item.approved_at is None:
             item.approved_at = _now()
@@ -858,6 +1064,203 @@ async def create_upload_link(
     await db.commit()
     await db.refresh(link)
     return _upload_link_read(link, passcode=passcode)
+
+
+@router.get("/admin/{bucket_id}/vendor-access", response_model=list[BucketVendorAccessRead])
+async def list_bucket_vendor_access(
+    bucket_id: UUID,
+    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketVendorAccessRead]:
+    await _load_bucket_or_404(db, bucket_id)
+    rows = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.bucket_id == bucket_id)
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+            .order_by(BucketVendorAccess.created_at.desc())
+        )
+    ).scalars().all()
+    return [_vendor_access_read(access) for access in rows]
+
+
+@router.post("/admin/{bucket_id}/vendor-access", response_model=BucketVendorAccessRead)
+async def create_bucket_vendor_access(
+    bucket_id: UUID,
+    payload: BucketVendorAccessCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketVendorAccessRead:
+    await _load_bucket_or_404(db, bucket_id)
+    vendor = await _vendor_user_from_payload(
+        db,
+        vendor_user_id=payload.vendor_user_id,
+        vendor_name=payload.vendor_name,
+        vendor_email=str(payload.vendor_email) if payload.vendor_email else None,
+        send_invite=True,
+    )
+    access = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.bucket_id == bucket_id, BucketVendorAccess.vendor_user_id == vendor.id)
+            .options(selectinload(BucketVendorAccess.files))
+        )
+    ).scalar_one_or_none()
+    action = "vendor_access_created"
+    if access is None:
+        access = BucketVendorAccess(bucket_id=bucket_id, vendor_user_id=vendor.id)
+        db.add(access)
+    else:
+        action = "vendor_access_reactivated" if access.status == "revoked" else "vendor_access_updated"
+    access.status = "active"
+    access.expires_at = payload.expires_at
+    access.can_preview = payload.can_preview
+    access.can_download = payload.can_download
+    access.can_add_notes = payload.can_add_notes
+    access.can_see_internal_notes = payload.can_see_internal_notes
+    access.can_use_ai_chat = payload.can_use_ai_chat
+    access.can_view_ai_summary = payload.can_view_ai_summary
+    access.can_view_ai_tasks = payload.can_view_ai_tasks
+    access.can_propose_tasks = payload.can_propose_tasks
+    await _apply_vendor_access_file_scope(
+        db,
+        access,
+        bucket_id,
+        file_scope=payload.file_scope,
+        file_ids=payload.file_ids,
+    )
+    await db.flush()
+    await _log(
+        db,
+        bucket_id,
+        action,
+        request=request,
+        user=user,
+        target_type="vendor_access",
+        target_id=str(access.id),
+        detail=f"{vendor.name} | {access.file_scope}",
+    )
+    await db.commit()
+    access = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.id == access.id)
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one()
+    return _vendor_access_read(access)
+
+
+@router.patch("/admin/{bucket_id}/vendor-access/{access_id}", response_model=BucketVendorAccessRead)
+async def patch_bucket_vendor_access(
+    bucket_id: UUID,
+    access_id: UUID,
+    payload: BucketVendorAccessPatch,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketVendorAccessRead:
+    access = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.id == access_id)
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if access is None or access.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vendor access not found")
+    changes: list[str] = []
+    if "status" in payload.model_fields_set and payload.status is not None:
+        access.status = payload.status
+        changes.append(f"status={payload.status}")
+    for field in (
+        "expires_at",
+        "can_preview",
+        "can_download",
+        "can_add_notes",
+        "can_see_internal_notes",
+        "can_use_ai_chat",
+        "can_view_ai_summary",
+        "can_view_ai_tasks",
+        "can_propose_tasks",
+    ):
+        if field in payload.model_fields_set:
+            setattr(access, field, getattr(payload, field))
+            changes.append(field)
+    if "file_scope" in payload.model_fields_set or "file_ids" in payload.model_fields_set:
+        await _apply_vendor_access_file_scope(
+            db,
+            access,
+            bucket_id,
+            file_scope=payload.file_scope or access.file_scope,
+            file_ids=payload.file_ids if payload.file_ids is not None else _vendor_file_ids(access),
+        )
+        changes.append(f"files={len(_vendor_file_ids(access))}")
+    action = "vendor_access_reactivated" if "status=active" in changes else "vendor_access_revoked" if "status=revoked" in changes else "vendor_access_updated"
+    await _log(
+        db,
+        bucket_id,
+        action,
+        request=request,
+        user=user,
+        target_type="vendor_access",
+        target_id=str(access.id),
+        detail=", ".join(changes) or None,
+    )
+    await db.commit()
+    access = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.id == access.id)
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one()
+    return _vendor_access_read(access)
+
+
+@router.delete("/admin/{bucket_id}/vendor-access/{access_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_bucket_vendor_access(
+    bucket_id: UUID,
+    access_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    access = await db.get(BucketVendorAccess, access_id)
+    if access is None or access.bucket_id != bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vendor access not found")
+    access.status = "revoked"
+    await _log(
+        db,
+        bucket_id,
+        "vendor_access_revoked",
+        request=request,
+        user=user,
+        target_type="vendor_access",
+        target_id=str(access.id),
+    )
+    await db.commit()
 
 
 @router.post("/admin/{bucket_id}/shares", response_model=BucketShareRead)
@@ -1168,7 +1571,7 @@ async def delete_admin_file(
                 BucketFile.id == file_id,
                 BucketFile.bucket_id == bucket_id,
             )
-            .options(selectinload(BucketFile.shares))
+            .options(selectinload(BucketFile.shares), selectinload(BucketFile.vendor_access))
         )
     ).scalar_one_or_none()
     if file is None:
@@ -1180,6 +1583,7 @@ async def delete_admin_file(
     file.deleted_by_user_id = user.id
     file.delete_storage_status = _delete_s3_object(file.s3_key)
     file.shares.clear()
+    file.vendor_access.clear()
     await _recalculate_requested_document_status(db, file.requested_document_id)
     await _log(
         db,
@@ -1259,6 +1663,276 @@ async def create_admin_file_annotation(
     await db.commit()
     await db.refresh(annotation)
     return annotation
+
+
+@router.get("/vendor", response_model=list[BucketVendorBucketRead])
+async def list_vendor_buckets(
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketVendorBucketRead]:
+    rows = (
+        await db.execute(
+            select(BucketVendorAccess)
+            .where(BucketVendorAccess.vendor_user_id == user.id)
+            .options(
+                selectinload(BucketVendorAccess.vendor),
+                selectinload(BucketVendorAccess.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+            .order_by(BucketVendorAccess.created_at.desc())
+        )
+    ).scalars().all()
+    output: list[BucketVendorBucketRead] = []
+    for access in rows:
+        if access.bucket.archived_at is not None or not _is_active(access.status, access.expires_at):
+            continue
+        files = _vendor_access_files(access)
+        bucket = BucketVendorBucketRead.model_validate(access.bucket)
+        bucket.file_count = len(files)
+        bucket.uploaded_file_count = len(files)
+        bucket.vendor_access = _vendor_access_read(access)
+        output.append(bucket)
+    return output
+
+
+@router.get("/vendor/{bucket_id}", response_model=BucketVendorAccessReadResponse)
+async def get_vendor_bucket(
+    bucket_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketVendorAccessReadResponse:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    access.last_accessed_at = _now()
+    access.view_count += 1
+    files: list[BucketShareFileRead] = []
+    for file in _vendor_access_files(access):
+        item = BucketShareFileRead.model_validate(file)
+        if access.can_preview:
+            item.preview_url = _download_url(file.s3_key, disposition="inline")
+        if access.can_download:
+            item.download_url = _download_url(file.s3_key, disposition="attachment")
+        files.append(item)
+    notes = [
+        note for note in access.bucket.notes
+        if note.visibility == "shared" or note.vendor_access_id == access.id or access.can_see_internal_notes
+    ]
+    review = await latest_review(db, access.bucket_id)
+    tasks = await visible_action_items(db, access.bucket_id, route="vendor", vendor_access_id=access.id, approved_only=True) if access.can_view_ai_tasks else []
+    await _log(
+        db,
+        access.bucket_id,
+        "vendor_bucket_accessed",
+        request=request,
+        user=user,
+        actor_role="vendor",
+        target_type="vendor_access",
+        target_id=str(access.id),
+    )
+    await db.commit()
+    bucket = BucketRead.model_validate(access.bucket)
+    bucket.file_count = len(files)
+    bucket.uploaded_file_count = len(files)
+    return BucketVendorAccessReadResponse(
+        bucket=bucket,
+        vendor_access=_vendor_access_read(access),
+        files=files,
+        notes=[BucketNoteRead.model_validate(note) for note in notes],
+        ai_summary=vendor_visible_summary(review, access) if access.can_view_ai_summary else None,
+        ai_tasks=[BucketAIActionItemRead.model_validate(item) for item in tasks],
+    )
+
+
+@router.get("/vendor/{bucket_id}/ai-summary", response_model=BucketAISummaryRead)
+async def vendor_ai_summary(
+    bucket_id: UUID,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAISummaryRead:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_view_ai_summary:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI summary is disabled for this vendor access")
+    return BucketAISummaryRead(summary=vendor_visible_summary(await latest_review(db, access.bucket_id), access))
+
+
+@router.get("/vendor/{bucket_id}/ai-tasks", response_model=list[BucketAIActionItemRead])
+async def vendor_ai_tasks(
+    bucket_id: UUID,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_view_ai_tasks:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI tasks are disabled for this vendor access")
+    return await visible_action_items(db, access.bucket_id, route="vendor", vendor_access_id=access.id, approved_only=True)
+
+
+@router.post("/vendor/{bucket_id}/ai-chat", response_model=BucketAIChatResponse)
+async def vendor_ai_chat(
+    bucket_id: UUID,
+    payload: BucketAIChatMessageCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketAIChatResponse:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_use_ai_chat:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "AI chat is disabled for this vendor access")
+    messages, proposals = await create_chat_reply(
+        db,
+        bucket=access.bucket,
+        audience="vendor",
+        message=payload.message,
+        actor_name=user.name or user.email,
+        user=user,
+        vendor_access=access,
+    )
+    if not access.can_propose_tasks:
+        for item in proposals:
+            await db.delete(item)
+        proposals = []
+    await _log(
+        db,
+        access.bucket_id,
+        "vendor_ai_chat",
+        request=request,
+        user=user,
+        actor_role="vendor",
+        target_type="vendor_access",
+        target_id=str(access.id),
+        detail=payload.message[:180],
+    )
+    if proposals:
+        await _log(
+            db,
+            access.bucket_id,
+            "vendor_task_proposed",
+            request=request,
+            user=user,
+            actor_role="vendor",
+            target_type="vendor_access",
+            target_id=str(access.id),
+            detail=f"{len(proposals)} proposed task{'s' if len(proposals) != 1 else ''}",
+        )
+    await db.commit()
+    return BucketAIChatResponse(
+        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        proposed_action_items=[BucketAIActionItemRead.model_validate(item) for item in proposals],
+    )
+
+
+@router.get("/vendor/{bucket_id}/files/{file_id}/review", response_model=BucketFileReviewRead)
+async def vendor_file_review(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileReviewRead:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_preview:
+        await _log(db, bucket_id, "vendor_file_review_denied", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file_id), detail="preview disabled")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Preview is disabled for this vendor access")
+    file = _file_belongs_to_vendor_access(access, file_id)
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    annotations = await _file_annotations(db, bucket_id, file_id)
+    await _log(db, bucket_id, "vendor_file_previewed", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await db.commit()
+    return _review_response(file, annotations, preview=True)
+
+
+@router.post("/vendor/{bucket_id}/files/{file_id}/download", response_model=BucketFileUrl)
+async def vendor_file_download(
+    bucket_id: UUID,
+    file_id: UUID,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUrl:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    file = _file_belongs_to_vendor_access(access, file_id)
+    if file is None:
+        await _log(db, bucket_id, "vendor_file_download_denied", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file_id), detail="file not assigned")
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if not access.can_download:
+        await _log(db, bucket_id, "vendor_file_download_denied", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Download is disabled for this vendor access")
+    access.download_count += 1
+    await _log(db, bucket_id, "vendor_file_download_requested", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await db.commit()
+    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
+
+
+@router.post("/vendor/{bucket_id}/files/{file_id}/annotations", response_model=BucketFileAnnotationRead)
+async def create_vendor_file_annotation(
+    bucket_id: UUID,
+    file_id: UUID,
+    payload: BucketFileAnnotationCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileAnnotation:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_preview or not access.can_add_notes:
+        await _log(db, bucket_id, "vendor_file_annotation_denied", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file_id), detail="preview or notes disabled")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Annotations are disabled for this vendor access")
+    file = _file_belongs_to_vendor_access(access, file_id)
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    annotation = BucketFileAnnotation(
+        bucket_id=bucket_id,
+        file_id=file_id,
+        vendor_access_id=access.id,
+        page_number=payload.page_number,
+        x=payload.x,
+        y=payload.y,
+        width=payload.width,
+        height=payload.height,
+        comment=payload.comment.strip(),
+        author_name=user.name or user.email,
+        author_role="vendor",
+    )
+    db.add(annotation)
+    await db.flush()
+    await _log(db, bucket_id, "vendor_file_annotation_created", request=request, user=user, actor_role="vendor", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await db.commit()
+    await db.refresh(annotation)
+    return annotation
+
+
+@router.post("/vendor/{bucket_id}/notes", response_model=BucketNoteRead)
+async def create_vendor_note(
+    bucket_id: UUID,
+    payload: BucketNoteCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.VENDOR)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketNote:
+    access = await _load_vendor_access_or_404(db, bucket_id, user)
+    if not access.can_add_notes:
+        await _log(db, bucket_id, "vendor_note_denied", request=request, user=user, actor_role="vendor", target_type="vendor_access", target_id=str(access.id), detail="notes disabled")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Notes are disabled for this vendor access")
+    note = BucketNote(
+        bucket_id=bucket_id,
+        vendor_access_id=access.id,
+        author_name=user.name or user.email,
+        author_role="vendor",
+        visibility="shared",
+        content=payload.content,
+    )
+    db.add(note)
+    await db.flush()
+    await _log(db, bucket_id, "vendor_note_created", request=request, user=user, actor_role="vendor", target_type="note", target_id=str(note.id))
+    await db.commit()
+    await db.refresh(note)
+    return note
 
 
 @router.get("/request/{token}", response_model=BucketRequestInfoRead)

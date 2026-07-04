@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     isoftpull_login_password: str = ""
     isoftpull_dashboard_url: str = "https://app.isoftpull.com"
 
+    # Stripe — client payment authorization. Card entry must happen through
+    # Stripe-hosted elements/SDKs; the backend only stores reusable tokens and
+    # non-sensitive card metadata.
+    stripe_secret_key: str = ""
+    stripe_publishable_key: str = ""
+    stripe_webhook_secret: str = ""
+    primary_super_admin_email: str = "franco@qualifiedcommercial.com"
+
     # RentCast
     rentcast_api_key: str = ""
 

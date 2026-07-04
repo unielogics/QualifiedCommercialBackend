@@ -19,7 +19,12 @@ from app.enums import CreditPullStatus, Role
 from app.models.client import Client
 from app.models.credit_pull import CreditPull
 from app.services import calendar_emitter
+from app.schemas.billing import CreditPullAccessRead
 from app.schemas.credit import CreditPullRead, CreditPullRequest
+from app.services.payment_authorization import (
+    client_has_completed_payment_authorization,
+    require_payment_authorized_for_credit,
+)
 from app.services import isoftpull_client
 from app.services import isoftpull_report_parser
 from app.services.isoftpull_session import IsoftpullSessionError, get_session
@@ -68,6 +73,8 @@ async def current(
         the pulled FICO + parsed report on the loan Credit panel.
       • client_id=<uuid> + borrower role mismatch → 403.
     """
+    if user.role == Role.CLIENT:
+        await require_payment_authorized_for_credit(db, user)
     target_cid: str | None
     if client_id and client_id != "self":
         from uuid import UUID
@@ -119,6 +126,30 @@ async def current(
     return _to_read(row) if row else None
 
 
+@router.get("/pull-access", response_model=CreditPullAccessRead)
+async def pull_access(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CreditPullAccessRead:
+    if user.role != Role.CLIENT:
+        return CreditPullAccessRead(
+            role=user.role.value,
+            requires_payment_authorization=False,
+            payment_authorized=True,
+            can_run_credit=True,
+        )
+    authorized = await client_has_completed_payment_authorization(db, user)
+    has_client = user.client is not None
+    return CreditPullAccessRead(
+        role=user.role.value,
+        requires_payment_authorization=True,
+        payment_authorized=authorized,
+        can_run_credit=authorized and has_client,
+        reason_code=None if authorized and has_client else "payment_authorization_required",
+        message=None if authorized and has_client else "Complete the payment pre-authorization before activating credit features.",
+    )
+
+
 @router.post("/pull", response_model=CreditPullRead)
 async def initiate_pull(
     payload: CreditPullRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -126,6 +157,7 @@ async def initiate_pull(
     cid = _client_id_for(user)
     if cid is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Client profile required")
+    await require_payment_authorized_for_credit(db, user)
     if not payload.fcra_consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "FCRA consent required")
 
@@ -535,6 +567,7 @@ async def credit_summary(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Credit pull not found")
     if not _viewer_can_see_pull(user, pull):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
+    await require_payment_authorized_for_credit(db, user)
     scraped = _scraped_from_pull(pull)
     if scraped is None:
         # No parsed report — fall back to a minimal summary built off the

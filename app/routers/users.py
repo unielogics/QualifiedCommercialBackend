@@ -48,12 +48,12 @@ class UserPatch(BaseModel):
 async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
     """List every operator-team user. Super-admin only.
 
-    Excludes CLIENT/LENDER users (Team is the operator team) and soft-deleted rows.
+    Excludes CLIENT/LENDER/VENDOR users (Team is the operator team) and soft-deleted rows.
     """
     rows = (
         await db.execute(
             select(User)
-            .where(User.role.notin_([Role.CLIENT, Role.LENDER]), User.deleted_at.is_(None))
+            .where(User.role.notin_([Role.CLIENT, Role.LENDER, Role.VENDOR]), User.deleted_at.is_(None))
             .order_by(User.name)
         )
     ).scalars().all()
@@ -81,6 +81,11 @@ async def invite_user(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "CLIENT role belongs to /clients — use that endpoint to create borrowers.",
+        )
+    if body.role == Role.VENDOR:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "VENDOR role belongs to bucket vendor access — use /buckets/admin/vendors.",
         )
 
     existing = (

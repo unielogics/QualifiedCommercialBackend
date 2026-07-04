@@ -30,6 +30,7 @@ from app.models.bucket import (
     BucketRequestedDocument,
     BucketShare,
     BucketUploadLink,
+    BucketVendorAccess,
 )
 from app.models.user import User
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
@@ -72,7 +73,7 @@ Return ONLY JSON in this shape:
   "answer": "helpful answer scoped to the user's permitted context",
   "proposed_context_patch": null,
   "proposed_action_items": [
-    {"title": "...", "instructions": "...", "route": "admin|uploader|share", "rationale": "..."}
+    {"title": "...", "instructions": "...", "route": "admin|uploader|share|vendor", "rationale": "..."}
   ]
 }
 
@@ -81,7 +82,7 @@ Rules:
 - External users cannot update saved bucket instructions directly.
 - If an external user asks for something actionable, create proposed_action_items for super-admin approval.
 - For admin users, proposed_context_patch may include deal_type, documentation_level, collateral_type, loan_purpose, underwriting_focus, or custom_instructions when the admin asks to update instructions.
-- For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for shared-reviewer tasks, and "admin" for internal Qualified Commercial tasks.
+- For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for one-time shared-reviewer tasks, "vendor" for authenticated vendor tasks, and "admin" for internal Qualified Commercial tasks.
 - When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
 - Keep answers concise and operational.
 """
@@ -717,6 +718,29 @@ def share_visible_summary(review: BucketAIReview | None, share: BucketShare) -> 
     }
 
 
+def vendor_visible_summary(review: BucketAIReview | None, access: BucketVendorAccess) -> dict[str, Any] | None:
+    if review is None or not isinstance(review.result, dict):
+        return None
+    visible_files = (
+        access.bucket.files if access.file_scope == "all_active" else access.files
+    )
+    visible_names = {
+        file.file_name for file in visible_files
+        if file.status == "uploaded" and file.deleted_at is None
+    }
+    per_file = [
+        item for item in review.result.get("per_file_summaries", []) or []
+        if isinstance(item, dict) and item.get("file_name") in visible_names
+    ]
+    return {
+        "summary": f"{len(visible_names)} vendor-visible file{'' if len(visible_names) == 1 else 's'} available for review.",
+        "per_file_summaries": per_file,
+        "missing_or_incomplete_items": _visible_review_items(review.result.get("missing_or_incomplete_items") or [], visible_names),
+        "discrepancies": _visible_review_items(review.result.get("discrepancies") or [], visible_names),
+        "blocked_files": _visible_review_items(review.result.get("blocked_files") or [], visible_names),
+    }
+
+
 def _visible_review_items(items: Any, visible_names: set[str]) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
@@ -804,6 +828,7 @@ async def visible_action_items(
     route: str | None = None,
     upload_link_id: UUID | None = None,
     share_id: UUID | None = None,
+    vendor_access_id: UUID | None = None,
     approved_only: bool = False,
 ) -> list[BucketAIActionItem]:
     stmt = select(BucketAIActionItem).where(BucketAIActionItem.bucket_id == bucket_id)
@@ -822,6 +847,8 @@ async def visible_action_items(
         )
     if share_id:
         stmt = stmt.where(BucketAIActionItem.share_id == share_id)
+    if vendor_access_id:
+        stmt = stmt.where(BucketAIActionItem.vendor_access_id == vendor_access_id)
     return (await db.execute(stmt.order_by(BucketAIActionItem.created_at.desc()))).scalars().all()
 
 
@@ -835,11 +862,13 @@ async def create_chat_reply(
     user: User | None = None,
     upload_link: BucketUploadLink | None = None,
     share: BucketShare | None = None,
+    vendor_access: BucketVendorAccess | None = None,
 ) -> tuple[list[BucketAIMessage], list[BucketAIActionItem]]:
     user_row = BucketAIMessage(
         bucket_id=bucket.id,
         upload_link_id=upload_link.id if upload_link else None,
         share_id=share.id if share else None,
+        vendor_access_id=vendor_access.id if vendor_access else None,
         user_id=user.id if user else None,
         audience=audience,
         role="user",
@@ -849,7 +878,7 @@ async def create_chat_reply(
     db.add(user_row)
     await db.flush()
 
-    context = await _chat_context(db, bucket=bucket, audience=audience, upload_link=upload_link, share=share)
+    context = await _chat_context(db, bucket=bucket, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access)
     model = model_light()
     try:
         resp = await tracked_messages_create(
@@ -858,7 +887,13 @@ async def create_chat_reply(
             client=get_client(),
             model=model,
             user_id=user.id if user else None,
-            metadata={"bucket_id": str(bucket.id), "audience": audience, "share_id": str(share.id) if share else None, "upload_link_id": str(upload_link.id) if upload_link else None},
+            metadata={
+                "bucket_id": str(bucket.id),
+                "audience": audience,
+                "share_id": str(share.id) if share else None,
+                "upload_link_id": str(upload_link.id) if upload_link else None,
+                "vendor_access_id": str(vendor_access.id) if vendor_access else None,
+            },
             max_tokens=1200,
             system=CHAT_SYSTEM,
             messages=[{"role": "user", "content": json.dumps({"context": context, "message": message}, default=str)}],
@@ -870,6 +905,7 @@ async def create_chat_reply(
             bucket_id=bucket.id,
             upload_link_id=upload_link.id if upload_link else None,
             share_id=share.id if share else None,
+            vendor_access_id=vendor_access.id if vendor_access else None,
             audience=audience,
             role="assistant",
             author_name="Bucket AI",
@@ -881,7 +917,7 @@ async def create_chat_reply(
         )
         db.add(assistant)
         await db.flush()
-        proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, user=user)
+        proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access, user=user)
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_message_created", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=message[:180])
         return [user_row, assistant], proposals
     except Exception as exc:  # noqa: BLE001
@@ -890,6 +926,7 @@ async def create_chat_reply(
             bucket_id=bucket.id,
             upload_link_id=upload_link.id if upload_link else None,
             share_id=share.id if share else None,
+            vendor_access_id=vendor_access.id if vendor_access else None,
             audience=audience,
             role="assistant",
             author_name="Bucket AI",
@@ -908,6 +945,7 @@ async def _chat_context(
     audience: str,
     upload_link: BucketUploadLink | None,
     share: BucketShare | None,
+    vendor_access: BucketVendorAccess | None,
 ) -> dict[str, Any]:
     base = {
         "bucket": {
@@ -965,6 +1003,31 @@ async def _chat_context(
             "approved_tasks": [_task_context(task) for task in tasks],
             "instructions": "Answer only from the files and notes visible to this share link.",
         }
+    if vendor_access is not None:
+        review = await latest_review(db, bucket.id)
+        files = (
+            bucket.files if vendor_access.file_scope == "all_active" else vendor_access.files
+        )
+        visible_files = [
+            file for file in files
+            if file.status == "uploaded" and file.deleted_at is None
+        ]
+        tasks = await visible_action_items(db, bucket.id, route="vendor", vendor_access_id=vendor_access.id, approved_only=True)
+        notes = [
+            note for note in bucket.notes
+            if note.visibility == "shared"
+            or note.vendor_access_id == vendor_access.id
+            or vendor_access.can_see_internal_notes
+        ]
+        return {
+            **base,
+            "recipient_name": vendor_access.vendor.name if vendor_access.vendor else "Vendor",
+            "visible_files": [_file_context(file) for file in visible_files],
+            "visible_notes": [_note_context(note) for note in notes],
+            "visible_summary": vendor_visible_summary(review, vendor_access) if vendor_access.can_view_ai_summary else None,
+            "approved_tasks": [_task_context(task) for task in tasks],
+            "instructions": "Answer only from the files and notes visible to this authenticated vendor access. If the vendor asks for requirements or clarifications, propose tasks for super-admin approval before they become visible to clients or other users.",
+        }
     return base
 
 
@@ -977,6 +1040,7 @@ async def _create_proposals(
     audience: str,
     upload_link: BucketUploadLink | None,
     share: BucketShare | None,
+    vendor_access: BucketVendorAccess | None,
     user: User | None = None,
 ) -> list[BucketAIActionItem]:
     raw_items = parsed.get("proposed_action_items")
@@ -991,10 +1055,12 @@ async def _create_proposals(
         instructions = str(raw.get("instructions") or "").strip()
         if not title or not instructions:
             continue
-        route = str(raw.get("route") or ("share" if share else "uploader" if upload_link else "admin")).strip()
-        if route not in {"admin", "uploader", "share"}:
+        route = str(raw.get("route") or ("vendor" if vendor_access else "share" if share else "uploader" if upload_link else "admin")).strip()
+        if route not in {"admin", "uploader", "share", "vendor"}:
             route = "admin"
         if route == "share" and share is None and audience == "admin":
+            route = "admin"
+        if route == "vendor" and vendor_access is None and audience == "admin":
             route = "admin"
         approved_at = _now() if auto_approve else None
         item = BucketAIActionItem(
@@ -1002,6 +1068,7 @@ async def _create_proposals(
             source_message_id=source_message.id,
             upload_link_id=upload_link.id if route == "uploader" and upload_link else None,
             share_id=share.id if route == "share" and share else None,
+            vendor_access_id=vendor_access.id if route == "vendor" and vendor_access else None,
             status="approved" if auto_approve else "proposed",
             route=route,
             title=title[:220],

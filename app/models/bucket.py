@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, func
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,15 @@ bucket_share_files = Table(
     "bucket_share_files",
     Base.metadata,
     Column("share_id", PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="CASCADE"), primary_key=True),
+    Column("file_id", PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="CASCADE"), primary_key=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+
+bucket_vendor_access_files = Table(
+    "bucket_vendor_access_files",
+    Base.metadata,
+    Column("vendor_access_id", PG_UUID(as_uuid=True), ForeignKey("bucket_vendor_access.id", ondelete="CASCADE"), primary_key=True),
     Column("file_id", PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="CASCADE"), primary_key=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
@@ -48,6 +57,7 @@ class Bucket(TimestampMixin, Base):
     file_annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     upload_links: Mapped[list[BucketUploadLink]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     shares: Mapped[list[BucketShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    vendor_access: Mapped[list[BucketVendorAccess]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     notes: Mapped[list[BucketNote]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     activity: Mapped[list[BucketActivityLog]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     ai_reviews: Mapped[list[BucketAIReview]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
@@ -145,6 +155,10 @@ class BucketFile(TimestampMixin, Base):
         secondary=bucket_share_files,
         back_populates="files",
     )
+    vendor_access: Mapped[list[BucketVendorAccess]] = relationship(
+        secondary=bucket_vendor_access_files,
+        back_populates="files",
+    )
     annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="file", cascade="all, delete-orphan")
 
 
@@ -161,6 +175,9 @@ class BucketFileAnnotation(TimestampMixin, Base):
     share_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    vendor_access_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_vendor_access.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     page_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     x: Mapped[float] = mapped_column(Float, nullable=False)
     y: Mapped[float] = mapped_column(Float, nullable=False)
@@ -173,6 +190,7 @@ class BucketFileAnnotation(TimestampMixin, Base):
     bucket: Mapped[Bucket] = relationship(back_populates="file_annotations")
     file: Mapped[BucketFile] = relationship(back_populates="annotations")
     share: Mapped[BucketShare | None] = relationship()
+    vendor_access: Mapped[BucketVendorAccess | None] = relationship()
 
 
 class BucketShare(TimestampMixin, Base):
@@ -208,6 +226,42 @@ class BucketShare(TimestampMixin, Base):
     )
 
 
+class BucketVendorAccess(TimestampMixin, Base):
+    __tablename__ = "bucket_vendor_access"
+    __table_args__ = (
+        UniqueConstraint("bucket_id", "vendor_user_id", name="uq_bucket_vendor_access_bucket_user"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    vendor_user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    file_scope: Mapped[str] = mapped_column(String(24), nullable=False, default="all_active", server_default="all_active")
+    can_preview: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_download: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    can_add_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_see_internal_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    can_use_ai_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_view_ai_summary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_view_ai_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_propose_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    view_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    download_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    bucket: Mapped[Bucket] = relationship(back_populates="vendor_access")
+    vendor: Mapped[User] = relationship(foreign_keys=[vendor_user_id])
+    files: Mapped[list[BucketFile]] = relationship(
+        secondary=bucket_vendor_access_files,
+        back_populates="vendor_access",
+    )
+
+
 class BucketNote(TimestampMixin, Base):
     __tablename__ = "bucket_notes"
 
@@ -218,6 +272,9 @@ class BucketNote(TimestampMixin, Base):
     share_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True
     )
+    vendor_access_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_vendor_access.id", ondelete="SET NULL"), nullable=True
+    )
     author_name: Mapped[str] = mapped_column(String(180), nullable=False)
     author_role: Mapped[str] = mapped_column(String(40), nullable=False)
     visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="admin", server_default="admin")
@@ -225,6 +282,7 @@ class BucketNote(TimestampMixin, Base):
 
     bucket: Mapped[Bucket] = relationship(back_populates="notes")
     share: Mapped[BucketShare | None] = relationship()
+    vendor_access: Mapped[BucketVendorAccess | None] = relationship()
 
 
 class BucketActivityLog(Base):
@@ -291,6 +349,9 @@ class BucketAIMessage(Base):
     share_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    vendor_access_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_vendor_access.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -307,6 +368,7 @@ class BucketAIMessage(Base):
     bucket: Mapped[Bucket] = relationship(back_populates="ai_messages")
     upload_link: Mapped[BucketUploadLink | None] = relationship()
     share: Mapped[BucketShare | None] = relationship()
+    vendor_access: Mapped[BucketVendorAccess | None] = relationship()
     user: Mapped[User | None] = relationship(foreign_keys=[user_id])
 
 
@@ -325,6 +387,9 @@ class BucketAIActionItem(Base):
     )
     share_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_shares.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    vendor_access_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_vendor_access.id", ondelete="SET NULL"), nullable=True, index=True
     )
     file_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True, index=True
@@ -353,6 +418,7 @@ class BucketAIActionItem(Base):
     source_message: Mapped[BucketAIMessage | None] = relationship()
     upload_link: Mapped[BucketUploadLink | None] = relationship()
     share: Mapped[BucketShare | None] = relationship()
+    vendor_access: Mapped[BucketVendorAccess | None] = relationship()
     file: Mapped[BucketFile | None] = relationship()
     requested_document: Mapped[BucketRequestedDocument | None] = relationship()
     created_by_user: Mapped[User | None] = relationship(foreign_keys=[created_by_user_id])
