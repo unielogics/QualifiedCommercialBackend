@@ -59,10 +59,17 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
   "underwriter_questions": [{"question": "...", "route": "admin|uploader|share", "reason": "..."}],
   "proof_of_funds_financial_collateral_gaps": [{"title": "...", "detail": "..."}],
   "recommended_next_document_requests": [{"title": "...", "instructions": "...", "route": "admin|uploader|share", "rationale": "..."}],
-  "per_file_summaries": [{"file_id": "...", "file_name": "...", "summary": "...", "red_flags": ["..."]}]
+  "per_file_summaries": [{"file_id": "...", "file_name": "...", "summary": "...", "red_flags": ["..."]}],
+  "bankability_assessment": {
+    "status": "Bankable|Incomplete - cannot determine|Not bankable based on current file",
+    "product_fit": ["DSCR", "Full-doc commercial", "Dealer financing with real estate collateral"],
+    "reason": "...",
+    "conditions": ["..."]
+  }
 }
 
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
+If ai_context.review_type is "dealer_gatekeeper_v1", act as a strict public lead gatekeeper for a car dealer financing file. Always require last 2 years tax returns, current-year P&L, last 3 months bank statements, an asset/real estate schedule, and mortgage notes/payoff statements for real estate collateral where available. Do not mark the file "Bankable" when core required documents are missing; use "Incomplete - cannot determine" until enough evidence is present. This is a preliminary screen, not a commitment to lend.
 Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items. Keep each item detail/summary under 220 characters. Never list every file. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and requested next actions over exhaustive document recaps.
 """
 
