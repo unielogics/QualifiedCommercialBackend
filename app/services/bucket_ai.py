@@ -920,6 +920,11 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     await db.flush()
 
     files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    extracted_zip_parent_ids = {
+        file.parent_zip_file_id
+        for file in files
+        if getattr(file, "parent_zip_file_id", None) is not None and file.deleted_at is None
+    }
     review.file_ids = [str(file.id) for file in files]
 
     requested = [
@@ -941,6 +946,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             "size_bytes": file.size_bytes,
             "requested_document_id": str(file.requested_document_id) if file.requested_document_id else None,
             "uploaded_by": file.uploaded_by_name,
+            "parent_zip_file_id": str(file.parent_zip_file_id) if getattr(file, "parent_zip_file_id", None) else None,
+            "zip_entry_path": getattr(file, "zip_entry_path", None),
+            "extraction_status": getattr(file, "extraction_status", None),
+            "extraction_reason": getattr(file, "extraction_reason", None),
         }
         for file in files
     ]
@@ -981,6 +990,9 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             continue
         raw, content_type = fetched
         if _is_zip_file(content_type, file.file_name):
+            if file.id in extracted_zip_parent_ids:
+                skipped.append(_skip_file(file, "zip_parent_archive", "ZIP contents were extracted into bucket files, so the archive itself was not re-read by AI review."))
+                continue
             if len(raw) > MAX_ZIP_FILE_BYTES:
                 skipped.append(_skip_file(file, "zip_too_large", "The ZIP file is larger than the current AI extraction limit and was reviewed by metadata only."))
                 continue

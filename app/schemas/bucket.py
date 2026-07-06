@@ -137,6 +137,10 @@ class BucketRequestUploadedFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
     requested_document_id: UUID | None
+    parent_zip_file_id: UUID | None = None
+    zip_entry_path: str | None = None
+    extraction_status: str | None = None
+    extraction_reason: str | None = None
     file_name: str
     content_type: str
     size_bytes: int
@@ -191,6 +195,10 @@ class BucketFileRead(ORMModel):
     id: UUID
     bucket_id: UUID
     requested_document_id: UUID | None
+    parent_zip_file_id: UUID | None = None
+    zip_entry_path: str | None = None
+    extraction_status: str | None = None
+    extraction_reason: str | None = None
     file_name: str
     s3_key: str
     content_type: str

@@ -147,10 +147,18 @@ class BucketFile(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     delete_storage_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parent_zip_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    zip_entry_path: Mapped[str | None] = mapped_column(String(700), nullable=True)
+    extraction_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    extraction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     bucket: Mapped[Bucket] = relationship(back_populates="files")
     requested_document: Mapped[BucketRequestedDocument | None] = relationship(back_populates="files")
     upload_link: Mapped[BucketUploadLink | None] = relationship()
+    parent_zip_file: Mapped[BucketFile | None] = relationship(remote_side=[id], back_populates="extracted_files")
+    extracted_files: Mapped[list[BucketFile]] = relationship(back_populates="parent_zip_file")
     shares: Mapped[list[BucketShare]] = relationship(
         secondary=bucket_share_files,
         back_populates="files",

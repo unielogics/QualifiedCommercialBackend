@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import mimetypes
 import secrets
+import zipfile
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -20,6 +24,7 @@ from app.models.booking_settings import BookingSettings
 from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
 from app.models.event import CalendarEvent
+from app.models.dealer_intake_login import DealerIntakeLoginChallenge
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
@@ -28,6 +33,7 @@ from app.routers.buckets import (
     _hash_passcode,
     _log,
     _public_url,
+    _s3_client,
     _safe_filename,
     _upload_url,
 )
@@ -50,6 +56,27 @@ client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket
 
 TERMS_VERSION = "2026-05-19"
 PRIVACY_VERSION = "2026-05-19"
+DEALER_LOGIN_CODE_TTL_MINUTES = 10
+DEALER_LOGIN_SESSION_TTL_HOURS = 12
+DEALER_LOGIN_MAX_ATTEMPTS = 5
+DEALER_LOGIN_RATE_LIMIT_WINDOW_MINUTES = 15
+DEALER_LOGIN_RATE_LIMIT_MAX = 5
+ZIP_MAX_ENTRIES = 60
+ZIP_MAX_ENTRY_BYTES = 40 * 1024 * 1024
+ZIP_MAX_TOTAL_BYTES = 80 * 1024 * 1024
+ZIP_SUPPORTED_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".csv",
+    ".xlsx",
+    ".txt",
+    ".md",
+    ".log",
+}
 
 
 REQUIRED_DOCUMENTS = [
@@ -152,6 +179,28 @@ class DealerResumeLinkResponse(BaseModel):
     message: str = "If a matching secure intake exists, a resume link has been sent."
 
 
+class DealerLoginStartRequest(BaseModel):
+    email: EmailStr
+
+
+class DealerLoginStartResponse(BaseModel):
+    ok: bool = True
+    message: str = "If a secure dealer file exists for this email, a short access code has been sent."
+
+
+class DealerLoginVerifyRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=16)
+
+
+class DealerLogoutRequest(BaseModel):
+    session_token: str | None = Field(default=None, max_length=255)
+
+
+class DealerLogoutResponse(BaseModel):
+    ok: bool = True
+
+
 class DealerFileUploadInit(BaseModel):
     requested_document_id: UUID | None = None
     file_name: str = Field(min_length=1, max_length=255)
@@ -195,6 +244,7 @@ class DealerIntakeRead(ORMModel):
 class DealerIntakeResponse(BaseModel):
     intake: DealerIntakeRead
     token: str | None = None
+    session_token: str | None = None
     resume_url: str | None = None
     upload_url: str | None = None
     assistant_message: str
@@ -216,6 +266,19 @@ def _hash_token(token: str) -> str:
 
 def _new_public_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def _new_login_code() -> str:
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _dealer_session_from_request(request: Request) -> str | None:
+    raw = request.headers.get("x-dealer-session") or request.headers.get("authorization")
+    if not raw:
+        return None
+    if raw.lower().startswith("bearer "):
+        return raw.split(" ", 1)[1].strip()
+    return raw.strip()
 
 
 def _normalize_email(email: str) -> str:
@@ -273,6 +336,149 @@ def _record_resume_email(
     state["resume_email_deliveries"] = deliveries[-10:]
     intake.intake_state = state
     return record
+
+
+def _record_login_code_email(
+    intake: PublicUnderwritingIntake,
+    *,
+    code: str,
+    request: Request,
+    reason: str,
+) -> dict[str, Any]:
+    subject = "Your Qualified Commercial dealer review access code"
+    body_text = (
+        f"Hi {intake.full_name},\n\n"
+        f"Your dealer funding review access code is {code}.\n\n"
+        f"This code expires in {DEALER_LOGIN_CODE_TTL_MINUTES} minutes. "
+        "If you did not request this code, you can ignore this email.\n\n"
+        "Qualified Commercial LLC"
+    )
+    body_html = (
+        f"<p>Hi {intake.full_name},</p>"
+        "<p>Your dealer funding review access code is:</p>"
+        f'<p style="font-size:22px;font-weight:700;letter-spacing:2px">{code}</p>'
+        f"<p>This code expires in {DEALER_LOGIN_CODE_TTL_MINUTES} minutes. "
+        "If you did not request this code, you can ignore this email.</p>"
+        "<p>Qualified Commercial LLC</p>"
+    )
+    result = send_email(to_email=intake.email, subject=subject, body_text=body_text, body_html=body_html)
+    record = {
+        "reason": reason,
+        "status": result.detail,
+        "ok": result.ok,
+        "message_id": result.message_id,
+        "sent_at": _now().isoformat(),
+        **_request_audit(request),
+    }
+    state = _intake_state(intake)
+    deliveries = state.get("dealer_login_email_deliveries")
+    if not isinstance(deliveries, list):
+        deliveries = []
+    deliveries.append(record)
+    state["dealer_login_email"] = record
+    state["dealer_login_email_deliveries"] = deliveries[-10:]
+    intake.intake_state = state
+    return record
+
+
+async def _latest_active_intake_by_email(db: AsyncSession, email: str) -> PublicUnderwritingIntake | None:
+    return (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.email == _normalize_email(email))
+            .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+            .where(Bucket.archived_at.is_(None))
+            .options(
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+                selectinload(PublicUnderwritingIntake.bucket_upload_link),
+                selectinload(PublicUnderwritingIntake.latest_review),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+            .order_by(PublicUnderwritingIntake.updated_at.desc())
+        )
+    ).scalars().first()
+
+
+async def _start_login_challenge(
+    db: AsyncSession,
+    *,
+    email: str,
+    request: Request,
+    reason: str,
+) -> bool:
+    normalized = _normalize_email(email)
+    intake = await _latest_active_intake_by_email(db, normalized)
+    if intake is None or intake.bucket is None or intake.bucket.archived_at is not None:
+        return False
+    email_hash = _hash_token(normalized)
+    window_start = _now() - timedelta(minutes=DEALER_LOGIN_RATE_LIMIT_WINDOW_MINUTES)
+    recent_count = (
+        await db.execute(
+            select(func.count(DealerIntakeLoginChallenge.id)).where(
+                DealerIntakeLoginChallenge.email_hash == email_hash,
+                DealerIntakeLoginChallenge.created_at >= window_start,
+            )
+        )
+    ).scalar_one()
+    if recent_count >= DEALER_LOGIN_RATE_LIMIT_MAX:
+        return True
+    code = _new_login_code()
+    challenge = DealerIntakeLoginChallenge(
+        intake_id=intake.id,
+        email_hash=email_hash,
+        code_hash=_hash_token(code),
+        expires_at=_now() + timedelta(minutes=DEALER_LOGIN_CODE_TTL_MINUTES),
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    db.add(challenge)
+    _record_login_code_email(intake, code=code, request=request, reason=reason)
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_login_code_sent",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="dealer_ai_intake",
+        target_id=str(intake.id),
+        detail="Dealer AI continuation code sent",
+    )
+    return True
+
+
+async def _load_intake_by_dealer_session(db: AsyncSession, session_token: str) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge]:
+    session_hash = _hash_token(session_token)
+    challenge = (
+        await db.execute(
+            select(DealerIntakeLoginChallenge)
+            .where(
+                DealerIntakeLoginChallenge.session_hash == session_hash,
+                DealerIntakeLoginChallenge.revoked_at.is_(None),
+                DealerIntakeLoginChallenge.session_expires_at > _now(),
+            )
+            .options(
+                selectinload(DealerIntakeLoginChallenge.intake)
+                .selectinload(PublicUnderwritingIntake.bucket)
+                .selectinload(Bucket.requested_documents),
+                selectinload(DealerIntakeLoginChallenge.intake)
+                .selectinload(PublicUnderwritingIntake.bucket)
+                .selectinload(Bucket.files),
+                selectinload(DealerIntakeLoginChallenge.intake)
+                .selectinload(PublicUnderwritingIntake.bucket)
+                .selectinload(Bucket.notes),
+                selectinload(DealerIntakeLoginChallenge.intake).selectinload(PublicUnderwritingIntake.bucket_upload_link),
+                selectinload(DealerIntakeLoginChallenge.intake).selectinload(PublicUnderwritingIntake.latest_review),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if challenge is None or challenge.intake is None or challenge.intake.bucket.archived_at is not None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session is expired or invalid")
+    return challenge.intake, challenge
 
 
 def _active_files(bucket: Bucket) -> list[BucketFile]:
@@ -849,6 +1055,7 @@ async def _response(
     intake: PublicUnderwritingIntake,
     *,
     token: str | None,
+    session_token: str | None = None,
     assistant_message: str | None = None,
     messages: list[Any] | None = None,
     forced_widget_type: str | None = None,
@@ -859,9 +1066,24 @@ async def _response(
     widget = None
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
+    if messages is None:
+        recent = (
+            await db.execute(
+                select(BucketAIMessage)
+                .where(
+                    BucketAIMessage.bucket_id == intake.bucket_id,
+                    BucketAIMessage.audience == "uploader",
+                    BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
+                )
+                .order_by(BucketAIMessage.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        messages = list(reversed(recent))
     return DealerIntakeResponse(
         intake=DealerIntakeRead.model_validate(intake),
         token=token,
+        session_token=session_token,
         resume_url=_public_url(f"/dealer-ai-underwriter?token={token}") if token else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or _message_for_widget(widget, intake),
@@ -952,6 +1174,165 @@ async def _start_upload(
     return BucketFileUploadInitResponse(file_id=file.id, upload_url=upload_url, s3_key=s3_key, required_headers=headers)
 
 
+def _is_zip_upload(file: BucketFile) -> bool:
+    media = (file.content_type or "").lower()
+    return file.file_name.lower().endswith(".zip") or "application/zip" in media or "application/x-zip-compressed" in media
+
+
+def _safe_zip_entry_path(name: str) -> str | None:
+    normalized = name.replace("\\", "/").strip("/")
+    if not normalized or normalized.endswith("/"):
+        return None
+    parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+    if not parts or len(parts) != len(normalized.split("/")):
+        return None
+    return "/".join(parts)[:700]
+
+
+def _zip_entry_supported(name: str) -> bool:
+    lower = name.lower()
+    return any(lower.endswith(ext) for ext in ZIP_SUPPORTED_EXTENSIONS)
+
+
+def _guess_entry_content_type(name: str) -> str:
+    guessed, _ = mimetypes.guess_type(name)
+    if guessed:
+        return guessed
+    lower = name.lower()
+    if lower.endswith(".xlsx"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if lower.endswith(".zip"):
+        return "application/zip"
+    return "application/octet-stream"
+
+
+def _read_bucket_object(s3_key: str) -> bytes | None:
+    bucket, _, _ = _bucket_storage_config()
+    try:
+        obj = _s3_client().get_object(Bucket=bucket, Key=s3_key)
+        return obj["Body"].read()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _put_bucket_object(s3_key: str, content_type: str, data: bytes) -> None:
+    bucket, _, kms_key_id = _bucket_storage_config()
+    _s3_client().put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=data,
+        ContentType=content_type,
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=kms_key_id,
+    )
+
+
+async def _extract_zip_bucket_files(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    file: BucketFile,
+    request: Request,
+    *,
+    actor_name: str,
+    actor_email: str,
+) -> None:
+    if not _is_zip_upload(file):
+        return
+    if file.extraction_status in {"extracted", "partial", "skipped"}:
+        return
+    raw = _read_bucket_object(file.s3_key)
+    if raw is None:
+        file.extraction_status = "skipped"
+        file.extraction_reason = json.dumps([{"entry": file.file_name, "reason": "zip_fetch_failed"}])
+        return
+    skipped: list[dict[str, str]] = []
+    extracted = 0
+    total_bytes = 0
+    _, prefix, _ = _bucket_storage_config()
+    try:
+        with zipfile.ZipFile(BytesIO(raw)) as archive:
+            for index, member in enumerate(archive.infolist()):
+                if index >= ZIP_MAX_ENTRIES:
+                    skipped.append({"entry": member.filename, "reason": "zip_entry_limit"})
+                    continue
+                entry_path = _safe_zip_entry_path(member.filename)
+                if not entry_path:
+                    skipped.append({"entry": member.filename, "reason": "zip_unsafe_path"})
+                    continue
+                if entry_path.lower().endswith(".zip"):
+                    skipped.append({"entry": entry_path, "reason": "nested_zip_unsupported"})
+                    continue
+                if member.flag_bits & 0x1:
+                    skipped.append({"entry": entry_path, "reason": "zip_entry_encrypted"})
+                    continue
+                if member.file_size > ZIP_MAX_ENTRY_BYTES:
+                    skipped.append({"entry": entry_path, "reason": "zip_entry_too_large"})
+                    continue
+                if total_bytes + member.file_size > ZIP_MAX_TOTAL_BYTES:
+                    skipped.append({"entry": entry_path, "reason": "zip_total_too_large"})
+                    continue
+                if not _zip_entry_supported(entry_path):
+                    skipped.append({"entry": entry_path, "reason": "unsupported_file_type"})
+                    continue
+                duplicate = (
+                    await db.execute(
+                        select(BucketFile).where(
+                            BucketFile.parent_zip_file_id == file.id,
+                            BucketFile.zip_entry_path == entry_path,
+                            BucketFile.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if duplicate is not None:
+                    continue
+                try:
+                    data = archive.read(member)
+                except RuntimeError:
+                    skipped.append({"entry": entry_path, "reason": "zip_entry_encrypted"})
+                    continue
+                total_bytes += len(data)
+                content_type = _guess_entry_content_type(entry_path)
+                child_id = uuid4()
+                safe = _safe_filename(entry_path.split("/")[-1])
+                child_key = f"{prefix}/uploads/{intake.bucket_id}/{child_id}-zip-{safe}"
+                _put_bucket_object(child_key, content_type, data)
+                child = BucketFile(
+                    id=child_id,
+                    bucket_id=intake.bucket_id,
+                    requested_document_id=None,
+                    upload_link_id=intake.bucket_upload_link_id,
+                    file_name=entry_path,
+                    s3_key=child_key,
+                    content_type=content_type,
+                    size_bytes=len(data),
+                    uploaded_by_name=actor_name,
+                    uploaded_by_email=actor_email,
+                    status="uploaded",
+                    parent_zip_file_id=file.id,
+                    zip_entry_path=entry_path,
+                    extraction_status="extracted",
+                )
+                db.add(child)
+                extracted += 1
+    except zipfile.BadZipFile:
+        skipped.append({"entry": file.file_name, "reason": "zip_parse_failed"})
+    file.extraction_status = "extracted" if extracted and not skipped else "partial" if extracted else "skipped"
+    file.extraction_reason = json.dumps(skipped[-80:])
+    if extracted:
+        await _log(
+            db,
+            intake.bucket_id,
+            "dealer_ai_zip_extracted",
+            request=request,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role="public_lead",
+            target_type="file",
+            target_id=str(file.id),
+            detail=f"Extracted {extracted} supported file(s) from {file.file_name}",
+        )
+
+
 async def _complete_upload(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
@@ -982,6 +1363,7 @@ async def _complete_upload(
                 content=payload.note,
             )
         )
+    await _extract_zip_bucket_files(db, intake, file, request, actor_name=actor_name, actor_email=actor_email)
     await _log(
         db,
         intake.bucket_id,
@@ -1007,6 +1389,14 @@ async def start_dealer_intake(
 ) -> DealerIntakeResponse:
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
+    existing = await _latest_active_intake_by_email(db, str(payload.email))
+    if existing is not None:
+        await _start_login_challenge(db, email=str(payload.email), request=request, reason="existing_intake_start")
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A secure dealer file already exists for this email. We sent a short access code so you can continue that file.",
+        )
     client = await _find_or_create_client(db, payload)
     bucket, link = await _create_bucket_for_intake(db, client, payload, request)
     token = _new_public_token()
@@ -1053,6 +1443,124 @@ async def start_dealer_intake(
             + email_note
         ),
     )
+
+
+@router.post("/login/start", response_model=DealerLoginStartResponse)
+async def start_dealer_login(
+    payload: DealerLoginStartRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLoginStartResponse:
+    await _start_login_challenge(db, email=str(payload.email), request=request, reason="dealer_login_requested")
+    await db.commit()
+    return DealerLoginStartResponse()
+
+
+@router.post("/login/verify", response_model=DealerIntakeResponse)
+async def verify_dealer_login(
+    payload: DealerLoginVerifyRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    email = _normalize_email(str(payload.email))
+    email_hash = _hash_token(email)
+    challenge = (
+        await db.execute(
+            select(DealerIntakeLoginChallenge)
+            .where(
+                DealerIntakeLoginChallenge.email_hash == email_hash,
+                DealerIntakeLoginChallenge.used_at.is_(None),
+                DealerIntakeLoginChallenge.revoked_at.is_(None),
+                DealerIntakeLoginChallenge.expires_at > _now(),
+            )
+            .order_by(DealerIntakeLoginChallenge.created_at.desc())
+        )
+    ).scalars().first()
+    if challenge is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if _hash_token(payload.code.strip()) != challenge.code_hash:
+        challenge.attempt_count += 1
+        if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+            challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    session_token = secrets.token_urlsafe(40)
+    public_token = _new_public_token()
+    challenge.used_at = _now()
+    challenge.session_hash = _hash_token(session_token)
+    challenge.session_expires_at = _now() + timedelta(hours=DEALER_LOGIN_SESSION_TTL_HOURS)
+    intake = await db.get(PublicUnderwritingIntake, challenge.intake_id)
+    if intake is None:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    intake.token_hash = _hash_token(public_token)
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_login_verified",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="dealer_ai_intake",
+        target_id=str(intake.id),
+        detail="Dealer AI continuation login verified",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        assistant_message="Welcome back. I restored your secure dealer funding room with your prior uploads and chat context.",
+    )
+
+
+@router.get("/session", response_model=DealerIntakeResponse)
+async def get_dealer_session(request: Request, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
+    session_token = _dealer_session_from_request(request)
+    if not session_token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session is required")
+    intake, _challenge = await _load_intake_by_dealer_session(db, session_token)
+    public_token = _new_public_token()
+    intake.token_hash = _hash_token(public_token)
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        assistant_message="Welcome back. I restored your secure dealer funding room with your prior uploads and chat context.",
+    )
+
+
+@router.post("/logout", response_model=DealerLogoutResponse)
+async def logout_dealer_session(
+    payload: DealerLogoutRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLogoutResponse:
+    session_token = payload.session_token or _dealer_session_from_request(request)
+    if session_token:
+        challenge = (
+            await db.execute(
+                select(DealerIntakeLoginChallenge).where(
+                    DealerIntakeLoginChallenge.session_hash == _hash_token(session_token),
+                    DealerIntakeLoginChallenge.revoked_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if challenge is not None:
+            challenge.revoked_at = _now()
+            await db.commit()
+    return DealerLogoutResponse()
 
 
 @router.post("/resume-link", response_model=DealerResumeLinkResponse)
