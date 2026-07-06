@@ -17,7 +17,7 @@ from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink
+from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -475,6 +475,11 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
             if next_detail:
                 parts.append(f"Next best move: {next_detail}")
             return " ".join(parts)[:1200]
+        if not _active_files(intake.bucket):
+            return (
+                "Your secure underwriter chat is open. Attach PDFs, images, ZIP files, spreadsheets, or bank/tax documents here, "
+                "and I will screen what they prove before asking the next underwriting question."
+            )
         return (
             "I am reading the uploaded file set like a banking underwriter. I will classify the documents by what they actually are, "
             "then tell you what they support and what baseline items are still missing."
@@ -514,6 +519,7 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
 
 
 def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    state = _intake_state(intake)
     return {
         "review_type": "dealer_gatekeeper_v1",
         "deal_type": "dealer financing with real estate collateral",
@@ -526,6 +532,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
         "asset_rows": _asset_rows(intake),
+        "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
             "allowed_document_categories": [
                 "last 2 years tax returns",
@@ -553,6 +560,39 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "fundable, not fundable, or cannot determine from the current baseline evidence. Return a preliminary screen, not a commitment to lend."
         ),
     }
+
+
+def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None) -> None:
+    text = (message or "").strip()
+    if not text:
+        return
+    state = _intake_state(intake)
+    facts = state.get("chat_facts")
+    if not isinstance(facts, list):
+        facts = []
+    facts.append({"at": _now().isoformat(), "source": "client_chat", "text": text[:1200]})
+    state["chat_facts"] = facts[-30:]
+    intake.intake_state = state
+
+
+async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake) -> list[dict[str, str]]:
+    rows = (
+        await db.execute(
+            select(BucketAIMessage)
+            .where(BucketAIMessage.bucket_id == intake.bucket_id, BucketAIMessage.audience == "uploader")
+            .order_by(BucketAIMessage.created_at.desc())
+            .limit(24)
+        )
+    ).scalars().all()
+    return [
+        {
+            "role": row.role,
+            "author": row.author_name or row.role,
+            "content": row.content[:1600],
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+        }
+        for row in reversed(rows)
+    ]
 
 
 async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -> Client:
@@ -816,18 +856,7 @@ async def _response(
     forced_widget_reason: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
-    widget = (
-        _widget_for_type(
-            intake,
-            forced_widget_type,
-            source=forced_widget_source,
-            reason=forced_widget_reason or ("User asked for this tool" if forced_widget_source == "user_intent" else forced_widget_source),
-        )
-        if forced_widget_type
-        else None
-    )
-    widget = widget or _next_widget(intake)
-    widget = await _decorate_widget(db, intake, widget)
+    widget = None
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
     return DealerIntakeResponse(
@@ -836,7 +865,7 @@ async def _response(
         resume_url=_public_url(f"/dealer-ai-underwriter?token={token}") if token else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or _message_for_widget(widget, intake),
-        widget=widget,
+        widget=None,
         requested_documents=[BucketRequestedDocumentRead.model_validate(doc) for doc in intake.bucket.requested_documents],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=summary,
@@ -1101,7 +1130,7 @@ async def dealer_intake_chat(
     intake = await _load_public_intake(db, token)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
-    forced_widget_type = _widget_intent_from_message(payload.message, intake)
+    _record_chat_fact(intake, payload.message)
     await _log_dealer_update_events(
         db,
         intake,
@@ -1114,9 +1143,8 @@ async def dealer_intake_chat(
     intake.last_message_at = _now()
     messages = []
     assistant_message = None
-    ai_widget_type = None
     if payload.message and payload.message.strip():
-        chat_messages, _, ai_widget_type = await create_chat_reply(
+        chat_messages, _, _ = await create_chat_reply(
             db,
             bucket=intake.bucket,
             audience="uploader",
@@ -1129,16 +1157,12 @@ async def dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_public_intake(db, token)
-    next_widget_type = forced_widget_type or ai_widget_type
     return await _response(
         db,
         intake,
         token=token,
         assistant_message=assistant_message,
         messages=messages,
-        forced_widget_type=next_widget_type,
-        forced_widget_source="user_intent" if forced_widget_type else "ai_suggested",
-        forced_widget_reason="User asked for this tool" if forced_widget_type else "Suggested by the underwriter chat",
     )
 
 
@@ -1171,12 +1195,13 @@ async def run_dealer_review(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
-    intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake)}
+    review_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake), "recent_dealer_chat": await _recent_dealer_chat(db, intake)}
+    intake.bucket.ai_context = review_context
     review = BucketAIReview(
         bucket_id=intake.bucket_id,
         requested_by_user_id=None,
         status="queued",
-        context_snapshot=intake.bucket.ai_context or {},
+        context_snapshot=review_context,
         file_ids=[str(file.id) for file in _active_files(intake.bucket)],
         provider="bedrock",
     )
@@ -1352,13 +1377,12 @@ async def my_dealer_intake_chat(
     intake = await _load_client_intake(db, user, intake_id)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
-    forced_widget_type = _widget_intent_from_message(payload.message, intake)
+    _record_chat_fact(intake, payload.message)
     await _log_dealer_update_events(db, intake, update_data, request=request, user=user)
     messages = []
     assistant_message = None
-    ai_widget_type = None
     if payload.message and payload.message.strip():
-        chat_messages, _, ai_widget_type = await create_chat_reply(
+        chat_messages, _, _ = await create_chat_reply(
             db,
             bucket=intake.bucket,
             audience="uploader",
@@ -1372,16 +1396,12 @@ async def my_dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_client_intake(db, user, intake_id)
-    next_widget_type = forced_widget_type or ai_widget_type
     return await _response(
         db,
         intake,
         token=None,
         assistant_message=assistant_message,
         messages=messages,
-        forced_widget_type=next_widget_type,
-        forced_widget_source="user_intent" if forced_widget_type else "ai_suggested",
-        forced_widget_reason="User asked for this tool" if forced_widget_type else "Suggested by the underwriter chat",
     )
 
 

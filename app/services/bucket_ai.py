@@ -4,6 +4,8 @@ import base64
 import csv
 import json
 import logging
+import mimetypes
+import zipfile
 from datetime import UTC, datetime
 from io import BytesIO, StringIO
 from typing import Any
@@ -47,6 +49,9 @@ MAX_SPREADSHEET_ROWS = 80
 MAX_SPREADSHEET_COLS = 30
 MAX_SPREADSHEET_TEXT_CHARS = 24000
 MAX_CELL_CHARS = 200
+MAX_ZIP_ENTRIES = 30
+MAX_ZIP_ENTRY_BYTES = 10 * 1024 * 1024
+MAX_ZIP_TOTAL_EXTRACTED_BYTES = 40 * 1024 * 1024
 CHAT_WIDGET_TYPES = {
     "upload_files",
     "entity_structure",
@@ -112,7 +117,6 @@ CHAT_SYSTEM = """You are the Bucket AI assistant for a secure Qualified Commerci
 Return ONLY JSON in this shape:
 {
   "answer": "helpful answer scoped to the user's permitted context",
-  "suggested_widget": null,
   "proposed_context_patch": null,
   "proposed_action_items": [
     {"title": "...", "instructions": "...", "route": "admin|uploader|share|vendor", "rationale": "..."}
@@ -128,15 +132,13 @@ Rules:
 - When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
 - For dealer_gatekeeper_v1 contexts, do not request documents outside the baseline package. Ask clarifying questions only for related LLC/account structure and real estate address, estimated amount owed, or estimated value.
 - For dealer_gatekeeper_v1 contexts, use the latest evidence map if present. Explain what the uploaded files actually support before saying what is missing.
-- If the user asks to upload files, enter properties manually, clarify LLC/account structure, provide deal facts, book a call, rerun/reanalyze, or review fundability, set suggested_widget to {"type": "upload_files|real_estate_schedule|entity_structure|deal_profile|book_call|run_review|bankability_result", "reason": "short reason"}.
-- Suggest a widget only when it helps the next step. Otherwise return suggested_widget null and answer normally.
-- When evidence is incomplete, choose only one next best action. Do not stack multiple widgets or ask the user for every missing item at once.
+- When evidence is incomplete, choose only one next best action. Do not ask the user for every missing item at once.
 - Write the answer like a human senior banking underwriter who understands used-car dealerships, real-estate-backed commercial lending, floorplan lines, MCA exposure, dealer cash flow, related LLCs, and operating account analysis.
 - Do not sound like a generic chatbot. Avoid filler such as "I understand", "as an AI", "happy to help", and long tutorials.
 - Be direct, calm, and practical: acknowledge the fact in front of you, state what it means for bankability, then give the next specific move.
 - For dealer_gatekeeper_v1 contexts, use strict underwriting language: "I can preliminarily screen this", "this is incomplete", "this supports the file", "this creates a lender question", or "I cannot determine yet" when evidence is missing.
 - Ask one high-value question at a time unless the user asks for a list.
-- When the user asks to upload files or enter property collateral, tell them what information you need and reference the in-chat tool/widget that will appear. Do not describe navigation or external UI steps.
+- When the user asks to upload files or enter property collateral, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
 - Keep answers concise and operational, normally 2-5 short sentences.
 """
 
@@ -401,7 +403,8 @@ def _decode_tabular_text(raw: bytes) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
-def _extract_csv_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[str, str] | None]:
+def _extract_csv_text(file: BucketFile, raw: bytes, *, display_name: str | None = None) -> tuple[str | None, tuple[str, str] | None]:
+    file_name = display_name or file.file_name
     try:
         decoded, encoding = _decode_tabular_text(raw)
         sample = decoded[:4096]
@@ -424,7 +427,7 @@ def _extract_csv_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[s
             return None, ("csv_parse_failed", "This CSV did not contain readable rows for AI review.")
         payload = {
             "file_id": str(file.id),
-            "file_name": file.file_name,
+            "file_name": file_name,
             "type": "csv_table",
             "encoding": encoding,
             "rows_sampled": len(rows),
@@ -445,7 +448,8 @@ def _extract_csv_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[s
         return None, ("csv_parse_failed", "The system could not parse this CSV safely, so it was reviewed by metadata only.")
 
 
-def _extract_xlsx_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[str, str] | None]:
+def _extract_xlsx_text(file: BucketFile, raw: bytes, *, display_name: str | None = None) -> tuple[str | None, tuple[str, str] | None]:
+    file_name = display_name or file.file_name
     values_wb = None
     formulas_wb = None
     try:
@@ -531,7 +535,7 @@ def _extract_xlsx_text(file: BucketFile, raw: bytes) -> tuple[str | None, tuple[
 
         payload = {
             "file_id": str(file.id),
-            "file_name": file.file_name,
+            "file_name": file_name,
             "type": "xlsx_workbook",
             "sheet_names": formulas_wb.sheetnames,
             "visible_sheets_included": [sheet["name"] for sheet in sheets],
@@ -566,6 +570,170 @@ def _skip_file(file: BucketFile, reason: str, explanation: str) -> dict[str, str
         "reason": reason,
         "explanation": explanation,
     }
+
+
+def _skip_named_file(file: BucketFile, file_name: str, reason: str, explanation: str) -> dict[str, str]:
+    skipped = _skip_file(file, reason, explanation)
+    skipped["file_name"] = file_name
+    return skipped
+
+
+def _is_zip_file(content_type: str, file_name: str) -> bool:
+    lower = f"{content_type} {file_name}".lower()
+    return file_name.lower().endswith(".zip") or "application/zip" in lower or "application/x-zip-compressed" in lower
+
+
+def _safe_zip_member_name(name: str) -> str | None:
+    cleaned = name.replace("\\", "/").strip()
+    if not cleaned or cleaned.startswith("/") or cleaned.endswith("/"):
+        return None
+    parts = [part for part in cleaned.split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _append_review_file_content(
+    *,
+    content: list[dict[str, Any]],
+    skipped: list[dict[str, str]],
+    blocked_files: list[dict[str, str]],
+    file: BucketFile,
+    raw: bytes,
+    content_type: str,
+    display_name: str | None = None,
+    attached_pdf_pages: int,
+    spreadsheet_text_chars: int,
+) -> tuple[bool, int, int]:
+    file_name = display_name or file.file_name
+    if len(raw) > MAX_FILE_BYTES:
+        skipped.append(_skip_named_file(file, file_name, "too_large", "The file is larger than the current AI review limit and was reviewed by metadata only."))
+        return False, attached_pdf_pages, spreadsheet_text_chars
+    if _is_xlsx_file(content_type, file_name):
+        extracted, parse_skip = _extract_xlsx_text(file, raw, display_name=file_name)
+        if parse_skip:
+            reason, explanation = parse_skip
+            skipped.append(_skip_named_file(file, file_name, reason, explanation))
+            return False, attached_pdf_pages, spreadsheet_text_chars
+        limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
+        if limited is None:
+            skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this workbook was reviewed by metadata only."))
+            return False, attached_pdf_pages, spreadsheet_text_chars
+        spreadsheet_text_chars += len(limited)
+        content.append({"type": "text", "text": f"Spreadsheet file {file.id}: {file_name}\nExtracted workbook/table data for underwriting review:\n\n{limited}"})
+        if truncated:
+            skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "Only the first part of this workbook could be included before the spreadsheet text budget was reached."))
+        return True, attached_pdf_pages, spreadsheet_text_chars
+    if _is_legacy_xls_file(file_name):
+        skipped.append(_skip_named_file(file, file_name, "legacy_spreadsheet_unsupported", "Legacy .xls files are not supported by the current AI spreadsheet parser. Upload an .xlsx or CSV export."))
+        return False, attached_pdf_pages, spreadsheet_text_chars
+    if _is_csv_file(content_type, file_name):
+        extracted, parse_skip = _extract_csv_text(file, raw, display_name=file_name)
+        if parse_skip:
+            reason, explanation = parse_skip
+            skipped.append(_skip_named_file(file, file_name, reason, explanation))
+            return False, attached_pdf_pages, spreadsheet_text_chars
+        limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
+        if limited is None:
+            skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this CSV was reviewed by metadata only."))
+            return False, attached_pdf_pages, spreadsheet_text_chars
+        spreadsheet_text_chars += len(limited)
+        content.append({"type": "text", "text": f"CSV file {file.id}: {file_name}\nExtracted table data for underwriting review:\n\n{limited}"})
+        if truncated:
+            skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "Only the first part of this CSV could be included before the spreadsheet text budget was reached."))
+        return True, attached_pdf_pages, spreadsheet_text_chars
+    media = _media_type(content_type, file_name)
+    if media:
+        if media == "application/pdf":
+            page_count, pdf_skip = _pdf_review_metadata(raw)
+            if pdf_skip:
+                reason, explanation = pdf_skip
+                skipped_file = _skip_named_file(file, file_name, reason, explanation)
+                if reason == "password_protected":
+                    blocked_files.append(skipped_file)
+                skipped.append(skipped_file)
+                return False, attached_pdf_pages, spreadsheet_text_chars
+            if page_count is not None and attached_pdf_pages + page_count > MAX_PDF_PAGES:
+                skipped.append(_skip_named_file(file, file_name, "pdf_page_budget_exceeded", f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only."))
+                return False, attached_pdf_pages, spreadsheet_text_chars
+            attached_pdf_pages += page_count or 0
+            content.append({"type": "text", "text": f"PDF file {file.id}: {file_name}"})
+        else:
+            content.append({"type": "text", "text": f"Image file {file.id}: {file_name} ({media}) attached for visual underwriting review."})
+        content.append(_content_block(media, raw))
+        return True, attached_pdf_pages, spreadsheet_text_chars
+    lower = f"{content_type} {file_name}".lower()
+    if "text/" in lower or file_name.lower().endswith((".txt", ".md", ".log")):
+        snippet = raw[:MAX_TEXT_FILE_CHARS].decode("utf-8", errors="replace")
+        content.append({"type": "text", "text": f"File {file.id}: {file_name}\n\n{snippet}"})
+        return True, attached_pdf_pages, spreadsheet_text_chars
+    skipped.append(_skip_named_file(file, file_name, "unsupported_content_type", "This file type is not directly attached to the AI model yet and was reviewed by metadata only."))
+    return False, attached_pdf_pages, spreadsheet_text_chars
+
+
+def _append_zip_file_content(
+    *,
+    content: list[dict[str, Any]],
+    skipped: list[dict[str, str]],
+    blocked_files: list[dict[str, str]],
+    file: BucketFile,
+    raw: bytes,
+    attached: int,
+    attached_pdf_pages: int,
+    spreadsheet_text_chars: int,
+) -> tuple[int, int, int]:
+    try:
+        with zipfile.ZipFile(BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_ZIP_ENTRIES:
+                skipped.append(_skip_file(file, "zip_entry_limit", f"Only the first {MAX_ZIP_ENTRIES} ZIP entries can be inspected in one AI review."))
+            total_extracted = 0
+            inspected = 0
+            content.append({"type": "text", "text": f"ZIP file {file.id}: {file.file_name} accepted. The AI will review supported files extracted from this archive."})
+            for member in members:
+                if inspected >= MAX_ZIP_ENTRIES or attached >= MAX_REVIEW_ATTACHMENTS:
+                    break
+                inspected += 1
+                member_name = _safe_zip_member_name(member.filename)
+                display_name = f"{file.file_name}::{member_name or member.filename}"
+                if member_name is None:
+                    skipped.append(_skip_named_file(file, display_name, "zip_unsafe_path", "This ZIP entry used an unsafe or empty path and was skipped."))
+                    continue
+                if member_name.lower().endswith(".zip"):
+                    skipped.append(_skip_named_file(file, display_name, "nested_zip_unsupported", "Nested ZIP files are not extracted for AI review."))
+                    continue
+                if member.flag_bits & 0x1:
+                    skipped.append(_skip_named_file(file, display_name, "zip_entry_encrypted", "This ZIP entry is encrypted and cannot be read by AI review."))
+                    continue
+                if member.file_size > MAX_ZIP_ENTRY_BYTES:
+                    skipped.append(_skip_named_file(file, display_name, "zip_entry_too_large", "This ZIP entry is larger than the current AI review limit and was skipped."))
+                    continue
+                total_extracted += member.file_size
+                if total_extracted > MAX_ZIP_TOTAL_EXTRACTED_BYTES:
+                    skipped.append(_skip_named_file(file, display_name, "zip_total_too_large", "The ZIP extraction budget was reached, so remaining entries were skipped."))
+                    break
+                try:
+                    member_raw = archive.read(member)
+                except RuntimeError:
+                    skipped.append(_skip_named_file(file, display_name, "zip_entry_encrypted", "This ZIP entry is encrypted and cannot be read by AI review."))
+                    continue
+                member_content_type = mimetypes.guess_type(member_name)[0] or "application/octet-stream"
+                added, attached_pdf_pages, spreadsheet_text_chars = _append_review_file_content(
+                    content=content,
+                    skipped=skipped,
+                    blocked_files=blocked_files,
+                    file=file,
+                    raw=member_raw,
+                    content_type=member_content_type,
+                    display_name=display_name,
+                    attached_pdf_pages=attached_pdf_pages,
+                    spreadsheet_text_chars=spreadsheet_text_chars,
+                )
+                if added:
+                    attached += 1
+    except zipfile.BadZipFile:
+        skipped.append(_skip_file(file, "zip_parse_failed", "The uploaded ZIP could not be opened safely and was reviewed by metadata only."))
+    return attached, attached_pdf_pages, spreadsheet_text_chars
 
 
 async def log_bucket_ai_activity(
@@ -679,88 +847,33 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             skipped.append(_skip_file(file, "fetch_failed", "The system could not retrieve this file from storage for AI review."))
             continue
         raw, content_type = fetched
-        if len(raw) > MAX_FILE_BYTES:
-            skipped.append(_skip_file(file, "too_large", "The file is larger than the current AI review limit and was reviewed by metadata only."))
-            continue
-        if _is_xlsx_file(content_type, file.file_name):
-            extracted, parse_skip = _extract_xlsx_text(file, raw)
-            if parse_skip:
-                reason, explanation = parse_skip
-                skipped.append(_skip_file(file, reason, explanation))
+        if _is_zip_file(content_type, file.file_name):
+            if len(raw) > MAX_FILE_BYTES:
+                skipped.append(_skip_file(file, "too_large", "The ZIP file is larger than the current AI review limit and was reviewed by metadata only."))
                 continue
-            limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
-            if limited is None:
-                skipped.append(_skip_file(file, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this workbook was reviewed by metadata only."))
-                continue
-            spreadsheet_text_chars += len(limited)
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"Spreadsheet file {file.id}: {file.file_name}\nExtracted workbook/table data for underwriting review:\n\n{limited}",
-                }
+            attached, attached_pdf_pages, spreadsheet_text_chars = _append_zip_file_content(
+                content=content,
+                skipped=skipped,
+                blocked_files=blocked_files,
+                file=file,
+                raw=raw,
+                attached=attached,
+                attached_pdf_pages=attached_pdf_pages,
+                spreadsheet_text_chars=spreadsheet_text_chars,
             )
-            if truncated:
-                skipped.append(_skip_file(file, "spreadsheet_too_large", "Only the first part of this workbook could be included before the spreadsheet text budget was reached."))
+            continue
+        added, attached_pdf_pages, spreadsheet_text_chars = _append_review_file_content(
+            content=content,
+            skipped=skipped,
+            blocked_files=blocked_files,
+            file=file,
+            raw=raw,
+            content_type=content_type,
+            attached_pdf_pages=attached_pdf_pages,
+            spreadsheet_text_chars=spreadsheet_text_chars,
+        )
+        if added:
             attached += 1
-            continue
-        if _is_legacy_xls_file(file.file_name):
-            skipped.append(_skip_file(file, "legacy_spreadsheet_unsupported", "Legacy .xls files are not supported by the current AI spreadsheet parser. Upload an .xlsx or CSV export."))
-            continue
-        if _is_csv_file(content_type, file.file_name):
-            extracted, parse_skip = _extract_csv_text(file, raw)
-            if parse_skip:
-                reason, explanation = parse_skip
-                skipped.append(_skip_file(file, reason, explanation))
-                continue
-            limited, truncated = _limit_structured_text(extracted or "", MAX_SPREADSHEET_TEXT_CHARS - spreadsheet_text_chars)
-            if limited is None:
-                skipped.append(_skip_file(file, "spreadsheet_too_large", "The AI review reached the spreadsheet text budget, so this CSV was reviewed by metadata only."))
-                continue
-            spreadsheet_text_chars += len(limited)
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"CSV file {file.id}: {file.file_name}\nExtracted table data for underwriting review:\n\n{limited}",
-                }
-            )
-            if truncated:
-                skipped.append(_skip_file(file, "spreadsheet_too_large", "Only the first part of this CSV could be included before the spreadsheet text budget was reached."))
-            attached += 1
-            continue
-        media = _media_type(content_type, file.file_name)
-        if media:
-            if media == "application/pdf":
-                page_count, pdf_skip = _pdf_review_metadata(raw)
-                if pdf_skip:
-                    reason, explanation = pdf_skip
-                    skipped_file = _skip_file(file, reason, explanation)
-                    if reason == "password_protected":
-                        blocked_files.append(skipped_file)
-                    skipped.append(skipped_file)
-                    continue
-                if page_count is not None and attached_pdf_pages + page_count > MAX_PDF_PAGES:
-                    skipped.append(
-                        _skip_file(
-                            file,
-                            "pdf_page_budget_exceeded",
-                            f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only.",
-                        )
-                    )
-                    continue
-                attached_pdf_pages += page_count or 0
-                content.append({"type": "text", "text": f"PDF file {file.id}: {file.file_name}"})
-            else:
-                content.append({"type": "text", "text": f"Image file {file.id}: {file.file_name} ({media}) attached for visual underwriting review."})
-            content.append(_content_block(media, raw))
-            attached += 1
-            continue
-        lower = f"{content_type} {file.file_name}".lower()
-        if "text/" in lower or file.file_name.lower().endswith((".txt", ".csv", ".md", ".log")):
-            snippet = raw[:MAX_TEXT_FILE_CHARS].decode("utf-8", errors="replace")
-            content.append({"type": "text", "text": f"File {file.id}: {file.file_name}\n\n{snippet}"})
-            attached += 1
-            continue
-        skipped.append(_skip_file(file, "unsupported_content_type", "This file type is not directly attached to the AI model yet and was reviewed by metadata only."))
 
     if skipped:
         content.append({"type": "text", "text": "Files not attached to model: " + json.dumps(skipped)})
