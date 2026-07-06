@@ -149,6 +149,7 @@ for r in [
     buckets.router,
     dealer_ai_intake.router,
     dealer_ai_intake.client_router,
+    dealer_ai_intake.admin_router,
     documents.router,
     messages.router,
     notifications.router,

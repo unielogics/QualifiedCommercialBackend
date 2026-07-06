@@ -55,6 +55,7 @@ from app.services.payment_authorization import primary_super_admin
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
+admin_router = APIRouter(prefix="/admin/dealer-ai-leads", tags=["admin-dealer-ai-leads"])
 
 TERMS_VERSION = "2026-05-19"
 PRIVACY_VERSION = "2026-05-19"
@@ -245,6 +246,38 @@ class DealerIntakeResponse(BaseModel):
     ai_summary: dict[str, Any] | None = None
     latest_review: BucketAIReviewRead | None = None
     messages: list[BucketAIMessageRead] = []
+
+
+class DealerAILeadRow(BaseModel):
+    id: UUID
+    client_id: UUID | None = None
+    bucket_id: UUID
+    bucket_name: str
+    full_name: str
+    email: str
+    phone: str | None = None
+    business_name: str | None = None
+    status: str
+    probability_status: str | None = None
+    confidence: str | None = None
+    one_next_step: str | None = None
+    latest_review_status: str | None = None
+    booking_recommended: bool = False
+    call_booked: bool = False
+    file_count: int = 0
+    missing_required_count: int = 0
+    requested_loan_amount: float | None = None
+    estimated_credit_score: int | None = None
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+
+
+class DealerAILeadListResponse(BaseModel):
+    items: list[DealerAILeadRow]
+    total: int
+    limit: int
+    offset: int
 
 
 def _now() -> datetime:
@@ -1788,6 +1821,158 @@ async def download_dealer_intelligence_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+def _require_super_admin(user: CurrentUser) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+
+
+def _lead_result(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    review = intake.latest_review if intake.latest_review else None
+    if review and isinstance(review.result, dict):
+        return review.result
+    return intake.result_snapshot if isinstance(intake.result_snapshot, dict) else {}
+
+
+def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
+    result = _lead_result(intake)
+    active_files = _active_files(intake.bucket)
+    missing_docs = _missing_required_docs(intake.bucket)
+    return DealerAILeadRow(
+        id=intake.id,
+        client_id=intake.client_id,
+        bucket_id=intake.bucket_id,
+        bucket_name=intake.bucket.name,
+        full_name=intake.full_name,
+        email=intake.email,
+        phone=intake.phone,
+        business_name=intake.business_name,
+        status=intake.status,
+        probability_status=str(result.get("probability_status") or "") or None,
+        confidence=str(result.get("confidence") or "") or None,
+        one_next_step=str(result.get("one_next_step") or "") or None,
+        latest_review_status=intake.latest_review.status if intake.latest_review else None,
+        booking_recommended=result.get("booking_recommended") is True,
+        call_booked=_call_booked(intake),
+        file_count=len(active_files),
+        missing_required_count=len(missing_docs),
+        requested_loan_amount=float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+        estimated_credit_score=int(intake.estimated_credit_score) if intake.estimated_credit_score is not None else None,
+        created_at=intake.created_at,
+        updated_at=intake.updated_at,
+        last_message_at=intake.last_message_at,
+    )
+
+
+async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUnderwritingIntake:
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.id == intake_id)
+            .options(
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+                selectinload(PublicUnderwritingIntake.bucket_upload_link),
+                selectinload(PublicUnderwritingIntake.latest_review),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if intake is None or intake.bucket.archived_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI lead not found")
+    return intake
+
+
+@admin_router.get("", response_model=DealerAILeadListResponse)
+async def list_dealer_ai_leads(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str | None = None,
+    status_filter: str | None = None,
+    probability_status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> DealerAILeadListResponse:
+    _require_super_admin(user)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    stmt = (
+        select(PublicUnderwritingIntake)
+        .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+        .where(Bucket.archived_at.is_(None))
+        .options(
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+            selectinload(PublicUnderwritingIntake.bucket_upload_link),
+            selectinload(PublicUnderwritingIntake.latest_review),
+            with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+        )
+        .order_by(PublicUnderwritingIntake.updated_at.desc())
+    )
+    if status_filter and status_filter != "all":
+        stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+    if q:
+        needle = f"%{q.strip().lower()}%"
+        stmt = stmt.where(
+            func.lower(PublicUnderwritingIntake.full_name).like(needle)
+            | func.lower(PublicUnderwritingIntake.email).like(needle)
+            | func.lower(PublicUnderwritingIntake.business_name).like(needle)
+        )
+    rows = list((await db.execute(stmt)).scalars().unique().all())
+    if probability_status and probability_status != "all":
+        rows = [
+            row for row in rows
+            if str(_lead_result(row).get("probability_status") or "") == probability_status
+        ]
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    return DealerAILeadListResponse(
+        items=[_lead_row(row) for row in page],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@admin_router.get("/{intake_id}/intelligence.pdf")
+async def download_admin_dealer_intelligence_pdf(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    review = intake.latest_review if intake.latest_review else None
+    latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    missing_docs = _missing_required_docs(intake.bucket)
+    pdf_bytes = await asyncio.to_thread(
+        render_dealer_intelligence_pdf,
+        intake=intake,
+        files=files,
+        missing_docs=missing_docs,
+        result=latest_result,
+    )
+    filename = _safe_filename(f"dealer-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@admin_router.get("/{intake_id}", response_model=DealerIntakeResponse)
+async def get_dealer_ai_lead(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _response(db, intake, token=None)
 
 
 @router.get("/{token}", response_model=DealerIntakeResponse)
