@@ -44,14 +44,17 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
 MAX_PDF_PAGES = 100
 MAX_TEXT_FILE_CHARS = 16000
+MAX_PDF_TEXT_PAGES = 80
+MAX_PDF_TEXT_CHARS = 50000
 MAX_SPREADSHEET_SHEETS = 6
 MAX_SPREADSHEET_ROWS = 80
 MAX_SPREADSHEET_COLS = 30
 MAX_SPREADSHEET_TEXT_CHARS = 24000
 MAX_CELL_CHARS = 200
 MAX_ZIP_ENTRIES = 30
-MAX_ZIP_ENTRY_BYTES = 10 * 1024 * 1024
-MAX_ZIP_TOTAL_EXTRACTED_BYTES = 40 * 1024 * 1024
+MAX_ZIP_FILE_BYTES = 50 * 1024 * 1024
+MAX_ZIP_ENTRY_BYTES = 40 * 1024 * 1024
+MAX_ZIP_TOTAL_EXTRACTED_BYTES = 50 * 1024 * 1024
 CHAT_WIDGET_TYPES = {
     "upload_files",
     "entity_structure",
@@ -108,7 +111,9 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
 If ai_context.review_type is "dealer_gatekeeper_v1", act as a strict public lead gatekeeper for a car dealer financing file. Use only this baseline package for document requests: last 2 years tax returns, current-year P&L, last 3 months bank statements, real estate schedule or mortgage notes/payoff statements, and floorplan/MCA/inventory statements only when applicable. Do not request other document categories. Treat multiple dealer LLCs and bank accounts as normal, but require clarity on the primary operating entity, main operating account, related LLCs, and how accounts/entities work together. Real estate collateral must include full address, estimated amount owed, and estimated property value, whether provided through a typed schedule or mortgage-note uploads. Do not mark the file "Bankable" when core baseline evidence is missing or entity/account relationships are unclear; use "Incomplete - cannot determine" until enough evidence is present. This is a preliminary screen, not a commitment to lend.
 For dealer_gatekeeper_v1 contexts, uploaded files may be random or miscategorized by the client. Classify documents from the readable content and file name first; do not rely only on requested_document_id. If a mortgage note, payoff statement, amortization schedule, loan statement, or debt schedule is uploaded, treat it as partial real-estate/collateral evidence even when the selected category is wrong. Do not say every baseline category is missing when any uploaded file supports a baseline category. Instead say exactly what the uploaded files prove and what is still missing, for example: "I see collateral debt evidence, but not tax returns, P&L, bank statements, property values, or entity relationship explanation." Ask for estimated values or missing addresses for collateral files when needed.
-For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) what still blocks a credit decision, and (3) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
+For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) whether the file appears fundable, preliminarily fundable subject to confirmation, not fundable, or cannot be determined, (3) what still blocks a credit decision, and (4) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
+For dealer_gatekeeper_v1 contexts with strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
+For dealer_gatekeeper_v1 contexts where multiple LLCs, owner entities, real-estate entities, or dealership entities appear, ask for one written explanation that covers: primary operating LLC, main operating bank account, which LLCs own the real estate, how money transfers between entities, and whether dealership revenue supports property debt. This should be a conversational underwriting question, not a form or widget.
 Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items; document_evidence_map.files <= 12 items; document_evidence_map.baseline_coverage <= 8 items. Keep each item detail/summary under 220 characters. Never list every file outside document_evidence_map. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and one requested next action over exhaustive document recaps.
 """
 
@@ -361,6 +366,84 @@ def _pdf_review_metadata(raw: bytes) -> tuple[int | None, tuple[str, str] | None
         )
 
 
+def _extract_pdf_text(file: BucketFile, raw: bytes, *, display_name: str | None = None) -> tuple[str | None, tuple[str, str] | None]:
+    file_name = display_name or file.file_name
+    try:
+        reader = PdfReader(BytesIO(raw), strict=False)
+        if reader.is_encrypted:
+            return None, (
+                "password_protected",
+                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+            )
+        page_count = len(reader.pages)
+        pages: list[dict[str, Any]] = []
+        chars_used = 0
+        pages_examined = 0
+        text_pages = 0
+        truncated = False
+        for page_offset in range(min(page_count, MAX_PDF_TEXT_PAGES)):
+            page_index = page_offset + 1
+            page = reader.pages[page_offset]
+            pages_examined += 1
+            try:
+                page_text = (page.extract_text() or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("bucket_ai: PDF page text extract failed file=%s page=%s: %s", file.id, page_index, exc)
+                continue
+            if not page_text:
+                continue
+            text_pages += 1
+            remaining = MAX_PDF_TEXT_CHARS - chars_used
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(page_text) > remaining:
+                page_text = page_text[:remaining]
+                truncated = True
+            chars_used += len(page_text)
+            pages.append({"page": page_index, "text": page_text})
+            if truncated:
+                break
+        if not pages:
+            return None, (
+                "pdf_text_unavailable",
+                "This PDF could not be text-extracted. It may be scanned or image-only; upload a searchable PDF or split/readable copy.",
+            )
+        warnings = [
+            warning
+            for warning in (
+                f"Only the first {MAX_PDF_TEXT_PAGES} pages were inspected." if page_count > MAX_PDF_TEXT_PAGES else None,
+                f"Only the first {MAX_PDF_TEXT_CHARS} extracted characters were included." if truncated else None,
+                "Text extraction may miss tables, stamps, signatures, or image-only pages.",
+            )
+            if warning
+        ]
+        payload = {
+            "file_id": str(file.id),
+            "file_name": file_name,
+            "type": "large_pdf_text_extract",
+            "page_count": page_count,
+            "pages_examined": pages_examined,
+            "pages_with_text": text_pages,
+            "characters_included": chars_used,
+            "warnings": warnings,
+            "pages": pages,
+        }
+        return json.dumps(payload, default=str, ensure_ascii=False), None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bucket_ai: PDF text extraction failed file=%s: %s", file.id, exc)
+        message = str(exc).lower()
+        if "encrypt" in message or "password" in message:
+            return None, (
+                "password_protected",
+                "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
+            )
+        return None, (
+            "pdf_text_extract_failed",
+            "The system could not extract readable text from this PDF, so it was reviewed by metadata only.",
+        )
+
+
 def _is_xlsx_file(content_type: str, file_name: str) -> bool:
     lower = f"{content_type} {file_name}".lower()
     return (
@@ -606,6 +689,26 @@ def _append_review_file_content(
     spreadsheet_text_chars: int,
 ) -> tuple[bool, int, int]:
     file_name = display_name or file.file_name
+    media = _media_type(content_type, file_name)
+    if media == "application/pdf" and len(raw) > MAX_FILE_BYTES:
+        extracted, parse_skip = _extract_pdf_text(file, raw, display_name=file_name)
+        if parse_skip:
+            reason, explanation = parse_skip
+            skipped_file = _skip_named_file(file, file_name, reason, explanation)
+            if reason == "password_protected":
+                blocked_files.append(skipped_file)
+            skipped.append(skipped_file)
+            return False, attached_pdf_pages, spreadsheet_text_chars
+        content.append({"type": "text", "text": f"Large PDF file {file.id}: {file_name}\nExtracted searchable text for underwriting review because the file is too large for direct model attachment:\n\n{extracted}"})
+        skipped.append(
+            _skip_named_file(
+                file,
+                file_name,
+                "large_pdf_text_extract",
+                "The PDF was too large to attach directly, so searchable text was extracted and reviewed. Tables/images/signatures may still need a readable split copy if the AI flags gaps.",
+            )
+        )
+        return True, attached_pdf_pages, spreadsheet_text_chars
     if len(raw) > MAX_FILE_BYTES:
         skipped.append(_skip_named_file(file, file_name, "too_large", "The file is larger than the current AI review limit and was reviewed by metadata only."))
         return False, attached_pdf_pages, spreadsheet_text_chars
@@ -642,19 +745,49 @@ def _append_review_file_content(
         if truncated:
             skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "Only the first part of this CSV could be included before the spreadsheet text budget was reached."))
         return True, attached_pdf_pages, spreadsheet_text_chars
-    media = _media_type(content_type, file_name)
     if media:
         if media == "application/pdf":
             page_count, pdf_skip = _pdf_review_metadata(raw)
             if pdf_skip:
                 reason, explanation = pdf_skip
+                if reason in {"too_many_pdf_pages", "pdf_parse_failed"}:
+                    extracted, extract_skip = _extract_pdf_text(file, raw, display_name=file_name)
+                    if extracted:
+                        content.append({"type": "text", "text": f"PDF file {file.id}: {file_name}\nExtracted searchable text for underwriting review because direct PDF attachment was not available ({reason}):\n\n{extracted}"})
+                        skipped.append(
+                            _skip_named_file(
+                                file,
+                                file_name,
+                                "pdf_text_extract_used",
+                                "The PDF could not be attached directly, so searchable text was extracted and reviewed. Tables/images/signatures may still need a readable split copy if the AI flags gaps.",
+                            )
+                        )
+                        return True, attached_pdf_pages, spreadsheet_text_chars
+                    if extract_skip:
+                        reason, explanation = extract_skip
                 skipped_file = _skip_named_file(file, file_name, reason, explanation)
                 if reason == "password_protected":
                     blocked_files.append(skipped_file)
                 skipped.append(skipped_file)
                 return False, attached_pdf_pages, spreadsheet_text_chars
             if page_count is not None and attached_pdf_pages + page_count > MAX_PDF_PAGES:
-                skipped.append(_skip_named_file(file, file_name, "pdf_page_budget_exceeded", f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only."))
+                extracted, extract_skip = _extract_pdf_text(file, raw, display_name=file_name)
+                if extracted:
+                    content.append({"type": "text", "text": f"PDF file {file.id}: {file_name}\nExtracted searchable text for underwriting review because the total direct PDF page budget was reached:\n\n{extracted}"})
+                    skipped.append(
+                        _skip_named_file(
+                            file,
+                            file_name,
+                            "pdf_page_budget_text_extract",
+                            f"Direct PDF attachment was skipped because Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. Searchable text was extracted and reviewed instead.",
+                        )
+                    )
+                    return True, attached_pdf_pages, spreadsheet_text_chars
+                if extract_skip:
+                    reason, explanation = extract_skip
+                    skipped.append(_skip_named_file(file, file_name, reason, explanation))
+                else:
+                    skipped.append(_skip_named_file(file, file_name, "pdf_page_budget_exceeded", f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only."))
                 return False, attached_pdf_pages, spreadsheet_text_chars
             attached_pdf_pages += page_count or 0
             content.append({"type": "text", "text": f"PDF file {file.id}: {file_name}"})
@@ -848,8 +981,8 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             continue
         raw, content_type = fetched
         if _is_zip_file(content_type, file.file_name):
-            if len(raw) > MAX_FILE_BYTES:
-                skipped.append(_skip_file(file, "too_large", "The ZIP file is larger than the current AI review limit and was reviewed by metadata only."))
+            if len(raw) > MAX_ZIP_FILE_BYTES:
+                skipped.append(_skip_file(file, "zip_too_large", "The ZIP file is larger than the current AI extraction limit and was reviewed by metadata only."))
                 continue
             attached, attached_pdf_pages, spreadsheet_text_chars = _append_zip_file_content(
                 content=content,
