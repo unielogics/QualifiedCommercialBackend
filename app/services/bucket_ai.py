@@ -100,6 +100,25 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
     "detail": "...",
     "reason": "..."
   },
+  "screening_stage": "stage_1_bankability",
+  "probability_status": "Good probability - book call|Promising but needs one clarification|Not enough evidence yet|Poor probability based on current file",
+  "program_fit": ["real_estate_backed", "no_collateral_dscr", "full_doc_commercial", "high_cost_debt_refinance", "unknown"],
+  "confidence": "high|medium|low",
+  "key_metrics": {
+    "revenue_trend": "...",
+    "ytd_annualized_revenue": null,
+    "annualized_adjusted_deposits": null,
+    "tax_return_revenue_vs_bank_deposits": "...",
+    "estimated_ebitda_or_cash_flow": null,
+    "estimated_debt_burden": null,
+    "estimated_dscr": null,
+    "nsf_or_overdraft_flags": "...",
+    "requested_amount_reasonableness": "..."
+  },
+  "strengths": ["..."],
+  "risks": ["..."],
+  "one_next_step": "...",
+  "booking_recommended": false,
   "bankability_assessment": {
     "status": "Bankable|Incomplete - cannot determine|Not bankable based on current file",
     "product_fit": ["DSCR", "Full-doc commercial", "Dealer financing with real estate collateral"],
@@ -109,7 +128,9 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 }
 
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
-If ai_context.review_type is "dealer_gatekeeper_v1", act as a strict public lead gatekeeper for a car dealer financing file. Use only this baseline package for document requests: last 2 years tax returns, current-year P&L, last 3 months bank statements, real estate schedule or mortgage notes/payoff statements, and floorplan/MCA/inventory statements only when applicable. Do not request other document categories. Treat multiple dealer LLCs and bank accounts as normal, but require clarity on the primary operating entity, main operating account, related LLCs, and how accounts/entities work together. Real estate collateral must include full address, estimated amount owed, and estimated property value, whether provided through a typed schedule or mortgage-note uploads. Do not mark the file "Bankable" when core baseline evidence is missing or entity/account relationships are unclear; use "Incomplete - cannot determine" until enough evidence is present. This is a preliminary screen, not a commitment to lend.
+If ai_context.review_type is "dealer_gatekeeper_v1", act as a strict Stage 1 public lead gatekeeper for a car dealer financing file. Stage 1 is preliminary bankability, not final approval. Use the minimum Stage 1 package first: last 2 years business tax returns, current-year/YTD P&L, last 3 months main operating bank statements, requested amount, use of funds, stated current monthly debt payments, and estimated credit score/tier. Do not ask for a full underwriting package unless Stage 1 shows good probability. Treat real estate collateral as the next targeted clarification after cash-flow context indicates a possible path: property address, estimated value, current mortgage balance, and ownership/entity relationship if unclear. Floorplan/MCA/inventory statements are conditional only when documents, bank statements, or chat answers indicate those obligations exist.
+For dealer_gatekeeper_v1, set screening_stage to "stage_1_bankability" and choose exactly one probability_status from: "Good probability - book call", "Promising but needs one clarification", "Not enough evidence yet", or "Poor probability based on current file". Set booking_recommended true only when the file has good lending probability and a human call should be offered now. Do not use CALL_NOW, MAYBE, or DO_NOT_CALL labels.
+For dealer_gatekeeper_v1, calculate key_metrics when the documents allow it: revenue trend, YTD annualized revenue, annualized adjusted deposits, tax return revenue vs bank deposit consistency, estimated EBITDA/cash flow, estimated debt burden, estimated DSCR, NSF/overdraft/negative-balance flags, and requested amount reasonableness. Use null or a short unavailable explanation when the file does not support the metric.
 For dealer_gatekeeper_v1 contexts, uploaded files may be random or miscategorized by the client. Classify documents from the readable content and file name first; do not rely only on requested_document_id. If a mortgage note, payoff statement, amortization schedule, loan statement, or debt schedule is uploaded, treat it as partial real-estate/collateral evidence even when the selected category is wrong. Do not say every baseline category is missing when any uploaded file supports a baseline category. Instead say exactly what the uploaded files prove and what is still missing, for example: "I see collateral debt evidence, but not tax returns, P&L, bank statements, property values, or entity relationship explanation." Ask for estimated values or missing addresses for collateral files when needed.
 For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) whether the file appears fundable, preliminarily fundable subject to confirmation, not fundable, or cannot be determined, (3) what still blocks a credit decision, and (4) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
 For dealer_gatekeeper_v1 contexts with strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
@@ -136,7 +157,9 @@ Rules:
 - For admin users, proposed_context_patch may include deal_type, documentation_level, collateral_type, loan_purpose, underwriting_focus, or custom_instructions when the admin asks to update instructions.
 - For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for one-time shared-reviewer tasks, "vendor" for authenticated vendor tasks, and "admin" for internal Qualified Commercial tasks.
 - When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
-- For dealer_gatekeeper_v1 contexts, do not request documents outside the baseline package. Ask clarifying questions only for related LLC/account structure and real estate address, estimated amount owed, or estimated value.
+- For dealer_gatekeeper_v1 contexts, Stage 1 asks for last 2 years business tax returns, YTD P&L, last 3 months main operating bank statements, requested amount, use of funds, stated current monthly debt payments, and estimated credit tier/score. Ask for one missing Stage 1 item at a time.
+- Do not ask for the full Stage 2 underwriting package unless the latest review says "Good probability - book call" or the user asks what comes after a promising Stage 1 screen.
+- Treat real estate address, estimated value, and current mortgage balance as targeted follow-up clarifications after cash-flow context supports a possible real-estate-backed path.
 - For dealer_gatekeeper_v1 contexts, use the latest evidence map if present. Explain what the uploaded files actually support before saying what is missing.
 - When evidence is incomplete, choose only one next best action. Do not ask the user for every missing item at once.
 - Write the answer like a human senior banking underwriter who understands used-car dealerships, real-estate-backed commercial lending, floorplan lines, MCA exposure, dealer cash flow, related LLCs, and operating account analysis.
@@ -174,21 +197,36 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
             "Floorplan debt, MCA debt, inventory turn, bank deposits, tax returns, P&L, and real estate equity all affect bankability.",
         ],
         "baseline_document_policy": {
+            "stage": "stage_1_bankability",
             "allowed_document_categories": [
-                "last 2 years tax returns",
-                "current year P&L",
-                "last 3 months bank statements",
-                "asset/real estate schedule or mortgage notes/payoff statements",
-                "floorplan/MCA/inventory statements only when applicable",
+                "last 2 years business tax returns",
+                "current year/YTD P&L",
+                "last 3 months main operating bank statements",
+                "requested amount",
+                "use of funds",
+                "stated current monthly debt payments",
+                "estimated credit tier/score",
             ],
             "do_not_request_other_document_categories": True,
-            "extra_questions_allowed_only_for": [
+            "stage_1_metrics": [
+                "revenue trend",
+                "YTD annualized revenue",
+                "annualized adjusted deposits",
+                "tax return revenue vs bank deposits",
+                "estimated EBITDA/cash flow",
+                "estimated debt burden",
+                "estimated DSCR",
+                "NSF/overdraft/negative balance flags",
+                "requested amount reasonableness",
+            ],
+            "conditional_follow_up_only_after_cash_flow_context": [
+                "real estate full address",
+                "real estate estimated property value",
+                "real estate current mortgage balance",
                 "primary operating LLC/entity",
                 "main operating bank account",
                 "related LLC/entity relationship",
-                "real estate full address",
-                "real estate estimated amount owed",
-                "real estate estimated property value",
+                "floorplan/MCA/inventory statements when evidence suggests those obligations",
             ],
         },
         "answer_style": {
@@ -262,6 +300,39 @@ def _suggested_widget_type(parsed: dict[str, Any]) -> str | None:
 
 def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
     shaped = dict(result)
+    shaped["screening_stage"] = str(shaped.get("screening_stage") or "stage_1_bankability")
+    probability = str(shaped.get("probability_status") or "").strip()
+    allowed_probability = {
+        "Good probability - book call",
+        "Promising but needs one clarification",
+        "Not enough evidence yet",
+        "Poor probability based on current file",
+    }
+    if probability not in allowed_probability:
+        assessment = shaped.get("bankability_assessment") if isinstance(shaped.get("bankability_assessment"), dict) else {}
+        combined = f"{assessment.get('status') or ''} {assessment.get('reason') or ''} {shaped.get('executive_summary') or ''}".lower()
+        if any(term in combined for term in ("not bankable", "not fundable", "poor probability", "decline")):
+            probability = "Poor probability based on current file"
+        elif any(term in combined for term in ("good probability", "book call", "bankable", "fundable")) and not any(term in combined for term in ("cannot", "missing", "incomplete", "subject to")):
+            probability = "Good probability - book call"
+        elif any(term in combined for term in ("promising", "subject to", "one clarification", "preliminarily fundable")):
+            probability = "Promising but needs one clarification"
+        else:
+            probability = "Not enough evidence yet"
+    shaped["probability_status"] = probability
+    shaped["booking_recommended"] = bool(shaped.get("booking_recommended") is True or probability == "Good probability - book call")
+    if not isinstance(shaped.get("program_fit"), list):
+        shaped["program_fit"] = [str(shaped.get("program_fit"))] if shaped.get("program_fit") else []
+    confidence = str(shaped.get("confidence") or "").lower()
+    shaped["confidence"] = confidence if confidence in {"high", "medium", "low"} else "low"
+    if not isinstance(shaped.get("key_metrics"), dict):
+        shaped["key_metrics"] = {}
+    if not isinstance(shaped.get("strengths"), list):
+        shaped["strengths"] = []
+    if not isinstance(shaped.get("risks"), list):
+        shaped["risks"] = []
+    if not isinstance(shaped.get("one_next_step"), str):
+        shaped["one_next_step"] = ""
     evidence_map = shaped.get("document_evidence_map")
     if not isinstance(evidence_map, dict):
         evidence_map = {"files": [], "baseline_coverage": []}

@@ -81,9 +81,9 @@ ZIP_SUPPORTED_EXTENSIONS = {
 
 REQUIRED_DOCUMENTS = [
     {
-        "name": "Last 2 years tax returns",
+        "name": "Last 2 years business tax returns",
         "category": "Financials",
-        "description": "Upload business and personal tax returns for the last two years where available.",
+        "description": "Upload the dealership/business tax returns for the last two years.",
         "allow_multiple_files": True,
     },
     {
@@ -96,18 +96,6 @@ REQUIRED_DOCUMENTS = [
         "name": "Last 3 months bank statements",
         "category": "Bank Statements",
         "description": "Upload the last three months of business bank statements.",
-        "allow_multiple_files": True,
-    },
-    {
-        "name": "Asset and real estate schedule",
-        "category": "Collateral",
-        "description": "List owned real estate and assets, including estimated property values and current loan balances.",
-        "allow_multiple_files": True,
-    },
-    {
-        "name": "Mortgage notes or payoff statements",
-        "category": "Collateral",
-        "description": "Upload mortgage notes, payoff statements, or loan statements for real estate collateral where available.",
         "allow_multiple_files": True,
     },
 ]
@@ -553,10 +541,9 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
     if not files and not intake.result_snapshot:
         return {
             "type": "upload_files",
-            "title": "Upload baseline documents",
+            "title": "Upload Stage 1 cash-flow documents",
             "description": (
-                "Upload only the baseline package: tax returns, current P&L, bank statements, real estate schedule or mortgage notes, "
-                "and floorplan/MCA/inventory statements only if applicable."
+                "Upload last 2 years business tax returns, YTD P&L, and last 3 months from the main operating bank account first."
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         }
@@ -568,10 +555,9 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
     widgets: dict[str, dict[str, Any]] = {
         "upload_files": {
             "type": "upload_files",
-            "title": "Upload baseline documents",
+            "title": "Upload Stage 1 cash-flow documents",
             "description": (
-                "Upload only the baseline package: tax returns, current P&L, bank statements, real estate schedule or mortgage notes, "
-                "and floorplan/MCA/inventory statements only if applicable."
+                "Upload last 2 years business tax returns, YTD P&L, and last 3 months from the main operating bank account first."
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         },
@@ -683,9 +669,8 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
     kind = widget.get("type")
     if kind == "upload_files":
         return (
-            "Your secure file room is open. Upload the baseline package only: tax returns, current P&L, bank statements, "
-            "real estate schedule or mortgage notes, and floorplan/MCA/inventory statements only if they apply. "
-            "I will not ask for unlimited documents."
+            "Your secure file room is open. Stage 1 starts with the cash-flow package only: last 2 years business tax returns, "
+            "YTD P&L, and the last 3 months from the main operating bank account. I will ask for one clarification at a time after that."
         )
     if kind == "entity_structure":
         return (
@@ -783,6 +768,9 @@ def _blocking_items(result: dict[str, Any]) -> list[str]:
 def _next_step_text(result: dict[str, Any]) -> str:
     next_best = result.get("next_best_action") if isinstance(result.get("next_best_action"), dict) else {}
     next_type = str(next_best.get("type") or "").lower()
+    one_next_step = _short_text(result.get("one_next_step"), max_len=300)
+    if one_next_step:
+        return one_next_step
     detail = _short_text(next_best.get("detail") or next_best.get("title") or "", max_len=300)
     questions = result.get("underwriter_questions") if isinstance(result.get("underwriter_questions"), list) else []
     entity_question = None
@@ -811,7 +799,8 @@ def _next_step_text(result: dict[str, Any]) -> str:
 
 def _format_review_update(result: dict[str, Any]) -> str:
     assessment = result.get("bankability_assessment") if isinstance(result.get("bankability_assessment"), dict) else {}
-    status_label = _short_text(assessment.get("status") if isinstance(assessment, dict) else None, max_len=90) or "Updated"
+    probability = _short_text(result.get("probability_status"), max_len=90)
+    status_label = probability or _short_text(assessment.get("status") if isinstance(assessment, dict) else None, max_len=90) or "Updated"
     reason = _short_text(
         (assessment.get("reason") if isinstance(assessment, dict) else None)
         or result.get("executive_summary")
@@ -832,6 +821,12 @@ def _format_review_update(result: dict[str, Any]) -> str:
     blockers = _blocking_items(result)
     if blockers:
         lines.extend(["", "Still blocking a decision", *[f"- {item}" for item in blockers]])
+    strengths = result.get("strengths") if isinstance(result.get("strengths"), list) else []
+    risks = result.get("risks") if isinstance(result.get("risks"), list) else []
+    if strengths:
+        lines.extend(["", "Strengths", *[f"- {_short_text(item, max_len=180)}" for item in strengths[:3] if _short_text(item)]])
+    if risks and not blockers:
+        lines.extend(["", "Risks", *[f"- {_short_text(item, max_len=180)}" for item in risks[:3] if _short_text(item)]])
     lines.extend(
         [
             "",
@@ -840,6 +835,8 @@ def _format_review_update(result: dict[str, Any]) -> str:
             "- I will handle the rest in sequence after this answer, so you are not hit with every clarification at once.",
         ]
     )
+    if result.get("booking_recommended") is True:
+        lines.extend(["", "Booking", "- This looks strong enough to offer an underwriting call. Choose one of the available times below."])
     return "\n".join(lines)
 
 
@@ -859,30 +856,43 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "asset_rows": _asset_rows(intake),
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
+            "stage": "stage_1_bankability",
             "allowed_document_categories": [
-                "last 2 years tax returns",
-                "current year P&L",
-                "last 3 months bank statements",
-                "asset/real estate schedule or mortgage notes/payoff statements",
-                "floorplan/MCA/inventory statements only when applicable",
+                "last 2 years business tax returns",
+                "current year/YTD P&L",
+                "last 3 months main operating bank statements",
+                "requested amount",
+                "use of funds",
+                "stated current monthly debt payments",
+                "estimated credit tier/score",
             ],
             "do_not_request_other_document_categories": True,
+            "stage_2_after_good_probability_only": [
+                "personal tax returns",
+                "personal financial statement",
+                "dealer license",
+                "debt schedule",
+                "mortgage statements",
+                "property tax/insurance",
+                "entity docs",
+                "KYC/credit authorization",
+                "appraisal/BPO/title items when needed",
+            ],
         },
         "underwriting_focus": (
-            "Strictly screen bankability for dealer capital without asking the client to choose a loan product. "
+            "Strictly screen Stage 1 bankability for dealer capital without asking the client to choose a loan product. "
             "Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, "
             "portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. "
-            "Do not request documents outside the approved baseline package. If core documents are missing, classify the file "
-            "as incomplete or cannot determine based only on missing baseline items. Treat multiple dealership LLCs and bank "
-            "accounts as normal, but flag unclear primary operating entity, main operating bank account, related-entity flows, "
-            "ownership, collateral, credit, floorplan, MCA, and cash-flow gaps."
+            "Stage 1 focuses on business tax returns, YTD P&L, main operating bank statements, requested amount, use of funds, "
+            "stated monthly debt, and estimated credit. Do not ask for the full Stage 2 package until Stage 1 shows good probability. "
+            "Treat real estate and related LLC/account structure as targeted follow-up clarifications after cash-flow context supports a path."
         ),
         "custom_instructions": (
-            "This is a public lead-magnet strict underwriter for car dealers. Ask only for last 2 years tax returns, current-year P&L, "
-            "last 3 months bank statements, real estate schedule or mortgage notes/payoff statements, and floorplan/MCA/inventory "
-            "statements only when applicable. The user may not know which lending product fits. Collect evidence quickly, ask only "
-            "essential follow-up questions about related LLC/account structure and real estate estimated values/debt, then return "
-            "fundable, not fundable, or cannot determine from the current baseline evidence. Return a preliminary screen, not a commitment to lend."
+            "This is a public lead-magnet strict Stage 1 underwriter for car dealers. Ask first for last 2 years business tax returns, "
+            "YTD P&L, last 3 months main operating bank statements, requested amount, use of funds, stated monthly debt payments, "
+            "and estimated credit. The user may not know which lending product fits. Return one of these probability statuses: "
+            "Good probability - book call, Promising but needs one clarification, Not enough evidence yet, or Poor probability based on current file. "
+            "Set booking_recommended true only for Good probability - book call. Return a preliminary screen, not a commitment to lend."
         ),
     }
 
@@ -971,10 +981,20 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
         description="Public AI gatekeeper intake for dealer financing with real estate collateral.",
         ai_context={
             "review_type": "dealer_gatekeeper_v1",
+            "screening_stage": "stage_1_bankability",
             "deal_type": "dealer financing with real estate collateral",
             "documentation_level": "full doc",
             "collateral_type": "real estate collateral and business assets",
             "client_email": client.email,
+            "stage_1_required_items": [
+                "last 2 years business tax returns",
+                "current year/YTD P&L",
+                "last 3 months main operating bank statements",
+                "requested amount",
+                "use of funds",
+                "stated current monthly debt payments",
+                "estimated credit tier/score",
+            ],
         },
         created_by_id=owner.id if owner else None,
     )
@@ -1182,7 +1202,19 @@ async def _response(
     forced_widget_reason: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
+    latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
     widget = None
+    if latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
+        widget = await _decorate_widget(
+            db,
+            intake,
+            _widget_for_type(
+                intake,
+                "book_call",
+                source="ai_recommended",
+                reason="Stage 1 screen shows good probability.",
+            ),
+        )
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
     if messages is None:
@@ -1205,8 +1237,8 @@ async def _response(
         session_token=session_token,
         resume_url=_public_url(f"/dealer-ai-underwriter?token={token}") if token else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
-        assistant_message=assistant_message or _message_for_widget(widget, intake),
-        widget=None,
+        assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else _message_for_widget(widget, intake)),
+        widget=widget,
         requested_documents=[BucketRequestedDocumentRead.model_validate(doc) for doc in intake.bucket.requested_documents],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=summary,
