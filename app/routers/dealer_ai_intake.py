@@ -41,11 +41,15 @@ from app.schemas.bucket import (
 )
 from app.schemas.common import ORMModel
 from app.services.bucket_ai import create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
+from app.services.email.ses_client import send_email
 from app.services.payment_authorization import primary_super_admin
 
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
+
+TERMS_VERSION = "2026-05-19"
+PRIVACY_VERSION = "2026-05-19"
 
 
 REQUIRED_DOCUMENTS = [
@@ -107,6 +111,10 @@ class DealerIntakeStart(BaseModel):
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
     business_name: str | None = Field(default=None, max_length=180)
+    terms_accepted: bool = False
+    privacy_accepted: bool = False
+    terms_version: str = Field(default=TERMS_VERSION, max_length=32)
+    privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
 
     @field_validator("business_name", "phone", mode="before")
     @classmethod
@@ -133,6 +141,15 @@ class DealerIntakePatch(BaseModel):
 class DealerChatRequest(BaseModel):
     message: str | None = Field(default=None, max_length=4000)
     updates: DealerIntakePatch | None = None
+
+
+class DealerResumeLinkRequest(BaseModel):
+    email: EmailStr
+
+
+class DealerResumeLinkResponse(BaseModel):
+    ok: bool = True
+    message: str = "If a matching secure intake exists, a resume link has been sent."
 
 
 class DealerFileUploadInit(BaseModel):
@@ -203,6 +220,59 @@ def _new_public_token() -> str:
 
 def _normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def _request_audit(request: Request) -> dict[str, Any]:
+    return {
+        "ip_address": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent"),
+        "timestamp": _now().isoformat(),
+    }
+
+
+def _record_resume_email(
+    intake: PublicUnderwritingIntake,
+    *,
+    token: str,
+    request: Request,
+    reason: str,
+) -> dict[str, Any]:
+    resume_url = _public_url(f"/dealer-ai-underwriter?token={token}")
+    subject = "Your Qualified Commercial dealer funding review link"
+    body_text = (
+        f"Hi {intake.full_name},\n\n"
+        "Use this secure link to resume your Qualified Commercial dealer funding review:\n"
+        f"{resume_url}\n\n"
+        "This link opens your encrypted AI underwriting room for the dealer financing file. "
+        "If you did not request this link, you can ignore this email.\n\n"
+        "Qualified Commercial LLC"
+    )
+    body_html = (
+        f"<p>Hi {intake.full_name},</p>"
+        "<p>Use this secure link to resume your Qualified Commercial dealer funding review:</p>"
+        f'<p><a href="{resume_url}">Resume dealer funding review</a></p>'
+        "<p>This link opens your encrypted AI underwriting room for the dealer financing file. "
+        "If you did not request this link, you can ignore this email.</p>"
+        "<p>Qualified Commercial LLC</p>"
+    )
+    result = send_email(to_email=intake.email, subject=subject, body_text=body_text, body_html=body_html)
+    record = {
+        "reason": reason,
+        "status": result.detail,
+        "ok": result.ok,
+        "message_id": result.message_id,
+        "sent_at": _now().isoformat(),
+        **_request_audit(request),
+    }
+    state = _intake_state(intake)
+    deliveries = state.get("resume_email_deliveries")
+    if not isinstance(deliveries, list):
+        deliveries = []
+    deliveries.append(record)
+    state["resume_email"] = record
+    state["resume_email_deliveries"] = deliveries[-10:]
+    intake.intake_state = state
+    return record
 
 
 def _active_files(bucket: Bucket) -> list[BucketFile]:
@@ -918,6 +988,8 @@ async def start_dealer_intake(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
+    if not payload.terms_accepted or not payload.privacy_accepted:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
     client = await _find_or_create_client(db, payload)
     bucket, link = await _create_bucket_for_intake(db, client, payload, request)
     token = _new_public_token()
@@ -930,11 +1002,29 @@ async def start_dealer_intake(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
-        intake_state={"messages": [], "source": "dealer_ai_intake"},
+        intake_state={
+            "messages": [],
+            "source": "dealer_ai_intake",
+            "legal_acceptance": {
+                "terms_accepted": payload.terms_accepted,
+                "privacy_accepted": payload.privacy_accepted,
+                "terms_version": payload.terms_version or TERMS_VERSION,
+                "privacy_version": payload.privacy_version or PRIVACY_VERSION,
+                **_request_audit(request),
+            },
+        },
     )
     db.add(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
+    email_record = _record_resume_email(intake, token=token, request=request, reason="intake_created")
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    email_note = (
+        " I also emailed you a secure resume link so you can come back later."
+        if email_record.get("ok")
+        else " Use the copy resume link option as a backup if email delivery is unavailable."
+    )
     return await _response(
         db,
         intake,
@@ -943,8 +1033,44 @@ async def start_dealer_intake(
             "I opened your secure dealer funding file. I am going to screen this like a bank underwriter: tax returns, current P&L, "
             "bank statements, real estate collateral, and any floorplan/MCA exposure that applies. Upload what you have now, and I will "
             "only ask follow-up questions when the LLC/account structure or collateral values are not clear enough to make a preliminary call."
+            + email_note
         ),
     )
+
+
+@router.post("/resume-link", response_model=DealerResumeLinkResponse)
+async def send_dealer_resume_link(
+    payload: DealerResumeLinkRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerResumeLinkResponse:
+    email = _normalize_email(str(payload.email))
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.email == email)
+            .options(selectinload(PublicUnderwritingIntake.bucket))
+            .order_by(PublicUnderwritingIntake.updated_at.desc())
+        )
+    ).scalars().first()
+    if intake is not None and intake.bucket is not None and intake.bucket.archived_at is None:
+        token = _new_public_token()
+        intake.token_hash = _hash_token(token)
+        _record_resume_email(intake, token=token, request=request, reason="resume_link_requested")
+        await _log(
+            db,
+            intake.bucket_id,
+            "dealer_ai_resume_link_requested",
+            request=request,
+            actor_name=intake.full_name,
+            actor_email=intake.email,
+            actor_role="public_lead",
+            target_type="dealer_ai_intake",
+            target_id=str(intake.id),
+            detail="Dealer AI resume link requested by email",
+        )
+        await db.commit()
+    return DealerResumeLinkResponse()
 
 
 @router.get("/{token}", response_model=DealerIntakeResponse)
