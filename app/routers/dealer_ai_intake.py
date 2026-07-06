@@ -330,6 +330,107 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     }
 
 
+def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str = "system_next_step", reason: str | None = None) -> dict[str, Any] | None:
+    missing = _missing_required_docs(intake.bucket)
+    widgets: dict[str, dict[str, Any]] = {
+        "upload_files": {
+            "type": "upload_files",
+            "title": "Upload baseline documents",
+            "description": (
+                "Upload only the baseline package: tax returns, current P&L, bank statements, real estate schedule or mortgage notes, "
+                "and floorplan/MCA/inventory statements only if applicable."
+            ),
+            "missing_document_ids": [str(doc.id) for doc in missing],
+        },
+        "entity_structure": {
+            "type": "entity_structure",
+            "title": "Dealer entity and bank account structure",
+            "description": "Clarify the primary operating LLC, main operating bank account, related LLCs, and how the accounts work together.",
+        },
+        "deal_profile": {
+            "type": "deal_profile",
+            "title": "Essential funding facts",
+            "description": "Answer only what you know: use of funds, desired capital amount, and estimated credit score. The AI will infer the likely lending path.",
+            "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
+        },
+        "real_estate_schedule": {
+            "type": "real_estate_schedule",
+            "title": "Add real estate collateral",
+            "description": "Type each property address, estimated amount owed, and estimated value. You can also upload mortgage notes, but estimated value is still needed.",
+        },
+        "referral": {
+            "type": "referral",
+            "title": "Referral credit",
+            "description": "Who referred you to this link? If nobody did, enter self.",
+        },
+        "run_review": {
+            "type": "run_review",
+            "title": "Run preliminary AI screen",
+            "description": (
+                "Run this when there is enough evidence for a useful answer. Missing documents will be listed as gaps, "
+                "not treated as a reason to stop the review."
+            ),
+        },
+        "book_call": {
+            "type": "book_call",
+            "title": "Book the next underwriting call",
+            "description": "Choose one of the next available times with Qualified Commercial to validate the preliminary screen.",
+        },
+        "bankability_result": {
+            "type": "bankability_result",
+            "title": "Preliminary bankability screen",
+            "description": "Review the AI summary, missing items, product fit, and next steps.",
+        },
+    }
+    widget = widgets.get(kind)
+    if widget is None:
+        return None
+    return {**widget, "source": source, "reason": reason or source}
+
+
+def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingIntake) -> str | None:
+    text = (message or "").lower()
+    if not text.strip():
+        return None
+    property_terms = (
+        "manual properties",
+        "manually upload my properties",
+        "enter properties",
+        "add properties",
+        "property line",
+        "property list",
+        "real estate schedule",
+        "collateral schedule",
+        "amount owed",
+        "estimated value",
+        "property value",
+        "property address",
+        "mortgage balance",
+        "real estate",
+    )
+    if any(term in text for term in property_terms):
+        return "real_estate_schedule"
+    upload_terms = ("upload", "file", "document", "docs", "statement", "tax return", "p&l", "profit and loss", "mca", "floorplan", "inventory")
+    if any(term in text for term in upload_terms):
+        return "upload_files"
+    entity_terms = ("llc", "entity", "entities", "bank account", "related company", "operating account", "company structure")
+    if any(term in text for term in entity_terms):
+        return "entity_structure"
+    deal_terms = ("loan amount", "requested amount", "use of funds", "credit score", "capital amount", "funding amount")
+    if any(term in text for term in deal_terms):
+        return "deal_profile"
+    referral_terms = ("referred", "referral", "who sent", "who referred")
+    if any(term in text for term in referral_terms):
+        return "referral"
+    call_terms = ("book", "call", "appointment", "meeting", "schedule")
+    if any(term in text for term in call_terms) and not _call_booked(intake):
+        return "book_call"
+    review_terms = ("review", "underwrite", "screen", "fundable", "bankable", "preliminary")
+    if any(term in text for term in review_terms):
+        return "bankability_result" if intake.result_snapshot else "run_review"
+    return None
+
+
 def _message_for_widget(widget: dict[str, Any], intake: PublicUnderwritingIntake) -> str:
     kind = widget.get("type")
     if kind == "upload_files":
@@ -663,9 +764,12 @@ async def _response(
     token: str | None,
     assistant_message: str | None = None,
     messages: list[Any] | None = None,
+    forced_widget_type: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
-    widget = await _decorate_widget(db, intake, _next_widget(intake))
+    widget = _widget_for_type(intake, forced_widget_type, source="user_intent", reason="User asked for this tool") if forced_widget_type else None
+    widget = widget or _next_widget(intake)
+    widget = await _decorate_widget(db, intake, widget)
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
     return DealerIntakeResponse(
@@ -883,6 +987,7 @@ async def dealer_intake_chat(
     intake = await _load_public_intake(db, token)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    forced_widget_type = _widget_intent_from_message(payload.message, intake)
     await _log_dealer_update_events(
         db,
         intake,
@@ -909,7 +1014,7 @@ async def dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return await _response(db, intake, token=token, assistant_message=assistant_message, messages=messages)
+    return await _response(db, intake, token=token, assistant_message=assistant_message, messages=messages, forced_widget_type=forced_widget_type)
 
 
 @router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
@@ -1122,6 +1227,7 @@ async def my_dealer_intake_chat(
     intake = await _load_client_intake(db, user, intake_id)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    forced_widget_type = _widget_intent_from_message(payload.message, intake)
     await _log_dealer_update_events(db, intake, update_data, request=request, user=user)
     messages = []
     assistant_message = None
@@ -1140,7 +1246,7 @@ async def my_dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_client_intake(db, user, intake_id)
-    return await _response(db, intake, token=None, assistant_message=assistant_message, messages=messages)
+    return await _response(db, intake, token=None, assistant_message=assistant_message, messages=messages, forced_widget_type=forced_widget_type)
 
 
 @client_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
