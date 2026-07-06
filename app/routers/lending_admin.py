@@ -1452,3 +1452,332 @@ async def token_usage_timeseries(
         }
         for row in sorted(merged.values(), key=lambda item: item["day"])
     ]
+
+
+def _pct_change(current: float, previous: float) -> float | None:
+    if previous == 0:
+        return None if current == 0 else 100.0
+    return round(((current - previous) / previous) * 100.0, 1)
+
+
+def _metadata_id(metadata: dict[str, Any] | None, *keys: str) -> UUID | None:
+    if not metadata:
+        return None
+    for key in keys:
+        value = metadata.get(key)
+        if not value:
+            continue
+        try:
+            return UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _money_float(value: Any) -> float:
+    return round(float(value or 0), 6)
+
+
+@router.get("/token-usage/attribution")
+async def token_usage_attribution(
+    user: CurrentUser,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 250,
+    db: AsyncSession = Depends(get_db),
+):
+    """High-fidelity AI spend attribution for the canonical admin page.
+
+    The summary endpoints intentionally stay small. This endpoint resolves the
+    current Bedrock usage ledger and legacy Anthropic ledger into admin-facing
+    source rows: clients, loan files, buckets, dealer AI leads, vault documents,
+    models, and features. All dollar values are actual ledger estimates unless
+    explicitly named as a projection/run-rate.
+    """
+    _require_admin(user)
+    from app.models.ai_usage_event import AIUsageEvent as E
+    from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.bucket import Bucket
+    from app.models.client import Client
+    from app.models.deal import Deal
+    from app.models.document import Document
+    from app.models.loan import Loan
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+    from app.models.user import User
+
+    start, end = _usage_window(from_date, to_date)
+    window_seconds = max(1.0, (end - start).total_seconds())
+    previous_start = start - (end - start)
+    limit = max(25, min(limit, 1000))
+
+    async def _totals(s: datetime, e: datetime) -> dict[str, Any]:
+        legacy = (
+            await db.execute(
+                select(
+                    func.count().label("calls"),
+                    func.coalesce(func.sum(U.input_tokens + U.cache_read_tokens + U.cache_creation_tokens), 0),
+                    func.coalesce(func.sum(U.output_tokens), 0),
+                    func.coalesce(func.sum(U.cost_usd), 0),
+                )
+                .where(U.created_at >= s)
+                .where(U.created_at < e)
+            )
+        ).one()
+        events = (
+            await db.execute(
+                select(
+                    func.count().label("calls"),
+                    func.coalesce(func.sum(E.input_tokens), 0),
+                    func.coalesce(func.sum(E.output_tokens), 0),
+                    func.coalesce(func.sum(E.estimated_cost_usd), 0),
+                )
+                .where(E.created_at >= s)
+                .where(E.created_at < e)
+            )
+        ).one()
+        return {
+            "calls": int(legacy[0] or 0) + int(events[0] or 0),
+            "input_tokens": int(legacy[1] or 0) + int(events[1] or 0),
+            "output_tokens": int(legacy[2] or 0) + int(events[2] or 0),
+            "cost_usd": _money_float(float(legacy[3] or 0) + float(events[3] or 0)),
+        }
+
+    totals = await _totals(start, end)
+    previous = await _totals(previous_start, start)
+    days = max(1.0, window_seconds / 86400.0)
+    projected_30_day = _money_float((totals["cost_usd"] / days) * 30.0) if totals["cost_usd"] else 0.0
+
+    event_rows = list(
+        (
+            await db.execute(
+                select(E)
+                .where(E.created_at >= start)
+                .where(E.created_at < end)
+                .order_by(E.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    legacy_rows = list(
+        (
+            await db.execute(
+                select(U)
+                .where(U.created_at >= start)
+                .where(U.created_at < end)
+                .order_by(U.created_at.desc())
+            )
+        ).scalars().all()
+    )
+
+    client_ids = {row.client_id for row in event_rows if row.client_id} | {row.client_id for row in legacy_rows if row.client_id}
+    loan_ids = {row.loan_id for row in event_rows if row.loan_id} | {row.loan_id for row in legacy_rows if row.loan_id}
+    deal_ids = {row.deal_id for row in legacy_rows if row.deal_id}
+    bucket_ids = {_metadata_id(row.metadata_json, "bucket_id") for row in event_rows}
+    bucket_ids = {bid for bid in bucket_ids if bid is not None}
+    document_ids = {_metadata_id(row.metadata_json, "document_id") for row in event_rows}
+    document_ids = {did for did in document_ids if did is not None}
+    user_ids = {row.user_id for row in event_rows if row.user_id}
+
+    clients: dict[UUID, Client] = {}
+    loans: dict[UUID, Loan] = {}
+    deals: dict[UUID, Deal] = {}
+    buckets: dict[UUID, Bucket] = {}
+    documents: dict[UUID, Document] = {}
+    intakes_by_bucket: dict[UUID, PublicUnderwritingIntake] = {}
+    users: dict[UUID, User] = {}
+
+    if client_ids:
+        clients = {item.id: item for item in (await db.execute(select(Client).where(Client.id.in_(client_ids)))).scalars().all()}
+    if loan_ids:
+        loans = {item.id: item for item in (await db.execute(select(Loan).where(Loan.id.in_(loan_ids)))).scalars().all()}
+    if deal_ids:
+        deals = {item.id: item for item in (await db.execute(select(Deal).where(Deal.id.in_(deal_ids)))).scalars().all()}
+    if bucket_ids:
+        buckets = {item.id: item for item in (await db.execute(select(Bucket).where(Bucket.id.in_(bucket_ids)))).scalars().all()}
+        intakes_by_bucket = {
+            item.bucket_id: item
+            for item in (
+                await db.execute(
+                    select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id.in_(bucket_ids))
+                )
+            ).scalars().all()
+        }
+    if document_ids:
+        documents = {item.id: item for item in (await db.execute(select(Document).where(Document.id.in_(document_ids)))).scalars().all()}
+        doc_loan_ids = {doc.loan_id for doc in documents.values() if doc.loan_id and doc.loan_id not in loans}
+        if doc_loan_ids:
+            loans.update({item.id: item for item in (await db.execute(select(Loan).where(Loan.id.in_(doc_loan_ids)))).scalars().all()})
+    if user_ids:
+        users = {item.id: item for item in (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()}
+
+    def source_for_event(row: E) -> dict[str, str | None]:
+        metadata = row.metadata_json or {}
+        bucket_id = _metadata_id(metadata, "bucket_id")
+        document_id = _metadata_id(metadata, "document_id")
+        if bucket_id and bucket_id in intakes_by_bucket:
+            intake = intakes_by_bucket[bucket_id]
+            label = intake.business_name or intake.full_name or intake.email
+            return {
+                "key": f"dealer_ai_lead:{intake.id}",
+                "kind": "dealer_ai_lead",
+                "id": str(intake.id),
+                "label": f"Dealer AI lead · {label}",
+                "href": f"/admin/dealer-ai-leads?lead={intake.id}",
+            }
+        if bucket_id and bucket_id in buckets:
+            bucket = buckets[bucket_id]
+            return {
+                "key": f"bucket:{bucket.id}",
+                "kind": "bucket",
+                "id": str(bucket.id),
+                "label": f"Bucket · {bucket.name}",
+                "href": f"/admin/buckets?bucket={bucket.id}",
+            }
+        if row.loan_id and row.loan_id in loans:
+            loan = loans[row.loan_id]
+            label = loan.address or loan.deal_id or str(loan.id)
+            return {"key": f"loan:{loan.id}", "kind": "loan", "id": str(loan.id), "label": f"Funding file · {label}", "href": f"/loans/{loan.id}"}
+        if document_id and document_id in documents:
+            doc = documents[document_id]
+            return {"key": f"document:{doc.id}", "kind": "vault_document", "id": str(doc.id), "label": f"Vault document · {doc.name}", "href": f"/loans/{doc.loan_id}#docs"}
+        if row.client_id and row.client_id in clients:
+            client = clients[row.client_id]
+            return {"key": f"client:{client.id}", "kind": "client", "id": str(client.id), "label": f"Client · {client.name}", "href": f"/clients/{client.id}/workspace"}
+        if row.user_id and row.user_id in users:
+            account = users[row.user_id]
+            return {"key": f"user:{account.id}", "kind": "user", "id": str(account.id), "label": f"User · {account.name or account.email}", "href": None}
+        return {"key": "system:unattributed", "kind": "system", "id": None, "label": "System / unattributed", "href": None}
+
+    def source_for_legacy(row: U) -> dict[str, str | None]:
+        if row.loan_id and row.loan_id in loans:
+            loan = loans[row.loan_id]
+            label = loan.address or loan.deal_id or str(loan.id)
+            return {"key": f"loan:{loan.id}", "kind": "loan", "id": str(loan.id), "label": f"Funding file · {label}", "href": f"/loans/{loan.id}"}
+        if row.deal_id and row.deal_id in deals:
+            deal = deals[row.deal_id]
+            return {"key": f"deal:{deal.id}", "kind": "deal", "id": str(deal.id), "label": f"Deal · {deal.title}", "href": f"/deals/{deal.id}"}
+        if row.client_id and row.client_id in clients:
+            client = clients[row.client_id]
+            return {"key": f"client:{client.id}", "kind": "client", "id": str(client.id), "label": f"Client · {client.name}", "href": f"/clients/{client.id}/workspace"}
+        return {"key": "legacy:unattributed", "kind": "legacy", "id": None, "label": "Legacy usage / limited context", "href": None}
+
+    def merge(bucket: dict[str, dict[str, Any]], source: dict[str, str | None], *, calls: int, tokens: int, cost: float, feature: str, provider: str) -> None:
+        row = bucket.setdefault(
+            source["key"] or "unknown",
+            {
+                "key": source["key"] or "unknown",
+                "kind": source["kind"],
+                "id": source["id"],
+                "label": source["label"],
+                "href": source["href"],
+                "calls": 0,
+                "tokens": 0,
+                "cost_usd": 0.0,
+                "features": {},
+                "providers": {},
+            },
+        )
+        row["calls"] += calls
+        row["tokens"] += tokens
+        row["cost_usd"] += cost
+        row["features"][feature] = row["features"].get(feature, 0) + cost
+        row["providers"][provider] = row["providers"].get(provider, 0) + cost
+
+    by_source: dict[str, dict[str, Any]] = {}
+    by_feature: dict[str, dict[str, Any]] = {}
+    recent_events: list[dict[str, Any]] = []
+
+    for row in event_rows:
+        cost = _money_float(row.estimated_cost_usd)
+        tokens = int(row.input_tokens or 0) + int(row.output_tokens or 0)
+        source = source_for_event(row)
+        merge(by_source, source, calls=1, tokens=tokens, cost=cost, feature=row.feature, provider=row.provider)
+        merge(
+            by_feature,
+            {"key": f"feature:{row.feature}", "kind": "feature", "id": None, "label": row.feature.replace("_", " "), "href": None},
+            calls=1,
+            tokens=tokens,
+            cost=cost,
+            feature=row.feature,
+            provider=row.provider,
+        )
+        if len(recent_events) < limit:
+            recent_events.append(
+                {
+                    "id": str(row.id),
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "feature": row.feature,
+                    "category": row.category,
+                    "tokens": tokens,
+                    "cost_usd": cost,
+                    "source": source,
+                    "ledger": "bedrock",
+                    "cost_basis": "actual_estimated",
+                    "metadata": row.metadata_json or {},
+                }
+            )
+
+    for row in legacy_rows:
+        cost = _money_float(row.cost_usd)
+        tokens = int(row.input_tokens or 0) + int(row.cache_read_tokens or 0) + int(row.cache_creation_tokens or 0) + int(row.output_tokens or 0)
+        source = source_for_legacy(row)
+        merge(by_source, source, calls=1, tokens=tokens, cost=cost, feature=row.activity, provider="anthropic_legacy")
+        merge(
+            by_feature,
+            {"key": f"feature:{row.activity}", "kind": "feature", "id": None, "label": row.activity.replace("_", " "), "href": None},
+            calls=1,
+            tokens=tokens,
+            cost=cost,
+            feature=row.activity,
+            provider="anthropic_legacy",
+        )
+        if len(recent_events) < limit:
+            recent_events.append(
+                {
+                    "id": str(row.id),
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "provider": "anthropic_legacy",
+                    "model": row.model,
+                    "feature": row.activity,
+                    "category": "legacy",
+                    "tokens": tokens,
+                    "cost_usd": cost,
+                    "source": source,
+                    "ledger": "legacy",
+                    "cost_basis": "actual_legacy",
+                    "metadata": {},
+                }
+            )
+
+    source_rows = sorted(by_source.values(), key=lambda item: item["cost_usd"], reverse=True)
+    feature_rows = sorted(by_feature.values(), key=lambda item: item["cost_usd"], reverse=True)
+    for row in [*source_rows, *feature_rows]:
+        row["cost_usd"] = _money_float(row["cost_usd"])
+        row["top_feature"] = max(row["features"].items(), key=lambda item: item[1])[0] if row["features"] else None
+        row["top_provider"] = max(row["providers"].items(), key=lambda item: item[1])[0] if row["providers"] else None
+        row.pop("features", None)
+        row.pop("providers", None)
+
+    recent_events.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+
+    return {
+        "from": start.isoformat(),
+        "to": end.isoformat(),
+        "actual": totals,
+        "previous_actual": previous,
+        "trend": {
+            "delta_usd": _money_float(totals["cost_usd"] - previous["cost_usd"]),
+            "pct": _pct_change(totals["cost_usd"], previous["cost_usd"]),
+            "direction": "up" if totals["cost_usd"] > previous["cost_usd"] else "down" if totals["cost_usd"] < previous["cost_usd"] else "flat",
+        },
+        "projection": {
+            "projected_30_day_usd": projected_30_day,
+            "daily_run_rate_usd": _money_float(totals["cost_usd"] / days) if totals["cost_usd"] else 0.0,
+            "basis_days": round(days, 1),
+            "basis": "run_rate_projection",
+        },
+        "source_rows": source_rows[:limit],
+        "feature_rows": feature_rows[:limit],
+        "recent_events": recent_events[:limit],
+    }
