@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import mimetypes
 import secrets
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,7 @@ from app.schemas.bucket import (
 )
 from app.schemas.common import ORMModel
 from app.services.bucket_ai import create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
+from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email
 from app.services.payment_authorization import primary_super_admin
 
@@ -1754,6 +1756,38 @@ async def send_dealer_resume_link(
         )
         await db.commit()
     return DealerResumeLinkResponse()
+
+
+@router.get("/intelligence.pdf")
+async def download_dealer_intelligence_pdf(
+    request: Request,
+    token: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    if token:
+        intake = await _load_public_intake(db, token)
+    else:
+        session_token = _dealer_session_from_request(request)
+        if not session_token:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session or resume token required")
+        intake, _challenge = await _load_intake_by_dealer_session(db, session_token)
+    review = intake.latest_review if intake.latest_review else None
+    latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    missing_docs = _missing_required_docs(intake.bucket)
+    pdf_bytes = await asyncio.to_thread(
+        render_dealer_intelligence_pdf,
+        intake=intake,
+        files=files,
+        missing_docs=missing_docs,
+        result=latest_result,
+    )
+    filename = _safe_filename(f"dealer-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{token}", response_model=DealerIntakeResponse)
