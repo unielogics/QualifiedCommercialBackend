@@ -340,7 +340,7 @@ def _call_booked(intake: PublicUnderwritingIntake) -> bool:
     return isinstance(booking, dict) and bool(booking.get("event_id"))
 
 
-def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
     files = _active_files(intake.bucket)
     missing = _missing_required_docs(intake.bucket)
     if not files and not intake.result_snapshot:
@@ -353,51 +353,13 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         }
-    if not _entity_structure_complete(intake):
+    if intake.result_snapshot:
         return {
-            "type": "entity_structure",
-            "title": "Dealer entity and bank account structure",
-            "description": "Clarify the primary operating LLC, main operating bank account, related LLCs, and how the accounts work together.",
+            "type": "bankability_result",
+            "title": "Preliminary bankability screen",
+            "description": "Review the AI summary, missing items, product fit, and next steps.",
         }
-    if not intake.loan_purpose or intake.requested_loan_amount is None or intake.estimated_credit_score is None:
-        return {
-            "type": "deal_profile",
-            "title": "Essential funding facts",
-            "description": "Answer only what you know: use of funds, desired capital amount, and estimated credit score. The AI will infer the likely lending path.",
-            "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
-        }
-    if not _has_real_estate_schedule(intake):
-        return {
-            "type": "real_estate_schedule",
-            "title": "Real estate collateral schedule",
-            "description": "Add address, estimated amount owed, and estimated value. You may upload mortgage notes instead, but estimated values are still required for a clear screen.",
-        }
-    if not intake.referral_source:
-        return {
-            "type": "referral",
-            "title": "Referral credit",
-            "description": "Who referred you to this link? If nobody did, enter self.",
-        }
-    if not intake.result_snapshot:
-        return {
-            "type": "run_review",
-            "title": "Run preliminary AI screen",
-            "description": (
-                "Run this when there is enough evidence for a useful answer. Missing documents will be listed as gaps, "
-                "not treated as a reason to stop the review."
-            ),
-        }
-    if not _call_booked(intake):
-        return {
-            "type": "book_call",
-            "title": "Book the next underwriting call",
-            "description": "Choose one of the next available times with Qualified Commercial to validate the preliminary screen.",
-        }
-    return {
-        "type": "bankability_result",
-        "title": "Preliminary bankability screen",
-        "description": "Review the AI summary, missing items, product fit, and next steps.",
-    }
+    return None
 
 
 def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str = "system_next_step", reason: str | None = None) -> dict[str, Any] | None:
@@ -501,7 +463,12 @@ def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingI
     return None
 
 
-def _message_for_widget(widget: dict[str, Any], intake: PublicUnderwritingIntake) -> str:
+def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritingIntake) -> str:
+    if not widget:
+        return (
+            "I am reading the uploaded file set like a banking underwriter. I will classify the documents by what they actually are, "
+            "then tell you what they support and what baseline items are still missing."
+        )
     kind = widget.get("type")
     if kind == "upload_files":
         return (
@@ -814,8 +781,8 @@ async def _dealer_call_slots(db: AsyncSession) -> tuple[Any | None, BookingSetti
     ]
 
 
-async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, widget: dict[str, Any]) -> dict[str, Any]:
-    if widget.get("type") != "book_call":
+async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, widget: dict[str, Any] | None) -> dict[str, Any] | None:
+    if widget is None or widget.get("type") != "book_call":
         return widget
     owner, booking, slots = await _dealer_call_slots(db)
     decorated = dict(widget)
