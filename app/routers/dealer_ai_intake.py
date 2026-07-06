@@ -185,6 +185,7 @@ class DealerLoginStartRequest(BaseModel):
 
 class DealerLoginStartResponse(BaseModel):
     ok: bool = True
+    login_required: bool = False
     message: str = "If a secure dealer file exists for this email, a short access code has been sent."
 
 
@@ -1451,9 +1452,16 @@ async def start_dealer_login(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerLoginStartResponse:
-    await _start_login_challenge(db, email=str(payload.email), request=request, reason="dealer_login_requested")
+    login_required = await _start_login_challenge(db, email=str(payload.email), request=request, reason="dealer_login_requested")
     await db.commit()
-    return DealerLoginStartResponse()
+    return DealerLoginStartResponse(
+        login_required=login_required,
+        message=(
+            "We found an existing secure dealer file for this email. Enter the code we sent to continue."
+            if login_required
+            else "No existing secure dealer file was found. Complete Step 1 to start a new review."
+        ),
+    )
 
 
 @router.post("/login/verify", response_model=DealerIntakeResponse)
