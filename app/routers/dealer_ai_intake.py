@@ -457,6 +457,9 @@ def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingI
     call_terms = ("book", "call", "appointment", "meeting", "schedule")
     if any(term in text for term in call_terms) and not _call_booked(intake):
         return "book_call"
+    rerun_terms = ("reanalyze", "re-analyze", "rerun", "re-run", "run again", "review again", "refresh review", "refresh screen")
+    if any(term in text for term in rerun_terms):
+        return "run_review"
     review_terms = ("review", "underwrite", "screen", "fundable", "bankable", "preliminary")
     if any(term in text for term in review_terms):
         return "bankability_result" if intake.result_snapshot else "run_review"
