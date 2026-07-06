@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -14,10 +14,14 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.db import get_db
 from app.deps import CurrentUser
-from app.enums import Role
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
+from app.models.activity import Activity
+from app.models.booking_settings import BookingSettings
 from app.models.bucket import Bucket, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
+from app.models.event import CalendarEvent
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
     _bucket_storage_config,
     _generate_passcode,
@@ -86,6 +90,18 @@ class DealerAssetRow(BaseModel):
     notes: str | None = Field(default=None, max_length=500)
 
 
+class DealerEntityStructure(BaseModel):
+    primary_operating_entity: str | None = Field(default=None, max_length=180)
+    main_operating_bank_account: str | None = Field(default=None, max_length=180)
+    related_entities: str | None = Field(default=None, max_length=1200)
+    relationship_explanation: str | None = Field(default=None, max_length=1600)
+
+    @field_validator("primary_operating_entity", "main_operating_bank_account", "related_entities", "relationship_explanation", mode="before")
+    @classmethod
+    def blank_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
 class DealerIntakeStart(BaseModel):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
@@ -106,6 +122,7 @@ class DealerIntakePatch(BaseModel):
     estimated_credit_score: int | None = Field(default=None, ge=300, le=850)
     referral_source: str | None = Field(default=None, max_length=180)
     asset_rows: list[DealerAssetRow] | None = None
+    entity_structure: DealerEntityStructure | None = None
 
     @field_validator("business_name", "phone", "loan_purpose", "referral_source", mode="before")
     @classmethod
@@ -128,6 +145,10 @@ class DealerFileUploadInit(BaseModel):
 class DealerUploadComplete(BaseModel):
     file_id: UUID
     note: str | None = Field(default=None, max_length=2000)
+
+
+class DealerBookCallRequest(BaseModel):
+    starts_at: datetime
 
 
 class DealerIntakeRead(ORMModel):
@@ -202,18 +223,71 @@ def _asset_rows(intake: PublicUnderwritingIntake) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _intake_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    return dict(intake.intake_state or {})
+
+
+def _entity_structure(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    raw = _intake_state(intake).get("entity_structure")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _entity_structure_complete(intake: PublicUnderwritingIntake) -> bool:
+    entity = _entity_structure(intake)
+    return all(
+        str(entity.get(key) or "").strip()
+        for key in (
+            "primary_operating_entity",
+            "main_operating_bank_account",
+            "related_entities",
+            "relationship_explanation",
+        )
+    )
+
+
+def _has_real_estate_schedule(intake: PublicUnderwritingIntake) -> bool:
+    return any(
+        str(row.get("address") or "").strip()
+        and row.get("estimated_loan_amount") is not None
+        and row.get("estimated_property_value") is not None
+        for row in _asset_rows(intake)
+    )
+
+
+def _has_uploaded_doc_name(intake: PublicUnderwritingIntake, needle: str) -> bool:
+    wanted = needle.lower()
+    docs = {doc.id: doc for doc in intake.bucket.requested_documents}
+    for file in _active_files(intake.bucket):
+        doc = docs.get(file.requested_document_id) if file.requested_document_id else None
+        haystack = f"{file.file_name} {doc.name if doc else ''} {doc.category if doc else ''}".lower()
+        if wanted in haystack:
+            return True
+    return False
+
+
+def _call_booked(intake: PublicUnderwritingIntake) -> bool:
+    booking = _intake_state(intake).get("call_booking")
+    return isinstance(booking, dict) and bool(booking.get("event_id"))
+
+
 def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     files = _active_files(intake.bucket)
     missing = _missing_required_docs(intake.bucket)
     if not files and not intake.result_snapshot:
         return {
             "type": "upload_files",
-            "title": "Upload what you have now",
+            "title": "Upload baseline documents",
             "description": (
-                "Start with bank statements, P&L, tax returns, floorplan/MCA statements, inventory, "
-                "and any real estate collateral documents. The AI can screen partial files and tell you what is missing."
+                "Upload only the baseline package: tax returns, current P&L, bank statements, real estate schedule or mortgage notes, "
+                "and floorplan/MCA/inventory statements only if applicable."
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
+        }
+    if not _entity_structure_complete(intake):
+        return {
+            "type": "entity_structure",
+            "title": "Dealer entity and bank account structure",
+            "description": "Clarify the primary operating LLC, main operating bank account, related LLCs, and how the accounts work together.",
         }
     if not intake.loan_purpose or intake.requested_loan_amount is None or intake.estimated_credit_score is None:
         return {
@@ -222,11 +296,11 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "description": "Answer only what you know: use of funds, desired capital amount, and estimated credit score. The AI will infer the likely lending path.",
             "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
         }
-    if not _asset_rows(intake):
+    if not _has_real_estate_schedule(intake):
         return {
-            "type": "asset_table",
-            "title": "Real estate and asset schedule",
-            "description": "Add each property or major asset with the address, estimated current loan amount, and estimated value.",
+            "type": "real_estate_schedule",
+            "title": "Real estate collateral schedule",
+            "description": "Add address, estimated amount owed, and estimated value. You may upload mortgage notes instead, but estimated values are still required for a clear screen.",
         }
     if not intake.referral_source:
         return {
@@ -243,6 +317,12 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
                 "not treated as a reason to stop the review."
             ),
         }
+    if not _call_booked(intake):
+        return {
+            "type": "book_call",
+            "title": "Book the next underwriting call",
+            "description": "Choose one of the next available times with Qualified Commercial to validate the preliminary screen.",
+        }
     return {
         "type": "bankability_result",
         "title": "Preliminary bankability screen",
@@ -254,16 +334,22 @@ def _message_for_widget(widget: dict[str, Any], intake: PublicUnderwritingIntake
     kind = widget.get("type")
     if kind == "upload_files":
         return (
-            "Your secure file room is open. Upload whatever you have now. You do not need to know the lending product; "
-            "I will review the documents, ask only the essential follow-up questions, and identify the likely path and missing evidence."
+            "Your secure file room is open. Upload the baseline package only: tax returns, current P&L, bank statements, "
+            "real estate schedule or mortgage notes, and floorplan/MCA/inventory statements only if they apply. "
+            "I will not ask for unlimited documents."
+        )
+    if kind == "entity_structure":
+        return (
+            "Next I need to understand the dealership structure: the main operating LLC, the main operating bank account, "
+            "any related LLCs, and how those accounts/entities work together."
         )
     if kind == "deal_profile":
         return (
             "I have files to review. Next, give me the use of funds, rough requested amount, and estimated credit score. "
             "This is self-reported for now and will be validated during the intro call."
         )
-    if kind == "asset_table":
-        return "Now add the real estate collateral and major assets. If you have mortgage notes or payoff statements, you can upload those too."
+    if kind == "real_estate_schedule":
+        return "Now add the real estate collateral schedule: full address, estimated amount owed, and estimated value. You can upload mortgage notes, but I still need estimated values."
     if kind == "referral":
         return "Before I run the final screen, tell us who referred you so we can credit the right person."
     if kind == "run_review":
@@ -274,6 +360,8 @@ def _message_for_widget(widget: dict[str, Any], intake: PublicUnderwritingIntake
     if kind == "bankability_result":
         status_label = (intake.result_snapshot or {}).get("bankability_assessment", {}).get("status")
         return f"The preliminary screen is ready{f': {status_label}' if status_label else ''}. Review the summary and next steps below."
+    if kind == "book_call":
+        return "The preliminary screen is ready. Choose one of the available call times so Qualified Commercial can validate the file and next steps with you."
     return "How can I help with this dealer financing file?"
 
 
@@ -288,19 +376,33 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "estimated_credit_score": intake.estimated_credit_score,
         "business_name": intake.business_name,
         "referral_source": intake.referral_source,
+        "entity_structure": _entity_structure(intake),
         "asset_rows": _asset_rows(intake),
+        "baseline_document_policy": {
+            "allowed_document_categories": [
+                "last 2 years tax returns",
+                "current year P&L",
+                "last 3 months bank statements",
+                "asset/real estate schedule or mortgage notes/payoff statements",
+                "floorplan/MCA/inventory statements only when applicable",
+            ],
+            "do_not_request_other_document_categories": True,
+        },
         "underwriting_focus": (
             "Strictly screen bankability for dealer capital without asking the client to choose a loan product. "
             "Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, "
             "portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. "
-            "If core documents are missing, classify the file as incomplete or conditional rather than blocking the review. "
-            "Flag proof-of-funds, financial, collateral, credit, ownership, floorplan, MCA, and cash-flow gaps."
+            "Do not request documents outside the approved baseline package. If core documents are missing, classify the file "
+            "as incomplete or cannot determine based only on missing baseline items. Treat multiple dealership LLCs and bank "
+            "accounts as normal, but flag unclear primary operating entity, main operating bank account, related-entity flows, "
+            "ownership, collateral, credit, floorplan, MCA, and cash-flow gaps."
         ),
         "custom_instructions": (
-            "This is a public lead-magnet gatekeeper for car dealers. Ask for last 2 years tax returns, current-year P&L, "
-            "last 3 months bank statements, asset/real estate schedule, and mortgage notes/payoff statements. "
-            "The user may not know which lending product fits. Collect evidence quickly, ask only essential follow-up questions, "
-            "return likely program fit, missing evidence, discrepancies, and next steps. Return a preliminary bankability screen, not a commitment to lend."
+            "This is a public lead-magnet strict underwriter for car dealers. Ask only for last 2 years tax returns, current-year P&L, "
+            "last 3 months bank statements, real estate schedule or mortgage notes/payoff statements, and floorplan/MCA/inventory "
+            "statements only when applicable. The user may not know which lending product fits. Collect evidence quickly, ask only "
+            "essential follow-up questions about related LLC/account structure and real estate estimated values/debt, then return "
+            "fundable, not fundable, or cannot determine from the current baseline evidence. Return a preliminary screen, not a commitment to lend."
         ),
     }
 
@@ -459,12 +561,103 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     if "asset_rows" in data:
         intake.asset_rows = [row.model_dump() if isinstance(row, DealerAssetRow) else row for row in updates.asset_rows or []]
     state = dict(intake.intake_state or {})
+    if "entity_structure" in data:
+        state["entity_structure"] = updates.entity_structure.model_dump() if updates.entity_structure else {}
     state["last_updates"] = data
     intake.intake_state = state
     intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake)}
 
 
-def _response(
+async def _log_dealer_update_events(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    data: dict[str, Any],
+    *,
+    request: Request | None = None,
+    user: CurrentUser | None = None,
+    actor_name: str | None = None,
+    actor_email: str | None = None,
+    actor_role: str | None = None,
+) -> None:
+    if "entity_structure" in data:
+        await _log(
+            db,
+            intake.bucket_id,
+            "dealer_ai_entity_structure_captured",
+            request=request,
+            user=user,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role=actor_role,
+            target_type="dealer_ai_intake",
+            target_id=str(intake.id),
+            detail="Dealer entity and operating account structure captured",
+        )
+    if "asset_rows" in data:
+        await _log(
+            db,
+            intake.bucket_id,
+            "dealer_ai_real_estate_schedule_updated",
+            request=request,
+            user=user,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role=actor_role,
+            target_type="dealer_ai_intake",
+            target_id=str(intake.id),
+            detail="Dealer real estate collateral schedule updated",
+        )
+
+
+async def _booking_settings_for_primary_admin(db: AsyncSession) -> tuple[Any | None, BookingSettings | None]:
+    owner = await primary_super_admin(db)
+    if owner is None:
+        return None, None
+    booking = (
+        await db.execute(
+            select(BookingSettings).where(
+                BookingSettings.user_id == owner.id,
+                BookingSettings.enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    return owner, booking
+
+
+async def _dealer_call_slots(db: AsyncSession) -> tuple[Any | None, BookingSettings | None, list[dict[str, str]]]:
+    owner, booking = await _booking_settings_for_primary_admin(db)
+    if owner is None or booking is None:
+        return owner, booking, []
+    slots = await _available_booking_slots(db, owner, booking)
+    now = _now()
+    next_day = now + timedelta(hours=24)
+    preferred = [slot for slot in slots if slot.starts_at <= next_day]
+    chosen = (preferred or slots)[:3]
+    return owner, booking, [
+        {
+            "starts_at": slot.starts_at.isoformat(),
+            "label": slot.label,
+            "date_label": slot.date_label,
+        }
+        for slot in chosen
+    ]
+
+
+async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, widget: dict[str, Any]) -> dict[str, Any]:
+    if widget.get("type") != "book_call":
+        return widget
+    owner, booking, slots = await _dealer_call_slots(db)
+    decorated = dict(widget)
+    decorated["slots"] = slots
+    decorated["host_name"] = owner.name or owner.email if owner is not None else "Qualified Commercial"
+    decorated["duration_min"] = booking.duration_min if booking is not None else 30
+    if not slots:
+        decorated["disabled_reason"] = "No call times are available right now. Qualified Commercial will follow up directly."
+    return decorated
+
+
+async def _response(
+    db: AsyncSession,
     intake: PublicUnderwritingIntake,
     *,
     token: str | None,
@@ -472,7 +665,7 @@ def _response(
     messages: list[Any] | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
-    widget = _next_widget(intake)
+    widget = await _decorate_widget(db, intake, _next_widget(intake))
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
     return DealerIntakeResponse(
@@ -638,12 +831,14 @@ async def start_dealer_intake(
     db.add(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return _response(
+    return await _response(
+        db,
         intake,
         token=token,
         assistant_message=(
-            "Your secure dealer funding room is open. Upload whatever documents you have now. "
-            "I will review the file, infer the likely lending path, ask only essential follow-up questions, and list what is missing."
+            "Your secure dealer funding room is open. Upload the baseline package only: tax returns, current P&L, bank statements, "
+            "real estate collateral schedule or mortgage notes, and floorplan/MCA/inventory statements only if they apply. "
+            "I will screen fundability from that baseline and ask only for related LLC/account and collateral-value clarification."
         ),
     )
 
@@ -651,30 +846,52 @@ async def start_dealer_intake(
 @router.get("/{token}", response_model=DealerIntakeResponse)
 async def get_dealer_intake(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
-    return _response(intake, token=token)
+    return await _response(db, intake, token=token)
 
 
 @router.patch("/{token}", response_model=DealerIntakeResponse)
 async def update_dealer_intake(
     token: str,
     payload: DealerIntakePatch,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    update_data = payload.model_dump(exclude_unset=True)
     _apply_updates(intake, payload)
+    await _log_dealer_update_events(
+        db,
+        intake,
+        update_data,
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+    )
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return _response(intake, token=token)
+    return await _response(db, intake, token=token)
 
 
 @router.post("/{token}/chat", response_model=DealerIntakeResponse)
 async def dealer_intake_chat(
     token: str,
     payload: DealerChatRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    await _log_dealer_update_events(
+        db,
+        intake,
+        update_data,
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+    )
     intake.last_message_at = _now()
     messages = []
     assistant_message = None
@@ -692,7 +909,7 @@ async def dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return _response(intake, token=token, assistant_message=assistant_message, messages=messages)
+    return await _response(db, intake, token=token, assistant_message=assistant_message, messages=messages)
 
 
 @router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
@@ -754,9 +971,124 @@ async def run_dealer_review(
         intake.result_snapshot = fresh_review.result
         intake.status = "reviewed"
         intake.completed_at = _now()
+        _, _, slots = await _dealer_call_slots(db)
+        state = _intake_state(intake)
+        if slots and not state.get("call_options_shown_at"):
+            state["call_options_shown_at"] = _now().isoformat()
+            intake.intake_state = state
+            await _log(
+                db,
+                intake.bucket_id,
+                "dealer_ai_call_options_shown",
+                request=request,
+                actor_name=intake.full_name,
+                actor_email=intake.email,
+                actor_role="public_lead",
+                target_type="dealer_ai_intake",
+                target_id=str(intake.id),
+                detail="Dealer AI call options shown",
+            )
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return _response(intake, token=token)
+    return await _response(db, intake, token=token)
+
+
+@router.post("/{token}/book-call", response_model=DealerIntakeResponse)
+async def book_dealer_call(
+    token: str,
+    payload: DealerBookCallRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    if _call_booked(intake):
+        return await _response(
+            db,
+            intake,
+            token=token,
+            assistant_message="Your call is already booked. Keep uploading baseline documents here if anything is still missing before the meeting.",
+        )
+    starts_at = _to_utc_minute(payload.starts_at)
+    owner, booking, slots = await _dealer_call_slots(db)
+    if owner is None or booking is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
+    if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That call time is no longer available. Choose another time.")
+
+    who = f"{intake.full_name} <{intake.email}>"
+    description = (
+        "Booked from Dealer AI Underwriter.\n"
+        f"Dealer intake: {intake.id}\n"
+        f"Bucket: {intake.bucket_id}\n"
+        f"Business: {intake.business_name or '(not provided)'}\n"
+        f"Name: {intake.full_name}\n"
+        f"Email: {intake.email}\n"
+        f"Phone: {intake.phone or '(not provided)'}\n"
+        f"Requested amount: {intake.requested_loan_amount or '(not provided)'}\n"
+        f"Use of funds: {intake.loan_purpose or '(not provided)'}\n"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=f"Dealer AI call: {intake.business_name or intake.full_name}",
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.AUTO,
+        owner_user_id=owner.id,
+        external_ref_kind="dealer_ai_intake",
+        external_ref_id=str(intake.id),
+    )
+    db.add(ev)
+    await db.flush()
+
+    state = _intake_state(intake)
+    state["call_booking"] = {
+        "event_id": str(ev.id),
+        "starts_at": starts_at.isoformat(),
+        "booked_at": _now().isoformat(),
+        "host_user_id": str(owner.id),
+        "host_email": owner.email,
+    }
+    intake.intake_state = state
+    db.add(
+        Activity(
+            client_id=intake.client_id,
+            actor_id=None,
+            actor_label="public",
+            kind="calendar.dealer_ai_call_booked",
+            summary=f"Dealer AI call booked for {intake.business_name or intake.full_name}",
+            payload={
+                "event_id": str(ev.id),
+                "intake_id": str(intake.id),
+                "bucket_id": str(intake.bucket_id),
+                "host_user_id": str(owner.id),
+                "starts_at": starts_at.isoformat(),
+            },
+        )
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_call_booked",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="calendar_event",
+        target_id=str(ev.id),
+        detail=f"Dealer AI call booked for {starts_at.isoformat()}",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(
+        db,
+        intake,
+        token=token,
+        assistant_message="Your call is booked. Keep uploading baseline documents here if anything is still missing before the meeting.",
+    )
 
 
 @client_router.get("", response_model=list[DealerIntakeRead])
@@ -776,18 +1108,21 @@ async def list_my_dealer_intakes(user: CurrentUser, db: AsyncSession = Depends(g
 @client_router.get("/{intake_id}", response_model=DealerIntakeResponse)
 async def get_my_dealer_intake(intake_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
     intake = await _load_client_intake(db, user, intake_id)
-    return _response(intake, token=None)
+    return await _response(db, intake, token=None)
 
 
 @client_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)
 async def my_dealer_intake_chat(
     intake_id: UUID,
     payload: DealerChatRequest,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_client_intake(db, user, intake_id)
+    update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
+    await _log_dealer_update_events(db, intake, update_data, request=request, user=user)
     messages = []
     assistant_message = None
     if payload.message and payload.message.strip():
@@ -805,7 +1140,7 @@ async def my_dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_client_intake(db, user, intake_id)
-    return _response(intake, token=None, assistant_message=assistant_message, messages=messages)
+    return await _response(db, intake, token=None, assistant_message=assistant_message, messages=messages)
 
 
 @client_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
