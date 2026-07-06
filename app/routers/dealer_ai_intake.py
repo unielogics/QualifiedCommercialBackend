@@ -670,18 +670,7 @@ def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingI
 def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritingIntake) -> str:
     if not widget:
         if isinstance(intake.result_snapshot, dict):
-            assessment = intake.result_snapshot.get("bankability_assessment") if isinstance(intake.result_snapshot.get("bankability_assessment"), dict) else {}
-            status_label = assessment.get("status") if isinstance(assessment, dict) else None
-            reason = assessment.get("reason") if isinstance(assessment, dict) else None
-            next_best = intake.result_snapshot.get("next_best_action") if isinstance(intake.result_snapshot.get("next_best_action"), dict) else {}
-            next_detail = next_best.get("detail") if isinstance(next_best, dict) else None
-            parts = [
-                f"Preliminary screen updated{f': {status_label}' if status_label else ''}.",
-                str(reason or intake.result_snapshot.get("executive_summary") or "Review the current evidence and missing baseline items."),
-            ]
-            if next_detail:
-                parts.append(f"Next best move: {next_detail}")
-            return " ".join(parts)[:1200]
+            return _format_review_update(intake.result_snapshot)
         if not _active_files(intake.bucket):
             return (
                 "Your secure underwriter chat is open. Attach PDFs, images, ZIP files, spreadsheets, or bank/tax documents here, "
@@ -723,6 +712,135 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
     if kind == "book_call":
         return "The preliminary screen is ready. Choose one of the available call times so Qualified Commercial can validate the file and next steps with you."
     return "How can I help with this dealer financing file?"
+
+
+def _short_text(value: Any, *, max_len: int = 260) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _review_item_text(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return _short_text(item, max_len=190) if item else None
+    title = _short_text(item.get("title") or item.get("document_type") or item.get("file_name") or item.get("category"), max_len=88)
+    detail = _short_text(item.get("detail") or item.get("summary") or item.get("gap") or item.get("instructions") or item.get("reason"), max_len=180)
+    if title and detail:
+        return f"{title}: {detail}"
+    return title or detail or None
+
+
+def _evidence_items(result: dict[str, Any]) -> list[str]:
+    evidence_map = result.get("document_evidence_map") if isinstance(result.get("document_evidence_map"), dict) else {}
+    files = evidence_map.get("files") if isinstance(evidence_map, dict) else []
+    items: list[str] = []
+    if isinstance(files, list):
+        for file_item in files:
+            if not isinstance(file_item, dict):
+                continue
+            file_name = _short_text(file_item.get("file_name"), max_len=70)
+            supports = file_item.get("supports") if isinstance(file_item.get("supports"), list) else []
+            support_text = _short_text("; ".join(str(item) for item in supports[:2] if item), max_len=190)
+            classification = _short_text(file_item.get("ai_classification"), max_len=70)
+            if file_name and support_text:
+                items.append(f"{file_name}: {support_text}")
+            elif file_name and classification:
+                items.append(f"{file_name}: classified as {classification}")
+            if len(items) >= 4:
+                break
+    if not items:
+        available = result.get("available_documents")
+        if isinstance(available, list):
+            items = [text for text in (_review_item_text(item) for item in available[:4]) if text]
+    return items[:4]
+
+
+def _blocking_items(result: dict[str, Any]) -> list[str]:
+    raw_items: list[Any] = []
+    missing = result.get("missing_or_incomplete_items")
+    gaps = result.get("proof_of_funds_financial_collateral_gaps")
+    if isinstance(missing, list):
+        raw_items.extend(missing)
+    if isinstance(gaps, list):
+        raw_items.extend(gaps)
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in raw_items:
+        text = _review_item_text(item)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+        if len(items) >= 4:
+            break
+    return items
+
+
+def _next_step_text(result: dict[str, Any]) -> str:
+    next_best = result.get("next_best_action") if isinstance(result.get("next_best_action"), dict) else {}
+    next_type = str(next_best.get("type") or "").lower()
+    detail = _short_text(next_best.get("detail") or next_best.get("title") or "", max_len=300)
+    questions = result.get("underwriter_questions") if isinstance(result.get("underwriter_questions"), list) else []
+    entity_question = None
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        question_text = str(question.get("question") or "")
+        lower = question_text.lower()
+        if any(term in lower for term in ("llc", "entity", "entities", "account", "bank account", "transfer")):
+            entity_question = _short_text(question_text, max_len=260)
+            break
+    if next_type == "entity_structure" or (entity_question and not detail):
+        return (
+            "Reply with the primary operating LLC and the main operating bank account first. "
+            "After that, I will ask how the related property LLCs move money with the dealership."
+        )
+    if detail:
+        return detail
+    if entity_question:
+        return (
+            "Reply with the primary operating LLC and main bank account first. "
+            "We will handle the related LLC money-flow explanation after that."
+        )
+    return "Send the next baseline item or clarification requested above, and I will update the screen from there."
+
+
+def _format_review_update(result: dict[str, Any]) -> str:
+    assessment = result.get("bankability_assessment") if isinstance(result.get("bankability_assessment"), dict) else {}
+    status_label = _short_text(assessment.get("status") if isinstance(assessment, dict) else None, max_len=90) or "Updated"
+    reason = _short_text(
+        (assessment.get("reason") if isinstance(assessment, dict) else None)
+        or result.get("executive_summary")
+        or "Review the current evidence and missing baseline items.",
+        max_len=420,
+    )
+    lines = [
+        "Preliminary screen updated",
+        "",
+        "Status",
+        f"- {status_label}",
+    ]
+    if reason:
+        lines.append(f"- {reason}")
+    evidence = _evidence_items(result)
+    if evidence:
+        lines.extend(["", "What the files prove", *[f"- {item}" for item in evidence]])
+    blockers = _blocking_items(result)
+    if blockers:
+        lines.extend(["", "Still blocking a decision", *[f"- {item}" for item in blockers]])
+    lines.extend(
+        [
+            "",
+            "Next step",
+            f"- {_next_step_text(result)}",
+            "- I will handle the rest in sequence after this answer, so you are not hit with every clarification at once.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:

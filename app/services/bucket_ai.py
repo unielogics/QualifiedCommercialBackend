@@ -114,6 +114,7 @@ For dealer_gatekeeper_v1 contexts, uploaded files may be random or miscategorize
 For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) whether the file appears fundable, preliminarily fundable subject to confirmation, not fundable, or cannot be determined, (3) what still blocks a credit decision, and (4) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
 For dealer_gatekeeper_v1 contexts with strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
 For dealer_gatekeeper_v1 contexts where multiple LLCs, owner entities, real-estate entities, or dealership entities appear, ask for one written explanation that covers: primary operating LLC, main operating bank account, which LLCs own the real estate, how money transfers between entities, and whether dealership revenue supports property debt. This should be a conversational underwriting question, not a form or widget.
+For dealer_gatekeeper_v1 client-facing summaries, organize the content as a short underwriting memo, not a dense paragraph. The JSON fields should support this order: status, what the files prove, what still blocks a decision, and one next step. Do not combine multiple client tasks into one next_best_action. If LLC/entity workflow is unclear, make the immediate next step only the first clarification: primary operating LLC and main operating bank account. The follow-up about related LLC money flow should come after the client answers.
 Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items; document_evidence_map.files <= 12 items; document_evidence_map.baseline_coverage <= 8 items. Keep each item detail/summary under 220 characters. Never list every file outside document_evidence_map. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and one requested next action over exhaustive document recaps.
 """
 
@@ -143,6 +144,8 @@ Rules:
 - Be direct, calm, and practical: acknowledge the fact in front of you, state what it means for bankability, then give the next specific move.
 - For dealer_gatekeeper_v1 contexts, use strict underwriting language: "I can preliminarily screen this", "this is incomplete", "this supports the file", "this creates a lender question", or "I cannot determine yet" when evidence is missing.
 - Ask one high-value question at a time unless the user asks for a list.
+- For dealer_gatekeeper_v1 chat answers, use short sections and bullets when summarizing files: "What I see", "What it means", and "Next step". Keep the next step to one client action.
+- If related LLCs/accounts need clarification, ask only the first step first: primary operating LLC and main operating bank account. After the client answers, then ask how the related LLCs move money with the dealership.
 - When the user asks to upload files or enter property collateral, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
 - Keep answers concise and operational, normally 2-5 short sentences.
 """
@@ -190,7 +193,8 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
         },
         "answer_style": {
             "tone": "human banking underwriter, not generic chatbot",
-            "format": "2-5 short sentences unless the user asks for more detail",
+            "format": "short sections and bullets for review summaries; 2-5 short sentences for ordinary chat",
+            "client_pacing": "ask for one client action at a time; split LLC/account workflow into sequential clarifications",
             "avoid": ["generic AI disclaimers", "long tutorials", "open-ended document hunting"],
         },
     }
