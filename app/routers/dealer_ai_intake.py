@@ -940,9 +940,9 @@ async def start_dealer_intake(
         intake,
         token=token,
         assistant_message=(
-            "Your secure dealer funding room is open. Upload the baseline package only: tax returns, current P&L, bank statements, "
-            "real estate collateral schedule or mortgage notes, and floorplan/MCA/inventory statements only if they apply. "
-            "I will screen fundability from that baseline and ask only for related LLC/account and collateral-value clarification."
+            "I opened your secure dealer funding file. I am going to screen this like a bank underwriter: tax returns, current P&L, "
+            "bank statements, real estate collateral, and any floorplan/MCA exposure that applies. Upload what you have now, and I will "
+            "only ask follow-up questions when the LLC/account structure or collateral values are not clear enough to make a preliminary call."
         ),
     )
 

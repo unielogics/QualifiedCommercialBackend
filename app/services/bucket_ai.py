@@ -92,12 +92,62 @@ Rules:
 - For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for one-time shared-reviewer tasks, "vendor" for authenticated vendor tasks, and "admin" for internal Qualified Commercial tasks.
 - When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
 - For dealer_gatekeeper_v1 contexts, do not request documents outside the baseline package. Ask clarifying questions only for related LLC/account structure and real estate address, estimated amount owed, or estimated value.
-- Keep answers concise and operational.
+- Write the answer like a human senior banking underwriter who understands used-car dealerships, real-estate-backed commercial lending, floorplan lines, MCA exposure, dealer cash flow, related LLCs, and operating account analysis.
+- Do not sound like a generic chatbot. Avoid filler such as "I understand", "as an AI", "happy to help", and long tutorials.
+- Be direct, calm, and practical: acknowledge the fact in front of you, state what it means for bankability, then give the next specific move.
+- For dealer_gatekeeper_v1 contexts, use strict underwriting language: "I can preliminarily screen this", "this is incomplete", "this supports the file", "this creates a lender question", or "I cannot determine yet" when evidence is missing.
+- Ask one high-value question at a time unless the user asks for a list.
+- When the user asks to upload files or enter property collateral, tell them what information you need and reference the in-chat tool/widget that will appear. Do not describe navigation or external UI steps.
+- Keep answers concise and operational, normally 2-5 short sentences.
 """
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
+    context = bucket.ai_context or {}
+    if context.get("review_type") != "dealer_gatekeeper_v1":
+        return {}
+    return {
+        "review_type": "dealer_gatekeeper_v1",
+        "deal_type": context.get("deal_type") or "dealer financing with real estate collateral",
+        "documentation_level": context.get("documentation_level") or "full doc",
+        "collateral_type": context.get("collateral_type") or "real estate collateral and business assets",
+        "underwriter_persona": (
+            "Speak like a senior banking underwriter for used-car dealership financing. "
+            "Be conversational but strict, practical, and evidence-driven."
+        ),
+        "dealer_knowledge": [
+            "Used-car dealers often operate through multiple LLCs that share cash flow, inventory, real estate, and bank accounts.",
+            "The main operating entity, main operating bank account, related entities, and account transfers must be clear before a confident screen.",
+            "Floorplan debt, MCA debt, inventory turn, bank deposits, tax returns, P&L, and real estate equity all affect bankability.",
+        ],
+        "baseline_document_policy": {
+            "allowed_document_categories": [
+                "last 2 years tax returns",
+                "current year P&L",
+                "last 3 months bank statements",
+                "asset/real estate schedule or mortgage notes/payoff statements",
+                "floorplan/MCA/inventory statements only when applicable",
+            ],
+            "do_not_request_other_document_categories": True,
+            "extra_questions_allowed_only_for": [
+                "primary operating LLC/entity",
+                "main operating bank account",
+                "related LLC/entity relationship",
+                "real estate full address",
+                "real estate estimated amount owed",
+                "real estate estimated property value",
+            ],
+        },
+        "answer_style": {
+            "tone": "human banking underwriter, not generic chatbot",
+            "format": "2-5 short sentences unless the user asks for more detail",
+            "avoid": ["generic AI disclaimers", "long tutorials", "open-ended document hunting"],
+        },
+    }
 
 
 def _text_from_response(resp: Any) -> str:
@@ -989,27 +1039,48 @@ async def _chat_context(
     if upload_link is not None:
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
+        public_ai_context = _public_ai_context(bucket)
         return {
             **base,
             "recipient_name": upload_link.recipient_name,
+            "ai_context": public_ai_context or None,
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
             "visible_summary": upload_link_visible_summary(review, bucket),
-            "instructions": "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. Do not discuss admin notes or shares. External users cannot change saved AI instructions.",
+            "instructions": (
+                "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
+                "Do not discuss admin notes or shares. External users cannot change saved AI instructions."
+                + (
+                    " This is a dealer_gatekeeper_v1 file: speak like a human banking underwriter with car dealership finance knowledge, "
+                    "keep the baseline package strict, and use the in-chat tool when the user asks to upload files or enter real estate collateral."
+                    if public_ai_context
+                    else ""
+                )
+            ),
             "approved_tasks": [_task_context(task) for task in tasks],
         }
     if share is not None:
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="share", share_id=share.id, approved_only=True)
         notes = [note for note in bucket.notes if note.visibility == "shared" or share.can_see_internal_notes]
+        public_ai_context = _public_ai_context(bucket)
         return {
             **base,
             "recipient_name": share.recipient_name,
+            "ai_context": public_ai_context or None,
             "visible_files": [_file_context(file) for file in share.files if file.status == "uploaded" and file.deleted_at is None],
             "visible_notes": [_note_context(note) for note in notes],
             "visible_summary": share_visible_summary(review, share) if share.can_view_ai_summary else None,
             "approved_tasks": [_task_context(task) for task in tasks],
-            "instructions": "Answer only from the files and notes visible to this share link.",
+            "instructions": (
+                "Answer only from the files and notes visible to this share link."
+                + (
+                    " This is a dealer_gatekeeper_v1 file: answer like a banking underwriter who understands car dealer financing, "
+                    "floorplan/MCA exposure, related LLCs, and real estate collateral."
+                    if public_ai_context
+                    else ""
+                )
+            ),
         }
     if vendor_access is not None:
         review = await latest_review(db, bucket.id)
@@ -1027,14 +1098,25 @@ async def _chat_context(
             or note.vendor_access_id == vendor_access.id
             or vendor_access.can_see_internal_notes
         ]
+        public_ai_context = _public_ai_context(bucket)
         return {
             **base,
             "recipient_name": vendor_access.vendor.name if vendor_access.vendor else "Vendor",
+            "ai_context": public_ai_context or None,
             "visible_files": [_file_context(file) for file in visible_files],
             "visible_notes": [_note_context(note) for note in notes],
             "visible_summary": vendor_visible_summary(review, vendor_access) if vendor_access.can_view_ai_summary else None,
             "approved_tasks": [_task_context(task) for task in tasks],
-            "instructions": "Answer only from the files and notes visible to this authenticated vendor access. If the vendor asks for requirements or clarifications, propose tasks for super-admin approval before they become visible to clients or other users.",
+            "instructions": (
+                "Answer only from the files and notes visible to this authenticated vendor access. "
+                "If the vendor asks for requirements or clarifications, propose tasks for super-admin approval before they become visible to clients or other users."
+                + (
+                    " This is a dealer_gatekeeper_v1 file: answer like a banking underwriter who understands car dealer financing, "
+                    "floorplan/MCA exposure, related LLCs, and real estate collateral."
+                    if public_ai_context
+                    else ""
+                )
+            ),
         }
     return base
 
