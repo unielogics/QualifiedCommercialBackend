@@ -203,11 +203,23 @@ def _asset_rows(intake: PublicUnderwritingIntake) -> list[dict[str, Any]]:
 
 
 def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    files = _active_files(intake.bucket)
+    missing = _missing_required_docs(intake.bucket)
+    if not files and not intake.result_snapshot:
+        return {
+            "type": "upload_files",
+            "title": "Upload what you have now",
+            "description": (
+                "Start with bank statements, P&L, tax returns, floorplan/MCA statements, inventory, "
+                "and any real estate collateral documents. The AI can screen partial files and tell you what is missing."
+            ),
+            "missing_document_ids": [str(doc.id) for doc in missing],
+        }
     if not intake.loan_purpose or intake.requested_loan_amount is None or intake.estimated_credit_score is None:
         return {
             "type": "deal_profile",
-            "title": "Dealer financing profile",
-            "description": "Tell us the purpose, rough loan amount, and estimated credit score. We will validate credit during the intro call.",
+            "title": "Essential funding facts",
+            "description": "Answer only what you know: use of funds, desired capital amount, and estimated credit score. The AI will infer the likely lending path.",
             "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
         }
     if not _asset_rows(intake):
@@ -215,14 +227,6 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "type": "asset_table",
             "title": "Real estate and asset schedule",
             "description": "Add each property or major asset with the address, estimated current loan amount, and estimated value.",
-        }
-    missing = _missing_required_docs(intake.bucket)
-    if missing:
-        return {
-            "type": "upload_files",
-            "title": "Upload required documents",
-            "description": "Upload the required files so the AI can screen bankability.",
-            "missing_document_ids": [str(doc.id) for doc in missing],
         }
     if not intake.referral_source:
         return {
@@ -234,7 +238,10 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         return {
             "type": "run_review",
             "title": "Run preliminary AI screen",
-            "description": "The AI will review the uploaded file room and give a strict preliminary bankability screen.",
+            "description": (
+                "Run this when there is enough evidence for a useful answer. Missing documents will be listed as gaps, "
+                "not treated as a reason to stop the review."
+            ),
         }
     return {
         "type": "bankability_result",
@@ -245,16 +252,25 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any]:
 
 def _message_for_widget(widget: dict[str, Any], intake: PublicUnderwritingIntake) -> str:
     kind = widget.get("type")
+    if kind == "upload_files":
+        return (
+            "Your secure file room is open. Upload whatever you have now. You do not need to know the lending product; "
+            "I will review the documents, ask only the essential follow-up questions, and identify the likely path and missing evidence."
+        )
     if kind == "deal_profile":
-        return "I have your contact info. Next I need the loan purpose, rough requested amount, and your estimated credit score. This is self-reported for now and will be validated during the intro call."
+        return (
+            "I have files to review. Next, give me the use of funds, rough requested amount, and estimated credit score. "
+            "This is self-reported for now and will be validated during the intro call."
+        )
     if kind == "asset_table":
         return "Now add the real estate collateral and major assets. If you have mortgage notes or payoff statements, you can upload those too."
-    if kind == "upload_files":
-        return "The file is not ready for a bankability answer yet. Upload the required tax returns, P&L, bank statements, asset schedule, and mortgage-note documents."
     if kind == "referral":
         return "Before I run the final screen, tell us who referred you so we can credit the right person."
     if kind == "run_review":
-        return "Everything needed for the first screen is captured. Run the AI review and I will tell you whether the file appears bankable, incomplete, or not bankable from the current evidence."
+        return (
+            "Run the preliminary screen when you are ready. I will classify likely program fit, available evidence, "
+            "missing documents, underwriter questions, and next steps from the current file."
+        )
     if kind == "bankability_result":
         status_label = (intake.result_snapshot or {}).get("bankability_assessment", {}).get("status")
         return f"The preliminary screen is ready{f': {status_label}' if status_label else ''}. Review the summary and next steps below."
@@ -274,14 +290,17 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "referral_source": intake.referral_source,
         "asset_rows": _asset_rows(intake),
         "underwriting_focus": (
-            "Strictly screen bankability for DSCR, full-doc commercial/dealer financing, and real estate collateral. "
-            "Do not mark bankable if required core documents are missing. Flag proof-of-funds, financial, collateral, "
-            "credit, and ownership gaps."
+            "Strictly screen bankability for dealer capital without asking the client to choose a loan product. "
+            "Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, "
+            "portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. "
+            "If core documents are missing, classify the file as incomplete or conditional rather than blocking the review. "
+            "Flag proof-of-funds, financial, collateral, credit, ownership, floorplan, MCA, and cash-flow gaps."
         ),
         "custom_instructions": (
             "This is a public lead-magnet gatekeeper for car dealers. Ask for last 2 years tax returns, current-year P&L, "
             "last 3 months bank statements, asset/real estate schedule, and mortgage notes/payoff statements. "
-            "Return a preliminary bankability screen, not a commitment to lend."
+            "The user may not know which lending product fits. Collect evidence quickly, ask only essential follow-up questions, "
+            "return likely program fit, missing evidence, discrepancies, and next steps. Return a preliminary bankability screen, not a commitment to lend."
         ),
     }
 
@@ -622,7 +641,10 @@ async def start_dealer_intake(
     return _response(
         intake,
         token=token,
-        assistant_message="I can screen this dealer financing file. I will collect the core facts, upload the documents into a secure bucket, then give a strict preliminary bankability answer.",
+        assistant_message=(
+            "Your secure dealer funding room is open. Upload whatever documents you have now. "
+            "I will review the file, infer the likely lending path, ask only essential follow-up questions, and list what is missing."
+        ),
     )
 
 
