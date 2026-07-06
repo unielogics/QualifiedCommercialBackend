@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import html
 import json
+import logging
 import mimetypes
 import secrets
 import zipfile
@@ -17,6 +19,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
@@ -27,6 +30,7 @@ from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.user import User
 from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
     _bucket_storage_config,
@@ -56,6 +60,7 @@ from app.services.payment_authorization import primary_super_admin
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
 admin_router = APIRouter(prefix="/admin/dealer-ai-leads", tags=["admin-dealer-ai-leads"])
+log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
 PRIVACY_VERSION = "2026-05-19"
@@ -403,6 +408,197 @@ def _record_login_code_email(
     state["dealer_login_email_deliveries"] = deliveries[-10:]
     intake.intake_state = state
     return record
+
+
+def _admin_lead_url(intake: PublicUnderwritingIntake) -> str:
+    return _public_url(f"/admin/dealer-ai-leads?lead={intake.id}")
+
+
+def _admin_bucket_url(intake: PublicUnderwritingIntake) -> str:
+    return _public_url(f"/buckets?bucket={intake.bucket_id}")
+
+
+def _dealer_label(intake: PublicUnderwritingIntake) -> str:
+    return intake.business_name or intake.full_name or intake.email or "Dealer AI lead"
+
+
+async def _super_admin_emails(db: AsyncSession) -> list[str]:
+    rows = (
+        await db.execute(
+            select(User.email)
+            .where(User.role == Role.SUPER_ADMIN)
+            .where(User.deleted_at.is_(None))
+            .order_by(User.email.asc())
+        )
+    ).scalars().all()
+    recipients = [email.strip().lower() for email in rows if email and "@" in email]
+    if not recipients:
+        fallback = get_settings().primary_super_admin_email.strip().lower()
+        if fallback:
+            recipients.append(fallback)
+    return sorted(set(recipients))
+
+
+def _email_line(value: Any) -> str:
+    text = str(value or "").strip()
+    return text or "-"
+
+
+def _dealer_decision_from_result(result: dict[str, Any]) -> str | None:
+    assessment = result.get("bankability_assessment") if isinstance(result.get("bankability_assessment"), dict) else {}
+    fragments = [
+        result.get("probability_status"),
+        result.get("fundability_status"),
+        result.get("status"),
+        result.get("screen_status"),
+        assessment.get("status") if isinstance(assessment, dict) else None,
+        assessment.get("reason") if isinstance(assessment, dict) else None,
+    ]
+    joined = " ".join(str(fragment or "") for fragment in fragments).lower()
+    if result.get("booking_recommended") is True or "good probability" in joined or "book call" in joined:
+        return "approved"
+    if any(term in joined for term in ("poor probability", "not fundable", "not bankable", "do not call", "declined", "denied")):
+        return "denied"
+    return None
+
+
+async def _send_super_admin_email(
+    db: AsyncSession,
+    *,
+    subject: str,
+    body_text: str,
+    body_html: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for recipient in await _super_admin_emails(db):
+        result = send_email(to_email=recipient, subject=subject, body_text=body_text, body_html=body_html)
+        records.append(
+            {
+                "recipient": recipient,
+                "ok": result.ok,
+                "status": result.detail,
+                "message_id": result.message_id,
+                "sent_at": _now().isoformat(),
+            }
+        )
+    return records
+
+
+async def _record_super_admin_intake_notification(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    request: Request,
+) -> None:
+    state = _intake_state(intake)
+    if state.get("super_admin_intake_started_email"):
+        return
+    lead_url = _admin_lead_url(intake)
+    bucket_url = _admin_bucket_url(intake)
+    label = _dealer_label(intake)
+    subject = f"Dealer AI intake started: {label}"
+    body_text = (
+        "A dealer started a Qualified Commercial AI funding review.\n\n"
+        f"Dealer/business: {_email_line(intake.business_name)}\n"
+        f"Contact: {_email_line(intake.full_name)}\n"
+        f"Email: {_email_line(intake.email)}\n"
+        f"Phone: {_email_line(intake.phone)}\n"
+        f"Bucket: {_email_line(intake.bucket.name if intake.bucket else intake.bucket_id)}\n\n"
+        f"Review lead: {lead_url}\n"
+        f"Open bucket: {bucket_url}\n"
+    )
+    body_html = (
+        "<p>A dealer started a Qualified Commercial AI funding review.</p>"
+        "<ul>"
+        f"<li><strong>Dealer/business:</strong> {html.escape(_email_line(intake.business_name))}</li>"
+        f"<li><strong>Contact:</strong> {html.escape(_email_line(intake.full_name))}</li>"
+        f"<li><strong>Email:</strong> {html.escape(_email_line(intake.email))}</li>"
+        f"<li><strong>Phone:</strong> {html.escape(_email_line(intake.phone))}</li>"
+        f"<li><strong>Bucket:</strong> {html.escape(_email_line(intake.bucket.name if intake.bucket else intake.bucket_id))}</li>"
+        "</ul>"
+        f'<p><a href="{html.escape(lead_url)}">Review dealer AI lead</a></p>'
+        f'<p><a href="{html.escape(bucket_url)}">Open bucket</a></p>'
+    )
+    try:
+        state["super_admin_intake_started_email"] = {
+            "type": "dealer_ai_intake_started",
+            "sent_at": _now().isoformat(),
+            "deliveries": await _send_super_admin_email(db, subject=subject, body_text=body_text, body_html=body_html),
+            **_request_audit(request),
+        }
+        intake.intake_state = state
+    except Exception as exc:  # noqa: BLE001
+        log.warning("dealer_ai_intake: super-admin start notification failed intake=%s: %s", intake.id, exc)
+
+
+async def _record_super_admin_decision_notification(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    result: dict[str, Any],
+    *,
+    request: Request,
+    review_id: UUID | None = None,
+) -> None:
+    decision = _dealer_decision_from_result(result)
+    if decision is None:
+        return
+    state = _intake_state(intake)
+    notifications = state.get("super_admin_decision_emails")
+    if not isinstance(notifications, dict):
+        notifications = {}
+    if notifications.get(decision):
+        return
+    lead_url = _admin_lead_url(intake)
+    bucket_url = _admin_bucket_url(intake)
+    label = _dealer_label(intake)
+    probability = _email_line(result.get("probability_status"))
+    confidence = _email_line(result.get("confidence"))
+    next_step = _email_line(result.get("one_next_step") or _next_step_text(result))
+    if decision == "approved":
+        subject = f"Dealer AI approved screen: {label}"
+        headline = "The Dealer AI screen returned a positive result."
+    else:
+        subject = f"Dealer AI denied screen: {label}"
+        headline = "The Dealer AI screen returned a negative result."
+    body_text = (
+        f"{headline}\n\n"
+        "This is an AI preliminary screen, not a final commitment to lend.\n\n"
+        f"Dealer/business: {_email_line(intake.business_name)}\n"
+        f"Contact: {_email_line(intake.full_name)}\n"
+        f"Email: {_email_line(intake.email)}\n"
+        f"Probability status: {probability}\n"
+        f"Confidence: {confidence}\n"
+        f"Next step: {next_step}\n\n"
+        f"Review lead: {lead_url}\n"
+        f"Open bucket: {bucket_url}\n"
+    )
+    body_html = (
+        f"<p>{html.escape(headline)}</p>"
+        "<p><strong>This is an AI preliminary screen, not a final commitment to lend.</strong></p>"
+        "<ul>"
+        f"<li><strong>Dealer/business:</strong> {html.escape(_email_line(intake.business_name))}</li>"
+        f"<li><strong>Contact:</strong> {html.escape(_email_line(intake.full_name))}</li>"
+        f"<li><strong>Email:</strong> {html.escape(_email_line(intake.email))}</li>"
+        f"<li><strong>Probability status:</strong> {html.escape(probability)}</li>"
+        f"<li><strong>Confidence:</strong> {html.escape(confidence)}</li>"
+        f"<li><strong>Next step:</strong> {html.escape(next_step)}</li>"
+        "</ul>"
+        f'<p><a href="{html.escape(lead_url)}">Review dealer AI lead</a></p>'
+        f'<p><a href="{html.escape(bucket_url)}">Open bucket</a></p>'
+    )
+    try:
+        notifications[decision] = {
+            "type": f"dealer_ai_{decision}",
+            "review_id": str(review_id) if review_id else None,
+            "probability_status": result.get("probability_status"),
+            "sent_at": _now().isoformat(),
+            "deliveries": await _send_super_admin_email(db, subject=subject, body_text=body_text, body_html=body_html),
+            **_request_audit(request),
+        }
+        state["super_admin_decision_emails"] = notifications
+        intake.intake_state = state
+    except Exception as exc:  # noqa: BLE001
+        log.warning("dealer_ai_intake: super-admin decision notification failed intake=%s decision=%s: %s", intake.id, decision, exc)
 
 
 async def _latest_active_intake_by_email(db: AsyncSession, email: str) -> PublicUnderwritingIntake | None:
@@ -1611,6 +1807,7 @@ async def start_dealer_intake(
     await db.commit()
     intake = await _load_public_intake(db, token)
     email_record = _record_resume_email(intake, token=token, request=request, reason="intake_created")
+    await _record_super_admin_intake_notification(db, intake, request=request)
     await db.commit()
     intake = await _load_public_intake(db, token)
     email_note = (
@@ -2111,6 +2308,13 @@ async def run_dealer_review(
         intake.result_snapshot = fresh_review.result
         intake.status = "reviewed"
         intake.completed_at = _now()
+        await _record_super_admin_decision_notification(
+            db,
+            intake,
+            fresh_review.result,
+            request=request,
+            review_id=fresh_review.id,
+        )
         _, _, slots = await _dealer_call_slots(db)
         state = _intake_state(intake)
         if slots and not state.get("call_options_shown_at"):
