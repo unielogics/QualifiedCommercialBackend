@@ -803,7 +803,7 @@ async def admin_ai_chat(
     db: AsyncSession = Depends(get_db),
 ) -> BucketAIChatResponse:
     bucket = await _load_bucket_or_404(db, bucket_id)
-    messages, proposals = await create_chat_reply(
+    messages, proposals, _ = await create_chat_reply(
         db,
         bucket=bucket,
         audience="admin",
@@ -1779,7 +1779,7 @@ async def vendor_ai_chat(
     access = await _load_vendor_access_or_404(db, bucket_id, user)
     if not access.can_use_ai_chat:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "AI chat is disabled for this vendor access")
-    messages, proposals = await create_chat_reply(
+    messages, proposals, _ = await create_chat_reply(
         db,
         bucket=access.bucket,
         audience="vendor",
@@ -2140,7 +2140,7 @@ async def request_ai_chat(
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     bucket = await _load_bucket_or_404(db, link.bucket_id)
-    messages, proposals = await create_chat_reply(
+    messages, proposals, _ = await create_chat_reply(
         db,
         bucket=bucket,
         audience="uploader",
@@ -2259,7 +2259,7 @@ async def share_ai_chat(
         await _log(db, share.bucket_id, "share_passcode_failed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id), detail="ai chat")
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid passcode")
-    messages, proposals = await create_chat_reply(
+    messages, proposals, _ = await create_chat_reply(
         db,
         bucket=share.bucket,
         audience="shared_user",

@@ -353,12 +353,6 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         }
-    if intake.result_snapshot:
-        return {
-            "type": "bankability_result",
-            "title": "Preliminary bankability screen",
-            "description": "Review the AI summary, missing items, product fit, and next steps.",
-        }
     return None
 
 
@@ -468,6 +462,19 @@ def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingI
 
 def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritingIntake) -> str:
     if not widget:
+        if isinstance(intake.result_snapshot, dict):
+            assessment = intake.result_snapshot.get("bankability_assessment") if isinstance(intake.result_snapshot.get("bankability_assessment"), dict) else {}
+            status_label = assessment.get("status") if isinstance(assessment, dict) else None
+            reason = assessment.get("reason") if isinstance(assessment, dict) else None
+            next_best = intake.result_snapshot.get("next_best_action") if isinstance(intake.result_snapshot.get("next_best_action"), dict) else {}
+            next_detail = next_best.get("detail") if isinstance(next_best, dict) else None
+            parts = [
+                f"Preliminary screen updated{f': {status_label}' if status_label else ''}.",
+                str(reason or intake.result_snapshot.get("executive_summary") or "Review the current evidence and missing baseline items."),
+            ]
+            if next_detail:
+                parts.append(f"Next best move: {next_detail}")
+            return " ".join(parts)[:1200]
         return (
             "I am reading the uploaded file set like a banking underwriter. I will classify the documents by what they actually are, "
             "then tell you what they support and what baseline items are still missing."
@@ -805,9 +812,20 @@ async def _response(
     assistant_message: str | None = None,
     messages: list[Any] | None = None,
     forced_widget_type: str | None = None,
+    forced_widget_source: str = "user_intent",
+    forced_widget_reason: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
-    widget = _widget_for_type(intake, forced_widget_type, source="user_intent", reason="User asked for this tool") if forced_widget_type else None
+    widget = (
+        _widget_for_type(
+            intake,
+            forced_widget_type,
+            source=forced_widget_source,
+            reason=forced_widget_reason or ("User asked for this tool" if forced_widget_source == "user_intent" else forced_widget_source),
+        )
+        if forced_widget_type
+        else None
+    )
     widget = widget or _next_widget(intake)
     widget = await _decorate_widget(db, intake, widget)
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
@@ -1096,8 +1114,9 @@ async def dealer_intake_chat(
     intake.last_message_at = _now()
     messages = []
     assistant_message = None
+    ai_widget_type = None
     if payload.message and payload.message.strip():
-        chat_messages, _ = await create_chat_reply(
+        chat_messages, _, ai_widget_type = await create_chat_reply(
             db,
             bucket=intake.bucket,
             audience="uploader",
@@ -1110,7 +1129,17 @@ async def dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return await _response(db, intake, token=token, assistant_message=assistant_message, messages=messages, forced_widget_type=forced_widget_type)
+    next_widget_type = forced_widget_type or ai_widget_type
+    return await _response(
+        db,
+        intake,
+        token=token,
+        assistant_message=assistant_message,
+        messages=messages,
+        forced_widget_type=next_widget_type,
+        forced_widget_source="user_intent" if forced_widget_type else "ai_suggested",
+        forced_widget_reason="User asked for this tool" if forced_widget_type else "Suggested by the underwriter chat",
+    )
 
 
 @router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
@@ -1327,8 +1356,9 @@ async def my_dealer_intake_chat(
     await _log_dealer_update_events(db, intake, update_data, request=request, user=user)
     messages = []
     assistant_message = None
+    ai_widget_type = None
     if payload.message and payload.message.strip():
-        chat_messages, _ = await create_chat_reply(
+        chat_messages, _, ai_widget_type = await create_chat_reply(
             db,
             bucket=intake.bucket,
             audience="uploader",
@@ -1342,7 +1372,17 @@ async def my_dealer_intake_chat(
             assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_client_intake(db, user, intake_id)
-    return await _response(db, intake, token=None, assistant_message=assistant_message, messages=messages, forced_widget_type=forced_widget_type)
+    next_widget_type = forced_widget_type or ai_widget_type
+    return await _response(
+        db,
+        intake,
+        token=None,
+        assistant_message=assistant_message,
+        messages=messages,
+        forced_widget_type=next_widget_type,
+        forced_widget_source="user_intent" if forced_widget_type else "ai_suggested",
+        forced_widget_reason="User asked for this tool" if forced_widget_type else "Suggested by the underwriter chat",
+    )
 
 
 @client_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)

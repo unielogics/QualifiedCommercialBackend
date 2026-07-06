@@ -47,6 +47,16 @@ MAX_SPREADSHEET_ROWS = 80
 MAX_SPREADSHEET_COLS = 30
 MAX_SPREADSHEET_TEXT_CHARS = 24000
 MAX_CELL_CHARS = 200
+CHAT_WIDGET_TYPES = {
+    "upload_files",
+    "entity_structure",
+    "deal_profile",
+    "real_estate_schedule",
+    "referral",
+    "run_review",
+    "bankability_result",
+    "book_call",
+}
 
 REVIEW_SYSTEM = """You are a senior commercial lending underwriter reviewing a secure document bucket.
 
@@ -60,6 +70,28 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
   "proof_of_funds_financial_collateral_gaps": [{"title": "...", "detail": "..."}],
   "recommended_next_document_requests": [{"title": "...", "instructions": "...", "route": "admin|uploader|share", "rationale": "..."}],
   "per_file_summaries": [{"file_id": "...", "file_name": "...", "summary": "...", "red_flags": ["..."]}],
+  "document_evidence_map": {
+    "files": [
+      {
+        "file_id": "...",
+        "file_name": "...",
+        "ai_classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|other|unreadable",
+        "supports": ["..."],
+        "baseline_categories_supported": ["..."],
+        "confidence": "high|medium|low",
+        "limitations": ["..."]
+      }
+    ],
+    "baseline_coverage": [
+      {"category": "last 2 years tax returns", "status": "satisfied|partial|missing|unclear", "evidence": ["..."], "gap": "..."}
+    ]
+  },
+  "next_best_action": {
+    "type": "upload_files|real_estate_schedule|entity_structure|deal_profile|book_call|none",
+    "title": "...",
+    "detail": "...",
+    "reason": "..."
+  },
   "bankability_assessment": {
     "status": "Bankable|Incomplete - cannot determine|Not bankable based on current file",
     "product_fit": ["DSCR", "Full-doc commercial", "Dealer financing with real estate collateral"],
@@ -71,7 +103,8 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
 If ai_context.review_type is "dealer_gatekeeper_v1", act as a strict public lead gatekeeper for a car dealer financing file. Use only this baseline package for document requests: last 2 years tax returns, current-year P&L, last 3 months bank statements, real estate schedule or mortgage notes/payoff statements, and floorplan/MCA/inventory statements only when applicable. Do not request other document categories. Treat multiple dealer LLCs and bank accounts as normal, but require clarity on the primary operating entity, main operating account, related LLCs, and how accounts/entities work together. Real estate collateral must include full address, estimated amount owed, and estimated property value, whether provided through a typed schedule or mortgage-note uploads. Do not mark the file "Bankable" when core baseline evidence is missing or entity/account relationships are unclear; use "Incomplete - cannot determine" until enough evidence is present. This is a preliminary screen, not a commitment to lend.
 For dealer_gatekeeper_v1 contexts, uploaded files may be random or miscategorized by the client. Classify documents from the readable content and file name first; do not rely only on requested_document_id. If a mortgage note, payoff statement, amortization schedule, loan statement, or debt schedule is uploaded, treat it as partial real-estate/collateral evidence even when the selected category is wrong. Do not say every baseline category is missing when any uploaded file supports a baseline category. Instead say exactly what the uploaded files prove and what is still missing, for example: "I see collateral debt evidence, but not tax returns, P&L, bank statements, property values, or entity relationship explanation." Ask for estimated values or missing addresses for collateral files when needed.
-Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items. Keep each item detail/summary under 220 characters. Never list every file. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and requested next actions over exhaustive document recaps.
+For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) what still blocks a credit decision, and (3) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
+Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items; document_evidence_map.files <= 12 items; document_evidence_map.baseline_coverage <= 8 items. Keep each item detail/summary under 220 characters. Never list every file outside document_evidence_map. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and one requested next action over exhaustive document recaps.
 """
 
 CHAT_SYSTEM = """You are the Bucket AI assistant for a secure Qualified Commercial document room.
@@ -79,6 +112,7 @@ CHAT_SYSTEM = """You are the Bucket AI assistant for a secure Qualified Commerci
 Return ONLY JSON in this shape:
 {
   "answer": "helpful answer scoped to the user's permitted context",
+  "suggested_widget": null,
   "proposed_context_patch": null,
   "proposed_action_items": [
     {"title": "...", "instructions": "...", "route": "admin|uploader|share|vendor", "rationale": "..."}
@@ -93,6 +127,10 @@ Rules:
 - For admin users, when they ask you to create to-dos, missing-file requests, clarification requests, or follow-up actions, return those as proposed_action_items. Use route "uploader" for client upload tasks, "share" for one-time shared-reviewer tasks, "vendor" for authenticated vendor tasks, and "admin" for internal Qualified Commercial tasks.
 - When suggesting document requests, prefer the provided document template names/categories when they fit. If none fit, create a clear custom task title and instructions.
 - For dealer_gatekeeper_v1 contexts, do not request documents outside the baseline package. Ask clarifying questions only for related LLC/account structure and real estate address, estimated amount owed, or estimated value.
+- For dealer_gatekeeper_v1 contexts, use the latest evidence map if present. Explain what the uploaded files actually support before saying what is missing.
+- If the user asks to upload files, enter properties manually, clarify LLC/account structure, provide deal facts, book a call, rerun/reanalyze, or review fundability, set suggested_widget to {"type": "upload_files|real_estate_schedule|entity_structure|deal_profile|book_call|run_review|bankability_result", "reason": "short reason"}.
+- Suggest a widget only when it helps the next step. Otherwise return suggested_widget null and answer normally.
+- When evidence is incomplete, choose only one next best action. Do not stack multiple widgets or ask the user for every missing item at once.
 - Write the answer like a human senior banking underwriter who understands used-car dealerships, real-estate-backed commercial lending, floorplan lines, MCA exposure, dealer cash flow, related LLCs, and operating account analysis.
 - Do not sound like a generic chatbot. Avoid filler such as "I understand", "as an AI", "happy to help", and long tutorials.
 - Be direct, calm, and practical: acknowledge the fact in front of you, state what it means for bankability, then give the next specific move.
@@ -197,6 +235,45 @@ def _json_or_fallback(text: str, fallback_key: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
     return {fallback_key: text}
+
+
+def _suggested_widget_type(parsed: dict[str, Any]) -> str | None:
+    raw = parsed.get("suggested_widget")
+    if isinstance(raw, dict):
+        value = raw.get("type")
+    else:
+        value = raw
+    if not isinstance(value, str):
+        return None
+    widget_type = value.strip()
+    return widget_type if widget_type in CHAT_WIDGET_TYPES else None
+
+
+def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
+    shaped = dict(result)
+    evidence_map = shaped.get("document_evidence_map")
+    if not isinstance(evidence_map, dict):
+        evidence_map = {"files": [], "baseline_coverage": []}
+    else:
+        evidence_map = dict(evidence_map)
+        if not isinstance(evidence_map.get("files"), list):
+            evidence_map["files"] = []
+        if not isinstance(evidence_map.get("baseline_coverage"), list):
+            evidence_map["baseline_coverage"] = []
+    shaped["document_evidence_map"] = evidence_map
+    next_best = shaped.get("next_best_action")
+    if not isinstance(next_best, dict):
+        recommended = shaped.get("recommended_next_document_requests")
+        first = recommended[0] if isinstance(recommended, list) and recommended and isinstance(recommended[0], dict) else None
+        detail = str(first.get("instructions") or first.get("detail") or "") if first else "Continue the underwriting conversation."
+        next_best = {
+            "type": "upload_files" if first else "none",
+            "title": str(first.get("title") or "Next baseline item") if first else "No immediate tool needed",
+            "detail": detail,
+            "reason": str(first.get("rationale") or "Recommended by the review") if first else "No next best action was provided by the review.",
+        }
+    shaped["next_best_action"] = next_best
+    return shaped
 
 
 def _s3_client():
@@ -704,7 +781,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         )
         review.provider = "bedrock"
         review.model = getattr(resp, "model", None) or model
-        result = _json_or_fallback(_text_from_response(resp), "executive_summary")
+        result = _ensure_review_result_shape(_json_or_fallback(_text_from_response(resp), "executive_summary"))
         if blocked_files:
             result["blocked_files"] = blocked_files
         if skipped:
@@ -922,7 +999,7 @@ async def create_chat_reply(
     upload_link: BucketUploadLink | None = None,
     share: BucketShare | None = None,
     vendor_access: BucketVendorAccess | None = None,
-) -> tuple[list[BucketAIMessage], list[BucketAIActionItem]]:
+) -> tuple[list[BucketAIMessage], list[BucketAIActionItem], str | None]:
     user_row = BucketAIMessage(
         bucket_id=bucket.id,
         upload_link_id=upload_link.id if upload_link else None,
@@ -960,6 +1037,7 @@ async def create_chat_reply(
         parsed = _json_or_fallback(_text_from_response(resp), "answer")
         answer = str(parsed.get("answer") or parsed.get("summary") or _text_from_response(resp))[:5000]
         patch = parsed.get("proposed_context_patch") if isinstance(parsed.get("proposed_context_patch"), dict) else None
+        suggested_widget = _suggested_widget_type(parsed)
         assistant = BucketAIMessage(
             bucket_id=bucket.id,
             upload_link_id=upload_link.id if upload_link else None,
@@ -978,7 +1056,7 @@ async def create_chat_reply(
         await db.flush()
         proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access, user=user)
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_message_created", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=message[:180])
-        return [user_row, assistant], proposals
+        return [user_row, assistant], proposals, suggested_widget
     except Exception as exc:  # noqa: BLE001
         log.exception("bucket_ai: chat failed bucket=%s", bucket.id)
         assistant = BucketAIMessage(
@@ -994,7 +1072,7 @@ async def create_chat_reply(
         db.add(assistant)
         await db.flush()
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_failed", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=str(exc)[:180])
-        return [user_row, assistant], []
+        return [user_row, assistant], [], None
 
 
 async def _chat_context(
@@ -1041,6 +1119,7 @@ async def _chat_context(
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
         public_ai_context = _public_ai_context(bucket)
+        latest_result = review.result if review and isinstance(review.result, dict) else None
         return {
             **base,
             "recipient_name": upload_link.recipient_name,
@@ -1048,6 +1127,10 @@ async def _chat_context(
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
             "visible_summary": upload_link_visible_summary(review, bucket),
+            "latest_review": latest_result,
+            "document_evidence_map": latest_result.get("document_evidence_map") if latest_result else None,
+            "next_best_action": latest_result.get("next_best_action") if latest_result else None,
+            "baseline_coverage": (latest_result.get("document_evidence_map") or {}).get("baseline_coverage") if latest_result else None,
             "instructions": (
                 "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
                 "Do not discuss admin notes or shares. External users cannot change saved AI instructions."
