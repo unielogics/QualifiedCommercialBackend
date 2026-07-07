@@ -2185,13 +2185,7 @@ async def request_upload_complete(
     return file
 
 
-@router.get("/request/{token}/ai-tasks", response_model=list[BucketAIActionItemRead])
-async def request_ai_tasks(
-    token: str,
-    request: Request,
-    passcode: str = Query(default=""),
-    db: AsyncSession = Depends(get_db),
-) -> list[BucketAIActionItem]:
+async def _request_ai_tasks(db: AsyncSession, *, token: str, passcode: str, request: Request) -> list[BucketAIActionItem]:
     link = await _load_upload_link_or_404(db, token)
     if not link.can_view_ai_tasks:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "AI tasks are disabled for this upload link")
@@ -2200,6 +2194,30 @@ async def request_ai_tasks(
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     return await visible_action_items(db, link.bucket_id, route="uploader", upload_link_id=link.id, approved_only=True)
+
+
+@router.post("/request/{token}/ai-tasks", response_model=list[BucketAIActionItemRead])
+async def request_ai_tasks(
+    token: str,
+    payload: BucketRequestAccessRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    """Passcode travels in the POST body — query strings leak into access logs,
+    Referer headers, and browser history."""
+    return await _request_ai_tasks(db, token=token, passcode=payload.passcode, request=request)
+
+
+@router.get("/request/{token}/ai-tasks", response_model=list[BucketAIActionItemRead], deprecated=True)
+async def request_ai_tasks_get(
+    token: str,
+    request: Request,
+    passcode: str = Query(default=""),
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketAIActionItem]:
+    """Deprecated: passcode-in-query variant kept for older mobile clients.
+    Web uses the POST route above; remove once mobile is updated."""
+    return await _request_ai_tasks(db, token=token, passcode=passcode, request=request)
 
 
 @router.post("/request/{token}/ai-chat", response_model=BucketAIChatResponse)
