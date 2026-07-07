@@ -136,6 +136,11 @@ For dealer_gatekeeper_v1 incomplete reviews, structure the judgment like a senio
 For dealer_gatekeeper_v1 contexts with strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
 For dealer_gatekeeper_v1 contexts where multiple LLCs, owner entities, real-estate entities, or dealership entities appear, ask for one written explanation that covers: primary operating LLC, main operating bank account, which LLCs own the real estate, how money transfers between entities, and whether dealership revenue supports property debt. This should be a conversational underwriting question, not a form or widget.
 For dealer_gatekeeper_v1 client-facing summaries, organize the content as a short underwriting memo, not a dense paragraph. The JSON fields should support this order: status, what the files prove, what still blocks a decision, and one next step. Do not combine multiple client tasks into one next_best_action. If LLC/entity workflow is unclear, make the immediate next step only the first clarification: primary operating LLC and main operating bank account. The follow-up about related LLC money flow should come after the client answers.
+If ai_context.review_type is "real_estate_dscr_v1", act as a strict real-estate investor / DSCR underwriter. This is not a car dealer review. Never ask about dealership name, floorplan, MCA, inventory, dealer gross receipts, or dealer LLC workflow. Screen purchase, refinance, and cash-out investor files using rent support, PITIA, DSCR, LTV, equity, cash to close, property condition, occupancy, lease/rent roll, purchase contract or payoff, taxes, insurance, HOA, entity/vesting, and estimated credit tier.
+For real_estate_dscr_v1, set screening_stage to "stage_1_dscr_property_screen" and choose exactly one probability_status from: "Good probability - book call", "Promising but needs one clarification", "Not enough evidence yet", or "Poor probability based on current file". Set booking_recommended true only when the property/rent/equity evidence supports a good preliminary probability and a human call should be offered now.
+For real_estate_dscr_v1, calculate key_metrics when documents allow it: DSCR, LTV, estimated property value, requested loan amount, equity, monthly rent, PITIA, NOI, cash to close, max supportable loan, reserve/cash gap, and credit-tier impact. Use null or a short unavailable explanation when evidence does not support a metric. Never invent numbers.
+For real_estate_dscr_v1, classify uploaded files by readable content and filename. Treat leases, rent rolls, appraisal/value evidence, purchase contracts, payoff statements, mortgage statements, tax bills, insurance declarations, HOA statements, and settlement statements as useful partial evidence even when the selected category is wrong.
+For real_estate_dscr_v1 client-facing summaries, use short sections and bullets: "What I see", "What it means", and "Next step". Ask only one next question or upload request at a time. If evidence is missing, say exactly which DSCR/LTV/PITIA/cash-to-close assumption is unsupported.
 Keep the response compact enough to parse: executive_summary <= 1200 characters; available_documents <= 8 items; missing_or_incomplete_items <= 12 items; discrepancies <= 8 items; underwriter_questions <= 8 items; proof_of_funds_financial_collateral_gaps <= 8 items; recommended_next_document_requests <= 12 items; per_file_summaries <= 5 items; document_evidence_map.files <= 12 items; document_evidence_map.baseline_coverage <= 8 items. Keep each item detail/summary under 220 characters. Never list every file outside document_evidence_map. Per-file summaries are optional and should cover only the most important readable documents. Prioritize critical underwriting issues and one requested next action over exhaustive document recaps.
 """
 
@@ -169,6 +174,9 @@ Rules:
 - Ask one high-value question at a time unless the user asks for a list.
 - For dealer_gatekeeper_v1 chat answers, use short sections and bullets when summarizing files: "What I see", "What it means", and "Next step". Keep the next step to one client action.
 - If related LLCs/accounts need clarification, ask only the first step first: primary operating LLC and main operating bank account. After the client answers, then ask how the related LLCs move money with the dealership.
+- For real_estate_dscr_v1 contexts, answer like a real-estate investor / DSCR underwriter. Focus on rent, PITIA, DSCR, LTV, property value, payoff/purchase evidence, cash-to-close, entity/vesting, property condition, occupancy, and estimated credit tier.
+- For real_estate_dscr_v1 contexts, do not mention dealership, floorplan, MCA, inventory, dealer gross receipts, or dealer operating accounts.
+- For real_estate_dscr_v1 chat answers, use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence. Ask one real-estate funding question or upload request at a time.
 - When the user asks to upload files or enter property collateral, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
 - Keep answers concise and operational, normally 2-5 short sentences.
 """
@@ -180,7 +188,54 @@ def _now() -> datetime:
 
 def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
     context = bucket.ai_context or {}
-    if context.get("review_type") != "dealer_gatekeeper_v1":
+    review_type = context.get("review_type")
+    if review_type == "real_estate_dscr_v1":
+        return {
+            "review_type": "real_estate_dscr_v1",
+            "deal_type": context.get("deal_type") or "real estate investor funding review",
+            "documentation_level": context.get("documentation_level") or "preliminary DSCR / investor review",
+            "collateral_type": context.get("collateral_type") or "income-producing real estate",
+            "underwriter_persona": (
+                "Speak like a senior real-estate investor and DSCR lending underwriter. "
+                "Be practical, direct, and evidence-driven."
+            ),
+            "real_estate_knowledge": [
+                "DSCR depends on supported rent and PITIA, not generic borrower claims.",
+                "LTV depends on credible value evidence and current debt or requested loan amount.",
+                "Purchase, refinance, and cash-out files need different evidence: contract, payoff, mortgage statement, taxes, insurance, HOA, rent support, and entity/vesting.",
+            ],
+            "baseline_document_policy": {
+                "stage": "stage_1_dscr_property_screen",
+                "allowed_document_categories": [
+                    "lease, rent roll, or rent support",
+                    "purchase contract for acquisitions",
+                    "payoff or mortgage statement for refinance or cash-out",
+                    "property tax, insurance, HOA, or PITIA support",
+                    "entity or vesting documents when available",
+                    "estimated value or purchase price",
+                    "requested loan amount",
+                    "monthly rent",
+                    "transaction type",
+                    "estimated credit tier",
+                ],
+                "do_not_request_dealer_documents": True,
+                "stage_1_metrics": [
+                    "DSCR",
+                    "LTV",
+                    "estimated property value",
+                    "loan amount",
+                    "equity",
+                    "monthly rent",
+                    "PITIA",
+                    "NOI",
+                    "cash to close",
+                    "max supportable loan",
+                    "reserve/cash gap",
+                    "credit-tier impact",
+                ],
+            },
+        }
+    if review_type != "dealer_gatekeeper_v1":
         return {}
     return {
         "review_type": "dealer_gatekeeper_v1",
@@ -1452,6 +1507,7 @@ async def _chat_context(
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
         public_ai_context = _public_ai_context(bucket)
+        public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         latest_result = review.result if review and isinstance(review.result, dict) else None
         return {
             **base,
@@ -1470,7 +1526,12 @@ async def _chat_context(
                 + (
                     " This is a dealer_gatekeeper_v1 file: speak like a human banking underwriter with car dealership finance knowledge, "
                     "keep the baseline package strict, and use the in-chat tool when the user asks to upload files or enter real estate collateral."
-                    if public_ai_context
+                    if public_review_type == "dealer_gatekeeper_v1"
+                    else ""
+                )
+                + (
+                    " This is a real_estate_dscr_v1 file: speak like a senior DSCR/investor lending underwriter. Focus on rent support, PITIA, DSCR, LTV, payoff or purchase evidence, property value, entity/vesting, and credit tier. Never ask dealer-specific questions."
+                    if public_review_type == "real_estate_dscr_v1"
                     else ""
                 )
             ),
@@ -1481,6 +1542,7 @@ async def _chat_context(
         tasks = await visible_action_items(db, bucket.id, route="share", share_id=share.id, approved_only=True)
         notes = [note for note in bucket.notes if note.visibility == "shared" or share.can_see_internal_notes]
         public_ai_context = _public_ai_context(bucket)
+        public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         return {
             **base,
             "recipient_name": share.recipient_name,
@@ -1494,7 +1556,12 @@ async def _chat_context(
                 + (
                     " This is a dealer_gatekeeper_v1 file: answer like a banking underwriter who understands car dealer financing, "
                     "floorplan/MCA exposure, related LLCs, and real estate collateral."
-                    if public_ai_context
+                    if public_review_type == "dealer_gatekeeper_v1"
+                    else ""
+                )
+                + (
+                    " This is a real_estate_dscr_v1 file: answer like a DSCR/investor lending underwriter. Focus only on the shared real-estate funding evidence and do not ask dealer-specific questions."
+                    if public_review_type == "real_estate_dscr_v1"
                     else ""
                 )
             ),
@@ -1516,6 +1583,7 @@ async def _chat_context(
             or vendor_access.can_see_internal_notes
         ]
         public_ai_context = _public_ai_context(bucket)
+        public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         return {
             **base,
             "recipient_name": vendor_access.vendor.name if vendor_access.vendor else "Vendor",
@@ -1530,7 +1598,12 @@ async def _chat_context(
                 + (
                     " This is a dealer_gatekeeper_v1 file: answer like a banking underwriter who understands car dealer financing, "
                     "floorplan/MCA exposure, related LLCs, and real estate collateral."
-                    if public_ai_context
+                    if public_review_type == "dealer_gatekeeper_v1"
+                    else ""
+                )
+                + (
+                    " This is a real_estate_dscr_v1 file: answer like a DSCR/investor lending underwriter. Focus only on assigned real-estate funding evidence and do not ask dealer-specific questions."
+                    if public_review_type == "real_estate_dscr_v1"
                     else ""
                 )
             ),

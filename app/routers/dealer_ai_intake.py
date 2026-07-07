@@ -58,6 +58,7 @@ from app.services.payment_authorization import primary_super_admin
 
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
+funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
 admin_router = APIRouter(prefix="/admin/dealer-ai-leads", tags=["admin-dealer-ai-leads"])
 log = logging.getLogger(__name__)
@@ -108,6 +109,33 @@ REQUIRED_DOCUMENTS = [
     },
 ]
 
+REAL_ESTATE_REQUIRED_DOCUMENTS = [
+    {
+        "name": "Lease, rent roll, or rent support",
+        "category": "Property income",
+        "description": "Upload lease agreements, rent roll, or other support for current and expected rent.",
+        "allow_multiple_files": True,
+    },
+    {
+        "name": "Purchase contract, payoff, or mortgage statement",
+        "category": "Transaction and debt",
+        "description": "Upload the purchase contract for acquisitions or payoff/mortgage statements for refinance and cash-out.",
+        "allow_multiple_files": True,
+    },
+    {
+        "name": "Taxes, insurance, HOA, or PITIA support",
+        "category": "Property expenses",
+        "description": "Upload property tax, insurance, HOA, or payment evidence needed to estimate PITIA and DSCR.",
+        "allow_multiple_files": True,
+    },
+    {
+        "name": "Entity or vesting documents",
+        "category": "Ownership",
+        "description": "Upload entity, vesting, or ownership documents when available.",
+        "allow_multiple_files": True,
+    },
+]
+
 
 class DealerAssetRow(BaseModel):
     id: str | None = None
@@ -140,6 +168,28 @@ class DealerIntakeStart(BaseModel):
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
 
     @field_validator("business_name", "phone", mode="before")
+    @classmethod
+    def empty_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class FundingReviewStart(BaseModel):
+    full_name: str = Field(min_length=1, max_length=180)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=48)
+    investor_name: str | None = Field(default=None, max_length=180)
+    target_property_address: str | None = Field(default=None, max_length=320)
+    transaction_type: str | None = Field(default=None, max_length=64)
+    requested_amount: float | None = Field(default=None, ge=0)
+    estimated_value_or_purchase_price: float | None = Field(default=None, ge=0)
+    monthly_rent: float | None = Field(default=None, ge=0)
+    estimated_credit_tier: str | None = Field(default=None, max_length=64)
+    terms_accepted: bool = False
+    privacy_accepted: bool = False
+    terms_version: str = Field(default=TERMS_VERSION, max_length=32)
+    privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+
+    @field_validator("phone", "investor_name", "target_property_address", "transaction_type", "estimated_credit_tier", mode="before")
     @classmethod
     def empty_to_none(cls, value: object) -> object:
         return None if value == "" else value
@@ -328,22 +378,25 @@ def _record_resume_email(
     token: str,
     request: Request,
     reason: str,
+    public_path: str = "/dealer-ai-underwriter",
+    review_label: str = "dealer funding review",
+    room_label: str = "dealer financing file",
 ) -> dict[str, Any]:
-    resume_url = _public_url(f"/dealer-ai-underwriter?token={token}")
-    subject = "Your Qualified Commercial dealer funding review link"
+    resume_url = _public_url(f"{public_path}?token={token}")
+    subject = f"Your Qualified Commercial {review_label} link"
     body_text = (
         f"Hi {intake.full_name},\n\n"
-        "Use this secure link to resume your Qualified Commercial dealer funding review:\n"
+        f"Use this secure link to resume your Qualified Commercial {review_label}:\n"
         f"{resume_url}\n\n"
-        "This link opens your encrypted AI underwriting room for the dealer financing file. "
+        f"This link opens your encrypted AI underwriting room for the {room_label}. "
         "If you did not request this link, you can ignore this email.\n\n"
         "Qualified Commercial LLC"
     )
     body_html = (
         f"<p>Hi {intake.full_name},</p>"
-        "<p>Use this secure link to resume your Qualified Commercial dealer funding review:</p>"
-        f'<p><a href="{resume_url}">Resume dealer funding review</a></p>'
-        "<p>This link opens your encrypted AI underwriting room for the dealer financing file. "
+        f"<p>Use this secure link to resume your Qualified Commercial {review_label}:</p>"
+        f'<p><a href="{resume_url}">Resume {html.escape(review_label)}</a></p>'
+        f"<p>This link opens your encrypted AI underwriting room for the {html.escape(room_label)}. "
         "If you did not request this link, you can ignore this email.</p>"
         "<p>Qualified Commercial LLC</p>"
     )
@@ -373,18 +426,19 @@ def _record_login_code_email(
     code: str,
     request: Request,
     reason: str,
+    review_label: str = "dealer funding review",
 ) -> dict[str, Any]:
-    subject = "Your Qualified Commercial dealer review access code"
+    subject = f"Your Qualified Commercial {review_label} access code"
     body_text = (
         f"Hi {intake.full_name},\n\n"
-        f"Your dealer funding review access code is {code}.\n\n"
+        f"Your {review_label} access code is {code}.\n\n"
         f"This code expires in {DEALER_LOGIN_CODE_TTL_MINUTES} minutes. "
         "If you did not request this code, you can ignore this email.\n\n"
         "Qualified Commercial LLC"
     )
     body_html = (
         f"<p>Hi {intake.full_name},</p>"
-        "<p>Your dealer funding review access code is:</p>"
+        f"<p>Your {html.escape(review_label)} access code is:</p>"
         f'<p style="font-size:22px;font-weight:700;letter-spacing:2px">{code}</p>'
         f"<p>This code expires in {DEALER_LOGIN_CODE_TTL_MINUTES} minutes. "
         "If you did not request this code, you can ignore this email.</p>"
@@ -601,24 +655,30 @@ async def _record_super_admin_decision_notification(
         log.warning("dealer_ai_intake: super-admin decision notification failed intake=%s decision=%s: %s", intake.id, decision, exc)
 
 
-async def _latest_active_intake_by_email(db: AsyncSession, email: str) -> PublicUnderwritingIntake | None:
-    return (
-        await db.execute(
-            select(PublicUnderwritingIntake)
-            .where(PublicUnderwritingIntake.email == _normalize_email(email))
-            .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
-            .where(Bucket.archived_at.is_(None))
-            .options(
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
-                selectinload(PublicUnderwritingIntake.bucket_upload_link),
-                selectinload(PublicUnderwritingIntake.latest_review),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
-            )
-            .order_by(PublicUnderwritingIntake.updated_at.desc())
+async def _latest_active_intake_by_email(
+    db: AsyncSession,
+    email: str,
+    *,
+    variant: str | None = None,
+) -> PublicUnderwritingIntake | None:
+    query = (
+        select(PublicUnderwritingIntake)
+        .where(PublicUnderwritingIntake.email == _normalize_email(email))
+        .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+        .where(Bucket.archived_at.is_(None))
+        .options(
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+            selectinload(PublicUnderwritingIntake.bucket_upload_link),
+            selectinload(PublicUnderwritingIntake.latest_review),
+            with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
         )
-    ).scalars().first()
+        .order_by(PublicUnderwritingIntake.updated_at.desc())
+    )
+    if variant:
+        query = query.where(PublicUnderwritingIntake.variant == variant)
+    return (await db.execute(query)).scalars().first()
 
 
 async def _start_login_challenge(
@@ -627,9 +687,13 @@ async def _start_login_challenge(
     email: str,
     request: Request,
     reason: str,
+    variant: str | None = None,
+    review_label: str = "dealer funding review",
+    event_prefix: str = "dealer_ai",
+    target_type: str = "dealer_ai_intake",
 ) -> bool:
     normalized = _normalize_email(email)
-    intake = await _latest_active_intake_by_email(db, normalized)
+    intake = await _latest_active_intake_by_email(db, normalized, variant=variant)
     if intake is None or intake.bucket is None or intake.bucket.archived_at is not None:
         return False
     email_hash = _hash_token(normalized)
@@ -654,18 +718,18 @@ async def _start_login_challenge(
         user_agent=request.headers.get("user-agent"),
     )
     db.add(challenge)
-    _record_login_code_email(intake, code=code, request=request, reason=reason)
+    _record_login_code_email(intake, code=code, request=request, reason=reason, review_label=review_label)
     await _log(
         db,
         intake.bucket_id,
-        "dealer_ai_login_code_sent",
+        f"{event_prefix}_login_code_sent",
         request=request,
         actor_name=intake.full_name,
         actor_email=intake.email,
         actor_role="public_lead",
-        target_type="dealer_ai_intake",
+        target_type=target_type,
         target_id=str(intake.id),
-        detail="Dealer AI continuation code sent",
+        detail=f"{review_label.title()} continuation code sent",
     )
     return True
 
@@ -1128,6 +1192,67 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     }
 
 
+def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    state = _intake_state(intake)
+    basics = state.get("funding_review_basics") if isinstance(state.get("funding_review_basics"), dict) else {}
+    return {
+        "review_type": "real_estate_dscr_v1",
+        "deal_type": "real estate investor funding review",
+        "documentation_level": "preliminary DSCR / investor review",
+        "collateral_type": "income-producing real estate",
+        "loan_purpose": intake.loan_purpose or basics.get("transaction_type"),
+        "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else basics.get("requested_amount"),
+        "estimated_credit_tier": basics.get("estimated_credit_tier"),
+        "investor_name": intake.business_name,
+        "target_property_address": basics.get("target_property_address"),
+        "transaction_type": basics.get("transaction_type"),
+        "estimated_value_or_purchase_price": basics.get("estimated_value_or_purchase_price"),
+        "monthly_rent": basics.get("monthly_rent"),
+        "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
+        "baseline_document_policy": {
+            "stage": "stage_1_dscr_property_screen",
+            "allowed_document_categories": [
+                "lease, rent roll, or rent support",
+                "purchase contract for acquisition",
+                "payoff or mortgage statement for refinance/cash-out",
+                "property tax, insurance, HOA, or PITIA support",
+                "entity or vesting documents when available",
+                "requested amount",
+                "estimated value or purchase price",
+                "monthly rent",
+                "transaction type",
+                "estimated credit tier",
+            ],
+            "do_not_request_dealer_documents": True,
+            "stage_1_metrics": [
+                "DSCR",
+                "LTV",
+                "estimated property value",
+                "loan amount",
+                "equity",
+                "monthly rent",
+                "PITIA",
+                "NOI",
+                "cash to close",
+                "max supportable loan",
+                "reserve/cash gap",
+                "credit-tier impact",
+            ],
+        },
+        "underwriting_focus": (
+            "Screen a real-estate investor file for DSCR and investor lending. Infer purchase, refinance, or cash-out path from the intake, chat, "
+            "and documents. Focus on rent support, PITIA, DSCR, LTV, equity, cash to close, property condition, occupancy, lease/rent roll, "
+            "purchase contract or payoff, taxes, insurance, HOA, entity/vesting, and estimated credit tier. Ask one next question or upload request at a time."
+        ),
+        "custom_instructions": (
+            "This is not a car dealer review. Do not ask about dealership name, floorplan, MCA, inventory, gross receipts, or dealership LLC workflow. "
+            "Return a preliminary funding screen for DSCR/investor real estate only. Use the probability statuses: Good probability - book call, "
+            "Promising but needs one clarification, Not enough evidence yet, or Poor probability based on current file. Never invent DSCR, LTV, PITIA, "
+            "cash-to-close, or rent metrics; use null or unavailable when evidence is missing."
+        ),
+    }
+
+
 def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None) -> None:
     text = (message or "").strip()
     if not text:
@@ -1202,6 +1327,54 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
     return client
 
 
+async def _find_or_create_funding_client(db: AsyncSession, payload: FundingReviewStart) -> Client:
+    email = _normalize_email(str(payload.email))
+    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
+    owner = await primary_super_admin(db)
+    lead_payload = {
+        "source": "funding_review",
+        "investor_name": payload.investor_name,
+        "target_property_address": payload.target_property_address,
+        "transaction_type": payload.transaction_type,
+        "requested_amount": payload.requested_amount,
+        "estimated_value_or_purchase_price": payload.estimated_value_or_purchase_price,
+        "monthly_rent": payload.monthly_rent,
+        "estimated_credit_tier": payload.estimated_credit_tier,
+    }
+    if client is None:
+        client = Client(
+            name=payload.full_name.strip(),
+            email=email,
+            phone=payload.phone,
+            referral_source="funding_review",
+            originating_agent_id=owner.id if owner else None,
+            current_agent_id=owner.id if owner else None,
+            source_channel="funding_review",
+            lead_source="other",
+            lead_temperature="warm",
+            financing_support_needed="yes",
+            relationship_context="new_lead",
+            client_experience_mode="self_directed",
+            client_experience_mode_reason="funding_review",
+            client_experience_mode_locked_by="firm",
+            lead_intake=lead_payload,
+        )
+        db.add(client)
+        await db.flush()
+        return client
+    if not client.phone and payload.phone:
+        client.phone = payload.phone
+    if payload.full_name and (not client.name or client.name.lower() == email):
+        client.name = payload.full_name.strip()
+    if client.current_agent_id is None and owner is not None:
+        client.current_agent_id = owner.id
+    intake = dict(client.lead_intake or {})
+    intake.update({key: value for key, value in lead_payload.items() if value is not None})
+    client.lead_intake = intake
+    await db.flush()
+    return client
+
+
 async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: DealerIntakeStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
     owner = await primary_super_admin(db)
     bucket = Bucket(
@@ -1268,6 +1441,85 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
         target_type="bucket",
         target_id=str(bucket.id),
         detail="Public dealer AI intake created",
+    )
+    await db.flush()
+    return bucket, link
+
+
+async def _create_bucket_for_funding_review(db: AsyncSession, client: Client, payload: FundingReviewStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
+    owner = await primary_super_admin(db)
+    investor_name = payload.investor_name or payload.full_name
+    bucket = Bucket(
+        name=f"{investor_name} Funding Review",
+        bucket_type="real_estate_ai_intake",
+        client_name=investor_name,
+        purpose="Real estate investor funding AI intake",
+        description="Public DSCR and investor lending preliminary review.",
+        ai_context={
+            "review_type": "real_estate_dscr_v1",
+            "screening_stage": "stage_1_dscr_property_screen",
+            "deal_type": "real estate investor funding review",
+            "documentation_level": "preliminary DSCR / investor review",
+            "collateral_type": "income-producing residential or commercial real estate",
+            "client_email": client.email,
+            "target_property_address": payload.target_property_address,
+            "transaction_type": payload.transaction_type,
+            "requested_amount": payload.requested_amount,
+            "estimated_value_or_purchase_price": payload.estimated_value_or_purchase_price,
+            "monthly_rent": payload.monthly_rent,
+            "estimated_credit_tier": payload.estimated_credit_tier,
+            "stage_1_required_items": [
+                "lease, rent roll, or rent support",
+                "purchase contract, payoff, or mortgage statement",
+                "property tax, insurance, HOA, or PITIA support",
+                "estimated value or purchase price",
+                "requested amount",
+                "monthly rent",
+                "transaction type",
+                "estimated credit tier",
+            ],
+        },
+        created_by_id=owner.id if owner else None,
+    )
+    db.add(bucket)
+    await db.flush()
+    for doc in REAL_ESTATE_REQUIRED_DOCUMENTS:
+        db.add(
+            BucketRequestedDocument(
+                bucket_id=bucket.id,
+                name=doc["name"],
+                category=doc["category"],
+                description=doc["description"],
+                required=True,
+                allow_multiple_files=bool(doc["allow_multiple_files"]),
+                status="requested",
+                is_custom=False,
+            )
+        )
+    passcode = _generate_passcode()
+    link = BucketUploadLink(
+        bucket_id=bucket.id,
+        token=secrets.token_urlsafe(32),
+        recipient_name=payload.full_name.strip(),
+        recipient_email=client.email,
+        allow_notes=True,
+        allow_multiple_sessions=True,
+        can_use_ai_chat=True,
+        can_view_ai_tasks=True,
+        passcode_hash=_hash_passcode(passcode),
+    )
+    db.add(link)
+    await _log(
+        db,
+        bucket.id,
+        "funding_review_intake_created",
+        request=request,
+        actor_name=payload.full_name,
+        actor_email=client.email,
+        actor_role="public_lead",
+        target_type="bucket",
+        target_id=str(bucket.id),
+        detail="Public real estate funding review created",
     )
     await db.flush()
     return bucket, link
@@ -1431,6 +1683,8 @@ async def _response(
     forced_widget_type: str | None = None,
     forced_widget_source: str = "user_intent",
     forced_widget_reason: str | None = None,
+    public_path: str = "/dealer-ai-underwriter",
+    empty_message: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
@@ -1466,9 +1720,9 @@ async def _response(
         intake=DealerIntakeRead.model_validate(intake),
         token=token,
         session_token=session_token,
-        resume_url=_public_url(f"/dealer-ai-underwriter?token={token}") if token else None,
+        resume_url=_public_url(f"{public_path}?token={token}") if token else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
-        assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else _message_for_widget(widget, intake)),
+        assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
         requested_documents=[BucketRequestedDocumentRead.model_validate(doc) for doc in intake.bucket.requested_documents],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
@@ -2516,3 +2770,485 @@ async def my_dealer_upload_complete(
 ) -> BucketFile:
     intake = await _load_client_intake(db, user, intake_id)
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
+
+
+FUNDING_PUBLIC_PATH = "/funding-review"
+FUNDING_VARIANT = "real_estate_dscr_v1"
+
+
+def _funding_empty_message() -> str:
+    return (
+        "I opened your secure real estate funding review. I will screen this like an investor-loan underwriter: rent support, PITIA, "
+        "DSCR, LTV, purchase or payoff evidence, property value, entity/vesting, and credit tier. Attach what you have and I will ask one "
+        "targeted question or upload request at a time."
+    )
+
+
+def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
+    if intake.variant != FUNDING_VARIANT:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding review not found")
+
+
+async def _load_funding_intake_by_session(db: AsyncSession, request: Request) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge, str]:
+    session_token = request.headers.get("x-funding-session") or request.headers.get("X-Funding-Session")
+    if not session_token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Funding review session is required")
+    intake, challenge = await _load_intake_by_dealer_session(db, session_token)
+    _require_funding_intake(intake)
+    return intake, challenge, session_token
+
+
+@funding_router.post("/start", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def start_funding_review(
+    payload: FundingReviewStart,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    if not payload.terms_accepted or not payload.privacy_accepted:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
+    existing = await _latest_active_intake_by_email(db, str(payload.email), variant=FUNDING_VARIANT)
+    if existing is not None:
+        await _start_login_challenge(
+            db,
+            email=str(payload.email),
+            request=request,
+            reason="existing_funding_review_start",
+            variant=FUNDING_VARIANT,
+            review_label="real estate funding review",
+            event_prefix="funding_review",
+            target_type="funding_review_intake",
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A secure funding review already exists for this email. We sent a short access code so you can continue that file.",
+        )
+    client = await _find_or_create_funding_client(db, payload)
+    bucket, link = await _create_bucket_for_funding_review(db, client, payload, request)
+    token = _new_public_token()
+    basics = {
+        "investor_name": payload.investor_name,
+        "target_property_address": payload.target_property_address,
+        "transaction_type": payload.transaction_type,
+        "requested_amount": payload.requested_amount,
+        "estimated_value_or_purchase_price": payload.estimated_value_or_purchase_price,
+        "monthly_rent": payload.monthly_rent,
+        "estimated_credit_tier": payload.estimated_credit_tier,
+    }
+    intake = PublicUnderwritingIntake(
+        client_id=client.id,
+        bucket_id=bucket.id,
+        bucket_upload_link_id=link.id,
+        token_hash=_hash_token(token),
+        variant=FUNDING_VARIANT,
+        full_name=payload.full_name.strip(),
+        email=client.email or _normalize_email(str(payload.email)),
+        phone=payload.phone,
+        business_name=payload.investor_name,
+        loan_purpose=payload.transaction_type,
+        requested_loan_amount=payload.requested_amount,
+        asset_rows=[
+            {
+                "address": payload.target_property_address,
+                "estimated_property_value": payload.estimated_value_or_purchase_price,
+                "notes": "Target property from funding review intake",
+            }
+        ]
+        if payload.target_property_address or payload.estimated_value_or_purchase_price
+        else [],
+        intake_state={
+            "messages": [],
+            "source": "funding_review",
+            "funding_review_basics": basics,
+            "legal_acceptance": {
+                "terms_accepted": payload.terms_accepted,
+                "privacy_accepted": payload.privacy_accepted,
+                "terms_version": payload.terms_version or TERMS_VERSION,
+                "privacy_version": payload.privacy_version or PRIVACY_VERSION,
+                **_request_audit(request),
+            },
+        },
+    )
+    db.add(intake)
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    _record_resume_email(
+        intake,
+        token=token,
+        request=request,
+        reason="funding_review_created",
+        public_path=FUNDING_PUBLIC_PATH,
+        review_label="real estate funding review",
+        room_label="real estate funding review file",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, assistant_message=_funding_empty_message())
+
+
+@funding_router.post("/login/start", response_model=DealerLoginStartResponse)
+async def start_funding_review_login(
+    payload: DealerLoginStartRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLoginStartResponse:
+    login_required = await _start_login_challenge(
+        db,
+        email=str(payload.email),
+        request=request,
+        reason="funding_review_login_requested",
+        variant=FUNDING_VARIANT,
+        review_label="real estate funding review",
+        event_prefix="funding_review",
+        target_type="funding_review_intake",
+    )
+    await db.commit()
+    return DealerLoginStartResponse(
+        login_required=login_required,
+        message=(
+            "We found an existing funding review for this email. Enter the code we sent to continue."
+            if login_required
+            else "No existing funding review was found. Complete Step 1 to start a new review."
+        ),
+    )
+
+
+@funding_router.post("/login/verify", response_model=DealerIntakeResponse)
+async def verify_funding_review_login(
+    payload: DealerLoginVerifyRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    email_hash = _hash_token(_normalize_email(str(payload.email)))
+    challenge = (
+        await db.execute(
+            select(DealerIntakeLoginChallenge)
+            .join(PublicUnderwritingIntake, DealerIntakeLoginChallenge.intake_id == PublicUnderwritingIntake.id)
+            .where(
+                PublicUnderwritingIntake.variant == FUNDING_VARIANT,
+                DealerIntakeLoginChallenge.email_hash == email_hash,
+                DealerIntakeLoginChallenge.used_at.is_(None),
+                DealerIntakeLoginChallenge.revoked_at.is_(None),
+                DealerIntakeLoginChallenge.expires_at > _now(),
+            )
+            .order_by(DealerIntakeLoginChallenge.created_at.desc())
+        )
+    ).scalars().first()
+    if challenge is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if _hash_token(payload.code.strip()) != challenge.code_hash:
+        challenge.attempt_count += 1
+        if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+            challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    session_token = secrets.token_urlsafe(40)
+    public_token = _new_public_token()
+    challenge.used_at = _now()
+    challenge.session_hash = _hash_token(session_token)
+    challenge.session_expires_at = _now() + timedelta(hours=DEALER_LOGIN_SESSION_TTL_HOURS)
+    intake = await db.get(PublicUnderwritingIntake, challenge.intake_id)
+    if intake is None or intake.variant != FUNDING_VARIANT:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    intake.token_hash = _hash_token(public_token)
+    await _log(
+        db,
+        intake.bucket_id,
+        "funding_review_login_verified",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="funding_review_intake",
+        target_id=str(intake.id),
+        detail="Funding review continuation login verified",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        public_path=FUNDING_PUBLIC_PATH,
+        assistant_message="Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
+    )
+
+
+@funding_router.get("/session", response_model=DealerIntakeResponse)
+async def get_funding_review_session(request: Request, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
+    intake, _challenge, session_token = await _load_funding_intake_by_session(db, request)
+    public_token = _new_public_token()
+    intake.token_hash = _hash_token(public_token)
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        public_path=FUNDING_PUBLIC_PATH,
+        assistant_message="Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
+    )
+
+
+@funding_router.post("/logout", response_model=DealerLogoutResponse)
+async def logout_funding_review_session(
+    payload: DealerLogoutRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLogoutResponse:
+    session_token = payload.session_token or request.headers.get("x-funding-session") or request.headers.get("X-Funding-Session")
+    if session_token:
+        challenge = (
+            await db.execute(
+                select(DealerIntakeLoginChallenge).where(
+                    DealerIntakeLoginChallenge.session_hash == _hash_token(session_token),
+                    DealerIntakeLoginChallenge.revoked_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if challenge is not None:
+            challenge.revoked_at = _now()
+            await db.commit()
+    return DealerLogoutResponse()
+
+
+@funding_router.get("/intelligence.pdf")
+async def download_funding_review_intelligence_pdf(
+    request: Request,
+    token: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    if token:
+        intake = await _load_public_intake(db, token)
+        _require_funding_intake(intake)
+    else:
+        intake, _challenge, _session_token = await _load_funding_intake_by_session(db, request)
+    review = intake.latest_review if intake.latest_review else None
+    latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    pdf_bytes = await asyncio.to_thread(
+        render_dealer_intelligence_pdf,
+        intake=intake,
+        files=sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True),
+        missing_docs=_missing_required_docs(intake.bucket),
+        result=latest_result,
+    )
+    filename = _safe_filename(f"funding-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@funding_router.get("/{token}", response_model=DealerIntakeResponse)
+async def get_funding_review(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, empty_message=_funding_empty_message())
+
+
+@funding_router.post("/{token}/chat", response_model=DealerIntakeResponse)
+async def funding_review_chat(
+    token: str,
+    payload: DealerChatRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    _apply_updates(intake, payload.updates)
+    _record_chat_fact(intake, payload.message)
+    intake.last_message_at = _now()
+    messages = []
+    assistant_message = None
+    if payload.message and payload.message.strip():
+        intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_funding_review_context(intake)}
+        chat_messages, _, _ = await create_chat_reply(
+            db,
+            bucket=intake.bucket,
+            audience="uploader",
+            message=payload.message.strip(),
+            actor_name=intake.full_name,
+            upload_link=intake.bucket_upload_link,
+        )
+        messages = chat_messages
+        if chat_messages:
+            assistant_message = chat_messages[-1].content
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, assistant_message=assistant_message, messages=messages)
+
+
+@funding_router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def funding_review_upload_init(
+    token: str,
+    payload: DealerFileUploadInit,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@funding_router.post("/{token}/files/complete", response_model=BucketFileRead)
+async def funding_review_upload_complete(
+    token: str,
+    payload: DealerUploadComplete,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@funding_router.post("/{token}/run-review", response_model=DealerIntakeResponse)
+async def run_funding_review(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    review_context = {**(intake.bucket.ai_context or {}), **_funding_review_context(intake), "recent_funding_review_chat": await _recent_dealer_chat(db, intake)}
+    intake.bucket.ai_context = review_context
+    review = BucketAIReview(
+        bucket_id=intake.bucket_id,
+        requested_by_user_id=None,
+        status="queued",
+        context_snapshot=review_context,
+        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
+        provider="bedrock",
+    )
+    db.add(review)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        "funding_review_ai_review_queued",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="ai_review",
+        target_id=str(review.id),
+        detail="Public real estate funding screen",
+    )
+    await run_bucket_ai_review(db, review.id)
+    fresh_review = await latest_review(db, intake.bucket_id)
+    intake.latest_review_id = fresh_review.id if fresh_review else review.id
+    if fresh_review and isinstance(fresh_review.result, dict):
+        intake.result_snapshot = fresh_review.result
+        intake.status = "reviewed"
+        intake.completed_at = _now()
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH)
+
+
+@funding_router.post("/{token}/book-call", response_model=DealerIntakeResponse)
+async def book_funding_review_call(
+    token: str,
+    payload: DealerBookCallRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    if _call_booked(intake):
+        return await _response(
+            db,
+            intake,
+            token=token,
+            public_path=FUNDING_PUBLIC_PATH,
+            assistant_message="Your call is already booked. Keep uploading property and rent evidence here if anything is still missing before the meeting.",
+        )
+    starts_at = _to_utc_minute(payload.starts_at)
+    owner, booking, slots = await _dealer_call_slots(db)
+    if owner is None or booking is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
+    if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That call time is no longer available. Choose another time.")
+    who = f"{intake.full_name} <{intake.email}>"
+    description = (
+        "Booked from Real Estate Funding Review.\n"
+        f"Funding review intake: {intake.id}\n"
+        f"Bucket: {intake.bucket_id}\n"
+        f"Investor/entity: {intake.business_name or '(not provided)'}\n"
+        f"Name: {intake.full_name}\n"
+        f"Email: {intake.email}\n"
+        f"Phone: {intake.phone or '(not provided)'}\n"
+        f"Requested amount: {intake.requested_loan_amount or '(not provided)'}\n"
+        f"Transaction type: {intake.loan_purpose or '(not provided)'}\n"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=f"Funding review call: {intake.business_name or intake.full_name}",
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.AUTO,
+        owner_user_id=owner.id,
+        external_ref_kind="funding_review_intake",
+        external_ref_id=str(intake.id),
+    )
+    db.add(ev)
+    await db.flush()
+    state = _intake_state(intake)
+    state["call_booking"] = {
+        "event_id": str(ev.id),
+        "starts_at": starts_at.isoformat(),
+        "booked_at": _now().isoformat(),
+        "host_user_id": str(owner.id),
+        "host_email": owner.email,
+    }
+    intake.intake_state = state
+    db.add(
+        Activity(
+            client_id=intake.client_id,
+            actor_id=None,
+            actor_label="public",
+            kind="calendar.funding_review_call_booked",
+            summary=f"Funding review call booked for {intake.business_name or intake.full_name}",
+            payload={
+                "event_id": str(ev.id),
+                "intake_id": str(intake.id),
+                "bucket_id": str(intake.bucket_id),
+                "host_user_id": str(owner.id),
+                "starts_at": starts_at.isoformat(),
+            },
+        )
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "funding_review_call_booked",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="calendar_event",
+        target_id=str(ev.id),
+        detail=f"Funding review call booked for {starts_at.isoformat()}",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=FUNDING_PUBLIC_PATH,
+        assistant_message="Your call is booked. Keep uploading property, rent, and PITIA evidence here if anything is still missing before the meeting.",
+    )

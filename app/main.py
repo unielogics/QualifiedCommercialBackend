@@ -148,6 +148,7 @@ for r in [
     brokers.router,
     buckets.router,
     dealer_ai_intake.router,
+    dealer_ai_intake.funding_router,
     dealer_ai_intake.client_router,
     dealer_ai_intake.admin_router,
     documents.router,
