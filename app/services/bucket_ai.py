@@ -1452,7 +1452,12 @@ async def _chat_context(
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id, route="uploader", upload_link_id=upload_link.id, approved_only=True)
         public_ai_context = _public_ai_context(bucket)
-        latest_result = review.result if review and isinstance(review.result, dict) else None
+        # SECURITY: the uploader (public token + passcode) must NOT receive the
+        # raw review.result — it carries internal underwriter reasoning (raw AI
+        # context, per-file red flags, question routing, bankability internals).
+        # Give only the sanitized visible_summary + approved_tasks, matching the
+        # share/vendor branches below. The dealer's own intelligence panel is
+        # fed separately by dealer_ai_intake._response, which redacts too.
         return {
             **base,
             "recipient_name": upload_link.recipient_name,
@@ -1460,10 +1465,6 @@ async def _chat_context(
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
             "visible_summary": upload_link_visible_summary(review, bucket),
-            "latest_review": latest_result,
-            "document_evidence_map": latest_result.get("document_evidence_map") if latest_result else None,
-            "next_best_action": latest_result.get("next_best_action") if latest_result else None,
-            "baseline_coverage": (latest_result.get("document_evidence_map") or {}).get("baseline_coverage") if latest_result else None,
             "instructions": (
                 "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
                 "Do not discuss admin notes or shares. External users cannot change saved AI instructions."

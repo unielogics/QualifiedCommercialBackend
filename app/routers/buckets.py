@@ -5,6 +5,7 @@ import hmac
 import logging
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
@@ -155,8 +156,34 @@ def _hash_passcode(passcode: str) -> str:
     return f"pbkdf2_sha256${iterations}${salt}${digest}"
 
 
+# Brute-force guard for share/upload passcodes. Generated passcodes are only
+# 6 digits (900k space) and there is no edge rate limiting, so without this a
+# leaked token URL could be cracked by enumerating passcodes. Single-instance
+# in-memory counter (same assumption as the public.py throttle), keyed on the
+# per-share/link passcode hash so the lock follows the target, not the caller IP.
+_PASSCODE_ATTEMPTS: dict[str, tuple[int, float]] = {}
+_PASSCODE_MAX_ATTEMPTS = 10
+_PASSCODE_LOCKOUT_SECONDS = 900.0
+
+
+def _passcode_locked(key: str) -> bool:
+    entry = _PASSCODE_ATTEMPTS.get(key)
+    if not entry:
+        return False
+    attempts, locked_until = entry
+    if attempts < _PASSCODE_MAX_ATTEMPTS:
+        return False
+    if time.monotonic() >= locked_until:
+        _PASSCODE_ATTEMPTS.pop(key, None)  # window elapsed — allow a fresh burst
+        return False
+    return True
+
+
 def _verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
     if not passcode_hash:
+        return False
+    # Deny (and skip the expensive PBKDF2) while the target is locked out.
+    if _passcode_locked(passcode_hash):
         return False
     try:
         scheme, raw_iterations, salt, expected = passcode_hash.split("$", 3)
@@ -166,7 +193,12 @@ def _verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
     except ValueError:
         return False
     digest = hashlib.pbkdf2_hmac("sha256", passcode.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
-    return hmac.compare_digest(digest, expected)
+    if hmac.compare_digest(digest, expected):
+        _PASSCODE_ATTEMPTS.pop(passcode_hash, None)  # success resets the counter
+        return True
+    attempts = _PASSCODE_ATTEMPTS.get(passcode_hash, (0, 0.0))[0] + 1
+    _PASSCODE_ATTEMPTS[passcode_hash] = (attempts, time.monotonic() + _PASSCODE_LOCKOUT_SECONDS)
+    return False
 
 
 def _generate_passcode() -> str:
@@ -339,8 +371,39 @@ async def _load_vendor_access_or_404(db: AsyncSession, bucket_id: UUID, user: Us
     return access
 
 
+# Content types the browser may safely render inline. Anything else (notably
+# text/html, image/svg+xml, xml, javascript) can execute script in the S3
+# origin when previewed inline, so it is neutralized to a download.
+_INLINE_SAFE_CONTENT_TYPES = frozenset(
+    {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/webp",
+        "text/plain",
+        "text/csv",
+    }
+)
+
+
+def _sanitize_upload_content_type(content_type: str | None) -> str:
+    """Coerce an attacker-controlled upload content-type to a safe stored type.
+    Executable/markup types (html, svg, xml, js) become application/octet-stream
+    so the object can never be served as active content — the root fix for
+    stored-XSS via uploaded files."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return "application/octet-stream"
+    if any(token in ct for token in ("html", "svg", "xml", "javascript", "script", "xhtml")):
+        return "application/octet-stream"
+    return ct
+
+
 def _upload_url(s3_key: str, content_type: str) -> tuple[str, dict[str, str]]:
     bucket, _, kms_key_id = _bucket_storage_config()
+    content_type = _sanitize_upload_content_type(content_type)
     headers = {
         "Content-Type": content_type,
         "x-amz-server-side-encryption": "aws:kms",
@@ -360,13 +423,16 @@ def _upload_url(s3_key: str, content_type: str) -> tuple[str, dict[str, str]]:
     return url, headers
 
 
-def _download_url(s3_key: str, *, disposition: str = "inline", ttl: int = 900) -> str:
+def _download_url(s3_key: str, *, disposition: str = "inline", ttl: int = 900, content_type: str | None = None) -> str:
     bucket, _, _ = _bucket_storage_config()
-    return _s3_client().generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": s3_key, "ResponseContentDisposition": disposition},
-        ExpiresIn=ttl,
-    )
+    params: dict[str, str] = {"Bucket": bucket, "Key": s3_key}
+    # Defense-in-depth for historical objects: only let known-safe types render
+    # inline; force anything else to download so it cannot execute in the browser.
+    if disposition == "inline" and content_type is not None and _sanitize_upload_content_type(content_type) not in _INLINE_SAFE_CONTENT_TYPES:
+        disposition = "attachment"
+        params["ResponseContentType"] = "application/octet-stream"
+    params["ResponseContentDisposition"] = disposition
+    return _s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
 
 
 def _delete_s3_object(s3_key: str) -> str:
@@ -431,7 +497,7 @@ def _file_belongs_to_vendor_access(access: BucketVendorAccess, file_id: UUID) ->
 def _review_response(file: BucketFile, annotations: list[BucketFileAnnotation], *, preview: bool = True) -> BucketFileReviewRead:
     return BucketFileReviewRead(
         file=BucketFileRead.model_validate(file),
-        preview_url=_download_url(file.s3_key, disposition="inline") if preview else None,
+        preview_url=_download_url(file.s3_key, disposition="inline", content_type=file.content_type) if preview else None,
         annotations=[BucketFileAnnotationRead.model_validate(annotation) for annotation in annotations],
     )
 
@@ -1479,7 +1545,7 @@ async def admin_upload_init(
         upload_link_id=None,
         file_name=payload.file_name,
         s3_key=s3_key,
-        content_type=payload.content_type,
+        content_type=_sanitize_upload_content_type(payload.content_type),
         size_bytes=payload.size_bytes,
         uploaded_by_name=payload.uploader_name,
         uploaded_by_email=str(payload.uploader_email) if payload.uploader_email else None,
@@ -1613,7 +1679,7 @@ async def admin_file_url(
     disposition = "attachment" if download else "inline"
     await _log(db, bucket_id, "file_download_url_created" if download else "file_preview_url_created", request=request, user=user, target_type="file", target_id=str(file.id), detail=file.file_name)
     await db.commit()
-    return BucketFileUrl(url=_download_url(file.s3_key, disposition=disposition), expires_in=900)
+    return BucketFileUrl(url=_download_url(file.s3_key, disposition=disposition, content_type=file.content_type), expires_in=900)
 
 
 @router.get("/admin/{bucket_id}/files/{file_id}/review", response_model=BucketFileReviewRead)
@@ -1710,7 +1776,7 @@ async def get_vendor_bucket(
     for file in _vendor_access_files(access):
         item = BucketShareFileRead.model_validate(file)
         if access.can_preview:
-            item.preview_url = _download_url(file.s3_key, disposition="inline")
+            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
         if access.can_download:
             item.download_url = _download_url(file.s3_key, disposition="attachment")
         files.append(item)
@@ -2050,7 +2116,7 @@ async def request_upload_init(
         upload_link_id=link.id,
         file_name=payload.file_name,
         s3_key=s3_key,
-        content_type=payload.content_type,
+        content_type=_sanitize_upload_content_type(payload.content_type),
         size_bytes=payload.size_bytes,
         uploaded_by_name=payload.uploader_name,
         uploaded_by_email=str(payload.uploader_email) if payload.uploader_email else None,
@@ -2175,11 +2241,19 @@ async def share_access(
             continue
         item = BucketShareFileRead.model_validate(file)
         if share.can_preview:
-            item.preview_url = _download_url(file.s3_key, disposition="inline")
+            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
         if share.can_download:
             item.download_url = _download_url(file.s3_key, disposition="attachment")
         files.append(item)
-    notes = [n for n in share.bucket.notes if n.visibility == "shared" or share.can_see_internal_notes]
+    # A "shared" note is visible to this recipient only if it was authored by
+    # the operator (no share/vendor owner) or by this same share — not by other
+    # share recipients or vendors on the bucket (which would leak their PII and
+    # comments). can_see_internal_notes still widens to everything.
+    notes = [
+        n for n in share.bucket.notes
+        if share.can_see_internal_notes
+        or (n.visibility == "shared" and n.vendor_access_id is None and n.share_id in (None, share.id))
+    ]
     review = await latest_review(db, share.bucket_id)
     tasks = await visible_action_items(db, share.bucket_id, route="share", share_id=share.id, approved_only=True) if share.can_view_ai_tasks else []
     await _log(db, share.bucket_id, "share_accessed", request=request, actor_name=share.recipient_name, actor_email=share.recipient_email, actor_role="shared_user", target_type="share", target_id=str(share.id))

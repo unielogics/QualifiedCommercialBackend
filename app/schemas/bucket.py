@@ -418,6 +418,9 @@ class BucketShareInfoRead(BaseModel):
 
 
 class BucketShareFileRead(BucketFileRead):
+    # Internal storage key must never reach external share/vendor recipients;
+    # they download via the server-signed preview_url/download_url only.
+    s3_key: str = Field(exclude=True)
     preview_url: str | None = None
     download_url: str | None = None
 
