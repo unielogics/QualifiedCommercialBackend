@@ -136,6 +136,35 @@ resource "aws_iam_role_policy" "qcbackend_bedrock" {
   })
 }
 
+resource "aws_iam_role_policy" "qcbackend_ses_send" {
+  name = "qcbackend-ses-qualifiedcommercial-send"
+  role = aws_iam_role.qcbackend_instance.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ses:SendEmail",
+        "ses:SendRawEmail"
+      ]
+      Resource = concat(
+        [
+          "arn:aws:ses:${var.aws_region}:${data.aws_caller_identity.current.account_id}:identity/${var.domain_root}"
+        ],
+        var.ses_configuration_set != "" ? [
+          "arn:aws:ses:${var.aws_region}:${data.aws_caller_identity.current.account_id}:configuration-set/${var.ses_configuration_set}"
+        ] : []
+      )
+      Condition = {
+        StringEquals = {
+          "ses:FromAddress" = var.ses_from_address
+        }
+      }
+    }]
+  })
+}
+
 # SSM Session Manager + patch agent — lets us shell into the box without SSH keys.
 resource "aws_iam_role_policy_attachment" "qcbackend_ssm" {
   role       = aws_iam_role.qcbackend_instance.name

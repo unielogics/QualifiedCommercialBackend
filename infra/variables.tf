@@ -40,6 +40,18 @@ variable "route53_zone_id" {
   description = "Hosted zone ID for domain_root. Hardcoded so we skip route53:ListTagsForResource."
 }
 
+variable "ses_from_address" {
+  type        = string
+  default     = "no-reply@qualifiedcommercial.com"
+  description = "Only this verified sender address may be used by the backend EC2 role for SES outbound mail."
+}
+
+variable "ses_configuration_set" {
+  type        = string
+  default     = "my-first-configuration-set"
+  description = "Optional SES configuration set used for bounce/complaint tracking."
+}
+
 # ---------- GitHub Actions OIDC ----------
 
 variable "github_org" {
@@ -87,6 +99,9 @@ variable "secret_payload" {
       S3_BUCKET             qc-documents-prod
       BUCKETS_KMS_KEY_ID    arn:aws:kms:<region>:<account>:key/<key-id>
       USE_FAKE_INBOX        true
+      SES_FROM_ADDRESS      no-reply@qualifiedcommercial.com
+      SES_REGION            us-east-1
+      SES_CONFIGURATION_SET optional SES configuration set
       APP_ENV               production
       LOG_LEVEL             INFO
   EOT

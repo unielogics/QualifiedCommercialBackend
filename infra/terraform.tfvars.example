@@ -9,6 +9,8 @@ existing_rds_identifier  = "qualifiedcommercial"     # postgres 18.3, port 5432
 
 domain_root   = "qualifiedcommercial.com"
 api_subdomain = "api"
+ses_from_address = "no-reply@qualifiedcommercial.com"
+ses_configuration_set = "my-first-configuration-set"
 
 github_org  = "REPLACE-ME-with-your-github-org-or-username"
 github_repo = "QualifiedCommercial"
@@ -35,6 +37,9 @@ secret_payload = {
   STRIPE_SECRET_KEY     = "sk_live_REPLACE"
   STRIPE_PUBLISHABLE_KEY = "pk_live_REPLACE"
   STRIPE_WEBHOOK_SECRET = "whsec_REPLACE_AFTER_CREATING_STRIPE_WEBHOOK"
+  SES_FROM_ADDRESS      = "no-reply@qualifiedcommercial.com"
+  SES_REGION            = "us-east-1"
+  SES_CONFIGURATION_SET = "my-first-configuration-set"
   USE_FAKE_INBOX        = "true"
   APP_ENV               = "production"
   LOG_LEVEL             = "INFO"

@@ -34,8 +34,27 @@ Reflects what's actually live in AWS / GitHub.
 | ✅ | IAM role | `qcbackend-instance-role` + instance profile (attached to EC2) |
 | ✅ | IAM role | `qcbackend-github-deploy` (OIDC trust to `unielogics/QualifiedCommercialBackend@main`) |
 | ✅ | Route 53 A | `api.qualifiedcommercial.com` → EC2 |
+| ✅ | SES domain identity | `qualifiedcommercial.com` in `us-east-1` with DKIM + MAIL FROM `mail.qualifiedcommercial.com` |
 
 All managed by Terraform in [`infra/`](../infra/). Everything is **additive** alongside hand-built VPC/EC2/RDS — `terraform destroy` won't touch the latter.
+
+### SES outbound email
+
+Dealer AI access-code, resume-link, and super-admin notification emails use AWS SES through the EC2 instance role. No SMTP password or static AWS key is stored in the app.
+
+Production requirements:
+- SES account is out of sandbox in `us-east-1`.
+- `qualifiedcommercial.com` is verified in SES with DKIM enabled.
+- Custom MAIL FROM is `mail.qualifiedcommercial.com`.
+- Secrets Manager payload includes:
+  ```bash
+  SES_FROM_ADDRESS=no-reply@qualifiedcommercial.com
+  SES_REGION=us-east-1
+  SES_CONFIGURATION_SET=my-first-configuration-set
+  ```
+- IAM role policy `qcbackend-ses-qualifiedcommercial-send` allows only `ses:SendEmail` / `ses:SendRawEmail`, scoped to the `qualifiedcommercial.com` SES identity and locked with `ses:FromAddress = no-reply@qualifiedcommercial.com`.
+
+Do not grant broad `ses:*` or `Resource="*"` send permissions to the backend role. Read-only SES diagnostic permissions such as `ses:GetSendQuota` are not required by the app.
 
 ---
 
