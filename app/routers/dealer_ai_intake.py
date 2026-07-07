@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import secrets
+import time
 import zipfile
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,7 @@ from app.routers.buckets import (
     _public_url,
     _s3_client,
     _safe_filename,
+    _sanitize_upload_content_type,
     _upload_url,
     _vendor_user_from_payload,
 )
@@ -77,6 +79,23 @@ DEALER_LOGIN_RATE_LIMIT_MAX = 5
 ZIP_MAX_ENTRIES = 60
 ZIP_MAX_ENTRY_BYTES = 40 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 80 * 1024 * 1024
+
+# Abuse guards for the fully-public POST endpoints (single-instance in-memory,
+# same assumption as the public.py throttle). /start creates a Client + Bucket +
+# upload link + intake per call, and /run-review runs a heavy Bedrock pass, so
+# both are rate-limited to stop scripted mass-creation / LLM-cost amplification.
+_START_MIN_INTERVAL_SECONDS = 15.0
+_START_LAST_BY_IP: dict[str, float] = {}
+_REVIEW_MIN_INTERVAL_SECONDS = 45.0
+_REVIEW_LAST_BY_TOKEN: dict[str, float] = {}
+
+
+def _throttle_or_429(store: dict[str, float], key: str, min_interval: float, message: str) -> None:
+    now = time.monotonic()
+    last = store.get(key)
+    if last is not None and (now - last) < min_interval:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, message)
+    store[key] = now
 ZIP_SUPPORTED_EXTENSIONS = {
     ".pdf",
     ".png",
@@ -2143,6 +2162,43 @@ async def _prepare_vendor_access(
     return access
 
 
+# Keys of intake_state that are safe to expose to the public/uploader token
+# holder. Everything else (super-admin notification emails + message-ids,
+# login/resume email delivery records with reviewer IPs/user-agents, retained
+# chat_facts) is internal audit data and must never reach the dealer.
+_CLIENT_SAFE_INTAKE_STATE_KEYS = ("entity_structure", "call_booking", "deal_profile")
+
+
+def _client_safe_intake_state(state: Any) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    safe = {key: state[key] for key in _CLIENT_SAFE_INTAKE_STATE_KEYS if key in state}
+    return safe or None
+
+
+def _client_safe_result(result: Any) -> Any:
+    """Strip internal underwriter-only fields from an AI review result before
+    it reaches a public/uploader response. The dealer intelligence panel shows
+    bankability / key_metrics / strengths / risks; it never reads the fields
+    removed here (raw AI context, per-file red flags, question routing)."""
+    if not isinstance(result, dict):
+        return result
+    safe = {key: value for key, value in result.items() if key != "context_snapshot"}
+    questions = safe.get("underwriter_questions")
+    if isinstance(questions, list):
+        safe["underwriter_questions"] = [
+            {k: v for k, v in item.items() if k not in ("route", "reason")} if isinstance(item, dict) else item
+            for item in questions
+        ]
+    per_file = safe.get("per_file_summaries")
+    if isinstance(per_file, list):
+        safe["per_file_summaries"] = [
+            {k: v for k, v in item.items() if k != "red_flags"} if isinstance(item, dict) else item
+            for item in per_file
+        ]
+    return safe
+
+
 async def _response(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
@@ -2188,10 +2244,23 @@ async def _response(
             )
         ).scalars().all()
         messages = list(reversed(recent))
+    # Management artifacts + email sends are populated only for the super-admin
+    # dealer-lead endpoint (include_management=True); every public/uploader/
+    # funding caller gets empty lists.
     artifacts = await _management_artifacts(db, intake.id) if include_management else []
     email_sends = await _management_email_sends(db, intake.id) if include_management else []
+    intake_read = DealerIntakeRead.model_validate(intake)
+    # Redact internal-only data from the public/uploader payload. The dealer
+    # sees only whitelisted intake_state keys and a sanitized review result.
+    intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
+    intake_read.result_snapshot = _client_safe_result(intake.result_snapshot)
+    review_read = None
+    if review:
+        review_read = BucketAIReviewRead.model_validate(review)
+        review_read.result = _client_safe_result(review_read.result)
+        review_read.context_snapshot = None
     return DealerIntakeResponse(
-        intake=DealerIntakeRead.model_validate(intake),
+        intake=intake_read,
         token=token,
         session_token=session_token,
         resume_url=_public_url(f"{public_path}?token={token}") if token else None,
@@ -2201,7 +2270,7 @@ async def _response(
         requested_documents=[BucketRequestedDocumentRead.model_validate(doc) for doc in intake.bucket.requested_documents],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=summary,
-        latest_review=BucketAIReviewRead.model_validate(review) if review else None,
+        latest_review=review_read,
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
         artifacts=[_artifact_read(artifact) for artifact in artifacts],
         email_sends=[_email_send_read(row) for row in email_sends],
@@ -2262,7 +2331,7 @@ async def _start_upload(
         upload_link_id=intake.bucket_upload_link_id,
         file_name=payload.file_name,
         s3_key=s3_key,
-        content_type=payload.content_type,
+        content_type=_sanitize_upload_content_type(payload.content_type),
         size_bytes=payload.size_bytes,
         uploaded_by_name=actor_name,
         uploaded_by_email=actor_email,
@@ -2403,7 +2472,7 @@ async def _extract_zip_bucket_files(
                     skipped.append({"entry": entry_path, "reason": "zip_entry_encrypted"})
                     continue
                 total_bytes += len(data)
-                content_type = _guess_entry_content_type(entry_path)
+                content_type = _sanitize_upload_content_type(_guess_entry_content_type(entry_path))
                 child_id = uuid4()
                 safe = _safe_filename(entry_path.split("/")[-1])
                 child_key = f"{prefix}/uploads/{intake.bucket_id}/{child_id}-zip-{safe}"
@@ -2501,6 +2570,12 @@ async def start_dealer_intake(
 ) -> DealerIntakeResponse:
     if not payload.terms_accepted or not payload.privacy_accepted:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
+    _throttle_or_429(
+        _START_LAST_BY_IP,
+        (request.client.host if request.client else "?") or "?",
+        _START_MIN_INTERVAL_SECONDS,
+        "Please wait a moment before starting another review.",
+    )
     existing = await _latest_active_intake_by_email(db, str(payload.email))
     if existing is not None:
         await _start_login_challenge(db, email=str(payload.email), request=request, reason="existing_intake_start")
@@ -3160,6 +3235,14 @@ async def run_dealer_review(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    # Per-token cooldown: run-review triggers a heavy Bedrock pass over up to 8
+    # files; without this a token holder can replay it to amplify LLM cost.
+    _throttle_or_429(
+        _REVIEW_LAST_BY_TOKEN,
+        _hash_token(token),
+        _REVIEW_MIN_INTERVAL_SECONDS,
+        "A review was just started. Please wait a moment before running another.",
+    )
     review_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake), "recent_dealer_chat": await _recent_dealer_chat(db, intake)}
     intake.bucket.ai_context = review_context
     review = BucketAIReview(

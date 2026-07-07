@@ -14,7 +14,7 @@ from typing import Annotated
 import httpx
 import jwt
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -184,10 +184,14 @@ async def get_current_user(
         email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
         # If a row was pre-created by a team invite (has email + role but no
         # clerk_id yet), bind it instead of creating a duplicate.
+        # Case-insensitive match: invited rows (e.g. vendor bucket access) are
+        # stored lower-cased, but Clerk may return the email in a different
+        # case. A case-sensitive compare would miss the invite and mint a
+        # duplicate CLIENT row, silently stripping the user's granted access.
         invited = (
             await db.execute(
                 select(User).options(_with_client, _with_broker).where(
-                    User.email == email, User.clerk_id.is_(None)
+                    func.lower(User.email) == (email or "").lower(), User.clerk_id.is_(None)
                 )
             )
         ).scalar_one_or_none()

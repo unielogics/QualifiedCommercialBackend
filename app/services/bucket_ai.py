@@ -1510,6 +1510,15 @@ async def _chat_context(
         public_ai_context = _public_ai_context(bucket)
         public_review_type = public_ai_context.get("review_type") if public_ai_context else None
         latest_result = review.result if review and isinstance(review.result, dict) else None
+        # SECURITY (H3): the uploader (public token + passcode) must NOT receive the
+        # raw review.result — it carries internal underwriter reasoning (raw AI
+        # context, per-file red flags, question routing, bankability internals).
+        # The uploader-facing chat needs the document evidence map / next best
+        # action / baseline coverage to guide the dealer, and those specific keys
+        # are on the client-safe allowlist (they are what _client_safe_result in
+        # dealer_ai_intake keeps). Surface only those named keys — never the whole
+        # result dict — so no internal reasoning can leak even via prompt injection.
+        evidence_map = latest_result.get("document_evidence_map") if latest_result else None
         return {
             **base,
             "recipient_name": upload_link.recipient_name,
@@ -1517,10 +1526,9 @@ async def _chat_context(
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
             "visible_summary": upload_link_visible_summary(review, bucket),
-            "latest_review": latest_result,
-            "document_evidence_map": latest_result.get("document_evidence_map") if latest_result else None,
+            "document_evidence_map": evidence_map,
             "next_best_action": latest_result.get("next_best_action") if latest_result else None,
-            "baseline_coverage": (latest_result.get("document_evidence_map") or {}).get("baseline_coverage") if latest_result else None,
+            "baseline_coverage": (evidence_map or {}).get("baseline_coverage") if evidence_map else None,
             "instructions": (
                 "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
                 "Do not discuss admin notes or shares. External users cannot change saved AI instructions."
