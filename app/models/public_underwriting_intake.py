@@ -14,6 +14,7 @@ from app.models._mixins import TimestampMixin
 if TYPE_CHECKING:
     from app.models.bucket import Bucket, BucketAIReview, BucketUploadLink
     from app.models.client import Client
+    from app.models.user import User
 
 
 class PublicUnderwritingIntake(TimestampMixin, Base):
@@ -55,3 +56,58 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     bucket: Mapped[Bucket] = relationship()
     bucket_upload_link: Mapped[BucketUploadLink | None] = relationship()
     latest_review: Mapped[BucketAIReview | None] = relationship()
+
+
+class PublicUnderwritingIntakeArtifact(TimestampMixin, Base):
+    __tablename__ = "public_underwriting_intake_artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    intake_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intakes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    artifact_type: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    s3_key: Mapped[str | None] = mapped_column(String(700), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    intake: Mapped[PublicUnderwritingIntake] = relationship()
+    created_by_user: Mapped[User | None] = relationship()
+
+
+class PublicUnderwritingIntakeEmailSend(TimestampMixin, Base):
+    __tablename__ = "public_underwriting_intake_email_sends"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    intake_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intakes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    executive_summary_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intake_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    lender_packet_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intake_artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    to_emails: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    cc_emails: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    subject: Mapped[str] = mapped_column(String(512), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    vendor_access_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    ses_status: Mapped[str] = mapped_column(String(40), nullable=False, default="pending", server_default="pending")
+    ses_message_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    ses_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sent_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    intake: Mapped[PublicUnderwritingIntake] = relationship()
+    executive_summary_artifact: Mapped[PublicUnderwritingIntakeArtifact | None] = relationship(
+        foreign_keys=[executive_summary_artifact_id]
+    )
+    lender_packet_artifact: Mapped[PublicUnderwritingIntakeArtifact | None] = relationship(
+        foreign_keys=[lender_packet_artifact_id]
+    )
+    sent_by_user: Mapped[User | None] = relationship()

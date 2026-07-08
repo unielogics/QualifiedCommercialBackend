@@ -25,11 +25,11 @@ from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink
+from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink, BucketVendorAccess
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
-from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.public_underwriting_intake import PublicUnderwritingIntake, PublicUnderwritingIntakeArtifact, PublicUnderwritingIntakeEmailSend
 from app.models.user import User
 from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
@@ -41,6 +41,7 @@ from app.routers.buckets import (
     _s3_client,
     _safe_filename,
     _upload_url,
+    _vendor_user_from_payload,
 )
 from app.schemas.bucket import (
     BucketAIMessageRead,
@@ -52,9 +53,12 @@ from app.schemas.bucket import (
 )
 from app.schemas.common import ORMModel
 from app.services.bucket_ai import create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
+from app.services.ai.bedrock_client import get_client, model_light
+from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
-from app.services.email.ses_client import send_email
+from app.services.email.ses_client import send_email, send_raw_email
 from app.services.payment_authorization import primary_super_admin
+from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
 
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
@@ -264,6 +268,72 @@ class DealerBookCallRequest(BaseModel):
     starts_at: datetime
 
 
+class PublicUnderwritingArtifactRead(ORMModel):
+    id: UUID
+    intake_id: UUID
+    artifact_type: str
+    title: str
+    body_text: str | None = None
+    body_json: dict[str, Any] | None = None
+    s3_key: str | None = None
+    download_url: str | None = None
+    created_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PublicUnderwritingEmailSendRead(ORMModel):
+    id: UUID
+    intake_id: UUID
+    executive_summary_artifact_id: UUID | None = None
+    lender_packet_artifact_id: UUID | None = None
+    to_emails: list[str]
+    cc_emails: list[str] | None = None
+    subject: str
+    body: str
+    vendor_access_ids: list[str] | None = None
+    ses_status: str
+    ses_message_ids: list[str] | None = None
+    ses_error: str | None = None
+    sent_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VendorEmailPreviewRequest(BaseModel):
+    to_emails: list[EmailStr] = Field(default_factory=list)
+    cc_emails: list[EmailStr] = Field(default_factory=list)
+    include_lender_packet: bool = True
+    subject: str | None = Field(default=None, max_length=512)
+    body: str | None = Field(default=None, max_length=8000)
+
+
+class VendorEmailSendRequest(VendorEmailPreviewRequest):
+    subject: str = Field(min_length=1, max_length=512)
+    body: str = Field(min_length=1, max_length=12000)
+    can_preview: bool = True
+    can_download: bool = True
+    can_add_notes: bool = True
+    can_view_ai_summary: bool = True
+    can_use_ai_chat: bool = False
+    can_view_ai_tasks: bool = False
+    can_propose_tasks: bool = False
+
+
+class VendorEmailPreviewResponse(BaseModel):
+    subject: str
+    body: str
+    to_emails: list[str]
+    cc_emails: list[str]
+    executive_summary: PublicUnderwritingArtifactRead | None = None
+    lender_packet: PublicUnderwritingArtifactRead | None = None
+
+
+class VendorEmailSendResponse(BaseModel):
+    email_sends: list[PublicUnderwritingEmailSendRead]
+    vendor_access_ids: list[UUID]
+
+
 class DealerIntakeRead(ORMModel):
     id: UUID
     client_id: UUID | None
@@ -301,10 +371,13 @@ class DealerIntakeResponse(BaseModel):
     ai_summary: dict[str, Any] | None = None
     latest_review: BucketAIReviewRead | None = None
     messages: list[BucketAIMessageRead] = []
+    artifacts: list[PublicUnderwritingArtifactRead] = []
+    email_sends: list[PublicUnderwritingEmailSendRead] = []
 
 
 class DealerAILeadRow(BaseModel):
     id: UUID
+    variant: str
     client_id: UUID | None = None
     bucket_id: UUID
     bucket_name: str
@@ -1672,6 +1745,403 @@ async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, w
     return decorated
 
 
+def _artifact_download_url(artifact: PublicUnderwritingIntakeArtifact) -> str | None:
+    if not artifact.s3_key:
+        return None
+    try:
+        bucket, _prefix, _kms = _bucket_storage_config()
+        filename = _safe_filename(f"{artifact.title or artifact.artifact_type}.pdf")
+        return _s3_client().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": artifact.s3_key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=900,
+        )
+    except Exception:
+        log.exception("Unable to build public underwriting artifact URL")
+        return None
+
+
+def _artifact_read(artifact: PublicUnderwritingIntakeArtifact) -> PublicUnderwritingArtifactRead:
+    return PublicUnderwritingArtifactRead.model_validate(artifact).model_copy(
+        update={"download_url": _artifact_download_url(artifact)}
+    )
+
+
+def _email_send_read(row: PublicUnderwritingIntakeEmailSend) -> PublicUnderwritingEmailSendRead:
+    return PublicUnderwritingEmailSendRead.model_validate(row)
+
+
+async def _management_artifacts(db: AsyncSession, intake_id: UUID) -> list[PublicUnderwritingIntakeArtifact]:
+    return (
+        await db.execute(
+            select(PublicUnderwritingIntakeArtifact)
+            .where(PublicUnderwritingIntakeArtifact.intake_id == intake_id)
+            .order_by(PublicUnderwritingIntakeArtifact.created_at.desc())
+        )
+    ).scalars().all()
+
+
+async def _management_email_sends(db: AsyncSession, intake_id: UUID) -> list[PublicUnderwritingIntakeEmailSend]:
+    return (
+        await db.execute(
+            select(PublicUnderwritingIntakeEmailSend)
+            .where(PublicUnderwritingIntakeEmailSend.intake_id == intake_id)
+            .order_by(PublicUnderwritingIntakeEmailSend.created_at.desc())
+            .limit(40)
+        )
+    ).scalars().all()
+
+
+async def _latest_artifact(db: AsyncSession, intake_id: UUID, artifact_type: str) -> PublicUnderwritingIntakeArtifact | None:
+    return (
+        await db.execute(
+            select(PublicUnderwritingIntakeArtifact)
+            .where(
+                PublicUnderwritingIntakeArtifact.intake_id == intake_id,
+                PublicUnderwritingIntakeArtifact.artifact_type == artifact_type,
+            )
+            .order_by(PublicUnderwritingIntakeArtifact.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def _ai_response_text(resp: Any) -> str:
+    blocks = getattr(resp, "content", None) or []
+    parts: list[str] = []
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _json_from_ai_text(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else {"body": stripped}
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(stripped[start:end + 1])
+                return parsed if isinstance(parsed, dict) else {"body": stripped}
+            except json.JSONDecodeError:
+                pass
+    return {"body": stripped}
+
+
+def _latest_result_for_intake(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    review = intake.latest_review if intake.latest_review else None
+    if review and isinstance(review.result, dict):
+        return review.result
+    if isinstance(intake.result_snapshot, dict):
+        return intake.result_snapshot
+    return {}
+
+
+async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    docs_by_id = {str(doc.id): doc for doc in intake.bucket.requested_documents}
+    files = []
+    for file in sorted(_active_files(intake.bucket), key=lambda item: item.created_at, reverse=True):
+        doc = docs_by_id.get(str(file.requested_document_id)) if file.requested_document_id else None
+        files.append(
+            {
+                "id": str(file.id),
+                "file_name": file.file_name,
+                "zip_entry_path": file.zip_entry_path,
+                "content_type": file.content_type,
+                "size_bytes": file.size_bytes,
+                "requested_document": doc.name if doc else None,
+                "created_at": file.created_at.isoformat() if file.created_at else None,
+            }
+        )
+    missing_docs = [
+        {"id": str(doc.id), "name": doc.name, "category": doc.category, "description": doc.description}
+        for doc in _missing_required_docs(intake.bucket)
+    ]
+    return {
+        "variant": intake.variant,
+        "intake": {
+            "id": str(intake.id),
+            "full_name": intake.full_name,
+            "email": intake.email,
+            "phone": intake.phone,
+            "business_name": intake.business_name,
+            "loan_purpose": intake.loan_purpose,
+            "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+            "estimated_credit_score": intake.estimated_credit_score,
+            "referral_source": intake.referral_source,
+            "asset_rows": intake.asset_rows,
+            "intake_state": intake.intake_state,
+        },
+        "bucket": {
+            "id": str(intake.bucket_id),
+            "name": intake.bucket.name,
+            "purpose": intake.bucket.purpose,
+            "description": intake.bucket.description,
+        },
+        "files": files,
+        "missing_documents": missing_docs,
+        "latest_review": _latest_result_for_intake(intake),
+        "chat_history": await _recent_dealer_chat(db, intake),
+    }
+
+
+def _summary_title(intake: PublicUnderwritingIntake) -> str:
+    label = intake.business_name or intake.full_name or "Underwriting lead"
+    return f"{label} executive summary"
+
+
+async def _generate_management_json(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+    *,
+    purpose: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = await _lead_management_context(db, intake)
+    variant_label = "real estate DSCR/investor" if intake.variant.startswith("real_estate") else "dealer capital"
+    if purpose == "executive_summary":
+        schema = {
+            "title": "short title",
+            "executive_summary": "operator-facing summary",
+            "recommended_approach": "best loan approach",
+            "suggested_application_types": ["application or product paths that make sense"],
+            "borrower_profile": "borrower or guarantor notes",
+            "entity_vesting_notes": "entity and ownership notes",
+            "property_collateral": "property/collateral summary",
+            "requested_terms": "requested amount and purpose",
+            "key_metrics": {},
+            "documents_reviewed": ["files and what they prove"],
+            "missing_confirmations": ["missing items or unsupported fields"],
+            "risks": ["risk items"],
+            "mitigants": ["mitigants"],
+            "vendor_submission_angle": "how to position this to vendors/lenders",
+            "next_best_action": "one next operator action",
+            "disclaimer": "preliminary review only",
+        }
+        instruction = (
+            "Create a concise but useful operator-facing executive summary for a Qualified Commercial AI underwriting lead. "
+            "Use the uploaded evidence, chat answers, latest review, and intake data only. Do not invent values. "
+            "If a field is unsupported, write Awaiting evidence. Return strict JSON only."
+        )
+        feature = "loan_summary"
+    else:
+        schema = {"subject": "email subject", "body": "editable vendor email body"}
+        instruction = (
+            "Prepare a lender/vendor email for a Qualified Commercial underwriter. It must be professional, concise, "
+            "and editable. Include the strongest evidence, suggested submission angle, missing confirmations, and say that a secure bucket login link "
+            "and underwriting packet are included. Do not include unsecured file links. Return strict JSON only."
+        )
+        feature = "lender_send"
+    prompt = {
+        "purpose": purpose,
+        "variant": variant_label,
+        "instruction": instruction,
+        "required_json_shape": schema,
+        "context": context,
+        "extra": extra or {},
+    }
+    resp = await tracked_messages_create(
+        db,
+        feature=feature,
+        client=get_client(),
+        model=model_light(),
+        user_id=user.id,
+        client_id=intake.client_id,
+        metadata={"intake_id": intake.id, "bucket_id": intake.bucket_id, "purpose": purpose},
+        max_tokens=2200,
+        temperature=0.2,
+        messages=[{"role": "user", "content": json.dumps(json_safe_metadata(prompt), ensure_ascii=False)}],
+    )
+    parsed = _json_from_ai_text(_ai_response_text(resp))
+    if purpose == "executive_summary" and not parsed.get("executive_summary") and parsed.get("body"):
+        parsed["executive_summary"] = parsed["body"]
+    return json_safe_metadata(parsed)
+
+
+async def _create_executive_summary_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+) -> PublicUnderwritingIntakeArtifact:
+    summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
+    title = str(summary.get("title") or _summary_title(intake))[:240]
+    body_text = str(summary.get("executive_summary") or summary.get("body") or "")
+    artifact = PublicUnderwritingIntakeArtifact(
+        intake_id=intake.id,
+        artifact_type="executive_summary",
+        title=title,
+        body_text=body_text,
+        body_json=summary,
+        created_by_user_id=user.id,
+    )
+    db.add(artifact)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        "underwriting_executive_summary_generated",
+        user=user,
+        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=title,
+    )
+    return artifact
+
+
+async def _ensure_executive_summary_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+) -> PublicUnderwritingIntakeArtifact:
+    existing = await _latest_artifact(db, intake.id, "executive_summary")
+    return existing or await _create_executive_summary_artifact(db, intake, user)
+
+
+async def _store_lender_packet_pdf(
+    intake: PublicUnderwritingIntake,
+    pdf_bytes: bytes,
+    title: str,
+) -> str:
+    bucket, prefix, kms_key_id = _bucket_storage_config()
+    key_prefix = f"{prefix}/public-underwriting/{intake.id}/artifacts" if prefix else f"public-underwriting/{intake.id}/artifacts"
+    key = f"{key_prefix}/{uuid4()}-{_safe_filename(title)}.pdf"
+    await asyncio.to_thread(
+        _s3_client().put_object,
+        Bucket=bucket,
+        Key=key,
+        Body=pdf_bytes,
+        ContentType="application/pdf",
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=kms_key_id,
+    )
+    return key
+
+
+async def _create_lender_packet_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+    executive_summary: PublicUnderwritingIntakeArtifact | None = None,
+) -> PublicUnderwritingIntakeArtifact:
+    summary_artifact = executive_summary or await _ensure_executive_summary_artifact(db, intake, user)
+    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    missing_docs = _missing_required_docs(intake.bucket)
+    title = f"{intake.business_name or intake.full_name or 'Lead'} lender packet"
+    pdf_bytes = await asyncio.to_thread(
+        render_underwriting_packet_pdf,
+        intake=intake,
+        files=files,
+        missing_docs=missing_docs,
+        result=_latest_result_for_intake(intake),
+        executive_summary=summary_artifact.body_json if isinstance(summary_artifact.body_json, dict) else None,
+    )
+    s3_key = await _store_lender_packet_pdf(intake, pdf_bytes, title)
+    artifact = PublicUnderwritingIntakeArtifact(
+        intake_id=intake.id,
+        artifact_type="lender_packet",
+        title=title,
+        body_text="Qualified Commercial underwriting packet PDF generated for lender/vendor review.",
+        body_json={"source_summary_artifact_id": str(summary_artifact.id), "size_bytes": len(pdf_bytes)},
+        s3_key=s3_key,
+        created_by_user_id=user.id,
+    )
+    db.add(artifact)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        "underwriting_lender_packet_generated",
+        user=user,
+        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=title,
+    )
+    return artifact
+
+
+async def _ensure_lender_packet_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+) -> PublicUnderwritingIntakeArtifact:
+    existing = await _latest_artifact(db, intake.id, "lender_packet")
+    return existing or await _create_lender_packet_artifact(db, intake, user)
+
+
+async def _s3_bytes(s3_key: str) -> bytes:
+    bucket, _prefix, _kms = _bucket_storage_config()
+
+    def _read() -> bytes:
+        response = _s3_client().get_object(Bucket=bucket, Key=s3_key)
+        return response["Body"].read()
+
+    return await asyncio.to_thread(_read)
+
+
+async def _prepare_vendor_access(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    email: str,
+    payload: VendorEmailSendRequest,
+) -> BucketVendorAccess:
+    vendor = await _vendor_user_from_payload(
+        db,
+        vendor_user_id=None,
+        vendor_name=email.split("@", 1)[0],
+        vendor_email=email,
+        send_invite=True,
+    )
+    access = (
+        await db.execute(
+            select(BucketVendorAccess).where(
+                BucketVendorAccess.bucket_id == intake.bucket_id,
+                BucketVendorAccess.vendor_user_id == vendor.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if access is None:
+        access = BucketVendorAccess(bucket_id=intake.bucket_id, vendor_user_id=vendor.id)
+        db.add(access)
+        await db.flush()
+        event_name = "vendor_access_created"
+    else:
+        event_name = "vendor_access_updated"
+    access.status = "active"
+    access.file_scope = "all_active"
+    access.files = []
+    access.can_preview = payload.can_preview
+    access.can_download = payload.can_download
+    access.can_add_notes = payload.can_add_notes
+    access.can_see_internal_notes = False
+    access.can_view_ai_summary = payload.can_view_ai_summary
+    access.can_use_ai_chat = payload.can_use_ai_chat
+    access.can_view_ai_tasks = payload.can_view_ai_tasks
+    access.can_propose_tasks = payload.can_propose_tasks
+    await _log(
+        db,
+        intake.bucket_id,
+        event_name,
+        actor_name="Qualified Commercial",
+        actor_role="system",
+        target_type="vendor_access",
+        target_id=str(access.id),
+        detail=f"Vendor package access prepared for {email}",
+    )
+    return access
+
+
 async def _response(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
@@ -1685,6 +2155,7 @@ async def _response(
     forced_widget_reason: str | None = None,
     public_path: str = "/dealer-ai-underwriter",
     empty_message: str | None = None,
+    include_management: bool = False,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
@@ -1716,6 +2187,8 @@ async def _response(
             )
         ).scalars().all()
         messages = list(reversed(recent))
+    artifacts = await _management_artifacts(db, intake.id) if include_management else []
+    email_sends = await _management_email_sends(db, intake.id) if include_management else []
     return DealerIntakeResponse(
         intake=DealerIntakeRead.model_validate(intake),
         token=token,
@@ -1729,6 +2202,8 @@ async def _response(
         ai_summary=summary,
         latest_review=BucketAIReviewRead.model_validate(review) if review else None,
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
+        artifacts=[_artifact_read(artifact) for artifact in artifacts],
+        email_sends=[_email_send_read(row) for row in email_sends],
     )
 
 
@@ -2292,6 +2767,7 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
     missing_docs = _missing_required_docs(intake.bucket)
     return DealerAILeadRow(
         id=intake.id,
+        variant=intake.variant,
         client_id=intake.client_id,
         bucket_id=intake.bucket_id,
         bucket_name=intake.bucket.name,
@@ -2343,6 +2819,7 @@ async def list_dealer_ai_leads(
     q: str | None = None,
     status_filter: str | None = None,
     probability_status: str | None = None,
+    variant_filter: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> DealerAILeadListResponse:
@@ -2365,6 +2842,13 @@ async def list_dealer_ai_leads(
     )
     if status_filter and status_filter != "all":
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+    if variant_filter and variant_filter != "all":
+        if variant_filter == "dealer":
+            stmt = stmt.where(PublicUnderwritingIntake.variant == "dealer_financing_v1")
+        elif variant_filter == "real_estate":
+            stmt = stmt.where(PublicUnderwritingIntake.variant == "real_estate_dscr_v1")
+        else:
+            stmt = stmt.where(PublicUnderwritingIntake.variant == variant_filter)
     if q:
         needle = f"%{q.strip().lower()}%"
         stmt = stmt.where(
@@ -2423,7 +2907,151 @@ async def get_dealer_ai_lead(
 ) -> DealerIntakeResponse:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _response(db, intake, token=None)
+    return await _response(db, intake, token=None, include_management=True)
+
+
+@admin_router.post("/{intake_id}/executive-summary", response_model=PublicUnderwritingArtifactRead)
+async def create_dealer_ai_executive_summary(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PublicUnderwritingArtifactRead:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    artifact = await _create_executive_summary_artifact(db, intake, user)
+    await db.commit()
+    artifact = await _latest_artifact(db, intake_id, "executive_summary") or artifact
+    return _artifact_read(artifact)
+
+
+@admin_router.post("/{intake_id}/lender-packet", response_model=PublicUnderwritingArtifactRead)
+async def create_dealer_ai_lender_packet(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PublicUnderwritingArtifactRead:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    artifact = await _create_lender_packet_artifact(db, intake, user)
+    await db.commit()
+    artifact = await _latest_artifact(db, intake_id, "lender_packet") or artifact
+    return _artifact_read(artifact)
+
+
+@admin_router.post("/{intake_id}/vendor-email/preview", response_model=VendorEmailPreviewResponse)
+async def preview_dealer_ai_vendor_email(
+    intake_id: UUID,
+    payload: VendorEmailPreviewRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> VendorEmailPreviewResponse:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
+    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if payload.include_lender_packet else None
+    draft = await _generate_management_json(
+        db,
+        intake,
+        user,
+        purpose="vendor_email",
+        extra={
+            "requested_recipients": [str(email) for email in payload.to_emails],
+            "cc_emails": [str(email) for email in payload.cc_emails],
+            "executive_summary": summary_artifact.body_json,
+            "lender_packet_title": packet_artifact.title if packet_artifact else None,
+        },
+    )
+    subject = payload.subject or str(draft.get("subject") or f"Qualified Commercial review: {intake.business_name or intake.full_name}")
+    body = payload.body or str(draft.get("body") or summary_artifact.body_text or "")
+    await db.commit()
+    return VendorEmailPreviewResponse(
+        subject=subject[:512],
+        body=body,
+        to_emails=[str(email) for email in payload.to_emails],
+        cc_emails=[str(email) for email in payload.cc_emails],
+        executive_summary=_artifact_read(summary_artifact),
+        lender_packet=_artifact_read(packet_artifact) if packet_artifact else None,
+    )
+
+
+@admin_router.post("/{intake_id}/vendor-email/send", response_model=VendorEmailSendResponse)
+async def send_dealer_ai_vendor_email(
+    intake_id: UUID,
+    payload: VendorEmailSendRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> VendorEmailSendResponse:
+    _require_super_admin(user)
+    if not payload.to_emails:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "At least one vendor email is required")
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
+    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if payload.include_lender_packet else None
+    cc_emails = [str(email).lower().strip() for email in payload.cc_emails if str(email).strip()]
+    sends: list[PublicUnderwritingIntakeEmailSend] = []
+    access_ids: list[UUID] = []
+    attachment: tuple[str, bytes, str] | None = None
+    attachment_note = ""
+    if packet_artifact and packet_artifact.s3_key:
+        try:
+            packet_bytes = await _s3_bytes(packet_artifact.s3_key)
+            if len(packet_bytes) <= 8 * 1024 * 1024:
+                attachment = (f"{_safe_filename(packet_artifact.title)}.pdf", packet_bytes, "application/pdf")
+            else:
+                attachment_note = "\n\nThe underwriting packet is available through the secure vendor bucket because the PDF is too large for email."
+        except Exception as exc:
+            attachment_note = f"\n\nThe underwriting packet is available through the secure vendor bucket. Attachment fallback reason: {exc}"
+    for raw_email in payload.to_emails:
+        email = str(raw_email).lower().strip()
+        access = await _prepare_vendor_access(db, intake, email, payload)
+        access_ids.append(access.id)
+        vendor_link = _public_url(f"/vendor/buckets?bucket={intake.bucket_id}")
+        body = (
+            payload.body.strip()
+            + "\n\nSecure bucket access:\n"
+            + vendor_link
+            + "\n\nQualified Commercial has enabled vendor access for this bucket. Please log in with the invited vendor email to view the file package."
+            + attachment_note
+        )
+        html_body = "<br>".join(html.escape(line) for line in body.splitlines())
+        result = send_raw_email(
+            to_emails=[email],
+            cc_emails=cc_emails,
+            subject=payload.subject.strip(),
+            body_text=body,
+            body_html=f"<p>{html_body}</p>",
+            attachments=[attachment] if attachment else None,
+        )
+        send_row = PublicUnderwritingIntakeEmailSend(
+            intake_id=intake.id,
+            executive_summary_artifact_id=summary_artifact.id,
+            lender_packet_artifact_id=packet_artifact.id if packet_artifact else None,
+            to_emails=[email],
+            cc_emails=cc_emails,
+            subject=payload.subject.strip(),
+            body=body,
+            vendor_access_ids=[str(access.id)],
+            ses_status=result.detail,
+            ses_message_ids=[result.message_id] if result.message_id else None,
+            ses_error=result.error,
+            sent_by_user_id=user.id,
+        )
+        db.add(send_row)
+        sends.append(send_row)
+        await _log(
+            db,
+            intake.bucket_id,
+            "underwriting_vendor_email_sent" if result.ok else "underwriting_vendor_email_failed",
+            user=user,
+            actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+            target_type="public_underwriting_email",
+            target_id=email,
+            detail=result.detail if result.ok else result.error or result.detail,
+        )
+    await db.commit()
+    for row in sends:
+        await db.refresh(row)
+    return VendorEmailSendResponse(email_sends=[_email_send_read(row) for row in sends], vendor_access_ids=access_ids)
 
 
 @router.get("/{token}", response_model=DealerIntakeResponse)

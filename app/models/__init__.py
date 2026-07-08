@@ -101,7 +101,11 @@ from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
 from app.models.provider_secret import ProviderSecret  # noqa: F401
 from app.models.provider_usage_event import ProviderUsageEvent  # noqa: F401
-from app.models.public_underwriting_intake import PublicUnderwritingIntake  # noqa: F401
+from app.models.public_underwriting_intake import (  # noqa: F401
+    PublicUnderwritingIntake,
+    PublicUnderwritingIntakeArtifact,
+    PublicUnderwritingIntakeEmailSend,
+)
 from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.regional_manager import RegionalManagerAgent  # noqa: F401
 from app.models.user import User  # noqa: F401
