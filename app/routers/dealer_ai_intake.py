@@ -106,9 +106,9 @@ REQUIRED_DOCUMENTS = [
         "allow_multiple_files": True,
     },
     {
-        "name": "Last 3 months bank statements",
+        "name": "Last 6 months bank statements",
         "category": "Bank Statements",
-        "description": "Upload the last three months of business bank statements.",
+        "description": "Upload the last six months of the main operating business bank statements.",
         "allow_multiple_files": True,
     },
 ]
@@ -911,7 +911,7 @@ def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
             "type": "upload_files",
             "title": "Upload Stage 1 cash-flow documents",
             "description": (
-                "Upload last 2 years business tax returns, YTD P&L, and last 3 months from the main operating bank account first."
+                "Upload last 2 years business tax returns, YTD P&L, and last 6 months from the main operating bank account first."
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         }
@@ -925,7 +925,7 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
             "type": "upload_files",
             "title": "Upload Stage 1 cash-flow documents",
             "description": (
-                "Upload last 2 years business tax returns, YTD P&L, and last 3 months from the main operating bank account first."
+                "Upload last 2 years business tax returns, YTD P&L, and last 6 months from the main operating bank account first."
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         },
@@ -937,7 +937,7 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
         "deal_profile": {
             "type": "deal_profile",
             "title": "Essential funding facts",
-            "description": "Answer only what you know: use of funds, desired capital amount, and estimated credit score. The AI will infer the likely lending path.",
+            "description": "Answer only what you know: requested amount, detailed use of funds, and estimated credit score. Break down payoff, working capital, inventory, taxes, repairs, acquisitions, or other uses.",
             "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
         },
         "real_estate_schedule": {
@@ -1038,7 +1038,7 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
     if kind == "upload_files":
         return (
             "Your secure file room is open. Stage 1 starts with the cash-flow package only: last 2 years business tax returns, "
-            "YTD P&L, and the last 3 months from the main operating bank account. I will ask for one clarification at a time after that."
+            "YTD P&L, and the last 6 months from the main operating bank account. I will ask for one clarification at a time after that."
         )
     if kind == "entity_structure":
         return (
@@ -1047,7 +1047,8 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
         )
     if kind == "deal_profile":
         return (
-            "I have files to review. Next, give me the use of funds, rough requested amount, and estimated credit score. "
+            "I have files to review. Next, give me the rough requested amount, estimated credit score, and a detailed use of funds. "
+            "Break down what the money is for, such as debt payoff, working capital, inventory, taxes, repairs, acquisition, or cash-out reserves. "
             "This is self-reported for now and will be validated during the intro call."
         )
     if kind == "real_estate_schedule":
@@ -1228,9 +1229,9 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "allowed_document_categories": [
                 "last 2 years business tax returns",
                 "current year/YTD P&L",
-                "last 3 months main operating bank statements",
+                "last 6 months main operating bank statements",
                 "requested amount",
-                "use of funds",
+                "detailed use of funds with amount breakdown",
                 "stated current monthly debt payments",
                 "estimated credit tier/score",
             ],
@@ -1251,13 +1252,13 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "Strictly screen Stage 1 bankability for dealer capital without asking the client to choose a loan product. "
             "Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, "
             "portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. "
-            "Stage 1 focuses on business tax returns, YTD P&L, main operating bank statements, requested amount, use of funds, "
+            "Stage 1 focuses on business tax returns, YTD P&L, main operating bank statements, requested amount, detailed use of funds, "
             "stated monthly debt, and estimated credit. Do not ask for the full Stage 2 package until Stage 1 shows good probability. "
             "Treat real estate and related LLC/account structure as targeted follow-up clarifications after cash-flow context supports a path."
         ),
         "custom_instructions": (
             "This is a public lead-magnet strict Stage 1 underwriter for car dealers. Ask first for last 2 years business tax returns, "
-            "YTD P&L, last 3 months main operating bank statements, requested amount, use of funds, stated monthly debt payments, "
+            "YTD P&L, last 6 months main operating bank statements, requested amount, a detailed use-of-funds breakdown, stated monthly debt payments, "
             "and estimated credit. The user may not know which lending product fits. Return one of these probability statuses: "
             "Good probability - book call, Promising but needs one clarification, Not enough evidence yet, or Poor probability based on current file. "
             "Set booking_recommended true only for Good probability - book call. Return a preliminary screen, not a commitment to lend."
@@ -1466,9 +1467,9 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
             "stage_1_required_items": [
                 "last 2 years business tax returns",
                 "current year/YTD P&L",
-                "last 3 months main operating bank statements",
+                "last 6 months main operating bank statements",
                 "requested amount",
-                "use of funds",
+                "detailed use of funds with amount breakdown",
                 "stated current monthly debt payments",
                 "estimated credit tier/score",
             ],
