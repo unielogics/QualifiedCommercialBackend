@@ -444,6 +444,17 @@ def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketSha
     return data
 
 
+async def _load_share_for_admin_read(db: AsyncSession, share_id: UUID) -> BucketShare:
+    share = (
+        await db.execute(
+            select(BucketShare)
+            .where(BucketShare.id == share_id)
+            .options(selectinload(BucketShare.files))
+        )
+    ).scalar_one()
+    return share
+
+
 def _upload_link_read(link: BucketUploadLink, *, passcode: str | None = None) -> BucketUploadLinkRead:
     data = BucketUploadLinkRead.model_validate(link)
     data.upload_url = _public_url(f"/buckets/request/{link.token}")
@@ -1296,7 +1307,7 @@ async def create_share(
     await db.flush()
     await _log(db, bucket_id, "share_created", request=request, user=user, target_type="share", target_id=str(share.id), detail=share.recipient_name)
     await db.commit()
-    await db.refresh(share)
+    share = await _load_share_for_admin_read(db, share.id)
     return _share_read(share, passcode=passcode)
 
 
@@ -1333,7 +1344,7 @@ async def patch_share(
     action = "share_status_changed" if "status" in payload.model_fields_set else "share_updated"
     await _log(db, bucket_id, action, request=request, user=user, target_type="share", target_id=str(share.id), detail=", ".join(changes) or None)
     await db.commit()
-    await db.refresh(share)
+    share = await _load_share_for_admin_read(db, share.id)
     return _share_read(share)
 
 
@@ -1358,7 +1369,7 @@ async def regenerate_share_passcode(
     share.passcode_hash = _hash_passcode(passcode)
     await _log(db, bucket_id, "share_passcode_regenerated", request=request, user=user, target_type="share", target_id=str(share.id), detail=share.recipient_name)
     await db.commit()
-    await db.refresh(share)
+    share = await _load_share_for_admin_read(db, share.id)
     return BucketSharePasscodeResetRead(share=_share_read(share, passcode=passcode), passcode=passcode)
 
 
