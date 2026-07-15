@@ -991,6 +991,14 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
     widget = widgets.get(kind)
     if widget is None:
         return None
+    # The upload/entity/deal/real-estate widgets are car-dealer-worded (floorplan,
+    # dealer LLCs, Stage 1 cash-flow docs). Suppress them for non-dealer intakes so
+    # a real-estate file never surfaces dealer widgets; book_call / bankability_result
+    # / run_review are product-neutral and stay available to both.
+    review_type = (intake.bucket.ai_context or {}).get("review_type")
+    dealer_only_widgets = {"upload_files", "entity_structure", "deal_profile", "real_estate_schedule", "referral"}
+    if review_type != "dealer_gatekeeper_v1" and kind in dealer_only_widgets:
+        return None
     return {**widget, "source": source, "reason": reason or source}
 
 
@@ -1044,6 +1052,10 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
     if not widget:
         if isinstance(intake.result_snapshot, dict):
             return _format_review_update(intake.result_snapshot)
+        # No widget and no review yet: give a product-appropriate opening so a
+        # real-estate file never sees dealer-flavored fallback text.
+        if intake.variant == FUNDING_VARIANT:
+            return _funding_empty_message()
         if not _active_files(intake.bucket):
             return (
                 "Your secure underwriter chat is open. Attach PDFs, images, ZIP files, spreadsheets, or bank/tax documents here, "
@@ -1674,7 +1686,12 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
         state["entity_structure"] = updates.entity_structure.model_dump() if updates.entity_structure else {}
     state["last_updates"] = data
     intake.intake_state = state
-    intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake)}
+    # Stamp the AI context for THIS intake's product — never force dealer context
+    # onto a real-estate intake (this is reached from dealer chat/patch, the
+    # client portal, and funding chat). Keys off the RE variant, which is stable
+    # across the variant-normalization migration.
+    context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+    intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
 
 
 async def _log_dealer_update_events(
@@ -2806,6 +2823,7 @@ async def download_dealer_intelligence_pdf(
         if not session_token:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session or resume token required")
         intake, _challenge = await _load_intake_by_dealer_session(db, session_token)
+    _require_dealer_intake(intake)
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
@@ -2920,9 +2938,11 @@ async def list_dealer_ai_leads(
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
     if variant_filter and variant_filter != "all":
         if variant_filter == "dealer":
-            stmt = stmt.where(PublicUnderwritingIntake.variant == "dealer_financing_v1")
+            # Accept both the canonical and legacy dealer variant so the filter is
+            # correct before and after the 0090 normalization migration.
+            stmt = stmt.where(PublicUnderwritingIntake.variant.in_(DEALER_VARIANTS))
         elif variant_filter == "real_estate":
-            stmt = stmt.where(PublicUnderwritingIntake.variant == "real_estate_dscr_v1")
+            stmt = stmt.where(PublicUnderwritingIntake.variant == FUNDING_VARIANT)
         else:
             stmt = stmt.where(PublicUnderwritingIntake.variant == variant_filter)
     if q:
@@ -3133,6 +3153,7 @@ async def send_dealer_ai_vendor_email(
 @router.get("/{token}", response_model=DealerIntakeResponse)
 async def get_dealer_intake(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     return await _response(db, intake, token=token)
 
 
@@ -3144,6 +3165,7 @@ async def update_dealer_intake(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     update_data = payload.model_dump(exclude_unset=True)
     _apply_updates(intake, payload)
     await _log_dealer_update_events(
@@ -3168,6 +3190,7 @@ async def dealer_intake_chat(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     update_data = payload.updates.model_dump(exclude_unset=True) if payload.updates else {}
     _apply_updates(intake, payload.updates)
     _record_chat_fact(intake, payload.message)
@@ -3214,6 +3237,7 @@ async def dealer_upload_init(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
 
 
@@ -3225,6 +3249,7 @@ async def dealer_upload_complete(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
 
 
@@ -3235,6 +3260,7 @@ async def run_dealer_review(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     # Per-token cooldown: run-review triggers a heavy Bedrock pass over up to 8
     # files; without this a token holder can replay it to amplify LLM cost.
     _throttle_or_429(
@@ -3311,6 +3337,7 @@ async def book_dealer_call(
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
     if _call_booked(intake):
         return await _response(
             db,
@@ -3499,6 +3526,20 @@ def _funding_empty_message() -> str:
 def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
     if intake.variant != FUNDING_VARIANT:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding review not found")
+
+
+# Dealer variants: the canonical "dealer_gatekeeper_v1" plus the legacy
+# "dealer_financing_v1" default, so the guard is correct both before and after
+# the 0090 variant-normalization migration.
+DEALER_VARIANTS = {"dealer_gatekeeper_v1", "dealer_financing_v1"}
+
+
+def _require_dealer_intake(intake: PublicUnderwritingIntake) -> None:
+    """Reject a non-dealer intake on the dealer public routes, so a real-estate
+    token can never be driven through car-dealer logic. Mirrors
+    _require_funding_intake; 404 (not 403) to match the funding convention."""
+    if intake.variant not in DEALER_VARIANTS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI intake not found")
 
 
 async def _load_funding_intake_by_session(db: AsyncSession, request: Request) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge, str]:

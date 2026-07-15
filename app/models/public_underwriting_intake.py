@@ -34,7 +34,7 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("bucket_ai_reviews.id", ondelete="SET NULL"), nullable=True, index=True
     )
     token_hash: Mapped[str] = mapped_column(String(96), nullable=False, unique=True, index=True)
-    variant: Mapped[str] = mapped_column(String(64), nullable=False, default="dealer_financing_v1", server_default="dealer_financing_v1")
+    variant: Mapped[str] = mapped_column(String(64), nullable=False, default="dealer_gatekeeper_v1", server_default="dealer_gatekeeper_v1")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="collecting", server_default="collecting")
 
     full_name: Mapped[str] = mapped_column(String(180), nullable=False)
