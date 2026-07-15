@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import json
 import logging
 import mimetypes
@@ -28,6 +29,7 @@ from app.models.bucket import (
     BucketAIReview,
     BucketDocumentTemplate,
     BucketFile,
+    BucketFileAnalysis,
     BucketNote,
     BucketRequestedDocument,
     BucketShare,
@@ -36,9 +38,15 @@ from app.models.bucket import (
 )
 from app.models.user import User
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
-from app.services.ai.usage import json_safe_metadata, tracked_messages_create
+from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 
 log = logging.getLogger(__name__)
+
+# Per-file analysis schema/prompt version. Bump this ONLY when the per-file
+# analysis prompt or output shape changes — reuse of a cached analysis is gated
+# on (file, content_hash, this version), so bumping forces a one-time re-analysis
+# at the new version. A model upgrade alone does NOT invalidate the cache.
+CURRENT_FILE_ANALYSIS_VERSION = 1
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
@@ -218,6 +226,45 @@ def build_chat_system(review_type: str | None) -> str:
     if review_type == "real_estate_dscr_v1":
         return f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
     return f"{CHAT_PREAMBLE}\n"
+
+
+# Compact single-file analysis prompt. Produces a durable per-file record the
+# whole system reuses, so a file's bytes are sent to the model only once. Output
+# mirrors one entry of document_evidence_map.files[] + per_file_summaries[] so
+# the whole-bucket synthesis and every read surface reuse the existing shape.
+FILE_ANALYSIS_PREAMBLE = """You are a senior commercial lending underwriter classifying ONE uploaded document.
+
+Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
+{
+  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|other|unreadable",
+  "confidence": "high|medium|low",
+  "summary": "1-3 sentence plain-English summary of what this document is and what it proves for underwriting",
+  "supports": ["short phrases naming what this file supports"],
+  "baseline_categories_supported": ["which baseline package categories this file satisfies, if any"],
+  "red_flags": ["underwriter concerns visible in THIS file: mismatched names/dates/amounts, NSF/overdraft, stale dates, tampering, illegible sections"],
+  "limitations": ["what this file does NOT establish / what is unreadable"],
+  "key_facts": {"note": "structured facts you can extract: names, entities, dates, amounts, revenue, deposits, DSCR/LTV/rent/PITIA inputs, property address, balances. Use null when not present. Never invent numbers."}
+}
+
+Analyze only the single document provided. Do not speculate about other files. Keep summary under 320 characters and each list <= 6 items."""
+
+DEALER_FILE_ANALYSIS_HINT = """This document belongs to a car-dealer financing file. Read it as bank-statement / tax-return / P&L / floorplan / MCA / real-estate-collateral evidence where applicable. Do not ask DSCR/rent questions."""
+
+RE_FILE_ANALYSIS_HINT = """This document belongs to a real-estate / DSCR investor file. Read it as lease / rent roll / appraisal / purchase contract / payoff / mortgage statement / tax / insurance / HOA / entity evidence where applicable. Never classify it with dealer floorplan/MCA/inventory categories."""
+
+
+def build_file_analysis_system(review_type: str | None) -> str:
+    """Per-file analysis prompt, product-aware but single-persona (never mixes
+    dealer and real-estate guidance), mirroring build_review_system."""
+    if review_type == "dealer_gatekeeper_v1":
+        return f"{FILE_ANALYSIS_PREAMBLE}\n{DEALER_FILE_ANALYSIS_HINT}\n"
+    if review_type == "real_estate_dscr_v1":
+        return f"{FILE_ANALYSIS_PREAMBLE}\n{RE_FILE_ANALYSIS_HINT}\n"
+    return f"{FILE_ANALYSIS_PREAMBLE}\n"
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _now() -> datetime:
@@ -1064,6 +1111,174 @@ async def log_bucket_ai_activity(
             created_at=_now(),
         )
     )
+
+
+async def _cached_file_analysis(
+    db: AsyncSession, file: BucketFile, content_hash: str
+) -> BucketFileAnalysis | None:
+    """Return a reusable analysis for this file's current content, or None."""
+    return (
+        await db.execute(
+            select(BucketFileAnalysis)
+            .where(
+                BucketFileAnalysis.bucket_file_id == file.id,
+                BucketFileAnalysis.content_hash == content_hash,
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+                BucketFileAnalysis.status.in_(["completed", "skipped"]),
+            )
+            .order_by(BucketFileAnalysis.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _get_or_create_analysis_row(
+    db: AsyncSession, file: BucketFile, content_hash: str
+) -> BucketFileAnalysis:
+    """Upsert-by-key the analysis row for (file, hash, current version)."""
+    row = (
+        await db.execute(
+            select(BucketFileAnalysis).where(
+                BucketFileAnalysis.bucket_file_id == file.id,
+                BucketFileAnalysis.content_hash == content_hash,
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = BucketFileAnalysis(
+            bucket_file_id=file.id,
+            bucket_id=file.bucket_id,
+            content_hash=content_hash,
+            analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
+            status="pending",
+        )
+        db.add(row)
+        await db.flush()
+    return row
+
+
+async def analyze_bucket_file(
+    db: AsyncSession,
+    file: BucketFile,
+    *,
+    review_type: str | None = None,
+    force: bool = False,
+) -> BucketFileAnalysis | None:
+    """Analyze a single file ONCE per (content, version) and persist a durable,
+    reusable per-file analysis. On a cache hit this returns the stored row with
+    NO model call. Only a new/changed file (or force=True) spends tokens.
+
+    review_type picks the per-file persona (dealer vs real-estate). Returns None
+    only if the file bytes cannot be fetched from storage.
+    """
+    fetched = _fetch_file(file)
+    if fetched is None:
+        return None
+    raw, content_type = fetched
+    content_hash = _sha256_bytes(raw)
+    # Record the current fingerprint so change-detection works even before a
+    # review runs.
+    if file.content_hash != content_hash:
+        file.content_hash = content_hash
+
+    if not force:
+        cached = await _cached_file_analysis(db, file, content_hash)
+        if cached is not None:
+            return cached
+
+    row = await _get_or_create_analysis_row(db, file, content_hash)
+    row.status = "running"
+    await db.flush()
+
+    # Build a single-file content list, reusing the exact extraction helpers the
+    # whole-bucket review uses (PDF/xlsx/csv/text/image + zip).
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": json.dumps(
+                {
+                    "file": {
+                        "file_id": str(file.id),
+                        "file_name": file.file_name,
+                        "content_type": content_type,
+                        "size_bytes": file.size_bytes,
+                    },
+                    "instruction": "Classify and analyze this single document for underwriting. Return only the required JSON.",
+                },
+                default=str,
+            ),
+        }
+    ]
+    skipped: list[dict[str, str]] = []
+    blocked_files: list[dict[str, str]] = []
+    if _is_zip_file(content_type, file.file_name):
+        # A zip parent is not analyzed directly; its extracted children each get
+        # their own analysis. Cache a skip so it is not retried every run.
+        row.status = "skipped"
+        row.skip_reason = "zip_parent_archive"
+        row.skip_detail = "ZIP archives are analyzed via their extracted files, not directly."
+        row.analyzed_at = _now()
+        await db.flush()
+        return row
+    added, _pages, _chars = _append_review_file_content(
+        content=content,
+        skipped=skipped,
+        blocked_files=blocked_files,
+        file=file,
+        raw=raw,
+        content_type=content_type,
+        attached_pdf_pages=0,
+        spreadsheet_text_chars=0,
+    )
+    if not added:
+        # Unreadable / unsupported / too large — cache the skip so we don't retry.
+        skip = (skipped or blocked_files or [{}])[0]
+        row.status = "skipped"
+        row.skip_reason = skip.get("reason", "unsupported")
+        row.skip_detail = skip.get("explanation", "This file could not be read for AI analysis.")
+        row.classification = "unreadable"
+        row.analyzed_at = _now()
+        await db.flush()
+        return row
+
+    try:
+        model = model_heavy()
+        resp = await tracked_messages_create(
+            db,
+            feature="file_analysis",
+            client=get_client(),
+            model=model,
+            metadata={"bucket_id": str(file.bucket_id), "bucket_file_id": str(file.id)},
+            max_tokens=1500,
+            system=build_file_analysis_system(review_type),
+            messages=[{"role": "user", "content": content}],
+        )
+        parsed = _json_or_fallback(_text_from_response(resp), "summary")
+        input_tokens, output_tokens = _usage_tokens(resp)
+        row.provider = "bedrock"
+        row.model = getattr(resp, "model", None) or model
+        row.status = "completed"
+        row.classification = str(parsed.get("classification") or "") or None
+        row.confidence = str(parsed.get("confidence") or "") or None
+        row.summary = str(parsed.get("summary") or "") or None
+        row.analysis = {
+            "supports": parsed.get("supports") or [],
+            "baseline_categories_supported": parsed.get("baseline_categories_supported") or [],
+            "red_flags": parsed.get("red_flags") or [],
+            "limitations": parsed.get("limitations") or [],
+            "key_facts": parsed.get("key_facts") if isinstance(parsed.get("key_facts"), dict) else {},
+        }
+        row.input_tokens = input_tokens
+        row.output_tokens = output_tokens
+        row.error = None
+        row.analyzed_at = _now()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("analyze_bucket_file failed file=%s", file.id)
+        row.status = "failed"
+        row.error = str(exc)[:2000]
+    await db.flush()
+    return row
 
 
 async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIReview | None:

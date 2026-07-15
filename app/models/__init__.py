@@ -47,6 +47,7 @@ from app.models.bucket import (  # noqa: F401
     BucketAIReview,
     BucketDocumentTemplate,
     BucketFile,
+    BucketFileAnalysis,
     BucketFileAnnotation,
     BucketNote,
     BucketRequestedDocument,

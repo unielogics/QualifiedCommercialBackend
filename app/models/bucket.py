@@ -153,6 +153,10 @@ class BucketFile(TimestampMixin, Base):
     zip_entry_path: Mapped[str | None] = mapped_column(String(700), nullable=True)
     extraction_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     extraction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # SHA-256 of the last-fetched S3 object bytes; compared against
+    # bucket_file_analyses.content_hash to detect an unchanged file and reuse
+    # its cached AI analysis without re-spending tokens.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     bucket: Mapped[Bucket] = relationship(back_populates="files")
     requested_document: Mapped[BucketRequestedDocument | None] = relationship(back_populates="files")
@@ -168,6 +172,7 @@ class BucketFile(TimestampMixin, Base):
         back_populates="files",
     )
     annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="file", cascade="all, delete-orphan")
+    analyses: Mapped[list[BucketFileAnalysis]] = relationship(back_populates="file", cascade="all, delete-orphan")
 
 
 class BucketFileAnnotation(TimestampMixin, Base):
@@ -342,6 +347,47 @@ class BucketAIReview(Base):
 
     bucket: Mapped[Bucket] = relationship(back_populates="ai_reviews")
     requested_by: Mapped[User | None] = relationship(foreign_keys=[requested_by_user_id])
+
+
+class BucketFileAnalysis(TimestampMixin, Base):
+    """Durable, reusable per-file AI analysis. One row per
+    (file, content_hash, analysis_version) so a file's bytes are sent to the
+    model at most ONCE per version — every surface (buckets, leads, admin, chat,
+    whole-bucket review) reads this instead of re-analyzing the file."""
+
+    __tablename__ = "bucket_file_analyses"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_file_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Denormalized so all per-file analyses for a bucket are queryable without
+    # joining through bucket_files.
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    analysis_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
+    skip_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    skip_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    classification: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    confidence: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    file: Mapped[BucketFile] = relationship(back_populates="analyses")
+    bucket: Mapped[Bucket] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("bucket_file_id", "content_hash", "analysis_version", name="uq_file_analysis_hash_version"),
+    )
 
 
 class BucketAIMessage(Base):
