@@ -168,6 +168,16 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    scheduler.add_job(
+        _wrap(job_bucket_file_analysis_drain),
+        "interval",
+        minutes=1,
+        id="bucket_file_analysis_drain",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Cadence engine (Phase 5, alembic 0032). Every 30 min walks
     # ai_cadence_rules + spawns draft messages / tasks / escalations.
     # Draft-first by default — auto-send is opt-in per rule.
@@ -475,6 +485,22 @@ async def job_bucket_ai_review_drain() -> None:
         except Exception:
             await db.rollback()
             log.exception("bucket_ai_review_drain: failed; rolled back")
+
+
+async def job_bucket_file_analysis_drain() -> None:
+    """Analyze files queued on upload-complete so reviews compose from a warm
+    per-file cache (no per-review attachment limit, minimal review-time tokens)."""
+    from app.db import SessionLocal
+    from app.services.bucket_ai import drain_file_analyses
+
+    async with SessionLocal() as db:
+        try:
+            count = await drain_file_analyses(db, limit=5)
+            if count:
+                log.info("bucket_file_analysis_drain: processed=%d", count)
+        except Exception:
+            await db.rollback()
+            log.exception("bucket_file_analysis_drain: failed; rolled back")
 
 
 async def job_lender_inbound_poll() -> None:

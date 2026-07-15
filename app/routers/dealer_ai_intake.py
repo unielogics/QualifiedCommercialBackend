@@ -2588,6 +2588,25 @@ async def _complete_upload(
         target_id=str(file.id),
         detail=file.file_name,
     )
+    # Queue this file (and any files extracted from it as a zip) for background
+    # analysis so the review composes from a warm per-file cache.
+    try:
+        from app.services.bucket_ai import enqueue_file_analysis
+
+        await db.flush()
+        children = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.parent_zip_file_id == file.id,
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.status == "uploaded",
+                )
+            )
+        ).scalars().all()
+        for target in [file, *children]:
+            await enqueue_file_analysis(db, target)
+    except Exception:  # noqa: BLE001
+        log.exception("enqueue file analysis failed intake=%s file=%s", intake.id, file.id)
     await db.commit()
     await db.refresh(file)
     return file

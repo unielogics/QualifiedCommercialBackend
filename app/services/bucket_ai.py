@@ -1496,6 +1496,74 @@ async def drain_bucket_ai_reviews(db: AsyncSession, *, limit: int = 3) -> int:
     return len(rows)
 
 
+async def enqueue_file_analysis(db: AsyncSession, file: BucketFile) -> None:
+    """Cheaply mark a file for background analysis (no AI call, no S3 read).
+    Called best-effort on upload-complete so the file is analyzed before anyone
+    opens the lead — the review then composes from a warm cache. Safe to call
+    repeatedly: it only inserts a placeholder when no fresh analysis exists.
+
+    The content_hash is unknown until the bytes are fetched, so we use a sentinel
+    'pending' hash; drain_file_analyses re-keys the row to the real hash when it
+    runs analyze_bucket_file.
+    """
+    existing = (
+        await db.execute(
+            select(BucketFileAnalysis.id)
+            .where(
+                BucketFileAnalysis.bucket_file_id == file.id,
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+                BucketFileAnalysis.status.in_(["pending", "running", "completed", "skipped"]),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    db.add(
+        BucketFileAnalysis(
+            bucket_file_id=file.id,
+            bucket_id=file.bucket_id,
+            content_hash="pending",
+            analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
+            status="pending",
+        )
+    )
+
+
+async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
+    """Analyze files queued as 'pending' (from upload-complete) outside the
+    request path, so reviews compose from a warm cache. Each file is analyzed
+    once; the placeholder row is replaced by analyze_bucket_file's real
+    (hash, version) row."""
+    rows = (
+        await db.execute(
+            select(BucketFileAnalysis)
+            .where(BucketFileAnalysis.status == "pending", BucketFileAnalysis.content_hash == "pending")
+            .order_by(BucketFileAnalysis.created_at.asc())
+            .limit(limit)
+            .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
+        )
+    ).scalars().all()
+    processed = 0
+    for placeholder in rows:
+        file = placeholder.file
+        # Drop the placeholder; analyze_bucket_file upserts the real hashed row.
+        await db.delete(placeholder)
+        await db.flush()
+        if file is None or file.deleted_at is not None or file.status != "uploaded":
+            await db.commit()
+            continue
+        review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
+        try:
+            await analyze_bucket_file(db, file, review_type=review_type)
+            await db.commit()
+            processed += 1
+        except Exception:
+            await db.rollback()
+            log.exception("drain_file_analyses: failed file=%s", file.id)
+    return processed
+
+
 async def latest_review(db: AsyncSession, bucket_id: UUID) -> BucketAIReview | None:
     completed = (
         await db.execute(

@@ -1627,6 +1627,14 @@ async def admin_upload_complete(
         import logging
 
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", bucket_id, file.id)
+    try:
+        from app.services.bucket_ai import enqueue_file_analysis
+
+        await enqueue_file_analysis(db, file)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("enqueue file analysis failed bucket=%s file=%s", bucket_id, file.id)
     await db.commit()
     await db.refresh(file)
     return file
