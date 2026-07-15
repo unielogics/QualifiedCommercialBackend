@@ -88,6 +88,10 @@ _START_MIN_INTERVAL_SECONDS = 15.0
 _START_LAST_BY_IP: dict[str, float] = {}
 _REVIEW_MIN_INTERVAL_SECONDS = 45.0
 _REVIEW_LAST_BY_TOKEN: dict[str, float] = {}
+# Admin-initiated re-run cooldown, keyed by intake id. Each re-run is a heavy
+# Bedrock pass over up to 8 files; a short cooldown blocks accidental repeats.
+_ADMIN_REVIEW_MIN_INTERVAL_SECONDS = 60.0
+_ADMIN_REVIEW_LAST_BY_INTAKE: dict[str, float] = {}
 
 
 def _throttle_or_429(store: dict[str, float], key: str, min_interval: float, message: str) -> None:
@@ -2906,6 +2910,65 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
     return intake
 
 
+async def _execute_intake_review(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    request: Request,
+    actor_name: str,
+    actor_email: str | None,
+    actor_role: str,
+    log_event: str,
+    detail: str,
+    requested_by_user_id: UUID | None = None,
+) -> BucketAIReview | None:
+    """Run an AI review INLINE over the intake's current bucket uploads and
+    snapshot the result back onto the intake. Shared by the public dealer/funding
+    run-review endpoints and the admin re-run endpoint.
+
+    Picks the AI context by variant so a real-estate lead is never re-run with
+    dealer context (and vice-versa). Returns the fresh review (or None)."""
+    is_funding = intake.variant == FUNDING_VARIANT
+    context_fn = _funding_review_context if is_funding else _dealer_context
+    recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
+    review_context = {
+        **(intake.bucket.ai_context or {}),
+        **context_fn(intake),
+        recent_key: await _recent_dealer_chat(db, intake),
+    }
+    intake.bucket.ai_context = review_context
+    review = BucketAIReview(
+        bucket_id=intake.bucket_id,
+        requested_by_user_id=requested_by_user_id,
+        status="queued",
+        context_snapshot=review_context,
+        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
+        provider="bedrock",
+    )
+    db.add(review)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        log_event,
+        request=request,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        actor_role=actor_role,
+        target_type="ai_review",
+        target_id=str(review.id),
+        detail=detail,
+    )
+    await run_bucket_ai_review(db, review.id)
+    fresh_review = await latest_review(db, intake.bucket_id)
+    intake.latest_review_id = fresh_review.id if fresh_review else review.id
+    if fresh_review and isinstance(fresh_review.result, dict):
+        intake.result_snapshot = fresh_review.result
+        intake.status = "reviewed"
+        intake.completed_at = _now()
+    return fresh_review
+
+
 @admin_router.get("", response_model=DealerAILeadListResponse)
 async def list_dealer_ai_leads(
     user: CurrentUser,
@@ -3004,6 +3067,106 @@ async def get_dealer_ai_lead(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _response(db, intake, token=None, include_management=True)
+
+
+@admin_router.post("/{intake_id}/run-review", response_model=DealerIntakeResponse)
+async def rerun_dealer_ai_lead_review(
+    intake_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin re-run of the AI review on the lead's latest bucket uploads, inline,
+    returning the fresh breakdown. Cooldown-throttled per intake to bound cost."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    _throttle_or_429(
+        _ADMIN_REVIEW_LAST_BY_INTAKE,
+        str(intake.id),
+        _ADMIN_REVIEW_MIN_INTERVAL_SECONDS,
+        "A review was just re-run for this lead. Please wait a moment before running another.",
+    )
+    is_funding = intake.variant == FUNDING_VARIANT
+    await _execute_intake_review(
+        db,
+        intake,
+        request=request,
+        actor_name=user.name or "Super admin",
+        actor_email=user.email,
+        actor_role="super_admin",
+        log_event="funding_review_ai_review_rerun" if is_funding else "dealer_ai_review_rerun",
+        detail="Admin re-run over latest uploads",
+        requested_by_user_id=user.id,
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _response(db, intake, token=None, include_management=True)
+
+
+@admin_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)
+async def dealer_ai_lead_chat(
+    intake_id: UUID,
+    payload: DealerChatRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin chat with the underwriting AI on a lead, in a PRIVATE internal
+    thread (audience='admin') the client never sees."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    messages: list[BucketAIMessage] = []
+    assistant_message = None
+    if payload.message and payload.message.strip():
+        chat_messages, _, _ = await create_chat_reply(
+            db,
+            bucket=intake.bucket,
+            audience="admin",
+            message=payload.message.strip(),
+            actor_name=user.name or "Super admin",
+            user=user,
+        )
+        messages = chat_messages
+        if chat_messages:
+            assistant_message = chat_messages[-1].content
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _response(
+        db,
+        intake,
+        token=None,
+        include_management=True,
+        assistant_message=assistant_message,
+        messages=messages,
+    )
+
+
+@admin_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def dealer_ai_lead_upload_init(
+    intake_id: UUID,
+    payload: DealerFileUploadInit,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    """Admin file upload into the lead's bucket (attaches to the upload link and
+    runs zip extraction on complete, like the client path)."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
+
+
+@admin_router.post("/{intake_id}/files/complete", response_model=BucketFileRead)
+async def dealer_ai_lead_upload_complete(
+    intake_id: UUID,
+    payload: DealerUploadComplete,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
 
 
 @admin_router.post("/{intake_id}/executive-summary", response_model=PublicUnderwritingArtifactRead)
@@ -3269,37 +3432,17 @@ async def run_dealer_review(
         _REVIEW_MIN_INTERVAL_SECONDS,
         "A review was just started. Please wait a moment before running another.",
     )
-    review_context = {**(intake.bucket.ai_context or {}), **_dealer_context(intake), "recent_dealer_chat": await _recent_dealer_chat(db, intake)}
-    intake.bucket.ai_context = review_context
-    review = BucketAIReview(
-        bucket_id=intake.bucket_id,
-        requested_by_user_id=None,
-        status="queued",
-        context_snapshot=review_context,
-        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
-        provider="bedrock",
-    )
-    db.add(review)
-    await db.flush()
-    await _log(
+    fresh_review = await _execute_intake_review(
         db,
-        intake.bucket_id,
-        "dealer_ai_review_queued",
+        intake,
         request=request,
         actor_name=intake.full_name,
         actor_email=intake.email,
         actor_role="public_lead",
-        target_type="ai_review",
-        target_id=str(review.id),
+        log_event="dealer_ai_review_queued",
         detail="Public dealer AI screen",
     )
-    await run_bucket_ai_review(db, review.id)
-    fresh_review = await latest_review(db, intake.bucket_id)
-    intake.latest_review_id = fresh_review.id if fresh_review else review.id
     if fresh_review and isinstance(fresh_review.result, dict):
-        intake.result_snapshot = fresh_review.result
-        intake.status = "reviewed"
-        intake.completed_at = _now()
         await _record_super_admin_decision_notification(
             db,
             intake,
@@ -3872,37 +4015,16 @@ async def run_funding_review(
 ) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
-    review_context = {**(intake.bucket.ai_context or {}), **_funding_review_context(intake), "recent_funding_review_chat": await _recent_dealer_chat(db, intake)}
-    intake.bucket.ai_context = review_context
-    review = BucketAIReview(
-        bucket_id=intake.bucket_id,
-        requested_by_user_id=None,
-        status="queued",
-        context_snapshot=review_context,
-        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
-        provider="bedrock",
-    )
-    db.add(review)
-    await db.flush()
-    await _log(
+    await _execute_intake_review(
         db,
-        intake.bucket_id,
-        "funding_review_ai_review_queued",
+        intake,
         request=request,
         actor_name=intake.full_name,
         actor_email=intake.email,
         actor_role="public_lead",
-        target_type="ai_review",
-        target_id=str(review.id),
+        log_event="funding_review_ai_review_queued",
         detail="Public real estate funding screen",
     )
-    await run_bucket_ai_review(db, review.id)
-    fresh_review = await latest_review(db, intake.bucket_id)
-    intake.latest_review_id = fresh_review.id if fresh_review else review.id
-    if fresh_review and isinstance(fresh_review.result, dict):
-        intake.result_snapshot = fresh_review.result
-        intake.status = "reviewed"
-        intake.completed_at = _now()
     await db.commit()
     intake = await _load_public_intake(db, token)
     return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH)
