@@ -498,6 +498,44 @@ def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
     return shaped
 
 
+def _merge_per_file_analyses(result: dict[str, Any], per_file_analyses: list[dict[str, Any]]) -> None:
+    """Ensure the review result's per-file sections reflect the durable per-file
+    analyses (the source of truth). If the synthesis pass did not emit
+    document_evidence_map.files / per_file_summaries, populate them from the
+    cached rows so every read surface sees consistent per-file data."""
+    if not per_file_analyses:
+        return
+    evidence_map = result.get("document_evidence_map")
+    if not isinstance(evidence_map, dict):
+        evidence_map = {"files": [], "baseline_coverage": []}
+    if not isinstance(evidence_map.get("files"), list) or not evidence_map.get("files"):
+        evidence_map["files"] = [
+            {
+                "file_id": item["file_id"],
+                "file_name": item["file_name"],
+                "ai_classification": item.get("ai_classification"),
+                "supports": item.get("supports") or [],
+                "baseline_categories_supported": item.get("baseline_categories_supported") or [],
+                "confidence": item.get("confidence"),
+                "limitations": item.get("limitations") or [],
+            }
+            for item in per_file_analyses
+        ]
+    if not isinstance(evidence_map.get("baseline_coverage"), list):
+        evidence_map["baseline_coverage"] = []
+    result["document_evidence_map"] = evidence_map
+    if not isinstance(result.get("per_file_summaries"), list) or not result.get("per_file_summaries"):
+        result["per_file_summaries"] = [
+            {
+                "file_id": item["file_id"],
+                "file_name": item["file_name"],
+                "summary": item.get("summary") or "",
+                "red_flags": item.get("red_flags") or [],
+            }
+            for item in per_file_analyses
+        ]
+
+
 def _s3_client():
     settings = get_settings()
     kwargs: dict[str, Any] = {"region_name": settings.aws_region}
@@ -1358,59 +1396,57 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         }
     ]
 
-    attached = 0
-    attached_pdf_pages = 0
-    spreadsheet_text_chars = 0
+    review_type = (review.context_snapshot or bucket.ai_context or {}).get("review_type")
+
+    # COMPOSE FROM CACHE: resolve each file's durable per-file analysis (analyzed
+    # once, reused thereafter — a cache hit spends NO tokens). The synthesis pass
+    # then reads these cheap text summaries instead of re-sending file bytes, so
+    # an unchanged file set costs only the synthesis call.
     skipped: list[dict[str, str]] = []
-    blocked_files: list[dict[str, str]] = []
+    per_file_analyses: list[dict[str, Any]] = []
     for file in files:
-        if attached >= MAX_REVIEW_ATTACHMENTS:
-            skipped.append(_skip_file(file, "attachment_limit", "The AI review reached the attachment limit, so this file was reviewed by metadata only."))
+        if file.id in extracted_zip_parent_ids:
+            skipped.append(_skip_file(file, "zip_parent_archive", "ZIP contents were extracted into bucket files, so the archive itself was not re-read by AI review."))
             continue
-        fetched = _fetch_file(file)
-        if fetched is None:
+        analysis = await analyze_bucket_file(db, file, review_type=review_type)
+        if analysis is None:
             skipped.append(_skip_file(file, "fetch_failed", "The system could not retrieve this file from storage for AI review."))
             continue
-        raw, content_type = fetched
-        if _is_zip_file(content_type, file.file_name):
-            if file.id in extracted_zip_parent_ids:
-                skipped.append(_skip_file(file, "zip_parent_archive", "ZIP contents were extracted into bucket files, so the archive itself was not re-read by AI review."))
-                continue
-            if len(raw) > MAX_ZIP_FILE_BYTES:
-                skipped.append(_skip_file(file, "zip_too_large", "The ZIP file is larger than the current AI extraction limit and was reviewed by metadata only."))
-                continue
-            attached, attached_pdf_pages, spreadsheet_text_chars = _append_zip_file_content(
-                content=content,
-                skipped=skipped,
-                blocked_files=blocked_files,
-                file=file,
-                raw=raw,
-                attached=attached,
-                attached_pdf_pages=attached_pdf_pages,
-                spreadsheet_text_chars=spreadsheet_text_chars,
-            )
+        if analysis.status == "skipped":
+            skipped.append(_skip_file(file, analysis.skip_reason or "skipped", analysis.skip_detail or "This file was not analyzed."))
             continue
-        added, attached_pdf_pages, spreadsheet_text_chars = _append_review_file_content(
-            content=content,
-            skipped=skipped,
-            blocked_files=blocked_files,
-            file=file,
-            raw=raw,
-            content_type=content_type,
-            attached_pdf_pages=attached_pdf_pages,
-            spreadsheet_text_chars=spreadsheet_text_chars,
+        if analysis.status != "completed":
+            continue
+        data = analysis.analysis or {}
+        per_file_analyses.append(
+            {
+                "file_id": str(file.id),
+                "file_name": file.file_name,
+                "ai_classification": analysis.classification,
+                "confidence": analysis.confidence,
+                "summary": analysis.summary,
+                "supports": data.get("supports") or [],
+                "baseline_categories_supported": data.get("baseline_categories_supported") or [],
+                "red_flags": data.get("red_flags") or [],
+                "limitations": data.get("limitations") or [],
+                "key_facts": data.get("key_facts") or {},
+            }
         )
-        if added:
-            attached += 1
 
+    content.append(
+        {
+            "type": "text",
+            "text": "Per-file analyses (already extracted; synthesize from these — do not ask for the raw files):\n"
+            + json.dumps(per_file_analyses, default=str),
+        }
+    )
     if skipped:
-        content.append({"type": "text", "text": "Files not attached to model: " + json.dumps(skipped)})
-    if blocked_files:
-        content.append({"type": "text", "text": "Files requiring action before AI can read them: " + json.dumps(blocked_files)})
+        content.append({"type": "text", "text": "Files not analyzed (metadata only): " + json.dumps(skipped)})
 
     try:
-        model = model_heavy()
-        review_type = (review.context_snapshot or bucket.ai_context or {}).get("review_type")
+        # Synthesis reads cheap per-file text, so the lighter model suffices;
+        # per-file heavy reasoning already happened once in analyze_bucket_file.
+        model = model_light()
         resp = await tracked_messages_create(
             db,
             feature="document_scan",
@@ -1424,8 +1460,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         review.provider = "bedrock"
         review.model = getattr(resp, "model", None) or model
         result = _ensure_review_result_shape(_json_or_fallback(_text_from_response(resp), "executive_summary"))
-        if blocked_files:
-            result["blocked_files"] = blocked_files
+        # Backfill per-file sections from the durable analyses so the result shape
+        # stays complete even if the synthesis omitted them (source of truth is the
+        # per-file rows, not the synthesis).
+        _merge_per_file_analyses(result, per_file_analyses)
         if skipped:
             result["skipped_files"] = skipped
         review.result = result
