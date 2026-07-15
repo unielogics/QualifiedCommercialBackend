@@ -2234,6 +2234,7 @@ async def _response(
     public_path: str = "/dealer-ai-underwriter",
     empty_message: str | None = None,
     include_management: bool = False,
+    admin_thread: bool = False,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
@@ -2252,14 +2253,23 @@ async def _response(
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     summary = upload_link_visible_summary(review, intake.bucket)
     if messages is None:
+        # The admin cockpit reads the PRIVATE internal thread (audience='admin');
+        # the public/uploader surfaces read the client-visible 'uploader' thread.
+        if admin_thread:
+            filters = [
+                BucketAIMessage.bucket_id == intake.bucket_id,
+                BucketAIMessage.audience == "admin",
+            ]
+        else:
+            filters = [
+                BucketAIMessage.bucket_id == intake.bucket_id,
+                BucketAIMessage.audience == "uploader",
+                BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
+            ]
         recent = (
             await db.execute(
                 select(BucketAIMessage)
-                .where(
-                    BucketAIMessage.bucket_id == intake.bucket_id,
-                    BucketAIMessage.audience == "uploader",
-                    BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
-                )
+                .where(*filters)
                 .order_by(BucketAIMessage.created_at.desc())
                 .limit(50)
             )
@@ -3066,7 +3076,7 @@ async def get_dealer_ai_lead(
 ) -> DealerIntakeResponse:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _response(db, intake, token=None, include_management=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
 
 
 @admin_router.post("/{intake_id}/run-review", response_model=DealerIntakeResponse)
@@ -3100,7 +3110,7 @@ async def rerun_dealer_ai_lead_review(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _response(db, intake, token=None, include_management=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
 
 
 @admin_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)
@@ -3115,7 +3125,6 @@ async def dealer_ai_lead_chat(
     thread (audience='admin') the client never sees."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    messages: list[BucketAIMessage] = []
     assistant_message = None
     if payload.message and payload.message.strip():
         chat_messages, _, _ = await create_chat_reply(
@@ -3126,7 +3135,6 @@ async def dealer_ai_lead_chat(
             actor_name=user.name or "Super admin",
             user=user,
         )
-        messages = chat_messages
         if chat_messages:
             assistant_message = chat_messages[-1].content
     await db.commit()
@@ -3137,7 +3145,7 @@ async def dealer_ai_lead_chat(
         token=None,
         include_management=True,
         assistant_message=assistant_message,
-        messages=messages,
+        admin_thread=True,
     )
 
 
