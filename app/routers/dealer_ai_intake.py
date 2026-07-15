@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -241,6 +241,22 @@ class DealerIntakePatch(BaseModel):
 class DealerChatRequest(BaseModel):
     message: str | None = Field(default=None, max_length=4000)
     updates: DealerIntakePatch | None = None
+
+
+class ReviewRunStartResponse(BaseModel):
+    review_id: UUID
+    status: str
+
+
+class ReviewProgressResponse(BaseModel):
+    review_id: UUID
+    status: str
+    stage: str
+    label: str
+    percent: int
+    files_total: int
+    files_done: int
+    error: str | None = None
 
 
 class DealerResumeLinkRequest(BaseModel):
@@ -2974,6 +2990,7 @@ async def _execute_intake_review(
         file_ids=[str(file.id) for file in _active_files(intake.bucket)],
         provider="bedrock",
     )
+    review.progress = {"stage": "queued", "label": "Preparing the review…", "percent": 0, "files_total": 0, "files_done": 0}
     db.add(review)
     await db.flush()
     await _log(
@@ -2996,6 +3013,86 @@ async def _execute_intake_review(
         intake.status = "reviewed"
         intake.completed_at = _now()
     return fresh_review
+
+
+async def _create_queued_review(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    request: Request,
+    actor_name: str,
+    actor_email: str | None,
+    actor_role: str,
+    log_event: str,
+    detail: str,
+    requested_by_user_id: UUID | None = None,
+) -> BucketAIReview:
+    """Create a queued review row (committed) for a lead, picking the AI context
+    by variant. The heavy pass runs separately (background) so the request
+    returns immediately and the UI can poll progress."""
+    is_funding = intake.variant == FUNDING_VARIANT
+    context_fn = _funding_review_context if is_funding else _dealer_context
+    recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
+    review_context = {
+        **(intake.bucket.ai_context or {}),
+        **context_fn(intake),
+        recent_key: await _recent_dealer_chat(db, intake),
+    }
+    intake.bucket.ai_context = review_context
+    review = BucketAIReview(
+        bucket_id=intake.bucket_id,
+        requested_by_user_id=requested_by_user_id,
+        status="queued",
+        context_snapshot=review_context,
+        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
+        provider="bedrock",
+        progress={"stage": "queued", "label": "Preparing the review…", "percent": 0, "files_total": 0, "files_done": 0},
+    )
+    db.add(review)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        log_event,
+        request=request,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        actor_role=actor_role,
+        target_type="ai_review",
+        target_id=str(review.id),
+        detail=detail,
+    )
+    await db.commit()
+    return review
+
+
+async def _run_review_background(review_id: UUID, intake_id: UUID) -> None:
+    """Run a queued review to completion in its own DB session (survives the
+    request), then snapshot the result onto the intake. Errors are captured on
+    the review row (status/progress='error') by run_bucket_ai_review."""
+    from app.db import SessionLocal
+
+    async with SessionLocal() as db:
+        try:
+            await run_bucket_ai_review(db, review_id)
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            log.exception("background review failed review=%s", review_id)
+            return
+        # Snapshot the completed result onto the intake.
+        try:
+            intake = await db.get(PublicUnderwritingIntake, intake_id)
+            review = await db.get(BucketAIReview, review_id)
+            if intake is not None and review is not None:
+                intake.latest_review_id = review_id
+                if isinstance(review.result, dict):
+                    intake.result_snapshot = review.result
+                    intake.status = "reviewed"
+                    intake.completed_at = _now()
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            log.exception("background review snapshot failed review=%s", review_id)
 
 
 @admin_router.get("", response_model=DealerAILeadListResponse)
@@ -3098,15 +3195,17 @@ async def get_dealer_ai_lead(
     return await _response(db, intake, token=None, include_management=True, admin_thread=True)
 
 
-@admin_router.post("/{intake_id}/run-review", response_model=DealerIntakeResponse)
+@admin_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)
 async def rerun_dealer_ai_lead_review(
     intake_id: UUID,
     request: Request,
+    background: BackgroundTasks,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> DealerIntakeResponse:
-    """Admin re-run of the AI review on the lead's latest bucket uploads, inline,
-    returning the fresh breakdown. Cooldown-throttled per intake to bound cost."""
+) -> ReviewRunStartResponse:
+    """Kick off an admin re-run of the AI review on the lead's latest uploads.
+    Returns immediately with a review_id; the heavy pass runs in the background
+    and the UI polls GET /{intake_id}/review-progress. Cooldown-throttled."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     _throttle_or_429(
@@ -3116,7 +3215,7 @@ async def rerun_dealer_ai_lead_review(
         "A review was just re-run for this lead. Please wait a moment before running another.",
     )
     is_funding = intake.variant == FUNDING_VARIANT
-    await _execute_intake_review(
+    review = await _create_queued_review(
         db,
         intake,
         request=request,
@@ -3127,9 +3226,46 @@ async def rerun_dealer_ai_lead_review(
         detail="Admin re-run over latest uploads",
         requested_by_user_id=user.id,
     )
-    await db.commit()
+    background.add_task(_run_review_background, review.id, intake.id)
+    return ReviewRunStartResponse(review_id=review.id, status="queued")
+
+
+@admin_router.get("/{intake_id}/review-progress", response_model=ReviewProgressResponse)
+async def dealer_ai_lead_review_progress(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    review_id: UUID | None = None,
+) -> ReviewProgressResponse:
+    """Poll the live progress of a lead's most recent (or a specific) AI review."""
+    _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    if review_id is not None:
+        review = await db.get(BucketAIReview, review_id)
+        if review is None or review.bucket_id != intake.bucket_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Review not found")
+    else:
+        review = (
+            await db.execute(
+                select(BucketAIReview)
+                .where(BucketAIReview.bucket_id == intake.bucket_id)
+                .order_by(BucketAIReview.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No review found")
+    progress = review.progress if isinstance(review.progress, dict) else {}
+    return ReviewProgressResponse(
+        review_id=review.id,
+        status=review.status,
+        stage=str(progress.get("stage") or review.status),
+        label=str(progress.get("label") or ""),
+        percent=int(progress.get("percent") or (100 if review.status in {"completed", "failed"} else 0)),
+        files_total=int(progress.get("files_total") or 0),
+        files_done=int(progress.get("files_done") or 0),
+        error=review.error,
+    )
 
 
 @admin_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)

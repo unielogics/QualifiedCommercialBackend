@@ -336,6 +336,10 @@ class BucketAIReview(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued", server_default="queued")
     context_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     file_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Live, pollable progress for the run-review UI: {stage, label, percent,
+    # files_total, files_done}. Updated + committed at each step so a separate
+    # progress request sees honest, real-time state.
+    progress: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model: Mapped[str | None] = mapped_column(String(160), nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

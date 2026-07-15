@@ -1398,17 +1398,46 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
 
     review_type = (review.context_snapshot or bucket.ai_context or {}).get("review_type")
 
+    # Files that will actually be analyzed (zip parents are represented by their
+    # extracted children, so exclude them from the progress denominator).
+    analyzable = [f for f in files if f.id not in extracted_zip_parent_ids]
+    files_total = len(analyzable)
+
+    async def _set_progress(stage: str, label: str, files_done: int) -> None:
+        # Percent: reserve 0-85% for per-file analysis, 85-100% for synthesis.
+        if stage == "synthesizing":
+            pct = 90
+        elif stage == "complete":
+            pct = 100
+        elif files_total:
+            pct = int(round((files_done / files_total) * 85))
+        else:
+            pct = 85
+        review.progress = {
+            "stage": stage,
+            "label": label,
+            "percent": pct,
+            "files_total": files_total,
+            "files_done": files_done,
+        }
+        await db.commit()
+
+    await _set_progress("reading", "Reading uploaded documents…", 0)
+
     # COMPOSE FROM CACHE: resolve each file's durable per-file analysis (analyzed
     # once, reused thereafter — a cache hit spends NO tokens). The synthesis pass
     # then reads these cheap text summaries instead of re-sending file bytes, so
     # an unchanged file set costs only the synthesis call.
     skipped: list[dict[str, str]] = []
     per_file_analyses: list[dict[str, Any]] = []
+    files_done = 0
     for file in files:
         if file.id in extracted_zip_parent_ids:
             skipped.append(_skip_file(file, "zip_parent_archive", "ZIP contents were extracted into bucket files, so the archive itself was not re-read by AI review."))
             continue
+        await _set_progress("analyzing", f"Analyzing {file.file_name}…", files_done)
         analysis = await analyze_bucket_file(db, file, review_type=review_type)
+        files_done += 1
         if analysis is None:
             skipped.append(_skip_file(file, "fetch_failed", "The system could not retrieve this file from storage for AI review."))
             continue
@@ -1432,6 +1461,8 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
                 "key_facts": data.get("key_facts") or {},
             }
         )
+
+    await _set_progress("synthesizing", "Synthesizing the underwriting breakdown…", files_done)
 
     content.append(
         {
@@ -1469,6 +1500,13 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         review.result = result
         review.status = "completed"
         review.completed_at = _now()
+        review.progress = {
+            "stage": "complete",
+            "label": "Review complete",
+            "percent": 100,
+            "files_total": files_total,
+            "files_done": files_done,
+        }
         await _create_review_recommendation_actions(db, bucket=bucket, review=review, result=result)
         await log_bucket_ai_activity(db, bucket.id, "ai_review_completed", target_type="ai_review", target_id=str(review.id), detail=bucket.name)
     except Exception as exc:  # noqa: BLE001
@@ -1476,6 +1514,13 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         review.status = "failed"
         review.error = str(exc)[:2000]
         review.completed_at = _now()
+        review.progress = {
+            "stage": "error",
+            "label": "The review could not be completed.",
+            "percent": 100,
+            "files_total": files_total,
+            "files_done": files_done,
+        }
         await log_bucket_ai_activity(db, bucket.id, "ai_review_failed", target_type="ai_review", target_id=str(review.id), detail=review.error)
     await db.flush()
     return review
