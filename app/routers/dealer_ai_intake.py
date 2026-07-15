@@ -66,7 +66,7 @@ from app.services.public_underwriting_packet_pdf import render_underwriting_pack
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
-admin_router = APIRouter(prefix="/admin/dealer-ai-leads", tags=["admin-dealer-ai-leads"])
+admin_router = APIRouter(prefix="/admin/ai-underwriter-leads", tags=["admin-ai-underwriter-leads"])
 log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
@@ -561,7 +561,7 @@ def _record_login_code_email(
 
 
 def _admin_lead_url(intake: PublicUnderwritingIntake) -> str:
-    return _public_url(f"/admin/dealer-ai-leads?lead={intake.id}")
+    return _public_url(f"/admin/ai-underwriter-leads?lead={intake.id}")
 
 
 def _admin_bucket_url(intake: PublicUnderwritingIntake) -> str:

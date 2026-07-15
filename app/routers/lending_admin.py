@@ -1621,7 +1621,7 @@ async def token_usage_attribution(
                 "kind": "dealer_ai_lead",
                 "id": str(intake.id),
                 "label": f"Dealer AI lead · {label}",
-                "href": f"/admin/dealer-ai-leads?lead={intake.id}",
+                "href": f"/admin/ai-underwriter-leads?lead={intake.id}",
             }
         if bucket_id and bucket_id in buckets:
             bucket = buckets[bucket_id]
