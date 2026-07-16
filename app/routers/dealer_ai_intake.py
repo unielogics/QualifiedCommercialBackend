@@ -3604,6 +3604,87 @@ async def dealer_ai_lead_chat(
     )
 
 
+async def _client_thread_messages(db: AsyncSession, intake: PublicUnderwritingIntake) -> list[BucketAIMessage]:
+    """The client-visible (uploader) thread for this lead, oldest→newest."""
+    rows = (
+        await db.execute(
+            select(BucketAIMessage)
+            .where(
+                BucketAIMessage.bucket_id == intake.bucket_id,
+                BucketAIMessage.audience == "uploader",
+                BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
+            )
+            .order_by(BucketAIMessage.created_at.desc())
+            .limit(80)
+        )
+    ).scalars().all()
+    return list(reversed(rows))
+
+
+class ClientThreadResponse(BaseModel):
+    messages: list[BucketAIMessageRead] = []
+
+
+@admin_router.get("/{intake_id}/client-thread", response_model=ClientThreadResponse)
+async def get_dealer_ai_client_thread(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientThreadResponse:
+    """Return the CLIENT-visible (uploader) conversation for this lead so the
+    super-admin can see what the borrower and their AI have exchanged. This is a
+    different thread from the private admin cockpit chat (audience='admin')."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    messages = await _client_thread_messages(db, intake)
+    return ClientThreadResponse(messages=[BucketAIMessageRead.model_validate(m) for m in messages])
+
+
+@admin_router.post("/{intake_id}/client-thread/reply", response_model=ClientThreadResponse)
+async def reply_dealer_ai_client_thread(
+    intake_id: UUID,
+    payload: DealerChatRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientThreadResponse:
+    """Post a message ON BEHALF of the operator INTO the client's (uploader)
+    thread, attributed as the underwriter, so the borrower sees a human reply and
+    their AI advances the funnel. The message IS visible to the client (unlike the
+    private admin thread). An audit-log entry records the admin who authored it."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if not (payload.message and payload.message.strip()):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A message is required")
+    if intake.bucket_upload_link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This lead has no client upload link to reply into")
+    attribution = f"Underwriter — {user.name}" if user.name else "Underwriter"
+    await create_chat_reply(
+        db,
+        bucket=intake.bucket,
+        audience="uploader",
+        message=payload.message.strip(),
+        actor_name=attribution,
+        user=user,
+        upload_link=intake.bucket_upload_link,
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_admin_replied_to_client",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"On-behalf reply into client thread by {user.name or user.email}",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    messages = await _client_thread_messages(db, intake)
+    return ClientThreadResponse(messages=[BucketAIMessageRead.model_validate(m) for m in messages])
+
+
 @admin_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
 async def dealer_ai_lead_upload_init(
     intake_id: UUID,
