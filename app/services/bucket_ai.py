@@ -143,6 +143,8 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
 }
 
 Be specific. Flag missing proof of funds, unclear financials, mismatched names/dates/amounts, missing collateral documents, unreadable files, stale documents, and any question an underwriter would ask before approval.
+
+Never invent or estimate a credit score/tier. If ai_context.authoritative_facts.credit_score is present, you MUST use that exact value and ignore any other credit number in the chat, documents, or prior review. Otherwise use ONLY the value the borrower most recently stated in the chat (a later message overrides any earlier one) or a value present in an uploaded document; if none is provided, say the credit score is not provided. Do not copy any number from these instructions.
 """
 
 # Compaction limits appended to every product's review prompt.

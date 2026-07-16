@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import mimetypes
+import re
 import secrets
 import time
 import zipfile
@@ -1392,18 +1393,26 @@ def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None) -> 
 
 
 async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake) -> list[dict[str, str]]:
+    # Include BOTH the client (uploader) thread and the internal admin thread. The
+    # operator often corrects or supplements facts in the admin chat (e.g. a
+    # restated credit score), and those corrections are authoritative — excluding
+    # them made the summary/email report a stale client-stated value.
     rows = (
         await db.execute(
             select(BucketAIMessage)
-            .where(BucketAIMessage.bucket_id == intake.bucket_id, BucketAIMessage.audience == "uploader")
+            .where(
+                BucketAIMessage.bucket_id == intake.bucket_id,
+                BucketAIMessage.audience.in_(["uploader", "admin"]),
+            )
             .order_by(BucketAIMessage.created_at.desc())
-            .limit(24)
+            .limit(32)
         )
     ).scalars().all()
     return [
         {
             "role": row.role,
             "author": row.author_name or row.role,
+            "audience": row.audience,
             "content": row.content[:1600],
             "created_at": row.created_at.isoformat() if row.created_at else "",
         }
@@ -2004,6 +2013,7 @@ async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingI
         {"id": str(doc.id), "name": doc.name, "category": doc.category, "description": doc.description}
         for doc in _missing_required_docs(intake.bucket)
     ]
+    chat_history = await _recent_dealer_chat(db, intake)
     return {
         "variant": intake.variant,
         "intake": {
@@ -2028,8 +2038,46 @@ async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingI
         "files": files,
         "missing_documents": missing_docs,
         "latest_review": _latest_result_for_intake(intake),
-        "chat_history": await _recent_dealer_chat(db, intake),
+        "chat_history": chat_history,
+        # Deterministically resolved most-recent borrower-stated credit score, so the
+        # model does not have to reconcile conflicting chat/prior-review values (it
+        # was picking a stale earlier value). Authoritative when present.
+        "authoritative_facts": _authoritative_facts_from_chat(chat_history, intake),
     }
+
+
+_CREDIT_RE = re.compile(r"(\d{3})\s*\+?\s*(?:credit|fico)|(?:credit|fico)[^\d]{0,20}(\d{3})", re.IGNORECASE)
+
+
+def _authoritative_facts_from_chat(
+    chat_history: list[dict[str, str]], intake: PublicUnderwritingIntake
+) -> dict[str, Any]:
+    """Resolve facts the operator/borrower stated in chat that must override any
+    stale figure in a prior review — currently the credit score. Scans newest-first
+    and returns the most recent stated value so the summary/email never reports an
+    outdated number."""
+    facts: dict[str, Any] = {}
+    # chat_history is oldest→newest; walk newest-first for the latest statement.
+    # ONLY trust user/borrower/operator messages — an assistant reply may echo a
+    # stale value, so counting assistant text would defeat the correction.
+    for msg in reversed(chat_history):
+        if str(msg.get("role") or "").lower() != "user":
+            continue
+        content = str(msg.get("content") or "")
+        if not content:
+            continue
+        m = _CREDIT_RE.search(content)
+        if m:
+            score = m.group(1) or m.group(2)
+            if score and 300 <= int(score) <= 850:
+                plus = "+" if "+" in content else ""
+                facts["credit_score"] = f"{score}{plus}"
+                facts["credit_score_source"] = f"most recent borrower statement in chat ({msg.get('created_at') or 'chat'})"
+                break
+    if "credit_score" not in facts and intake.estimated_credit_score:
+        facts["credit_score"] = str(intake.estimated_credit_score)
+        facts["credit_score_source"] = "intake form"
+    return facts
 
 
 async def _collect_packet_financials(
@@ -2113,7 +2161,11 @@ async def _generate_management_json(
         instruction = (
             "Create an operator-facing executive summary for a Qualified Commercial AI underwriting lead. "
             "Use the uploaded evidence, chat answers, latest review, and intake data only. Do not invent values. "
-            "If a field is unsupported, write 'Awaiting evidence'."
+            "If a field is unsupported, write 'Awaiting evidence'. "
+            "When sources conflict, the MOST RECENT chat statement is authoritative and overrides any earlier chat "
+            "message AND any figure in the prior 'latest_review' text (that prior review may be stale). "
+            "If context.authoritative_facts.credit_score is present, you MUST use that exact credit score value "
+            "everywhere and ignore any other credit number in the evidence or prior review."
         )
         system = (
             "You are a senior commercial credit officer writing an internal executive summary that a human underwriter "
@@ -2121,21 +2173,32 @@ async def _generate_management_json(
             "The 'executive_summary' field MUST be 2-4 flowing narrative paragraphs (no bullet points, no 'key: value' "
             "fragments, no JSON-looking text inside it). Every narrative field is prose a person would write. "
             "'key_metrics' MUST be a flat list of {label, value, note?} objects where value is a SHORT scalar string "
-            "(e.g. \"$31.2M\", \"1.35x\", \"608\") — never a nested object or array. Be specific and cite figures from the "
-            "evidence. Return STRICT JSON only, matching the given shape exactly."
+            "(format examples only: a dollar figure, a ratio like 1.35x, or a percentage) — never a nested object or array. "
+            "Be specific and cite figures from the evidence; never copy a number from these instructions. "
+            "For any credit score/tier, use ONLY the value the borrower most recently stated in the chat (a later message "
+            "overrides an earlier one) or a value present in an uploaded document — never estimate, round, or invent a "
+            "credit score. If no credit score has been provided, write 'Not provided' rather than guessing. "
+            "Return STRICT JSON only, matching the given shape exactly."
         )
         feature = "loan_summary"
     else:
-        schema = {"subject": "email subject", "body": "editable vendor email body"}
+        schema = {"subject": "email subject", "body": "editable outreach email body"}
         instruction = (
-            "Prepare a lender/vendor email for a Qualified Commercial underwriter. It must be professional, concise, "
-            "and editable. Include the strongest evidence, suggested submission angle, missing confirmations, and say that a secure bucket login link "
-            "and underwriting packet are included. Do not include unsecured file links."
+            "Prepare a lender/vendor outreach email that WE are sending TO an external lending party about this borrower. "
+            "It must be professional, concise, and editable. Include the strongest evidence, suggested submission angle, "
+            "missing confirmations, and say that a secure bucket login link and underwriting packet are included. Do not "
+            "include unsecured file links. "
+            "The email MUST open with the greeting 'Dear Lending Party,' — do NOT address it to Qualified Commercial and "
+            "do NOT invent a specific recipient name or company. "
+            "The email MUST close with this exact signature block on its own lines:\n"
+            "Best regards,\nJonathan Franco"
         )
         system = (
-            "You are a commercial lending relationship manager writing a concise, professional lender/vendor outreach "
-            "email a human will lightly edit and send. Warm but businesslike; short paragraphs; no placeholders or raw "
-            "field dumps. Return STRICT JSON only, matching the given shape exactly."
+            "You are writing, on behalf of the sender Jonathan Franco, a concise professional outreach email that will be "
+            "sent to an outside lender/vendor. The sender is presenting a borrower's file to that lender — the lender is the "
+            "recipient, NOT Qualified Commercial. Open with 'Dear Lending Party,' and sign off as 'Jonathan Franco'. Warm but "
+            "businesslike; short paragraphs; no placeholders, no bracketed tokens, no raw field dumps. Return STRICT JSON "
+            "only, matching the given shape exactly."
         )
         feature = "lender_send"
     prompt = {
@@ -3203,10 +3266,15 @@ async def _execute_intake_review(
     is_funding = intake.variant == FUNDING_VARIANT
     context_fn = _funding_review_context if is_funding else _dealer_context
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
+    recent_chat = await _recent_dealer_chat(db, intake)
     review_context = {
         **(intake.bucket.ai_context or {}),
         **context_fn(intake),
-        recent_key: await _recent_dealer_chat(db, intake),
+        recent_key: recent_chat,
+        # Deterministically resolved borrower-stated facts (e.g. latest credit
+        # score) so the review synthesis reports the corrected value, not a stale
+        # one echoed in a prior review.
+        "authoritative_facts": _authoritative_facts_from_chat(recent_chat, intake),
     }
     intake.bucket.ai_context = review_context
     review = BucketAIReview(
@@ -3260,10 +3328,15 @@ async def _create_queued_review(
     is_funding = intake.variant == FUNDING_VARIANT
     context_fn = _funding_review_context if is_funding else _dealer_context
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
+    recent_chat = await _recent_dealer_chat(db, intake)
     review_context = {
         **(intake.bucket.ai_context or {}),
         **context_fn(intake),
-        recent_key: await _recent_dealer_chat(db, intake),
+        recent_key: recent_chat,
+        # Deterministically resolved borrower-stated facts (e.g. latest credit
+        # score) so the review synthesis reports the corrected value, not a stale
+        # one echoed in a prior review.
+        "authoritative_facts": _authoritative_facts_from_chat(recent_chat, intake),
     }
     intake.bucket.ai_context = review_context
     review = BucketAIReview(
