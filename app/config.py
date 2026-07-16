@@ -99,9 +99,13 @@ class Settings(BaseSettings):
     # must be a real mailbox in the same workspace.
     gmail_service_account_path: str = ""
     gmail_delegated_user: str = ""
-    # Legacy OAuth knobs — kept so future end-user OAuth path is still available
+    # End-user Google OAuth (per-user Gmail/Calendar/Drive connect). The same
+    # Web-application client is used for all three services; scopes are requested
+    # incrementally per feature. Redirect URI must be registered in the GCP
+    # console and point at GET /api/v1/google/oauth/callback.
     gmail_oauth_client_id: str = ""
     gmail_oauth_client_secret: str = ""
+    google_oauth_redirect_uri: str = ""  # e.g. https://api.qualifiedcommercial.com/api/v1/google/oauth/callback
     # Gmail Pub/Sub push — real-time inbound. When `gmail_pubsub_topic`
     # is set (projects/<proj>/topics/<topic>) the app registers a
     # users.watch() on the delegated mailbox's INBOX; Gmail then pushes

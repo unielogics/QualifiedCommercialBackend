@@ -257,32 +257,56 @@ async def send_approved_draft(db: AsyncSession, draft: EmailDraft, *, actor_labe
     sent_id: str | None = None
     note: str
 
-    if settings.gmail_service_account_path and settings.gmail_delegated_user:
-        # Local import to avoid hard-binding the Gmail client at module load.
-        from app.services.email.gmail_client import gmail_config, send_message
+    # 1) Send-as-user: if the draft has a sender with a connected personal Gmail,
+    #    send from THEIR mailbox (their Sent folder, replies to them).
+    if draft.sender_user_id is not None:
+        from app.services.email.user_mailer import send_as_user
 
-        cfg = gmail_config()
-        if cfg is None:
-            note = "Gmail config missing; draft marked as approved but not sent."
+        result = await send_as_user(
+            db,
+            draft.sender_user_id,
+            to_emails=[draft.to_email],
+            subject=draft.subject,
+            body_text=draft.body,
+            cc_emails=list(draft.cc_emails or []),
+            bcc_emails=list(draft.bcc_emails or []),
+        )
+        if result.ok:
+            sent_id = result.message_id
+            note = f"Sent as connected user. message_id={sent_id}"
+        elif result.detail.startswith("gmail_send_failed"):
+            note = f"{result.detail}. Draft kept as approved for retry."
         else:
-            try:
-                # Real Gmail send. cc_emails / bcc_emails are carried as
-                # Cc / Bcc headers in the raw MIME — Gmail delivers to all
-                # three (the Bcc header is stripped from the delivered copy).
-                resp = send_message(
-                    cfg,
-                    to=draft.to_email,
-                    subject=draft.subject,
-                    body=draft.body,
-                    cc=list(draft.cc_emails or []),
-                    bcc=list(draft.bcc_emails or []),
-                )
-                sent_id = resp.get("id")
-                note = f"Sent via Gmail. message_id={sent_id}"
-            except Exception as exc:  # noqa: BLE001
-                note = f"Gmail send failed: {exc}. Draft kept as approved for retry."
-    else:
-        note = "Gmail not configured (no SA path / delegated user). Draft approved but not sent."
+            note = ""  # not connected / SES dormant — fall through to firm paths below
+
+    # 2) Firm Gmail service account (existing behavior) when no per-user send happened.
+    if sent_id is None and not note:
+        if settings.gmail_service_account_path and settings.gmail_delegated_user:
+            # Local import to avoid hard-binding the Gmail client at module load.
+            from app.services.email.gmail_client import gmail_config, send_message
+
+            cfg = gmail_config()
+            if cfg is None:
+                note = "Gmail config missing; draft marked as approved but not sent."
+            else:
+                try:
+                    # Real Gmail send. cc_emails / bcc_emails are carried as
+                    # Cc / Bcc headers in the raw MIME — Gmail delivers to all
+                    # three (the Bcc header is stripped from the delivered copy).
+                    resp = send_message(
+                        cfg,
+                        to=draft.to_email,
+                        subject=draft.subject,
+                        body=draft.body,
+                        cc=list(draft.cc_emails or []),
+                        bcc=list(draft.bcc_emails or []),
+                    )
+                    sent_id = resp.get("id")
+                    note = f"Sent via Gmail. message_id={sent_id}"
+                except Exception as exc:  # noqa: BLE001
+                    note = f"Gmail send failed: {exc}. Draft kept as approved for retry."
+        else:
+            note = "Gmail not configured (no SA path / delegated user). Draft approved but not sent."
 
     draft.status = EmailDraftStatus.SENT if sent_id else EmailDraftStatus.APPROVED
     draft.actioned_by = actor_label

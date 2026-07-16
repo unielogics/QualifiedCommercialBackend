@@ -475,6 +475,9 @@ async def draft_lender_send(
         subject=subject,
         body=full_body,
         status=EmailDraftStatus.PENDING,
+        # Send-as-user: prefer the acting user, else the loan's operational owner.
+        # send_as_user() falls back to firm SES when this user has no Gmail grant.
+        sender_user_id=actor_user_id or loan.assigned_owner_id,
         triggered_by_kind="lender_submission",
         triggered_by_payload={
             "delivery": delivery,

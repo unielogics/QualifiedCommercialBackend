@@ -49,6 +49,14 @@ class EmailDraft(TimestampMixin, Base):
     """e.g. 'inbound_lender_request', 'doc_received', 'auto_followup'"""
     triggered_by_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # Whose connected Google account should send this draft (send-as-user). When
+    # null or the user has no Gmail grant, the send falls back to firm SES.
+    sender_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # When the broker actions it, store who + when.
     actioned_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
     sent_message_id: Mapped[str | None] = mapped_column(String(160), nullable=True)

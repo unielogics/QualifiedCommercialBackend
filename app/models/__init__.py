@@ -75,6 +75,7 @@ from app.models.document_analysis_result import DocumentAnalysisResult  # noqa: 
 from app.models.email_draft import EmailDraft  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401
 from app.models.fred_observation import FredObservation  # noqa: F401
+from app.models.google_account import GoogleAccount  # noqa: F401
 from app.models.hud import HudLineItem  # noqa: F401
 from app.models.hud_share_link import HudShareLink  # noqa: F401
 from app.models.legal_acceptance import LegalAcceptance  # noqa: F401
