@@ -26,7 +26,7 @@ from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketNote, BucketRequestedDocument, BucketUploadLink, BucketVendorAccess
+from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketUploadLink, BucketVendorAccess
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
@@ -54,7 +54,7 @@ from app.schemas.bucket import (
     BucketRequestedDocumentRead,
 )
 from app.schemas.common import ORMModel
-from app.services.bucket_ai import create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
+from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION, create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
@@ -1877,8 +1877,27 @@ def _ai_response_text(resp: Any) -> str:
     return "\n".join(parts).strip()
 
 
-def _json_from_ai_text(text: str) -> dict[str, Any]:
+def _strip_code_fence(text: str) -> str:
+    """Remove a leading/trailing markdown code fence (```json ... ```), if present.
+
+    The heavy/light models frequently wrap their JSON in a fenced block. Without
+    stripping the fence, json.loads fails and the caller falls back to treating
+    the whole fenced string as prose — which is exactly why the executive summary
+    was rendering as raw JSON in the UI.
+    """
     stripped = text.strip()
+    if stripped.startswith("```"):
+        # Drop the opening fence line (``` or ```json) and the closing fence.
+        newline = stripped.find("\n")
+        if newline != -1:
+            stripped = stripped[newline + 1 :]
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[: -3]
+    return stripped.strip()
+
+
+def _json_from_ai_text(text: str) -> dict[str, Any]:
+    stripped = _strip_code_fence(text)
     try:
         parsed = json.loads(stripped)
         return parsed if isinstance(parsed, dict) else {"body": stripped}
@@ -1948,6 +1967,48 @@ async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingI
         "missing_documents": missing_docs,
         "latest_review": _latest_result_for_intake(intake),
         "chat_history": await _recent_dealer_chat(db, intake),
+    }
+
+
+async def _collect_packet_financials(
+    db: AsyncSession, intake: PublicUnderwritingIntake
+) -> dict[str, Any]:
+    """Pull the structured per-file facts the lender packet visualizes: month-over-month
+    bank activity (last 6 months) and 2-year tax-return figures. Reads the durable
+    per-file analysis cache (no new AI calls). Returns raw facts; the PDF renderer
+    handles charting and redaction so this stays a thin data-loader."""
+    active_ids = {file.id for file in _active_files(intake.bucket)}
+    if not active_ids:
+        return {"bank_months": [], "tax_years": []}
+    rows = (
+        await db.execute(
+            select(BucketFileAnalysis)
+            .where(
+                BucketFileAnalysis.bucket_id == intake.bucket_id,
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+                BucketFileAnalysis.status == "completed",
+            )
+            .order_by(BucketFileAnalysis.created_at.desc())
+        )
+    ).scalars().all()
+
+    from app.services.public_underwriting_packet_pdf import (
+        extract_bank_months,
+        extract_tax_years,
+    )
+
+    analyses = [
+        {
+            "file_id": str(row.bucket_file_id),
+            "classification": row.classification,
+            "key_facts": row.analysis.get("key_facts") if isinstance(row.analysis, dict) else {},
+        }
+        for row in rows
+        if row.bucket_file_id in active_ids
+    ]
+    return {
+        "bank_months": extract_bank_months(analyses),
+        "tax_years": extract_tax_years(analyses),
     }
 
 
@@ -2185,6 +2246,7 @@ async def _create_lender_packet_artifact(
     summary_artifact = executive_summary or await _ensure_executive_summary_artifact(db, intake, user)
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     missing_docs = _missing_required_docs(intake.bucket)
+    financials = await _collect_packet_financials(db, intake)
     title = f"{intake.business_name or intake.full_name or 'Lead'} lender packet"
     pdf_bytes = await asyncio.to_thread(
         render_underwriting_packet_pdf,
@@ -2193,6 +2255,7 @@ async def _create_lender_packet_artifact(
         missing_docs=missing_docs,
         result=_latest_result_for_intake(intake),
         executive_summary=summary_artifact.body_json if isinstance(summary_artifact.body_json, dict) else None,
+        financials=financials,
     )
     s3_key = await _store_lender_packet_pdf(intake, pdf_bytes, title)
     artifact = PublicUnderwritingIntakeArtifact(
