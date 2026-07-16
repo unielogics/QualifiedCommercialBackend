@@ -327,6 +327,120 @@ def _dual_chart_svg(panels: list[dict[str, Any]], *, panel_w: int = 328, panel_h
     return "".join(parts), width
 
 
+def _dual_axis_chart_svg(
+    title: str,
+    x_labels: list[str],
+    left_series: list[dict[str, Any]],
+    right_series: list[dict[str, Any]],
+    *,
+    width: int = 660,
+    height: int = 250,
+) -> tuple[str, int]:
+    """One chart with TWO independent Y axes so series of different magnitudes
+    (cash-flow in millions on the left, ending balance in hundreds of thousands on
+    the right) share a single plot correctly. Gridlines are shared; each axis gets
+    its own tick labels. Returns (svg, logical_width)."""
+    pad_l, pad_r, pad_t, pad_b = 64, 68, 56, 34
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    x0 = pad_l
+    x1 = width - pad_r
+    y0 = pad_t
+    y1 = height - pad_b
+    n = len(x_labels)
+    STEPS = 4
+
+    def _axis_range(series: list[dict[str, Any]]) -> tuple[float, float]:
+        """Return (vmin, vmax) that always includes 0 as a baseline and pads the
+        top; if any value is negative (e.g. an overdrawn ending balance) the axis
+        extends below 0 so the point stays on-canvas instead of falling off."""
+        vals = [v for s in series for v in s["values"] if v is not None]
+        if not vals:
+            return 0.0, 1.0
+        hi = max(vals)
+        lo = min(vals)
+        vmax = hi * 1.15 if hi > 0 else 0.0
+        vmin = lo * 1.15 if lo < 0 else 0.0
+        if vmax <= vmin:  # all zero, or degenerate
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    left_min, left_max = _axis_range(left_series)
+    right_min, right_max = _axis_range(right_series)
+
+    def px(i: int) -> float:
+        if n <= 1:
+            return x0 + plot_w / 2
+        return x0 + plot_w * i / (n - 1)
+
+    def py(v: float, vmin: float, vmax: float) -> float:
+        span = (vmax - vmin) or 1.0
+        return y1 - ((v - vmin) / span) * plot_h
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" stroke="{LINE}" stroke-width="1" rx="8"/>',
+        f'<text x="16" y="24" font-family="Arial" font-size="13" font-weight="700" fill="{INK}">{escape(title)}</text>',
+    ]
+    # shared horizontal gridlines; left tick labels (teal) + right tick labels (navy).
+    # Each axis interpolates its own [vmin, vmax] across the shared gridline fractions.
+    for g in range(STEPS + 1):
+        frac = g / STEPS
+        gy = y1 - frac * plot_h
+        parts.append(f'<line x1="{x0}" y1="{gy:.1f}" x2="{x1}" y2="{gy:.1f}" stroke="#eef1f6" stroke-width="1"/>')
+        parts.append(
+            f'<text x="{x0 - 8}" y="{gy + 3:.1f}" font-family="Arial" font-size="8" fill="{TEAL}" text-anchor="end">{escape(_fmt_compact(left_min + (left_max - left_min) * frac))}</text>'
+        )
+        parts.append(
+            f'<text x="{x1 + 8}" y="{gy + 3:.1f}" font-family="Arial" font-size="8" fill="{NAVY}" text-anchor="start">{escape(_fmt_compact(right_min + (right_max - right_min) * frac))}</text>'
+        )
+    # axis spines (teal left = cash flow, navy right = ending balance)
+    parts.append(f'<line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y1}" stroke="{TEAL}" stroke-width="1.5"/>')
+    parts.append(f'<line x1="{x1}" y1="{y0}" x2="{x1}" y2="{y1}" stroke="{NAVY}" stroke-width="1.5"/>')
+    # x labels
+    for i, lab in enumerate(x_labels):
+        parts.append(
+            f'<text x="{px(i):.1f}" y="{y1 + 15:.1f}" font-family="Arial" font-size="8.5" fill="{MUTE}" text-anchor="middle">{escape(lab)}</text>'
+        )
+
+    def _draw(series: list[dict[str, Any]], vmin: float, vmax: float) -> None:
+        for s in series:
+            color = s["color"]
+            # Segment the line at None gaps so a missing month leaves a break rather
+            # than a false straight line implying continuous data.
+            segment: list[str] = []
+            for i, v in enumerate(s["values"]):
+                if v is None:
+                    if len(segment) >= 2:
+                        parts.append(f'<polyline points="{" ".join(segment)}" fill="none" stroke="{color}" stroke-width="2.4"/>')
+                    segment = []
+                    continue
+                pt = f"{px(i):.1f},{py(v, vmin, vmax):.1f}"
+                segment.append(pt)
+                parts.append(f'<circle cx="{px(i):.1f}" cy="{py(v, vmin, vmax):.1f}" r="3.2" fill="{color}"/>')
+            if len(segment) >= 2:
+                parts.append(f'<polyline points="{" ".join(segment)}" fill="none" stroke="{color}" stroke-width="2.4"/>')
+
+    _draw(left_series, left_min, left_max)
+    _draw(right_series, right_min, right_max)
+
+    # legend row on the top line, right-aligned so it never collides with the title.
+    # Color maps each series to its axis (teal/red = left cash-flow, navy = right balance).
+    legend = [(s["label"], s["color"]) for s in left_series] + [(s["label"], s["color"]) for s in right_series]
+    def _seg_w(label: str) -> float:
+        return 22 + len(label) * 5.6 + 16
+    total = sum(_seg_w(lbl) for lbl, _ in legend)
+    title_right = 16 + len(title) * 7.2  # keep the legend clear of the title text
+    lx = max(title_right + 10, width - 16 - total)
+    ly = 16
+    for label, color in legend:
+        parts.append(f'<rect x="{lx:.1f}" y="{ly}" width="16" height="10" rx="2" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 21:.1f}" y="{ly + 9}" font-family="Arial" font-size="9.5" fill="{SLATE}">{escape(label)}</text>')
+        lx += _seg_w(label)
+    parts.append("</svg>")
+    return "".join(parts), width
+
+
 def _svg_to_png_datauri(svg: str, scale: float = 2.0) -> str | None:
     """Rasterize an SVG string to a base64 PNG data-URI via PyMuPDF (no native deps)."""
     try:
@@ -405,41 +519,43 @@ def _bank_section(months: list[dict[str, Any]]) -> str:
             '<p class="empty">Awaiting bank-statement evidence.</p></section>'
         )
     labels = [m["label"] for m in months]
-    dual, dual_w = _dual_chart_svg([
-        {
-            "title": "Monthly cash flow",
-            "x_labels": labels,
-            "series": [
-                {"label": "Deposits", "color": TEAL, "values": [m["deposits"] for m in months]},
-                {"label": "Withdrawals", "color": RED, "values": [m["withdrawals"] for m in months]},
-            ],
-        },
-        {
-            "title": "Ending balance",
-            "x_labels": labels,
-            "series": [{"label": "Ending balance", "color": NAVY, "values": [m["ending_balance"] for m in months]}],
-        },
-    ])
-    # Target ~656pt so the chart sits inside the card's inner width on a landscape page.
-    target = 656
-    dual_uri = _svg_to_png_fit(dual, dual_w, target)
-    charts = f'<div class="charts"><img src="{dual_uri}" width="{target}"/></div>' if dual_uri else ""
 
     def _net(m: dict[str, Any]) -> float | None:
         if m["deposits"] is None or m["withdrawals"] is None:
             return None
         return m["deposits"] - m["withdrawals"]
 
-    rows = "".join(
-        "<tr>"
-        f'<td>{escape(m["label"])}</td>'
-        f'<td class="num">{_fmt_full(m["deposits"])}</td>'
-        f'<td class="num">{_fmt_full(m["withdrawals"])}</td>'
-        f'<td class="num">{_fmt_full(_net(m))}</td>'
-        f'<td class="num">{_fmt_full(m["ending_balance"])}</td>'
-        f'<td class="num">{"—" if m["nsf"] is None else m["nsf"]}</td>'
-        "</tr>"
-        for m in months
+    # ONE chart, two Y axes: deposits & withdrawals on the left (cash-flow scale),
+    # ending balance on the right (its own, much smaller scale).
+    chart_svg, chart_w = _dual_axis_chart_svg(
+        "Monthly cash flow & ending balance",
+        labels,
+        left_series=[
+            {"label": "Deposits", "color": TEAL, "values": [m["deposits"] for m in months]},
+            {"label": "Withdrawals", "color": RED, "values": [m["withdrawals"] for m in months]},
+        ],
+        right_series=[
+            {"label": "Ending balance", "color": NAVY, "values": [m["ending_balance"] for m in months]},
+        ],
+    )
+    # Target ~656pt so the chart sits inside the card's inner width on a landscape page.
+    target = 656
+    chart_uri = _svg_to_png_fit(chart_svg, chart_w, target)
+    charts = f'<div class="charts"><img src="{chart_uri}" width="{target}"/></div>' if chart_uri else ""
+
+    # Transposed table: one ROW per metric, one COLUMN per month (spreadsheet layout).
+    month_headers = "".join(f"<th class='num'>{escape(m['label'])}</th>" for m in months)
+
+    def _metric_row(label: str, fmt) -> str:
+        cells = "".join(f'<td class="num">{fmt(m)}</td>' for m in months)
+        return f'<tr><td class="rowhead">{escape(label)}</td>{cells}</tr>'
+
+    body = (
+        _metric_row("Deposits", lambda m: _fmt_full(m["deposits"]))
+        + _metric_row("Withdrawals", lambda m: _fmt_full(m["withdrawals"]))
+        + _metric_row("Net", lambda m: _fmt_full(_net(m)))
+        + _metric_row("Ending balance", lambda m: _fmt_full(m["ending_balance"]))
+        + _metric_row("NSF / OD", lambda m: ("—" if m["nsf"] is None else str(m["nsf"])))
     )
     deposits_vals = [m["deposits"] for m in months if m["deposits"] is not None]
     avg_dep = sum(deposits_vals) / len(deposits_vals) if deposits_vals else None
@@ -447,9 +563,8 @@ def _bank_section(months: list[dict[str, Any]]) -> str:
         '<section class="card wide"><h2>Bank activity — last 6 months</h2>'
         f"{charts}"
         '<table class="grid-table"><thead><tr>'
-        "<th>Month</th><th class='num'>Deposits</th><th class='num'>Withdrawals</th>"
-        "<th class='num'>Net</th><th class='num'>Ending balance</th><th class='num'>NSF/OD</th>"
-        f"</tr></thead><tbody>{rows}</tbody></table>"
+        f"<th>Metric</th>{month_headers}"
+        f"</tr></thead><tbody>{body}</tbody></table>"
         f'<p class="note">Average monthly deposits across the period: <strong>{_fmt_full(avg_dep)}</strong> '
         f"({len(months)} month{'s' if len(months) != 1 else ''} of statements analyzed). "
         "Account numbers redacted for confidentiality.</p>"
@@ -763,6 +878,7 @@ def render_underwriting_packet_pdf(
     .grid-table th {{ background:{HEADFILL}; color:#ffffff; text-transform:uppercase; font-size:9px; letter-spacing:.05em; padding:7px 8px; text-align:left; }}
     .grid-table th.num, .grid-table td.num {{ text-align:right; }}
     .grid-table td {{ border-bottom:1px solid {LINE}; padding:6px 8px; color:{INK}; }}
+    .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; text-align:left; background:{ZEBRA}; }}
     .grid-table tbody tr:nth-child(even) td {{ background:{ZEBRA}; }}
     .charts {{ width:100%; margin-bottom:8px; text-align:center; }}
     .note {{ color:{MUTE}; font-size:10px; font-style:italic; margin-top:8px; }}
