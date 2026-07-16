@@ -867,6 +867,14 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
                 satisfied_keys.add(key)
     required_covered = _READINESS_BASELINE.issubset(satisfied_keys)
 
+    # A complete baseline package is NOT an "evidence gap". "Not enough evidence yet"
+    # means required documents are missing — but here the deterministic check shows
+    # the Stage-1 baseline (bank statements + tax returns) is actually satisfied. Only
+    # correct THAT specific mislabel; leave a genuine "Poor probability"/"Good
+    # probability"/"Promising" the model chose on the financials untouched.
+    if required_covered and str(result.get("probability_status") or "").strip() == "Not enough evidence yet":
+        result["probability_status"] = "Promising but needs one clarification"
+
     # Reconcile the AI-authored missing list: drop any item that maps to a baseline
     # category now satisfied by an analyzed file, so a reconciled category stops
     # blocking readiness.

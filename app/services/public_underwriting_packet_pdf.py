@@ -199,7 +199,27 @@ def extract_bank_months(analyses: list[dict[str, Any]], limit: int = 6) -> list[
 _TAX_KEYS = (
     "gross_receipts", "gross_income", "total_income", "net_income", "taxable_income",
     "ordinary_business_income", "total_revenue", "cost_of_goods_sold", "depreciation",
+    # Alternate field names the per-file analyzer emits for some return years
+    # (e.g. an 1120-S current/prior-year layout), so those returns are still
+    # recognized AND their figures extract.
+    "gross_receipts_current_year", "gross_receipts_or_sales", "gross_sales",
+    "total_income_current", "total_income_line6",
+    "ordinary_business_income_loss", "ordinary_business_income_loss_current",
+    "net_income_per_books_current", "net_income_per_books",
 )
+
+# Ordered alias lists for the money fields — first non-null wins. Covers both the
+# plain 1120-S naming (2023-style) and the current/prior-year naming (2024-style).
+_GROSS_RECEIPTS_ALIASES = (
+    "gross_receipts", "gross_receipts_current_year", "gross_receipts_or_sales",
+    "gross_sales", "gross_income", "total_revenue",
+)
+_NET_INCOME_ALIASES = (
+    "net_income", "ordinary_business_income", "ordinary_business_income_loss_current",
+    "ordinary_business_income_loss", "net_income_per_books_current",
+    "net_income_per_books", "taxable_income",
+)
+_TOTAL_INCOME_ALIASES = ("total_income", "total_income_current", "total_income_line6")
 
 # Classifications that carry revenue-like line items but are NOT tax returns, so the
 # _TAX_KEYS content heuristic must not misclassify them (e.g. a YTD P&L has
@@ -235,13 +255,20 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
         is_tax = cls == "tax_return" or (cls not in _NON_TAX_CLASSES and any(k in facts for k in _TAX_KEYS))
         if not is_tax:
             continue
+        def _first_num(aliases: tuple[str, ...]) -> float | None:
+            for k in aliases:
+                v = _num(facts.get(k))
+                if v is not None:
+                    return v
+            return None
+
         year = _tax_year(facts) or cls
         rec = {
             "year": year if re.fullmatch(r"(19|20)\d{2}", str(year or "")) else (_tax_year(facts) or "—"),
             "entity": _text(facts.get("entity_name") or facts.get("business_name") or facts.get("taxpayer"), fallback=""),
-            "gross_receipts": _num(facts.get("gross_receipts") or facts.get("gross_income") or facts.get("total_revenue")),
-            "net_income": _num(facts.get("net_income") or facts.get("ordinary_business_income") or facts.get("taxable_income")),
-            "total_income": _num(facts.get("total_income")),
+            "gross_receipts": _first_num(_GROSS_RECEIPTS_ALIASES),
+            "net_income": _first_num(_NET_INCOME_ALIASES),
+            "total_income": _first_num(_TOTAL_INCOME_ALIASES),
         }
         yk = str(rec["year"])
         if yk and yk != "—":
