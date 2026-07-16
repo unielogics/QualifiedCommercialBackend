@@ -46,7 +46,9 @@ log = logging.getLogger(__name__)
 # analysis prompt or output shape changes — reuse of a cached analysis is gated
 # on (file, content_hash, this version), so bumping forces a one-time re-analysis
 # at the new version. A model upgrade alone does NOT invalidate the cache.
-CURRENT_FILE_ANALYSIS_VERSION = 1
+# v2: adds the scanned-PDF vision fallback + per-month bank-statement facts.
+# Bumping invalidates v1 rows so files cached as "unreadable"/skipped re-analyze.
+CURRENT_FILE_ANALYSIS_VERSION = 2
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
@@ -54,6 +56,11 @@ MAX_PDF_PAGES = 100
 MAX_TEXT_FILE_CHARS = 16000
 MAX_PDF_TEXT_PAGES = 80
 MAX_PDF_TEXT_CHARS = 50000
+# Vision fallback for scanned/image-only PDFs (no embedded text): rasterize up
+# to this many pages and send them to the model as images so a scanned bank
+# statement is READ, not silently dropped as "unreadable".
+MAX_PDF_VISION_PAGES = 15
+PDF_VISION_DPI = 150
 MAX_SPREADSHEET_SHEETS = 6
 MAX_SPREADSHEET_ROWS = 80
 MAX_SPREADSHEET_COLS = 30
@@ -246,7 +253,9 @@ Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
   "key_facts": {"note": "structured facts you can extract: names, entities, dates, amounts, revenue, deposits, DSCR/LTV/rent/PITIA inputs, property address, balances. Use null when not present. Never invent numbers."}
 }
 
-Analyze only the single document provided. Do not speculate about other files. Keep summary under 320 characters and each list <= 6 items."""
+Analyze only the single document provided. Do not speculate about other files. Keep summary under 320 characters and each list <= 6 items.
+
+If this document is a BANK STATEMENT (or contains multiple statement periods), populate key_facts with the exact fields needed to judge deposit consistency: bank, account_holder, account_last4, statement_period (e.g. "2026-01-01 to 2026-01-31"), beginning_balance, ending_balance, total_deposits_and_credits, total_withdrawals_and_debits, number_of_deposits, number_of_checks, average_ledger_balance, low_daily_balance, nsf_or_overdraft_count, returned_check_count, and negative_balance_dates. If the file covers MORE THAN ONE month, add a "months" array with one object per month carrying these same fields, so month-over-month deposit consistency can be confirmed. Read every page/month; never summarize only the first month."""
 
 DEALER_FILE_ANALYSIS_HINT = """This document belongs to a car-dealer financing file. Read it as bank-statement / tax-return / P&L / floorplan / MCA / real-estate-collateral evidence where applicable. Do not ask DSCR/rent questions."""
 
@@ -697,6 +706,57 @@ def _extract_pdf_text(file: BucketFile, raw: bytes, *, display_name: str | None 
         )
 
 
+def _render_pdf_pages_as_images(raw: bytes, *, max_pages: int = MAX_PDF_VISION_PAGES, dpi: int = PDF_VISION_DPI) -> list[bytes]:
+    """Rasterize a PDF's pages to PNG bytes for the vision fallback. Uses PyMuPDF
+    (pure wheel, no system deps). Returns [] if rendering is unavailable/fails."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception:  # noqa: BLE001
+        log.warning("bucket_ai: PyMuPDF unavailable — cannot rasterize scanned PDF for vision fallback")
+        return []
+    images: list[bytes] = []
+    try:
+        with fitz.open(stream=raw, filetype="pdf") as doc:
+            zoom = dpi / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            for page in doc:
+                if len(images) >= max_pages:
+                    break
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                images.append(pix.tobytes("png"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bucket_ai: PDF rasterization failed: %s", exc)
+        return []
+    return images
+
+
+def _append_pdf_vision_pages(
+    content: list[dict[str, Any]],
+    file: BucketFile,
+    raw: bytes,
+    file_name: str,
+) -> bool:
+    """Last-resort read for a scanned/image-only PDF: rasterize its pages and
+    attach them as image blocks so the model can read them visually. Returns
+    True if at least one page image was attached."""
+    images = _render_pdf_pages_as_images(raw)
+    if not images:
+        return False
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                f"PDF file {file.id}: {file_name}\nThis PDF had no extractable text (scanned or image-only), "
+                f"so its {len(images)} page(s) are attached as images for visual underwriting review. "
+                "Read the figures/tables directly from the images."
+            ),
+        }
+    )
+    for img in images:
+        content.append(_content_block("image/png", img))
+    return True
+
+
 def _is_xlsx_file(content_type: str, file_name: str) -> bool:
     lower = f"{content_type} {file_name}".lower()
     return (
@@ -947,6 +1007,9 @@ def _append_review_file_content(
         extracted, parse_skip = _extract_pdf_text(file, raw, display_name=file_name)
         if parse_skip:
             reason, explanation = parse_skip
+            if reason != "password_protected" and _append_pdf_vision_pages(content, file, raw, file_name):
+                skipped.append(_skip_named_file(file, file_name, "pdf_vision_read", "This large PDF had no extractable text (scanned/image-only), so its pages were read as images by the AI."))
+                return True, attached_pdf_pages, spreadsheet_text_chars
             skipped_file = _skip_named_file(file, file_name, reason, explanation)
             if reason == "password_protected":
                 blocked_files.append(skipped_file)
@@ -1018,6 +1081,11 @@ def _append_review_file_content(
                         return True, attached_pdf_pages, spreadsheet_text_chars
                     if extract_skip:
                         reason, explanation = extract_skip
+                # Scanned / image-only / unparseable PDF with no text — read it
+                # visually via rasterized pages before giving up.
+                if reason != "password_protected" and _append_pdf_vision_pages(content, file, raw, file_name):
+                    skipped.append(_skip_named_file(file, file_name, "pdf_vision_read", "This PDF had no extractable text (scanned/image-only), so its pages were read as images by the AI."))
+                    return True, attached_pdf_pages, spreadsheet_text_chars
                 skipped_file = _skip_named_file(file, file_name, reason, explanation)
                 if reason == "password_protected":
                     blocked_files.append(skipped_file)
@@ -1035,6 +1103,9 @@ def _append_review_file_content(
                             f"Direct PDF attachment was skipped because Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. Searchable text was extracted and reviewed instead.",
                         )
                     )
+                    return True, attached_pdf_pages, spreadsheet_text_chars
+                if _append_pdf_vision_pages(content, file, raw, file_name):
+                    skipped.append(_skip_named_file(file, file_name, "pdf_vision_read", "The direct PDF page budget was reached and no text could be extracted, so this PDF's pages were read as images by the AI."))
                     return True, attached_pdf_pages, spreadsheet_text_chars
                 if extract_skip:
                     reason, explanation = extract_skip
@@ -1288,7 +1359,7 @@ async def analyze_bucket_file(
             client=get_client(),
             model=model,
             metadata={"bucket_id": str(file.bucket_id), "bucket_file_id": str(file.id)},
-            max_tokens=1500,
+            max_tokens=3000,
             system=build_file_analysis_system(review_type),
             messages=[{"role": "user", "content": content}],
         )
