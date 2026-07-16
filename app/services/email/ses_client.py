@@ -33,6 +33,13 @@ class SesSendResult:
     message_id: str | None
     detail: str
 
+    @property
+    def error(self) -> str | None:
+        """The failure detail when the send did not succeed, else None.
+        Callers persist result.error as the send's error column; without this
+        property those reads raised AttributeError and 500'd the endpoint."""
+        return None if self.ok else self.detail
+
 
 def ses_configured() -> bool:
     """True when SES has a verified From address configured."""
