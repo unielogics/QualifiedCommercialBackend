@@ -201,6 +201,14 @@ _TAX_KEYS = (
     "ordinary_business_income", "total_revenue", "cost_of_goods_sold", "depreciation",
 )
 
+# Classifications that carry revenue-like line items but are NOT tax returns, so the
+# _TAX_KEYS content heuristic must not misclassify them (e.g. a YTD P&L has
+# gross_receipts but is not a filed return).
+_NON_TAX_CLASSES = {
+    "bank_statement", "current_p_and_l", "profit_and_loss", "p_and_l", "pnl",
+    "floorplan_mca_inventory", "identity", "other",
+}
+
 
 def _tax_year(facts: dict[str, Any]) -> str | None:
     for k in ("tax_year", "year", "return_year", "fiscal_year"):
@@ -221,7 +229,10 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
         facts = item.get("key_facts") or {}
         if not isinstance(facts, dict):
             continue
-        is_tax = cls == "tax_return" or any(k in facts for k in _TAX_KEYS)
+        # Only treat as a tax return by explicit classification, or by the content
+        # heuristic when the file is NOT a known non-tax type (a P&L / bank statement
+        # can carry gross_receipts/net_income without being a filed return).
+        is_tax = cls == "tax_return" or (cls not in _NON_TAX_CLASSES and any(k in facts for k in _TAX_KEYS))
         if not is_tax:
             continue
         year = _tax_year(facts) or cls

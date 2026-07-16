@@ -151,7 +151,7 @@ REVIEW_LIMITS = """Keep the response compact enough to parse: executive_summary 
 # Car-dealer-only review rules. Never combined with the real-estate rules below.
 DEALER_REVIEW_RULES = """Act as a strict Stage 1 public lead gatekeeper for a car dealer financing file. Stage 1 is preliminary bankability, not final approval. Use the minimum Stage 1 package first: last 2 years business tax returns, current-year/YTD P&L, last 6 months main operating bank statements, requested amount, detailed use of funds with amount breakdown, stated current monthly debt payments, and estimated credit score/tier. Do not ask for a full underwriting package unless Stage 1 shows good probability. Treat real estate collateral as the next targeted clarification after cash-flow context indicates a possible path: property address, estimated value, current mortgage balance, and ownership/entity relationship if unclear. Floorplan/MCA/inventory statements are conditional only when documents, bank statements, or chat answers indicate those obligations exist.
 Set screening_stage to "stage_1_bankability" and choose exactly one probability_status from: "Good probability - book call", "Promising but needs one clarification", "Not enough evidence yet", or "Poor probability based on current file". Set booking_recommended true only when the file has good lending probability and a human call should be offered now. Do not use CALL_NOW, MAYBE, or DO_NOT_CALL labels.
-Calculate key_metrics when the documents allow it: revenue trend, YTD annualized revenue, annualized adjusted deposits, tax return revenue vs bank deposit consistency, estimated EBITDA/cash flow, estimated debt burden, estimated DSCR, NSF/overdraft/negative-balance flags, and requested amount reasonableness. Use null or a short unavailable explanation when the file does not support the metric.
+ALWAYS calculate key_metrics as NUMBERS whenever the uploaded bank statements or tax returns support them — do NOT leave them null when the evidence is present. From bank statements, compute annualized_adjusted_deposits (average monthly total deposits × 12) and estimated_ebitda_or_cash_flow (average monthly deposits minus withdrawals × 12). From tax returns, set ytd_annualized_revenue to the most recent year's gross receipts and describe revenue_trend across the two years. Populate estimated_debt_burden and estimated_dscr when a debt schedule, stated monthly debt, or bank-visible loan/floorplan payments allow it. Also fill tax_return_revenue_vs_bank_deposits (consistency check) and requested_amount_reasonableness. Only use null for a metric the file genuinely cannot support, and when you do, say exactly which document would supply it. Every key_metrics number MUST be a bare number (no "$" or commas).
 Uploaded files may be random or miscategorized by the client. Classify documents from the readable content and file name first; do not rely only on requested_document_id. If a mortgage note, payoff statement, amortization schedule, loan statement, or debt schedule is uploaded, treat it as partial real-estate/collateral evidence even when the selected category is wrong. Do not say every baseline category is missing when any uploaded file supports a baseline category. Instead say exactly what the uploaded files prove and what is still missing, for example: "I see collateral debt evidence, but not tax returns, P&L, bank statements, property values, or entity relationship explanation." Ask for estimated values or missing addresses for collateral files when needed.
 For incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) whether the file appears fundable, preliminarily fundable subject to confirmation, not fundable, or cannot be determined, (3) what still blocks a credit decision, and (4) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
 With strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
@@ -476,6 +476,8 @@ def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
     shaped["confidence"] = confidence if confidence in {"high", "medium", "low"} else "low"
     if not isinstance(shaped.get("key_metrics"), dict):
         shaped["key_metrics"] = {}
+    if not isinstance(shaped.get("lending_ready"), bool):
+        shaped["lending_ready"] = False
     if not isinstance(shaped.get("strengths"), list):
         shaped["strengths"] = []
     if not isinstance(shaped.get("risks"), list):
@@ -609,6 +611,189 @@ def _merge_per_file_analyses(
             }
             for item in per_file_analyses
         ]
+
+
+def _compute_key_metrics_from_cache(
+    result: dict[str, Any], per_file_analyses: list[dict[str, Any]]
+) -> None:
+    """Deterministically populate numeric key_metrics from the durable per-file
+    bank/tax facts, so the intelligence cards show real figures even when the
+    light synthesis pass leaves key_metrics blank (its common failure mode).
+
+    Only fills a metric the synthesis left null/empty — an AI-provided value is
+    never overwritten. Reuses the same extractors the lender packet uses."""
+    from app.services.public_underwriting_packet_pdf import (
+        extract_bank_months,
+        extract_tax_years,
+    )
+
+    # extract_* keys on "classification"; per_file_analyses carries "ai_classification".
+    normalized = [
+        {
+            "file_id": item.get("file_id"),
+            "classification": item.get("ai_classification"),
+            "key_facts": item.get("key_facts") or {},
+        }
+        for item in per_file_analyses
+    ]
+    months = extract_bank_months(normalized)
+    years = extract_tax_years(normalized)
+
+    km = result.get("key_metrics")
+    if not isinstance(km, dict):
+        km = {}
+
+    def _blank(key: str) -> bool:
+        v = km.get(key)
+        return v is None or (isinstance(v, str) and (not v.strip() or v.strip().lower() in {"null", "n/a", "unavailable"}))
+
+    # Annualized GROSS deposits = average monthly total deposits × 12. This is the
+    # raw bank-inflow figure, NOT scrubbed revenue — never relabel it as revenue.
+    dep_vals = [m["deposits"] for m in months if m.get("deposits") is not None]
+    avg_monthly_deposits = sum(dep_vals) / len(dep_vals) if dep_vals else None
+    annualized_deposits = round(avg_monthly_deposits * 12) if avg_monthly_deposits is not None else None
+
+    # Tax-return figures (the only source we treat as true revenue / earnings).
+    tax_latest = years[-1] if years else None
+    tax_prior = years[-2] if len(years) >= 2 else None
+    tax_revenue = tax_latest.get("gross_receipts") if tax_latest else None
+    tax_net_income = tax_latest.get("net_income") if tax_latest else None
+
+    # Annualized gross bank deposits (bank inflow — an activity signal, not revenue).
+    if _blank("annualized_adjusted_deposits") and annualized_deposits is not None:
+        km["annualized_adjusted_deposits"] = annualized_deposits
+    # Revenue is a TAX-RETURN figure only. Do NOT promote bank deposits into the
+    # revenue field — gross deposits are not revenue (transfers, refunds, financing
+    # inflows inflate them). Leave null when no tax return, so the card shows a
+    # "needs tax returns" hint instead of a misleading number.
+    if _blank("ytd_annualized_revenue") and tax_revenue is not None:
+        km["ytd_annualized_revenue"] = round(tax_revenue)
+    # EBITDA/cash-flow proxy is a tax net-income figure, NOT deposits minus
+    # withdrawals (that is only the net change in the bank balance).
+    if _blank("estimated_ebitda_or_cash_flow") and tax_net_income is not None:
+        km["estimated_ebitda_or_cash_flow"] = round(tax_net_income)
+    # NOTE: estimated_debt_burden and estimated_dscr are intentionally NOT derived
+    # from bank withdrawals — total operating outflow (inventory, payroll, floorplan
+    # paydowns) is not debt service, so a withdrawals-based DSCR would badly mislead
+    # an underwriter. These stay null unless the AI extracts them from a real debt
+    # schedule / stated monthly debt, which surfaces a "needs debt schedule" hint.
+    if _blank("revenue_trend") and tax_latest and tax_prior:
+        a = tax_prior.get("gross_receipts")
+        b = tax_latest.get("gross_receipts")
+        if a and b:
+            pct = (b - a) / a * 100
+            km["revenue_trend"] = f"{tax_prior.get('year')}→{tax_latest.get('year')}: {pct:+.0f}% gross receipts"
+    if _blank("tax_return_revenue_vs_bank_deposits") and tax_revenue is not None and annualized_deposits is not None:
+        km["tax_return_revenue_vs_bank_deposits"] = (
+            f"Tax gross receipts ${tax_revenue:,.0f} vs annualized gross deposits ${annualized_deposits:,.0f}"
+        )
+
+    result["key_metrics"] = km
+
+
+# Stage-1 baseline categories a dealer file needs before it is "ready for lending".
+_READINESS_BASELINE = {"bank statement", "tax return"}
+
+
+def _baseline_key(category_or_name: str) -> str | None:
+    """Map a coverage-row category or missing-item title to a normalized baseline
+    key in _READINESS_BASELINE ('bank statement' / 'tax return'), or None."""
+    text = str(category_or_name or "").lower()
+    if "bank" in text and ("statement" in text or "account" in text):
+        return "bank statement"
+    if "tax" in text and "return" in text:
+        return "tax return"
+    return None
+
+
+def _apply_lending_readiness(result: dict[str, Any]) -> None:
+    """Set result['lending_ready'] and, when the file is NOT ready, derive a
+    concrete clarifying next step from the HIGHEST-PRIORITY open gap instead of a
+    generic 'continue the conversation'.
+
+    Ready requires BOTH: (a) every required Stage-1 baseline category
+    (_READINESS_BASELINE) is present and satisfied in baseline_coverage, and
+    (b) no open missing_or_incomplete_items remain AFTER reconciling them against
+    satisfied coverage (an AI-authored 'missing tax returns' is dropped once a
+    tax-return file is classified as satisfied)."""
+    evidence_map = result.get("document_evidence_map") or {}
+    coverage = evidence_map.get("baseline_coverage") or []
+    missing = result.get("missing_or_incomplete_items") or []
+
+    def _status(row: dict[str, Any]) -> str:
+        return str(row.get("status") or "").strip().lower()
+
+    satisfied_states = {"satisfied", "uploaded", "complete"}
+    baseline_rows = [c for c in coverage if isinstance(c, dict)]
+
+    # Which required baseline categories are satisfied by the coverage rows.
+    satisfied_keys: set[str] = set()
+    for row in baseline_rows:
+        key = _baseline_key(row.get("category"))
+        if key and _status(row) in satisfied_states:
+            satisfied_keys.add(key)
+    required_covered = _READINESS_BASELINE.issubset(satisfied_keys)
+
+    # Reconcile the AI-authored missing list: drop any item that maps to a baseline
+    # category now satisfied by an analyzed file, so a reconciled category stops
+    # blocking readiness.
+    open_items = []
+    for m in missing:
+        if not isinstance(m, dict):
+            continue
+        key = _baseline_key(m.get("title") or m.get("detail"))
+        if key and key in satisfied_keys:
+            continue
+        open_items.append(m)
+
+    unsatisfied_rows = [c for c in baseline_rows if _status(c) not in satisfied_states]
+
+    ready = required_covered and not open_items
+    result["lending_ready"] = ready
+
+    nba = result.get("next_best_action")
+    nba_generic = (
+        not isinstance(nba, dict)
+        or str(nba.get("type") or "none") == "none"
+        or "continue the underwriting conversation" in str(nba.get("detail") or "").lower()
+    )
+    one_next = str(result.get("one_next_step") or "").strip()
+
+    if ready:
+        if not one_next:
+            result["one_next_step"] = "All Stage 1 evidence is in and clear — advance to lender packaging."
+        return
+
+    # Pick the top gap: highest-priority open missing item first, then any required
+    # baseline category still missing, then any unsatisfied coverage row.
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    top_gap = None
+    if open_items:
+        ranked = sorted(open_items, key=lambda m: priority_rank.get(str(m.get("priority") or "").lower(), 1))
+        item = ranked[0]
+        top_gap = str(item.get("title") or item.get("detail") or "").strip()
+    if not top_gap:
+        missing_baseline = _READINESS_BASELINE - satisfied_keys
+        if missing_baseline:
+            # Deterministic order: bank statement before tax return.
+            for key in ("bank statement", "tax return"):
+                if key in missing_baseline:
+                    top_gap = f"last {'6 months of bank statements' if key == 'bank statement' else '2 years of tax returns'}"
+                    break
+    if not top_gap and unsatisfied_rows:
+        top_gap = str(unsatisfied_rows[0].get("category") or "").strip()
+
+    if top_gap:
+        question = f"To complete the initial underwriting, please clarify or provide: {top_gap}."
+        if nba_generic:
+            result["next_best_action"] = {
+                "type": "clarify",
+                "title": "Ask the borrower to clarify",
+                "detail": question,
+                "reason": "Derived from the top open underwriting gap.",
+            }
+        if not one_next:
+            result["one_next_step"] = question
 
 
 def _s3_client():
@@ -1643,6 +1828,11 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             wanted = _classifications_for_requested_doc(doc.name, doc.category)
             if wanted & present_classes:
                 doc.status = "uploaded"
+        # Deterministically fill numeric key_metrics from the cached bank/tax facts
+        # (the synthesis pass frequently leaves them null) and compute lending
+        # readiness + a concrete clarifying next step from the open gaps.
+        _compute_key_metrics_from_cache(result, per_file_analyses)
+        _apply_lending_readiness(result)
         if skipped:
             result["skipped_files"] = skipped
         review.result = result
