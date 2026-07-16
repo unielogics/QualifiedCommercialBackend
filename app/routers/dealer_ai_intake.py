@@ -3451,6 +3451,97 @@ async def create_dealer_ai_lender_packet(
     return _artifact_read(artifact)
 
 
+@admin_router.get("/{intake_id}/package.zip")
+async def download_dealer_ai_package_zip(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Bundle the full shipping package as a single ZIP: every uploaded document,
+    the lender-packet PDF, the executive summary (markdown), a ready-to-edit
+    vendor email template, and a README manifest — so the operator can ship the
+    whole file anywhere (attach, upload, or archive) in one download."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
+    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user)
+    email_draft = await _generate_management_json(
+        db,
+        intake,
+        user,
+        purpose="vendor_email",
+        extra={"executive_summary": summary_artifact.body_json, "lender_packet_title": packet_artifact.title},
+    )
+    await db.commit()
+
+    label = _safe_filename(intake.business_name or intake.full_name or "lead")
+    files = sorted(_active_files(intake.bucket), key=lambda f: f.file_name.lower())
+    manifest_lines = [
+        f"Qualified Commercial — Underwriting Package",
+        f"Borrower/entity: {intake.business_name or intake.full_name or '-'}",
+        f"Contact: {intake.full_name or '-'} <{intake.email or '-'}>",
+        f"Generated: {_now().strftime('%b %d, %Y %I:%M %p UTC')}",
+        "",
+        "Contents:",
+        "  executive-summary.md   — AI executive summary",
+        "  lender-packet.pdf       — formatted lender/vendor packet",
+        "  email-template.txt      — ready-to-edit vendor outreach email",
+        f"  documents/              — {len(files)} uploaded file(s)",
+        "",
+        "Uploaded documents:",
+    ]
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Executive summary (markdown prose).
+        zf.writestr("executive-summary.md", summary_artifact.body_text or "Awaiting AI executive summary.")
+        # Lender packet PDF.
+        if packet_artifact.s3_key:
+            try:
+                zf.writestr("lender-packet.pdf", await _s3_bytes(packet_artifact.s3_key))
+            except Exception:  # noqa: BLE001
+                log.exception("package.zip: lender packet fetch failed intake=%s", intake_id)
+        # Vendor email template.
+        subject = str(email_draft.get("subject") or f"Qualified Commercial review: {intake.business_name or intake.full_name}")
+        body = str(email_draft.get("body") or summary_artifact.body_text or "")
+        zf.writestr("email-template.txt", f"Subject: {subject}\n\n{body}\n")
+        # All uploaded documents under documents/.
+        used_names: set[str] = set()
+        for f in files:
+            entry_name = _safe_filename(f.file_name) or f"file-{str(f.id)[:8]}"
+            candidate = entry_name
+            n = 2
+            while candidate in used_names:
+                candidate = f"{entry_name}-{n}"
+                n += 1
+            used_names.add(candidate)
+            manifest_lines.append(f"  - {f.file_name} ({round((f.size_bytes or 0) / 1024)} KB)")
+            try:
+                zf.writestr(f"documents/{candidate}", await _s3_bytes(f.s3_key))
+            except Exception:  # noqa: BLE001
+                log.exception("package.zip: doc fetch failed file=%s", f.id)
+        zf.writestr("README.txt", "\n".join(manifest_lines) + "\n")
+
+    payload = buf.getvalue()
+    filename = f"{label}-package.zip"
+    await _log(
+        db,
+        intake.bucket_id,
+        "underwriting_package_zip_downloaded",
+        user=user,
+        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"{filename} ({round(len(payload) / 1024)} KB, {len(files)} docs)",
+    )
+    await db.commit()
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @admin_router.post("/{intake_id}/vendor-email/preview", response_model=VendorEmailPreviewResponse)
 async def preview_dealer_ai_vendor_email(
     intake_id: UUID,
