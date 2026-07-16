@@ -638,9 +638,9 @@ def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
     )
 
 
-def _simple_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
+def _simple_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str]], empty_message: str = "Awaiting evidence.") -> str:
     if not rows:
-        body = f'<tr><td colspan="{len(columns)}" class="empty">Awaiting evidence.</td></tr>'
+        body = f'<tr><td colspan="{len(columns)}" class="empty">{escape(empty_message)}</td></tr>'
     else:
         body = "".join(
             "<tr>" + "".join(f"<td>{escape(_text(row.get(key), fallback='—'))}</td>" for key, _ in columns) + "</tr>"
@@ -766,14 +766,38 @@ def render_underwriting_packet_pdf(
     mitigants = [_redact(s) for s in (_strings(executive_summary.get("mitigants")) or _strings(result.get("mitigants")))]
     strengths = [_redact(s) for s in (_strings(executive_summary.get("strengths")) or _strings(result.get("strengths")))]
 
+    evidence = _record(result.get("document_evidence_map"))
+    coverage_rows = _records(evidence.get("baseline_coverage")) or _records(evidence.get("file_classifications"))
+
+    # Missing confirmations must reflect the RECONCILED review, not raw requested-doc
+    # link state. Prefer the AI's explicit missing list; otherwise derive gaps from
+    # baseline_coverage rows that are not satisfied. Only fall back to the requested-
+    # doc checklist when there is no coverage at all — and even then, drop any doc a
+    # coverage row already marks satisfied, so a fully-satisfied file shows no
+    # phantom "missing" items (which would contradict a "ready for lending" state).
+    _satisfied_states = {"satisfied", "uploaded", "complete"}
     missing_rows = _records(result.get("missing_or_incomplete_items"))
-    if not missing_rows:
+    if not missing_rows and coverage_rows:
+        missing_rows = [
+            {
+                "title": _text(row.get("category"), fallback="Baseline item"),
+                "detail": _text(row.get("gap"), fallback=""),
+                "priority": _text(row.get("status"), fallback="open"),
+            }
+            for row in coverage_rows
+            if str(row.get("status") or "").strip().lower() not in _satisfied_states
+        ]
+    elif not missing_rows:
+        satisfied_categories = {
+            str(row.get("category") or "").strip().lower()
+            for row in coverage_rows
+            if str(row.get("status") or "").strip().lower() in _satisfied_states
+        }
         missing_rows = [
             {"title": getattr(doc, "name", "Missing item"), "detail": getattr(doc, "description", ""), "priority": "open"}
             for doc in missing_docs
+            if str(getattr(doc, "name", "") or "").strip().lower() not in satisfied_categories
         ]
-    evidence = _record(result.get("document_evidence_map"))
-    coverage_rows = _records(evidence.get("baseline_coverage")) or _records(evidence.get("file_classifications"))
     reviewed_docs = [
         {
             "file": getattr(file, "zip_entry_path", None) or getattr(file, "file_name", "Uploaded file"),
@@ -941,7 +965,7 @@ def render_underwriting_packet_pdf(
     <td>{_simple_table("Evidence coverage", coverage_rows, [("category", "Category"), ("status", "Status"), ("gap", "Evidence / gap")])}</td>
   </tr></table>
 
-  {_simple_table("Missing confirmations", missing_rows, [("title", "Item"), ("priority", "Priority"), ("detail", "Detail")])}
+  {_simple_table("Missing confirmations", missing_rows, [("title", "Item"), ("priority", "Priority"), ("detail", "Detail")], empty_message="All Stage 1 baseline evidence received — no outstanding confirmations.")}
 
   <table class="cols"><tr>
     <td>{_bullet_card("Strengths", strengths, "green")}</td>

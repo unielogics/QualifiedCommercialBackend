@@ -1896,6 +1896,62 @@ def _strip_code_fence(text: str) -> str:
     return stripped.strip()
 
 
+def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+    """Recover a JSON object cut off by max_tokens: close an open string + any
+    unbalanced brackets and drop a dangling key, then retry. Keeps a long
+    exec-summary/email response from collapsing to a raw {"body": ...} blob when
+    the model runs out of output budget mid-object. Returns the parsed dict or None."""
+    cleaned = _strip_code_fence(text)
+    if not cleaned.startswith("{"):
+        return None
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    for ch in cleaned:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    repaired = cleaned
+    if in_string:
+        repaired += '"'
+    repaired = repaired.rstrip()
+    # Truncation left a dangling object key with no value (`"key` just closed, or
+    # `"key":` with nothing after) — drop it so the object closes validly.
+    if in_string and stack and stack[-1] == "}":
+        last_key_quote = repaired.rfind('"', 0, len(repaired) - 1)
+        if last_key_quote > 0:
+            repaired = repaired[:last_key_quote].rstrip().rstrip(",").rstrip()
+    repaired = repaired.rstrip()
+    while repaired and repaired[-1] in ":,":
+        if repaired[-1] == ":":
+            repaired = repaired[:-1].rstrip()
+            key_q = repaired.rfind('"')
+            key_q2 = repaired.rfind('"', 0, key_q) if key_q > 0 else -1
+            if key_q2 >= 0:
+                repaired = repaired[:key_q2].rstrip().rstrip(",").rstrip()
+        else:
+            repaired = repaired[:-1].rstrip()
+    for closer in reversed(stack):
+        repaired += closer
+    try:
+        parsed = json.loads(repaired)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def _json_from_ai_text(text: str) -> dict[str, Any]:
     stripped = _strip_code_fence(text)
     try:
@@ -1910,6 +1966,12 @@ def _json_from_ai_text(text: str) -> dict[str, Any]:
                 return parsed if isinstance(parsed, dict) else {"body": stripped}
             except json.JSONDecodeError:
                 pass
+    # Recover a truncated object so structured fields (title, key_metrics, …)
+    # survive instead of collapsing into a raw {"body": raw-json-string} fallback
+    # that renders as JSON in the UI.
+    repaired = _repair_truncated_json(stripped)
+    if isinstance(repaired, dict) and repaired:
+        return repaired
     return {"body": stripped}
 
 
@@ -2092,7 +2154,10 @@ async def _generate_management_json(
         user_id=user.id,
         client_id=intake.client_id,
         metadata={"intake_id": intake.id, "bucket_id": intake.bucket_id, "purpose": purpose},
-        max_tokens=2600,
+        # Generous budget so a full exec summary (many key_metrics + documents_reviewed)
+        # is not truncated mid-JSON — truncation is the main cause of the summary
+        # rendering as raw JSON.
+        max_tokens=4096,
         temperature=0.3,
         system=system,
         messages=[{"role": "user", "content": json.dumps(json_safe_metadata(prompt), ensure_ascii=False)}],
@@ -2184,7 +2249,15 @@ async def _create_executive_summary_artifact(
 ) -> PublicUnderwritingIntakeArtifact:
     summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
     title = str(summary.get("title") or _summary_title(intake))[:240]
-    body_text = _format_executive_summary_markdown(summary) or str(summary.get("executive_summary") or summary.get("body") or "")
+    body_text = _format_executive_summary_markdown(summary)
+    if not body_text:
+        # Never surface a raw JSON blob: prefer the narrative field, and if only a
+        # raw {"body": "...json..."} survived, pull the executive_summary string out.
+        candidate = str(summary.get("executive_summary") or summary.get("body") or "").strip()
+        if candidate.lstrip().startswith("{") or candidate.lstrip().startswith("```"):
+            recovered = _repair_truncated_json(candidate) or {}
+            candidate = str(recovered.get("executive_summary") or "").strip()
+        body_text = candidate
     artifact = PublicUnderwritingIntakeArtifact(
         intake_id=intake.id,
         artifact_type="executive_summary",
