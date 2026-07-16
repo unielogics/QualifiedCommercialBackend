@@ -223,6 +223,41 @@ class FundingReviewStart(BaseModel):
         return None if value == "" else value
 
 
+class AdminLeadCreate(BaseModel):
+    """Super-admin creates an AI-underwriter lead on behalf of a client. Mirrors the
+    public start schemas but with no terms/throttle and an explicit variant selector.
+    The client can later log in with this email exactly like a self-serve lead."""
+
+    variant: str = Field(default="dealer")  # "dealer" | "real_estate"
+    full_name: str = Field(min_length=1, max_length=180)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=48)
+    business_name: str | None = Field(default=None, max_length=180)
+    # Real-estate basics (optional; mirror FundingReviewStart).
+    investor_name: str | None = Field(default=None, max_length=180)
+    target_property_address: str | None = Field(default=None, max_length=320)
+    transaction_type: str | None = Field(default=None, max_length=64)
+    requested_amount: float | None = Field(default=None, ge=0)
+    estimated_value_or_purchase_price: float | None = Field(default=None, ge=0)
+    monthly_rent: float | None = Field(default=None, ge=0)
+    estimated_credit_tier: str | None = Field(default=None, max_length=64)
+    notify_client: bool = False  # email the client a secure resume/login link now
+    force_new: bool = False  # create a second lead even if one already exists for this email
+
+    @field_validator("variant", mode="before")
+    @classmethod
+    def normalize_variant(cls, value: object) -> object:
+        return (str(value).strip().lower() if value else "dealer")
+
+    @field_validator(
+        "phone", "business_name", "investor_name", "target_property_address",
+        "transaction_type", "estimated_credit_tier", mode="before",
+    )
+    @classmethod
+    def empty_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
 class DealerIntakePatch(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)
     phone: str | None = Field(default=None, max_length=48)
@@ -3493,6 +3528,169 @@ async def get_dealer_ai_lead(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
+@admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def create_admin_ai_lead(
+    payload: AdminLeadCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Super-admin creates an AI-underwriter lead ON BEHALF of a client and can
+    start underwriting immediately. The client can log in later with this email
+    exactly like a self-serve lead (email + code), since login keys off the email
+    and the intake carries client_id. Reuses the same creation helpers as the
+    public /start flows via lightweight adapter payloads. No terms/throttle."""
+    _require_super_admin(user)
+    if payload.variant not in ("dealer", "real_estate"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
+    is_re = payload.variant == "real_estate"
+    variant_const = FUNDING_VARIANT if is_re else "dealer_gatekeeper_v1"
+
+    # Duplicate policy: unless force_new, surface the existing active lead so the
+    # operator opens it instead of creating a duplicate bucket for the same email.
+    if not payload.force_new:
+        existing = await _latest_active_intake_by_email(db, str(payload.email), variant=variant_const)
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "message": "An active lead already exists for this email.",
+                    "intake_id": str(existing.id),
+                },
+            )
+
+    provenance = {
+        "created_by_admin": {
+            "user_id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "at": _now().isoformat(),
+        },
+        "on_behalf_of_client": True,
+    }
+
+    if is_re:
+        adapter = FundingReviewStart(
+            full_name=payload.full_name,
+            email=payload.email,
+            phone=payload.phone,
+            investor_name=payload.investor_name,
+            target_property_address=payload.target_property_address,
+            transaction_type=payload.transaction_type,
+            requested_amount=payload.requested_amount,
+            estimated_value_or_purchase_price=payload.estimated_value_or_purchase_price,
+            monthly_rent=payload.monthly_rent,
+            estimated_credit_tier=payload.estimated_credit_tier,
+        )
+        client = await _find_or_create_funding_client(db, adapter)
+        bucket, link = await _create_bucket_for_funding_review(db, client, adapter, request)
+    else:
+        adapter = DealerIntakeStart(
+            full_name=payload.full_name,
+            email=payload.email,
+            phone=payload.phone,
+            business_name=payload.business_name,
+        )
+        client = await _find_or_create_client(db, adapter)
+        bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
+
+    # CRM traceability: mark that this client/lead originated from an admin action.
+    if isinstance(client.lead_intake, dict):
+        client.lead_intake = {**client.lead_intake, "created_by_admin": str(user.id)}
+
+    token = _new_public_token()
+    intake_state: dict[str, Any] = {
+        "messages": [],
+        "source": ("funding_review" if is_re else "dealer_ai_intake"),
+        "admin_provenance": provenance,
+    }
+    if is_re:
+        intake_state["funding_review_basics"] = {
+            "investor_name": payload.investor_name,
+            "target_property_address": payload.target_property_address,
+            "transaction_type": payload.transaction_type,
+            "requested_amount": payload.requested_amount,
+            "estimated_value_or_purchase_price": payload.estimated_value_or_purchase_price,
+            "monthly_rent": payload.monthly_rent,
+            "estimated_credit_tier": payload.estimated_credit_tier,
+        }
+
+    intake = PublicUnderwritingIntake(
+        client_id=client.id,
+        bucket_id=bucket.id,
+        bucket_upload_link_id=link.id,
+        token_hash=_hash_token(token),
+        variant=variant_const,
+        full_name=payload.full_name.strip(),
+        email=client.email or _normalize_email(str(payload.email)),
+        phone=payload.phone,
+        business_name=(payload.investor_name if is_re else payload.business_name),
+        loan_purpose=(payload.transaction_type if is_re else None),
+        requested_loan_amount=(payload.requested_amount if is_re else None),
+        asset_rows=(
+            [
+                {
+                    "address": payload.target_property_address,
+                    "estimated_property_value": payload.estimated_value_or_purchase_price,
+                    "notes": "Target property from admin-created funding review",
+                }
+            ]
+            if is_re and (payload.target_property_address or payload.estimated_value_or_purchase_price)
+            else []
+        ),
+        intake_state=intake_state,
+    )
+    db.add(intake)
+    await _log(
+        db,
+        bucket.id,
+        "dealer_ai_lead_created_by_admin",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Admin created {payload.variant} lead for {intake.email}",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+
+    email_note = ""
+    if payload.notify_client:
+        if is_re:
+            record = _record_resume_email(
+                intake,
+                token=token,
+                request=request,
+                reason="admin_created",
+                public_path=FUNDING_PUBLIC_PATH,
+                review_label="real estate funding review",
+                room_label="real estate funding review file",
+            )
+        else:
+            record = _record_resume_email(intake, token=token, request=request, reason="admin_created")
+        await db.commit()
+        intake = await _load_admin_dealer_lead(db, intake.id)
+        email_note = (
+            " A secure login link was emailed to the client."
+            if record.get("ok")
+            else " Email delivery is unavailable; share the resume link manually."
+        )
+
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
+        include_management=True,
+        admin_thread=True,
+        assistant_message=(
+            "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
+            + email_note
+        ),
+    )
 
 
 @admin_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)
