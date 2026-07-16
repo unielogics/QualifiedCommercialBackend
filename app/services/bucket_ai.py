@@ -2252,6 +2252,66 @@ async def visible_action_items(
     return (await db.execute(stmt.order_by(BucketAIActionItem.created_at.desc()))).scalars().all()
 
 
+async def _recent_thread_messages(
+    db: AsyncSession,
+    *,
+    bucket_id: UUID,
+    audience: str,
+    upload_link_id: UUID | None,
+    exclude_id: UUID | None = None,
+    limit: int = 20,
+) -> list[BucketAIMessage]:
+    """Recent chat turns for ONE thread, oldest→newest, for conversation memory.
+
+    Strictly audience-scoped so the private admin thread and the client (uploader)
+    thread never see each other. For the uploader audience the query is also pinned
+    to the upload link so two client links on one bucket don't bleed together. Do
+    NOT route this through _recent_dealer_chat (dealer_ai_intake.py), which merges
+    audiences for review/summary building."""
+    filters = [
+        BucketAIMessage.bucket_id == bucket_id,
+        BucketAIMessage.audience == audience,
+    ]
+    if audience == "uploader":
+        filters.append(BucketAIMessage.upload_link_id == upload_link_id)
+    if exclude_id is not None:
+        filters.append(BucketAIMessage.id != exclude_id)
+    rows = (
+        await db.execute(
+            select(BucketAIMessage)
+            .where(*filters)
+            .order_by(BucketAIMessage.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return list(reversed(rows))
+
+
+def _thread_turns_for_model(history: list[BucketAIMessage], max_chars: int = 2000) -> list[dict[str, str]]:
+    """Map stored chat messages to Anthropic-format turns, defensively cleaning any
+    assistant row that stored raw JSON scaffolding, and MERGING consecutive
+    same-role turns (the API requires strictly alternating user/assistant roles;
+    on-behalf/admin threads can have adjacent user messages)."""
+    turns: list[dict[str, str]] = []
+    for msg in history:
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        role = "assistant" if msg.role == "assistant" else "user"
+        if role == "assistant" and (content.startswith("{") or content.startswith("```")):
+            content = (_extract_answer_string(content) or _strip_code_fence(content) or content)
+        content = content[:max_chars]
+        author = (msg.author_name or "").strip()
+        # Attribute user turns so the model can tell operator/borrower apart.
+        if role == "user" and author and author.lower() not in ("you", "user"):
+            content = f"[{author}] {content}"
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"] = f"{turns[-1]['content']}\n\n{content}"[: max_chars * 2]
+        else:
+            turns.append({"role": role, "content": content})
+    return turns
+
+
 async def create_chat_reply(
     db: AsyncSession,
     *,
@@ -2281,6 +2341,33 @@ async def create_chat_reply(
     context = await _chat_context(db, bucket=bucket, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access)
     review_type = (bucket.ai_context or {}).get("review_type")
     model = model_light()
+
+    # Conversation memory: thread the prior turns (audience-scoped) so the AI does
+    # not re-ask what was already answered. The context/document blob rides on the
+    # opening user turn; then the real transcript; then the current message last.
+    history = await _recent_thread_messages(
+        db,
+        bucket_id=bucket.id,
+        audience=audience,
+        upload_link_id=upload_link.id if upload_link else None,
+        exclude_id=user_row.id,
+    )
+    convo = _thread_turns_for_model(history)
+    chat_messages_arg: list[dict[str, str]] = [
+        {"role": "user", "content": json.dumps({"context": context}, default=str)}
+    ]
+    # Anthropic requires the first turn to be user and strictly alternating roles.
+    # If the earliest history turn is an assistant reply, fold it into the opening
+    # user (context) turn instead of emitting user,assistant,assistant,...
+    for turn in convo:
+        if not chat_messages_arg or chat_messages_arg[-1]["role"] != turn["role"]:
+            chat_messages_arg.append(turn)
+        else:
+            chat_messages_arg[-1]["content"] = f"{chat_messages_arg[-1]['content']}\n\n{turn['content']}"
+    if chat_messages_arg[-1]["role"] == "user":
+        chat_messages_arg[-1]["content"] = f"{chat_messages_arg[-1]['content']}\n\n{message}"
+    else:
+        chat_messages_arg.append({"role": "user", "content": message})
     try:
         resp = await tracked_messages_create(
             db,
@@ -2297,7 +2384,7 @@ async def create_chat_reply(
             },
             max_tokens=3000,
             system=build_chat_system(review_type),
-            messages=[{"role": "user", "content": json.dumps({"context": context, "message": message}, default=str)}],
+            messages=chat_messages_arg,
         )
         raw_text = _text_from_response(resp)
         parsed = _json_or_fallback(raw_text, "answer")

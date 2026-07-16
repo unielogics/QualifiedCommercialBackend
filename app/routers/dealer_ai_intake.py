@@ -1414,7 +1414,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     }
 
 
-def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None) -> None:
+def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None, *, source: str = "client_chat") -> None:
     text = (message or "").strip()
     if not text:
         return
@@ -1422,7 +1422,7 @@ def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None) -> 
     facts = state.get("chat_facts")
     if not isinstance(facts, list):
         facts = []
-    facts.append({"at": _now().isoformat(), "source": "client_chat", "text": text[:1200]})
+    facts.append({"at": _now().isoformat(), "source": source, "text": text[:1200]})
     state["chat_facts"] = facts[-30:]
     intake.intake_state = state
 
@@ -3790,6 +3790,10 @@ async def dealer_ai_lead_chat(
         )
         if chat_messages:
             assistant_message = chat_messages[-1].content
+        # Persist the operator's stated facts (requested amount, credit tier, use
+        # of funds, …) so the next review/summary sees them — the client path
+        # already records into chat_facts; the admin path did not until now.
+        _record_chat_fact(intake, payload.message, source="admin_chat")
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _response(
