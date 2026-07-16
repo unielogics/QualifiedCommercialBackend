@@ -167,6 +167,19 @@ async def list_calendar_activity(
     return safe
 
 
+async def _push_to_google(db: AsyncSession, ev: CalendarEvent, *, deleted: bool = False) -> None:
+    """Best-effort mirror of an internal event to the owner's Google Calendar.
+    Never raises — a Google outage must not break the local calendar write."""
+    try:
+        from app.services.google.calendar_sync import push_event
+
+        await push_event(db, ev, deleted=deleted)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("calendar google push failed event=%s", getattr(ev, "id", None))
+
+
 @router.post("", response_model=CalendarEventRead)
 async def create_event(
     payload: CalendarEventCreate,
@@ -202,6 +215,7 @@ async def create_event(
         import logging
 
         logging.getLogger(__name__).exception("calendar create notification failed event=%s", ev.id)
+    await _push_to_google(db, ev)
     return CalendarEventRead.model_validate(ev)
 
 
@@ -284,6 +298,7 @@ async def update_event(
         import logging
 
         logging.getLogger(__name__).exception("calendar update notification failed event=%s", ev.id)
+    await _push_to_google(db, ev)
     return CalendarEventRead.model_validate(ev)
 
 
@@ -309,5 +324,6 @@ async def delete_event(
             payload={"event_id": str(ev.id), "kind": ev.kind, "title": ev.title},
         )
     )
+    await _push_to_google(db, ev, deleted=True)
     await db.delete(ev)
     await db.flush()

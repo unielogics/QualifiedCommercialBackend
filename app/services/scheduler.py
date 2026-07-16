@@ -206,6 +206,21 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Google Calendar pull — fold each connected user's Google changes back into
+    # internal calendar_events every 5 min (incremental sync token; idempotent on
+    # google_event_id so a double-fire is harmless). Push (internal→Google) is
+    # inline on the calendar write path, not here. No-ops when nobody has a
+    # connected calendar. Single-instance assumption (see file header).
+    scheduler.add_job(
+        _wrap(job_google_calendar_pull),
+        "interval",
+        minutes=5,
+        id="google_calendar_pull",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Gmail Pub/Sub watch renewal. A users.watch() registration expires
     # after ~7 days; we re-register every 24h (and once ~10s after
     # startup, so a fresh deploy re-arms push immediately). No-ops when
@@ -521,6 +536,35 @@ async def job_gmail_watch_renew() -> None:
     from app.services.email.gmail_push import register_gmail_watch
 
     register_gmail_watch()
+
+
+async def job_google_calendar_pull() -> None:
+    """Fold each connected user's Google Calendar changes into internal
+    calendar_events. Walks users whose calendar is connected and runs an
+    incremental (syncToken) pull each. No-ops when nobody's connected.
+    Idempotent on google_event_id, so a double-fire is harmless."""
+    from sqlalchemy import select
+
+    from app.db import SessionLocal
+    from app.models.google_account import GoogleAccount
+    from app.services.google.calendar_sync import pull_events
+
+    async with SessionLocal() as db:
+        user_ids = (
+            await db.execute(
+                select(GoogleAccount.user_id).where(
+                    GoogleAccount.calendar_connected.is_(True),
+                    GoogleAccount.status == "active",
+                )
+            )
+        ).scalars().all()
+        for uid in user_ids:
+            try:
+                await pull_events(db, uid)
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+                log.exception("google_calendar_pull failed user=%s", uid)
 
 
 async def job_reengagement_pass() -> None:

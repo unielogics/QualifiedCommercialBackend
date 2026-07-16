@@ -57,6 +57,15 @@ class CalendarEvent(TimestampMixin, Base):
     external_ref_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     external_ref_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Two-way Google Calendar sync (0094). google_event_id is the linkage;
+    # google_etag + sync_origin form the loop guard (skip a pulled change whose
+    # etag matches what we last pushed). sync_origin ∈ {"internal","google"}.
+    google_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    google_calendar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    google_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sync_origin: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     loan: Mapped[Loan | None] = relationship(back_populates="calendar_events")
     owner: Mapped[User | None] = relationship(foreign_keys=[owner_user_id])
 
