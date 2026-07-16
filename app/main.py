@@ -83,6 +83,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Let browser fetch() read the download filename the server sets (dealer-named
+    # package.zip / intelligence.pdf); without this the header is hidden cross-origin.
+    expose_headers=["Content-Disposition"],
 )
 
 
