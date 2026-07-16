@@ -101,12 +101,18 @@ def send_raw_email(
     body_text: str,
     body_html: str | None = None,
     cc_emails: list[str] | None = None,
+    bcc_emails: list[str] | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
 ) -> SesSendResult:
     """Send a MIME email through SES.
 
     Attachments are tuples of (filename, bytes, content_type). This keeps
     generated underwriting packets out of ad-hoc base64 code at call sites.
+
+    BCC is honored by adding the addresses to the SMTP envelope (``Destinations``)
+    WITHOUT a Bcc MIME header, so blind recipients receive the message but are not
+    disclosed to the To/Cc recipients — preserving the merged-update audit BCC on
+    the SES fallback path.
     """
     settings = get_settings()
     from_addr = settings.ses_from_address.strip()
@@ -114,6 +120,7 @@ def send_raw_email(
         return SesSendResult(False, None, "not_configured")
     recipients = [email.strip() for email in to_emails if email and "@" in email]
     cc = [email.strip() for email in (cc_emails or []) if email and "@" in email]
+    bcc = [email.strip() for email in (bcc_emails or []) if email and "@" in email]
     if not recipients:
         return SesSendResult(False, None, "bad recipients")
 
@@ -141,7 +148,9 @@ def send_raw_email(
         client = boto3.client("ses", region_name=settings.ses_region or "us-east-1")
         kwargs: dict = {
             "Source": from_addr,
-            "Destinations": recipients + cc,
+            # Envelope recipients include BCC; the MIME message has no Bcc header,
+            # so blind recipients get the mail but stay hidden from To/Cc.
+            "Destinations": recipients + cc + bcc,
             "RawMessage": {"Data": msg.as_bytes()},
         }
         cfg_set = settings.ses_configuration_set.strip()
@@ -149,7 +158,7 @@ def send_raw_email(
             kwargs["ConfigurationSetName"] = cfg_set
         resp = client.send_raw_email(**kwargs)
         msg_id = resp.get("MessageId")
-        log.info("ses_client: raw sent to=%s cc=%s message_id=%s", recipients, cc, msg_id)
+        log.info("ses_client: raw sent to=%s cc=%s bcc=%d message_id=%s", recipients, cc, len(bcc), msg_id)
         return SesSendResult(True, msg_id, "sent")
     except Exception as exc:  # noqa: BLE001
         log.warning("ses_client: raw send failed to=%s cc=%s: %s", recipients, cc, exc)

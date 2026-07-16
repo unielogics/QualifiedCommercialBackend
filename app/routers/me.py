@@ -153,6 +153,30 @@ async def get_booking_settings(
     return _booking_settings_read(row)
 
 
+class BookingLinkRead(BaseModel):
+    enabled: bool
+    slug: str | None
+    url: str | None
+
+
+@router.get("/booking-link", response_model=BookingLinkRead)
+async def get_booking_link(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingLinkRead:
+    """The current user's public booking link, for inserting into email composers.
+    A slug always exists (auto-created); url is null when booking is disabled."""
+    row = await _get_or_create_booking_settings(db, user)
+    await db.commit()
+    settings = get_app_config()
+    base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
+    if not base or "localhost" in base or "127.0.0.1" in base or base.startswith("http://"):
+        if settings.app_env.lower() == "production":
+            base = "https://app.qualifiedcommercial.com"
+    url = f"{base}/book/{row.slug}" if (row.enabled and row.slug and base) else None
+    return BookingLinkRead(enabled=bool(row.enabled), slug=row.slug, url=url)
+
+
 @router.put("/booking-settings", response_model=UserBookingSettingsRead)
 async def put_booking_settings(
     payload: UserBookingSettingsUpdate,

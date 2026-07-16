@@ -115,3 +115,66 @@ async def google_disconnect(user: CurrentUser, db: AsyncSession = Depends(get_db
     removed = await goog.disconnect(db, user.id)
     await db.commit()
     return {"disconnected": removed}
+
+
+class AutomationSettings(BaseModel):
+    re_agent_auto_emails: bool = False
+    merged_updates_auto: bool = False
+    status_change_emails: bool = False
+
+
+@router.get("/connection/settings", response_model=AutomationSettings)
+async def get_automation_settings(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> AutomationSettings:
+    row = await goog.get_account(db, user.id)
+    data = (row.automation_settings if row and isinstance(row.automation_settings, dict) else {}) or {}
+    return AutomationSettings(**{k: bool(data.get(k, False)) for k in AutomationSettings.model_fields})
+
+
+@router.put("/connection/settings", response_model=AutomationSettings)
+async def put_automation_settings(
+    payload: AutomationSettings, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> AutomationSettings:
+    row = await goog.get_account(db, user.id)
+    if row is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Connect Google before configuring automations.")
+    row.automation_settings = payload.model_dump()
+    await db.commit()
+    return payload
+
+
+class DriveFile(BaseModel):
+    id: str
+    name: str
+    mime_type: str | None = None
+    size: str | None = None
+    modified_time: str | None = None
+
+
+class DriveListResponse(BaseModel):
+    files: list[DriveFile] = []
+
+
+@router.get("/drive/files", response_model=DriveListResponse)
+async def google_drive_files(
+    user: CurrentUser,
+    q: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> DriveListResponse:
+    """List the user's Drive files this app can see (drive.file scope — only files
+    the user picked/created with the app), for the email attach + share-to-AI picker."""
+    from app.services.google.drive_client import list_files
+
+    files = await list_files(db, user.id, query=q)
+    return DriveListResponse(
+        files=[
+            DriveFile(
+                id=f.get("id"),
+                name=f.get("name") or "file",
+                mime_type=f.get("mimeType"),
+                size=f.get("size"),
+                modified_time=f.get("modifiedTime"),
+            )
+            for f in files
+            if f.get("id")
+        ]
+    )

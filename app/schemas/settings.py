@@ -83,6 +83,10 @@ class AICadence(BaseModel):
     anomaly_alerts: bool = True
     weekend_ops: bool = False
     confidence_floor_default: float = 0.80  # 0..1
+    # Firm master switches for the Google-connected automated emails (Phase 4).
+    # A per-user toggle (google_accounts.automation_settings) must ALSO be on.
+    auto_re_agent_emails: bool = False
+    auto_status_change_emails: bool = False
 
 
 # --- Section: AI spend monitoring ----------------------------------------

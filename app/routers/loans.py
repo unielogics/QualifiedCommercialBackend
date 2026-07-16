@@ -857,9 +857,77 @@ async def transition_stage(
     # Phase 6 — stage moves are the most informative signal for the
     # Living Loan File. Mark dirty for the next drain.
     await mark_loan_dirty(db, loan.id)
+    # Phase 4 — realtor status-change email (gated by automation toggles; best-effort).
+    # Only on an ACTUAL transition — re-posting the same stage must not re-email.
+    old_str = old.value if hasattr(old, "value") else str(old)
+    new_str = payload.new_stage.value if hasattr(payload.new_stage, "value") else str(payload.new_stage)
+    if old_str != new_str:
+        try:
+            from app.services.email.merged_send import maybe_send_stage_change_email
+
+            await maybe_send_stage_change_email(db, loan, payload.new_stage, user.id)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("stage-change email hook failed loan=%s", loan.id)
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
+
+
+class MergedUpdateRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=512)
+    body: str = Field(min_length=1, max_length=12000)
+
+
+class MergedUpdateResponse(BaseModel):
+    draft_id: UUID
+    to_email: str
+    cc_emails: list[str]
+    bcc_count: int
+    status: str
+
+
+@router.post("/{loan_id}/merged-update", response_model=MergedUpdateResponse)
+async def create_merged_update(
+    loan_id: UUID,
+    payload: MergedUpdateRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> MergedUpdateResponse:
+    """Draft a single update email to the borrower with the realtor CC'd (one
+    thread). Approve-first via the email-drafts queue; sends from the super-admin's
+    connected Gmail. Super-admin only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin only")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+    from app.services.email.merged_send import draft_merged_update
+
+    try:
+        draft = await draft_merged_update(
+            db, loan_id=loan.id, subject=payload.subject, body=payload.body, actor_user_id=user.id
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.add(
+        Activity(
+            loan_id=loan.id,
+            actor_id=user.id,
+            actor_label=user.role,
+            kind="email.merged_update_drafted",
+            summary=f"Merged client+realtor update drafted: {draft.subject[:120]}",
+            payload={"draft_id": str(draft.id)},
+        )
+    )
+    await db.commit()
+    return MergedUpdateResponse(
+        draft_id=draft.id,
+        to_email=draft.to_email,
+        cc_emails=list(draft.cc_emails or []),
+        bcc_count=len(draft.bcc_emails or []),
+        status=draft.status.value if hasattr(draft.status, "value") else str(draft.status),
+    )
 
 
 # ── Connect / disconnect lender ───────────────────────────────────────

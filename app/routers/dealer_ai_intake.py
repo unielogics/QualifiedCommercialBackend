@@ -60,6 +60,7 @@ from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email, send_raw_email
+from app.services.email.user_mailer import send_as_user
 from app.services.payment_authorization import primary_super_admin
 from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
 
@@ -386,6 +387,9 @@ class VendorEmailPreviewRequest(BaseModel):
 class VendorEmailSendRequest(VendorEmailPreviewRequest):
     subject: str = Field(min_length=1, max_length=512)
     body: str = Field(min_length=1, max_length=12000)
+    # Optional Google Drive files to attach (file ids from the sender's Drive
+    # picker). Downloaded via the sender's OAuth grant at send time.
+    drive_file_ids: list[str] = Field(default_factory=list)
     can_preview: bool = True
     can_download: bool = True
     can_add_notes: bool = True
@@ -4086,17 +4090,46 @@ async def send_dealer_ai_vendor_email(
     cc_emails = [str(email).lower().strip() for email in payload.cc_emails if str(email).strip()]
     sends: list[PublicUnderwritingIntakeEmailSend] = []
     access_ids: list[UUID] = []
-    attachment: tuple[str, bytes, str] | None = None
+    _MAX_ATTACH = 8 * 1024 * 1024  # per-file cap
+    # Aggregate cap for the whole message. Kept comfortably under Gmail's ~25MB
+    # limit (attachments inflate ~1.37x under base64) so a stack of sub-8MB files
+    # can't build one oversized message that the provider rejects for EVERY
+    # recipient. Files that would push past the total are noted, not attached.
+    _MAX_TOTAL_ATTACH = 18 * 1024 * 1024
+    attachments: list[tuple[str, bytes, str]] = []
     attachment_note = ""
+    total_attach_bytes = 0
     if packet_artifact and packet_artifact.s3_key:
         try:
             packet_bytes = await _s3_bytes(packet_artifact.s3_key)
-            if len(packet_bytes) <= 8 * 1024 * 1024:
-                attachment = (f"{_safe_filename(packet_artifact.title)}.pdf", packet_bytes, "application/pdf")
+            if len(packet_bytes) <= _MAX_ATTACH:
+                attachments.append((f"{_safe_filename(packet_artifact.title)}.pdf", packet_bytes, "application/pdf"))
+                total_attach_bytes += len(packet_bytes)
             else:
                 attachment_note = "\n\nThe underwriting packet is available through the secure vendor bucket because the PDF is too large for email."
         except Exception as exc:
             attachment_note = f"\n\nThe underwriting packet is available through the secure vendor bucket. Attachment fallback reason: {exc}"
+    # Google Drive attachments (downloaded via the sender's OAuth grant). Skip any
+    # over the per-file OR aggregate size cap and note them rather than failing the
+    # whole send. max_bytes is enforced inside download_file_bytes so oversized
+    # files are never fully buffered in memory.
+    if payload.drive_file_ids:
+        from app.services.google.drive_client import download_file_bytes
+
+        for file_id in payload.drive_file_ids[:10]:
+            try:
+                got = await download_file_bytes(db, user.id, file_id, max_bytes=_MAX_ATTACH)
+            except Exception:  # noqa: BLE001 — not connected / revoked
+                got = None
+            if got is None:
+                attachment_note += f"\n\nA Google Drive file ({file_id}) could not be attached (unavailable or too large)."
+                continue
+            fname, data, ctype = got
+            if total_attach_bytes + len(data) > _MAX_TOTAL_ATTACH:
+                attachment_note += f"\n\n'{fname}' was not attached to keep the email under the size limit; it's in the secure vendor bucket."
+                continue
+            attachments.append((fname, data, ctype))
+            total_attach_bytes += len(data)
     for raw_email in payload.to_emails:
         email = str(raw_email).lower().strip()
         access = await _prepare_vendor_access(db, intake, email, payload)
@@ -4110,13 +4143,16 @@ async def send_dealer_ai_vendor_email(
             + attachment_note
         )
         html_body = "<br>".join(html.escape(line) for line in body.splitlines())
-        result = send_raw_email(
+        # Send from the operator's connected Gmail when available, else firm SES.
+        result = await send_as_user(
+            db,
+            user.id,
             to_emails=[email],
             cc_emails=cc_emails,
             subject=payload.subject.strip(),
             body_text=body,
             body_html=f"<p>{html_body}</p>",
-            attachments=[attachment] if attachment else None,
+            attachments=attachments or None,
         )
         send_row = PublicUnderwritingIntakeEmailSend(
             intake_id=intake.id,

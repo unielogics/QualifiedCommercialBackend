@@ -273,7 +273,12 @@ async def send_approved_draft(db: AsyncSession, draft: EmailDraft, *, actor_labe
         )
         if result.ok:
             sent_id = result.message_id
-            note = f"Sent as connected user. message_id={sent_id}"
+            # Attribute the transport accurately: only "sent_gmail" is truly from
+            # the connected user's mailbox; "sent" means it went out via firm SES.
+            if result.detail == "sent_gmail":
+                note = f"Sent as connected user. message_id={sent_id}"
+            else:
+                note = f"Sent via firm mailbox (sender's Gmail not connected). message_id={sent_id}"
         elif result.detail.startswith("gmail_send_failed"):
             note = f"{result.detail}. Draft kept as approved for retry."
         else:
@@ -307,6 +312,20 @@ async def send_approved_draft(db: AsyncSession, draft: EmailDraft, *, actor_labe
                     note = f"Gmail send failed: {exc}. Draft kept as approved for retry."
         else:
             note = "Gmail not configured (no SA path / delegated user). Draft approved but not sent."
+
+    # A merged super-admin update enrolls the realtor as a cc_outbound BROKER
+    # participant ONLY once the email actually goes out (any transport) — so a
+    # drafted-then-dismissed update never silently adds the realtor to all future
+    # loan correspondence. Enrollment happens at send time, not draft time.
+    if sent_id and draft.triggered_by_kind == "merged_update":
+        realtor_email = (draft.triggered_by_payload or {}).get("realtor_email")
+        if realtor_email:
+            from app.services.email.merged_send import enroll_realtor_participant
+
+            try:
+                await enroll_realtor_participant(db, draft.loan_id, realtor_email)
+            except Exception:  # noqa: BLE001
+                log.exception("merged_update: realtor enrollment failed loan=%s", draft.loan_id)
 
     draft.status = EmailDraftStatus.SENT if sent_id else EmailDraftStatus.APPROVED
     draft.actioned_by = actor_label

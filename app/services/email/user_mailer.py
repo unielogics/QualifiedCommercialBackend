@@ -120,10 +120,10 @@ async def send_as_user(
         if gmail_result is not None:
             return gmail_result
 
-    # SES fallback. Note: SES send_raw_email has no BCC; fold bcc into the
-    # destination set is unsafe (would expose them), so BCC is dropped on the
-    # SES path — the merged-email audit BCC is best-effort only when the sender
-    # has Gmail connected.
+    # SES fallback. send_raw_email honors BCC via the SMTP envelope (no Bcc
+    # header), so the merged-email audit BCC survives even when the sender has no
+    # connected Gmail. The transport is distinguishable by the result detail
+    # ("sent" = SES vs "sent_gmail" = user Gmail) so callers attribute accurately.
     import asyncio
 
     return await asyncio.to_thread(
@@ -133,5 +133,6 @@ async def send_as_user(
         body_text=body_text,
         body_html=body_html,
         cc_emails=cc_emails,
+        bcc_emails=bcc_emails,
         attachments=attachments,
     )

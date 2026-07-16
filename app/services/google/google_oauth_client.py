@@ -315,6 +315,40 @@ async def get_account(db: AsyncSession, user_id: uuid.UUID) -> GoogleAccount | N
     return (await db.execute(select(GoogleAccount).where(GoogleAccount.user_id == user_id))).scalar_one_or_none()
 
 
+# Maps an automation kind to (firm AICadence field, per-user automation_settings key).
+_AUTOMATION_GATES = {
+    "re_agent_email": ("auto_re_agent_emails", "re_agent_auto_emails"),
+    "status_change_email": ("auto_status_change_emails", "status_change_emails"),
+    "merged_update": ("auto_re_agent_emails", "merged_updates_auto"),
+}
+
+
+async def automation_allowed(db: AsyncSession, user_id: uuid.UUID, kind: str) -> bool:
+    """Gate an automated Google-sent email. Requires ALL of:
+      1. the firm master switch (AppSettings.ai_cadence.<field>) is on,
+      2. the sending user's per-account toggle (automation_settings.<key>) is on,
+      3. the user actually has Gmail connected (so we can send as them).
+    Any missing → False (caller skips the send / downgrades to a draft)."""
+    gate = _AUTOMATION_GATES.get(kind)
+    if gate is None:
+        return False
+    firm_field, user_key = gate
+
+    from app.models.app_settings import AppSettings
+    from app.schemas.settings import AppSettingsData
+
+    app_row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+    cadence = AppSettingsData.model_validate(app_row.data if app_row else {}).ai_cadence
+    if not bool(getattr(cadence, firm_field, False)):
+        return False
+
+    row = await get_account(db, user_id)
+    if row is None or not row.gmail_connected or row.status != "active":
+        return False
+    settings = row.automation_settings if isinstance(row.automation_settings, dict) else {}
+    return bool(settings.get(user_key, False))
+
+
 async def disconnect(db: AsyncSession, user_id: uuid.UUID) -> bool:
     """Best-effort revoke at Google + delete the local grant."""
     row = await get_account(db, user_id)
