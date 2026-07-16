@@ -706,16 +706,18 @@ def _baseline_key(category_or_name: str) -> str | None:
     return None
 
 
-def _apply_lending_readiness(result: dict[str, Any]) -> None:
+def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dict[str, Any]] | None = None) -> None:
     """Set result['lending_ready'] and, when the file is NOT ready, derive a
     concrete clarifying next step from the HIGHEST-PRIORITY open gap instead of a
     generic 'continue the conversation'.
 
     Ready requires BOTH: (a) every required Stage-1 baseline category
-    (_READINESS_BASELINE) is present and satisfied in baseline_coverage, and
-    (b) no open missing_or_incomplete_items remain AFTER reconciling them against
-    satisfied coverage (an AI-authored 'missing tax returns' is dropped once a
-    tax-return file is classified as satisfied)."""
+    (_READINESS_BASELINE) meets its MINIMUM evidence bar (>= 6 distinct bank
+    months and >= 2 tax years), computed deterministically from the per-file
+    facts — a single uploaded month does NOT satisfy '6 months of statements' —
+    and (b) no open missing_or_incomplete_items remain AFTER reconciling them
+    against satisfied coverage (an AI-authored 'missing tax returns' is dropped
+    once the tax-return minimum is actually met)."""
     evidence_map = result.get("document_evidence_map") or {}
     coverage = evidence_map.get("baseline_coverage") or []
     missing = result.get("missing_or_incomplete_items") or []
@@ -726,12 +728,35 @@ def _apply_lending_readiness(result: dict[str, Any]) -> None:
     satisfied_states = {"satisfied", "uploaded", "complete"}
     baseline_rows = [c for c in coverage if isinstance(c, dict)]
 
-    # Which required baseline categories are satisfied by the coverage rows.
+    # Deterministic minimum-evidence check from the per-file facts. This is the
+    # source of truth for readiness — coverage-row "satisfied" flags only require a
+    # single file of a class, which is not enough for a multi-period requirement.
     satisfied_keys: set[str] = set()
-    for row in baseline_rows:
-        key = _baseline_key(row.get("category"))
-        if key and _status(row) in satisfied_states:
-            satisfied_keys.add(key)
+    if per_file_analyses:
+        from app.services.public_underwriting_packet_pdf import (
+            extract_bank_months,
+            extract_tax_years,
+        )
+
+        normalized = [
+            {
+                "file_id": item.get("file_id"),
+                "classification": item.get("ai_classification"),
+                "key_facts": item.get("key_facts") or {},
+            }
+            for item in per_file_analyses
+        ]
+        # extract_bank_months already dedupes by statement month (capped at 6).
+        if len(extract_bank_months(normalized)) >= 6:
+            satisfied_keys.add("bank statement")
+        if len(extract_tax_years(normalized)) >= 2:
+            satisfied_keys.add("tax return")
+    else:
+        # No per-file facts available: fall back to coverage-row flags (best effort).
+        for row in baseline_rows:
+            key = _baseline_key(row.get("category"))
+            if key and _status(row) in satisfied_states:
+                satisfied_keys.add(key)
     required_covered = _READINESS_BASELINE.issubset(satisfied_keys)
 
     # Reconcile the AI-authored missing list: drop any item that maps to a baseline
@@ -1832,7 +1857,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # (the synthesis pass frequently leaves them null) and compute lending
         # readiness + a concrete clarifying next step from the open gaps.
         _compute_key_metrics_from_cache(result, per_file_analyses)
-        _apply_lending_readiness(result)
+        _apply_lending_readiness(result, per_file_analyses)
         if skipped:
             result["skipped_files"] = skipped
         review.result = result
