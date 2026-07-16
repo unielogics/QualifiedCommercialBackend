@@ -1968,27 +1968,38 @@ async def _generate_management_json(
     variant_label = "real estate DSCR/investor" if intake.variant.startswith("real_estate") else "dealer capital"
     if purpose == "executive_summary":
         schema = {
-            "title": "short title",
-            "executive_summary": "operator-facing summary",
-            "recommended_approach": "best loan approach",
-            "suggested_application_types": ["application or product paths that make sense"],
-            "borrower_profile": "borrower or guarantor notes",
-            "entity_vesting_notes": "entity and ownership notes",
-            "property_collateral": "property/collateral summary",
-            "requested_terms": "requested amount and purpose",
-            "key_metrics": {},
-            "documents_reviewed": ["files and what they prove"],
-            "missing_confirmations": ["missing items or unsupported fields"],
-            "risks": ["risk items"],
-            "mitigants": ["mitigants"],
-            "vendor_submission_angle": "how to position this to vendors/lenders",
+            "title": "short title (borrower name + deal in a few words)",
+            "executive_summary": "2-4 FLOWING PARAGRAPHS of underwriter prose — no bullet fragments, no key:value lines. Written like a credit officer's memo.",
+            "recommended_approach": "1-2 sentences: the best loan approach/structure",
+            "suggested_application_types": ["product/application paths that make sense"],
+            "borrower_profile": "1-2 sentence narrative of the borrower/guarantor",
+            "entity_vesting_notes": "1-2 sentence narrative of entity/ownership/vesting",
+            "property_collateral": "1-2 sentence narrative of property/collateral",
+            "requested_terms": "1-2 sentences: requested amount and purpose",
+            "key_metrics": [
+                {"label": "human label e.g. 2024 Gross Revenue", "value": "scalar value e.g. $31.2M", "note": "optional one-line context"}
+            ],
+            "documents_reviewed": ["file — what it proves"],
+            "missing_confirmations": ["missing item or unsupported field"],
+            "risks": ["risk item"],
+            "mitigants": ["mitigant"],
+            "vendor_submission_angle": "1-2 sentences: how to position this to vendors/lenders",
             "next_best_action": "one next operator action",
             "disclaimer": "preliminary review only",
         }
         instruction = (
-            "Create a concise but useful operator-facing executive summary for a Qualified Commercial AI underwriting lead. "
+            "Create an operator-facing executive summary for a Qualified Commercial AI underwriting lead. "
             "Use the uploaded evidence, chat answers, latest review, and intake data only. Do not invent values. "
-            "If a field is unsupported, write Awaiting evidence. Return strict JSON only."
+            "If a field is unsupported, write 'Awaiting evidence'."
+        )
+        system = (
+            "You are a senior commercial credit officer writing an internal executive summary that a human underwriter "
+            "will read and forward to lenders. Write in clear, confident underwriter prose — NOT machine output. "
+            "The 'executive_summary' field MUST be 2-4 flowing narrative paragraphs (no bullet points, no 'key: value' "
+            "fragments, no JSON-looking text inside it). Every narrative field is prose a person would write. "
+            "'key_metrics' MUST be a flat list of {label, value, note?} objects where value is a SHORT scalar string "
+            "(e.g. \"$31.2M\", \"1.35x\", \"608\") — never a nested object or array. Be specific and cite figures from the "
+            "evidence. Return STRICT JSON only, matching the given shape exactly."
         )
         feature = "loan_summary"
     else:
@@ -1996,7 +2007,12 @@ async def _generate_management_json(
         instruction = (
             "Prepare a lender/vendor email for a Qualified Commercial underwriter. It must be professional, concise, "
             "and editable. Include the strongest evidence, suggested submission angle, missing confirmations, and say that a secure bucket login link "
-            "and underwriting packet are included. Do not include unsecured file links. Return strict JSON only."
+            "and underwriting packet are included. Do not include unsecured file links."
+        )
+        system = (
+            "You are a commercial lending relationship manager writing a concise, professional lender/vendor outreach "
+            "email a human will lightly edit and send. Warm but businesslike; short paragraphs; no placeholders or raw "
+            "field dumps. Return STRICT JSON only, matching the given shape exactly."
         )
         feature = "lender_send"
     prompt = {
@@ -2015,14 +2031,89 @@ async def _generate_management_json(
         user_id=user.id,
         client_id=intake.client_id,
         metadata={"intake_id": intake.id, "bucket_id": intake.bucket_id, "purpose": purpose},
-        max_tokens=2200,
-        temperature=0.2,
+        max_tokens=2600,
+        temperature=0.3,
+        system=system,
         messages=[{"role": "user", "content": json.dumps(json_safe_metadata(prompt), ensure_ascii=False)}],
     )
     parsed = _json_from_ai_text(_ai_response_text(resp))
     if purpose == "executive_summary" and not parsed.get("executive_summary") and parsed.get("body"):
         parsed["executive_summary"] = parsed["body"]
     return json_safe_metadata(parsed)
+
+
+def _format_executive_summary_markdown(summary: dict[str, Any]) -> str:
+    """Render the structured executive-summary JSON into clean, human-readable
+    markdown so the UI and the exported package show prose, not raw key/values."""
+
+    def _clean(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _lines(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [_clean(item) for item in value if _clean(item)]
+        text = _clean(value)
+        return [text] if text else []
+
+    parts: list[str] = []
+    title = _clean(summary.get("title"))
+    if title:
+        parts.append(f"# {title}")
+
+    body = _clean(summary.get("executive_summary")) or _clean(summary.get("body"))
+    if body:
+        parts.append(body)
+
+    narrative_sections = [
+        ("Recommended approach", summary.get("recommended_approach")),
+        ("Borrower profile", summary.get("borrower_profile")),
+        ("Entity & vesting", summary.get("entity_vesting_notes")),
+        ("Property / collateral", summary.get("property_collateral")),
+        ("Requested terms", summary.get("requested_terms")),
+        ("Vendor submission angle", summary.get("vendor_submission_angle")),
+    ]
+    for label, value in narrative_sections:
+        text = _clean(value)
+        if text and text.lower() != "awaiting evidence":
+            parts.append(f"## {label}\n{text}")
+
+    metrics = summary.get("key_metrics")
+    if isinstance(metrics, list) and metrics:
+        rows = []
+        for m in metrics:
+            if isinstance(m, dict):
+                label = _clean(m.get("label"))
+                value = _clean(m.get("value"))
+                note = _clean(m.get("note"))
+                if label or value:
+                    rows.append(f"- **{label or 'Metric'}:** {value}" + (f" — {note}" if note else ""))
+        if rows:
+            parts.append("## Key metrics\n" + "\n".join(rows))
+    elif isinstance(metrics, dict) and metrics:
+        # Back-compat: older records stored key_metrics as a dict.
+        rows = [f"- **{str(k).replace('_', ' ').title()}:** {_clean(v)}" for k, v in metrics.items() if _clean(v)]
+        if rows:
+            parts.append("## Key metrics\n" + "\n".join(rows))
+
+    list_sections = [
+        ("Applications suggested", summary.get("suggested_application_types")),
+        ("Documents reviewed", summary.get("documents_reviewed")),
+        ("Strengths / mitigants", summary.get("mitigants")),
+        ("Risks", summary.get("risks")),
+        ("Missing confirmations", summary.get("missing_confirmations")),
+    ]
+    for label, value in list_sections:
+        items = _lines(value)
+        if items:
+            parts.append(f"## {label}\n" + "\n".join(f"- {item}" for item in items))
+
+    nba = _clean(summary.get("next_best_action"))
+    if nba:
+        parts.append(f"## Next best action\n{nba}")
+    disclaimer = _clean(summary.get("disclaimer"))
+    if disclaimer:
+        parts.append(f"_{disclaimer}_")
+    return "\n\n".join(parts).strip()
 
 
 async def _create_executive_summary_artifact(
@@ -2032,7 +2123,7 @@ async def _create_executive_summary_artifact(
 ) -> PublicUnderwritingIntakeArtifact:
     summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
     title = str(summary.get("title") or _summary_title(intake))[:240]
-    body_text = str(summary.get("executive_summary") or summary.get("body") or "")
+    body_text = _format_executive_summary_markdown(summary) or str(summary.get("executive_summary") or summary.get("body") or "")
     artifact = PublicUnderwritingIntakeArtifact(
         intake_id=intake.id,
         artifact_type="executive_summary",

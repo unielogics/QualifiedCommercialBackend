@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from html import escape
 from typing import Any
@@ -22,6 +23,22 @@ def _strings(value: Any) -> list[str]:
 def _text(value: Any, fallback: str = "Awaiting evidence") -> str:
     if value is None:
         return fallback
+    # Flatten nested structures into readable prose so no PDF cell ever renders a
+    # Python repr like {'dscr': 1.2} or ['a', 'b'].
+    if isinstance(value, dict):
+        pairs = []
+        for k, v in value.items():
+            flat = _text(v, fallback="")
+            if flat:
+                pairs.append(f"{str(k).replace('_', ' ').strip().title()}: {flat}")
+        text = "; ".join(pairs)
+        return text or fallback
+    if isinstance(value, (list, tuple)):
+        items = [_text(item, fallback="") for item in value]
+        text = "; ".join(item for item in items if item)
+        return text or fallback
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
     text = str(value).strip()
     return text or fallback
 
@@ -188,8 +205,42 @@ def render_underwriting_packet_pdf(
         {"metric": "Suggested path", "value": program_fit or "Awaiting evidence", "source": "AI review"},
         {"metric": "Requested amount", "value": requested_amount, "source": "Intake"},
     ]
-    for key, value in key_metrics.items():
-        metric_rows.append({"metric": str(key).replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
+    # Prefer the executive summary's curated scalar metrics (list of {label,value,note});
+    # fall back to the raw review key_metrics dict for older records.
+    exec_metrics = executive_summary.get("key_metrics")
+    if isinstance(exec_metrics, list) and exec_metrics:
+        for m in exec_metrics:
+            if isinstance(m, dict):
+                label = _text(m.get("label"), fallback="")
+                value = _text(m.get("value"), fallback="")
+                note = _text(m.get("note"), fallback="")
+                if label or value:
+                    metric_rows.append({"metric": label or "Metric", "value": value, "source": note or "AI extraction"})
+    else:
+        for key, value in key_metrics.items():
+            metric_rows.append({"metric": str(key).replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
+
+    # Rich narrative sections from the executive summary (previously generated but
+    # never rendered) — these turn the packet from a table dump into an exec doc.
+    def _prose(value: Any) -> str | None:
+        text = _text(value, fallback="")
+        return text if text and text.lower() != "awaiting evidence" else None
+
+    borrower_profile = _prose(executive_summary.get("borrower_profile"))
+    entity_vesting = _prose(executive_summary.get("entity_vesting_notes"))
+    property_collateral = _prose(executive_summary.get("property_collateral"))
+    requested_terms = _prose(executive_summary.get("requested_terms"))
+    application_types = _strings(executive_summary.get("suggested_application_types"))
+    narrative_cards = "".join(
+        f'<section class="card"><h2>{escape(label)}</h2><p>{escape(text)}</p></section>'
+        for label, text in (
+            ("Borrower profile", borrower_profile),
+            ("Entity & vesting", entity_vesting),
+            ("Property / collateral", property_collateral),
+            ("Requested terms", requested_terms),
+        )
+        if text
+    )
 
     fallback_lines = [
         title,
@@ -270,6 +321,9 @@ def render_underwriting_packet_pdf(
     <p>{escape(_text(recommended_angle))}</p>
   </section>
 
+  {narrative_cards}
+  {_list("Applications suggested", application_types) if application_types else ""}
+
   {_table("Application-style fields and metrics", metric_rows, [("metric", "Field"), ("value", "Value"), ("source", "Source")])}
   {_table("Documents reviewed", reviewed_docs, [("file", "Document"), ("type", "Type"), ("status", "Status")])}
   {_table("Evidence coverage", coverage_rows, [("category", "Category"), ("status", "Status"), ("gap", "Evidence / gap")])}
@@ -287,9 +341,45 @@ def render_underwriting_packet_pdf(
 </body>
 </html>
 """
+    log = logging.getLogger(__name__)
+    # 1) WeasyPrint — best CSS fidelity, but needs native libs (Pango/Cairo/GTK).
     try:
         from weasyprint import HTML
 
         return HTML(string=html_doc).write_pdf()
     except Exception:
-        return _minimal_pdf(fallback_lines)
+        log.warning("lender-packet: WeasyPrint unavailable, trying PyMuPDF Story renderer")
+    # 2) PyMuPDF Story — pure wheel, no system deps. Renders the same styled HTML
+    #    to a real multi-page document, so the packet looks like a document even
+    #    where WeasyPrint's native stack is absent (e.g. the deployed container).
+    try:
+        pdf = _render_html_pymupdf(html_doc)
+        if pdf:
+            return pdf
+    except Exception:
+        log.exception("lender-packet: PyMuPDF Story render failed; using plain-text fallback")
+    # 3) Last resort — sectioned plain-text PDF.
+    return _minimal_pdf(fallback_lines)
+
+
+def _render_html_pymupdf(html_doc: str) -> bytes | None:
+    """Render HTML to a paginated PDF using PyMuPDF's Story API (no native deps)."""
+    import io
+
+    import fitz
+
+    buf = io.BytesIO()
+    writer = fitz.DocumentWriter(buf)
+    story = fitz.Story(html=html_doc)
+    media = fitz.paper_rect("letter")
+    frame = media + (36, 36, -36, -36)  # 0.5" margins
+    more = 1
+    guard = 0
+    while more and guard < 200:
+        guard += 1
+        device = writer.begin_page(media)
+        more, _ = story.place(frame)
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue() or None
