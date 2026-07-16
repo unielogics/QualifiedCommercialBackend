@@ -420,6 +420,104 @@ def _without_optional_json_tail(text: str) -> str | None:
     return None
 
 
+def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+    """Best-effort recovery of a JSON object that was cut off (e.g. the model hit
+    max_tokens mid-value). Closes an open string and any unbalanced brackets, then
+    retries json.loads. Returns the parsed dict or None. This keeps a truncated
+    reply from leaking its raw scaffolding to the user — we still recover the
+    fields that completed (like "answer")."""
+    cleaned = _strip_code_fence(text)
+    if not cleaned.startswith("{"):
+        return None
+    # Walk the text tracking string/escape state and bracket depth so we can close
+    # whatever is still open at the truncation point.
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    for ch in cleaned:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    repaired = cleaned
+    if in_string:
+        repaired += '"'
+    repaired = repaired.rstrip()
+    # If truncation left a dangling object key with no value — either `"rationale`
+    # (string just closed, no colon) or `"key":` (colon, no value) — drop that key
+    # back to the last complete entry so the object closes validly.
+    if in_string and stack and stack[-1] == "}":
+        # We just closed an opening quote that had no colon after it → dangling key.
+        last_key_quote = repaired.rfind('"', 0, len(repaired) - 1)
+        if last_key_quote > 0:
+            before = repaired[:last_key_quote].rstrip().rstrip(",").rstrip()
+            repaired = before
+    repaired = repaired.rstrip()
+    while repaired and repaired[-1] in ":,":
+        # Trailing `:` (key with no value) or `,` — trim, and if a `:` also drop its key.
+        if repaired[-1] == ":":
+            repaired = repaired[:-1].rstrip()
+            key_q = repaired.rfind('"', 0, len(repaired))
+            key_q2 = repaired.rfind('"', 0, key_q) if key_q > 0 else -1
+            if key_q2 >= 0:
+                repaired = repaired[:key_q2].rstrip().rstrip(",").rstrip()
+        else:
+            repaired = repaired[:-1].rstrip()
+    for closer in reversed(stack):
+        repaired += closer
+    try:
+        parsed = json.loads(repaired)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_answer_string(text: str) -> str | None:
+    """Pull just the value of the top-level "answer" (or "summary") field out of a
+    JSON object even when the surrounding JSON is malformed/truncated, using a
+    targeted decode of the string literal. Guarantees the user never sees raw JSON
+    scaffolding when only the answer prose matters."""
+    cleaned = _strip_code_fence(text)
+    for key in ("answer", "summary"):
+        marker = f'"{key}"'
+        idx = cleaned.find(marker)
+        if idx < 0:
+            continue
+        colon = cleaned.find(":", idx + len(marker))
+        if colon < 0:
+            continue
+        quote = cleaned.find('"', colon + 1)
+        if quote < 0:
+            continue
+        # Decode the JSON string starting at the opening quote; raw_decode reads a
+        # single string literal and ignores trailing garbage.
+        try:
+            value, _ = json.JSONDecoder().raw_decode(cleaned[quote:])
+            if isinstance(value, str) and value.strip():
+                return value
+        except json.JSONDecodeError:
+            # Truncated string: close it and decode what we have.
+            snippet = cleaned[quote:]
+            try:
+                value, _ = json.JSONDecoder().raw_decode(snippet + '"')
+                if isinstance(value, str) and value.strip():
+                    return value
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def _json_or_fallback(text: str, fallback_key: str) -> dict[str, Any]:
     cleaned = _strip_code_fence(text)
     candidates = [cleaned]
@@ -432,6 +530,14 @@ def _json_or_fallback(text: str, fallback_key: str) -> dict[str, Any]:
             return parsed if isinstance(parsed, dict) else {fallback_key: text}
         except json.JSONDecodeError:
             continue
+    # Recover a truncated object so completed fields (answer, proposals) survive.
+    repaired = _repair_truncated_json(cleaned)
+    if isinstance(repaired, dict) and repaired:
+        return repaired
+    # Last resort: extract just the answer string so raw JSON never reaches the UI.
+    answer = _extract_answer_string(cleaned)
+    if answer:
+        return {fallback_key: answer}
     return {fallback_key: text}
 
 
@@ -2187,12 +2293,22 @@ async def create_chat_reply(
                 "upload_link_id": str(upload_link.id) if upload_link else None,
                 "vendor_access_id": str(vendor_access.id) if vendor_access else None,
             },
-            max_tokens=1200,
+            max_tokens=3000,
             system=build_chat_system(review_type),
             messages=[{"role": "user", "content": json.dumps({"context": context, "message": message}, default=str)}],
         )
-        parsed = _json_or_fallback(_text_from_response(resp), "answer")
-        answer = str(parsed.get("answer") or parsed.get("summary") or _text_from_response(resp))[:5000]
+        raw_text = _text_from_response(resp)
+        parsed = _json_or_fallback(raw_text, "answer")
+        # Never surface raw JSON scaffolding: prefer the parsed answer, then a
+        # targeted answer-string extraction, and only then the raw text if it does
+        # not itself look like a JSON object.
+        answer = str(parsed.get("answer") or parsed.get("summary") or "").strip()
+        if not answer:
+            answer = (_extract_answer_string(raw_text) or "").strip()
+        if not answer:
+            stripped = _strip_code_fence(raw_text)
+            answer = "" if stripped.startswith("{") else stripped
+        answer = (answer or "I could not generate a response. Please try again.")[:5000]
         patch = parsed.get("proposed_context_patch") if isinstance(parsed.get("proposed_context_patch"), dict) else None
         suggested_widget = _suggested_widget_type(parsed)
         assistant = BucketAIMessage(
