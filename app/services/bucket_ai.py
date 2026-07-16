@@ -507,11 +507,53 @@ def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
     return shaped
 
 
-def _merge_per_file_analyses(result: dict[str, Any], per_file_analyses: list[dict[str, Any]]) -> None:
+# Maps a requested-document checklist item to the per-file `ai_classification`
+# values that satisfy it. Used to reconcile the analyzed evidence against the
+# baseline package so satisfied categories stop showing as "missing".
+_CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
+    "bank statement": {"bank_statement"},
+    "tax return": {"tax_return"},
+    "p&l": {"current_p_and_l"},
+    "profit and loss": {"current_p_and_l"},
+    "profit & loss": {"current_p_and_l"},
+    "lease": {"lease_or_rent"},
+    "rent": {"lease_or_rent"},
+    "rent roll": {"lease_or_rent"},
+    "purchase contract": {"purchase_contract"},
+    "payoff": {"payoff_or_mortgage_statement"},
+    "mortgage statement": {"payoff_or_mortgage_statement"},
+    "insurance": {"insurance"},
+    "hoa": {"hoa"},
+    "entity": {"entity_or_vesting"},
+    "vesting": {"entity_or_vesting"},
+    "identity": {"identity"},
+    "id": {"identity"},
+    "floorplan": {"floorplan_mca_inventory"},
+    "mca": {"floorplan_mca_inventory"},
+    "inventory": {"floorplan_mca_inventory"},
+}
+
+
+def _classifications_for_requested_doc(name: str, category: str | None) -> set[str]:
+    text = f"{name} {category or ''}".lower()
+    matched: set[str] = set()
+    for keyword, classes in _CATEGORY_CLASSIFICATIONS.items():
+        if keyword in text:
+            matched |= classes
+    return matched
+
+
+def _merge_per_file_analyses(
+    result: dict[str, Any],
+    per_file_analyses: list[dict[str, Any]],
+    requested_documents: list[dict[str, Any]] | None = None,
+) -> None:
     """Ensure the review result's per-file sections reflect the durable per-file
-    analyses (the source of truth). If the synthesis pass did not emit
-    document_evidence_map.files / per_file_summaries, populate them from the
-    cached rows so every read surface sees consistent per-file data."""
+    analyses (the source of truth). Populates document_evidence_map.files,
+    per_file_summaries, AND baseline_coverage from the cached classifications so
+    satisfied categories (bank statements, tax returns, P&L, …) are shown as
+    covered instead of missing — even when the light synthesis pass leaves them
+    blank."""
     if not per_file_analyses:
         return
     evidence_map = result.get("document_evidence_map")
@@ -532,6 +574,30 @@ def _merge_per_file_analyses(result: dict[str, Any], per_file_analyses: list[dic
         ]
     if not isinstance(evidence_map.get("baseline_coverage"), list):
         evidence_map["baseline_coverage"] = []
+    # Build baseline_coverage against the requested-document checklist when the
+    # synthesis pass did not provide one, using what the files were classified as.
+    if requested_documents and not evidence_map.get("baseline_coverage"):
+        present_classes: dict[str, list[str]] = {}
+        for item in per_file_analyses:
+            cls = item.get("ai_classification")
+            if cls:
+                present_classes.setdefault(cls, []).append(item.get("file_name") or "")
+        coverage: list[dict[str, Any]] = []
+        for doc in requested_documents:
+            name = str(doc.get("name") or "")
+            category = doc.get("category")
+            wanted = _classifications_for_requested_doc(name, category)
+            evidence_files = [fn for cls in wanted for fn in present_classes.get(cls, [])]
+            coverage.append(
+                {
+                    "category": name,
+                    "status": "satisfied" if evidence_files else "missing",
+                    "evidence": evidence_files,
+                    "gap": "" if evidence_files else "No matching document analyzed yet.",
+                }
+            )
+        if coverage:
+            evidence_map["baseline_coverage"] = coverage
     result["document_evidence_map"] = evidence_map
     if not isinstance(result.get("per_file_summaries"), list) or not result.get("per_file_summaries"):
         result["per_file_summaries"] = [
@@ -1564,8 +1630,19 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         result = _ensure_review_result_shape(_json_or_fallback(_text_from_response(resp), "executive_summary"))
         # Backfill per-file sections from the durable analyses so the result shape
         # stays complete even if the synthesis omitted them (source of truth is the
-        # per-file rows, not the synthesis).
-        _merge_per_file_analyses(result, per_file_analyses)
+        # per-file rows, not the synthesis). Also builds baseline_coverage against
+        # the requested-document checklist from what the files were classified as.
+        _merge_per_file_analyses(result, per_file_analyses, requested_documents=requested)
+        # Reconcile the requested-document checklist: mark a requested doc as
+        # uploaded when an analyzed file satisfies its category, so satisfied
+        # baseline items stop showing as "missing" in the UI.
+        present_classes = {item.get("ai_classification") for item in per_file_analyses if item.get("ai_classification")}
+        for doc in bucket.requested_documents:
+            if doc.status == "uploaded":
+                continue
+            wanted = _classifications_for_requested_doc(doc.name, doc.category)
+            if wanted & present_classes:
+                doc.status = "uploaded"
         if skipped:
             result["skipped_files"] = skipped
         review.result = result
