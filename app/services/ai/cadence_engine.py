@@ -18,6 +18,12 @@ nothing equivalent has been actioned recently, and:
 Draft-first by default. The auto-send path is intentionally narrow —
 we'd rather miss a reminder than send a wrong one.
 
+Visibility lanes: internal/agent rules draft to Elara Inbox; borrower rules
+run through the OutreachMode kill switch + follow-up windowing; broker rules
+(visibility="broker") notify the loan's REALTOR — auto-send emails them from
+the loan owner's Gmail (gated by the re_agent_email automation toggle), else
+fall back to an operator AITask. Broker rules bypass the borrower-only gates.
+
 Run by `app/services/scheduler.py` every 30 minutes.
 """
 
@@ -94,7 +100,11 @@ async def preview_cadence_pass(
                 "client_id": t["client_id"],
                 "client_name": t["client_name"],
                 "requirement_key": t.get("requirement_key"),
-                "message_preview": _compose_assignment_message(rule, t),
+                "message_preview": (
+                    _compose_broker_message(rule, t)
+                    if rule.visibility == "broker"
+                    else _compose_assignment_message(rule, t)
+                ),
                 "fires_now": True,
             })
     return out
@@ -535,7 +545,14 @@ async def _fire_action(
     a forced downgrade from auto_send_reminder → draft_message when
     the file-level outreach_mode is draft_first)."""
     action = effective_action or rule.action_type
-    handler = _ACTION_HANDLERS.get(action, _handle_draft_message)
+    # Broker-lane rules route to the realtor-notify handler regardless of their
+    # nominal action_type — the recipient (loan's realtor) and gating
+    # (re_agent_email) are what differ, and the handler internally falls back to
+    # a draft when it can't auto-send.
+    if rule.visibility == "broker":
+        handler = _handle_broker_action
+    else:
+        handler = _ACTION_HANDLERS.get(action, _handle_draft_message)
     outcome = await handler(db, rule, target)
     if outcome is not None:
         await record_event(
@@ -755,6 +772,153 @@ async def _handle_auto_send_reminder(
     db.add(task)
     await db.flush()
     return {"ai_task_id": task.id, "client_id": target["client_id"]}
+
+
+async def _handle_broker_action(
+    db: AsyncSession,
+    rule: AICadenceRule,
+    target: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Real-estate-agent (broker) lane. Notifies the loan's realtor about an
+    outstanding item — NOT the borrower.
+
+    Auto-send (approval_required=False) emails the realtor directly from the
+    loan OWNER's connected Gmail, gated by automation_allowed(...,"re_agent_email")
+    (firm switch + owner per-user toggle + owner Gmail connected). Sender is the
+    loan owner (a property of the loan), never the acting user or the broker.
+
+    Falls back to an operator-facing AITask (Elara Inbox) whenever it cannot
+    auto-send: approval_required=True, no loan on the target, no owner, no
+    realtor, the automation gate is off, or the send itself fails. That way the
+    signal is never silently dropped."""
+    from app.models.loan import Loan
+
+    loan_id = target.get("loan_id")
+    msg = _compose_broker_message(rule, target)
+
+    async def _draft(reason: str) -> dict[str, Any]:
+        task = AITask(
+            loan_id=loan_id,
+            source=AITaskSource.PIPELINE,
+            priority=AITaskPriority.MEDIUM,
+            status=AITaskStatus.PENDING,
+            action="cadence_broker_notify",
+            title=f"Notify agent · {target.get('client_name') or 'client'}",
+            summary=msg or f"Cadence rule {rule.trigger_event} fired — notify the agent.",
+            agent="cadence",
+            draft_payload={
+                "client_id": str(target["client_id"]),
+                "rule_id": str(rule.id),
+                "trigger_event": rule.trigger_event,
+                "requirement_key": target.get("requirement_key"),
+                "message": msg,
+                "visibility": "broker",
+                "fallback_reason": reason,
+            },
+        )
+        db.add(task)
+        await db.flush()
+        return {"ai_task_id": task.id, "client_id": target["client_id"], "broker_sent": False}
+
+    if rule.approval_required:
+        return await _draft("approval_required")
+    if loan_id is None:
+        return await _draft("no_loan")
+
+    loan = await db.get(Loan, loan_id)
+    if loan is None:
+        return await _draft("loan_missing")
+
+    from app.services.email.merged_send import (
+        claim_broker_email_slot,
+        resolve_broker_send_target,
+    )
+
+    # Shared gate: owner + automation_allowed(re_agent_email) + realtor + no
+    # self-email (all normalized). None → downgrade to an operator draft so the
+    # signal isn't silently dropped.
+    resolved = await resolve_broker_send_target(db, loan)
+    if resolved is None:
+        return await _draft("automation_off")
+    sender_id, realtor_email = resolved
+
+    # One automated realtor email per loan per DAY, shared with the daily
+    # collection digest — a file with N outstanding requirements produces ONE
+    # email, not N, and firm-wide fan-out across every deal is bounded to one
+    # per loan per day. Claim (and commit) the dedup slot BEFORE the irreversible
+    # send so a poison rule later in the pass can't roll back the marker and
+    # cause a re-send on the next 30-min tick.
+    if not await claim_broker_email_slot(
+        db,
+        loan_id,
+        summary=f"Cadence broker email to {realtor_email} — {rule.trigger_event}",
+        payload={"rule_id": str(rule.id), "to": realtor_email, "source": "cadence", "trigger": rule.trigger_event},
+    ):
+        # Already emailed this loan today (digest or another rule) — draft instead
+        # so the operator still sees the signal without a duplicate send.
+        return await _draft("already_emailed_today")
+
+    from app.services.email.parser import inject_deal_id
+    from app.services.email.user_mailer import send_as_user
+
+    subject = inject_deal_id(f"Action needed — {loan.address}"[:200], loan.deal_id)
+    body = f"{msg}\n\nDeal: {loan.deal_id} · {loan.address}\n\n— Qualified Commercial"
+    try:
+        result = await send_as_user(db, sender_id, to_emails=[realtor_email], subject=subject, body_text=body)
+    except Exception:  # noqa: BLE001
+        log.exception("cadence broker notify send failed loan=%s", loan_id)
+        result = None
+    # Transport-strict attribution: only claim an auto-send when it actually left
+    # via the OWNER's Gmail (detail == "sent_gmail"). A firm-SES fallback (grant
+    # revoked between the gate and the send) is NOT attributed as the owner —
+    # record it as a draft/fallback so replies + identity aren't misrepresented.
+    if result is not None and result.ok and result.detail == "sent_gmail":
+        task = AITask(
+            loan_id=loan_id,
+            source=AITaskSource.PIPELINE,
+            priority=AITaskPriority.MEDIUM,
+            status=AITaskStatus.PENDING,
+            action="cadence_broker_sent",
+            title=f"Agent notified · {target.get('client_name') or 'client'}",
+            summary=(msg or "")[:480],
+            agent="cadence",
+            draft_payload={
+                "client_id": str(target["client_id"]),
+                "rule_id": str(rule.id),
+                "auto_send": True,
+                "visibility": "broker",
+                "realtor_email": realtor_email,
+                "message": msg,
+                "requirement_key": target.get("requirement_key"),
+            },
+        )
+        db.add(task)
+        await db.flush()
+        return {"ai_task_id": task.id, "client_id": target["client_id"], "broker_sent": True}
+    # Not sent from the owner's Gmail — surface as an operator draft. The dedup
+    # slot is already committed, so we won't retry the auto-send today; the draft
+    # lets a human send it manually.
+    detail = (result.detail if result is not None else "send_error")
+    return await _draft(f"not_owner_gmail:{detail}")
+
+
+def _compose_broker_message(rule: AICadenceRule, target: dict[str, Any]) -> str:
+    """Broker-framed message. Uses the rule's own template when present; else a
+    sensible default that names the outstanding requirement and the client."""
+    formatted = _format_template(rule.message_template, target)
+    if formatted:
+        return formatted
+    ctx = dict(target.get("context") or {})
+    label = ctx.get("requirement_label") or target.get("requirement_key") or "an outstanding item"
+    client_name = target.get("client_name") or "your client"
+    parts = [
+        f"Heads up — we're still waiting on {label} for {client_name}. "
+        "Could you give them a nudge so we can keep the file moving?"
+    ]
+    due = ctx.get("complete_file_by") or ctx.get("due_at")
+    if due:
+        parts.append(f"Target due date: {due}.")
+    return "\n\n".join(parts)
 
 
 _ACTION_HANDLERS = {

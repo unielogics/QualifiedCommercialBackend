@@ -515,7 +515,7 @@ class CadenceRuleUpsert(BaseModel):
     action_type: Literal["draft_message", "create_task", "escalate", "mark_stalled", "auto_send_reminder"]
     approval_required: bool = True
     message_template: str | None = None
-    visibility: Literal["internal", "agent", "borrower"] = "agent"
+    visibility: Literal["internal", "agent", "borrower", "broker"] = "agent"
     is_active: bool = True
     requires_ai_owner: bool = True
 

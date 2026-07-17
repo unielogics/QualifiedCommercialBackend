@@ -1,11 +1,19 @@
-"""Merged super-admin update — one email, one thread, client + realtor together.
+"""Merged super-admin update + real-estate-agent (broker) automations.
 
-When a super-admin works a loan file and wants to update both the borrower and
-their realtor at once, this drafts a single EmailDraft addressed To the client
-with the realtor CC'd (and super-admins BCC'd for audit). The subject carries the
-[QC-{deal_id}] tag so replies thread back into the loan via the inbound
-orchestrator. It's approve-first (status=PENDING) like lender_send, and sends via
-the super-admin's connected Gmail (send_as_user) on approval.
+Three related send paths, all keyed to a loan's connected Google users:
+
+1. draft_merged_update — one EmailDraft To the client, realtor Cc'd, super-admins
+   Bcc'd for audit; [QC-{deal_id}] subject tag so replies thread back via the
+   inbound orchestrator. Approve-first (status=PENDING), sent via the super-admin's
+   connected Gmail (send_as_user) on approval.
+2. maybe_send_stage_change_email — a realtor status-change email on real loan
+   stage transitions (gated by automation_allowed(...,"status_change_email")).
+3. maybe_send_broker_collection_email — a once-per-day digest to the realtor of
+   the outstanding items still being collected on the file, so they can chase the
+   borrower (gated by automation_allowed(...,"re_agent_email")).
+
+Both (2) and (3) send FROM the loan's operational owner (loan.assigned_owner_id),
+never the acting admin or the broker, and no-op when there's no owner.
 """
 
 from __future__ import annotations
@@ -192,3 +200,204 @@ async def maybe_send_stage_change_email(
     except Exception:  # noqa: BLE001
         log.exception("stage-change broker email failed loan=%s", loan.id)
         return False
+
+
+# ── Broker collection digest (RE-agent automation, re_agent_email) ────────────
+#
+# A once-per-day email to the loan's real-estate agent (broker) listing the
+# outstanding items still being collected on their file, so they can chase the
+# borrower. This is the "tasks that need completing/collecting" automation. It
+# mirrors maybe_send_stage_change_email: sender = loan owner (whose Gmail we send
+# from), gated by automation_allowed(...,"re_agent_email"). Dedup is a per-loan
+# Activity row so the daily scheduler tick can't double-send.
+
+_BROKER_DIGEST_ACTIVITY_KIND = "broker.collection_digest"
+_BROKER_DIGEST_DEDUP_HOURS = 20  # < 24h so a daily 9am tick fires at most once/day
+
+
+async def _owner_email(db: AsyncSession, user_id: uuid.UUID | None) -> str | None:
+    if user_id is None:
+        return None
+    from app.models.user import User
+
+    user = await db.get(User, user_id)
+    return _norm(user.email) if user and user.email else None
+
+
+async def _outstanding_docs_for_loan(db: AsyncSession, loan_id: uuid.UUID) -> list[str]:
+    """Names of documents still being collected on the loan (status=REQUESTED)."""
+    from app.enums import DocStatus
+    from app.models.document import Document
+
+    rows = (
+        await db.execute(
+            select(Document.name).where(
+                Document.loan_id == loan_id,
+                Document.status == DocStatus.REQUESTED,
+            )
+        )
+    ).scalars().all()
+    # De-dup + stable order; drop blanks.
+    seen: list[str] = []
+    for name in rows:
+        n = (name or "").strip()
+        if n and n not in seen:
+            seen.append(n)
+    return seen
+
+
+async def _broker_digest_already_sent_today(db: AsyncSession, loan_id: uuid.UUID) -> bool:
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.activity import Activity
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_BROKER_DIGEST_DEDUP_HOURS)
+    row = (
+        await db.execute(
+            select(Activity.id)
+            .where(
+                Activity.loan_id == loan_id,
+                Activity.kind == _BROKER_DIGEST_ACTIVITY_KIND,
+                Activity.occurred_at >= cutoff,
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+async def resolve_broker_send_target(
+    db: AsyncSession, loan: Loan
+) -> tuple[uuid.UUID, str] | None:
+    """Return (sender_owner_id, normalized_realtor_email) when this loan may
+    receive an automated RE-agent email, else None.
+
+    Shared gate for both the daily collection digest and the cadence broker
+    lane: requires an assigned owner, automation_allowed(...,"re_agent_email")
+    on that owner, a resolvable realtor, and owner != realtor (no self-email —
+    both sides normalized so case/whitespace can't defeat the guard)."""
+    from app.services.google.google_oauth_client import automation_allowed
+
+    sender_id = loan.assigned_owner_id
+    if sender_id is None or not await automation_allowed(db, sender_id, "re_agent_email"):
+        return None
+    realtor_email = _norm(await _realtor_email(db, loan))
+    if not realtor_email:
+        return None
+    owner_email = await _owner_email(db, sender_id)  # already normalized
+    if owner_email and owner_email == realtor_email:
+        return None
+    return sender_id, realtor_email
+
+
+async def claim_broker_email_slot(
+    db: AsyncSession, loan_id: uuid.UUID, *, summary: str, payload: dict | None = None
+) -> bool:
+    """Atomically claim today's ONE automated RE-agent email slot for a loan.
+
+    Both the daily collection digest and the cadence broker lane call this, so a
+    loan gets at most one automated realtor email per day across BOTH mechanisms
+    (whichever fires first wins). Inserts the dedup Activity row and COMMITS it
+    immediately, so the marker survives a later pass-wide commit failure/crash
+    and closes the check-then-send race with the manual run-doc-reminders
+    endpoint. Returns False if a recent marker already exists (someone else
+    claimed it) or the commit fails. The email is sent only after this returns
+    True, so at worst a crash between claim and send SKIPS one day's email
+    (safe) rather than sending twice (spammy).
+
+    Concurrency: a transaction-scoped Postgres advisory lock keyed on the loan
+    serializes concurrent claimers (e.g. the 30-min cadence pass overlapping the
+    manual run-doc-reminders endpoint). The lock is held until the commit that
+    persists the marker releases it, so the loser blocks, then its own recency
+    check sees the committed marker and backs off — no duplicate send even under
+    truly-simultaneous claims."""
+    from sqlalchemy import bindparam, text
+
+    from app.models.activity import Activity
+
+    # Two 32-bit keys: a constant namespace + a stable hash of the loan id.
+    _LOCK_NS = 0x51434252  # "QCBR"
+    lock_key = (int(loan_id.int) & 0x7FFFFFFF)
+    try:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:ns, :k)").bindparams(
+                bindparam("ns", _LOCK_NS), bindparam("k", lock_key)
+            )
+        )
+    except Exception:  # noqa: BLE001 — non-PG backend / lock error: fall back to the
+        # best-effort check-then-insert below (still safe on the single-instance
+        # scheduler; the advisory lock is defense-in-depth for multi-worker).
+        log.debug("broker email slot advisory lock unavailable loan=%s", loan_id)
+
+    if await _broker_digest_already_sent_today(db, loan_id):
+        return False
+    db.add(
+        Activity(
+            loan_id=loan_id,
+            actor_id=None,
+            actor_label="ai",
+            kind=_BROKER_DIGEST_ACTIVITY_KIND,
+            summary=summary,
+            payload=payload,
+        )
+    )
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001 — lost the race (or DB error); don't send.
+        await db.rollback()
+        log.warning("broker email slot claim failed loan=%s", loan_id)
+        return False
+    return True
+
+
+async def maybe_send_broker_collection_email(db: AsyncSession, loan: Loan) -> bool:
+    """Email the loan's real-estate agent a digest of outstanding collection items.
+
+    Gated by resolve_broker_send_target (owner + automation_allowed + realtor +
+    no self-email). Sends from the owner's Gmail. Best-effort: never raises.
+    Idempotent per loan per day — the dedup Activity marker is claimed AND
+    committed BEFORE the send, so a crash can only under-send, never double-send.
+    Returns True only when an email was actually sent."""
+    target = await resolve_broker_send_target(db, loan)
+    if target is None:
+        return False
+    sender_id, realtor_email = target
+
+    outstanding = await _outstanding_docs_for_loan(db, loan.id)
+    if not outstanding:
+        return False  # nothing to chase — stay quiet
+
+    shown = outstanding[:20]
+    more = len(outstanding) - len(shown)
+    # Claim the slot (commit the marker) before the irreversible send.
+    if not await claim_broker_email_slot(
+        db,
+        loan.id,
+        summary=f"Broker collection digest sent — {len(outstanding)} item(s) to {realtor_email}",
+        payload={"items": shown, "item_count": len(outstanding), "to": realtor_email, "source": "digest"},
+    ):
+        return False
+
+    from app.services.email.user_mailer import send_as_user
+
+    bullet_lines = "\n".join(f"  • {name}" for name in shown)
+    if more > 0:
+        bullet_lines += f"\n  • …and {more} more"
+    subject = inject_deal_id(f"Items still needed — {loan.address}"[:200], loan.deal_id)
+    body = (
+        f"Hi,\n\nThese items are still outstanding on {loan.address} "
+        f"(Deal {loan.deal_id}). Please help nudge your client so we can keep the "
+        f"file moving:\n\n{bullet_lines}\n\n"
+        f"Reply to this email and it will thread back to the file.\n\n— Qualified Commercial"
+    )
+    try:
+        result = await send_as_user(db, sender_id, to_emails=[realtor_email], subject=subject, body_text=body)
+    except Exception:  # noqa: BLE001
+        log.exception("broker collection digest failed loan=%s", loan.id)
+        return False
+    # The marker is already committed; even if the send failed we keep it so we
+    # don't hammer the realtor on the next tick. A failed send is logged only.
+    if not result.ok:
+        log.warning("broker collection digest send not ok loan=%s detail=%s", loan.id, result.detail)
+        return False
+    return True

@@ -619,6 +619,9 @@ async def evaluate_doc_reminders(
 
         # Group by (loan_id, scenario) for bundled messaging.
         groups: dict[tuple[_UUID, str], list[Document]] = defaultdict(list)
+        # Loans with at least one live (non-gated) outstanding doc — the broker
+        # collection-digest pass below iterates these.
+        broker_digest_loans: set[_UUID] = set()
         for doc in docs:
             if doc.loan_id is None or doc.requested_on is None:
                 continue
@@ -632,6 +635,7 @@ async def evaluate_doc_reminders(
             # unchanged for every other loan.
             if loan.collection_starts_on is not None and loan.collection_starts_on > today:
                 continue
+            broker_digest_loans.add(doc.loan_id)
             # Per-loan operator override (alembic 0022) wins over
             # both per-item and per-loan-type defaults — set via
             # PATCH /documents/{id} from the Workflow tab.
@@ -727,6 +731,27 @@ async def evaluate_doc_reminders(
                 elif scenario == "escalating":
                     _emit_escalation(db, doc, age)
             counts[scenario] += len(focus_docs)
+
+        # RE-agent (broker) collection digest — one email per loan per day to the
+        # loan's real-estate agent listing outstanding items, so they can chase
+        # the borrower. Gated per loan by automation_allowed(...,"re_agent_email")
+        # (firm switch + owner's per-user toggle + owner Gmail connected) and
+        # deduped by a broker.collection_digest Activity row inside the sender.
+        # Best-effort per loan — one failure never aborts the pass.
+        from app.services.email.merged_send import maybe_send_broker_collection_email
+
+        broker_sent = 0
+        for loan_id in broker_digest_loans:
+            loan = await _get_loan(loan_id)
+            if loan is None:
+                continue
+            try:
+                if await maybe_send_broker_collection_email(db, loan):
+                    broker_sent += 1
+            except Exception:  # noqa: BLE001
+                log.exception("broker collection digest failed loan=%s", loan_id)
+        if broker_sent:
+            counts["broker_digest"] = broker_sent
 
         await db.commit()
 

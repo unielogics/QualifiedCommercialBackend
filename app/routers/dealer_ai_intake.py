@@ -4130,7 +4130,7 @@ async def send_dealer_ai_vendor_email(
                 continue
             attachments.append((fname, data, ctype))
             total_attach_bytes += len(data)
-    for raw_email in payload.to_emails:
+    for idx, raw_email in enumerate(payload.to_emails):
         email = str(raw_email).lower().strip()
         access = await _prepare_vendor_access(db, intake, email, payload)
         access_ids.append(access.id)
@@ -4143,12 +4143,17 @@ async def send_dealer_ai_vendor_email(
             + attachment_note
         )
         html_body = "<br>".join(html.escape(line) for line in body.splitlines())
+        # Each To recipient gets their own message (separate secure-bucket access
+        # link). CC only ONCE — on the first message — so a CC'd colleague isn't
+        # copied N times (once per To recipient). The send row still records the
+        # intended cc list for audit.
+        send_cc = cc_emails if idx == 0 else []
         # Send from the operator's connected Gmail when available, else firm SES.
         result = await send_as_user(
             db,
             user.id,
             to_emails=[email],
-            cc_emails=cc_emails,
+            cc_emails=send_cc,
             subject=payload.subject.strip(),
             body_text=body,
             body_html=f"<p>{html_body}</p>",

@@ -58,7 +58,13 @@ class AICadenceRule(TimestampMixin, Base):
 
     message_template: Mapped[str | None] = mapped_column(Text, nullable=True)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="agent", server_default="agent")
-    """internal | agent | borrower."""
+    """internal | agent | borrower | broker.
+
+    broker = real-estate-agent lane: the action notifies the loan's realtor
+    (not the borrower). Auto-send (approval_required=False) emails the realtor
+    from the loan owner's Gmail, gated by the re_agent_email automation toggle;
+    otherwise it falls back to an operator-facing AITask. Bypasses the borrower
+    OutreachMode kill switch + follow-up windowing (both borrower-only)."""
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
 
