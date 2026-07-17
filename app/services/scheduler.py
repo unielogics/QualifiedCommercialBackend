@@ -221,6 +221,20 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Phase 4 — Workspace-mailbox inbox sync every 2 min. Reads the delegated
+    # mailbox into the EmailMessage store (bodies encrypted, matched to loan/client,
+    # body-less breadcrumb Activity). No-ops unless user_inbox_sync_enabled AND
+    # Gmail DWD is configured — ships dormant. Idempotent (dedup on gmail id).
+    scheduler.add_job(
+        _wrap(job_user_inbox_sync),
+        "interval",
+        minutes=2,
+        id="user_inbox_sync",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Gmail Pub/Sub watch renewal. A users.watch() registration expires
     # after ~7 days; we re-register every 24h (and once ~10s after
     # startup, so a fresh deploy re-arms push immediately). No-ops when
@@ -526,6 +540,16 @@ async def job_lender_inbound_poll() -> None:
     from app.services.email.inbound_poller import run_inbound_poll
 
     await run_inbound_poll()
+
+
+async def job_user_inbox_sync() -> None:
+    """Phase 4 — sync the delegated Workspace mailbox into the isolated EmailMessage
+    inbox (encrypted bodies, matched to loan/client, body-less breadcrumbs). Self-
+    no-ops unless USER_INBOX_SYNC_ENABLED and Gmail DWD is configured; dedups on the
+    gmail message id, so a double-fire is harmless."""
+    from app.services.email.user_inbox_sync import run_user_inbox_sync
+
+    await run_user_inbox_sync()
 
 
 async def job_gmail_watch_renew() -> None:

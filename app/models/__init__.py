@@ -73,6 +73,7 @@ from app.models.device_token import DeviceToken  # noqa: F401
 from app.models.document import Document  # noqa: F401
 from app.models.document_analysis_result import DocumentAnalysisResult  # noqa: F401
 from app.models.email_draft import EmailDraft  # noqa: F401
+from app.models.email_message import EmailMessage  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401
 from app.models.fred_observation import FredObservation  # noqa: F401
 from app.models.google_account import GoogleAccount  # noqa: F401

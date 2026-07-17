@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     gmail_pubsub_topic: str = ""
     gmail_push_token: str = ""
     use_fake_inbox: bool = True
+    # Phase 4 — per-message Workspace-mailbox inbox sync (the isolated inbox).
+    # Ships dormant: even with Gmail DWD configured, the inbox sync only runs when
+    # this is explicitly enabled, so the code can deploy before the feature is live.
+    user_inbox_sync_enabled: bool = False
 
     # Firebase Cloud Messaging — path to the Firebase Admin SDK
     # service-account JSON. Used by app/services/push.py to send
