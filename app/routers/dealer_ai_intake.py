@@ -12,7 +12,7 @@ import time
 import zipfile
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -27,7 +27,7 @@ from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketUploadLink, BucketVendorAccess
+from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
@@ -410,6 +410,17 @@ class VendorEmailSendRequest(VendorEmailPreviewRequest):
     # Optional Google Drive files to attach (file ids from the sender's Drive
     # picker). Downloaded via the sender's OAuth grant at send time.
     drive_file_ids: list[str] = Field(default_factory=list)
+    # Attachment toggles. Defaults preserve prior behavior (lender packet on;
+    # summary PDF + ZIP off). `include_lender_packet` (inherited) still gates the
+    # packet for backward-compat; attach_lender_packet mirrors it when provided.
+    attach_lender_packet: bool | None = None  # None → fall back to include_lender_packet
+    attach_executive_summary: bool = False  # summary is markdown → attached as .txt
+    attach_package_zip: bool = False
+    # How the recipient reaches the secure bucket:
+    #   "login"    → Clerk-invited vendor login link (default, prior behavior)
+    #   "passcode" → a no-login BucketShare link + one-time passcode embedded in the body
+    #   "none"     → no bucket access blurb
+    bucket_access: Literal["login", "passcode", "none"] = "login"
     can_preview: bool = True
     can_download: bool = True
     can_add_notes: bool = True
@@ -4124,18 +4135,19 @@ async def create_dealer_ai_lender_packet(
     return _artifact_read(artifact)
 
 
-@admin_router.get("/{intake_id}/package.zip")
-async def download_dealer_ai_package_zip(
-    intake_id: UUID,
+async def build_package_zip_bytes(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
     user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-) -> Response:
-    """Bundle the full shipping package as a single ZIP: every uploaded document,
+) -> tuple[str, bytes]:
+    """Build the full shipping package ZIP as raw bytes: every uploaded document,
     the lender-packet PDF, the executive summary (markdown), a ready-to-edit
-    vendor email template, and a README manifest — so the operator can ship the
-    whole file anywhere (attach, upload, or archive) in one download."""
-    _require_super_admin(user)
-    intake = await _load_admin_dealer_lead(db, intake_id)
+    vendor email template, and a README manifest.
+
+    Pure builder — returns (filename, bytes) with NO Response and NO DB commit, so
+    both the download route and the vendor-email send path can attach the same ZIP.
+    It DOES ensure the summary/packet artifacts + regenerate the email template
+    (side-effects the caller is expected to commit)."""
     summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
     packet_artifact = await _ensure_lender_packet_artifact(db, intake, user)
     email_draft = await _generate_management_json(
@@ -4145,7 +4157,6 @@ async def download_dealer_ai_package_zip(
         purpose="vendor_email",
         extra={"executive_summary": summary_artifact.body_json, "lender_packet_title": packet_artifact.title},
     )
-    await db.commit()
 
     label = _safe_filename(intake.business_name or intake.full_name or "lead")
     files = sorted(_active_files(intake.bucket), key=lambda f: f.file_name.lower())
@@ -4173,7 +4184,7 @@ async def download_dealer_ai_package_zip(
             try:
                 zf.writestr("lender-packet.pdf", await _s3_bytes(packet_artifact.s3_key))
             except Exception:  # noqa: BLE001
-                log.exception("package.zip: lender packet fetch failed intake=%s", intake_id)
+                log.exception("package.zip: lender packet fetch failed intake=%s", intake.id)
         # Vendor email template.
         subject = str(email_draft.get("subject") or f"Qualified Commercial review: {intake.business_name or intake.full_name}")
         body = str(email_draft.get("body") or summary_artifact.body_text or "")
@@ -4195,8 +4206,20 @@ async def download_dealer_ai_package_zip(
                 log.exception("package.zip: doc fetch failed file=%s", f.id)
         zf.writestr("README.txt", "\n".join(manifest_lines) + "\n")
 
-    payload = buf.getvalue()
-    filename = f"{label}-package.zip"
+    return f"{label}-package.zip", buf.getvalue()
+
+
+@admin_router.get("/{intake_id}/package.zip")
+async def download_dealer_ai_package_zip(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Bundle the full shipping package as a single ZIP — see build_package_zip_bytes."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    filename, payload = await build_package_zip_bytes(db, intake, user)
+    files = _active_files(intake.bucket)
     await _log(
         db,
         intake.bucket_id,
@@ -4263,29 +4286,66 @@ async def send_dealer_ai_vendor_email(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "At least one vendor email is required")
     intake = await _load_admin_dealer_lead(db, intake_id)
     summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
-    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if payload.include_lender_packet else None
+    # The lender packet is attached when explicitly requested (attach_lender_packet)
+    # or, for backward-compat, via the legacy include_lender_packet flag.
+    want_packet = payload.attach_lender_packet if payload.attach_lender_packet is not None else payload.include_lender_packet
+    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if want_packet else None
     cc_emails = [str(email).lower().strip() for email in payload.cc_emails if str(email).strip()]
     sends: list[PublicUnderwritingIntakeEmailSend] = []
     access_ids: list[UUID] = []
     _MAX_ATTACH = 8 * 1024 * 1024  # per-file cap
-    # Aggregate cap for the whole message. Kept comfortably under Gmail's ~25MB
-    # limit (attachments inflate ~1.37x under base64) so a stack of sub-8MB files
-    # can't build one oversized message that the provider rejects for EVERY
-    # recipient. Files that would push past the total are noted, not attached.
-    _MAX_TOTAL_ATTACH = 18 * 1024 * 1024
+    # Aggregate RAW cap for the whole message. Base64 inflates attachments ~1.37x,
+    # so 15 MiB raw ≈ ~20.5 MB encoded — a real buffer under Gmail's 25MB ceiling
+    # once MIME headers, the HTML body, and multipart boundaries are added. A stack
+    # of sub-8MB files can't build one oversized message that the provider rejects
+    # for EVERY recipient. Files that would push past the total are noted, not attached.
+    _MAX_TOTAL_ATTACH = 15 * 1024 * 1024
     attachments: list[tuple[str, bytes, str]] = []
     attachment_note = ""
     total_attach_bytes = 0
+
+    def _try_attach(name: str, data: bytes, ctype: str, *, too_big_note: str) -> None:
+        """Append an attachment if it fits both the per-file and running aggregate
+        caps; otherwise record a note (never silently drop, never overflow)."""
+        nonlocal total_attach_bytes, attachment_note
+        if len(data) > _MAX_ATTACH or total_attach_bytes + len(data) > _MAX_TOTAL_ATTACH:
+            attachment_note += too_big_note
+            return
+        attachments.append((name, data, ctype))
+        total_attach_bytes += len(data)
+
+    # Lender packet PDF.
     if packet_artifact and packet_artifact.s3_key:
         try:
-            packet_bytes = await _s3_bytes(packet_artifact.s3_key)
-            if len(packet_bytes) <= _MAX_ATTACH:
-                attachments.append((f"{_safe_filename(packet_artifact.title)}.pdf", packet_bytes, "application/pdf"))
-                total_attach_bytes += len(packet_bytes)
-            else:
-                attachment_note = "\n\nThe underwriting packet is available through the secure vendor bucket because the PDF is too large for email."
-        except Exception as exc:
-            attachment_note = f"\n\nThe underwriting packet is available through the secure vendor bucket. Attachment fallback reason: {exc}"
+            _try_attach(
+                f"{_safe_filename(packet_artifact.title)}.pdf",
+                await _s3_bytes(packet_artifact.s3_key),
+                "application/pdf",
+                too_big_note="\n\nThe underwriting packet is available through the secure vendor bucket because the PDF is too large for email.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            attachment_note += f"\n\nThe underwriting packet is available through the secure vendor bucket. Attachment fallback reason: {exc}"
+    # Executive summary (markdown → .txt).
+    if payload.attach_executive_summary and summary_artifact.body_text:
+        _try_attach(
+            f"{_safe_filename(summary_artifact.title or 'executive-summary')}.txt",
+            summary_artifact.body_text.encode("utf-8"),
+            "text/plain; charset=utf-8",
+            too_big_note="\n\nThe executive summary is available through the secure vendor bucket (too large to attach).",
+        )
+    # Full shipping package ZIP (built on the fly).
+    if payload.attach_package_zip:
+        try:
+            zip_name, zip_bytes = await build_package_zip_bytes(db, intake, user)
+            _try_attach(
+                zip_name,
+                zip_bytes,
+                "application/zip",
+                too_big_note="\n\nThe full package ZIP is too large to email — use the secure bucket access below or the Download ZIP button.",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("vendor-email: package zip build failed intake=%s", intake_id)
+            attachment_note += "\n\nThe full package ZIP could not be attached; use the secure bucket access below."
     # Google Drive attachments (downloaded via the sender's OAuth grant). Skip any
     # over the per-file OR aggregate size cap and note them rather than failing the
     # whole send. max_bytes is enforced inside download_file_bytes so oversized
@@ -4302,23 +4362,71 @@ async def send_dealer_ai_vendor_email(
                 attachment_note += f"\n\nA Google Drive file ({file_id}) could not be attached (unavailable or too large)."
                 continue
             fname, data, ctype = got
-            if total_attach_bytes + len(data) > _MAX_TOTAL_ATTACH:
-                attachment_note += f"\n\n'{fname}' was not attached to keep the email under the size limit; it's in the secure vendor bucket."
-                continue
-            attachments.append((fname, data, ctype))
-            total_attach_bytes += len(data)
+            _try_attach(
+                fname, data, ctype,
+                too_big_note=f"\n\n'{fname}' was not attached to keep the email under the size limit; it's in the secure vendor bucket.",
+            )
+
+    # Bucket access blurb. "passcode" creates ONE no-login share for the bucket and
+    # embeds the link + one-time passcode in every recipient's body (same access for
+    # all). "login" keeps the per-recipient Clerk vendor-login link. "none" omits it.
+    passcode_blurb = ""
+    passcode_blurb_redacted = ""  # persisted variant with the one-time code masked
+    if payload.bucket_access == "passcode":
+        share_passcode = _generate_passcode()
+        first_recipient = str(payload.to_emails[0]) if payload.to_emails else "Vendor"
+        share = BucketShare(
+            bucket_id=intake.bucket_id,
+            token=secrets.token_urlsafe(32),
+            recipient_name=first_recipient[:180],  # column is String(180)
+            recipient_email=first_recipient[:320] if payload.to_emails else None,
+            passcode_hash=_hash_passcode(share_passcode),
+            can_preview=payload.can_preview,
+            can_download=payload.can_download,
+            can_add_notes=payload.can_add_notes,
+            can_view_ai_summary=payload.can_view_ai_summary,
+            can_use_ai_chat=payload.can_use_ai_chat,
+            can_view_ai_tasks=payload.can_view_ai_tasks,
+            can_propose_tasks=payload.can_propose_tasks,
+        )
+        # Grant the share the bucket's active uploaded files, else the recipient
+        # opens the link to an empty package.
+        share.files = list(_active_files(intake.bucket))
+        db.add(share)
+        await db.flush()
+        share_url = _public_url(f"/buckets/share/{share.token}")
+        passcode_blurb = (
+            "\n\nSecure file access (no login required):\n"
+            f"{share_url}\nAccess code: {share_passcode}\n"
+            "Open the link and enter the access code to view the file package."
+        )
+        # The one-time passcode must NOT be persisted at rest (parity with the
+        # hash-only BucketShare design); the stored send-row body masks it.
+        passcode_blurb_redacted = (
+            "\n\nSecure file access (no login required):\n"
+            f"{share_url}\nAccess code: (sent to recipient; not stored)\n"
+            "Open the link and enter the access code to view the file package."
+        )
+
     for idx, raw_email in enumerate(payload.to_emails):
         email = str(raw_email).lower().strip()
-        access = await _prepare_vendor_access(db, intake, email, payload)
-        access_ids.append(access.id)
-        vendor_link = _public_url(f"/vendor/buckets?bucket={intake.bucket_id}")
-        body = (
-            payload.body.strip()
-            + "\n\nSecure bucket access:\n"
-            + vendor_link
-            + "\n\nQualified Commercial has enabled vendor access for this bucket. Please log in with the invited vendor email to view the file package."
-            + attachment_note
-        )
+        access = None
+        if payload.bucket_access == "login":
+            access = await _prepare_vendor_access(db, intake, email, payload)
+            access_ids.append(access.id)
+            vendor_link = _public_url(f"/vendor/buckets?bucket={intake.bucket_id}")
+            access_blurb = (
+                "\n\nSecure bucket access:\n"
+                + vendor_link
+                + "\n\nQualified Commercial has enabled vendor access for this bucket. Please log in with the invited vendor email to view the file package."
+            )
+            access_blurb_for_record = access_blurb
+        else:
+            access_blurb = passcode_blurb  # passcode share (same for all) or "" for none
+            access_blurb_for_record = passcode_blurb_redacted  # masks the one-time code at rest
+        body = payload.body.strip() + access_blurb + attachment_note
+        # Persisted copy never carries the live one-time passcode.
+        body_for_record = payload.body.strip() + access_blurb_for_record + attachment_note
         html_body = "<br>".join(html.escape(line) for line in body.splitlines())
         # Each To recipient gets their own message (separate secure-bucket access
         # link). CC only ONCE — on the first message — so a CC'd colleague isn't
@@ -4343,8 +4451,8 @@ async def send_dealer_ai_vendor_email(
             to_emails=[email],
             cc_emails=cc_emails,
             subject=payload.subject.strip(),
-            body=body,
-            vendor_access_ids=[str(access.id)],
+            body=body_for_record,
+            vendor_access_ids=[str(access.id)] if access is not None else None,
             ses_status=result.detail,
             ses_message_ids=[result.message_id] if result.message_id else None,
             ses_error=result.error,
