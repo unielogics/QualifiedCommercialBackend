@@ -1634,7 +1634,7 @@ class EngagementSignalRead(BaseModel):
     kind: str
     summary: str
     actor_label: str | None
-    created_at: datetime
+    created_at: datetime  # sourced from Activity.occurred_at (the model has no created_at)
     payload: dict | None
 
 
@@ -1663,13 +1663,13 @@ async def list_client_engagement(
     rows = (await db.execute(
         select(Activity)
         .where(Activity.client_id == client_id)
-        .order_by(Activity.created_at.desc())
+        .order_by(Activity.occurred_at.desc())
         .limit(100)
     )).scalars().all()
     return [
         EngagementSignalRead(
             id=r.id, kind=r.kind, summary=r.summary or "",
-            actor_label=r.actor_label, created_at=r.created_at, payload=r.payload,
+            actor_label=r.actor_label, created_at=r.occurred_at, payload=r.payload,
         )
         for r in rows
     ]
@@ -1707,7 +1707,8 @@ async def log_client_engagement(
     )
     db.add(row)
     await db.flush()
+    await db.refresh(row)  # populate server-defaulted occurred_at
     return EngagementSignalRead(
         id=row.id, kind=row.kind, summary=row.summary,
-        actor_label=row.actor_label, created_at=row.created_at, payload=row.payload,
+        actor_label=row.actor_label, created_at=row.occurred_at, payload=row.payload,
     )
