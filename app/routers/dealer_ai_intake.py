@@ -344,6 +344,26 @@ class DealerBookCallRequest(BaseModel):
     starts_at: datetime
 
 
+class DriveIngestRequest(BaseModel):
+    # Google Drive file ids the operator selected in the Drive picker. Under the
+    # drive.file scope these resolve only to files the app can see (picker-/app-
+    # granted), downloaded via the operator's OAuth grant at ingest time.
+    drive_file_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class DriveIngestItemResult(BaseModel):
+    drive_file_id: str
+    file_name: str | None = None
+    status: str  # "ingested" | "skipped"
+    reason: str | None = None
+
+
+class DriveIngestResponse(BaseModel):
+    ingested: int
+    skipped: int
+    items: list[DriveIngestItemResult]
+
+
 class PublicUnderwritingArtifactRead(ORMModel):
     id: UUID
     intake_id: UUID
@@ -3917,6 +3937,163 @@ async def dealer_ai_lead_upload_complete(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
+
+
+@admin_router.post("/{intake_id}/files/ingest-from-drive", response_model=DriveIngestResponse)
+async def dealer_ai_lead_ingest_from_drive(
+    intake_id: UUID,
+    payload: DriveIngestRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DriveIngestResponse:
+    """Ingest operator-selected Google Drive files into the lead's bucket so the
+    AI learns from them.
+
+    Each Drive file is downloaded via the operator's own OAuth grant (drive.file
+    scope — only picker-/app-granted files are visible), stored into the bucket's
+    S3 prefix as a BucketFile(status='uploaded'), and queued for per-file AI
+    analysis (enqueue_file_analysis) exactly like a normal upload — so the next
+    review composes from a warm cache. Best-effort per file: an unavailable /
+    oversized / duplicate file is skipped and reported, never aborting the batch."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+
+    from app.services.bucket_ai import enqueue_file_analysis
+    from app.services.google import google_oauth_client
+    from app.services.google.drive_client import download_file_bytes
+
+    _INGEST_MAX_BYTES = 25 * 1024 * 1024  # per-file cap for AI ingest
+    _, prefix, _ = _bucket_storage_config()
+    actor_name = user.name or "Super admin"
+    actor_email = user.email
+
+    items: list[DriveIngestItemResult] = []
+    ingested = 0
+    skipped = 0
+    # De-dupe against ids already ingested in this request.
+    seen_ids: set[str] = set()
+    # S3 keys written this request — used to best-effort clean up orphans if the
+    # batch fails before/at commit (S3 puts are not transactional with the DB).
+    put_keys: list[str] = []
+    log = logging.getLogger(__name__)
+
+    def _cleanup_put_objects() -> None:
+        bucket, _p, _k = _bucket_storage_config()
+        for key in put_keys:
+            try:
+                _s3_client().delete_object(Bucket=bucket, Key=key)
+            except Exception:  # noqa: BLE001
+                log.warning("drive ingest: orphan cleanup failed key=%s", key)
+
+    try:
+        for raw_id in payload.drive_file_ids:
+            file_id = (raw_id or "").strip()
+            if not file_id or file_id in seen_ids:
+                continue
+            seen_ids.add(file_id)
+            try:
+                got = await download_file_bytes(db, user.id, file_id, max_bytes=_INGEST_MAX_BYTES)
+            except (
+                google_oauth_client.GoogleNotConnected,
+                google_oauth_client.GoogleScopeMissing,
+                google_oauth_client.GoogleTokenRevoked,
+            ) as exc:
+                # A credential failure mid-batch is terminal for the remaining
+                # files, but files already stored this request are kept: commit
+                # them (below), and if NONE were ingested yet, surface a 409 so
+                # the operator knows to reconnect. This never orphans S3 — every
+                # put so far has a matching row about to be committed.
+                if ingested == 0:
+                    _cleanup_put_objects()
+                    if isinstance(exc, google_oauth_client.GoogleScopeMissing):
+                        raise HTTPException(status.HTTP_409_CONFLICT, "Reconnect Google with Drive access to import files.") from exc
+                    raise HTTPException(status.HTTP_409_CONFLICT, "Connect your Google account (Settings → Connections) before importing from Drive.") from exc
+                items.append(DriveIngestItemResult(drive_file_id=file_id, status="skipped", reason="google_disconnected"))
+                skipped += 1
+                break
+            if got is None:
+                items.append(DriveIngestItemResult(drive_file_id=file_id, status="skipped", reason="unavailable_or_too_large"))
+                skipped += 1
+                continue
+            fname, data, ctype = got
+            content_type = _sanitize_upload_content_type(ctype)
+            safe = _safe_filename(fname)
+            # Content-level idempotency: hash the downloaded bytes and skip if a
+            # byte-identical active file is already in the bucket. Using the hash
+            # (not name+size) avoids both a false "already there" on a coincidental
+            # name+size collision AND the multiple-rows crash a name+size lookup
+            # could hit. .first() (not one_or_none) is safe against dupes.
+            content_hash = hashlib.sha256(data).hexdigest()
+            existing = (
+                await db.execute(
+                    select(BucketFile.id).where(
+                        BucketFile.bucket_id == intake.bucket_id,
+                        BucketFile.content_hash == content_hash,
+                        BucketFile.deleted_at.is_(None),
+                    ).limit(1)
+                )
+            ).first()
+            if existing is not None:
+                items.append(DriveIngestItemResult(drive_file_id=file_id, file_name=fname, status="skipped", reason="already_in_bucket"))
+                skipped += 1
+                continue
+
+            new_id = uuid4()
+            s3_key = f"{prefix}/uploads/{intake.bucket_id}/{new_id}-drive-{safe}"
+            try:
+                _put_bucket_object(s3_key, content_type, data)
+            except Exception:  # noqa: BLE001
+                log.exception("drive ingest: S3 put failed intake=%s file=%s", intake_id, file_id)
+                items.append(DriveIngestItemResult(drive_file_id=file_id, file_name=fname, status="skipped", reason="storage_error"))
+                skipped += 1
+                continue
+            put_keys.append(s3_key)
+            bucket_file = BucketFile(
+                id=new_id,
+                bucket_id=intake.bucket_id,
+                requested_document_id=None,
+                upload_link_id=intake.bucket_upload_link_id,
+                file_name=fname,
+                s3_key=s3_key,
+                content_type=content_type,
+                size_bytes=len(data),
+                content_hash=content_hash,
+                uploaded_by_name=actor_name,
+                uploaded_by_email=actor_email,
+                status="uploaded",
+            )
+            db.add(bucket_file)
+            await db.flush()
+            # Queue per-file analysis so the review composes from a warm cache.
+            try:
+                await enqueue_file_analysis(db, bucket_file)
+            except Exception:  # noqa: BLE001
+                log.exception("drive ingest: enqueue analysis failed file=%s", bucket_file.id)
+            items.append(DriveIngestItemResult(drive_file_id=file_id, file_name=fname, status="ingested"))
+            ingested += 1
+
+        await _log(
+            db,
+            intake.bucket_id,
+            "underwriting_drive_files_ingested",
+            request=request,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+            target_type="bucket",
+            target_id=str(intake.bucket_id),
+            detail=f"Ingested {ingested} Drive file(s), skipped {skipped}",
+        )
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 — any failure after S3 writes: roll back + GC orphans.
+        await db.rollback()
+        _cleanup_put_objects()
+        log.exception("drive ingest: batch failed intake=%s — rolled back + cleaned %d object(s)", intake_id, len(put_keys))
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Drive import failed; no files were imported.")
+    return DriveIngestResponse(ingested=ingested, skipped=skipped, items=items)
 
 
 @admin_router.post("/{intake_id}/executive-summary", response_model=PublicUnderwritingArtifactRead)
