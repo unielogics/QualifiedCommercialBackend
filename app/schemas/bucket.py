@@ -274,6 +274,23 @@ class BucketShareCreate(BaseModel):
         return None if value == "" else value
 
 
+class BucketShareEmailRequest(BaseModel):
+    """Email an existing share's access (link + one-time passcode) from the acting
+    admin's connected Gmail. The passcode is supplied by the caller (known only at
+    create/regenerate time — the server stores only its hash), so the composer echoes
+    it back here to embed in the body."""
+    to_emails: list[EmailStr] = Field(min_length=1, max_length=25)
+    cc_emails: list[EmailStr] = Field(default_factory=list, max_length=25)
+    subject: str = Field(min_length=1, max_length=512)
+    body: str = Field(min_length=1, max_length=12000)
+
+
+class BucketShareEmailResponse(BaseModel):
+    ok: bool
+    sent: int
+    detail: str | None = None
+
+
 class BucketShareRead(ORMModel):
     id: UUID
     bucket_id: UUID

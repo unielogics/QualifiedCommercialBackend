@@ -930,6 +930,74 @@ async def create_merged_update(
     )
 
 
+class ClientEmailRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=512)
+    body: str = Field(min_length=1, max_length=12000)
+    cc_emails: list[str] = Field(default_factory=list, max_length=25)
+
+
+class ClientEmailResponse(BaseModel):
+    ok: bool
+    to_email: str
+    detail: str | None = None
+
+
+@router.post("/{loan_id}/client-email", response_model=ClientEmailResponse)
+async def send_client_email(
+    loan_id: UUID,
+    payload: ClientEmailRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientEmailResponse:
+    """Email the loan's borrower directly FROM the acting user's connected Gmail
+    (firm SES fallback). Subject is tagged [QC-{deal_id}] so replies thread back
+    into the loan. Logs email.outbound at BOTH loan and client level. Operator
+    roles only (super-admin / loan-exec / broker / regional-manager), scoped to
+    loans they can see via _scope_query — never a CLIENT."""
+    # Operator/broker only — a CLIENT must never be able to send a firm-branded
+    # email (arbitrary body + CC) to themselves/others via this endpoint.
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.BROKER, Role.REGIONAL_MANAGER):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not permitted")
+    scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
+    loan = (await db.execute(scope)).scalar_one_or_none()
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    from app.services.email.merged_send import _client_email
+    from app.services.email.user_mailer import send_as_user
+
+    client_email = await _client_email(db, loan)
+    if not client_email:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This loan's client has no email on file.")
+    cc_emails = [e for e in (str(x).lower().strip() for x in payload.cc_emails) if "@" in e]
+    subject = inject_deal_id(payload.subject.strip()[:500], loan.deal_id)
+    try:
+        result = await send_as_user(
+            db, user.id, to_emails=[client_email], cc_emails=cc_emails or None,
+            subject=subject, body_text=payload.body,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).exception("client-email send failed loan=%s", loan.id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Email send failed; try again.") from exc
+
+    # Breadcrumb at both loan and client level (no separate body storage here).
+    summary = f"Client email: {subject[:120]}"
+    db.add(Activity(
+        loan_id=loan.id, actor_id=user.id, actor_label=user.role,
+        kind="email.outbound",
+        summary=summary,
+        payload={"to": client_email, "cc": cc_emails, "ok": bool(result.ok), "transport": result.detail},
+    ))
+    if loan.client_id is not None:
+        db.add(Activity(
+            client_id=loan.client_id, actor_id=user.id, actor_label=user.role,
+            kind="email.outbound", summary=summary,
+            payload={"to": client_email, "loan_id": str(loan.id), "ok": bool(result.ok)},
+        ))
+    await db.commit()
+    return ClientEmailResponse(ok=bool(result.ok), to_email=client_email, detail=result.detail)
+
+
 # ── Connect / disconnect lender ───────────────────────────────────────
 
 

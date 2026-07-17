@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import logging
 import re
 import secrets
@@ -72,6 +73,8 @@ from app.schemas.bucket import (
     BucketShareAccessRead,
     BucketShareAccessRequest,
     BucketShareCreate,
+    BucketShareEmailRequest,
+    BucketShareEmailResponse,
     BucketShareFileRead,
     BucketShareInfoRead,
     BucketSharePasscodeResetRead,
@@ -1375,6 +1378,77 @@ async def create_share(
     await db.commit()
     share = await _load_share_for_admin_read(db, share.id)
     return _share_read(share, passcode=passcode)
+
+
+@router.post("/admin/{bucket_id}/shares/{share_id}/email", response_model=BucketShareEmailResponse)
+async def email_share(
+    bucket_id: UUID,
+    share_id: UUID,
+    payload: BucketShareEmailRequest,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketShareEmailResponse:
+    """Email an existing share's access (link + code) to recipients FROM the acting
+    admin's connected Gmail (firm SES fallback). The composer supplies the full
+    subject/body — the body already contains the link + passcode the operator chose.
+    CC is applied once. Logs a share.emailed activity (no passcode persisted)."""
+    await _load_bucket_or_404(db, bucket_id)
+    share = (
+        await db.execute(
+            select(BucketShare).where(BucketShare.id == share_id, BucketShare.bucket_id == bucket_id)
+        )
+    ).scalar_one_or_none()
+    if share is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Share not found")
+    # Don't re-advertise a revoked/expired share — the access layer would reject
+    # the link+code anyway, confusing the recipient.
+    if not _is_active(share.status, share.expires_at):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Cannot email a revoked or expired share")
+
+    from app.services.email.user_mailer import send_as_user
+
+    # De-dup case-insensitively; drop any CC already in To so no address gets the
+    # passcode twice.
+    to_emails = list(dict.fromkeys(str(e).lower().strip() for e in payload.to_emails if "@" in str(e)))
+    to_set = set(to_emails)
+    cc_emails = [c for c in dict.fromkeys(str(e).lower().strip() for e in payload.cc_emails if "@" in str(e)) if c not in to_set]
+    subject = payload.subject.strip()
+    body = payload.body  # composer body already carries link + passcode
+    html_body = "<br>".join(html.escape(line) for line in body.splitlines())
+
+    sent = 0
+    last_detail = None
+    cc_delivered = False  # attach CC to the first SUCCESSFUL send, not just idx 0
+    for email in to_emails:
+        result = await send_as_user(
+            db,
+            user.id,
+            to_emails=[email],
+            cc_emails=[] if cc_delivered else cc_emails,
+            subject=subject,
+            body_text=body,
+            body_html=f"<p>{html_body}</p>",
+        )
+        last_detail = result.detail
+        if result.ok:
+            sent += 1
+            if cc_emails and not cc_delivered:
+                cc_delivered = True
+    # Audit only — never store the passcode (the body carries it live to the
+    # recipient; the log records recipients + outcome, not the code).
+    await _log(
+        db,
+        bucket_id,
+        "share_emailed",
+        request=request,
+        user=user,
+        target_type="share",
+        target_id=str(share.id),
+        detail=f"Emailed share access to {len(to_emails)} recipient(s); {sent} sent.",
+    )
+    await db.commit()
+    return BucketShareEmailResponse(ok=sent > 0, sent=sent, detail=last_detail)
 
 
 @router.patch("/admin/{bucket_id}/shares/{share_id}", response_model=BucketShareRead)
