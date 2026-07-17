@@ -467,6 +467,10 @@ async def create_lender_package(
                 f"{payload.message or ''}"
             ),
             status=EmailDraftStatus.PENDING,
+            # Send the secure-package portal link FROM the acting admin's connected
+            # Gmail (send_as_user in send_approved_draft) rather than the firm SA;
+            # mirrors lender_send.draft_lender_send.
+            sender_user_id=user.id,
             triggered_by_kind="lender_secure_package",
             triggered_by_payload={
                 "package_id": str(package.id),

@@ -555,7 +555,7 @@ def _request_audit(request: Request) -> dict[str, Any]:
     }
 
 
-def _record_resume_email(
+async def _record_resume_email(
     intake: PublicUnderwritingIntake,
     *,
     token: str,
@@ -564,6 +564,8 @@ def _record_resume_email(
     public_path: str = "/dealer-ai-underwriter",
     review_label: str = "dealer funding review",
     room_label: str = "dealer financing file",
+    db: AsyncSession | None = None,
+    sender_user_id: UUID | None = None,
 ) -> dict[str, Any]:
     resume_url = _public_url(f"{public_path}?token={token}")
     subject = f"Your Qualified Commercial {review_label} link"
@@ -583,7 +585,22 @@ def _record_resume_email(
         "If you did not request this link, you can ignore this email.</p>"
         "<p>Qualified Commercial LLC</p>"
     )
-    result = send_email(to_email=intake.email, subject=subject, body_text=body_text, body_html=body_html)
+    # When an authenticated admin created the lead, send the resume link FROM their
+    # connected Gmail (send_as_user, SES fallback). Public/self-serve callers have no
+    # acting user, so they stay on firm SES.
+    if db is not None and sender_user_id is not None:
+        from app.services.email.user_mailer import send_as_user
+
+        result = await send_as_user(
+            db, sender_user_id, to_emails=[intake.email], subject=subject,
+            body_text=body_text, body_html=body_html,
+        )
+    else:
+        import asyncio as _asyncio
+
+        result = await _asyncio.to_thread(
+            send_email, to_email=intake.email, subject=subject, body_text=body_text, body_html=body_html,
+        )
     record = {
         "reason": reason,
         "status": result.detail,
@@ -3037,7 +3054,7 @@ async def start_dealer_intake(
     db.add(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
-    email_record = _record_resume_email(intake, token=token, request=request, reason="intake_created")
+    email_record = await _record_resume_email(intake, token=token, request=request, reason="intake_created")
     await _record_super_admin_intake_notification(db, intake, request=request)
     await db.commit()
     intake = await _load_public_intake(db, token)
@@ -3202,7 +3219,7 @@ async def send_dealer_resume_link(
     if intake is not None and intake.bucket is not None and intake.bucket.archived_at is None:
         token = _new_public_token()
         intake.token_hash = _hash_token(token)
-        _record_resume_email(intake, token=token, request=request, reason="resume_link_requested")
+        await _record_resume_email(intake, token=token, request=request, reason="resume_link_requested")
         await _log(
             db,
             intake.bucket_id,
@@ -3695,7 +3712,7 @@ async def create_admin_ai_lead(
     email_note = ""
     if payload.notify_client:
         if is_re:
-            record = _record_resume_email(
+            record = await _record_resume_email(
                 intake,
                 token=token,
                 request=request,
@@ -3703,9 +3720,13 @@ async def create_admin_ai_lead(
                 public_path=FUNDING_PUBLIC_PATH,
                 review_label="real estate funding review",
                 room_label="real estate funding review file",
+                db=db,
+                sender_user_id=user.id,
             )
         else:
-            record = _record_resume_email(intake, token=token, request=request, reason="admin_created")
+            record = await _record_resume_email(
+                intake, token=token, request=request, reason="admin_created", db=db, sender_user_id=user.id,
+            )
         await db.commit()
         intake = await _load_admin_dealer_lead(db, intake.id)
         email_note = (
@@ -4931,7 +4952,7 @@ async def start_funding_review(
     db.add(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
-    _record_resume_email(
+    await _record_resume_email(
         intake,
         token=token,
         request=request,
