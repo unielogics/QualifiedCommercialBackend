@@ -79,6 +79,7 @@ CHAT_WIDGET_TYPES = {
     "run_review",
     "bankability_result",
     "book_call",
+    "prequalification_result",
 }
 
 REVIEW_PREAMBLE = """You are a senior commercial lending underwriter reviewing a secure document bucket.
@@ -175,7 +176,8 @@ Return ONLY JSON in this shape:
   "proposed_context_patch": null,
   "proposed_action_items": [
     {"title": "...", "instructions": "...", "route": "admin|uploader|share|vendor", "rationale": "..."}
-  ]
+  ],
+  "proposed_borrower_facts": null
 }
 
 Rules:
@@ -190,7 +192,8 @@ Rules:
 - Be direct, calm, and practical: acknowledge the fact in front of you, state what it means for the file, then give the next specific move.
 - Ask one high-value question at a time unless the user asks for a list.
 - When the user asks to upload files or enter collateral details, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
-- Keep answers concise and operational, normally 2-5 short sentences."""
+- Keep answers concise and operational, normally 2-5 short sentences.
+- proposed_borrower_facts is ONLY used for real-estate/DSCR borrower chats (see the real-estate rules below when they apply); leave it null otherwise or when the borrower has not stated a new fact this turn."""
 
 # Car-dealer-only chat rules. Never combined with the real-estate rules below.
 DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD P&L, last 6 months main operating bank statements, requested amount, detailed use of funds with amount breakdown, stated current monthly debt payments, and estimated credit tier/score. Ask for one missing Stage 1 item at a time.
@@ -206,7 +209,10 @@ DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD
 # Real-estate/DSCR-only chat rules. Never combined with the dealer rules above.
 RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focus on rent, PITIA, DSCR, LTV, property value, payoff/purchase evidence, cash-to-close, entity/vesting, property condition, occupancy, and estimated credit tier.
 - Do not mention dealership, floorplan, MCA, inventory, dealer gross receipts, or dealer operating accounts.
-- Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence. Ask one real-estate funding question or upload request at a time."""
+- Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence. Ask one real-estate funding question or upload request at a time.
+- This is a prequalification conversation. Early on, briefly confirm the property/deal facts already on file from the intake form (property address, transaction type, requested amount, value/purchase price, monthly rent, credit tier) so the borrower knows you already have them — do not re-ask for anything already provided.
+- Once basics are confirmed, ask (one at a time, folded naturally into the underwriting conversation, not as a separate quiz) for whichever of these is still missing: down payment amount, whether the borrower has owned investment property before, and whether this purchase is residential (1-4 unit) or commercial. Only ask for ones not already answered.
+- When the borrower states one of these three facts in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (do not repeat previously-known facts): {"down_payment_amount": number, "prior_property_ownership": true|false, "is_commercial_property": true|false, "property_type": "short string, e.g. single-family / duplex / small multifamily / commercial retail"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state."""
 
 
 def build_review_system(review_type: str | None) -> str:

@@ -1081,6 +1081,85 @@ def _credit_pull_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+# Fields the real-estate chat may populate on funding_review_details.
+_FUNDING_REVIEW_DETAIL_KEYS = (
+    "down_payment_amount",
+    "prior_property_ownership",
+    "is_commercial_property",
+    "property_type",
+)
+
+
+def _funding_review_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """Conversationally-gathered real-estate detail (down payment, prior
+    ownership, residential-vs-commercial intent) — same intake_state
+    sub-object pattern as funding_review_basics/credit_pull. Populated via
+    proposed_borrower_facts in funding_review_chat, never by the dealer flow."""
+    raw = _intake_state(intake).get("funding_review_details")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
+    """Validates and merges an AI-proposed proposed_borrower_facts object into
+    intake_state["funding_review_details"]. Never trusts the model's shape
+    blindly — any key not on the allowlist, or with the wrong type, is
+    dropped rather than persisted."""
+    if not isinstance(proposed, dict):
+        return
+    accepted: dict[str, Any] = {}
+    for key in _FUNDING_REVIEW_DETAIL_KEYS:
+        if key not in proposed:
+            continue
+        value = proposed[key]
+        if key == "prior_property_ownership" or key == "is_commercial_property":
+            if isinstance(value, bool):
+                accepted[key] = value
+            continue
+        if key == "down_payment_amount":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                accepted[key] = float(value)
+            continue
+        if key == "property_type":
+            text = str(value).strip()
+            if text:
+                accepted[key] = text[:64]
+            continue
+    if not accepted:
+        return
+    state = _intake_state(intake)
+    existing = state.get("funding_review_details")
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(accepted)
+    state["funding_review_details"] = merged
+    intake.intake_state = state
+
+
+def _re_prequal_ready(intake: PublicUnderwritingIntake) -> bool:
+    """True once a real-estate lead has enough to auto-surface a
+    prequalification in chat: a completed soft credit pull, every RE baseline
+    document category uploaded, and every conversational detail (down
+    payment, prior ownership, commercial-vs-residential) answered — on top
+    of the deal basics already required to start the intake. Distinct from
+    _apply_lending_readiness (bucket_ai.py), which is dealer-shaped
+    (bank-statement/tax-return baseline) and does not fit RE evidence
+    categories or factor in credit-pull status. Dealer leads never call this."""
+    if intake.variant != FUNDING_VARIANT:
+        return False
+    if _credit_pull_state(intake).get("fico") is None:
+        return False
+    if _missing_required_docs(intake.bucket):
+        return False
+    basics = _intake_state(intake).get("funding_review_basics")
+    basics = basics if isinstance(basics, dict) else {}
+    if not all(
+        basics.get(key) not in (None, "")
+        for key in ("target_property_address", "transaction_type", "requested_amount", "estimated_value_or_purchase_price")
+    ):
+        return False
+    details = _funding_review_details(intake)
+    return all(details.get(key) is not None for key in _FUNDING_REVIEW_DETAIL_KEYS if key != "property_type")
+
+
 def _entity_structure_complete(intake: PublicUnderwritingIntake) -> bool:
     entity = _entity_structure(intake)
     return all(
@@ -1184,6 +1263,11 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
             "title": "Preliminary bankability screen",
             "description": "Review the AI summary, missing items, product fit, and next steps.",
         },
+        "prequalification_result": {
+            "type": "prequalification_result",
+            "title": "You're prequalified",
+            "description": "Review your preliminary prequalification, program fit, sizing, and next step.",
+        },
     }
     widget = widgets.get(kind)
     if widget is None:
@@ -1197,6 +1281,24 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
     if review_type != "dealer_gatekeeper_v1" and kind in dealer_only_widgets:
         return None
     return {**widget, "source": source, "reason": reason or source}
+
+
+def _prequalification_widget(artifact: PublicUnderwritingIntakeArtifact) -> dict[str, Any]:
+    """Builds the in-chat prequalification_result widget from a generated
+    prequalification artifact's body_json, so the borrower sees the outcome
+    as a card in the same turn it becomes ready — no separate round-trip."""
+    body = artifact.body_json if isinstance(artifact.body_json, dict) else {}
+    return {
+        "type": "prequalification_result",
+        "title": "You're prequalified",
+        "description": str(body.get("prequalification_summary") or "Your preliminary prequalification is ready.")[:600],
+        "source": "system_next_step",
+        "reason": "prequalification_ready",
+        "suggested_program": body.get("suggested_program"),
+        "sizing": body.get("sizing") if isinstance(body.get("sizing"), dict) else None,
+        "next_step": body.get("next_step"),
+        "disclaimer": body.get("disclaimer"),
+    }
 
 
 def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingIntake) -> str | None:
@@ -1293,6 +1395,8 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
         return f"The preliminary screen is ready{f': {status_label}' if status_label else ''}. Review the summary and next steps below."
     if kind == "book_call":
         return "The preliminary screen is ready. Choose one of the available call times so Qualified Commercial can validate the file and next steps with you."
+    if kind == "prequalification_result":
+        return str(widget.get("description") or "Your preliminary prequalification is ready — review it below.")
     return "How can I help with this dealer financing file?"
 
 
@@ -1512,6 +1616,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "transaction_type": basics.get("transaction_type"),
         "estimated_value_or_purchase_price": basics.get("estimated_value_or_purchase_price"),
         "monthly_rent": basics.get("monthly_rent"),
+        "funding_review_details": _funding_review_details(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
             "stage": "stage_1_dscr_property_screen",
@@ -2402,6 +2507,41 @@ async def _generate_management_json(
             "Return STRICT JSON only, matching the given shape exactly."
         )
         feature = "loan_summary"
+    elif purpose == "prequalification":
+        schema = {
+            "title": "short title (borrower name + property/deal in a few words)",
+            "prequalification_summary": "2-3 FLOWING PARAGRAPHS in underwriter prose stating the preliminary prequalification outcome, the program fit, and the reasoning — not bullet fragments.",
+            "suggested_program": "the single best-fit product/program name",
+            "alternate_programs": ["other product paths worth mentioning, if any"],
+            "sizing": {
+                "requested_amount": "scalar value e.g. $500,000",
+                "estimated_value_or_purchase_price": "scalar value e.g. $750,000",
+                "down_payment": "scalar value stated by the borrower, or 'Not provided'",
+                "estimated_ltv": "percentage e.g. 66.7%",
+                "credit_tier": "the verified/stated credit tier or FICO",
+            },
+            "key_strengths": ["short factor supporting a positive prequalification"],
+            "conditions_or_watchpoints": ["short item the lender/underwriter would still confirm"],
+            "next_step": "one clear next action for the borrower, e.g. book a call",
+            "disclaimer": "This is a preliminary prequalification based on the information and evidence provided so far. It is not a commitment to lend and is subject to full underwriting, appraisal, and verification.",
+        }
+        instruction = (
+            "Draft a borrower-facing preliminary real-estate investor/DSCR prequalification. Use ONLY the intake basics, "
+            "the conversationally-gathered funding_review_details (down payment, prior property ownership, "
+            "residential-vs-commercial intent), the verified credit pull, uploaded evidence, and chat history. Do not "
+            "invent values — if something is unsupported, say so plainly rather than guessing. "
+            "If context.authoritative_facts.credit_score is present, you MUST use that exact credit score value "
+            "everywhere and ignore any other credit number in the evidence or prior review. "
+            "Size the deal using the same 60%-75% LTV guidance already shown to the borrower on the intake form."
+        )
+        system = (
+            "You are a senior real-estate investor / DSCR underwriter delivering a preliminary prequalification "
+            "directly to the borrower in plain, confident, warm-but-professional prose — this is a moment the borrower "
+            "should feel good about, while staying strictly accurate to the evidence on file. Never state a firm rate, "
+            "a guaranteed approval, or a closing timeline. Always include the disclaimer verbatim as given in the "
+            "schema. Return STRICT JSON only, matching the given shape exactly."
+        )
+        feature = "loan_summary"
     else:
         schema = {"subject": "email subject", "body": "editable outreach email body"}
         instruction = (
@@ -2593,6 +2733,107 @@ async def _ensure_executive_summary_artifact(
     return existing or await _create_executive_summary_artifact(db, intake, user)
 
 
+def _format_prequalification_markdown(summary: dict[str, Any]) -> str:
+    """Render the structured prequalification JSON into clean, human-readable
+    markdown — same shape/approach as _format_executive_summary_markdown, kept
+    separate since the sections differ (sizing, program fit, borrower-facing
+    disclaimer) and this text is shown directly to the borrower, not just an
+    internal operator."""
+
+    def _clean(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _lines(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [_clean(item) for item in value if _clean(item)]
+        text = _clean(value)
+        return [text] if text else []
+
+    parts: list[str] = []
+    title = _clean(summary.get("title"))
+    if title:
+        parts.append(f"# {title}")
+
+    body = _clean(summary.get("prequalification_summary"))
+    if body:
+        parts.append(body)
+
+    program = _clean(summary.get("suggested_program"))
+    if program:
+        parts.append(f"## Suggested program\n{program}")
+    alternates = _lines(summary.get("alternate_programs"))
+    if alternates:
+        parts.append("## Other paths worth considering\n" + "\n".join(f"- {item}" for item in alternates))
+
+    sizing = summary.get("sizing")
+    if isinstance(sizing, dict):
+        rows = [f"- **{str(k).replace('_', ' ').title()}:** {_clean(v)}" for k, v in sizing.items() if _clean(v)]
+        if rows:
+            parts.append("## Sizing\n" + "\n".join(rows))
+
+    for label, value in [
+        ("Key strengths", summary.get("key_strengths")),
+        ("Conditions / watchpoints", summary.get("conditions_or_watchpoints")),
+    ]:
+        items = _lines(value)
+        if items:
+            parts.append(f"## {label}\n" + "\n".join(f"- {item}" for item in items))
+
+    next_step = _clean(summary.get("next_step"))
+    if next_step:
+        parts.append(f"## Next step\n{next_step}")
+    disclaimer = _clean(summary.get("disclaimer"))
+    if disclaimer:
+        parts.append(f"_{disclaimer}_")
+    return "\n\n".join(parts).strip()
+
+
+async def _create_prequalification_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+) -> PublicUnderwritingIntakeArtifact:
+    summary = await _generate_management_json(db, intake, user, purpose="prequalification")
+    title = str(summary.get("title") or f"{intake.business_name or intake.full_name or 'Investor'} prequalification")[:240]
+    body_text = _format_prequalification_markdown(summary)
+    if not body_text:
+        candidate = str(summary.get("prequalification_summary") or "").strip()
+        if candidate.lstrip().startswith("{") or candidate.lstrip().startswith("```"):
+            recovered = _repair_truncated_json(candidate) or {}
+            candidate = str(recovered.get("prequalification_summary") or "").strip()
+        body_text = candidate
+    artifact = PublicUnderwritingIntakeArtifact(
+        intake_id=intake.id,
+        artifact_type="prequalification",
+        title=title,
+        body_text=body_text,
+        body_json=summary,
+        created_by_user_id=user.id,
+    )
+    db.add(artifact)
+    await db.flush()
+    await _log(
+        db,
+        intake.bucket_id,
+        "underwriting_prequalification_generated",
+        user=user,
+        actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=title,
+    )
+    return artifact
+
+
+async def _ensure_prequalification_artifact(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    user: CurrentUser,
+) -> PublicUnderwritingIntakeArtifact:
+    existing = await _latest_artifact(db, intake.id, "prequalification")
+    return existing or await _create_prequalification_artifact(db, intake, user)
+
+
 async def _store_lender_packet_pdf(
     intake: PublicUnderwritingIntake,
     pdf_bytes: bytes,
@@ -2781,11 +3022,12 @@ async def _response(
     empty_message: str | None = None,
     include_management: bool = False,
     admin_thread: bool = False,
+    prequalification_widget: dict[str, Any] | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
-    widget = None
-    if latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
+    widget = prequalification_widget
+    if widget is None and latest_result and latest_result.get("booking_recommended") is True and not _call_booked(intake):
         widget = await _decorate_widget(
             db,
             intake,
@@ -4791,6 +5033,26 @@ async def create_dealer_ai_executive_summary(
     return _artifact_read(artifact)
 
 
+@admin_router.post("/{intake_id}/prequalification", response_model=PublicUnderwritingArtifactRead)
+async def create_dealer_ai_prequalification(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PublicUnderwritingArtifactRead:
+    """Admin manual draft/redraft of the borrower prequalification — always
+    creates a fresh artifact (unlike the chat auto-trigger's idempotent
+    get-or-create), since an admin clicking this expects a regenerate.
+    Real-estate only: the schema/instructions are DSCR-specific."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.variant != FUNDING_VARIANT:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Prequalification is only available for real estate leads")
+    artifact = await _create_prequalification_artifact(db, intake, user)
+    await db.commit()
+    artifact = await _latest_artifact(db, intake_id, "prequalification") or artifact
+    return _artifact_read(artifact)
+
+
 @admin_router.post("/{intake_id}/lender-packet", response_model=PublicUnderwritingArtifactRead)
 async def create_dealer_ai_lender_packet(
     intake_id: UUID,
@@ -5505,9 +5767,11 @@ FUNDING_VARIANT = "real_estate_dscr_v1"
 
 def _funding_empty_message() -> str:
     return (
-        "I opened your secure real estate funding review. I will screen this like an investor-loan underwriter: rent support, PITIA, "
-        "DSCR, LTV, purchase or payoff evidence, property value, entity/vesting, and credit tier. Attach what you have and I will ask one "
-        "targeted question or upload request at a time."
+        "Welcome — let's get you prequalified. I have the property and deal basics you just submitted, and I will screen this like an "
+        "investor-loan underwriter: rent support, PITIA, DSCR, LTV, purchase or payoff evidence, property value, entity/vesting, and credit "
+        "tier. I'll also ask a few quick questions — down payment, whether you've owned investment property before, and whether this is "
+        "residential or commercial — so I can point you at the right program. Attach what you have and I will ask one targeted question at "
+        "a time. Once I have enough to go on, I'll let you know where you stand."
     )
 
 
@@ -5823,9 +6087,29 @@ async def funding_review_chat(
         messages = chat_messages
         if chat_messages:
             assistant_message = chat_messages[-1].content
+            raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
+            proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
+            _merge_funding_review_details(intake, proposed_facts)
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, assistant_message=assistant_message, messages=messages)
+
+    prequal_widget = None
+    if _re_prequal_ready(intake) and await _latest_artifact(db, intake.id, "prequalification") is None:
+        acting_admin = await primary_super_admin(db)
+        if acting_admin is not None:
+            artifact = await _create_prequalification_artifact(db, intake, acting_admin)
+            await db.commit()
+            prequal_widget = _prequalification_widget(artifact)
+
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=FUNDING_PUBLIC_PATH,
+        assistant_message=assistant_message,
+        messages=messages,
+        prequalification_widget=prequal_widget,
+    )
 
 
 @funding_router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
