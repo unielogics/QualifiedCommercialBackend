@@ -45,6 +45,7 @@ from app.models.bucket import (  # noqa: F401
     BucketAIActionItem,
     BucketAIMessage,
     BucketAIReview,
+    BucketDocumentSignature,
     BucketDocumentTemplate,
     BucketFile,
     BucketFileAnalysis,

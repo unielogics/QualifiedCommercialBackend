@@ -26,6 +26,14 @@ class BucketRequestedDocumentCreate(BaseModel):
     allow_multiple_files: bool = False
     is_custom: bool = False
     save_to_library: bool = False
+    # Generic e-sign extension — a requested document can require the client
+    # to sign rather than upload a file (the signed certificate becomes the
+    # satisfying file). signature_kind="credit_authorization" drives the
+    # identity-fields form; "custom" is any other admin-requested signed form.
+    requires_signature: bool = False
+    signature_kind: str | None = Field(default=None, max_length=32)
+    template_file_id: UUID | None = None
+    signature_document_text: str | None = None
 
 
 class BucketRequestedDocumentRead(ORMModel):
@@ -39,6 +47,10 @@ class BucketRequestedDocumentRead(ORMModel):
     allow_multiple_files: bool
     status: str
     is_custom: bool
+    requires_signature: bool
+    signature_kind: str | None
+    template_file_id: UUID | None
+    signature_document_text: str | None
 
 
 class BucketCreate(BaseModel):

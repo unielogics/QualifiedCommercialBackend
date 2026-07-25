@@ -1107,6 +1107,10 @@ async def add_requested_document(
         required=payload.required,
         allow_multiple_files=payload.allow_multiple_files,
         is_custom=payload.is_custom,
+        requires_signature=payload.requires_signature,
+        signature_kind=payload.signature_kind,
+        template_file_id=payload.template_file_id,
+        signature_document_text=payload.signature_document_text,
     )
     db.add(doc)
     await db.flush()

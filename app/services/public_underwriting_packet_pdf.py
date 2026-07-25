@@ -649,6 +649,33 @@ def _tax_section(years: list[dict[str, Any]]) -> str:
     )
 
 
+def _credit_section(credit: dict[str, Any] | None) -> str:
+    """Renders the soft-pull credit summary when one exists on the lead.
+    Same section for dealer AND real-estate leads — the underlying data
+    (financials["credit"], from _credit_financials_section) is identical
+    for both verticals. Omitted entirely (empty string) when no pull has
+    run yet, so this never claims a score that hasn't been verified."""
+    if not credit or not credit.get("fico"):
+        return ""
+    fico = credit.get("fico")
+    tier = credit.get("tier")
+    pulled_at = credit.get("pulled_at")
+    bullets = credit.get("bullets") or []
+    bullets_html = "".join(f"<li>{escape(str(b))}</li>" for b in bullets)
+    rows = f'<tr><td class="rowhead">FICO</td><td><strong>{escape(str(fico))}</strong></td></tr>'
+    if tier:
+        rows += f'<tr><td class="rowhead">Tier</td><td>{escape(str(tier))}</td></tr>'
+    rows += f'<tr><td class="rowhead">Pulled</td><td>{escape(str(pulled_at)[:10] if pulled_at else "—")}</td></tr>'
+    notes_html = f"<ul class='notes'>{bullets_html}</ul>" if bullets_html else ""
+    return (
+        '<section class="card"><h2>Credit — verified soft pull</h2>'
+        f'<table class="grid-table"><tbody>{rows}</tbody></table>'
+        f"{notes_html}"
+        "<p class=\"note\">Sourced from a bureau soft credit inquiry — does not affect the applicant's credit score.</p>"
+        "</section>"
+    )
+
+
 def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
     body = "".join(
         "<tr>"
@@ -763,6 +790,7 @@ def render_underwriting_packet_pdf(
     financials = financials or {}
     bank_months = financials.get("bank_months") or []
     tax_years = financials.get("tax_years") or []
+    credit = financials.get("credit")
 
     variant = str(getattr(intake, "variant", "") or "")
     is_real_estate = variant.startswith("real_estate")
@@ -982,6 +1010,7 @@ def render_underwriting_packet_pdf(
 
   {narrative_cards}
 
+  {_credit_section(credit)}
   {_bank_section(bank_months)}
   {_tax_section(tax_years)}
 

@@ -27,7 +27,7 @@ from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
+from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketDocumentSignature, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
@@ -286,6 +286,39 @@ class AdminLeadFromBucketCreate(BaseModel):
         return None if value == "" else value
 
 
+class AdminCreditAuthorizationRequest(BaseModel):
+    """Admin requests a credit-authorization signature from the client on a
+    lead. Same request/response shape for dealer AND real-estate leads — the
+    only thing that varies per vertical is which template/default text gets
+    attached, which is admin-supplied data, not branching logic."""
+
+    template_file_id: UUID | None = None  # an admin-uploaded blank form (e.g. dealer-specific doc)
+    document_text: str | None = None  # overrides the built-in default disclosure when no template
+
+
+class AdminCreditPullRequest(BaseModel):
+    ssn: str | None = Field(default=None, description="9 digits, no dashes; optional retry after no-hit")
+
+    @field_validator("ssn")
+    @classmethod
+    def _ssn_digits_only(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not v.isdigit() or len(v) != 9:
+            raise ValueError("SSN must be exactly 9 digits, no dashes")
+        return v
+
+
+class LeadCreditStatusResponse(BaseModel):
+    authorization_requested: bool
+    authorization_signed: bool
+    requested_document_id: UUID | None = None
+    pull_id: UUID | None = None
+    fico: int | None = None
+    pulled_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
 class DealerIntakePatch(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)
     phone: str | None = Field(default=None, max_length=48)
@@ -365,6 +398,25 @@ class DealerFileUploadInit(BaseModel):
 class DealerUploadComplete(BaseModel):
     file_id: UUID
     note: str | None = Field(default=None, max_length=2000)
+
+
+class DealerDocumentSignRequest(BaseModel):
+    """Generic e-sign submission for a requires_signature BucketRequestedDocument.
+    applicant_* fields are only required when the requested document's
+    signature_kind is "credit_authorization" (mirrors CreditPullRequest's
+    identity fields minus SSN, which is never collected/persisted here)."""
+
+    requested_document_id: UUID
+    typed_name: str = Field(min_length=1, max_length=160)
+    esign_consent: bool
+    signature_data_url: str = Field(min_length=1)
+    applicant_legal_first_name: str | None = Field(default=None, max_length=120)
+    applicant_legal_last_name: str | None = Field(default=None, max_length=120)
+    applicant_dob: str | None = Field(default=None, max_length=32)
+    applicant_street: str | None = Field(default=None, max_length=240)
+    applicant_city: str | None = Field(default=None, max_length=120)
+    applicant_state: str | None = Field(default=None, max_length=2)
+    applicant_zip: str | None = Field(default=None, max_length=10)
 
 
 class DealerBookCallRequest(BaseModel):
@@ -1019,6 +1071,16 @@ def _entity_structure(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _credit_pull_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The compact credit-pull cross-reference written by
+    run_lead_credit_pull: {pull_id, fico, pulled_at, expires_at}. Same
+    intake_state sub-object pattern as entity_structure/funding_review_basics.
+    Deliberately NOT in _CLIENT_SAFE_INTAKE_STATE_KEYS — bureau data stays
+    admin/AI-only, for both dealer and real-estate leads."""
+    raw = _intake_state(intake).get("credit_pull")
+    return raw if isinstance(raw, dict) else {}
+
+
 def _entity_structure_complete(intake: PublicUnderwritingIntake) -> bool:
     entity = _entity_structure(intake)
     return all(
@@ -1385,6 +1447,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "loan_purpose": intake.loan_purpose,
         "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
         "estimated_credit_score": intake.estimated_credit_score,
+        "credit_pull": _credit_pull_state(intake) or None,
         "business_name": intake.business_name,
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
@@ -1443,6 +1506,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "loan_purpose": intake.loan_purpose or basics.get("transaction_type"),
         "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else basics.get("requested_amount"),
         "estimated_credit_tier": basics.get("estimated_credit_tier"),
+        "credit_pull": _credit_pull_state(intake) or None,
         "investor_name": intake.business_name,
         "target_property_address": basics.get("target_property_address"),
         "transaction_type": basics.get("transaction_type"),
@@ -2169,8 +2233,18 @@ def _authoritative_facts_from_chat(
     """Resolve facts the operator/borrower stated in chat that must override any
     stale figure in a prior review — currently the credit score. Scans newest-first
     and returns the most recent stated value so the summary/email never reports an
-    outdated number."""
+    outdated number.
+
+    Priority: a real bureau soft pull (credit_pull_state) always wins — it's
+    verified, not self-reported — followed by the most recent chat statement,
+    then the plain intake-form estimate. Same priority order for dealer AND
+    real-estate leads."""
     facts: dict[str, Any] = {}
+    credit_state = _credit_pull_state(intake)
+    if credit_state.get("fico") is not None:
+        facts["credit_score"] = str(credit_state["fico"])
+        facts["credit_score_source"] = "verified credit bureau soft pull"
+        return facts
     # chat_history is oldest→newest; walk newest-first for the latest statement.
     # ONLY trust user/borrower/operator messages — an assistant reply may echo a
     # stale value, so counting assistant text would defeat the correction.
@@ -2194,16 +2268,48 @@ def _authoritative_facts_from_chat(
     return facts
 
 
+async def _credit_financials_section(db: AsyncSession, intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
+    """The lender-packet credit sub-dict: FICO + tier + a few key bullets from
+    a completed bureau pull. None when no pull has run yet on this lead —
+    same lookup for dealer AND real-estate leads."""
+    credit_state = _credit_pull_state(intake)
+    pull_id = credit_state.get("pull_id")
+    if not pull_id:
+        return None
+    from app.models.credit_pull import CreditPull
+
+    pull = await db.get(CreditPull, UUID(pull_id))
+    if pull is None:
+        return None
+    result: dict[str, Any] = {
+        "fico": pull.fico,
+        "pulled_at": pull.pulled_at.isoformat() if pull.pulled_at else None,
+        "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
+        "bullets": [],
+    }
+    from app.routers.credit import _scraped_from_pull
+    from app.services.credit_summary import summarize as summarize_credit
+
+    scraped = _scraped_from_pull(pull)
+    if scraped is not None:
+        summary = summarize_credit(scraped)
+        result["tier"] = summary.tier
+        result["bullets"] = [b.label for b in summary.bullets if b.label][:4]
+    return result
+
+
 async def _collect_packet_financials(
     db: AsyncSession, intake: PublicUnderwritingIntake
 ) -> dict[str, Any]:
     """Pull the structured per-file facts the lender packet visualizes: month-over-month
-    bank activity (last 6 months) and 2-year tax-return figures. Reads the durable
-    per-file analysis cache (no new AI calls). Returns raw facts; the PDF renderer
-    handles charting and redaction so this stays a thin data-loader."""
+    bank activity (last 6 months), 2-year tax-return figures, and (when a soft pull has
+    run) a credit summary. Reads the durable per-file analysis cache (no new AI calls).
+    Returns raw facts; the PDF renderer handles charting and redaction so this stays a
+    thin data-loader."""
+    credit = await _credit_financials_section(db, intake)
     active_ids = {file.id for file in _active_files(intake.bucket)}
     if not active_ids:
-        return {"bank_months": [], "tax_years": []}
+        return {"bank_months": [], "tax_years": [], "credit": credit}
     rows = (
         await db.execute(
             select(BucketFileAnalysis)
@@ -2233,6 +2339,7 @@ async def _collect_packet_financials(
     return {
         "bank_months": extract_bank_months(analyses),
         "tax_years": extract_tax_years(analyses),
+        "credit": credit,
     }
 
 
@@ -2419,12 +2526,31 @@ def _format_executive_summary_markdown(summary: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _prepend_credit_key_metric(summary: dict[str, Any], intake: PublicUnderwritingIntake) -> None:
+    """Injects a deterministic "Credit (verified)" row into summary["key_metrics"]
+    from the real bureau pull — real data, not AI-guessed, so this bypasses the
+    model entirely. Same behavior for dealer AND real-estate leads. Renders via
+    both _format_executive_summary_markdown and the packet PDF's generic
+    key_metrics passthrough with no further wiring. No-op when no pull has run."""
+    credit_state = _credit_pull_state(intake)
+    fico = credit_state.get("fico")
+    if fico is None:
+        return
+    row = {"label": "Credit score (verified)", "value": str(fico), "note": "Bureau soft pull"}
+    metrics = summary.get("key_metrics")
+    if isinstance(metrics, list):
+        metrics.insert(0, row)
+    else:
+        summary["key_metrics"] = [row]
+
+
 async def _create_executive_summary_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
     user: CurrentUser,
 ) -> PublicUnderwritingIntakeArtifact:
     summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
+    _prepend_credit_key_metric(summary, intake)
     title = str(summary.get("title") or _summary_title(intake))[:240]
     body_text = _format_executive_summary_markdown(summary)
     if not body_text:
@@ -3030,6 +3156,148 @@ async def _complete_upload(
     await db.commit()
     await db.refresh(file)
     return file
+
+
+async def _sign_requested_document(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    payload: DealerDocumentSignRequest,
+    request: Request,
+    *,
+    actor_name: str,
+    actor_email: str,
+) -> BucketFile:
+    """Generic e-sign fulfillment for a requires_signature BucketRequestedDocument.
+    Shared by BOTH the dealer and funding-review public routers — identical
+    mechanism for both verticals; only the requested document's template/text
+    (admin-supplied) differs. Renders the certificate PDF, stores it as a
+    normal BucketFile linked via requested_document_id (which alone satisfies
+    the checklist via the existing upload-driven status recalculation)."""
+    from app.services import document_signature as sig_service
+    from app.services.payment_authorization import client_ip
+
+    req = await db.get(BucketRequestedDocument, payload.requested_document_id)
+    if req is None or req.bucket_id != intake.bucket_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Requested document not found")
+    if not req.requires_signature:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document does not require a signature")
+    if req.status == "uploaded":
+        raise HTTPException(status.HTTP_409_CONFLICT, "This document has already been signed")
+    if not payload.esign_consent:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "E-SIGN consent is required")
+
+    is_credit_auth = req.signature_kind == "credit_authorization"
+    document_text = req.signature_document_text or (
+        sig_service.credit_authorization_document_text() if is_credit_auth else ""
+    )
+    if not document_text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This requested document has no signable text configured")
+    doc_version = (
+        sig_service.CREDIT_AUTHORIZATION_DOCUMENT_VERSION if is_credit_auth else "custom-1"
+    )
+    doc_hash = sig_service.document_hash(document_text)
+
+    applicant_data = None
+    extra_rows: list[tuple[str, str]] = []
+    if is_credit_auth:
+        required = [
+            payload.applicant_legal_first_name,
+            payload.applicant_legal_last_name,
+            payload.applicant_dob,
+            payload.applicant_street,
+            payload.applicant_city,
+            payload.applicant_state,
+            payload.applicant_zip,
+        ]
+        if any(v is None or not str(v).strip() for v in required):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "All applicant identity fields are required to sign this form")
+        applicant_data = {
+            "legal_first_name": payload.applicant_legal_first_name,
+            "legal_last_name": payload.applicant_legal_last_name,
+            "dob": payload.applicant_dob,
+            "street": payload.applicant_street,
+            "city": payload.applicant_city,
+            "state": payload.applicant_state,
+            "zip": payload.applicant_zip,
+        }
+        extra_rows = [
+            ("Applicant name", f"{payload.applicant_legal_first_name} {payload.applicant_legal_last_name}"),
+            ("Date of birth", payload.applicant_dob or ""),
+            (
+                "Address",
+                ", ".join(
+                    x for x in [payload.applicant_street, payload.applicant_city, payload.applicant_state, payload.applicant_zip] if x
+                ),
+            ),
+        ]
+
+    sig_bytes, sig_hash, sig_content_type = sig_service.decode_signature_data_url(payload.signature_data_url)
+    if not sig_bytes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A drawn signature is required")
+
+    now = _now()
+    signature = BucketDocumentSignature(
+        requested_document_id=req.id,
+        document_version=doc_version,
+        document_hash=doc_hash,
+        typed_name=payload.typed_name.strip(),
+        esign_consent=True,
+        applicant_data=applicant_data,
+        ip_address=client_ip(request),
+        user_agent=(request.headers.get("user-agent") or "")[:512],
+        signed_at=now,
+    )
+    db.add(signature)
+    await db.flush()
+
+    _, prefix, kms_key_id = _bucket_storage_config()
+    sig_ext = "png" if "png" in sig_content_type else "bin"
+    sig_key = f"{prefix}/signatures/{intake.bucket_id}/{signature.id}/signature.{sig_ext}"
+    _put_bucket_object(sig_key, sig_content_type, sig_bytes)
+    signature.signature_s3_key = sig_key
+    signature.signature_hash = sig_hash
+
+    title = "Credit Report Authorization Certificate" if is_credit_auth else f"{req.name} — Signed Certificate"
+    pdf_bytes = sig_service.render_signature_certificate_pdf(
+        signature=signature, title=title, document_text=document_text, extra_rows=extra_rows
+    )
+    cert_key = f"{prefix}/signatures/{intake.bucket_id}/{signature.id}/certificate.pdf"
+    _put_bucket_object(cert_key, "application/pdf", pdf_bytes)
+    signature.certificate_s3_key = cert_key
+    signature.certificate_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    result_file = BucketFile(
+        bucket_id=intake.bucket_id,
+        requested_document_id=req.id,
+        upload_link_id=intake.bucket_upload_link_id,
+        file_name=f"{req.name} - Signed Certificate.pdf"[:255],
+        s3_key=cert_key,
+        content_type="application/pdf",
+        size_bytes=len(pdf_bytes),
+        uploaded_by_name=actor_name,
+        uploaded_by_email=actor_email,
+        status="uploaded",
+    )
+    db.add(result_file)
+    await db.flush()
+    signature.result_file_id = result_file.id
+    req.status = "uploaded"
+
+    await _log(
+        db,
+        intake.bucket_id,
+        "requested_document_signed",
+        request=request,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        actor_role="public_lead",
+        target_type="requested_document",
+        target_id=str(req.id),
+        detail=req.name,
+    )
+    await db.commit()
+    await db.refresh(result_file)
+    return result_file
 
 
 @router.post("/start", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
@@ -3932,6 +4200,204 @@ async def create_admin_ai_lead_from_bucket(
     )
 
 
+_CREDIT_AUTH_DOC_NAME = "Credit Report Authorization"
+
+
+def _credit_authorization_doc(intake: PublicUnderwritingIntake) -> BucketRequestedDocument | None:
+    """The lead's credit_authorization requested-document, if one has been
+    requested — same lookup for dealer AND real-estate leads."""
+    for doc in intake.bucket.requested_documents:
+        if doc.signature_kind == "credit_authorization":
+            return doc
+    return None
+
+
+@admin_router.post("/{intake_id}/credit-authorization", response_model=BucketRequestedDocumentRead)
+async def request_lead_credit_authorization(
+    intake_id: UUID,
+    payload: AdminCreditAuthorizationRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    """Admin requests the client sign a credit-authorization form on this
+    lead — identical code path for dealer and real-estate leads. Idempotent:
+    if one is already requested on this bucket, returns it (updating the
+    template/text in place if the client hasn't signed yet — once signed,
+    the request is immutable so an in-flight signature can't be silently
+    invalidated by a wording change) rather than creating a duplicate
+    checklist item."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+
+    if payload.template_file_id is not None:
+        template_file = await db.get(BucketFile, payload.template_file_id)
+        if template_file is None or template_file.bucket_id != intake.bucket_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Template file does not belong to this lead's bucket")
+
+    existing = _credit_authorization_doc(intake)
+    if existing is not None:
+        if existing.status != "uploaded" and (payload.template_file_id is not None or payload.document_text is not None):
+            existing.template_file_id = payload.template_file_id
+            existing.signature_document_text = payload.document_text
+            await db.commit()
+            await db.refresh(existing)
+        return existing
+
+    doc = BucketRequestedDocument(
+        bucket_id=intake.bucket_id,
+        name=_CREDIT_AUTH_DOC_NAME,
+        category="compliance",
+        description="Sign to authorize a soft credit inquiry for this file.",
+        required=True,
+        is_custom=True,
+        requires_signature=True,
+        signature_kind="credit_authorization",
+        template_file_id=payload.template_file_id,
+        signature_document_text=payload.document_text,
+    )
+    db.add(doc)
+    await _log(
+        db,
+        intake.bucket_id,
+        "credit_authorization_requested",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Admin requested credit authorization for {intake.email}",
+    )
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+@admin_router.get("/{intake_id}/credit-status", response_model=LeadCreditStatusResponse)
+async def get_lead_credit_status(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LeadCreditStatusResponse:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    doc = _credit_authorization_doc(intake)
+    if doc is None:
+        return LeadCreditStatusResponse(authorization_requested=False, authorization_signed=False)
+
+    credit_state = _credit_pull_state(intake)
+    return LeadCreditStatusResponse(
+        authorization_requested=True,
+        authorization_signed=doc.status == "uploaded",
+        requested_document_id=doc.id,
+        pull_id=UUID(credit_state["pull_id"]) if credit_state and credit_state.get("pull_id") else None,
+        fico=credit_state.get("fico") if credit_state else None,
+        pulled_at=datetime.fromisoformat(credit_state["pulled_at"]) if credit_state and credit_state.get("pulled_at") else None,
+        expires_at=datetime.fromisoformat(credit_state["expires_at"]) if credit_state and credit_state.get("expires_at") else None,
+    )
+
+
+@admin_router.post("/{intake_id}/credit-pull", response_model=LeadCreditStatusResponse)
+async def run_lead_credit_pull(
+    intake_id: UUID,
+    payload: AdminCreditPullRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LeadCreditStatusResponse:
+    """Admin runs a soft credit pull on a lead's client, gated on the client
+    having SIGNED the credit-authorization requested-document first. Identical
+    path for dealer and real-estate leads — the pull is keyed to
+    intake.client_id, which every lead has. Deliberately skips the Stripe
+    payment-authorization gate the borrower self-serve endpoint requires
+    (POST /credit/pull) — this is an admin underwriting-audit action, and
+    consent here is the signed authorization document itself."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.client_id is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This lead has no linked client")
+
+    doc = _credit_authorization_doc(intake)
+    if doc is None or doc.status != "uploaded":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The client must sign the credit authorization before a pull can run.",
+        )
+
+    signature = (
+        await db.execute(
+            select(BucketDocumentSignature)
+            .where(BucketDocumentSignature.requested_document_id == doc.id)
+            .order_by(BucketDocumentSignature.created_at.desc())
+        )
+    ).scalars().first()
+    applicant_data = signature.applicant_data if signature else None
+    if not applicant_data:
+        raise HTTPException(status.HTTP_409_CONFLICT, "No applicant identity data on file for this signature")
+
+    client = await db.get(Client, intake.client_id)
+    if client is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Linked client not found")
+
+    from datetime import date as _date
+
+    from app.services import credit_pull_core
+
+    try:
+        dob = _date.fromisoformat(str(applicant_data.get("dob")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Applicant date of birth on file is invalid") from exc
+
+    try:
+        pull = await credit_pull_core.run_soft_pull(
+            db,
+            client=client,
+            applicant=credit_pull_core.SoftPullApplicant(
+                legal_first_name=str(applicant_data.get("legal_first_name") or ""),
+                legal_last_name=str(applicant_data.get("legal_last_name") or ""),
+                dob=dob,
+                street=str(applicant_data.get("street") or ""),
+                city=str(applicant_data.get("city") or ""),
+                state=str(applicant_data.get("state") or ""),
+                zip=str(applicant_data.get("zip") or ""),
+                ssn=payload.ssn,
+            ),
+            actor=user,
+        )
+    except credit_pull_core.SoftPullDenied as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": exc.code, "message": exc.message}) from exc
+    except credit_pull_core.SoftPullValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except credit_pull_core.SoftPullRateLimited as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+    except credit_pull_core.SoftPullUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    # Compact cross-reference on the intake — the AI context functions and
+    # package PDF read this instead of re-querying CreditPull, and it's the
+    # ONLY place credit data touches PublicUnderwritingIntake (never added to
+    # _CLIENT_SAFE_INTAKE_STATE_KEYS — bureau data stays admin/AI-only).
+    state = _intake_state(intake)
+    state["credit_pull"] = {
+        "pull_id": str(pull.id),
+        "fico": pull.fico,
+        "pulled_at": pull.pulled_at.isoformat() if pull.pulled_at else None,
+        "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
+    }
+    intake.intake_state = state
+    await db.commit()
+
+    return LeadCreditStatusResponse(
+        authorization_requested=True,
+        authorization_signed=True,
+        requested_document_id=doc.id,
+        pull_id=pull.id,
+        fico=pull.fico,
+        pulled_at=pull.pulled_at,
+        expires_at=pull.expires_at,
+    )
+
+
 @admin_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)
 async def rerun_dealer_ai_lead_review(
     intake_id: UUID,
@@ -4783,6 +5249,18 @@ async def dealer_upload_complete(
     return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
 
 
+@router.post("/{token}/requested-documents/sign", response_model=BucketFileRead)
+async def dealer_sign_requested_document(
+    token: str,
+    payload: DealerDocumentSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
+    return await _sign_requested_document(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
 @router.post("/{token}/run-review", response_model=DealerIntakeResponse)
 async def run_dealer_review(
     token: str,
@@ -5372,6 +5850,18 @@ async def funding_review_upload_complete(
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
     return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@funding_router.post("/{token}/requested-documents/sign", response_model=BucketFileRead)
+async def funding_review_sign_requested_document(
+    token: str,
+    payload: DealerDocumentSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_funding_intake(intake)
+    return await _sign_requested_document(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
 
 
 @funding_router.post("/{token}/run-review", response_model=DealerIntakeResponse)

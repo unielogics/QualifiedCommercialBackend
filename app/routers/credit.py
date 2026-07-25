@@ -11,22 +11,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
-from app.config import get_settings
-from app.constants import SOFT_PULL_EXPIRING_SOON_DAYS, SOFT_PULL_VALIDITY_DAYS
+from app.constants import SOFT_PULL_EXPIRING_SOON_DAYS
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import CreditPullStatus, Role
-from app.models.client import Client
 from app.models.credit_pull import CreditPull
-from app.services import calendar_emitter
 from app.schemas.billing import CreditPullAccessRead
 from app.schemas.credit import CreditPullRead, CreditPullRequest
+from app.services import credit_pull_core
 from app.services.payment_authorization import (
     client_has_completed_payment_authorization,
     require_payment_authorized_for_credit,
 )
-from app.services import isoftpull_client
-from app.services import isoftpull_report_parser
 from app.services.isoftpull_session import IsoftpullSessionError, get_session
 
 router = APIRouter(prefix="/credit", tags=["credit"])
@@ -202,224 +198,43 @@ async def initiate_pull(
             "A credit pull is already in flight — try again in a minute.",
         )
 
-    # FCRA paper trail row. We persist only the last 4 of SSN (if given);
-    # the full 9-digit number is forwarded to iSoftPull below and never
-    # written to the database or logged. phone / email are derived from
-    # the User / Client records, not collected here.
-    pull = CreditPull(
-        client_id=cid,
-        status=CreditPullStatus.PENDING,
-        legal_first_name=payload.legal_first_name,
-        legal_last_name=payload.legal_last_name,
-        dob=payload.dob,
-        street=payload.street,
-        city=payload.city,
-        state=payload.state,
-        zip=payload.zip,
-        last4_ssn=payload.ssn[-4:] if payload.ssn else None,
-        fcra_consent=True,
-    )
-    db.add(pull)
-    await db.flush()
-
-    settings = get_settings()
-    private_key = settings.isoftpull_private_key or settings.isoftpull_api_key
-    public_key = settings.isoftpull_public_key
-
-    if private_key:
-        try:
-            result = await isoftpull_client.pull(
-                public_key=public_key,
-                private_key=private_key,
-                base_url=settings.isoftpull_api_url,
-                applicant=isoftpull_client.ApplicantPayload(
-                    legal_first_name=payload.legal_first_name,
-                    legal_last_name=payload.legal_last_name,
-                    street=payload.street,
-                    city=payload.city,
-                    state=payload.state,
-                    zip=payload.zip,
-                    dob=payload.dob.isoformat(),
-                    # SSN is optional — when None, iSoftPull tries to
-                    # match on name+address+DOB. The frontend only asks
-                    # for SSN if THIS attempt comes back as no-hit.
-                    ssn=payload.ssn,
-                ),
-                timeout_seconds=settings.isoftpull_timeout_seconds,
-                max_retries=settings.isoftpull_max_retries,
-            )
-        except isoftpull_client.IsoftpullValidationError as exc:
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"validation: {exc}"
-            await db.flush()
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-        except isoftpull_client.IsoftpullDeniedError as exc:
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"denied: {exc}"
-            await db.flush()
-            # Surface structured codes for deny outcomes the frontend can
-            # act on. Generic denials still pass through with the raw bureau
-            # string so operators can debug from the audit log.
-            #   no_hit_provide_ssn → reveal SSN field, retry
-            #   bureau_freeze      → tell the borrower to lift their freeze
-            detail_str = str(exc).lower()
-            if "no-hit" in detail_str and not payload.ssn:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "code": "no_hit_provide_ssn",
-                        "message": "We couldn't match your file on name + address + DOB alone. Add your SSN and try again.",
-                    },
-                ) from exc
-            if "freeze" in detail_str or "frozen" in detail_str:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "code": "bureau_freeze",
-                        "message": "Your credit file is frozen at the bureau. Please lift the freeze with Experian, Equifax, or TransUnion and try again.",
-                    },
-                ) from exc
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-        except isoftpull_client.IsoftpullRateLimitedError as exc:
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"rate_limited: {exc}"
-            await db.flush()
-            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
-        except isoftpull_client.IsoftpullTransportError as exc:
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"transport: {exc}"
-            await db.flush()
+    # Bureau-pull core is shared with the admin/lead-triggered path
+    # (app/services/credit_pull_core.py) so both callers use the exact same
+    # FICO-fallback chain, parsing, and CreditPull persistence.
+    try:
+        pull = await credit_pull_core.run_soft_pull(
+            db,
+            client=user.client,
+            applicant=credit_pull_core.SoftPullApplicant(
+                legal_first_name=payload.legal_first_name,
+                legal_last_name=payload.legal_last_name,
+                dob=payload.dob,
+                street=payload.street,
+                city=payload.city,
+                state=payload.state,
+                zip=payload.zip,
+                # SSN is optional — when None, iSoftPull tries to match on
+                # name+address+DOB. The frontend only asks for SSN if THIS
+                # attempt comes back as no-hit.
+                ssn=payload.ssn,
+            ),
+            actor=user,
+        )
+    except credit_pull_core.SoftPullDenied as exc:
+        if exc.code in ("no_hit_provide_ssn", "bureau_freeze"):
             raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Credit bureau is temporarily unavailable — please retry.",
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": exc.code, "message": exc.message},
             ) from exc
-        except Exception as exc:  # noqa: BLE001 — broad on purpose
-            # Catch-all so a programming or transient infra error doesn't
-            # leak as an opaque 500 to the mobile app. We still log the
-            # full traceback for ops and stamp the row as REVOKED so the
-            # 60s dedup window doesn't stick.
-            log.exception("Unexpected error during iSoftPull bureau call")
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"unexpected: {type(exc).__name__}: {exc}"
-            await db.flush()
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Credit pull failed — please retry. Our team has been notified.",
-            ) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message) from exc
+    except credit_pull_core.SoftPullValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except credit_pull_core.SoftPullRateLimited as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+    except credit_pull_core.SoftPullUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
-        try:
-            # FICO sourcing — three-tier fallback:
-            #   1. Full Feed JSON (preferred). Once iSoftPull enables it on
-            #      the API token, result.fico is populated and we use that.
-            #   2. Scrape the report viewer HTML using a server-side login.
-            #      Bridge while Full Feed is off — see services/
-            #      isoftpull_session.py + isoftpull_report_parser.py.
-            #   3. Intelligence-passed proxy (720). Only if both above fail.
-            INTELLIGENCE_PASSED_PROXY_FICO = 720
-            effective_fico = result.fico
-            fico_source = "full_feed" if result.fico is not None else None
-
-            scraped = None
-            if effective_fico is None and result.report_link:
-                scraped = await isoftpull_report_parser.fetch_and_parse(result.report_link)
-                if scraped and scraped.best_score is not None:
-                    effective_fico = scraped.best_score
-                    fico_source = f"scraped:{scraped.best_score_model}"
-
-            if effective_fico is None and result.intelligence_passed:
-                effective_fico = INTELLIGENCE_PASSED_PROXY_FICO
-                fico_source = "intelligence-proxy"
-
-            # Persist both the verbatim iSoftPull JSON AND the structured
-            # report we scraped. We stash the parsed report under
-            # bureau_response['parsed_report'] so we don't need a schema
-            # migration; the column is already JSONB. The summary is
-            # rebuildable from parsed_report so we don't store it.
-            persisted_response = dict(result.raw or {})
-            if scraped is not None:
-                persisted_response["parsed_report"] = scraped.to_dict()
-            pull.fico = effective_fico
-            pull.bureau_response = persisted_response
-            pull.status = CreditPullStatus.COMPLETED
-            pull.pulled_at = result.pulled_at
-            pull.expires_at = result.pulled_at + timedelta(days=SOFT_PULL_VALIDITY_DAYS)
-
-            note_parts: list[str] = []
-            if result.provider_pull_id:
-                note_parts.append(f"isoftpull_id={result.provider_pull_id}")
-            if result.intelligence_name:
-                note_parts.append(
-                    f"intelligence={result.intelligence_name}:{'pass' if result.intelligence_passed else 'fail'}"
-                )
-            if fico_source:
-                note_parts.append(f"fico_source={fico_source}")
-            if scraped:
-                detail = []
-                if scraped.fico_8 is not None:
-                    detail.append(f"fico8={scraped.fico_8}")
-                if scraped.fico_2 is not None:
-                    detail.append(f"fico2={scraped.fico_2}")
-                if scraped.vantage_4 is not None:
-                    detail.append(f"vantage4={scraped.vantage_4}")
-                if detail:
-                    note_parts.append("scraped:" + ",".join(detail))
-            if note_parts:
-                pull.notes = "; ".join(note_parts)
-
-            previous_fico = user.client.fico if user.client else None
-            if user.client:
-                user.client.fico = effective_fico
-            await db.flush()
-            await db.refresh(pull)
-
-            # Log the credit pull as an Activity for the audit trail.
-            # Score and source go in payload; the verbatim bureau JSON
-            # stays only on `credit_pulls.bureau_response`.
-            from app.services.activity_log import log_change
-            await log_change(
-                db,
-                kind="credit.pulled",
-                summary=(
-                    f"Credit pulled · FICO {effective_fico}"
-                    + (f" (was {previous_fico})" if previous_fico is not None and previous_fico != effective_fico else "")
-                ),
-                client_id=pull.client_id,
-                actor=user,
-                payload={
-                    "pull_id": str(pull.id),
-                    "fico": effective_fico,
-                    "previous_fico": previous_fico,
-                    "fico_source": fico_source,
-                    "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
-                },
-            )
-
-            # Emit the credit-expiry milestone so operators get a
-            # calendar nudge before the soft pull stales (typically
-            # 90 days; controlled by SOFT_PULL_VALIDITY_DAYS).
-            await calendar_emitter.emit_for_credit_pull(db, pull)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Failed to persist credit pull result")
-            pull.status = CreditPullStatus.REVOKED
-            pull.notes = f"persist_error: {type(exc).__name__}: {exc}"
-            await db.flush()
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Credit pull succeeded but failed to save — please retry.",
-            ) from exc
-        return _to_read(pull)
-
-    # No iSoftPull credentials configured. Log the operator-facing hint
-    # server-side so it never reaches a borrower; surface a generic
-    # message to the API caller.
-    pull.status = CreditPullStatus.REVOKED
-    pull.notes = "iSoftPull credentials not configured"
-    await db.flush()
-    log.error("Credit pull attempted but ISOFTPULL_PRIVATE_KEY is not configured")
-    raise HTTPException(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "Credit pull service is temporarily unavailable. Please contact support.",
-    )
+    return _to_read(pull)
 
 
 # ── Operator report viewer (proxied through the server-side iSoftPull session) ──

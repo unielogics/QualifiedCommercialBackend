@@ -94,10 +94,35 @@ class BucketRequestedDocument(TimestampMixin, Base):
     allow_multiple_files: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="requested", server_default="requested")
     is_custom: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Generic e-sign extension (credit-authorization forms, and any future
+    # "have the client sign X" requested document) — reuses the SAME
+    # upload-driven satisfaction mechanism: the rendered signature certificate
+    # is stored as a normal BucketFile linked via requested_document_id, so
+    # signing a document is, mechanically, uploading a file. No new
+    # satisfaction/status-flip logic is needed.
+    requires_signature: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # "credit_authorization" drives the identity-fields form shown alongside
+    # the signature pad (mirrors CreditPullRequest); "custom" is any other
+    # admin-requested signed form with no extra fields collected.
+    signature_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # An admin-uploaded blank-form BucketFile shown to the client for context
+    # (e.g. a dealer-specific disclosure) — falls back to
+    # signature_document_text (a stored default, e.g. the real-estate FCRA
+    # disclosure) when no template is attached.
+    template_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True
+    )
+    signature_document_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     bucket: Mapped[Bucket] = relationship(back_populates="requested_documents")
     template: Mapped[BucketDocumentTemplate | None] = relationship()
-    files: Mapped[list[BucketFile]] = relationship(back_populates="requested_document")
+    template_file: Mapped[BucketFile | None] = relationship(foreign_keys=[template_file_id])
+    files: Mapped[list[BucketFile]] = relationship(
+        back_populates="requested_document", foreign_keys="BucketFile.requested_document_id"
+    )
+    signatures: Mapped[list[BucketDocumentSignature]] = relationship(
+        back_populates="requested_document", cascade="all, delete-orphan"
+    )
 
 
 class BucketUploadLink(TimestampMixin, Base):
@@ -159,7 +184,9 @@ class BucketFile(TimestampMixin, Base):
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     bucket: Mapped[Bucket] = relationship(back_populates="files")
-    requested_document: Mapped[BucketRequestedDocument | None] = relationship(back_populates="files")
+    requested_document: Mapped[BucketRequestedDocument | None] = relationship(
+        back_populates="files", foreign_keys=[requested_document_id]
+    )
     upload_link: Mapped[BucketUploadLink | None] = relationship()
     parent_zip_file: Mapped[BucketFile | None] = relationship(remote_side=[id], back_populates="extracted_files")
     extracted_files: Mapped[list[BucketFile]] = relationship(back_populates="parent_zip_file")
@@ -173,6 +200,51 @@ class BucketFile(TimestampMixin, Base):
     )
     annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="file", cascade="all, delete-orphan")
     analyses: Mapped[list[BucketFileAnalysis]] = relationship(back_populates="file", cascade="all, delete-orphan")
+
+
+class BucketDocumentSignature(TimestampMixin, Base):
+    """A client's e-signature on a requested document (generic — used for the
+    credit-authorization form and any future "have the client sign X" need).
+    Mirrors PaymentAuthorization's typed-name + canvas-signature + rendered
+    certificate pattern, minus the Stripe fields (this flow never touches
+    billing). The rendered certificate is stored as a normal BucketFile
+    (via result_file_id) that ALSO satisfies the BucketRequestedDocument via
+    the existing upload-driven _recalculate_requested_document_status — signing
+    a document is, mechanically, uploading a file."""
+
+    __tablename__ = "bucket_document_signatures"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    requested_document_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_requested_documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The rendered certificate PDF, stored as a normal BucketFile on the same
+    # bucket (requested_document_id set on that row too — this is what flips
+    # the checklist item to "uploaded").
+    result_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True
+    )
+    document_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    typed_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    esign_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    signature_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    signature_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    certificate_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    certificate_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Only populated when the parent requested-document's signature_kind is
+    # "credit_authorization" — the applicant's own identifying info for the
+    # bureau pull (mirrors CreditPullRequest). SSN is deliberately NOT a field
+    # here; it is never persisted, only forwarded live at pull time.
+    applicant_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    requested_document: Mapped[BucketRequestedDocument] = relationship(
+        back_populates="signatures", foreign_keys=[requested_document_id]
+    )
+    result_file: Mapped[BucketFile | None] = relationship(foreign_keys=[result_file_id])
 
 
 class BucketFileAnnotation(TimestampMixin, Base):
