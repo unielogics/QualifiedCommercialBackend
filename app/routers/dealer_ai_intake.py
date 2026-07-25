@@ -259,6 +259,33 @@ class AdminLeadCreate(BaseModel):
         return None if value == "" else value
 
 
+class AdminLeadFromBucketCreate(BaseModel):
+    """Super-admin converts an EXISTING Bucket into an AI-underwriter lead — the
+    admin already has a folder of files (collected some other way) and wants the
+    AI audit + package-build against it, without a second, empty bucket being
+    created. Mirrors AdminLeadCreate's client fields but has NO bucket-creation
+    fields (no target_property_address / requested_amount / etc.) since the
+    bucket, and whatever files/requested-docs are already on it, stay as-is."""
+
+    variant: str = Field(default="dealer")  # "dealer" | "real_estate"
+    full_name: str = Field(min_length=1, max_length=180)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=48)
+    business_name: str | None = Field(default=None, max_length=180)  # or investor name, real-estate
+    notify_client: bool = False  # default OFF — this is an admin audit flow, not client self-service
+    force_new: bool = False  # create a second lead even if one already exists for this bucket
+
+    @field_validator("variant", mode="before")
+    @classmethod
+    def normalize_variant(cls, value: object) -> object:
+        return (str(value).strip().lower() if value else "dealer")
+
+    @field_validator("phone", "business_name", mode="before")
+    @classmethod
+    def empty_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
 class DealerIntakePatch(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)
     phone: str | None = Field(default=None, max_length=48)
@@ -3745,6 +3772,162 @@ async def create_admin_ai_lead(
         assistant_message=(
             "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
             + email_note
+        ),
+    )
+
+
+@admin_router.post("/from-bucket/{bucket_id}", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def create_admin_ai_lead_from_bucket(
+    bucket_id: UUID,
+    payload: AdminLeadFromBucketCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Convert an EXISTING Bucket (already collecting files some other way) into an
+    AI-underwriter lead, so the admin can audit those files with the AI review and
+    build a lender package — without a second, empty bucket being created and
+    without re-uploading anything. Reuses the same client find-or-create + intake
+    construction as create_admin_ai_lead, but skips _create_bucket_for_intake /
+    _create_bucket_for_funding_review entirely: the bucket, its BucketFile rows,
+    and any BucketRequestedDocument checklist it already has stay exactly as-is.
+    File association is automatic (_active_files just filters bucket.files)."""
+    _require_super_admin(user)
+    if payload.variant not in ("dealer", "real_estate"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
+    is_re = payload.variant == "real_estate"
+    variant_const = FUNDING_VARIANT if is_re else "dealer_gatekeeper_v1"
+
+    bucket = (
+        await db.execute(
+            select(Bucket)
+            .where(Bucket.id == bucket_id)
+            .options(selectinload(Bucket.upload_links))
+        )
+    ).scalar_one_or_none()
+    if bucket is None or bucket.archived_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket not found")
+
+    # Duplicate policy: unless force_new, surface the existing lead for this bucket
+    # rather than creating a second intake on top of the same files.
+    if not payload.force_new:
+        existing = (
+            await db.execute(
+                select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id == bucket_id)
+            )
+        ).scalars().first()
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "message": "An AI-underwriter lead already exists for this bucket.",
+                    "intake_id": str(existing.id),
+                },
+            )
+
+    provenance = {
+        "created_by_admin": {
+            "user_id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "at": _now().isoformat(),
+        },
+        "on_behalf_of_client": True,
+        "converted_from_bucket_id": str(bucket.id),
+    }
+
+    if is_re:
+        adapter = FundingReviewStart(
+            full_name=payload.full_name, email=payload.email, phone=payload.phone,
+            investor_name=payload.business_name,
+        )
+        client = await _find_or_create_funding_client(db, adapter)
+    else:
+        adapter = DealerIntakeStart(
+            full_name=payload.full_name, email=payload.email, phone=payload.phone,
+            business_name=payload.business_name,
+        )
+        client = await _find_or_create_client(db, adapter)
+
+    if isinstance(client.lead_intake, dict):
+        client.lead_intake = {**client.lead_intake, "created_by_admin": str(user.id)}
+
+    # Reuse the bucket's existing active upload link (if any) rather than minting a
+    # new one — bucket_upload_link_id is nullable, so a bucket with no client-facing
+    # link at all (e.g. a purely admin-populated audit bucket) is fine too.
+    link = next((l for l in bucket.upload_links if l.status == "active"), None)
+
+    token = _new_public_token()
+    intake = PublicUnderwritingIntake(
+        client_id=client.id,
+        bucket_id=bucket.id,
+        bucket_upload_link_id=link.id if link else None,
+        token_hash=_hash_token(token),
+        variant=variant_const,
+        full_name=payload.full_name.strip(),
+        email=client.email or _normalize_email(str(payload.email)),
+        phone=payload.phone,
+        business_name=payload.business_name,
+        intake_state={
+            "messages": [],
+            "source": "bucket_conversion",
+            "admin_provenance": provenance,
+        },
+    )
+    db.add(intake)
+    await db.flush()
+
+    # Warm the per-file analysis cache cheaply (placeholder inserts, no model calls)
+    # so the scheduler drain starts analyzing before the admin even opens the lead.
+    from app.services.bucket_ai import enqueue_file_analysis
+
+    for file in _active_files(bucket):
+        await enqueue_file_analysis(db, file)
+
+    await _log(
+        db,
+        bucket.id,
+        "ai_lead_created_from_bucket",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Admin converted bucket '{bucket.name}' into a {payload.variant} lead for {intake.email}",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+
+    email_note = ""
+    if payload.notify_client:
+        if is_re:
+            record = await _record_resume_email(
+                intake, token=token, request=request, reason="admin_created",
+                public_path=FUNDING_PUBLIC_PATH, review_label="real estate funding review",
+                room_label="real estate funding review file", db=db, sender_user_id=user.id,
+            )
+        else:
+            record = await _record_resume_email(
+                intake, token=token, request=request, reason="admin_created", db=db, sender_user_id=user.id,
+            )
+        await db.commit()
+        intake = await _load_admin_dealer_lead(db, intake.id)
+        email_note = (
+            " A secure login link was emailed to the client."
+            if record.get("ok")
+            else " Email delivery is unavailable; share the resume link manually."
+        )
+
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
+        include_management=True,
+        admin_thread=True,
+        assistant_message=(
+            "Lead created from the existing bucket — its files are already attached. "
+            "Run the AI review when ready." + email_note
         ),
     )
 
