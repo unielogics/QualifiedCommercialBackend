@@ -32,6 +32,7 @@ from app.models.bucket import (
     BucketFile,
     BucketFileAnnotation,
     BucketNote,
+    BucketPublicShare,
     BucketRequestedDocument,
     BucketShare,
     BucketUploadLink,
@@ -62,6 +63,10 @@ from app.schemas.bucket import (
     BucketFileUrl,
     BucketNoteCreate,
     BucketNoteRead,
+    BucketPublicShareAccessRead,
+    BucketPublicShareCreate,
+    BucketPublicShareFileRead,
+    BucketPublicShareRead,
     BucketRead,
     BucketRequestAccessRead,
     BucketRequestAccessRequest,
@@ -291,6 +296,7 @@ async def _load_bucket_or_404(db: AsyncSession, bucket_id: UUID) -> Bucket:
                 selectinload(Bucket.shares).selectinload(BucketShare.files),
                 selectinload(Bucket.vendor_access).selectinload(BucketVendorAccess.vendor),
                 selectinload(Bucket.vendor_access).selectinload(BucketVendorAccess.files),
+                selectinload(Bucket.public_shares).selectinload(BucketPublicShare.files),
                 selectinload(Bucket.notes),
                 with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
@@ -372,6 +378,23 @@ async def _load_vendor_access_or_404(db: AsyncSession, bucket_id: UUID, user: Us
     if access is None or access.bucket.archived_at is not None or not _is_active(access.status, access.expires_at):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Vendor bucket access not found or inactive")
     return access
+
+
+async def _load_public_share_or_404(db: AsyncSession, token: str) -> BucketPublicShare:
+    share = (
+        await db.execute(
+            select(BucketPublicShare)
+            .where(BucketPublicShare.token == token)
+            .options(
+                selectinload(BucketPublicShare.files),
+                selectinload(BucketPublicShare.bucket),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if share is None or not _is_active(share.status, share.expires_at):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found or inactive")
+    return share
 
 
 # Content types the browser may safely render inline. Anything else (notably
@@ -485,6 +508,13 @@ def _file_belongs_to_share(share: BucketShare, file_id: UUID) -> BucketFile | No
     return None
 
 
+def _file_belongs_to_public_share(share: BucketPublicShare, file_id: UUID) -> BucketFile | None:
+    for file in share.files:
+        if file.id == file_id and file.status == "uploaded" and file.deleted_at is None:
+            return file
+    return None
+
+
 def _vendor_access_files(access: BucketVendorAccess) -> list[BucketFile]:
     source = access.bucket.files if access.file_scope == "all_active" else access.files
     return [file for file in source if file.status == "uploaded" and file.deleted_at is None]
@@ -513,12 +543,30 @@ def _share_read(share: BucketShare, *, passcode: str | None = None) -> BucketSha
     return data
 
 
+def _public_share_read(share: BucketPublicShare) -> BucketPublicShareRead:
+    data = BucketPublicShareRead.model_validate(share)
+    data.files = [file for file in data.files if file.status == "uploaded" and file.deleted_at is None]
+    data.share_url = _public_url(f"/buckets/public-share/{share.token}")
+    return data
+
+
 async def _load_share_for_admin_read(db: AsyncSession, share_id: UUID) -> BucketShare:
     share = (
         await db.execute(
             select(BucketShare)
             .where(BucketShare.id == share_id)
             .options(selectinload(BucketShare.files))
+        )
+    ).scalar_one()
+    return share
+
+
+async def _load_public_share_for_admin_read(db: AsyncSession, share_id: UUID) -> BucketPublicShare:
+    share = (
+        await db.execute(
+            select(BucketPublicShare)
+            .where(BucketPublicShare.id == share_id)
+            .options(selectinload(BucketPublicShare.files))
         )
     ).scalar_one()
     return share
@@ -548,6 +596,7 @@ def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     ]
     data.shares = [_share_read(share) for share in bucket.shares]
     data.vendor_access = [_vendor_access_read(access) for access in bucket.vendor_access]
+    data.public_shares = [_public_share_read(share) for share in bucket.public_shares]
     return data
 
 
@@ -1382,6 +1431,33 @@ async def create_share(
     await db.commit()
     share = await _load_share_for_admin_read(db, share.id)
     return _share_read(share, passcode=passcode)
+
+
+@router.post("/admin/{bucket_id}/public-shares", response_model=BucketPublicShareRead)
+async def create_public_share(
+    bucket_id: UUID,
+    payload: BucketPublicShareCreate,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketPublicShareRead:
+    await _load_bucket_or_404(db, bucket_id)
+    files = await _uploaded_bucket_files(db, bucket_id, payload.file_ids)
+    share = BucketPublicShare(
+        bucket_id=bucket_id,
+        token=secrets.token_urlsafe(32),
+        recipient_name=payload.recipient_name,
+        can_preview=payload.can_preview,
+        can_download=payload.can_download,
+        expires_at=payload.expires_at,
+    )
+    share.files = files
+    db.add(share)
+    await db.flush()
+    await _log(db, bucket_id, "public_share_created", request=request, user=user, target_type="public_share", target_id=str(share.id), detail=share.recipient_name)
+    await db.commit()
+    share = await _load_public_share_for_admin_read(db, share.id)
+    return _public_share_read(share)
 
 
 @router.post("/admin/{bucket_id}/shares/{share_id}/email", response_model=BucketShareEmailResponse)
@@ -2398,6 +2474,53 @@ async def share_info(token: str, db: AsyncSession = Depends(get_db)) -> BucketSh
         can_view_ai_tasks=share.can_view_ai_tasks,
         can_propose_tasks=share.can_propose_tasks,
     )
+
+
+@router.get("/public-share/{token}", response_model=BucketPublicShareAccessRead)
+async def public_share_access(token: str, request: Request, db: AsyncSession = Depends(get_db)) -> BucketPublicShareAccessRead:
+    share = await _load_public_share_or_404(db, token)
+    share.last_accessed_at = _now()
+    share.view_count += 1
+    files = []
+    for file in share.files:
+        if file.status != "uploaded" or file.deleted_at is not None:
+            continue
+        item = BucketPublicShareFileRead.model_validate(file)
+        if share.can_preview:
+            item.preview_url = _download_url(file.s3_key, disposition="inline", content_type=file.content_type)
+        if share.can_download:
+            item.download_url = _download_url(file.s3_key, disposition="attachment")
+        files.append(item)
+    await _log(db, share.bucket_id, "public_share_accessed", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="public_share", target_id=str(share.id))
+    await db.commit()
+    return BucketPublicShareAccessRead(
+        bucket=BucketRead.model_validate(share.bucket),
+        share=_public_share_read(share),
+        files=files,
+    )
+
+
+@router.post("/public-share/{token}/files/{file_id}/download", response_model=BucketFileUrl)
+async def public_share_file_download(
+    token: str,
+    file_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUrl:
+    share = await _load_public_share_or_404(db, token)
+    file = _file_belongs_to_public_share(share, file_id)
+    if file is None:
+        await _log(db, share.bucket_id, "public_share_download_denied", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="file", target_id=str(file_id), detail="file not shared")
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
+    if not share.can_download:
+        await _log(db, share.bucket_id, "public_share_download_denied", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="file", target_id=str(file.id), detail=file.file_name)
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Download is disabled for this share")
+    share.download_count += 1
+    await _log(db, share.bucket_id, "public_share_download_requested", request=request, actor_name=share.recipient_name, actor_role="public_share_recipient", target_type="file", target_id=str(file.id), detail=file.file_name)
+    await db.commit()
+    return BucketFileUrl(url=_download_url(file.s3_key, disposition="attachment"), expires_in=900)
 
 
 @router.get("/share/{token}/ai-summary", response_model=BucketAISummaryRead)

@@ -33,6 +33,15 @@ bucket_vendor_access_files = Table(
 )
 
 
+bucket_public_share_files = Table(
+    "bucket_public_share_files",
+    Base.metadata,
+    Column("public_share_id", PG_UUID(as_uuid=True), ForeignKey("bucket_public_shares.id", ondelete="CASCADE"), primary_key=True),
+    Column("file_id", PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="CASCADE"), primary_key=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+
 class Bucket(TimestampMixin, Base):
     __tablename__ = "buckets"
 
@@ -58,6 +67,7 @@ class Bucket(TimestampMixin, Base):
     upload_links: Mapped[list[BucketUploadLink]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     shares: Mapped[list[BucketShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     vendor_access: Mapped[list[BucketVendorAccess]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    public_shares: Mapped[list[BucketPublicShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     notes: Mapped[list[BucketNote]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     activity: Mapped[list[BucketActivityLog]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     ai_reviews: Mapped[list[BucketAIReview]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
@@ -196,6 +206,10 @@ class BucketFile(TimestampMixin, Base):
     )
     vendor_access: Mapped[list[BucketVendorAccess]] = relationship(
         secondary=bucket_vendor_access_files,
+        back_populates="files",
+    )
+    public_shares: Mapped[list[BucketPublicShare]] = relationship(
+        secondary=bucket_public_share_files,
         back_populates="files",
     )
     annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="file", cascade="all, delete-orphan")
@@ -344,6 +358,35 @@ class BucketVendorAccess(TimestampMixin, Base):
     files: Mapped[list[BucketFile]] = relationship(
         secondary=bucket_vendor_access_files,
         back_populates="vendor_access",
+    )
+
+
+class BucketPublicShare(TimestampMixin, Base):
+    """A share link that requires neither login nor an access code — just the
+    token itself, optionally expiring. Used by the admin to hand files to
+    external banks/lenders with zero friction. Deliberately minimal
+    (preview/download only) compared to BucketShare's richer capability set."""
+
+    __tablename__ = "bucket_public_shares"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(96), nullable=False, unique=True, index=True)
+    recipient_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    can_preview: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    can_download: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    view_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    download_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    bucket: Mapped[Bucket] = relationship(back_populates="public_shares")
+    files: Mapped[list[BucketFile]] = relationship(
+        secondary=bucket_public_share_files,
+        back_populates="public_shares",
     )
 
 

@@ -84,6 +84,7 @@ class BucketDetail(BucketRead):
     upload_links: list[BucketUploadLinkRead] = []
     shares: list[BucketShareRead] = []
     vendor_access: list[BucketVendorAccessRead] = []
+    public_shares: list[BucketPublicShareRead] = []
     notes: list[BucketNoteRead] = []
     activity: list[BucketActivityRead] = []
 
@@ -461,6 +462,45 @@ class BucketShareAccessRead(BaseModel):
     notes: list[BucketNoteRead]
     ai_summary: dict | None = None
     ai_tasks: list[BucketAIActionItemRead] = []
+
+
+class BucketPublicShareCreate(BaseModel):
+    """No-login, no-passcode share link. Preview/download only — no notes,
+    AI chat, or task capabilities, unlike BucketShare."""
+    recipient_name: str | None = Field(default=None, max_length=180)
+    file_ids: list[UUID] = Field(min_length=1)
+    can_preview: bool = True
+    can_download: bool = True
+    expires_at: datetime | None = None
+
+
+class BucketPublicShareRead(ORMModel):
+    id: UUID
+    bucket_id: UUID
+    token: str
+    recipient_name: str | None
+    can_preview: bool
+    can_download: bool
+    status: str
+    expires_at: datetime | None
+    last_accessed_at: datetime | None
+    view_count: int
+    download_count: int
+    created_at: datetime
+    files: list[BucketFileRead] = []
+    share_url: str | None = None
+
+
+class BucketPublicShareFileRead(BucketFileRead):
+    s3_key: str = Field(exclude=True)
+    preview_url: str | None = None
+    download_url: str | None = None
+
+
+class BucketPublicShareAccessRead(BaseModel):
+    bucket: BucketRead
+    share: BucketPublicShareRead
+    files: list[BucketPublicShareFileRead]
 
 
 class BucketNoteCreate(BaseModel):
