@@ -57,6 +57,18 @@ async def list_clients(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     return out
 
 
+def _client_read_for_self(client: Client) -> ClientRead:
+    """ClientRead for the CLIENT themselves — strips agent_private
+    known_facts (agent notes) from realtor_profile before it reaches the
+    borrower. Builds a transient dict rather than mutating the persisted
+    row (same reshaping pattern as get_client's d = ...model_dump())."""
+    from app.services.ai.realtor_profile import filter_known_facts_for_client
+
+    d = ClientRead.model_validate(client).model_dump()
+    d["realtor_profile"] = filter_known_facts_for_client(d.get("realtor_profile"))
+    return ClientRead.model_validate(d)
+
+
 @router.get("/me", response_model=ClientRead)
 async def get_my_client(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ClientRead:
     """Return the current user's linked Client record. Used by the desktop
@@ -65,7 +77,7 @@ async def get_my_client(user: CurrentUser, db: AsyncSession = Depends(get_db)) -
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "Current user has no linked client record"
         )
-    return ClientRead.model_validate(user.client)
+    return _client_read_for_self(user.client)
 
 
 @router.patch("/me", response_model=ClientRead)
@@ -86,7 +98,7 @@ async def update_my_client(
         setattr(client, k, v)
     await db.flush()
     await db.refresh(client)
-    return ClientRead.model_validate(client)
+    return _client_read_for_self(client)
 
 
 @router.get("/me/living-profile", response_model=LivingProfileRead)
@@ -807,7 +819,7 @@ async def request_prequalification(
     #      packet, prequal_request_id linking the quote).
     #   5. Drop the first lending AI message into the new thread —
     #      deterministic for v1; the AI takes over from message 2.
-    from app.models.ai_chat_thread import AIChatMessage, AIChatThread
+    from app.models.ai_chat_thread import AIChatThread
     from app.models.lending_handoff_packet import LendingHandoffPacket
     from app.services.ai.handoff_builder import build_handoff_packet
 
@@ -842,38 +854,23 @@ async def request_prequalification(
         realtor_thread.phase = "realtor"
 
     # Spawn the lending-phase thread linked back to the realtor side.
-    lending_thread = AIChatThread(
+    # Shared with services/handoff.promote_deal_to_loan's Deal-sourced
+    # handoff path via lending_handoff_shared — the two builders read
+    # different inputs (Client.lead_intake here, Deal+ClientAIPlan there)
+    # and stay intentionally separate, but the thread-spawn shape is now
+    # one implementation instead of two independently-maintained copies.
+    from app.services.lending_handoff_shared import spawn_lending_thread
+
+    lending_thread = await spawn_lending_thread(
+        db,
         user_id=user.id,
-        client_id=client.id,
+        client=client,
         loan_id=None,
-        phase="lending",
-        parent_thread_id=realtor_thread.id if realtor_thread else None,
-        handoff_packet_id=packet.id,
+        packet=packet,
+        packet_payload=packet_payload,
+        realtor_thread_id=realtor_thread.id if realtor_thread else None,
         prequal_request_id=prequal.id,
-        title=f"Lending — {client.name[:80]}",
     )
-    db.add(lending_thread)
-    await db.flush()
-
-    # Backfill the packet with the lending thread id now that we have it.
-    packet.lending_thread_id = lending_thread.id
-
-    # Drop the first Lending AI message — deterministic, derived from
-    # the packet. The AI takes over from message 2 onwards using the
-    # handoff packet as its context block (LENDING_AI_SYSTEM_PROMPT
-    # selector, see app/routers/ai.py).
-    first_msg_body = _compose_first_lending_message(packet_payload, client)
-    db.add(AIChatMessage(
-        thread_id=lending_thread.id,
-        role="assistant",
-        body=first_msg_body,
-        actions=None,
-        attachments=None,
-    ))
-    from datetime import datetime as _dt, timezone as _tz
-    now = _dt.now(_tz.utc)
-    lending_thread.last_message_preview = first_msg_body[:200]
-    lending_thread.last_message_at = now
 
     await db.flush()
     await db.refresh(packet)
@@ -883,42 +880,11 @@ async def request_prequalification(
         client_id=client.id,
         lead_promotion_status=client.lead_promotion_status,
         handoff_packet_id=packet.id,
-        lending_thread_id=lending_thread.id,
+        lending_thread_id=lending_thread.id if lending_thread else None,
         handoff_summary=packet.handoff_summary,
         first_lending_question=packet.first_lending_question,
         missing_lending_items=packet.missing_lending_items or [],
     )
-
-
-def _compose_first_lending_message(packet: dict, client: Client) -> str:
-    """Build the deterministic first-message body the Lending AI
-    drops into the freshly-spawned lending thread. Demonstrates
-    memory inheritance — lists what we know, lists what's missing,
-    asks the highest-leverage first question."""
-    lines: list[str] = []
-    lines.append(f"I have {client.name} marked as ready for lending.")
-    summary = packet.get("handoff_summary") or ""
-    if summary:
-        lines.append("")
-        lines.append("Here's what I already know from the realtor side:")
-        for s in summary.split("\n"):
-            if s.strip() and not s.lower().startswith("client:"):
-                lines.append(f"  • {s.strip()}")
-    missing = packet.get("missing_lending_items") or []
-    if missing:
-        lines.append("")
-        lines.append("To start the lending package correctly, I still need:")
-        for m in missing[:5]:
-            lines.append(f"  • {_humanize_field(m)}")
-    first_q = packet.get("first_lending_question")
-    if first_q:
-        lines.append("")
-        lines.append(first_q)
-    return "\n".join(lines)
-
-
-def _humanize_field(field: str) -> str:
-    return field.replace("_", " ").replace(".", " · ").capitalize()
 
 
 # ── Realtor AI ChatAction confirm-endpoints (alembic 0030) ───────────
@@ -1346,20 +1312,23 @@ async def send_intake_link(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> SendIntakeLinkResponse:
-    """Generate a tracked intake URL for this client and log a send.
+    """Generate a sign-up link for this client and actually send it.
 
-    v1 (this commit): generates the URL, logs an Activity row, returns
-    the URL + channel. Actual SMS/email send wiring routes through the
-    existing notification fan-out and is gated by a follow-up commit
-    once the channel-resolution helper is in place. The frontend treats
-    the response as "sent" — if SMS/email transport fails, the
-    Activity row captures the intent and the broker can re-send.
+    Channel resolution: explicit > phone (sms) > email > portal. There is
+    no SMS transport in this codebase yet (no Twilio/similar adapter) — an
+    "sms" resolution falls back to "portal" rather than silently pretending
+    to text the client. The "email" branch sends via send_as_user (the
+    broker's connected Gmail, SES fallback) — sent_via only reports "email"
+    when that send genuinely succeeds; otherwise it reports "portal" so the
+    broker isn't told a message went out when it didn't. Every outcome logs
+    an Activity row for the audit trail.
 
     Role: BROKER (must own the client), SUPER_ADMIN, LOAN_EXEC.
     """
     from datetime import datetime as _dt, timezone as _tz
     from app.models.activity import Activity
     from app.config import get_settings
+    from app.services.email.user_mailer import send_as_user
 
     if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
@@ -1368,24 +1337,47 @@ async def send_intake_link(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     if user.role == Role.BROKER and user.broker and client.broker_id != user.broker.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
+    if client.contact_permission == "save_lead_only":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This client was saved as lead-only. Enable outreach on the client before sending an intake link.",
+        )
 
     # Channel resolution: explicit > phone (sms) > email > portal.
-    sent_via = (payload.channel or "").lower() or None
-    if sent_via not in {"portal", "email", "sms"}:
+    requested_via = (payload.channel or "").lower() or None
+    if requested_via not in {"portal", "email", "sms"}:
         if client.phone:
-            sent_via = "sms"
+            requested_via = "sms"
         elif client.email:
-            sent_via = "email"
+            requested_via = "email"
         else:
-            sent_via = "portal"
+            requested_via = "portal"
 
-    # Stub URL — production wiring would hit the existing intake
-    # token-mint flow (same one /clients/{id}/request-prequalification
-    # uses internally) and embed a tracking parameter so we can
-    # measure open/complete on the portal side.
     settings = get_settings()
-    portal_base = getattr(settings, "portal_public_url", None) or "https://app.qualifiedcommercial.com"
-    url = f"{portal_base.rstrip('/')}/intake?c={client_id}"
+    url = f"{settings.frontend_app_url.rstrip('/')}/sign-up"
+
+    sent_via = "portal"
+    send_detail = "No email on file — share the link directly."
+    if requested_via == "sms":
+        send_detail = "SMS requested but no SMS transport is configured — share the link directly."
+    elif requested_via == "email" and client.email:
+        result = await send_as_user(
+            db,
+            user.id,
+            to_emails=[client.email],
+            subject="Your secure Qualified Commercial file",
+            body_text=(
+                f"Hi {client.name},\n\n"
+                f"{user.name or user.email} has invited you to your secure Qualified Commercial file. "
+                f"Sign up here to get started:\n{url}\n\n"
+                "If you weren't expecting this, you can safely ignore this email."
+            ),
+        )
+        if result.ok:
+            sent_via = "email"
+            send_detail = f"Emailed to {client.email}."
+        else:
+            send_detail = f"Email send failed ({result.detail}) — share the link directly."
 
     now = _dt.now(_tz.utc)
     db.add(
@@ -1394,12 +1386,93 @@ async def send_intake_link(
             actor_id=user.id,
             actor_label=user.email,
             kind="nurture.intake_link_sent",
-            summary=f"{user.email} sent intake link via {sent_via}",
+            summary=f"{user.email} sent intake link via {sent_via}. {send_detail}",
         )
     )
     await db.flush()
 
     return SendIntakeLinkResponse(url=url, sent_via=sent_via, sent_at=now)
+
+
+# ── Agent reassignment (alembic 0097) ───────────────────────────────
+#
+# Moves a client from one agent to another. Writes an audit row (the
+# append-only history), updates Client.current_agent_id (leaves
+# originating_agent_id untouched — that's who first captured the lead,
+# never changes), and reassigns Loan.broker_id on the client's active
+# loans so open AITasks (which have no agent column of their own —
+# they inherit ownership transitively via loan_id -> Loan.broker_id)
+# follow the client to the new agent automatically.
+#
+# Narrower than the generic PATCH /clients/{id}'s broker_id path (which
+# also allows LOAN_EXEC) — reassignment is a more sensitive action, so
+# this is SUPER_ADMIN only, by design.
+
+
+class ReassignAgentRequest(BaseModel):
+    to_agent_id: UUID
+    reason: str | None = None
+
+
+@router.patch("/{client_id}/agent", response_model=ClientRead)
+async def reassign_agent(
+    client_id: UUID,
+    payload: ReassignAgentRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientRead:
+    """Reassign a client's owning agent. Super-admin only."""
+    from app.models.agent_reassignment_audit import AgentReassignmentAudit
+    from app.models.broker import Broker
+    from app.models.loan import Loan
+    from app.models.user import User
+
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin only")
+
+    client = (await db.execute(select(Client).where(Client.id == client_id))).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+
+    to_agent = (await db.execute(select(User).where(User.id == payload.to_agent_id))).scalar_one_or_none()
+    if to_agent is None or to_agent.role != Role.BROKER:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "to_agent_id must be an existing broker user")
+
+    from_agent_id = client.current_agent_id
+
+    db.add(
+        AgentReassignmentAudit(
+            client_id=client_id,
+            from_agent_id=from_agent_id,
+            to_agent_id=payload.to_agent_id,
+            reason=payload.reason,
+            performed_by_user_id=user.id,
+        )
+    )
+
+    client.current_agent_id = payload.to_agent_id
+
+    # Transfer open AITasks by reassigning the underlying loans' broker_id —
+    # AITask has no direct agent column, it inherits ownership via
+    # loan_id -> Loan.broker_id, which the existing broker-scoped task
+    # queries (app/routers/ai_tasks.py) already filter on.
+    to_broker = (await db.execute(select(Broker).where(Broker.user_id == payload.to_agent_id))).scalar_one_or_none()
+    if to_broker is not None:
+        from_broker = None
+        if from_agent_id is not None:
+            from_broker = (
+                await db.execute(select(Broker).where(Broker.user_id == from_agent_id))
+            ).scalar_one_or_none()
+        loans_stmt = select(Loan).where(Loan.client_id == client_id)
+        if from_broker is not None:
+            loans_stmt = loans_stmt.where(Loan.broker_id == from_broker.id)
+        loans = (await db.execute(loans_stmt)).scalars().all()
+        for loan in loans:
+            loan.broker_id = to_broker.id
+
+    await db.flush()
+    await db.refresh(client)
+    return ClientRead.model_validate(client)
 
 
 # ── Client Properties (alembic 0034) ────────────────────────────────
@@ -1600,8 +1673,10 @@ async def add_agent_note(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Append a free-form note to the client's realtor_profile.known_facts
-    with source=agent. The Realtor Elara sees this on the next chat turn
-    via apply_profile_patch's known_fact merge."""
+    with source=agent, tagged agent_private. The Realtor Elara sees this on
+    the next chat turn via apply_profile_patch's known_fact merge — but it
+    is stripped before the client can read their own profile (see
+    filter_known_facts_for_client, applied at GET/PATCH /clients/me)."""
     if user.role != Role.BROKER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Agent-only")
     text = (payload.text or "").strip()
@@ -1617,7 +1692,7 @@ async def add_agent_note(
     profile = client.realtor_profile or {}
     patched = apply_profile_patch(
         profile,
-        {"known_fact": {"field": payload.field or "note", "value": text, "source": "agent"}},
+        {"known_fact": {"field": payload.field or "note", "value": text, "source": "agent", "visibility": "agent_private"}},
         client_id=str(client_id),
         agent_id=str(user.id),
     )

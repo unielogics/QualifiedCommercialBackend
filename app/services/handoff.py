@@ -55,13 +55,14 @@ from app.enums import (
 )
 from app.models.activity import Activity
 from app.models.agent_task import AgentTask
-from app.models.ai_chat_thread import AIChatMessage, AIChatThread
+from app.models.ai_chat_thread import AIChatThread
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
 from app.models.client_requirement_status import ClientRequirementStatus
 from app.models.deal import Deal
 from app.models.lending_handoff_packet import LendingHandoffPacket
 from app.models.loan import Loan
+from app.services.lending_handoff_shared import spawn_lending_thread
 from app.models.prequal_request import PrequalRequest
 from app.services.ai.handoff_builder import build_handoff_packet
 
@@ -452,38 +453,22 @@ async def promote_deal_to_loan(
 
     # Spawn the lending-phase AIChatThread linked to the packet + the
     # new loan. The realtor thread keeps its history; the lending
-    # thread is the new conversation surface for underwriting.
-    lending_thread: AIChatThread | None = None
-    if user_id is not None:
-        lending_thread = AIChatThread(
-            user_id=user_id,
-            client_id=client.id,
-            loan_id=loan.id,
-            phase="lending",
-            parent_thread_id=realtor_thread.id if realtor_thread else None,
-            handoff_packet_id=packet.id,
-            prequal_request_id=prequal.id if prequal else None,
-            title=f"Lending — {client.name[:80]}",
-        )
-        db.add(lending_thread)
-        await db.flush()
-        packet.lending_thread_id = lending_thread.id
-
-        # Deterministic first message — same composition the existing
-        # prequal flow uses so the Lending AI's first turn looks
-        # identical regardless of which handoff path fired.
-        first_msg_body = _compose_first_lending_message(packet_payload, client)
-        db.add(
-            AIChatMessage(
-                thread_id=lending_thread.id,
-                role="assistant",
-                body=first_msg_body,
-                actions=None,
-                attachments=None,
-            )
-        )
-        lending_thread.last_message_preview = first_msg_body[:200]
-        lending_thread.last_message_at = datetime.now(timezone.utc)
+    # thread is the new conversation surface for underwriting. Shared
+    # with routers/clients.request_prequalification's pre-Deal handoff
+    # path via lending_handoff_shared — the two builders read different
+    # inputs (Deal+ClientAIPlan here, Client.lead_intake there) and stay
+    # intentionally separate, but the thread-spawn shape is now one
+    # implementation instead of two independently-maintained copies.
+    lending_thread = await spawn_lending_thread(
+        db,
+        user_id=user_id,
+        client=client,
+        loan_id=loan.id,
+        packet=packet,
+        packet_payload=packet_payload,
+        realtor_thread_id=realtor_thread.id if realtor_thread else None,
+        prequal_request_id=prequal.id if prequal else None,
+    )
 
     # Mark realtor thread phase=realtor if it was NULL (legacy threads).
     if realtor_thread is not None and realtor_thread.phase is None:
@@ -552,36 +537,6 @@ async def promote_deal_to_loan(
             for item in snapshot["missing_lending_items"]
         ],
     )
-
-
-def _compose_first_lending_message(packet: dict[str, Any], client: Client) -> str:
-    """Build the deterministic first-message body the Lending AI drops
-    into the freshly-spawned lending thread. Mirrors
-    routers/clients._compose_first_lending_message so the Lending AI's
-    first turn is identical regardless of which handoff path fired."""
-    lines: list[str] = [f"I have {client.name} marked as ready for lending."]
-    summary = packet.get("handoff_summary") or ""
-    if summary:
-        lines.append("")
-        lines.append("Here's what I already know from the realtor side:")
-        for s in summary.split("\n"):
-            if s.strip() and not s.lower().startswith("client:"):
-                lines.append(f"  • {s.strip()}")
-    missing = packet.get("missing_lending_items") or []
-    if missing:
-        lines.append("")
-        lines.append("To start the lending package correctly, I still need:")
-        for m in missing[:5]:
-            lines.append(f"  • {_humanize_field(m)}")
-    first_q = packet.get("first_lending_question")
-    if first_q:
-        lines.append("")
-        lines.append(first_q)
-    return "\n".join(lines)
-
-
-def _humanize_field(field: str) -> str:
-    return field.replace("_", " ").replace(".", " · ").capitalize()
 
 
 __all__ = ["promote_deal_to_loan", "PromoteResult"]

@@ -274,6 +274,11 @@ def apply_profile_patch(
     if "known_fact" in patch and isinstance(patch["known_fact"], dict):
         fact = patch["known_fact"]
         fact.setdefault("captured_at", datetime.now(timezone.utc).isoformat())
+        # Visibility (default client_visible — preserves prior behavior for
+        # AI-recorded facts, which inform the client-visible readiness view).
+        # Callers that want a private note (e.g. add_agent_note) set
+        # visibility="agent_private" on the patch dict explicitly.
+        fact.setdefault("visibility", "client_visible")
         # Dedup by field — most-recent wins.
         existing = [f for f in (base.get("known_facts") or []) if f.get("field") != fact.get("field")]
         existing.append(fact)
@@ -344,6 +349,27 @@ async def compute_missing_facts_from_resolver(
         context=context or {},
     )
     return [r.requirement_key for r in resolved if r.required_level == "required"]
+
+
+def filter_known_facts_for_client(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip agent-private known_facts before a profile reaches the CLIENT
+    themselves (GET/PATCH /clients/me). Mirrors the exclude-agent_private
+    half of services/handoff._filter_visibility, scoped to just this one
+    field. Returns a new dict — never mutates the caller's profile, so this
+    is safe to call on a transient response object without touching the
+    persisted row."""
+    if not isinstance(profile, dict):
+        return profile
+    known_facts = profile.get("known_facts")
+    if not isinstance(known_facts, list):
+        return profile
+    filtered = [
+        fact for fact in known_facts
+        if not (isinstance(fact, dict) and fact.get("visibility") == "agent_private")
+    ]
+    if len(filtered) == len(known_facts):
+        return profile
+    return {**profile, "known_facts": filtered}
 
 
 def _empty_buyer_profile() -> dict[str, Any]:

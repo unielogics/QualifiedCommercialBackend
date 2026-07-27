@@ -20,7 +20,7 @@ from collections import defaultdict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import false as sql_false, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -64,14 +64,29 @@ async def _load_deal(db: AsyncSession, deal_id: UUID, user: User) -> Deal:
     """Load a deal, scoped by role.
 
     - CLIENT: only their own deals (via client_id → user.client.id).
-    - BROKER: only deals assigned to them.
+    - BROKER: only deals on clients they own (Client.broker_id ==
+      user.broker.id — the same rule scoping.py uses for Client/Loan
+      everywhere else, not Deal.assigned_agent_id, which is a freely
+      settable, independently-drifting field that doesn't reliably track
+      the client's actual owning broker). Fails closed (sql_false()) when
+      user.broker is None, matching scoping.py's defense-in-depth — without
+      it, a BROKER-role user with no linked Broker row fell through to the
+      unfiltered base query and could load ANY deal by id.
     - SUPER_ADMIN / LOAN_EXEC: any.
     """
     stmt = select(Deal).where(Deal.id == deal_id)
-    if user.role == Role.CLIENT and user.client:
-        stmt = stmt.where(Deal.client_id == user.client.id)
-    elif user.role == Role.BROKER and user.broker:
-        stmt = stmt.where(Deal.assigned_agent_id == user.id)
+    if user.role == Role.CLIENT:
+        if user.client is None:
+            stmt = stmt.where(sql_false())
+        else:
+            stmt = stmt.where(Deal.client_id == user.client.id)
+    elif user.role == Role.BROKER:
+        if user.broker is None:
+            stmt = stmt.where(sql_false())
+        else:
+            stmt = stmt.where(
+                Deal.client_id.in_(select(ClientModel.id).where(ClientModel.broker_id == user.broker.id))
+            )
     elif user.role == Role.REGIONAL_MANAGER:
         stmt = stmt.where(
             Deal.client_id.in_(

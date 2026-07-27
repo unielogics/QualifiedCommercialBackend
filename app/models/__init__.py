@@ -1,6 +1,7 @@
 """ORM models — single import surface so Alembic autogenerate sees everything."""
 
 from app.models.activity import Activity  # noqa: F401
+from app.models.agent_reassignment_audit import AgentReassignmentAudit  # noqa: F401
 from app.models.ai_agent import (  # noqa: F401
     AIAgent,
     AIAgentExitRules,

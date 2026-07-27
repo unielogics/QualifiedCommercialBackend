@@ -64,11 +64,20 @@ async def get_deal(
       - BROKER: only deals on clients they own
       - SUPER_ADMIN / LOAN_EXEC: all
     """
+    # Look up client_id first with a minimal, unscoped read (just the FK,
+    # no other Deal fields touched), then enforce visibility through the
+    # client-scope filter BEFORE loading/returning the full Deal — so no
+    # future edit can slip a field-read in between an unscoped deal load
+    # and the access check.
+    deal_client_id = (
+        await db.execute(select(Deal.client_id).where(Deal.id == deal_id))
+    ).scalar_one_or_none()
+    if deal_client_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
+    await _load_client_or_404(deal_client_id, user, db)
     deal = await db.get(Deal, deal_id)
     if deal is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
-    # Load the client through the scope filter to enforce visibility.
-    await _load_client_or_404(deal.client_id, user, db)
     return DealOut.model_validate(deal)
 
 
@@ -233,6 +242,14 @@ async def mark_ready_for_lending(
     if user.role == Role.CLIENT:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Read-only")
     client = await _load_client_or_404(client_id, user, db)
+    # Explicit ownership check, matching its sibling
+    # clients.request_prequalification — the scope filter above already
+    # enforces this implicitly (scope_client_query restricts a BROKER's
+    # query to Client.broker_id == user.broker.id), but making it explicit
+    # here keeps the invariant visible at the call site instead of several
+    # functions away.
+    if user.role == Role.BROKER and user.broker and client.broker_id != user.broker.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your client")
     deal = (
         await db.execute(
             select(Deal).where(Deal.id == deal_id, Deal.client_id == client_id)
@@ -240,7 +257,6 @@ async def mark_ready_for_lending(
     ).scalar_one_or_none()
     if deal is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
-    _ = client  # client load already gated by scope; explicit binding for clarity
 
     result = await promote_deal_to_loan(
         db,
