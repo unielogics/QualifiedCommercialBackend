@@ -136,6 +136,18 @@ REQUIRED_DOCUMENTS = [
         "description": "Upload the last six months of the main operating business bank statements.",
         "allow_multiple_files": True,
     },
+    {
+        "name": "Debt schedule",
+        "category": "Debts",
+        "description": "Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each.",
+        "allow_multiple_files": False,
+    },
+    {
+        "name": "Personal financial statement",
+        "category": "Personal Financials",
+        "description": "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one.",
+        "allow_multiple_files": True,
+    },
 ]
 
 REAL_ESTATE_REQUIRED_DOCUMENTS = [
@@ -174,11 +186,20 @@ class DealerAssetRow(BaseModel):
     notes: str | None = Field(default=None, max_length=500)
 
 
+class DealerOwner(BaseModel):
+    name: str = Field(max_length=180)
+    ownership_percent: float | None = Field(default=None, ge=0, le=100)
+
+
 class DealerEntityStructure(BaseModel):
     primary_operating_entity: str | None = Field(default=None, max_length=180)
     main_operating_bank_account: str | None = Field(default=None, max_length=180)
     related_entities: str | None = Field(default=None, max_length=1200)
     relationship_explanation: str | None = Field(default=None, max_length=1600)
+    # Captured conversationally via proposed_borrower_facts (see
+    # _merge_dealer_details) — each named owner gets its own dynamically
+    # created "Identification — {name}" requested document.
+    owners: list[DealerOwner] = Field(default_factory=list)
 
     @field_validator("primary_operating_entity", "main_operating_bank_account", "related_entities", "relationship_explanation", mode="before")
     @classmethod
@@ -317,6 +338,17 @@ class LeadCreditStatusResponse(BaseModel):
     fico: int | None = None
     pulled_at: datetime | None = None
     expires_at: datetime | None = None
+
+
+class LeadProgramFitResponse(BaseModel):
+    """Admin-only read of the deterministic program-fit screen — mirrors
+    LeadCreditStatusResponse's shape (a plain read-only status endpoint, not
+    routed through the redacted intake_state payload)."""
+    computed: bool
+    sba: dict[str, Any] | None = None
+    real_estate_backed: dict[str, Any] | None = None
+    reinsurance_backed: dict[str, Any] | None = None
+    jumbo_dscr: dict[str, Any] | None = None
 
 
 class DealerIntakePatch(BaseModel):
@@ -946,7 +978,7 @@ async def _latest_active_intake_by_email(
         .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
         .where(Bucket.archived_at.is_(None))
         .options(
-            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
@@ -1026,7 +1058,8 @@ async def _load_intake_by_dealer_session(db: AsyncSession, session_token: str) -
             .options(
                 selectinload(DealerIntakeLoginChallenge.intake)
                 .selectinload(PublicUnderwritingIntake.bucket)
-                .selectinload(Bucket.requested_documents),
+                .selectinload(Bucket.requested_documents)
+                .selectinload(BucketRequestedDocument.template_file),
                 selectinload(DealerIntakeLoginChallenge.intake)
                 .selectinload(PublicUnderwritingIntake.bucket)
                 .selectinload(Bucket.files),
@@ -1057,6 +1090,39 @@ def _missing_required_docs(bucket: Bucket) -> list[BucketRequestedDocument]:
     return [doc for doc in bucket.requested_documents if doc.required and doc.id not in uploaded]
 
 
+async def _ensure_requested_document(
+    db: AsyncSession,
+    bucket: Bucket,
+    *,
+    name: str,
+    category: str,
+    description: str | None = None,
+    allow_multiple_files: bool = False,
+) -> BucketRequestedDocument:
+    """Idempotent get-or-create by (bucket_id, name) — lets the dealer chat
+    add a new baseline document mid-conversation (e.g. a newly-named owner's
+    ID, a tax extension filing, reinsurance statements) without duplicating
+    the row on a later turn. Mirrors the initial-bucket-creation loop in
+    _create_bucket_for_intake, just callable outside that one-time path."""
+    existing = next((doc for doc in bucket.requested_documents if doc.name == name), None)
+    if existing is not None:
+        return existing
+    doc = BucketRequestedDocument(
+        bucket_id=bucket.id,
+        name=name,
+        category=category,
+        description=description,
+        required=True,
+        allow_multiple_files=allow_multiple_files,
+        status="requested",
+        is_custom=True,
+    )
+    db.add(doc)
+    await db.flush()
+    bucket.requested_documents.append(doc)
+    return doc
+
+
 def _asset_rows(intake: PublicUnderwritingIntake) -> list[dict[str, Any]]:
     rows = intake.asset_rows if isinstance(intake.asset_rows, list) else []
     return [row for row in rows if isinstance(row, dict)]
@@ -1079,6 +1145,147 @@ def _credit_pull_state(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     admin/AI-only, for both dealer and real-estate leads."""
     raw = _intake_state(intake).get("credit_pull")
     return raw if isinstance(raw, dict) else {}
+
+
+def _key_metrics(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The latest computed key_metrics dict, sourced from the latest review
+    result if present, else the intake's result_snapshot. Both carry the same
+    shape (see REVIEW_PREAMBLE/_compute_key_metrics_from_cache)."""
+    review = intake.latest_review if intake.latest_review else None
+    result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
+    if not isinstance(result, dict):
+        return {}
+    km = result.get("key_metrics")
+    return km if isinstance(km, dict) else {}
+
+
+def _loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The deterministically-computed program-fit signal written by
+    _compute_loan_program_fit — same intake_state sub-object pattern as
+    credit_pull. Admin/AI-only, like credit_pull: never surfaced to the
+    dealer directly (no widget, no chat announcement of program names or
+    pricing) — the AI only uses it to avoid re-asking a resolved question."""
+    raw = _intake_state(intake).get("loan_program_fit")
+    return raw if isinstance(raw, dict) else {}
+
+
+# Reinsurance-backed program pricing, as supplied by the lending desk. Rate
+# steps downward with loan size; anything at/above $5MM is custom-priced by
+# the desk, not looked up here. One-year maturity; a 3-year maturity is not
+# yet approved by management. Loans under $3MM require only a Personal
+# Financial Statement (PFS); at/above $3MM the full underwriting package
+# (the enriched dealer baseline) is required regardless.
+_REINSURANCE_RATE_STEPS = (
+    (1_500_000, 7.87),
+    (2_000_000, 7.62),
+    (3_000_000, 7.32),
+)
+_REINSURANCE_MIN_REVENUE = 500_000
+_REINSURANCE_MIN_LIQUID_ASSETS = 2_500_000
+_REINSURANCE_DOC_TIER_THRESHOLD = 3_000_000
+_REINSURANCE_CUSTOM_PRICING_THRESHOLD = 5_000_000
+_JUMBO_MIN_REVENUE = 750_000
+_JUMBO_MIN_DSCR = 1.25
+
+
+def _reinsurance_rate_for_amount(amount: float | None) -> tuple[float | None, bool]:
+    """Returns (rate_percent, is_custom_priced). rate_percent is None until an
+    amount is known; is_custom_priced is True at/above $5MM, where the desk
+    prices individually rather than off this step table."""
+    if amount is None:
+        return None, False
+    if amount >= _REINSURANCE_CUSTOM_PRICING_THRESHOLD:
+        return None, True
+    rate = None
+    for threshold, step_rate in _REINSURANCE_RATE_STEPS:
+        if amount >= threshold:
+            rate = step_rate
+    return rate, False
+
+
+def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """Deterministic (non-AI) computation of which financing programs this
+    dealer file likely qualifies for, mirroring the credit_pull mechanism:
+    a plain computed dict written to intake_state, read back by an accessor,
+    and injected into the AI context / packet financials / PDF / executive
+    summary — never surfaced to the dealer directly. Recomputed cheaply on
+    every chat turn (no AI call, no DB round trip beyond what's already
+    loaded), so it never goes stale.
+
+    - SBA: the default path. Eligible once the full enriched baseline is
+      complete (tax returns/extension, current-year P&L, bank statements,
+      debt schedule, PFS, and one ID per declared owner) — no size/DSCR
+      threshold of its own.
+    - real_estate_backed: flagged when real-estate collateral has been
+      declared with a stated value. No pricing rules were supplied for this
+      program, so it carries eligibility only.
+    - reinsurance_backed: eligible when the dealer/owner has confirmed a
+      reinsurance account, both reinsurance statements are uploaded, and
+      either revenue or PFS liquid assets clear the stated thresholds.
+      Carries the desk-supplied pricing table and doc-tier flag.
+    - jumbo_dscr: eligible when revenue and the real (debt-schedule-derived)
+      DSCR both clear their thresholds.
+    """
+    km = _key_metrics(intake)
+    revenue = km.get("ytd_annualized_revenue")
+    dscr = km.get("estimated_dscr")
+    liquid_assets = km.get("pfs_total_liquid_assets")
+    details = _dealer_details(intake)
+    requested_amount = float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None
+
+    sba = {"eligible": not _missing_required_docs(intake.bucket)}
+
+    real_estate_backed = {
+        "eligible": _has_real_estate_schedule(intake),
+        "note": "Advance rate and pricing pending admin review — no rules configured for this program yet.",
+    }
+
+    reinsurance_present = details.get("reinsurance_account_present") is True
+    reinsurance_docs_uploaded = reinsurance_present and not any(
+        "reinsurance" in (doc.category or "").lower() and doc.id not in _uploaded_doc_ids(intake.bucket)
+        for doc in intake.bucket.requested_documents
+    )
+    reinsurance_liquidity_met = (isinstance(revenue, (int, float)) and revenue >= _REINSURANCE_MIN_REVENUE) or (
+        isinstance(liquid_assets, (int, float)) and liquid_assets >= _REINSURANCE_MIN_LIQUID_ASSETS
+    )
+    reinsurance_eligible = reinsurance_present and reinsurance_docs_uploaded and reinsurance_liquidity_met
+    rate, custom_priced = _reinsurance_rate_for_amount(requested_amount)
+    reinsurance_backed = {
+        "eligible": reinsurance_eligible,
+        "trading_platform": details.get("reinsurance_trading_platform"),
+        "requested_amount": requested_amount,
+        "rate_percent": rate,
+        "custom_priced_5mm_plus": custom_priced,
+        "maturity_years": 1,
+        "doc_tier": (
+            "full_underwriting"
+            if requested_amount is not None and requested_amount >= _REINSURANCE_DOC_TIER_THRESHOLD
+            else "pfs_only"
+        ),
+    }
+
+    jumbo_eligible = (
+        isinstance(revenue, (int, float))
+        and revenue > _JUMBO_MIN_REVENUE
+        and isinstance(dscr, (int, float))
+        and dscr > _JUMBO_MIN_DSCR
+    )
+    jumbo_dscr = {"eligible": bool(jumbo_eligible), "revenue": revenue, "dscr": dscr}
+
+    return {
+        "sba": sba,
+        "real_estate_backed": real_estate_backed,
+        "reinsurance_backed": reinsurance_backed,
+        "jumbo_dscr": jumbo_dscr,
+    }
+
+
+def _apply_loan_program_fit(intake: PublicUnderwritingIntake) -> None:
+    """Recomputes and writes intake_state["loan_program_fit"]. Cheap and
+    idempotent — safe to call on every dealer chat turn."""
+    state = _intake_state(intake)
+    state["loan_program_fit"] = _compute_loan_program_fit(intake)
+    intake.intake_state = state
 
 
 # Fields the real-estate chat may populate on funding_review_details.
@@ -1182,6 +1389,120 @@ def _has_real_estate_schedule(intake: PublicUnderwritingIntake) -> bool:
     )
 
 
+_DEALER_DETAIL_KEYS = (
+    "owners",
+    "current_year_tax_filed",
+    "reinsurance_account_present",
+    "reinsurance_trading_platform",
+)
+
+
+def _dealer_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """Conversationally-gathered dealer facts (owners, whether current-year
+    taxes are filed, reinsurance-account status) — same intake_state
+    sub-object pattern as funding_review_details/credit_pull. Populated via
+    proposed_borrower_facts in dealer_intake_chat, never by the RE flow."""
+    raw = _intake_state(intake).get("dealer_details")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> dict[str, Any]:
+    """Validates and merges an AI-proposed proposed_borrower_facts object into
+    intake_state["dealer_details"]. Never trusts the model's shape blindly —
+    any key not on the allowlist, or with the wrong type, is dropped rather
+    than persisted. Returns the newly-accepted keys only (not the merged
+    whole), so the caller can react to what's NEW this turn (e.g. create a
+    requested document for a newly-named owner)."""
+    if not isinstance(proposed, dict):
+        return {}
+    accepted: dict[str, Any] = {}
+    for key in _DEALER_DETAIL_KEYS:
+        if key not in proposed:
+            continue
+        value = proposed[key]
+        if key == "owners":
+            if not isinstance(value, list):
+                continue
+            owners: list[dict[str, Any]] = []
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                percent = item.get("ownership_percent")
+                owner: dict[str, Any] = {"name": name[:180]}
+                if isinstance(percent, (int, float)) and not isinstance(percent, bool) and 0 <= percent <= 100:
+                    owner["ownership_percent"] = float(percent)
+                owners.append(owner)
+            if owners:
+                accepted[key] = owners
+            continue
+        if key in ("current_year_tax_filed", "reinsurance_account_present"):
+            if isinstance(value, bool):
+                accepted[key] = value
+            continue
+        if key == "reinsurance_trading_platform":
+            text = str(value).strip()
+            if text:
+                accepted[key] = text[:180]
+            continue
+    if not accepted:
+        return {}
+    state = _intake_state(intake)
+    existing = state.get("dealer_details")
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(accepted)
+    state["dealer_details"] = merged
+    intake.intake_state = state
+    return accepted
+
+
+async def _apply_dealer_detail_documents(db: AsyncSession, intake: PublicUnderwritingIntake, newly_accepted: dict[str, Any]) -> None:
+    """Turns newly-learned dealer_details facts into dynamically-created
+    requested documents, so the baseline checklist grows with the
+    conversation instead of asking everything upfront. Idempotent via
+    _ensure_requested_document — safe to call every turn, only acts on keys
+    present in newly_accepted this turn."""
+    if not newly_accepted:
+        return
+    if "owners" in newly_accepted:
+        for owner in newly_accepted["owners"]:
+            name = owner.get("name")
+            if not name:
+                continue
+            await _ensure_requested_document(
+                db,
+                intake.bucket,
+                name=f"Identification — {name}",
+                category="Identity",
+                description=f"Upload a government-issued photo ID for {name}.",
+            )
+    if newly_accepted.get("current_year_tax_filed") is False:
+        await _ensure_requested_document(
+            db,
+            intake.bucket,
+            name="Current-year tax extension filing",
+            category="Financials",
+            description="Upload the current-year tax extension filing since the return has not yet been filed.",
+        )
+    if newly_accepted.get("reinsurance_account_present") is True:
+        await _ensure_requested_document(
+            db,
+            intake.bucket,
+            name="Reinsurance account bank statement (last 2 months)",
+            category="Reinsurance",
+            description="Upload the last two months of bank statements for the reinsurance account.",
+        )
+        await _ensure_requested_document(
+            db,
+            intake.bucket,
+            name="Reinsurance account administrator statement (last 2 months)",
+            category="Reinsurance",
+            description="Upload the last two months of administrator statements for the reinsurance account.",
+        )
+
+
 def _has_uploaded_doc_name(intake: PublicUnderwritingIntake, needle: str) -> bool:
     wanted = needle.lower()
     docs = {doc.id: doc for doc in intake.bucket.requested_documents}
@@ -1198,21 +1519,6 @@ def _call_booked(intake: PublicUnderwritingIntake) -> bool:
     return isinstance(booking, dict) and bool(booking.get("event_id"))
 
 
-def _next_widget(intake: PublicUnderwritingIntake) -> dict[str, Any] | None:
-    files = _active_files(intake.bucket)
-    missing = _missing_required_docs(intake.bucket)
-    if not files and not intake.result_snapshot:
-        return {
-            "type": "upload_files",
-            "title": "Upload Stage 1 cash-flow documents",
-            "description": (
-                "Upload last 2 years business tax returns, YTD P&L, and last 6 months from the main operating bank account first."
-            ),
-            "missing_document_ids": [str(doc.id) for doc in missing],
-        }
-    return None
-
-
 def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str = "system_next_step", reason: str | None = None) -> dict[str, Any] | None:
     missing = _missing_required_docs(intake.bucket)
     widgets: dict[str, dict[str, Any]] = {
@@ -1224,61 +1530,20 @@ def _widget_for_type(intake: PublicUnderwritingIntake, kind: str, *, source: str
             ),
             "missing_document_ids": [str(doc.id) for doc in missing],
         },
-        "entity_structure": {
-            "type": "entity_structure",
-            "title": "Dealer entity and bank account structure",
-            "description": "Clarify the primary operating LLC, main operating bank account, related LLCs, and how the accounts work together.",
-        },
-        "deal_profile": {
-            "type": "deal_profile",
-            "title": "Essential funding facts",
-            "description": "Answer only what you know: requested amount, detailed use of funds, and estimated credit score. Break down payoff, working capital, inventory, taxes, repairs, acquisitions, or other uses.",
-            "fields": ["loan_purpose", "requested_loan_amount", "estimated_credit_score"],
-        },
-        "real_estate_schedule": {
-            "type": "real_estate_schedule",
-            "title": "Add real estate collateral",
-            "description": "Type each property address, estimated amount owed, and estimated value. You can also upload mortgage notes, but estimated value is still needed.",
-        },
-        "referral": {
-            "type": "referral",
-            "title": "Referral credit",
-            "description": "Who referred you to this link? If nobody did, enter self.",
-        },
-        "run_review": {
-            "type": "run_review",
-            "title": "Run preliminary AI screen",
-            "description": (
-                "Run this when there is enough evidence for a useful answer. Missing documents will be listed as gaps, "
-                "not treated as a reason to stop the review."
-            ),
-        },
         "book_call": {
             "type": "book_call",
             "title": "Book the next underwriting call",
             "description": "Choose one of the next available times with Qualified Commercial to validate the preliminary screen.",
         },
-        "bankability_result": {
-            "type": "bankability_result",
-            "title": "Preliminary bankability screen",
-            "description": "Review the AI summary, missing items, product fit, and next steps.",
-        },
-        "prequalification_result": {
-            "type": "prequalification_result",
-            "title": "You're prequalified",
-            "description": "Review your preliminary prequalification, program fit, sizing, and next step.",
-        },
     }
     widget = widgets.get(kind)
     if widget is None:
         return None
-    # The upload/entity/deal/real-estate widgets are car-dealer-worded (floorplan,
-    # dealer LLCs, Stage 1 cash-flow docs). Suppress them for non-dealer intakes so
-    # a real-estate file never surfaces dealer widgets; book_call / bankability_result
-    # / run_review are product-neutral and stay available to both.
+    # upload_files is car-dealer-worded (floorplan, Stage 1 cash-flow docs);
+    # suppress it for non-dealer intakes so a real-estate file never sees it.
+    # book_call is product-neutral and stays available to both.
     review_type = (intake.bucket.ai_context or {}).get("review_type")
-    dealer_only_widgets = {"upload_files", "entity_structure", "deal_profile", "real_estate_schedule", "referral"}
-    if review_type != "dealer_gatekeeper_v1" and kind in dealer_only_widgets:
+    if review_type != "dealer_gatekeeper_v1" and kind == "upload_files":
         return None
     return {**widget, "source": source, "reason": reason or source}
 
@@ -1299,52 +1564,6 @@ def _prequalification_widget(artifact: PublicUnderwritingIntakeArtifact) -> dict
         "next_step": body.get("next_step"),
         "disclaimer": body.get("disclaimer"),
     }
-
-
-def _widget_intent_from_message(message: str | None, intake: PublicUnderwritingIntake) -> str | None:
-    text = (message or "").lower()
-    if not text.strip():
-        return None
-    property_terms = (
-        "manual properties",
-        "manually upload my properties",
-        "enter properties",
-        "add properties",
-        "property line",
-        "property list",
-        "real estate schedule",
-        "collateral schedule",
-        "amount owed",
-        "estimated value",
-        "property value",
-        "property address",
-        "mortgage balance",
-        "real estate",
-    )
-    if any(term in text for term in property_terms):
-        return "real_estate_schedule"
-    upload_terms = ("upload", "file", "document", "docs", "statement", "tax return", "p&l", "profit and loss", "mca", "floorplan", "inventory")
-    if any(term in text for term in upload_terms):
-        return "upload_files"
-    entity_terms = ("llc", "entity", "entities", "bank account", "related company", "operating account", "company structure")
-    if any(term in text for term in entity_terms):
-        return "entity_structure"
-    deal_terms = ("loan amount", "requested amount", "use of funds", "credit score", "capital amount", "funding amount")
-    if any(term in text for term in deal_terms):
-        return "deal_profile"
-    referral_terms = ("referred", "referral", "who sent", "who referred")
-    if any(term in text for term in referral_terms):
-        return "referral"
-    call_terms = ("book", "call", "appointment", "meeting", "schedule")
-    if any(term in text for term in call_terms) and not _call_booked(intake):
-        return "book_call"
-    rerun_terms = ("reanalyze", "re-analyze", "rerun", "re-run", "run again", "review again", "refresh review", "refresh screen")
-    if any(term in text for term in rerun_terms):
-        return "run_review"
-    review_terms = ("review", "underwrite", "screen", "fundable", "bankable", "preliminary")
-    if any(term in text for term in review_terms):
-        return "bankability_result" if intake.result_snapshot else "run_review"
-    return None
 
 
 def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritingIntake) -> str:
@@ -1370,29 +1589,6 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
             "Your secure file room is open. Stage 1 starts with the cash-flow package only: last 2 years business tax returns, "
             "YTD P&L, and the last 6 months from the main operating bank account. I will ask for one clarification at a time after that."
         )
-    if kind == "entity_structure":
-        return (
-            "Next I need to understand the dealership structure: the main operating LLC, the main operating bank account, "
-            "any related LLCs, and how those accounts/entities work together."
-        )
-    if kind == "deal_profile":
-        return (
-            "I have files to review. Next, give me the rough requested amount, estimated credit score, and a detailed use of funds. "
-            "Break down what the money is for, such as debt payoff, working capital, inventory, taxes, repairs, acquisition, or cash-out reserves. "
-            "This is self-reported for now and will be validated during the intro call."
-        )
-    if kind == "real_estate_schedule":
-        return "Now add the real estate collateral schedule: full address, estimated amount owed, and estimated value. You can upload mortgage notes, but I still need estimated values."
-    if kind == "referral":
-        return "Before I run the final screen, tell us who referred you so we can credit the right person."
-    if kind == "run_review":
-        return (
-            "Run the preliminary screen when you are ready. I will classify likely program fit, available evidence, "
-            "missing documents, underwriter questions, and next steps from the current file."
-        )
-    if kind == "bankability_result":
-        status_label = (intake.result_snapshot or {}).get("bankability_assessment", {}).get("status")
-        return f"The preliminary screen is ready{f': {status_label}' if status_label else ''}. Review the summary and next steps below."
     if kind == "book_call":
         return "The preliminary screen is ready. Choose one of the available call times so Qualified Commercial can validate the file and next steps with you."
     if kind == "prequalification_result":
@@ -1556,13 +1752,18 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
         "asset_rows": _asset_rows(intake),
+        "dealer_details": _dealer_details(intake) or None,
+        "loan_program_fit": _loan_program_fit(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
             "stage": "stage_1_bankability",
             "allowed_document_categories": [
-                "last 2 years business tax returns",
+                "last 2 years business tax returns (or current-year extension filing if not yet filed)",
                 "current year/YTD P&L",
                 "last 6 months main operating bank statements",
+                "debt schedule",
+                "personal financial statement for each owner",
+                "identification for each owner",
                 "requested amount",
                 "detailed use of funds with amount breakdown",
                 "stated current monthly debt payments",
@@ -1571,9 +1772,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "do_not_request_other_document_categories": True,
             "stage_2_after_good_probability_only": [
                 "personal tax returns",
-                "personal financial statement",
                 "dealer license",
-                "debt schedule",
                 "mortgage statements",
                 "property tax/insurance",
                 "entity docs",
@@ -1808,9 +2007,12 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
             "collateral_type": "real estate collateral and business assets",
             "client_email": client.email,
             "stage_1_required_items": [
-                "last 2 years business tax returns",
+                "last 2 years business tax returns (or current-year extension filing if not yet filed)",
                 "current year/YTD P&L",
                 "last 6 months main operating bank statements",
+                "debt schedule",
+                "personal financial statement for each owner",
+                "identification for each owner",
                 "requested amount",
                 "detailed use of funds with amount breakdown",
                 "stated current monthly debt payments",
@@ -1948,7 +2150,7 @@ async def _load_public_intake(db: AsyncSession, token: str) -> PublicUnderwritin
             select(PublicUnderwritingIntake)
             .where(PublicUnderwritingIntake.token_hash == _hash_token(token))
             .options(
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
                 selectinload(PublicUnderwritingIntake.bucket_upload_link),
@@ -1970,7 +2172,7 @@ async def _load_client_intake(db: AsyncSession, user: CurrentUser, intake_id: UU
             select(PublicUnderwritingIntake)
             .where(PublicUnderwritingIntake.id == intake_id, PublicUnderwritingIntake.client_id == user.client.id)
             .options(
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
                 selectinload(PublicUnderwritingIntake.bucket_upload_link),
@@ -2092,6 +2294,26 @@ async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, w
     if not slots:
         decorated["disabled_reason"] = "No call times are available right now. Qualified Commercial will follow up directly."
     return decorated
+
+
+def _requested_document_read(doc: BucketRequestedDocument) -> BucketRequestedDocumentRead:
+    """Adds a signed download URL for an admin-uploaded blank-form template
+    (e.g. a fillable PFS), independent of requires_signature — this is a plain
+    "download the blank form" affordance, not part of the e-sign flow."""
+    data = BucketRequestedDocumentRead.model_validate(doc)
+    if doc.template_file_id and doc.template_file is not None:
+        bucket, _prefix, _kms = _bucket_storage_config()
+        filename = _safe_filename(doc.template_file.file_name)
+        data.template_download_url = _s3_client().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": doc.template_file.s3_key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=900,
+        )
+    return data
 
 
 def _artifact_download_url(artifact: PublicUnderwritingIntakeArtifact) -> str | None:
@@ -2412,9 +2634,12 @@ async def _collect_packet_financials(
     Returns raw facts; the PDF renderer handles charting and redaction so this stays a
     thin data-loader."""
     credit = await _credit_financials_section(db, intake)
+    # program_fit is a dealer-only signal — never computed/rendered for a
+    # real-estate lead's packet.
+    program_fit = _loan_program_fit(intake) if intake.variant != FUNDING_VARIANT else None
     active_ids = {file.id for file in _active_files(intake.bucket)}
     if not active_ids:
-        return {"bank_months": [], "tax_years": [], "credit": credit}
+        return {"bank_months": [], "tax_years": [], "credit": credit, "program_fit": program_fit}
     rows = (
         await db.execute(
             select(BucketFileAnalysis)
@@ -2445,6 +2670,7 @@ async def _collect_packet_financials(
         "bank_months": extract_bank_months(analyses),
         "tax_years": extract_tax_years(analyses),
         "credit": credit,
+        "program_fit": program_fit,
     }
 
 
@@ -2684,6 +2910,32 @@ def _prepend_credit_key_metric(summary: dict[str, Any], intake: PublicUnderwriti
         summary["key_metrics"] = [row]
 
 
+def _prepend_program_fit_key_metric(summary: dict[str, Any], intake: PublicUnderwritingIntake) -> None:
+    """Injects an "Eligible programs" row from the deterministic program-fit
+    screen — dealer-only, real data (not AI-guessed). No-op for real-estate
+    leads or when no program is eligible yet."""
+    if intake.variant == FUNDING_VARIANT:
+        return
+    fit = _loan_program_fit(intake)
+    if not fit:
+        return
+    labels = {
+        "sba": "SBA",
+        "real_estate_backed": "Real-estate-backed",
+        "reinsurance_backed": "Reinsurance-backed",
+        "jumbo_dscr": "Jumbo/DSCR",
+    }
+    eligible = [label for key, label in labels.items() if (fit.get(key) or {}).get("eligible")]
+    if not eligible:
+        return
+    row = {"label": "Eligible programs", "value": ", ".join(eligible), "note": "Deterministic screen — confirm with underwriter"}
+    metrics = summary.get("key_metrics")
+    if isinstance(metrics, list):
+        metrics.insert(0, row)
+    else:
+        summary["key_metrics"] = [row]
+
+
 async def _create_executive_summary_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
@@ -2691,6 +2943,7 @@ async def _create_executive_summary_artifact(
 ) -> PublicUnderwritingIntakeArtifact:
     summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
     _prepend_credit_key_metric(summary, intake)
+    _prepend_program_fit_key_metric(summary, intake)
     title = str(summary.get("title") or _summary_title(intake))[:240]
     body_text = _format_executive_summary_markdown(summary)
     if not body_text:
@@ -3015,9 +3268,6 @@ async def _response(
     session_token: str | None = None,
     assistant_message: str | None = None,
     messages: list[Any] | None = None,
-    forced_widget_type: str | None = None,
-    forced_widget_source: str = "user_intent",
-    forced_widget_reason: str | None = None,
     public_path: str = "/dealer-ai-underwriter",
     empty_message: str | None = None,
     include_management: bool = False,
@@ -3086,7 +3336,7 @@ async def _response(
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
-        requested_documents=[BucketRequestedDocumentRead.model_validate(doc) for doc in intake.bucket.requested_documents],
+        requested_documents=[_requested_document_read(doc) for doc in intake.bucket.requested_documents],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=summary,
         latest_review=review_read,
@@ -3855,7 +4105,7 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
             select(PublicUnderwritingIntake)
             .where(PublicUnderwritingIntake.id == intake_id)
             .options(
-                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
                 selectinload(PublicUnderwritingIntake.bucket_upload_link),
@@ -3931,6 +4181,10 @@ async def _execute_intake_review(
         intake.result_snapshot = fresh_review.result
         intake.status = "reviewed"
         intake.completed_at = _now()
+        # Program-fit reads key_metrics, which only just became available on
+        # the fresh review — recompute now that the real numbers exist.
+        if not is_funding:
+            _apply_loan_program_fit(intake)
     return fresh_review
 
 
@@ -4038,7 +4292,7 @@ async def list_dealer_ai_leads(
         .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
         .where(Bucket.archived_at.is_(None))
         .options(
-            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
@@ -4051,9 +4305,7 @@ async def list_dealer_ai_leads(
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
     if variant_filter and variant_filter != "all":
         if variant_filter == "dealer":
-            # Accept both the canonical and legacy dealer variant so the filter is
-            # correct before and after the 0090 normalization migration.
-            stmt = stmt.where(PublicUnderwritingIntake.variant.in_(DEALER_VARIANTS))
+            stmt = stmt.where(PublicUnderwritingIntake.variant == DEALER_VARIANT)
         elif variant_filter == "real_estate":
             stmt = stmt.where(PublicUnderwritingIntake.variant == FUNDING_VARIANT)
         else:
@@ -4135,7 +4387,7 @@ async def create_admin_ai_lead(
     if payload.variant not in ("dealer", "real_estate"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
     is_re = payload.variant == "real_estate"
-    variant_const = FUNDING_VARIANT if is_re else "dealer_gatekeeper_v1"
+    variant_const = FUNDING_VARIANT if is_re else DEALER_VARIANT
 
     # Duplicate policy: unless force_new, surface the existing active lead so the
     # operator opens it instead of creating a duplicate bucket for the same email.
@@ -4306,7 +4558,7 @@ async def create_admin_ai_lead_from_bucket(
     if payload.variant not in ("dealer", "real_estate"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
     is_re = payload.variant == "real_estate"
-    variant_const = FUNDING_VARIANT if is_re else "dealer_gatekeeper_v1"
+    variant_const = FUNDING_VARIANT if is_re else DEALER_VARIANT
 
     bucket = (
         await db.execute(
@@ -4536,6 +4788,31 @@ async def get_lead_credit_status(
         fico=credit_state.get("fico") if credit_state else None,
         pulled_at=datetime.fromisoformat(credit_state["pulled_at"]) if credit_state and credit_state.get("pulled_at") else None,
         expires_at=datetime.fromisoformat(credit_state["expires_at"]) if credit_state and credit_state.get("expires_at") else None,
+    )
+
+
+@admin_router.get("/{intake_id}/program-fit", response_model=LeadProgramFitResponse)
+async def get_lead_program_fit(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LeadProgramFitResponse:
+    """Admin-only read of the deterministic program-fit screen (SBA / real-
+    estate-backed / reinsurance-backed / jumbo-DSCR) — dealer leads only,
+    recomputed live from the current key_metrics/dealer_details rather than
+    relying on the possibly-stale intake_state snapshot, so the admin always
+    sees the latest figures without needing a chat turn or re-run first."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.variant == FUNDING_VARIANT:
+        return LeadProgramFitResponse(computed=False)
+    fit = _compute_loan_program_fit(intake)
+    return LeadProgramFitResponse(
+        computed=True,
+        sba=fit.get("sba"),
+        real_estate_backed=fit.get("real_estate_backed"),
+        reinsurance_backed=fit.get("reinsurance_backed"),
+        jumbo_dscr=fit.get("jumbo_dscr"),
     )
 
 
@@ -5476,6 +5753,11 @@ async def dealer_intake_chat(
         messages = chat_messages
         if chat_messages:
             assistant_message = chat_messages[-1].content
+            raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
+            proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
+            newly_accepted = _merge_dealer_details(intake, proposed_facts)
+            await _apply_dealer_detail_documents(db, intake, newly_accepted)
+    _apply_loan_program_fit(intake)
     await db.commit()
     intake = await _load_public_intake(db, token)
     return await _response(
@@ -5780,17 +6062,14 @@ def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding review not found")
 
 
-# Dealer variants: the canonical "dealer_gatekeeper_v1" plus the legacy
-# "dealer_financing_v1" default, so the guard is correct both before and after
-# the 0090 variant-normalization migration.
-DEALER_VARIANTS = {"dealer_gatekeeper_v1", "dealer_financing_v1"}
+DEALER_VARIANT = "dealer_gatekeeper_v1"
 
 
 def _require_dealer_intake(intake: PublicUnderwritingIntake) -> None:
     """Reject a non-dealer intake on the dealer public routes, so a real-estate
     token can never be driven through car-dealer logic. Mirrors
     _require_funding_intake; 404 (not 403) to match the funding convention."""
-    if intake.variant not in DEALER_VARIANTS:
+    if intake.variant != DEALER_VARIANT:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI intake not found")
 
 

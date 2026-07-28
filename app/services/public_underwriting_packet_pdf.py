@@ -196,6 +196,64 @@ def extract_bank_months(analyses: list[dict[str, Any]], limit: int = 6) -> list[
     return ordered[-limit:]
 
 
+def extract_debt_schedule(analyses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Sums total monthly debt service and outstanding balance from every
+    analyzed debt-schedule document — the real DSCR denominator, as opposed
+    to bank withdrawals (which include inventory/payroll/floorplan paydowns,
+    not just debt service). Returns None if no debt schedule was analyzed."""
+    total_monthly_debt_service = 0.0
+    total_outstanding_balance = 0.0
+    debts: list[dict[str, Any]] = []
+    found = False
+    for item in analyses:
+        if item.get("classification") != "debt_schedule":
+            continue
+        facts = item.get("key_facts") or {}
+        if not isinstance(facts, dict):
+            continue
+        found = True
+        monthly = _num(facts.get("total_monthly_debt_service"))
+        outstanding = _num(facts.get("total_outstanding_balance"))
+        if monthly is not None:
+            total_monthly_debt_service += monthly
+        if outstanding is not None:
+            total_outstanding_balance += outstanding
+        rows = facts.get("debts")
+        if isinstance(rows, list):
+            debts.extend(row for row in rows if isinstance(row, dict))
+    if not found:
+        return None
+    return {
+        "total_monthly_debt_service": round(total_monthly_debt_service, 2) if total_monthly_debt_service else None,
+        "total_outstanding_balance": round(total_outstanding_balance, 2) if total_outstanding_balance else None,
+        "debts": debts,
+    }
+
+
+def extract_personal_financial_statements(analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extracts liquid-assets/net-worth figures from every analyzed personal
+    financial statement (one per owner). Used for reinsurance-program
+    liquidity eligibility — never averaged/summed across owners here, since
+    each PFS belongs to a distinct individual."""
+    statements: list[dict[str, Any]] = []
+    for item in analyses:
+        if item.get("classification") != "personal_financial_statement":
+            continue
+        facts = item.get("key_facts") or {}
+        if not isinstance(facts, dict):
+            continue
+        statements.append(
+            {
+                "statement_date": facts.get("statement_date"),
+                "total_assets": _num(facts.get("total_assets")),
+                "total_liabilities": _num(facts.get("total_liabilities")),
+                "net_worth": _num(facts.get("net_worth")),
+                "liquid_assets": _num(facts.get("liquid_assets")),
+            }
+        )
+    return statements
+
+
 _TAX_KEYS = (
     "gross_receipts", "gross_income", "total_income", "net_income", "taxable_income",
     "ordinary_business_income", "total_revenue", "cost_of_goods_sold", "depreciation",
@@ -676,6 +734,57 @@ def _credit_section(credit: dict[str, Any] | None) -> str:
     )
 
 
+def _program_fit_section(program_fit: dict[str, Any] | None) -> str:
+    """Renders the deterministic program-fit signal (SBA / real-estate-backed /
+    reinsurance-backed / jumbo-DSCR) for the admin/underwriter reading this
+    packet — dealer-only, computed by _compute_loan_program_fit. Omitted
+    entirely when program_fit is None (real-estate leads, or a dealer lead
+    with no computation yet)."""
+    if not isinstance(program_fit, dict) or not program_fit:
+        return ""
+
+    def _row(label: str, eligible: bool, detail: str) -> str:
+        status = "Eligible" if eligible else "Not yet eligible"
+        return f'<tr><td class="rowhead">{escape(label)}</td><td><strong>{escape(status)}</strong></td><td>{detail}</td></tr>'
+
+    sba = program_fit.get("sba") or {}
+    re_backed = program_fit.get("real_estate_backed") or {}
+    reinsurance = program_fit.get("reinsurance_backed") or {}
+    jumbo = program_fit.get("jumbo_dscr") or {}
+
+    reinsurance_detail_parts = []
+    if reinsurance.get("rate_percent") is not None:
+        reinsurance_detail_parts.append(f"Indicative rate {reinsurance['rate_percent']}%")
+    elif reinsurance.get("custom_priced_5mm_plus"):
+        reinsurance_detail_parts.append("Custom-priced (≥$5MM)")
+    if reinsurance.get("doc_tier"):
+        reinsurance_detail_parts.append(f"Docs: {reinsurance['doc_tier'].replace('_', ' ')}")
+    if reinsurance.get("maturity_years"):
+        reinsurance_detail_parts.append(f"{reinsurance['maturity_years']}-yr maturity")
+    reinsurance_detail = escape("; ".join(reinsurance_detail_parts)) if reinsurance_detail_parts else "—"
+
+    jumbo_detail_parts = []
+    if jumbo.get("revenue") is not None:
+        jumbo_detail_parts.append(f"Revenue ${jumbo['revenue']:,.0f}")
+    if jumbo.get("dscr") is not None:
+        jumbo_detail_parts.append(f"DSCR {jumbo['dscr']:.2f}")
+    jumbo_detail = escape("; ".join(jumbo_detail_parts)) if jumbo_detail_parts else "—"
+
+    rows = (
+        _row("SBA (default path)", bool(sba.get("eligible")), "Complete enriched baseline")
+        + _row("Real-estate-backed", bool(re_backed.get("eligible")), escape(str(re_backed.get("note") or "—")))
+        + _row("Reinsurance-backed", bool(reinsurance.get("eligible")), reinsurance_detail)
+        + _row("Jumbo / DSCR", bool(jumbo.get("eligible")), jumbo_detail)
+    )
+    return (
+        '<section class="card wide"><h2>Program fit — deterministic screen</h2>'
+        '<table class="grid-table"><thead><tr><th>Program</th><th>Status</th><th>Detail</th></tr></thead>'
+        f"<tbody>{rows}</tbody></table>"
+        '<p class="note">Computed from uploaded evidence and stated facts — not a lending decision. Confirm with an underwriter before quoting.</p>'
+        "</section>"
+    )
+
+
 def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
     body = "".join(
         "<tr>"
@@ -791,6 +900,7 @@ def render_underwriting_packet_pdf(
     bank_months = financials.get("bank_months") or []
     tax_years = financials.get("tax_years") or []
     credit = financials.get("credit")
+    loan_program_fit = financials.get("program_fit")
 
     variant = str(getattr(intake, "variant", "") or "")
     is_real_estate = variant.startswith("real_estate")
@@ -1011,6 +1121,7 @@ def render_underwriting_packet_pdf(
   {narrative_cards}
 
   {_credit_section(credit)}
+  {_program_fit_section(loan_program_fit)}
   {_bank_section(bank_months)}
   {_tax_section(tax_years)}
 

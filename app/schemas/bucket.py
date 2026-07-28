@@ -51,6 +51,7 @@ class BucketRequestedDocumentRead(ORMModel):
     signature_kind: str | None
     template_file_id: UUID | None
     signature_document_text: str | None
+    template_download_url: str | None = None
 
 
 class BucketCreate(BaseModel):

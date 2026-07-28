@@ -193,7 +193,7 @@ Rules:
 - Ask one high-value question at a time unless the user asks for a list.
 - When the user asks to upload files or enter collateral details, answer directly in chat. Do not reference widgets, tools, sidebars, or navigation.
 - Keep answers concise and operational, normally 2-5 short sentences.
-- proposed_borrower_facts is ONLY used for real-estate/DSCR borrower chats (see the real-estate rules below when they apply); leave it null otherwise or when the borrower has not stated a new fact this turn."""
+- proposed_borrower_facts lets you record a structured fact the borrower just stated; its exact field shape is product-specific and defined in the rules below for the active product. Leave it null when the borrower has not stated a new fact this turn, or when the active product's rules below don't define any fields for it."""
 
 # Car-dealer-only chat rules. Never combined with the real-estate rules below.
 DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD P&L, last 6 months main operating bank statements, requested amount, detailed use of funds with amount breakdown, stated current monthly debt payments, and estimated credit tier/score. Ask for one missing Stage 1 item at a time.
@@ -204,7 +204,10 @@ DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD
 - Write the answer like a human senior banking underwriter who understands used-car dealerships, real-estate-backed commercial lending, floorplan lines, MCA exposure, dealer cash flow, related LLCs, and operating account analysis.
 - Use strict underwriting language: "I can preliminarily screen this", "this is incomplete", "this supports the file", "this creates a lender question", or "I cannot determine yet" when evidence is missing.
 - Use short sections and bullets when summarizing files: "What I see", "What it means", and "Next step". Keep the next step to one client action.
-- If related LLCs/accounts need clarification, ask only the first step first: primary operating LLC and main operating bank account. After the client answers, then ask how the related LLCs move money with the dealership."""
+- If related LLCs/accounts need clarification, ask only the first step first: primary operating LLC and main operating bank account. After the client answers, then ask how the related LLCs move money with the dealership.
+- Fold these into the normal pacing, one at a time, only when not already known (check context.dealer_details first — never re-ask a fact already present there): (1) who the owner(s) are, by name; (2) whether the current-year business tax return has been filed yet; (3) whether the dealership or its owner holds a reinsurance account, and if so, what trading platform the assets sit on.
+- When the borrower states one of these in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (never repeat previously-known facts): {"owners": [{"name": "string", "ownership_percent": number}], "current_year_tax_filed": true|false, "reinsurance_account_present": true|false, "reinsurance_trading_platform": "short string"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state.
+- Never tell the borrower which loan program (SBA, real-estate-backed, reinsurance-backed, jumbo, or any other name) they qualify for, and never state or imply a rate, advance rate, or pricing figure — that determination and any pricing conversation happens only with a Qualified Commercial underwriter, not in this chat."""
 
 # Real-estate/DSCR-only chat rules. Never combined with the dealer rules above.
 RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focus on rent, PITIA, DSCR, LTV, property value, payoff/purchase evidence, cash-to-close, entity/vesting, property condition, occupancy, and estimated credit tier.
@@ -251,7 +254,7 @@ FILE_ANALYSIS_PREAMBLE = """You are a senior commercial lending underwriter clas
 
 Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
 {
-  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|other|unreadable",
+  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|debt_schedule|personal_financial_statement|other|unreadable",
   "confidence": "high|medium|low",
   "summary": "1-3 sentence plain-English summary of what this document is and what it proves for underwriting",
   "supports": ["short phrases naming what this file supports"],
@@ -263,7 +266,11 @@ Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
 
 Analyze only the single document provided. Do not speculate about other files. Keep summary under 320 characters and each list <= 6 items.
 
-If this document is a BANK STATEMENT (or contains multiple statement periods), populate key_facts with the exact fields needed to judge deposit consistency: bank, account_holder, account_last4, statement_period (e.g. "2026-01-01 to 2026-01-31"), beginning_balance, ending_balance, total_deposits_and_credits, total_withdrawals_and_debits, number_of_deposits, number_of_checks, average_ledger_balance, low_daily_balance, nsf_or_overdraft_count, returned_check_count, and negative_balance_dates. If the file covers MORE THAN ONE month, add a "months" array with one object per month carrying these same fields, so month-over-month deposit consistency can be confirmed. Read every page/month; never summarize only the first month."""
+If this document is a BANK STATEMENT (or contains multiple statement periods), populate key_facts with the exact fields needed to judge deposit consistency: bank, account_holder, account_last4, statement_period (e.g. "2026-01-01 to 2026-01-31"), beginning_balance, ending_balance, total_deposits_and_credits, total_withdrawals_and_debits, number_of_deposits, number_of_checks, average_ledger_balance, low_daily_balance, nsf_or_overdraft_count, returned_check_count, and negative_balance_dates. If the file covers MORE THAN ONE month, add a "months" array with one object per month carrying these same fields, so month-over-month deposit consistency can be confirmed. Read every page/month; never summarize only the first month.
+
+If this document is a DEBT SCHEDULE (a listing of outstanding business debts), populate key_facts with a "debts" array, one object per debt line: lender, original_amount, current_balance, monthly_payment, and maturity_date when shown. Also populate total_monthly_debt_service (the sum of every monthly_payment on the schedule) and total_outstanding_balance as top-level key_facts numbers — never estimate these from anywhere else, only sum what the document actually lists.
+
+If this document is a PERSONAL FINANCIAL STATEMENT (a PFS listing an individual's assets, liabilities, and net worth), populate key_facts with: statement_date, total_assets, total_liabilities, net_worth, and liquid_assets (cash, checking/savings, marketable securities — exclude real estate, retirement accounts, and business equity, which are not liquid). Use null for any figure not shown on the statement."""
 
 DEALER_FILE_ANALYSIS_HINT = """This document belongs to a car-dealer financing file. Read it as bank-statement / tax-return / P&L / floorplan / MCA / real-estate-collateral evidence where applicable. Do not ask DSCR/rent questions."""
 
@@ -647,6 +654,9 @@ _CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
     "floorplan": {"floorplan_mca_inventory"},
     "mca": {"floorplan_mca_inventory"},
     "inventory": {"floorplan_mca_inventory"},
+    "debt schedule": {"debt_schedule"},
+    "personal financial statement": {"personal_financial_statement"},
+    "pfs": {"personal_financial_statement"},
 }
 
 
@@ -738,6 +748,7 @@ def _compute_key_metrics_from_cache(
     never overwritten. Reuses the same extractors the lender packet uses."""
     from app.services.public_underwriting_packet_pdf import (
         extract_bank_months,
+        extract_debt_schedule,
         extract_tax_years,
     )
 
@@ -752,6 +763,7 @@ def _compute_key_metrics_from_cache(
     ]
     months = extract_bank_months(normalized)
     years = extract_tax_years(normalized)
+    debt_schedule = extract_debt_schedule(normalized)
 
     km = result.get("key_metrics")
     if not isinstance(km, dict):
@@ -786,11 +798,17 @@ def _compute_key_metrics_from_cache(
     # withdrawals (that is only the net change in the bank balance).
     if _blank("estimated_ebitda_or_cash_flow") and tax_net_income is not None:
         km["estimated_ebitda_or_cash_flow"] = round(tax_net_income)
-    # NOTE: estimated_debt_burden and estimated_dscr are intentionally NOT derived
-    # from bank withdrawals — total operating outflow (inventory, payroll, floorplan
-    # paydowns) is not debt service, so a withdrawals-based DSCR would badly mislead
-    # an underwriter. These stay null unless the AI extracts them from a real debt
-    # schedule / stated monthly debt, which surfaces a "needs debt schedule" hint.
+    # estimated_debt_burden and estimated_dscr are intentionally NOT derived from
+    # bank withdrawals — total operating outflow (inventory, payroll, floorplan
+    # paydowns) is not debt service, so a withdrawals-based DSCR would badly
+    # mislead an underwriter. Only a real debt schedule (summed monthly payments)
+    # is treated as the debt-service denominator.
+    if debt_schedule and debt_schedule.get("total_monthly_debt_service") is not None:
+        annual_debt_service = debt_schedule["total_monthly_debt_service"] * 12
+        if _blank("estimated_debt_burden"):
+            km["estimated_debt_burden"] = round(annual_debt_service)
+        if _blank("estimated_dscr") and annual_debt_service and tax_net_income is not None:
+            km["estimated_dscr"] = round(tax_net_income / annual_debt_service, 2)
     if _blank("revenue_trend") and tax_latest and tax_prior:
         a = tax_prior.get("gross_receipts")
         b = tax_latest.get("gross_receipts")
@@ -801,6 +819,13 @@ def _compute_key_metrics_from_cache(
         km["tax_return_revenue_vs_bank_deposits"] = (
             f"Tax gross receipts ${tax_revenue:,.0f} vs annualized gross deposits ${annualized_deposits:,.0f}"
         )
+
+    from app.services.public_underwriting_packet_pdf import extract_personal_financial_statements
+
+    pfs_rows = extract_personal_financial_statements(normalized)
+    liquid_vals = [row["liquid_assets"] for row in pfs_rows if row.get("liquid_assets") is not None]
+    if _blank("pfs_total_liquid_assets") and liquid_vals:
+        km["pfs_total_liquid_assets"] = round(sum(liquid_vals), 2)
 
     result["key_metrics"] = km
 
