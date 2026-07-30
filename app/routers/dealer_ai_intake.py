@@ -451,6 +451,45 @@ class DealerDocumentSignRequest(BaseModel):
     applicant_zip: str | None = Field(default=None, max_length=10)
 
 
+class DealerPfsAssetRow(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    amount: float = Field(ge=0)
+
+
+class DealerPfsLiabilityRow(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    amount: float = Field(ge=0)
+
+
+class DealerPfsSubmission(BaseModel):
+    """On-screen Personal Financial Statement submission — the fallback when a
+    borrower doesn't have or doesn't understand a real PFS to upload. No SSN
+    field: not needed for the AI's net-worth/liquidity math, and a hard credit
+    pull (if ever needed) goes through the separate credit-authorization
+    e-sign flow, which also never collects SSN."""
+
+    owner_full_name: str = Field(min_length=1, max_length=180)
+    statement_date: str = Field(min_length=1, max_length=32)
+    assets: list[DealerPfsAssetRow] = Field(min_length=1, max_length=8)
+    liabilities: list[DealerPfsLiabilityRow] = Field(min_length=0, max_length=6)
+    acknowledgment: bool
+
+
+class DealerDebtScheduleRow(BaseModel):
+    lender: str = Field(min_length=1, max_length=180)
+    balance: float = Field(ge=0)
+    monthly_payment: float = Field(ge=0)
+
+
+class DealerDebtScheduleSubmission(BaseModel):
+    """On-screen Debt Schedule submission — same fallback rationale as
+    DealerPfsSubmission above."""
+
+    business_name: str = Field(min_length=1, max_length=180)
+    debts: list[DealerDebtScheduleRow] = Field(min_length=1, max_length=30)
+    acknowledgment: bool
+
+
 class DealerBookCallRequest(BaseModel):
     starts_at: datetime
 
@@ -1088,6 +1127,49 @@ def _uploaded_doc_ids(bucket: Bucket) -> set[UUID]:
 def _missing_required_docs(bucket: Bucket) -> list[BucketRequestedDocument]:
     uploaded = _uploaded_doc_ids(bucket)
     return [doc for doc in bucket.requested_documents if doc.required and doc.id not in uploaded]
+
+
+# Which of the frontend's 8 fixed PFS asset-row labels count toward
+# liquid_assets (cash/savings/marketable securities only, per
+# FILE_ANALYSIS_PREAMBLE's own definition — excludes retirement, real estate,
+# vehicles, business equity, other). Must stay in sync with the matching
+# PFS_ASSET_LABELS liquid flags in qcdesktop's DraftFinancialFormModal.tsx.
+_PFS_LIQUID_LABELS = frozenset({
+    "Cash on hand and in banks",
+    "Savings accounts",
+    "Stocks and bonds / other marketable securities",
+})
+
+
+def _pfs_key_facts(payload: DealerPfsSubmission) -> dict[str, Any]:
+    total_assets = sum(row.amount for row in payload.assets)
+    total_liabilities = sum(row.amount for row in payload.liabilities)
+    liquid_assets = sum(row.amount for row in payload.assets if row.label in _PFS_LIQUID_LABELS)
+    return {
+        "statement_date": payload.statement_date,
+        "total_assets": total_assets,
+        "total_liabilities": total_liabilities,
+        "net_worth": total_assets - total_liabilities,
+        "liquid_assets": liquid_assets,
+    }
+
+
+def _debt_schedule_key_facts(payload: DealerDebtScheduleSubmission) -> dict[str, Any]:
+    debts = [
+        {
+            "lender": row.lender,
+            "original_amount": None,
+            "current_balance": row.balance,
+            "monthly_payment": row.monthly_payment,
+            "maturity_date": None,
+        }
+        for row in payload.debts
+    ]
+    return {
+        "debts": debts,
+        "total_monthly_debt_service": sum(row.monthly_payment for row in payload.debts),
+        "total_outstanding_balance": sum(row.balance for row in payload.debts),
+    }
 
 
 async def _ensure_requested_document(
@@ -3792,6 +3874,168 @@ async def _sign_requested_document(
     return result_file
 
 
+async def _store_drafted_form_pdf(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    req: BucketRequestedDocument,
+    pdf_bytes: bytes,
+    request: Request,
+    *,
+    file_label: str,
+    classification: str,
+    key_facts: dict[str, Any],
+    actor_name: str,
+    actor_email: str,
+) -> BucketFile:
+    """Store an on-screen-drafted PFS/debt-schedule PDF exactly like a real
+    upload: a normal BucketFile linked via requested_document_id (which alone
+    satisfies the checklist), SSE-KMS encrypted like every other bucket file.
+
+    The BucketFileAnalysis row is written directly from the trusted structured
+    input the borrower just typed — bypassing analyze_bucket_file/Bedrock
+    entirely, since there is nothing for the AI to re-derive from a picture of
+    numbers we ourselves just wrote into the PDF. This makes the drafted
+    form's key_facts available to _compute_key_metrics_from_cache /
+    extract_debt_schedule / extract_personal_financial_statements identically
+    to a real AI-analyzed upload — those readers only look at `classification`
+    and `key_facts`, never at provenance."""
+    _, prefix, _ = _bucket_storage_config()
+    file_id = uuid4()
+    s3_key = f"{prefix}/drafted-forms/{intake.bucket_id}/{file_id}.pdf"
+    _put_bucket_object(s3_key, "application/pdf", pdf_bytes)
+    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    result_file = BucketFile(
+        id=file_id,
+        bucket_id=intake.bucket_id,
+        requested_document_id=req.id,
+        upload_link_id=intake.bucket_upload_link_id,
+        file_name=f"{file_label}.pdf"[:255],
+        s3_key=s3_key,
+        content_type="application/pdf",
+        size_bytes=len(pdf_bytes),
+        uploaded_by_name=actor_name,
+        uploaded_by_email=actor_email,
+        status="uploaded",
+    )
+    db.add(result_file)
+    req.status = "uploaded"
+    await db.flush()
+
+    db.add(
+        BucketFileAnalysis(
+            bucket_file_id=result_file.id,
+            bucket_id=intake.bucket_id,
+            content_hash=content_hash,
+            analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
+            provider="drafted_form",
+            status="completed",
+            classification=classification,
+            confidence="high",
+            summary=f"{file_label} submitted via the on-screen drafting form.",
+            analysis={"key_facts": key_facts},
+            analyzed_at=_now(),
+        )
+    )
+
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_drafted_form_submitted",
+        request=request,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        actor_role="public_lead",
+        target_type="requested_document",
+        target_id=str(req.id),
+        detail=file_label,
+    )
+    await db.commit()
+    await db.refresh(result_file)
+    return result_file
+
+
+async def _submit_pfs_form(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    payload: DealerPfsSubmission,
+    request: Request,
+    *,
+    actor_name: str,
+    actor_email: str,
+) -> BucketFile:
+    if not payload.acknowledgment:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
+    req = next((doc for doc in intake.bucket.requested_documents if doc.category == "Personal Financials"), None)
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Personal financial statement is not requested on this intake")
+
+    from app.services.dealer_forms_pdf import render_pfs_pdf
+
+    key_facts = _pfs_key_facts(payload)
+    pdf_bytes = render_pfs_pdf(
+        owner_full_name=payload.owner_full_name,
+        statement_date=payload.statement_date,
+        assets=[(row.label, row.amount) for row in payload.assets],
+        liabilities=[(row.label, row.amount) for row in payload.liabilities],
+        total_assets=key_facts["total_assets"],
+        total_liabilities=key_facts["total_liabilities"],
+        net_worth=key_facts["net_worth"],
+    )
+    return await _store_drafted_form_pdf(
+        db,
+        intake,
+        req,
+        pdf_bytes,
+        request,
+        file_label=f"Personal Financial Statement — {payload.owner_full_name}",
+        classification="personal_financial_statement",
+        key_facts=key_facts,
+        actor_name=actor_name,
+        actor_email=actor_email,
+    )
+
+
+async def _submit_debt_schedule_form(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    payload: DealerDebtScheduleSubmission,
+    request: Request,
+    *,
+    actor_name: str,
+    actor_email: str,
+) -> BucketFile:
+    if not payload.acknowledgment:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
+    req = next((doc for doc in intake.bucket.requested_documents if doc.category == "Debts"), None)
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt schedule is not requested on this intake")
+    if req.status == "uploaded":
+        raise HTTPException(status.HTTP_409_CONFLICT, "A debt schedule has already been submitted for this file")
+
+    from app.services.dealer_forms_pdf import render_debt_schedule_pdf
+
+    key_facts = _debt_schedule_key_facts(payload)
+    pdf_bytes = render_debt_schedule_pdf(
+        business_name=payload.business_name,
+        debts=[(row.lender, row.balance, row.monthly_payment) for row in payload.debts],
+        total_balance=key_facts["total_outstanding_balance"],
+        total_monthly=key_facts["total_monthly_debt_service"],
+    )
+    return await _store_drafted_form_pdf(
+        db,
+        intake,
+        req,
+        pdf_bytes,
+        request,
+        file_label="Business Debt Schedule",
+        classification="debt_schedule",
+        key_facts=key_facts,
+        actor_name=actor_name,
+        actor_email=actor_email,
+    )
+
+
 @router.post("/start", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
 async def start_dealer_intake(
     payload: DealerIntakeStart,
@@ -5805,6 +6049,30 @@ async def dealer_sign_requested_document(
     return await _sign_requested_document(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
 
 
+@router.post("/{token}/requested-documents/pfs", response_model=BucketFileRead)
+async def dealer_submit_pfs(
+    token: str,
+    payload: DealerPfsSubmission,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
+    return await _submit_pfs_form(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@router.post("/{token}/requested-documents/debt-schedule", response_model=BucketFileRead)
+async def dealer_submit_debt_schedule(
+    token: str,
+    payload: DealerDebtScheduleSubmission,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_dealer_intake(intake)
+    return await _submit_debt_schedule_form(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
 @router.post("/{token}/run-review", response_model=DealerIntakeResponse)
 async def run_dealer_review(
     token: str,
@@ -6041,6 +6309,30 @@ async def my_dealer_upload_complete(
 ) -> BucketFile:
     intake = await _load_client_intake(db, user, intake_id)
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
+
+
+@client_router.post("/{intake_id}/requested-documents/pfs", response_model=BucketFileRead)
+async def my_dealer_submit_pfs(
+    intake_id: UUID,
+    payload: DealerPfsSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_client_intake(db, user, intake_id)
+    return await _submit_pfs_form(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
+
+
+@client_router.post("/{intake_id}/requested-documents/debt-schedule", response_model=BucketFileRead)
+async def my_dealer_submit_debt_schedule(
+    intake_id: UUID,
+    payload: DealerDebtScheduleSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_client_intake(db, user, intake_id)
+    return await _submit_debt_schedule_form(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
 
 
 FUNDING_PUBLIC_PATH = "/funding-review"
