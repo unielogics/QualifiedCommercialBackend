@@ -17,6 +17,9 @@ class Role(StrEnum):
     CLIENT = "client"
     LENDER = "lender"
     VENDOR = "vendor"
+    # External loan-referral partner, scoped to the dealer AI-intake tool only —
+    # no book-of-business (/loans, /clients, /reports) like Role.BROKER has.
+    DEALER_PARTNER = "dealer_partner"
 
 
 class PropertyType(StrEnum):

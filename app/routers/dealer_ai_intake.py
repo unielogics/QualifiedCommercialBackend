@@ -51,6 +51,7 @@ from app.schemas.bucket import (
     BucketAIReviewRead,
     BucketFileRead,
     BucketFileUploadInitResponse,
+    BucketNoteRead,
     BucketRequestUploadedFileRead,
     BucketRequestedDocumentRead,
 )
@@ -69,6 +70,7 @@ router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
 admin_router = APIRouter(prefix="/admin/ai-underwriter-leads", tags=["admin-ai-underwriter-leads"])
+broker_router = APIRouter(prefix="/broker/ai-underwriter-leads", tags=["broker-ai-underwriter-leads"])
 log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
@@ -278,6 +280,33 @@ class AdminLeadCreate(BaseModel):
     @classmethod
     def empty_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+
+class BrokerLeadCreate(BaseModel):
+    """Dealer partner (Role.DEALER_PARTNER) creates an AI-underwriter lead on
+    behalf of their own client. Dealer-variant only — no variant selector, no
+    real-estate fields. The client can later log in with this email exactly
+    like a self-serve lead."""
+
+    full_name: str = Field(min_length=1, max_length=180)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=48)
+    business_name: str | None = Field(default=None, max_length=180)
+    notify_client: bool = False
+    force_new: bool = False
+
+    @field_validator("phone", "business_name", mode="before")
+    @classmethod
+    def empty_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class OutcomeStatusUpdate(BaseModel):
+    outcome_status: Literal["submitted", "closed", "denied"]
+
+
+class DealerLeadNoteCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
 
 
 class AdminLeadFromBucketCreate(BaseModel):
@@ -633,6 +662,10 @@ class DealerIntakeResponse(BaseModel):
     messages: list[BucketAIMessageRead] = []
     artifacts: list[PublicUnderwritingArtifactRead] = []
     email_sends: list[PublicUnderwritingEmailSendRead] = []
+    # Internal admin <-> dealer-partner notes thread. Populated only for the
+    # admin_thread=True audience (admin cockpit + broker portal) — never sent
+    # to the public/uploader client-facing response.
+    notes: list[BucketNoteRead] = []
 
 
 class DealerAILeadRow(BaseModel):
@@ -646,6 +679,7 @@ class DealerAILeadRow(BaseModel):
     phone: str | None = None
     business_name: str | None = None
     status: str
+    outcome_status: str = "submitted"
     probability_status: str | None = None
     confidence: str | None = None
     one_next_step: str | None = None
@@ -3400,6 +3434,15 @@ async def _response(
     # funding caller gets empty lists.
     artifacts = await _management_artifacts(db, intake.id) if include_management else []
     email_sends = await _management_email_sends(db, intake.id) if include_management else []
+    # Internal notes thread — admin/dealer-partner only, never the client.
+    notes = (
+        sorted(
+            (n for n in intake.bucket.notes if n.visibility == "admin"),
+            key=lambda n: n.created_at,
+        )
+        if admin_thread
+        else []
+    )
     intake_read = DealerIntakeRead.model_validate(intake)
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
@@ -3425,6 +3468,7 @@ async def _response(
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
         artifacts=[_artifact_read(artifact) for artifact in artifacts],
         email_sends=[_email_send_read(row) for row in email_sends],
+        notes=[BucketNoteRead.model_validate(n) for n in notes],
     )
 
 
@@ -4327,6 +4371,7 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         phone=intake.phone,
         business_name=intake.business_name,
         status=intake.status,
+        outcome_status=intake.outcome_status,
         probability_status=str(result.get("probability_status") or "") or None,
         confidence=str(result.get("confidence") or "") or None,
         one_next_step=str(result.get("one_next_step") or "") or None,
@@ -4348,6 +4393,39 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
         await db.execute(
             select(PublicUnderwritingIntake)
             .where(PublicUnderwritingIntake.id == intake_id)
+            .options(
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+                selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+                selectinload(PublicUnderwritingIntake.bucket_upload_link),
+                selectinload(PublicUnderwritingIntake.latest_review),
+                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+            )
+        )
+    ).scalar_one_or_none()
+    if intake is None or intake.bucket.archived_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI lead not found")
+    return intake
+
+
+def _require_dealer_partner(user: CurrentUser) -> None:
+    if user.role != Role.DEALER_PARTNER:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
+
+
+async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID) -> PublicUnderwritingIntake:
+    """Same eager-load shape as _load_admin_dealer_lead, scoped to broker_id ==
+    user.id so a partner can never reach another partner's (or the house's)
+    lead by guessing an id. 404 (not 403) on ownership mismatch — matches this
+    codebase's existing convention of not revealing whether an id exists to a
+    caller who doesn't own it."""
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(
+                PublicUnderwritingIntake.id == intake_id,
+                PublicUnderwritingIntake.broker_id == user.id,
+            )
             .options(
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
@@ -4615,6 +4693,69 @@ async def get_dealer_ai_lead(
     return await _response(db, intake, token=None, include_management=True, admin_thread=True)
 
 
+@admin_router.get("/{intake_id}/notes", response_model=list[BucketNoteRead])
+async def list_admin_lead_notes(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketNote]:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+
+
+@admin_router.post("/{intake_id}/notes", response_model=BucketNoteRead, status_code=status.HTTP_201_CREATED)
+async def create_admin_lead_note(
+    intake_id: UUID,
+    payload: DealerLeadNoteCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketNote:
+    """Internal note on the shared admin <-> dealer-partner thread for this
+    lead. visibility="admin" keeps it invisible to the client and to any
+    bucket vendor/share viewer — confirmed no other surface reads visibility
+    == "admin" notes."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    note = BucketNote(
+        bucket_id=intake.bucket_id,
+        author_name=user.name,
+        author_role=user.role,
+        visibility="admin",
+        content=payload.content,
+    )
+    db.add(note)
+    await db.flush()
+    await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
+    await db.commit()
+    await db.refresh(note)
+    return note
+
+
+@admin_router.patch("/{intake_id}/outcome-status", response_model=DealerIntakeResponse)
+async def update_lead_outcome_status(
+    intake_id: UUID,
+    payload: OutcomeStatusUpdate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin-only: sets the firm's loan decision on this lead (submitted /
+    closed / denied). No broker-accessible write path exists to this field —
+    the loan outcome is the firm's call, not the referring partner's."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    intake.outcome_status = payload.outcome_status
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_outcome_status_changed", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.outcome_status,
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
 @admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
 async def create_admin_ai_lead(
     payload: AdminLeadCreate,
@@ -4779,6 +4920,346 @@ async def create_admin_ai_lead(
             "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
             + email_note
         ),
+    )
+
+
+# ── Dealer-partner (broker) endpoints ───────────────────────────────────
+# Curated subset for Role.DEALER_PARTNER: create/view/chat/upload/run-review
+# on their OWN leads only (broker_id == user.id). No credit-pull, program-fit,
+# vendor-email, exports, client-thread, or drive-ingest routes exist here —
+# those stay admin-only by design (see plan doc for the full rationale).
+
+
+@broker_router.get("", response_model=DealerAILeadListResponse)
+async def list_broker_dealer_leads(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str | None = None,
+    status_filter: str | None = None,
+    probability_status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> DealerAILeadListResponse:
+    _require_dealer_partner(user)
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    stmt = (
+        select(PublicUnderwritingIntake)
+        .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+        .where(Bucket.archived_at.is_(None), PublicUnderwritingIntake.broker_id == user.id)
+        .options(
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
+            selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
+            selectinload(PublicUnderwritingIntake.bucket_upload_link),
+            selectinload(PublicUnderwritingIntake.latest_review),
+            with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+        )
+        .order_by(PublicUnderwritingIntake.updated_at.desc())
+    )
+    if status_filter and status_filter != "all":
+        stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+    if q:
+        needle = f"%{q.strip().lower()}%"
+        stmt = stmt.where(
+            func.lower(PublicUnderwritingIntake.full_name).like(needle)
+            | func.lower(PublicUnderwritingIntake.email).like(needle)
+            | func.lower(PublicUnderwritingIntake.business_name).like(needle)
+        )
+    rows = list((await db.execute(stmt)).scalars().unique().all())
+    if probability_status and probability_status != "all":
+        rows = [row for row in rows if str(_lead_result(row).get("probability_status") or "") == probability_status]
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    return DealerAILeadListResponse(items=[_lead_row(row) for row in page], total=total, limit=limit, offset=offset)
+
+
+@broker_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def create_broker_ai_lead(
+    payload: BrokerLeadCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Dealer partner creates an AI-underwriter lead ON BEHALF of their own
+    client. Dealer-variant only. Reuses the same creation helpers as the
+    public /start and admin-create flows. No terms/throttle."""
+    _require_dealer_partner(user)
+
+    if not payload.force_new:
+        existing = await _latest_active_intake_by_email(db, str(payload.email), variant=DEALER_VARIANT)
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"message": "An active lead already exists for this email.", "intake_id": str(existing.id)},
+            )
+
+    provenance = {
+        "created_by_broker": {
+            "user_id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "at": _now().isoformat(),
+        },
+        "on_behalf_of_client": True,
+    }
+
+    adapter = DealerIntakeStart(
+        full_name=payload.full_name,
+        email=payload.email,
+        phone=payload.phone,
+        business_name=payload.business_name,
+    )
+    client = await _find_or_create_client(db, adapter)
+    bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
+
+    if isinstance(client.lead_intake, dict):
+        client.lead_intake = {**client.lead_intake, "created_by_broker": str(user.id)}
+
+    token = _new_public_token()
+    intake_state: dict[str, Any] = {
+        "messages": [],
+        "source": "dealer_ai_intake",
+        "broker_provenance": provenance,
+    }
+
+    intake = PublicUnderwritingIntake(
+        client_id=client.id,
+        bucket_id=bucket.id,
+        bucket_upload_link_id=link.id,
+        broker_id=user.id,
+        token_hash=_hash_token(token),
+        variant=DEALER_VARIANT,
+        full_name=payload.full_name.strip(),
+        email=client.email or _normalize_email(str(payload.email)),
+        phone=payload.phone,
+        business_name=payload.business_name,
+        asset_rows=[],
+        intake_state=intake_state,
+    )
+    db.add(intake)
+    await _log(
+        db,
+        bucket.id,
+        "dealer_ai_lead_created_by_broker",
+        request=request,
+        user=user,
+        actor_role="dealer_partner",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Broker {user.email} created dealer lead for {intake.email}",
+    )
+    await db.commit()
+    intake = await _load_broker_dealer_lead(db, user, intake.id)
+
+    email_note = ""
+    if payload.notify_client:
+        record = await _record_resume_email(
+            intake, token=token, request=request, reason="broker_created", db=db, sender_user_id=user.id,
+        )
+        await db.commit()
+        intake = await _load_broker_dealer_lead(db, user, intake.id)
+        email_note = (
+            " A secure login link was emailed to the client."
+            if record.get("ok")
+            else " Email delivery is unavailable; share the resume link manually."
+        )
+
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path="/dealer-ai-underwriter",
+        include_management=False,
+        admin_thread=True,
+        assistant_message=(
+            "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
+            + email_note
+        ),
+    )
+
+
+@broker_router.get("/{intake_id}", response_model=DealerIntakeResponse)
+async def get_broker_dealer_lead(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+
+
+@broker_router.get("/{intake_id}/notes", response_model=list[BucketNoteRead])
+async def list_broker_lead_notes(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[BucketNote]:
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+
+
+@broker_router.post("/{intake_id}/notes", response_model=BucketNoteRead, status_code=status.HTTP_201_CREATED)
+async def create_broker_lead_note(
+    intake_id: UUID,
+    payload: DealerLeadNoteCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketNote:
+    """Same shared thread as create_admin_lead_note — both routers write/read
+    the identical BucketNote rows (visibility='admin'), which is what makes
+    this a shared admin<->broker thread with no separate join table."""
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    note = BucketNote(
+        bucket_id=intake.bucket_id,
+        author_name=user.name,
+        author_role=user.role,
+        visibility="admin",
+        content=payload.content,
+    )
+    db.add(note)
+    await db.flush()
+    await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
+    await db.commit()
+    await db.refresh(note)
+    return note
+
+
+@broker_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)
+async def broker_dealer_lead_chat(
+    intake_id: UUID,
+    payload: DealerChatRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Dealer-partner chat with the underwriting AI on their own lead, in the
+    same private internal thread (audience='admin') the admin cockpit uses —
+    the client never sees this thread either way."""
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    assistant_message = None
+    if payload.message and payload.message.strip():
+        chat_messages, _, _ = await create_chat_reply(
+            db,
+            bucket=intake.bucket,
+            audience="admin",
+            message=payload.message.strip(),
+            actor_name=user.name or "Dealer partner",
+            user=user,
+        )
+        if chat_messages:
+            assistant_message = chat_messages[-1].content
+        _record_chat_fact(intake, payload.message, source="broker_chat")
+    await db.commit()
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _response(
+        db,
+        intake,
+        token=None,
+        include_management=False,
+        assistant_message=assistant_message,
+        admin_thread=True,
+    )
+
+
+@broker_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def broker_dealer_lead_upload_init(
+    intake_id: UUID,
+    payload: DealerFileUploadInit,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
+
+
+@broker_router.post("/{intake_id}/files/complete", response_model=BucketFileRead)
+async def broker_dealer_lead_upload_complete(
+    intake_id: UUID,
+    payload: DealerUploadComplete,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
+
+
+@broker_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)
+async def rerun_broker_dealer_lead_review(
+    intake_id: UUID,
+    request: Request,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ReviewRunStartResponse:
+    """Same async run-review + polling pattern as the admin endpoint, scoped
+    to the broker's own lead."""
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    _throttle_or_429(
+        _ADMIN_REVIEW_LAST_BY_INTAKE,
+        str(intake.id),
+        _ADMIN_REVIEW_MIN_INTERVAL_SECONDS,
+        "A review was just re-run for this lead. Please wait a moment before running another.",
+    )
+    review = await _create_queued_review(
+        db,
+        intake,
+        request=request,
+        actor_name=user.name or "Dealer partner",
+        actor_email=user.email,
+        actor_role="dealer_partner",
+        log_event="dealer_ai_review_rerun_by_broker",
+        detail="Broker re-run over latest uploads",
+        requested_by_user_id=user.id,
+    )
+    background.add_task(_run_review_background, review.id, intake.id)
+    return ReviewRunStartResponse(review_id=review.id, status="queued")
+
+
+@broker_router.get("/{intake_id}/review-progress", response_model=ReviewProgressResponse)
+async def broker_dealer_lead_review_progress(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    review_id: UUID | None = None,
+) -> ReviewProgressResponse:
+    _require_dealer_partner(user)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    if review_id is not None:
+        review = await db.get(BucketAIReview, review_id)
+        if review is None or review.bucket_id != intake.bucket_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Review not found")
+    else:
+        review = (
+            await db.execute(
+                select(BucketAIReview)
+                .where(BucketAIReview.bucket_id == intake.bucket_id)
+                .order_by(BucketAIReview.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No review found")
+    progress = review.progress if isinstance(review.progress, dict) else {}
+    return ReviewProgressResponse(
+        review_id=review.id,
+        status=review.status,
+        stage=str(progress.get("stage") or review.status),
+        label=str(progress.get("label") or ""),
+        percent=int(progress.get("percent") or (100 if review.status in {"completed", "failed"} else 0)),
+        files_total=int(progress.get("files_total") or 0),
+        files_done=int(progress.get("files_done") or 0),
+        error=review.error,
     )
 
 

@@ -33,9 +33,18 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     latest_review_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_ai_reviews.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Set only when a dealer partner (Role.DEALER_PARTNER) created this lead
+    # via /broker/ai-underwriter-leads — NULL for public-site self-serve leads
+    # and admin-created leads (both are house/admin-attributed).
+    broker_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(96), nullable=False, unique=True, index=True)
     variant: Mapped[str] = mapped_column(String(64), nullable=False, default="dealer_gatekeeper_v1", server_default="dealer_gatekeeper_v1")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="collecting", server_default="collecting")
+    # The firm's loan decision (submitted/closed/denied) — distinct from
+    # `status` above, which tracks the AI screening lifecycle, not the outcome.
+    outcome_status: Mapped[str] = mapped_column(String(16), nullable=False, default="submitted", server_default="submitted")
 
     full_name: Mapped[str] = mapped_column(String(180), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
@@ -53,6 +62,7 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     client: Mapped[Client | None] = relationship()
+    broker: Mapped[User | None] = relationship(foreign_keys=[broker_id])
     bucket: Mapped[Bucket] = relationship()
     bucket_upload_link: Mapped[BucketUploadLink | None] = relationship()
     latest_review: Mapped[BucketAIReview | None] = relationship()
