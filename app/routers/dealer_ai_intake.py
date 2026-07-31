@@ -24,7 +24,7 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
-from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Language, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
 from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketDocumentSignature, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
@@ -75,6 +75,61 @@ log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
 PRIVACY_VERSION = "2026-05-19"
+
+# Client-facing welcome copy in English/Spanish, keyed by Language. Spanish
+# strings: AI-translated, not yet native-speaker reviewed.
+_DEALER_WELCOME = {
+    Language.EN: (
+        "I opened your secure dealer funding file. I am going to screen this like a bank underwriter: tax returns, current P&L, "
+        "bank statements, real estate collateral, and any floorplan/MCA exposure that applies. Upload what you have now, and I will "
+        "only ask follow-up questions when the LLC/account structure or collateral values are not clear enough to make a preliminary call."
+    ),
+    Language.ES: (
+        "Abrí tu expediente seguro de financiamiento para concesionario. Voy a evaluar este archivo como lo haría un suscriptor bancario: "
+        "declaraciones de impuestos, P&L actual, estados de cuenta bancarios, garantía inmobiliaria y cualquier exposición de floorplan/MCA "
+        "que aplique. Sube lo que tengas ahora, y solo haré preguntas de seguimiento cuando la estructura de la LLC/cuenta o los valores de "
+        "la garantía no sean lo suficientemente claros para hacer una evaluación preliminar."
+    ),
+}
+
+_DEALER_WELCOME_BACK = {
+    Language.EN: "Welcome back. I restored your secure dealer funding room with your prior uploads and chat context.",
+    Language.ES: "Bienvenido de nuevo. Restauré tu sala segura de financiamiento con tus archivos y el contexto del chat anteriores.",
+}
+
+_RE_WELCOME_BACK = {
+    Language.EN: "Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
+    Language.ES: "Bienvenido de nuevo. Restauré tu revisión segura de financiamiento inmobiliario con tus archivos y el contexto del chat anteriores.",
+}
+
+
+def _dealer_welcome(lang: str, *, email_note: str = "") -> str:
+    return _DEALER_WELCOME.get(lang, _DEALER_WELCOME[Language.EN]) + email_note
+
+
+def _dealer_welcome_back(lang: str) -> str:
+    return _DEALER_WELCOME_BACK.get(lang, _DEALER_WELCOME_BACK[Language.EN])
+
+
+def _re_welcome_back(lang: str) -> str:
+    return _RE_WELCOME_BACK.get(lang, _RE_WELCOME_BACK[Language.EN])
+
+
+_DEALER_START_EMAIL_NOTE_OK = {
+    Language.EN: " I also emailed you a secure resume link so you can come back later.",
+    Language.ES: " También te envié por correo electrónico un enlace seguro para reanudar, para que puedas volver más tarde.",
+}
+_DEALER_START_EMAIL_NOTE_FAILED = {
+    Language.EN: " Use the copy resume link option as a backup if email delivery is unavailable.",
+    Language.ES: " Usa la opción de copiar el enlace para reanudar como respaldo si el envío de correo electrónico no está disponible.",
+}
+
+
+def _dealer_start_email_note(lang: str, *, ok: bool) -> str:
+    table = _DEALER_START_EMAIL_NOTE_OK if ok else _DEALER_START_EMAIL_NOTE_FAILED
+    return table.get(lang, table[Language.EN])
+
+
 DEALER_LOGIN_CODE_TTL_MINUTES = 10
 DEALER_LOGIN_SESSION_TTL_HOURS = 12
 DEALER_LOGIN_MAX_ATTEMPTS = 5
@@ -218,6 +273,7 @@ class DealerIntakeStart(BaseModel):
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    preferred_language: Language = Language.EN
 
     @field_validator("business_name", "phone", mode="before")
     @classmethod
@@ -240,6 +296,7 @@ class FundingReviewStart(BaseModel):
     privacy_accepted: bool = False
     terms_version: str = Field(default=TERMS_VERSION, max_length=32)
     privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    preferred_language: Language = Language.EN
 
     @field_validator("phone", "investor_name", "target_property_address", "transaction_type", "estimated_credit_tier", mode="before")
     @classmethod
@@ -267,6 +324,7 @@ class AdminLeadCreate(BaseModel):
     estimated_credit_tier: str | None = Field(default=None, max_length=64)
     notify_client: bool = False  # email the client a secure resume/login link now
     force_new: bool = False  # create a second lead even if one already exists for this email
+    preferred_language: Language = Language.EN
 
     @field_validator("variant", mode="before")
     @classmethod
@@ -294,6 +352,7 @@ class BrokerLeadCreate(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)
     notify_client: bool = False
     force_new: bool = False
+    preferred_language: Language = Language.EN
 
     @field_validator("phone", "business_name", mode="before")
     @classmethod
@@ -303,6 +362,10 @@ class BrokerLeadCreate(BaseModel):
 
 class OutcomeStatusUpdate(BaseModel):
     outcome_status: Literal["submitted", "closed", "denied"]
+
+
+class LanguageUpdate(BaseModel):
+    preferred_language: Language
 
 
 class DealerLeadNoteCreate(BaseModel):
@@ -324,6 +387,7 @@ class AdminLeadFromBucketCreate(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)  # or investor name, real-estate
     notify_client: bool = False  # default OFF — this is an admin audit flow, not client self-service
     force_new: bool = False  # create a second lead even if one already exists for this bucket
+    preferred_language: Language = Language.EN
 
     @field_validator("variant", mode="before")
     @classmethod
@@ -642,6 +706,7 @@ class DealerIntakeRead(ORMModel):
     asset_rows: list[dict[str, Any]] | None
     intake_state: dict[str, Any] | None
     result_snapshot: dict[str, Any] | None
+    preferred_language: str = "en"
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -680,6 +745,7 @@ class DealerAILeadRow(BaseModel):
     business_name: str | None = None
     status: str
     outcome_status: str = "submitted"
+    preferred_language: str = "en"
     probability_status: str | None = None
     confidence: str | None = None
     one_next_step: str | None = None
@@ -1689,7 +1755,7 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
         # No widget and no review yet: give a product-appropriate opening so a
         # real-estate file never sees dealer-flavored fallback text.
         if intake.variant == FUNDING_VARIANT:
-            return _funding_empty_message()
+            return _funding_empty_message(intake.preferred_language)
         if not _active_files(intake.bucket):
             return (
                 "Your secure underwriter chat is open. Attach PDFs, images, ZIP files, spreadsheets, or bank/tax documents here, "
@@ -4114,6 +4180,7 @@ async def start_dealer_intake(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
+        preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
             "source": "dealer_ai_intake",
@@ -4133,21 +4200,12 @@ async def start_dealer_intake(
     await _record_super_admin_intake_notification(db, intake, request=request)
     await db.commit()
     intake = await _load_public_intake(db, token)
-    email_note = (
-        " I also emailed you a secure resume link so you can come back later."
-        if email_record.get("ok")
-        else " Use the copy resume link option as a backup if email delivery is unavailable."
-    )
+    email_note = _dealer_start_email_note(intake.preferred_language, ok=email_record.get("ok") is True)
     return await _response(
         db,
         intake,
         token=token,
-        assistant_message=(
-            "I opened your secure dealer funding file. I am going to screen this like a bank underwriter: tax returns, current P&L, "
-            "bank statements, real estate collateral, and any floorplan/MCA exposure that applies. Upload what you have now, and I will "
-            "only ask follow-up questions when the LLC/account structure or collateral values are not clear enough to make a preliminary call."
-            + email_note
-        ),
+        assistant_message=_dealer_welcome(intake.preferred_language, email_note=email_note),
     )
 
 
@@ -4231,7 +4289,7 @@ async def verify_dealer_login(
         intake,
         token=public_token,
         session_token=session_token,
-        assistant_message="Welcome back. I restored your secure dealer funding room with your prior uploads and chat context.",
+        assistant_message=_dealer_welcome_back(intake.preferred_language),
     )
 
 
@@ -4250,7 +4308,7 @@ async def get_dealer_session(request: Request, db: AsyncSession = Depends(get_db
         intake,
         token=public_token,
         session_token=session_token,
-        assistant_message="Welcome back. I restored your secure dealer funding room with your prior uploads and chat context.",
+        assistant_message=_dealer_welcome_back(intake.preferred_language),
     )
 
 
@@ -4372,6 +4430,7 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         business_name=intake.business_name,
         status=intake.status,
         outcome_status=intake.outcome_status,
+        preferred_language=intake.preferred_language,
         probability_status=str(result.get("probability_status") or "") or None,
         confidence=str(result.get("confidence") or "") or None,
         one_next_step=str(result.get("one_next_step") or "") or None,
@@ -4756,6 +4815,30 @@ async def update_lead_outcome_status(
     return await _response(db, intake, token=None, include_management=True, admin_thread=True)
 
 
+@admin_router.patch("/{intake_id}/language", response_model=DealerIntakeResponse)
+async def update_lead_language(
+    intake_id: UUID,
+    payload: LanguageUpdate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin-only: corrects the client's language preference after the fact.
+    Mirrors update_lead_outcome_status — once set (by the client's own pick,
+    or an admin/broker's pick at lead-creation time), only an admin can
+    change it. No broker-accessible write path exists to this field."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    intake.preferred_language = payload.preferred_language
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_language_changed", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.preferred_language,
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
 @admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
 async def create_admin_ai_lead(
     payload: AdminLeadCreate,
@@ -4855,6 +4938,7 @@ async def create_admin_ai_lead(
         business_name=(payload.investor_name if is_re else payload.business_name),
         loan_purpose=(payload.transaction_type if is_re else None),
         requested_loan_amount=(payload.requested_amount if is_re else None),
+        preferred_language=payload.preferred_language,
         asset_rows=(
             [
                 {
@@ -5034,6 +5118,7 @@ async def create_broker_ai_lead(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
+        preferred_language=payload.preferred_language,
         asset_rows=[],
         intake_state=intake_state,
     )
@@ -5355,6 +5440,7 @@ async def create_admin_ai_lead_from_bucket(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
+        preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
             "source": "bucket_conversion",
@@ -5818,6 +5904,7 @@ async def reply_dealer_ai_client_thread(
         actor_name=attribution,
         user=user,
         upload_link=intake.bucket_upload_link,
+        preferred_language=intake.preferred_language,
     )
     await _log(
         db,
@@ -6474,6 +6561,7 @@ async def dealer_intake_chat(
             message=payload.message.strip(),
             actor_name=intake.full_name,
             upload_link=intake.bucket_upload_link,
+            preferred_language=intake.preferred_language,
         )
         messages = chat_messages
         if chat_messages:
@@ -6753,6 +6841,7 @@ async def my_dealer_intake_chat(
             actor_name=user.name or intake.full_name,
             user=user,
             upload_link=intake.bucket_upload_link,
+            preferred_language=intake.preferred_language,
         )
         messages = chat_messages
         if chat_messages:
@@ -6820,14 +6909,28 @@ FUNDING_PUBLIC_PATH = "/funding-review"
 FUNDING_VARIANT = "real_estate_dscr_v1"
 
 
-def _funding_empty_message() -> str:
-    return (
+# Spanish: AI-translated, not yet native-speaker reviewed.
+_FUNDING_EMPTY_MESSAGE = {
+    Language.EN: (
         "Welcome — let's get you prequalified. I have the property and deal basics you just submitted, and I will screen this like an "
         "investor-loan underwriter: rent support, PITIA, DSCR, LTV, purchase or payoff evidence, property value, entity/vesting, and credit "
         "tier. I'll also ask a few quick questions — down payment, whether you've owned investment property before, and whether this is "
         "residential or commercial — so I can point you at the right program. Attach what you have and I will ask one targeted question at "
         "a time. Once I have enough to go on, I'll let you know where you stand."
-    )
+    ),
+    Language.ES: (
+        "Bienvenido — vamos a preprobarte para el préstamo. Tengo los datos básicos de la propiedad y el trato que acabas de enviar, y voy a "
+        "evaluar esto como lo haría un suscriptor de préstamos para inversionistas: soporte de renta, PITIA, DSCR, LTV, evidencia de compra o "
+        "pago, valor de la propiedad, entidad/titularidad, y nivel de crédito. También te haré algunas preguntas rápidas — el pago inicial, si "
+        "has sido propietario de una propiedad de inversión antes, y si esto es residencial o comercial — para poder orientarte al programa "
+        "correcto. Adjunta lo que tengas y te haré una pregunta específica a la vez. Una vez que tenga suficiente información, te diré en qué "
+        "posición te encuentras."
+    ),
+}
+
+
+def _funding_empty_message(lang: str = Language.EN) -> str:
+    return _FUNDING_EMPTY_MESSAGE.get(lang, _FUNDING_EMPTY_MESSAGE[Language.EN])
 
 
 def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
@@ -6904,6 +7007,7 @@ async def start_funding_review(
         business_name=payload.investor_name,
         loan_purpose=payload.transaction_type,
         requested_loan_amount=payload.requested_amount,
+        preferred_language=payload.preferred_language,
         asset_rows=[
             {
                 "address": payload.target_property_address,
@@ -6940,7 +7044,7 @@ async def start_funding_review(
     )
     await db.commit()
     intake = await _load_public_intake(db, token)
-    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, assistant_message=_funding_empty_message())
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, assistant_message=_funding_empty_message(intake.preferred_language))
 
 
 @funding_router.post("/login/start", response_model=DealerLoginStartResponse)
@@ -7034,7 +7138,7 @@ async def verify_funding_review_login(
         token=public_token,
         session_token=session_token,
         public_path=FUNDING_PUBLIC_PATH,
-        assistant_message="Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
+        assistant_message=_re_welcome_back(intake.preferred_language),
     )
 
 
@@ -7051,7 +7155,7 @@ async def get_funding_review_session(request: Request, db: AsyncSession = Depend
         token=public_token,
         session_token=session_token,
         public_path=FUNDING_PUBLIC_PATH,
-        assistant_message="Welcome back. I restored your secure real estate funding review with your prior uploads and chat context.",
+        assistant_message=_re_welcome_back(intake.preferred_language),
     )
 
 
@@ -7109,7 +7213,7 @@ async def download_funding_review_intelligence_pdf(
 async def get_funding_review(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
-    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, empty_message=_funding_empty_message())
+    return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH, empty_message=_funding_empty_message(intake.preferred_language))
 
 
 @funding_router.post("/{token}/chat", response_model=DealerIntakeResponse)
@@ -7135,6 +7239,7 @@ async def funding_review_chat(
             message=payload.message.strip(),
             actor_name=intake.full_name,
             upload_link=intake.bucket_upload_link,
+            preferred_language=intake.preferred_language,
         )
         messages = chat_messages
         if chat_messages:

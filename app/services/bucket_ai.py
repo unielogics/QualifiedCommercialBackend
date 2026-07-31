@@ -234,17 +234,31 @@ def build_review_system(review_type: str | None) -> str:
     return f"{REVIEW_PREAMBLE}\n{REVIEW_LIMITS}\n"
 
 
-def build_chat_system(review_type: str | None) -> str:
+def build_chat_system(review_type: str | None, *, client_language: str | None = None) -> str:
     """Return the chat system prompt for exactly one product persona.
 
     Mirrors build_review_system: dealer and real-estate chat rules are never
     combined, and an unknown/None review_type gets the neutral preamble only.
+
+    client_language is ONLY ever passed for the client-facing ("uploader")
+    chat audience — see create_chat_reply. It must never be set for the
+    admin/broker-facing ("admin") audience, so that thread stays English
+    regardless of the lead's preferred language.
     """
     if review_type == "dealer_gatekeeper_v1":
-        return f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
-    if review_type == "real_estate_dscr_v1":
-        return f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
-    return f"{CHAT_PREAMBLE}\n"
+        base = f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
+    elif review_type == "real_estate_dscr_v1":
+        base = f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
+    else:
+        base = f"{CHAT_PREAMBLE}\n"
+    if client_language == "es":
+        base += (
+            "\n\nThe client's preferred language is Spanish. Respond ONLY in professional, natural "
+            "Spanish, regardless of what language the supporting context/documents are in, unless the "
+            "client's own message is written in English -- in that case, reply in English for that turn "
+            "only. Never mix languages within a single reply."
+        )
+    return base
 
 
 # Compact single-file analysis prompt. Produces a durable per-file record the
@@ -2363,6 +2377,7 @@ async def create_chat_reply(
     upload_link: BucketUploadLink | None = None,
     share: BucketShare | None = None,
     vendor_access: BucketVendorAccess | None = None,
+    preferred_language: str = "en",
 ) -> tuple[list[BucketAIMessage], list[BucketAIActionItem], str | None]:
     user_row = BucketAIMessage(
         bucket_id=bucket.id,
@@ -2423,7 +2438,10 @@ async def create_chat_reply(
                 "vendor_access_id": str(vendor_access.id) if vendor_access else None,
             },
             max_tokens=3000,
-            system=build_chat_system(review_type),
+            system=build_chat_system(
+                review_type,
+                client_language=preferred_language if audience == "uploader" else None,
+            ),
             messages=chat_messages_arg,
         )
         raw_text = _text_from_response(resp)

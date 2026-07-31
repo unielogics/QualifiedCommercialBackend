@@ -22,6 +22,15 @@ class Role(StrEnum):
     DEALER_PARTNER = "dealer_partner"
 
 
+class Language(StrEnum):
+    """Client-facing language preference for a public underwriting intake.
+    Drives frontend copy + AI chat language for the CLIENT ('uploader')
+    thread only. Admin/broker-facing UI and the 'admin' chat audience are
+    ALWAYS English regardless of this value."""
+    EN = "en"
+    ES = "es"
+
+
 class PropertyType(StrEnum):
     SFR = "single_family"
     UNITS_2_4 = "2_4_units"

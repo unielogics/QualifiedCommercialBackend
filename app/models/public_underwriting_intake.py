@@ -45,6 +45,12 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     # The firm's loan decision (submitted/closed/denied) — distinct from
     # `status` above, which tracks the AI screening lifecycle, not the outcome.
     outcome_status: Mapped[str] = mapped_column(String(16), nullable=False, default="submitted", server_default="submitted")
+    # Client-facing language for UI copy + AI chat ("en"/"es"). Set once at
+    # creation (self-serve pick, or admin/broker pick on the client's behalf)
+    # and sticky thereafter — only an admin can change it post-creation.
+    # Admin/broker-facing UI and the "admin" chat audience always stay
+    # English regardless of this value.
+    preferred_language: Mapped[str] = mapped_column(String(8), nullable=False, default="en", server_default="en")
 
     full_name: Mapped[str] = mapped_column(String(180), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
