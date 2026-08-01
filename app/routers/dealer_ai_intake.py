@@ -4470,6 +4470,14 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
 def _require_dealer_partner(user: CurrentUser) -> None:
     if user.role != Role.DEALER_PARTNER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
+    # Hard-block every broker endpoint until the NDA / non-solicitation
+    # agreement is signed (see app/routers/broker_nda.py). This is the real
+    # enforcement point; the frontend gate in AppShell.tsx is UX on top of it.
+    if user.nda_signed_at is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You must sign the dealer partner agreement before using the platform",
+        )
 
 
 async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID) -> PublicUnderwritingIntake:

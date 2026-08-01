@@ -33,6 +33,7 @@ from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.booking_settings import BookingSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
+from app.models.broker_nda_acceptance import BrokerNdaAcceptance  # noqa: F401
 from app.models.billing import (  # noqa: F401
     BillableExpense,
     ChargeAttempt,

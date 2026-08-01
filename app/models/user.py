@@ -34,6 +34,11 @@ class User(TimestampMixin, Base):
     # Presence (alembic 0046). Bumped automatically by deps.get_current_user
     # on every authed request. Drives the "online" dot in the loan header.
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Denormalized from the latest BrokerNdaAcceptance row so the AppShell
+    # hard-gate (and _require_nda_signed on every broker endpoint) is a cheap
+    # single-column read instead of a join on every request. Only meaningful
+    # for Role.DEALER_PARTNER; NULL for every other role forever.
+    nda_signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Optional links to broker/client profiles (one-to-one).
     # foreign_keys disambiguates Client.user_id from the post-0029
