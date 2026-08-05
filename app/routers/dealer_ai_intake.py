@@ -24,7 +24,7 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
-from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Language, Role
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, ContractType, Language, Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
 from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketDocumentSignature, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
@@ -398,6 +398,28 @@ class AdminLeadFromBucketCreate(BaseModel):
     @classmethod
     def empty_to_none(cls, value: object) -> object:
         return None if value == "" else value
+
+
+class AdminContractRequest(BaseModel):
+    """Admin requests one of the 3 client-facing contract types (SBA
+    Engagement, Client Engagement, Consulting Addendum) be signed on this
+    lead. Admin supplies the handful of deal-specific blanks not already on
+    the lead record (client legal name/entity/state auto-fill from the lead
+    where available); render_contract_document() fills the rest from each
+    field's own default (same pattern as the Referral Protection portal),
+    and the flattened text is stored exactly like the existing
+    credit-authorization requested-document — the sign-time path is
+    completely unchanged."""
+
+    contract_type: ContractType
+    field_values: dict[str, str] = Field(default_factory=dict)
+
+
+class AdminContractRequestStatus(BaseModel):
+    contract_type: ContractType
+    requested: bool
+    signed: bool
+    requested_document_id: UUID | None = None
 
 
 class AdminCreditAuthorizationRequest(BaseModel):
@@ -3981,7 +4003,41 @@ async def _sign_requested_document(
     )
     await db.commit()
     await db.refresh(result_file)
+
+    if actor_email:
+        _send_signed_document_copy_email(
+            to_email=actor_email,
+            typed_name=actor_name,
+            document_title=req.name,
+            pdf_bytes=pdf_bytes,
+        )
+
     return result_file
+
+
+def _send_signed_document_copy_email(*, to_email: str, typed_name: str, document_title: str, pdf_bytes: bytes) -> None:
+    """E-SIGN-compliant delivery of the signer's own copy for the requested-
+    document/chat sign flow (credit authorization + the 3 client-facing
+    contract types) — same pattern as app/routers/contracts.py's
+    _send_signed_copy_email, kept separate since this path's certificate PDF
+    is rendered by document_signature.py, not contract_templates.py."""
+    from app.services.email.ses_client import send_raw_email
+
+    subject = f"Signed: {document_title}"
+    body_text = (
+        f"Hello {typed_name},\n\n"
+        f"Attached is your signed copy of {document_title}, executed electronically under the U.S. "
+        "E-SIGN Act and UETA.\n\n"
+        "You may request a paper copy of this signed document at any time, or withdraw your consent to "
+        "electronic records prospectively, by contacting support@qualifiedcommercial.com.\n\n"
+        "Qualified Commercial LLC"
+    )
+    send_raw_email(
+        to_emails=[to_email],
+        subject=subject,
+        body_text=body_text,
+        attachments=[(f"{document_title}.pdf"[:255], pdf_bytes, "application/pdf")],
+    )
 
 
 async def _store_drafted_form_pdf(
@@ -4467,16 +4523,46 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
     return intake
 
 
-def _require_dealer_partner(user: CurrentUser) -> None:
+async def _require_dealer_partner(user: CurrentUser, db: AsyncSession) -> None:
     if user.role != Role.DEALER_PARTNER:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
-    # Hard-block every broker endpoint until the NDA / non-solicitation
-    # agreement is signed (see app/routers/broker_nda.py). This is the real
-    # enforcement point; the frontend gate in AppShell.tsx is UX on top of it.
-    if user.nda_signed_at is None:
+    # Hard-block every broker endpoint until BOTH the individual (Platform
+    # Access Agreement) and their company (Referral Protection Agreement)
+    # have a signed ContractAgreement on file — see app/routers/contracts.py
+    # and app/services/contract_templates.py. This is the real enforcement
+    # point; the frontend gate in AppShell.tsx is UX on top of it.
+    from app.enums import ContractSubjectType, ContractType
+    from app.models.contract_agreement import ContractAgreement
+
+    individual_signed = (
+        await db.execute(
+            select(ContractAgreement.id).where(
+                ContractAgreement.contract_type == ContractType.PLATFORM_ACCESS,
+                ContractAgreement.subject_type == ContractSubjectType.USER,
+                ContractAgreement.subject_id == user.id,
+            )
+        )
+    ).first()
+    if individual_signed is None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "You must sign the dealer partner agreement before using the platform",
+            "You must sign the Platform Access Agreement before using the platform",
+        )
+    company_signed = None
+    if user.referral_partner_company_id is not None:
+        company_signed = (
+            await db.execute(
+                select(ContractAgreement.id).where(
+                    ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
+                    ContractAgreement.subject_type == ContractSubjectType.COMPANY,
+                    ContractAgreement.subject_id == user.referral_partner_company_id,
+                )
+            )
+        ).first()
+    if company_signed is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Your company must have a signed Referral Protection Agreement on file before using the platform",
         )
 
 
@@ -5032,7 +5118,7 @@ async def list_broker_dealer_leads(
     limit: int = 50,
     offset: int = 0,
 ) -> DealerAILeadListResponse:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
     stmt = (
@@ -5076,7 +5162,7 @@ async def create_broker_ai_lead(
     """Dealer partner creates an AI-underwriter lead ON BEHALF of their own
     client. Dealer-variant only. Reuses the same creation helpers as the
     public /start and admin-create flows. No terms/throttle."""
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
 
     if not payload.force_new:
         existing = await _latest_active_intake_by_email(db, str(payload.email), variant=DEALER_VARIANT)
@@ -5178,7 +5264,7 @@ async def get_broker_dealer_lead(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerIntakeResponse:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     return await _response(db, intake, token=None, include_management=False, admin_thread=True)
 
@@ -5189,7 +5275,7 @@ async def list_broker_lead_notes(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[BucketNote]:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     return sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
 
@@ -5205,7 +5291,7 @@ async def create_broker_lead_note(
     """Same shared thread as create_admin_lead_note — both routers write/read
     the identical BucketNote rows (visibility='admin'), which is what makes
     this a shared admin<->broker thread with no separate join table."""
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     note = BucketNote(
         bucket_id=intake.bucket_id,
@@ -5233,7 +5319,7 @@ async def broker_dealer_lead_chat(
     """Dealer-partner chat with the underwriting AI on their own lead, in the
     same private internal thread (audience='admin') the admin cockpit uses —
     the client never sees this thread either way."""
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     assistant_message = None
     if payload.message and payload.message.strip():
@@ -5268,7 +5354,7 @@ async def broker_dealer_lead_upload_init(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     return await _start_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
 
@@ -5281,7 +5367,7 @@ async def broker_dealer_lead_upload_complete(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
 
@@ -5296,7 +5382,7 @@ async def rerun_broker_dealer_lead_review(
 ) -> ReviewRunStartResponse:
     """Same async run-review + polling pattern as the admin endpoint, scoped
     to the broker's own lead."""
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     _throttle_or_429(
         _ADMIN_REVIEW_LAST_BY_INTAKE,
@@ -5326,7 +5412,7 @@ async def broker_dealer_lead_review_progress(
     db: AsyncSession = Depends(get_db),
     review_id: UUID | None = None,
 ) -> ReviewProgressResponse:
-    _require_dealer_partner(user)
+    await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     if review_id is not None:
         review = await db.get(BucketAIReview, review_id)
@@ -5515,6 +5601,15 @@ async def create_admin_ai_lead_from_bucket(
 
 _CREDIT_AUTH_DOC_NAME = "Credit Report Authorization"
 
+# The 3 client-facing contract types deliverable through this existing
+# requested-document/chat sign flow (see app/routers/contracts.py's module
+# docstring — PLATFORM_ACCESS and REFERRAL_PROTECTION are NOT routed here).
+_CONTRACT_SIGNATURE_KIND: dict[ContractType, str] = {
+    ContractType.SBA_ENGAGEMENT: "contract_sba_engagement",
+    ContractType.CLIENT_ENGAGEMENT: "contract_client_engagement",
+    ContractType.CONSULTING_ADDENDUM: "contract_consulting_addendum",
+}
+
 
 def _credit_authorization_doc(intake: PublicUnderwritingIntake) -> BucketRequestedDocument | None:
     """The lead's credit_authorization requested-document, if one has been
@@ -5523,6 +5618,29 @@ def _credit_authorization_doc(intake: PublicUnderwritingIntake) -> BucketRequest
         if doc.signature_kind == "credit_authorization":
             return doc
     return None
+
+
+def _contract_doc(intake: PublicUnderwritingIntake, contract_type: ContractType) -> BucketRequestedDocument | None:
+    signature_kind = _CONTRACT_SIGNATURE_KIND[contract_type]
+    for doc in intake.bucket.requested_documents:
+        if doc.signature_kind == signature_kind:
+            return doc
+    return None
+
+
+def _contract_field_values_from_lead(intake: PublicUnderwritingIntake, contract_type: ContractType) -> dict[str, str]:
+    """Auto-fill the handful of identity fields every client-facing contract
+    template shares (client legal name) from the lead record, so the admin
+    only has to type what isn't already known. Every other in-scope field
+    (notice contacts, fee amounts) is left for the admin's explicit
+    field_values to override — see render_contract_document()'s own
+    per-field default fallback for anything neither supplies."""
+    values: dict[str, str] = {}
+    name = (intake.business_name or intake.full_name or "").strip()
+    if name:
+        for field_name in ("client_legal_name",):
+            values[field_name] = name
+    return values
 
 
 @admin_router.post("/{intake_id}/credit-authorization", response_model=BucketRequestedDocumentRead)
@@ -5584,6 +5702,95 @@ async def request_lead_credit_authorization(
     await db.commit()
     await db.refresh(doc)
     return doc
+
+
+_CONTRACT_DOC_NAME: dict[ContractType, str] = {
+    ContractType.SBA_ENGAGEMENT: "SBA Advisory and Packaging Engagement Agreement",
+    ContractType.CLIENT_ENGAGEMENT: "Capital Advisory and Placement Engagement Agreement",
+    ContractType.CONSULTING_ADDENDUM: "Consulting and Fee Schedule Addendum",
+}
+
+
+@admin_router.post("/{intake_id}/contracts", response_model=BucketRequestedDocumentRead)
+async def request_lead_contract(
+    intake_id: UUID,
+    payload: AdminContractRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    """Admin requests one of the 3 client-facing contract types be signed on
+    this lead, via the existing requested-document/chat sign flow — see
+    app/routers/contracts.py's module docstring for why PLATFORM_ACCESS and
+    REFERRAL_PROTECTION are NOT routed here. Idempotent per contract_type,
+    same immutable-once-signed semantics as credit-authorization."""
+    _require_super_admin(user)
+    if payload.contract_type not in _CONTRACT_SIGNATURE_KIND:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This contract type is not requestable on a lead")
+    intake = await _load_admin_dealer_lead(db, intake_id)
+
+    from app.services import contract_templates as tpl
+
+    field_values = {**_contract_field_values_from_lead(intake, payload.contract_type), **payload.field_values}
+    rendered = tpl.render_contract_document(payload.contract_type, field_values)
+    document_text = rendered.plain_text
+
+    existing = _contract_doc(intake, payload.contract_type)
+    if existing is not None:
+        if existing.status != "uploaded":
+            existing.signature_document_text = document_text
+            await db.commit()
+            await db.refresh(existing)
+        return existing
+
+    doc = BucketRequestedDocument(
+        bucket_id=intake.bucket_id,
+        name=_CONTRACT_DOC_NAME[payload.contract_type],
+        category="compliance",
+        description="Sign to execute this engagement agreement.",
+        required=True,
+        is_custom=True,
+        requires_signature=True,
+        signature_kind=_CONTRACT_SIGNATURE_KIND[payload.contract_type],
+        signature_document_text=document_text,
+    )
+    db.add(doc)
+    await _log(
+        db,
+        intake.bucket_id,
+        "contract_requested",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Admin requested {payload.contract_type.value} for {intake.email}",
+    )
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+@admin_router.get("/{intake_id}/contracts", response_model=list[AdminContractRequestStatus])
+async def get_lead_contract_status(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[AdminContractRequestStatus]:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    results: list[AdminContractRequestStatus] = []
+    for contract_type in _CONTRACT_SIGNATURE_KIND:
+        doc = _contract_doc(intake, contract_type)
+        results.append(
+            AdminContractRequestStatus(
+                contract_type=contract_type,
+                requested=doc is not None,
+                signed=bool(doc and doc.status == "uploaded"),
+                requested_document_id=doc.id if doc else None,
+            )
+        )
+    return results
 
 
 @admin_router.get("/{intake_id}/credit-status", response_model=LeadCreditStatusResponse)

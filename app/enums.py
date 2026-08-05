@@ -603,3 +603,26 @@ class AIAgentLeadStatus(StrEnum):
     REPLIED = "replied"
     HANDED_OFF = "handed_off"
     EXITED = "exited"
+
+
+class ContractType(StrEnum):
+    """The 5 real, attorney-drafted contract templates the platform can
+    dynamically fill and e-sign. See app/services/contract_templates.py for
+    the actual document bodies. PLATFORM_ACCESS is individual-scoped (a
+    dealer-partner user); REFERRAL_PROTECTION is company-scoped (a
+    ReferralPartnerCompany); the other three are client-facing, delivered
+    via the existing BucketRequestedDocument sign flow."""
+    PLATFORM_ACCESS = "platform_access"
+    REFERRAL_PROTECTION = "referral_protection"
+    SBA_ENGAGEMENT = "sba_engagement"
+    CLIENT_ENGAGEMENT = "client_engagement"
+    CONSULTING_ADDENDUM = "consulting_addendum"
+
+
+class ContractSubjectType(StrEnum):
+    """Polymorphic subject discriminator on ContractAgreement — mirrors the
+    target_type/target_id pattern already used by the activity-log helper,
+    since a contract can be signed by either an individual user or a
+    company with no single FK column that fits both."""
+    USER = "user"
+    COMPANY = "company"

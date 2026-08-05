@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from uuid import UUID
 
 from fastapi import APIRouter
 
@@ -19,9 +19,12 @@ class MeResponse(ORMModel):
     email: str
     name: str
     role: Role
-    # Only ever set for Role.DEALER_PARTNER; drives the AppShell hard-gate
-    # that blocks broker platform access until the NDA is signed.
-    nda_signed_at: datetime | None = None
+    # Only ever set for Role.DEALER_PARTNER. Whether this user (and their
+    # company) have the required signed contracts is a separate query — see
+    # GET /contracts/{contract_type}/status — not a field on this response,
+    # since AppShell's gate needs BOTH the individual Platform Access
+    # Agreement AND the company's Referral Protection Agreement status.
+    referral_partner_company_id: UUID | None = None
 
 
 @router.get("/me", response_model=MeResponse)
@@ -32,5 +35,5 @@ async def me(user: CurrentUser) -> MeResponse:
         email=user.email,
         name=user.name,
         role=user.role,
-        nda_signed_at=user.nda_signed_at,
+        referral_partner_company_id=user.referral_partner_company_id,
     )

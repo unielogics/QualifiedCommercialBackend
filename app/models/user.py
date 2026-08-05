@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,7 @@ from app.models._mixins import TimestampMixin
 if TYPE_CHECKING:
     from app.models.broker import Broker
     from app.models.client import Client
+    from app.models.referral_partner_company import ReferralPartnerCompany
 
 
 class User(TimestampMixin, Base):
@@ -34,11 +35,14 @@ class User(TimestampMixin, Base):
     # Presence (alembic 0046). Bumped automatically by deps.get_current_user
     # on every authed request. Drives the "online" dot in the loan header.
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Denormalized from the latest BrokerNdaAcceptance row so the AppShell
-    # hard-gate (and _require_nda_signed on every broker endpoint) is a cheap
-    # single-column read instead of a join on every request. Only meaningful
-    # for Role.DEALER_PARTNER; NULL for every other role forever.
-    nda_signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set for Role.DEALER_PARTNER users at invite time (typed company name,
+    # find-or-create against ReferralPartnerCompany). Whether that COMPANY
+    # has a signed Referral Protection Agreement on file is a separate,
+    # company-scoped ContractAgreement query — this FK only records which
+    # company a given individual belongs to. NULL for every other role.
+    referral_partner_company_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("referral_partner_companies.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Optional links to broker/client profiles (one-to-one).
     # foreign_keys disambiguates Client.user_id from the post-0029
@@ -46,4 +50,7 @@ class User(TimestampMixin, Base):
     broker: Mapped[Broker | None] = relationship(back_populates="user", uselist=False)
     client: Mapped[Client | None] = relationship(
         back_populates="user", uselist=False, foreign_keys="Client.user_id",
+    )
+    referral_partner_company: Mapped[ReferralPartnerCompany | None] = relationship(
+        foreign_keys=[referral_partner_company_id]
     )
