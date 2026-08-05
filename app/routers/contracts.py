@@ -193,6 +193,24 @@ async def contract_preview(contract_type: ContractType) -> ContractPreview:
     )
 
 
+class ContractRenderRequest(BaseModel):
+    field_values: dict[str, str] = Field(default_factory=dict)
+
+
+@router.post("/{contract_type}/render", response_model=ContractPreview)
+async def contract_render(contract_type: ContractType, payload: ContractRenderRequest) -> ContractPreview:
+    """Same public, token-free surface as /preview, but folds the signer's
+    own typed values into the document so the portal can show them the
+    actual filled agreement (review step) before they sign it."""
+    if contract_type not in _PUBLIC_PREVIEWABLE:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This contract type has no public preview")
+    return ContractPreview(
+        document_version=tpl.CONTRACT_DOCUMENT_VERSIONS[contract_type],
+        document=_document_read(contract_type, payload.field_values),
+        fields=_fields_read(contract_type),
+    )
+
+
 async def _next_contract_number(db: AsyncSession, contract_type: ContractType) -> str:
     from sqlalchemy import text
 
