@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -66,6 +67,13 @@ def _require_routable(contract_type: ContractType) -> None:
         )
 
 
+class TableColumnRead(BaseModel):
+    key: str
+    label: str
+    input_type: str
+    options: list[str] | None = None
+
+
 class ContractFieldRead(BaseModel):
     name: str
     label: str
@@ -73,11 +81,15 @@ class ContractFieldRead(BaseModel):
     default: str
     row_group: str | None
     in_scope_for_initial_signing: bool
+    table_columns: list[TableColumnRead] | None = None
 
 
 class ContractSectionRead(BaseModel):
     heading: str
     paragraphs: list[str]
+    columns: list[str] | None = None
+    rows: list[list[str]] | None = None
+    disclosure_field: str | None = None
 
 
 class ContractDocumentRead(BaseModel):
@@ -100,7 +112,10 @@ class ContractSignRequest(BaseModel):
     typed_name: str = Field(min_length=1, max_length=160)
     esign_consent: bool
     signature_data_url: str = Field(min_length=1)
-    field_values: dict[str, str] = Field(default_factory=dict)
+    # Any: a "disclosure_rows"-type field's value is a list[dict] (Schedule
+    # A's signer-submitted capital-relationship rows), not a scalar string --
+    # render_contract_document() validates the shape defensively per field.
+    field_values: dict[str, Any] = Field(default_factory=dict)
     # Public-portal-only (no authenticated user to read an email from):
     # where to send the signed copy + certificate. Ignored for
     # individual-scoped types, which use the authenticated user's own email.
@@ -142,13 +157,22 @@ async def _latest_agreement(
     ).scalar_one_or_none()
 
 
-def _document_read(contract_type: ContractType, field_values: dict[str, str] | None = None) -> ContractDocumentRead:
+def _document_read(contract_type: ContractType, field_values: dict[str, Any] | None = None) -> ContractDocumentRead:
     rendered = tpl.render_contract_document(contract_type, field_values or {})
     return ContractDocumentRead(
         title=rendered.title,
         party_facing_notice=rendered.party_facing_notice,
         preamble=rendered.preamble,
-        sections=[ContractSectionRead(heading=s.heading, paragraphs=s.paragraphs) for s in rendered.sections],
+        sections=[
+            ContractSectionRead(
+                heading=s.heading,
+                paragraphs=s.paragraphs,
+                columns=s.columns,
+                rows=s.rows,
+                disclosure_field=s.disclosure_field,
+            )
+            for s in rendered.sections
+        ],
     )
 
 
@@ -162,6 +186,14 @@ def _fields_read(contract_type: ContractType) -> list[ContractFieldRead]:
             default=f.default,
             row_group=f.row_group,
             in_scope_for_initial_signing=f.in_scope_for_initial_signing,
+            table_columns=(
+                [
+                    TableColumnRead(key=c.key, label=c.label, input_type=c.input_type, options=c.options)
+                    for c in f.table_columns
+                ]
+                if f.table_columns
+                else None
+            ),
         )
         for f in spec.fields.values()
     ]
@@ -194,7 +226,7 @@ async def contract_preview(contract_type: ContractType) -> ContractPreview:
 
 
 class ContractRenderRequest(BaseModel):
-    field_values: dict[str, str] = Field(default_factory=dict)
+    field_values: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/{contract_type}/render", response_model=ContractPreview)
@@ -364,6 +396,7 @@ async def _sign(
 
     pdf_bytes = tpl.render_contract_certificate_pdf(
         rendered=rendered,
+        contract_type=contract_type,
         contract_number=contract_number,
         typed_name=agreement.typed_name,
         document_hash=doc_hash,

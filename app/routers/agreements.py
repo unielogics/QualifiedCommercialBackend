@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -40,6 +40,7 @@ from app.models.billing import PaymentAuthorization
 from app.models.bucket import Bucket, BucketDocumentSignature, BucketRequestedDocument
 from app.models.client import Client
 from app.models.contract_agreement import ContractAgreement
+from app.models.deal_registration import DealRegistration
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
@@ -64,6 +65,11 @@ class AgreementRow(BaseModel):
     party_email: str | None
     party_company: str | None
     party_kind: str  # "user" | "company" | "lead" | "client" | "unknown"
+    # Only set when party_kind == "company" -- the ReferralPartnerCompany's
+    # own id, distinct from `id` (the ContractAgreement row's id) above.
+    # Lets the frontend target "Issue Deal Registration" at this specific
+    # company without a second lookup.
+    company_id: UUID | None = None
     typed_name: str
     signed_at: datetime | None
     document_version: str
@@ -116,6 +122,7 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
         party_email: str | None = None
         party_company: str | None = None
         party_kind = "unknown"
+        company_id: UUID | None = None
         detail_url: str | None = None
         if a.subject_type == ContractSubjectType.USER:
             user = users_by_id.get(a.subject_id)
@@ -135,6 +142,7 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
                 party_name = company.name
                 party_company = company.name
             party_kind = "company"
+            company_id = a.subject_id
             detail_url = "/settings?section=team"
 
         try:
@@ -152,6 +160,7 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
                 party_email=party_email,
                 party_company=party_company,
                 party_kind=party_kind,
+                company_id=company_id,
                 typed_name=a.typed_name,
                 signed_at=a.signed_at,
                 document_version=a.document_version,
@@ -338,3 +347,182 @@ async def list_agreements(
     total = len(rows)
     page = rows[offset : offset + limit]
     return AgreementListResponse(items=page, total=total, limit=limit, offset=offset)
+
+
+# --- Deal Registrations (Exhibit 1 of a signed Referral Protection Agreement) ---
+#
+# Issued by an admin each time Qualified Commercial actually introduces a
+# specific financing opportunity to a referral partner company under
+# Article 4 -- a separate, later event from signing the master agreement.
+# registration_number is generated from deal_registration_number_seq
+# (migration 0103), mirroring contract_number_seq's pattern exactly.
+
+_METHOD_OF_INTRODUCTION_CHOICES = {"email", "call", "meeting", "portal", "other"}
+
+
+class DealRegistrationCreate(BaseModel):
+    referral_partner_company_id: UUID
+    introduced_at: datetime
+    client_borrower: str = Field(min_length=1, max_length=255)
+    financing_opportunity: str = Field(min_length=1)
+    introduced_capital_source: str = Field(min_length=1, max_length=255)
+    introduced_program: str | None = Field(default=None, max_length=255)
+    introduced_contact: str | None = Field(default=None, max_length=255)
+    method_of_introduction: str
+    method_other_description: str | None = Field(default=None, max_length=255)
+    documents_transmitted: str | None = None
+    coded_designation: str | None = Field(default=None, max_length=255)
+    capital_source_number: str | None = Field(default=None, max_length=64)
+    date_identity_disclosed: datetime | None = None
+
+
+class DealRegistrationRead(BaseModel):
+    id: UUID
+    referral_partner_company_id: UUID
+    registration_number: str
+    introduced_at: datetime
+    client_borrower: str
+    financing_opportunity: str
+    introduced_capital_source: str
+    introduced_program: str | None
+    introduced_contact: str | None
+    method_of_introduction: str
+    method_other_description: str | None
+    documents_transmitted: str | None
+    coded_designation: str | None
+    capital_source_number: str | None
+    date_identity_disclosed: datetime | None
+    certificate_download_url: str | None = None
+    created_at: datetime
+
+
+def _deal_registration_read(reg: DealRegistration) -> DealRegistrationRead:
+    return DealRegistrationRead(
+        id=reg.id,
+        referral_partner_company_id=reg.referral_partner_company_id,
+        registration_number=reg.registration_number,
+        introduced_at=reg.introduced_at,
+        client_borrower=reg.client_borrower,
+        financing_opportunity=reg.financing_opportunity,
+        introduced_capital_source=reg.introduced_capital_source,
+        introduced_program=reg.introduced_program,
+        introduced_contact=reg.introduced_contact,
+        method_of_introduction=reg.method_of_introduction,
+        method_other_description=reg.method_other_description,
+        documents_transmitted=reg.documents_transmitted,
+        coded_designation=reg.coded_designation,
+        capital_source_number=reg.capital_source_number,
+        date_identity_disclosed=reg.date_identity_disclosed,
+        certificate_download_url=tpl.presign_private_s3_object(reg.certificate_s3_key),
+        created_at=reg.created_at,
+    )
+
+
+async def _next_deal_registration_number(db: AsyncSession) -> tuple[str, str, str]:
+    """Returns (full_number, prefix, suffix) -- prefix is the year, suffix is
+    the zero-padded sequence value, matching Exhibit 1's existing two-blank
+    "QC-$prefix-$suffix" template convention."""
+    seq = (await db.execute(text("SELECT nextval('deal_registration_number_seq')"))).scalar_one()
+    prefix = str(datetime.now(timezone.utc).year)
+    suffix = f"{seq:05d}"
+    return f"QC-{prefix}-{suffix}", prefix, suffix
+
+
+@router.post("/deal-registrations", response_model=DealRegistrationRead, status_code=201)
+async def issue_deal_registration(
+    payload: DealRegistrationCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealRegistration:
+    _require_super_admin(user)
+    if payload.method_of_introduction not in _METHOD_OF_INTRODUCTION_CHOICES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid method_of_introduction")
+
+    company = await db.get(ReferralPartnerCompany, payload.referral_partner_company_id)
+    if company is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Referral partner company not found")
+
+    registration_number, prefix, suffix = await _next_deal_registration_number(db)
+    reg = DealRegistration(
+        referral_partner_company_id=payload.referral_partner_company_id,
+        registration_number=registration_number,
+        introduced_at=payload.introduced_at,
+        client_borrower=payload.client_borrower,
+        financing_opportunity=payload.financing_opportunity,
+        introduced_capital_source=payload.introduced_capital_source,
+        introduced_program=payload.introduced_program,
+        introduced_contact=payload.introduced_contact,
+        method_of_introduction=payload.method_of_introduction,
+        method_other_description=payload.method_other_description,
+        documents_transmitted=payload.documents_transmitted,
+        coded_designation=payload.coded_designation,
+        capital_source_number=payload.capital_source_number,
+        date_identity_disclosed=payload.date_identity_disclosed,
+    )
+    db.add(reg)
+    await db.flush()
+
+    method_label = (
+        payload.method_other_description or "Other"
+        if payload.method_of_introduction == "other"
+        else payload.method_of_introduction.capitalize()
+    )
+    rows = [
+        ("Registration Number", registration_number),
+        ("Date and Time of Introduction", payload.introduced_at.isoformat()),
+        ("Referral Partner", company.name),
+        ("Client / Borrower", payload.client_borrower),
+        ("Financing Opportunity (type, amount, use of proceeds)", payload.financing_opportunity),
+        ("Introduced Capital Source", payload.introduced_capital_source),
+        ("Introduced Program / Division", payload.introduced_program or ""),
+        ("Introduced Contact (name, title)", payload.introduced_contact or ""),
+        ("Method of Introduction", method_label),
+        ("Documents Transmitted", payload.documents_transmitted or ""),
+        ("Coded Designation (if staged disclosure)", payload.coded_designation or ""),
+        ("Capital Source No.", payload.capital_source_number or ""),
+        ("Date Identity Disclosed", payload.date_identity_disclosed.isoformat() if payload.date_identity_disclosed else ""),
+    ]
+    pdf_bytes = tpl.render_exhibit_pdf(
+        registration_number=registration_number, referral_partner_name=company.name, rows=rows
+    )
+    cert_key = f"deal-registrations/{reg.id}/exhibit-1.pdf"
+    tpl.put_private_s3_object(key=cert_key, body=pdf_bytes, content_type="application/pdf")
+    reg.certificate_s3_key = cert_key
+
+    await db.commit()
+    await db.refresh(reg)
+    return reg
+
+
+@router.get("/deal-registrations", response_model=list[DealRegistrationRead])
+async def list_deal_registrations(
+    user: CurrentUser,
+    company_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[DealRegistrationRead]:
+    _require_super_admin(user)
+    regs = list(
+        (
+            await db.execute(
+                select(DealRegistration)
+                .where(DealRegistration.referral_partner_company_id == company_id)
+                .order_by(DealRegistration.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_deal_registration_read(r) for r in regs]
+
+
+@router.get("/deal-registrations/{registration_id}/certificate")
+async def deal_registration_certificate(
+    registration_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    _require_super_admin(user)
+    reg = await db.get(DealRegistration, registration_id)
+    if reg is None or reg.certificate_s3_key is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No certificate found for this Deal Registration")
+    return {"download_url": tpl.presign_private_s3_object(reg.certificate_s3_key)}

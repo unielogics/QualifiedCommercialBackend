@@ -89,6 +89,25 @@ def render_signature_certificate_pdf(
         for label, value in rows
     )
     doc_html = html.escape(document_text).replace("\n", "<br>")
+    # The 3 client-facing contract types (SBA/Client Engagement, Consulting
+    # Addendum) reach this generic certificate renderer with their rendered
+    # plain text already flattened into document_text -- replace Qualified
+    # Commercial's own "By: <name>" line with its standing signature image,
+    # same substitution contract_templates.py does for the other 2 contract
+    # types' dedicated certificate renderer, so all 5 contract certificates
+    # show a real signature rather than typed text.
+    from app.enums import ContractType
+    from app.services.contract_templates import get_template_spec, qc_signature_datauri
+
+    qc_field = get_template_spec(ContractType.SBA_ENGAGEMENT).fields.get("qc_signatory_name")
+    qc_name_default = qc_field.default if qc_field else None
+    signature_datauri = qc_signature_datauri()
+    if signature_datauri and qc_name_default:
+        escaped_by_line = html.escape(f"By: {qc_name_default}")
+        doc_html = doc_html.replace(
+            escaped_by_line,
+            f'<img class="qc-sig" src="{signature_datauri}" alt="Qualified Commercial signature"/>',
+        )
     body = f"""
     <html>
       <head>
@@ -101,6 +120,7 @@ def render_signature_certificate_pdf(
           th {{ width: 34%; text-align: left; background: #f3f4f6; }}
           th, td {{ border: 1px solid #d1d5db; padding: 8px 10px; vertical-align: top; font-size: 12px; }}
           .terms {{ border: 1px solid #d1d5db; padding: 14px; font-size: 11px; line-height: 1.45; }}
+          .qc-sig {{ height: 34px; margin: 2px 0; }}
         </style>
       </head>
       <body>

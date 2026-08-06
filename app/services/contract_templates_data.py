@@ -4,10 +4,12 @@ scripts/patch_qc_own_field_defaults.py +
 scripts/patch_venue_county_default.py + 
 scripts/patch_schedule_b_retainer_defaults.py + 
 scripts/patch_qc_own_fields_out_of_scope.py + 
-scripts/patch_signature_blocks.py from the source .docx contract
-text. Do not hand-edit generated dict literals directly here -- change
-contract_templates.py's post-processing instead, or re-run the generator
-against a corrected source .txt.
+scripts/patch_signature_blocks.py + 
+scripts/patch_table_sections.py + 
+scripts/patch_schedule_a_disclosure_fields.py from the source .docx
+contract text. Do not hand-edit generated dict literals directly here --
+change contract_templates.py's post-processing instead, or re-run the
+generator against a corrected source .txt.
 """
 
 from __future__ import annotations
@@ -1498,17 +1500,23 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                        { 'heading': 'SCHEDULE 1',
                                          'paragraphs': ['TRANSACTION DESCRIPTION AND FEE TERMS']},
                                        { 'heading': 'SCHEDULE Part 1 — The Financing Request',
-                                         'paragraphs': [ 'Item',
-                                                         'Detail',
-                                                         'Client legal name',
-                                                         'Additional borrower entities',
-                                                         'Principals / guarantors',
-                                                         'Product / facility type',
-                                                         'Requested amount',
-                                                         '$',
-                                                         'Purpose / use of proceeds',
-                                                         'Collateral / property',
-                                                         'Target closing date']},
+                                         'paragraphs': [],
+                                         'columns': ['Item', 'Detail'],
+                                         'rows': [ ['Client legal name', '$client_legal_name'],
+                                                   [ 'Additional borrower entities',
+                                                     '$financing_request_additional_borrower_entities'],
+                                                   [ 'Principals / guarantors',
+                                                     '$financing_request_principals_guarantors'],
+                                                   [ 'Product / facility type',
+                                                     '$financing_request_product_type'],
+                                                   [ 'Requested amount',
+                                                     '$financing_request_amount'],
+                                                   [ 'Purpose / use of proceeds',
+                                                     '$financing_request_use_of_proceeds'],
+                                                   [ 'Collateral / property',
+                                                     '$financing_request_collateral'],
+                                                   [ 'Target closing date',
+                                                     '$financing_request_target_closing_date']]},
                                        { 'heading': 'SCHEDULE Part 2 — Success Fee',
                                          'paragraphs': [ 'The success fee is the greater of the '
                                                          'percentage or the minimum amount stated '
@@ -1517,39 +1525,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'The percentage is applied to the gross '
                                                          'funded or committed amount of the '
                                                          'Transaction.',
-                                                         'Product',
-                                                         'Standard Range',
-                                                         'Rate for This File',
-                                                         'Minimum Fee',
-                                                         'Commercial Real Estate / DSCR',
-                                                         '3.5% – 5%',
-                                                         '$success_fee_rate_cre_dscr',
-                                                         '$success_fee_min_fee_cre_dscr',
-                                                         'Dealer Floorplan / Dealer LOC',
-                                                         '3% – 5%',
-                                                         '$success_fee_rate_dealer_floorplan',
-                                                         '$success_fee_min_fee_dealer_floorplan',
-                                                         'Warranty / Reinsurance Receivable',
-                                                         '3.5% – 5%',
-                                                         '$success_fee_rate_warranty_reinsurance',
-                                                         '$success_fee_min_fee_warranty_reinsurance',
-                                                         'Asset-Based Lending',
-                                                         '3% – 5%',
-                                                         '$success_fee_rate_asset_based_lending',
-                                                         '$success_fee_min_fee_asset_based_lending',
-                                                         'Bridge / Private Credit',
-                                                         '5% – 10%',
-                                                         '$success_fee_rate_bridge_private_credit',
-                                                         '$success_fee_min_fee_bridge_private_credit',
-                                                         'Working Capital / Line of Credit',
-                                                         '3.5% – 5%',
-                                                         '$success_fee_rate_working_capital_loc',
-                                                         '$success_fee_min_fee_working_capital_loc',
-                                                         'Other: $success_fee_other_product_name',
-                                                         '$success_fee_other_standard_rate_low – '
-                                                         '$success_fee_other_standard_rate_high',
-                                                         '$success_fee_rate_other',
-                                                         '$success_fee_min_fee_other',
                                                          'Standard rates. The ranges above are '
                                                          "Qualified Commercial's standard rates. "
                                                          'They are stated as ranges because '
@@ -1577,38 +1552,43 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'percent (100%) of the rate above, '
                                                          'calculated on the renewed or increased '
                                                          'amount, unless otherwise agreed in '
-                                                         'writing.']},
+                                                         'writing.'],
+                                         'columns': [ 'Product',
+                                                      'Standard Range',
+                                                      'Rate for This File',
+                                                      'Minimum Fee'],
+                                         'rows': [ [ 'Commercial Real Estate / DSCR',
+                                                     '3.5% – 5%',
+                                                     '$success_fee_rate_cre_dscr',
+                                                     '$success_fee_min_fee_cre_dscr'],
+                                                   [ 'Dealer Floorplan / Dealer LOC',
+                                                     '3% – 5%',
+                                                     '$success_fee_rate_dealer_floorplan',
+                                                     '$success_fee_min_fee_dealer_floorplan'],
+                                                   [ 'Warranty / Reinsurance Receivable',
+                                                     '3.5% – 5%',
+                                                     '$success_fee_rate_warranty_reinsurance',
+                                                     '$success_fee_min_fee_warranty_reinsurance'],
+                                                   [ 'Asset-Based Lending',
+                                                     '3% – 5%',
+                                                     '$success_fee_rate_asset_based_lending',
+                                                     '$success_fee_min_fee_asset_based_lending'],
+                                                   [ 'Bridge / Private Credit',
+                                                     '5% – 10%',
+                                                     '$success_fee_rate_bridge_private_credit',
+                                                     '$success_fee_min_fee_bridge_private_credit'],
+                                                   [ 'Working Capital / Line of Credit',
+                                                     '3.5% – 5%',
+                                                     '$success_fee_rate_working_capital_loc',
+                                                     '$success_fee_min_fee_working_capital_loc'],
+                                                   [ 'Other: $success_fee_other_product_name',
+                                                     '$success_fee_other_standard_rate_low – '
+                                                     '$success_fee_other_standard_rate_high',
+                                                     '$success_fee_rate_other',
+                                                     '$success_fee_min_fee_other']]},
                                        { 'heading': 'SCHEDULE Part 3 — Flat and Milestone Fees '
                                                     '(earned upon performance per Section 5.4)',
-                                         'paragraphs': [ 'Fee Type',
-                                                         'Standard Low',
-                                                         'Standard High',
-                                                         'Amount for This File',
-                                                         'Advisory / engagement fee (retainer)',
-                                                         '$2,500',
-                                                         '$5,000',
-                                                         '$flat_fee_advisory_engagement_retainer',
-                                                         'Underwriting & packaging fee',
-                                                         '$7,500',
-                                                         '$12,500',
-                                                         '$flat_fee_underwriting_packaging',
-                                                         'Financial modeling fee',
-                                                         '$2,000',
-                                                         '$5,000',
-                                                         '$flat_fee_financial_modeling',
-                                                         'Due diligence / document prep',
-                                                         '$3,000',
-                                                         '$6,000',
-                                                         '$flat_fee_due_diligence_doc_prep',
-                                                         'Technology fee',
-                                                         '$250',
-                                                         '$500',
-                                                         '$flat_fee_technology',
-                                                         'Third-party cost reimbursement',
-                                                         'At cost',
-                                                         'At cost',
-                                                         'At cost',
-                                                         "These are Qualified Commercial's "
+                                         'paragraphs': [ "These are Qualified Commercial's "
                                                          'standard fees and may be increased on '
                                                          'complex files. Complexity factors '
                                                          'include multiple operating entities or '
@@ -1626,28 +1606,37 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'writing before the corresponding work is '
                                                          'performed. Where no amount is inserted '
                                                          'for a fee type, the midpoint of the '
-                                                         'standard range applies.']},
+                                                         'standard range applies.'],
+                                         'columns': [ 'Fee Type',
+                                                      'Standard Low',
+                                                      'Standard High',
+                                                      'Amount for This File'],
+                                         'rows': [ [ 'Advisory / engagement fee (retainer)',
+                                                     '$2,500',
+                                                     '$5,000',
+                                                     '$flat_fee_advisory_engagement_retainer'],
+                                                   [ 'Underwriting & packaging fee',
+                                                     '$7,500',
+                                                     '$12,500',
+                                                     '$flat_fee_underwriting_packaging'],
+                                                   [ 'Financial modeling fee',
+                                                     '$2,000',
+                                                     '$5,000',
+                                                     '$flat_fee_financial_modeling'],
+                                                   [ 'Due diligence / document prep',
+                                                     '$3,000',
+                                                     '$6,000',
+                                                     '$flat_fee_due_diligence_doc_prep'],
+                                                   [ 'Technology fee',
+                                                     '$250',
+                                                     '$500',
+                                                     '$flat_fee_technology'],
+                                                   [ 'Third-party cost reimbursement',
+                                                     'At cost',
+                                                     'At cost',
+                                                     'At cost']]},
                                        { 'heading': 'SCHEDULE Part 4 — Milestones',
-                                         'paragraphs': [ 'Milestone',
-                                                         'Fee Earned',
-                                                         'Due',
-                                                         'Execution of this Agreement',
-                                                         'Advisory + technology fee (retainer)',
-                                                         'At execution',
-                                                         'Financial model delivered',
-                                                         'Financial modeling fee',
-                                                         'On delivery',
-                                                         'Diligence and document package assembled',
-                                                         'Due diligence / doc prep fee',
-                                                         'On assembly',
-                                                         'Submission to Capital Source',
-                                                         'Underwriting & packaging fee',
-                                                         'On submission',
-                                                         'Initial funding or first advance',
-                                                         'Success fee less amounts previously '
-                                                         'earned',
-                                                         'At closing',
-                                                         'Each milestone is a discrete deliverable '
+                                         'paragraphs': [ 'Each milestone is a discrete deliverable '
                                                          'and the corresponding fee is earned '
                                                          'whether or not the Transaction '
                                                          'ultimately funds. Amounts earned at '
@@ -1656,7 +1645,23 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'percentage of the funded amount would '
                                                          'yield less than the aggregate of the '
                                                          'flat and milestone fees earned, the '
-                                                         'aggregate earned amount is the fee.']},
+                                                         'aggregate earned amount is the fee.'],
+                                         'columns': ['Milestone', 'Fee Earned', 'Due'],
+                                         'rows': [ [ 'Execution of this Agreement',
+                                                     'Advisory + technology fee (retainer)',
+                                                     'At execution'],
+                                                   [ 'Financial model delivered',
+                                                     'Financial modeling fee',
+                                                     'On delivery'],
+                                                   [ 'Diligence and document package assembled',
+                                                     'Due diligence / doc prep fee',
+                                                     'On assembly'],
+                                                   [ 'Submission to Capital Source',
+                                                     'Underwriting & packaging fee',
+                                                     'On submission'],
+                                                   [ 'Initial funding or first advance',
+                                                     'Success fee less amounts previously earned',
+                                                     'At closing']]},
                                        { 'heading': 'SCHEDULE Part 5 — Adjustment',
                                          'paragraphs': [ '(a)\u2003Qualified Commercial may, in '
                                                          'its sole discretion and in writing, '
@@ -1796,12 +1801,13 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'a Capital Source does not defeat its '
                                                          'status as an Introduced Capital Source '
                                                          'where the definition in Article 1 is '
-                                                         'satisfied.',
-                                                         'No.',
-                                                         'Capital Source',
-                                                         'Program / Division',
-                                                         'Contact Introduced',
-                                                         'Date Introduced']}],
+                                                         'satisfied.'],
+                                         'columns': [ 'No.',
+                                                      'Capital Source',
+                                                      'Program / Division',
+                                                      'Contact Introduced',
+                                                      'Date Introduced'],
+                                         'rows': [['—', 'No entries yet.', '', '', '']]}],
                          'field_schema': { 'client_legal_name': { 'label': 'Client legal name',
                                                                   'default': '',
                                                                   'raw_token': '[CLIENT LEGAL '
@@ -2235,7 +2241,80 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                              'in_scope_for_initial_signing': False,
                                                                              'raw_token': '',
                                                                              'field_type': 'text',
-                                                                             'row_group': None}}},
+                                                                             'row_group': None},
+                                           'financing_request_additional_borrower_entities': { 'label': 'Financing '
+                                                                                                        'Request '
+                                                                                                        '— '
+                                                                                                        'Additional '
+                                                                                                        'Borrower '
+                                                                                                        'Entities',
+                                                                                               'default': '',
+                                                                                               'raw_token': '',
+                                                                                               'field_type': 'text',
+                                                                                               'row_group': None,
+                                                                                               'in_scope_for_initial_signing': True},
+                                           'financing_request_principals_guarantors': { 'label': 'Financing '
+                                                                                                 'Request '
+                                                                                                 '— '
+                                                                                                 'Principals '
+                                                                                                 '/ '
+                                                                                                 'Guarantors',
+                                                                                        'default': '',
+                                                                                        'raw_token': '',
+                                                                                        'field_type': 'text',
+                                                                                        'row_group': None,
+                                                                                        'in_scope_for_initial_signing': True},
+                                           'financing_request_product_type': { 'label': 'Financing '
+                                                                                        'Request — '
+                                                                                        'Product / '
+                                                                                        'Facility '
+                                                                                        'Type',
+                                                                               'default': '',
+                                                                               'raw_token': '',
+                                                                               'field_type': 'text',
+                                                                               'row_group': None,
+                                                                               'in_scope_for_initial_signing': True},
+                                           'financing_request_amount': { 'label': 'Financing '
+                                                                                  'Request — '
+                                                                                  'Requested '
+                                                                                  'Amount',
+                                                                         'default': '',
+                                                                         'raw_token': '',
+                                                                         'field_type': 'text',
+                                                                         'row_group': None,
+                                                                         'in_scope_for_initial_signing': True},
+                                           'financing_request_use_of_proceeds': { 'label': 'Financing '
+                                                                                           'Request '
+                                                                                           '— '
+                                                                                           'Purpose '
+                                                                                           '/ Use '
+                                                                                           'of '
+                                                                                           'Proceeds',
+                                                                                  'default': '',
+                                                                                  'raw_token': '',
+                                                                                  'field_type': 'text',
+                                                                                  'row_group': None,
+                                                                                  'in_scope_for_initial_signing': True},
+                                           'financing_request_collateral': { 'label': 'Financing '
+                                                                                      'Request — '
+                                                                                      'Collateral '
+                                                                                      '/ Property',
+                                                                             'default': '',
+                                                                             'raw_token': '',
+                                                                             'field_type': 'text',
+                                                                             'row_group': None,
+                                                                             'in_scope_for_initial_signing': True},
+                                           'financing_request_target_closing_date': { 'label': 'Financing '
+                                                                                               'Request '
+                                                                                               '— '
+                                                                                               'Target '
+                                                                                               'Closing '
+                                                                                               'Date',
+                                                                                      'default': '',
+                                                                                      'raw_token': '',
+                                                                                      'field_type': 'text',
+                                                                                      'row_group': None,
+                                                                                      'in_scope_for_initial_signing': True}}},
   'sba_engagement': { 'cover': [ 'SBA ADVISORY AND',
                                  'PACKAGING ENGAGEMENT AGREEMENT',
                                  'QUALIFIED COMMERCIAL LLC',
@@ -3357,15 +3436,18 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                     { 'heading': 'SCHEDULE 1',
                                       'paragraphs': ['TRANSACTION DESCRIPTION AND FEE TERMS']},
                                     { 'heading': 'SCHEDULE Part 1 — The Loan Request',
-                                      'paragraphs': [ 'Item',
-                                                      'Detail',
-                                                      'Client legal name',
-                                                      'Principals / guarantors',
-                                                      'Program (7(a) / 504 / USDA B&I / other)',
-                                                      'Requested amount',
-                                                      '$',
-                                                      'Use of proceeds',
-                                                      'Target closing date']},
+                                      'paragraphs': [],
+                                      'columns': ['Item', 'Detail'],
+                                      'rows': [ ['Client legal name', '$client_legal_name'],
+                                                [ 'Principals / guarantors',
+                                                  '$loan_request_principals_guarantors'],
+                                                [ 'Program (7(a) / 504 / USDA B&I / other)',
+                                                  '$loan_request_program'],
+                                                ['Requested amount', '$loan_request_amount'],
+                                                [ 'Use of proceeds',
+                                                  '$loan_request_use_of_proceeds'],
+                                                [ 'Target closing date',
+                                                  '$loan_request_target_closing_date']]},
                                     { 'heading': 'SCHEDULE Part 2 — Fees for Work Performed '
                                                  '(earned upon performance per Section 5.5)',
                                       'paragraphs': [ 'These fees compensate Qualified Commercial '
@@ -3379,34 +3461,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'submission, and any amount exceeding that '
                                                       'limitation is automatically reduced '
                                                       'accordingly.',
-                                                      'Fee Type',
-                                                      'Standard Low',
-                                                      'Standard High',
-                                                      'Amount for This File',
-                                                      'Advisory / engagement fee (retainer)',
-                                                      '$2,500',
-                                                      '$5,000',
-                                                      '$retainer_fee_amount',
-                                                      'Underwriting & packaging fee',
-                                                      '$7,500',
-                                                      '$12,500',
-                                                      '$underwriting_packaging_fee_amount',
-                                                      'Financial modeling fee',
-                                                      '$2,000',
-                                                      '$5,000',
-                                                      '$financial_modeling_fee_amount',
-                                                      'Due diligence / document prep',
-                                                      '$3,000',
-                                                      '$6,000',
-                                                      '$due_diligence_doc_prep_fee_amount',
-                                                      'Technology fee',
-                                                      '$250',
-                                                      '$500',
-                                                      '$technology_fee_amount',
-                                                      'Third-party cost reimbursement',
-                                                      'At cost',
-                                                      'At cost',
-                                                      'At cost',
                                                       "These are Qualified Commercial's standard "
                                                       'fees and may be increased on complex files '
                                                       '(multiple entities, unreconciled records, '
@@ -3415,7 +3469,35 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'Lender), documented in writing before the '
                                                       'work is performed. Where no amount is '
                                                       'inserted, the midpoint of the standard '
-                                                      'range applies.']},
+                                                      'range applies.'],
+                                      'columns': [ 'Fee Type',
+                                                   'Standard Low',
+                                                   'Standard High',
+                                                   'Amount for This File'],
+                                      'rows': [ [ 'Advisory / engagement fee (retainer)',
+                                                  '$2,500',
+                                                  '$5,000',
+                                                  '$retainer_fee_amount'],
+                                                [ 'Underwriting & packaging fee',
+                                                  '$7,500',
+                                                  '$12,500',
+                                                  '$underwriting_packaging_fee_amount'],
+                                                [ 'Financial modeling fee',
+                                                  '$2,000',
+                                                  '$5,000',
+                                                  '$financial_modeling_fee_amount'],
+                                                [ 'Due diligence / document prep',
+                                                  '$3,000',
+                                                  '$6,000',
+                                                  '$due_diligence_doc_prep_fee_amount'],
+                                                [ 'Technology fee',
+                                                  '$250',
+                                                  '$500',
+                                                  '$technology_fee_amount'],
+                                                [ 'Third-party cost reimbursement',
+                                                  'At cost',
+                                                  'At cost',
+                                                  'At cost']]},
                                     { 'heading': 'SCHEDULE Part 3 — Success Fee Component, if any',
                                       'paragraphs': [ 'If Qualified Commercial performs services '
                                                       'on this Loan Request properly characterized '
@@ -3430,22 +3512,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'automatically capped at, and superseded by, '
                                                       'the specific dollar or percentage limit the '
                                                       'operative SOP prescribes at submission.',
-                                                      'Program',
-                                                      'Standard Range',
-                                                      'Rate for This File',
-                                                      'Paid By',
-                                                      'SBA 7(a) / Express',
-                                                      '1% – 3%, subject to SOP cap',
-                                                      '$success_fee_rate_7a_express',
-                                                      'Lender',
-                                                      'SBA 504',
-                                                      '1% – 3%, subject to SOP cap',
-                                                      '$success_fee_rate_504',
-                                                      'Lender',
-                                                      'USDA B&I',
-                                                      '1% – 3%, subject to SOP cap',
-                                                      '$success_fee_rate_usda_bi',
-                                                      'Lender',
                                                       'Milestones. Fees in Part 2 are earned '
                                                       'against milestones: engagement/intake, '
                                                       'financial model delivered, diligence '
@@ -3466,7 +3532,23 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'submitted. Client shall not assert that '
                                                       'damages are speculative or unprovable by '
                                                       'reason of the fee being stated as a range '
-                                                      'or subject to the SOP cap.']},
+                                                      'or subject to the SOP cap.'],
+                                      'columns': [ 'Program',
+                                                   'Standard Range',
+                                                   'Rate for This File',
+                                                   'Paid By'],
+                                      'rows': [ [ 'SBA 7(a) / Express',
+                                                  '1% – 3%, subject to SOP cap',
+                                                  '$success_fee_rate_7a_express',
+                                                  'Lender'],
+                                                [ 'SBA 504',
+                                                  '1% – 3%, subject to SOP cap',
+                                                  '$success_fee_rate_504',
+                                                  'Lender'],
+                                                [ 'USDA B&I',
+                                                  '1% – 3%, subject to SOP cap',
+                                                  '$success_fee_rate_usda_bi',
+                                                  'Lender']]},
                                     { 'heading': 'SCHEDULE 2',
                                       'paragraphs': [ 'CLIENT DISCLOSURE OF EXISTING CAPITAL '
                                                       'RELATIONSHIPS',
@@ -3529,12 +3611,13 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                     { 'heading': 'EXHIBIT B',
                                       'paragraphs': [ 'REGISTRY OF INTRODUCED CAPITAL SOURCES',
                                                       'Maintained by Qualified Commercial under '
-                                                      'Section 6.5.',
-                                                      'No.',
-                                                      'Program Lender',
-                                                      'Program / Division',
-                                                      'Contact Introduced',
-                                                      'Date Introduced']},
+                                                      'Section 6.5.'],
+                                      'columns': [ 'No.',
+                                                   'Program Lender',
+                                                   'Program / Division',
+                                                   'Contact Introduced',
+                                                   'Date Introduced'],
+                                      'rows': [['—', 'No entries yet.', '', '', '']]},
                                     { 'heading': 'EXHIBIT C',
                                       'paragraphs': [ 'PROGRAM FEE DISCLOSURE ACKNOWLEDGMENT',
                                                       'This Exhibit is a preliminary '
@@ -3740,7 +3823,49 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                           'in_scope_for_initial_signing': False,
                                                                           'raw_token': '',
                                                                           'field_type': 'text',
-                                                                          'row_group': None}}},
+                                                                          'row_group': None},
+                                        'loan_request_principals_guarantors': { 'label': 'Loan '
+                                                                                         'Request '
+                                                                                         '— '
+                                                                                         'Principals '
+                                                                                         '/ '
+                                                                                         'Guarantors',
+                                                                                'default': '',
+                                                                                'raw_token': '',
+                                                                                'field_type': 'text',
+                                                                                'row_group': None,
+                                                                                'in_scope_for_initial_signing': True},
+                                        'loan_request_program': { 'label': 'Loan Request — Program',
+                                                                  'default': '',
+                                                                  'raw_token': '',
+                                                                  'field_type': 'text',
+                                                                  'row_group': None,
+                                                                  'in_scope_for_initial_signing': True},
+                                        'loan_request_amount': { 'label': 'Loan Request — '
+                                                                          'Requested Amount',
+                                                                 'default': '',
+                                                                 'raw_token': '',
+                                                                 'field_type': 'text',
+                                                                 'row_group': None,
+                                                                 'in_scope_for_initial_signing': True},
+                                        'loan_request_use_of_proceeds': { 'label': 'Loan Request — '
+                                                                                   'Use of '
+                                                                                   'Proceeds',
+                                                                          'default': '',
+                                                                          'raw_token': '',
+                                                                          'field_type': 'text',
+                                                                          'row_group': None,
+                                                                          'in_scope_for_initial_signing': True},
+                                        'loan_request_target_closing_date': { 'label': 'Loan '
+                                                                                       'Request — '
+                                                                                       'Target '
+                                                                                       'Closing '
+                                                                                       'Date',
+                                                                              'default': '',
+                                                                              'raw_token': '',
+                                                                              'field_type': 'text',
+                                                                              'row_group': None,
+                                                                              'in_scope_for_initial_signing': True}}},
   'referral_protection': { 'cover': [ 'STRATEGIC REFERRAL, CAPITAL ADVISORY',
                                       'AND BUSINESS RELATIONSHIP',
                                       'PROTECTION AGREEMENT',
@@ -6650,12 +6775,8 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'necessary.']},
                                          { 'heading': 'SCHEDULE Part 1 — Institutional '
                                                       'Relationships',
-                                           'paragraphs': [ 'Institution',
-                                                           'Division / Group',
-                                                           'Program or Product Used',
-                                                           'Relationship Manager',
-                                                           'Start Date',
-                                                           'Active?']},
+                                           'paragraphs': [],
+                                           'disclosure_field': 'schedule_a_institutional_rows'},
                                          { 'heading': 'SCHEDULE Part 2 — Other Capital '
                                                       'Relationships. Disclose every '
                                                       'non-institutional capital relationship, '
@@ -6666,11 +6787,8 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'factors, lessors, floorplan providers, '
                                                       'warehouse lines, and any other source of '
                                                       'capital or credit.',
-                                           'paragraphs': [ 'Counterparty',
-                                                           'Type',
-                                                           'Program / Facility',
-                                                           'Contact',
-                                                           'Start Date']},
+                                           'paragraphs': [],
+                                           'disclosure_field': 'schedule_a_other_capital_rows'},
                                          { 'heading': 'SCHEDULE Part 3 — Pending Applications and '
                                                       'Active Pursuits. List each Capital Source '
                                                       'and program to which the Referral Partner '
@@ -6678,11 +6796,7 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'actively and demonstrably pursuing, as of '
                                                       'the Effective Date. Attach contemporaneous '
                                                       'documentation for each.',
-                                           'paragraphs': [ 'Capital Source',
-                                                           'Program / Division',
-                                                           'Date Submitted or Initiated',
-                                                           'Documentation Attached',
-                                                           'CERTIFICATION. The undersigned, a duly '
+                                           'paragraphs': [ 'CERTIFICATION. The undersigned, a duly '
                                                            'authorized officer of the Referral '
                                                            'Partner, certifies that this Schedule '
                                                            'A is true, complete and accurate in '
@@ -6701,7 +6815,8 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            '$schedule_a_certifying_officer_name',
                                                            'Title: '
                                                            '$schedule_a_certifying_officer_title',
-                                                           'Date: $schedule_a_certification_date']},
+                                                           'Date: $schedule_a_certification_date'],
+                                           'disclosure_field': 'schedule_a_pending_rows'},
                                          { 'heading': 'SCHEDULE B',
                                            'paragraphs': [ 'COMPENSATION SCHEDULE',
                                                            'This Schedule B is subject to Article '
@@ -6747,51 +6862,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'Part 4(c); it does not obligate the '
                                                            'Referral Partner to pay any amount to '
                                                            'Qualified Commercial.',
-                                                           'Product / Program',
-                                                           'Standard Fee Range',
-                                                           'Retainer',
-                                                           'Paid By',
-                                                           'SBA 7(a) / Express (program-capped)',
-                                                           '1% – 3%',
-                                                           '$schedule_b_retainer_sba_7a_express',
-                                                           'Lender',
-                                                           'SBA 504 (program-capped)',
-                                                           '1% – 3%',
-                                                           '$schedule_b_retainer_sba_504',
-                                                           'Lender',
-                                                           'USDA B&I (program-capped)',
-                                                           '1% – 3%',
-                                                           '$schedule_b_retainer_usda_bi',
-                                                           'Lender',
-                                                           'Commercial Real Estate / DSCR',
-                                                           '3.5% – 5%',
-                                                           '$schedule_b_retainer_cre_dscr',
-                                                           'Lender',
-                                                           'Dealer Floorplan / Dealer LOC',
-                                                           '3% – 5%',
-                                                           '$schedule_b_retainer_dealer_floorplan',
-                                                           '☐ Lender ☐ Client',
-                                                           'Warranty / Reinsurance Receivable',
-                                                           '3.5% – 5%',
-                                                           '$schedule_b_retainer_warranty_reinsurance',
-                                                           '☐ Lender ☐ Client',
-                                                           'Asset-Based Lending',
-                                                           '3% – 5%',
-                                                           '$schedule_b_retainer_asset_based_lending',
-                                                           '☐ Lender ☐ Client',
-                                                           'Bridge / Private Credit',
-                                                           '5% – 10%',
-                                                           '$schedule_b_retainer_bridge_private_credit',
-                                                           'Client',
-                                                           'Working Capital / LOC',
-                                                           '3.5% – 5%',
-                                                           '$schedule_b_retainer_working_capital_loc',
-                                                           'Client',
-                                                           'Other: $schedule_b_other_product_name',
-                                                           '$schedule_b_other_fee_rate_low – '
-                                                           '$schedule_b_other_fee_rate_high',
-                                                           '$schedule_b_other_retainer',
-                                                           '☐ Lender ☐ Client',
                                                            'Program-capped products. The 1% – 3% '
                                                            'range stated for the products marked '
                                                            '(program-capped) is subject to Section '
@@ -6829,7 +6899,52 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'corresponding earned portions are set '
                                                            'forth in Part 3(g). Nothing in this '
                                                            'paragraph creates any payment '
-                                                           'obligation of the Referral Partner.']},
+                                                           'obligation of the Referral Partner.'],
+                                           'columns': [ 'Product / Program',
+                                                        'Standard Fee Range',
+                                                        'Retainer',
+                                                        'Paid By'],
+                                           'rows': [ [ 'SBA 7(a) / Express (program-capped)',
+                                                       '1% – 3%',
+                                                       '$schedule_b_retainer_sba_7a_express',
+                                                       'Lender'],
+                                                     [ 'SBA 504 (program-capped)',
+                                                       '1% – 3%',
+                                                       '$schedule_b_retainer_sba_504',
+                                                       'Lender'],
+                                                     [ 'USDA B&I (program-capped)',
+                                                       '1% – 3%',
+                                                       '$schedule_b_retainer_usda_bi',
+                                                       'Lender'],
+                                                     [ 'Commercial Real Estate / DSCR',
+                                                       '3.5% – 5%',
+                                                       '$schedule_b_retainer_cre_dscr',
+                                                       'Lender'],
+                                                     [ 'Dealer Floorplan / Dealer LOC',
+                                                       '3% – 5%',
+                                                       '$schedule_b_retainer_dealer_floorplan',
+                                                       '☐ Lender ☐ Client'],
+                                                     [ 'Warranty / Reinsurance Receivable',
+                                                       '3.5% – 5%',
+                                                       '$schedule_b_retainer_warranty_reinsurance',
+                                                       '☐ Lender ☐ Client'],
+                                                     [ 'Asset-Based Lending',
+                                                       '3% – 5%',
+                                                       '$schedule_b_retainer_asset_based_lending',
+                                                       '☐ Lender ☐ Client'],
+                                                     [ 'Bridge / Private Credit',
+                                                       '5% – 10%',
+                                                       '$schedule_b_retainer_bridge_private_credit',
+                                                       'Client'],
+                                                     [ 'Working Capital / LOC',
+                                                       '3.5% – 5%',
+                                                       '$schedule_b_retainer_working_capital_loc',
+                                                       'Client'],
+                                                     [ 'Other: $schedule_b_other_product_name',
+                                                       '$schedule_b_other_fee_rate_low – '
+                                                       '$schedule_b_other_fee_rate_high',
+                                                       '$schedule_b_other_retainer',
+                                                       '☐ Lender ☐ Client']]},
                                          { 'heading': 'SCHEDULE Part 2 — Advisory and Work-Product '
                                                       'Fees (earned upon performance per Section '
                                                       '16.5)',
@@ -6857,35 +6972,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'Qualified Commercial does not treat it '
                                                            'as independent advisory work under '
                                                            'Section 16.12(b).',
-                                                           'Fee Type',
-                                                           'Standard Low',
-                                                           'Standard High',
-                                                           'When Earned',
-                                                           'Advisory / engagement fee',
-                                                           '$2,500',
-                                                           '$5,000',
-                                                           'Upon engagement (retainer)',
-                                                           'Underwriting & packaging fee',
-                                                           '$7,500',
-                                                           '$12,500',
-                                                           'Upon submission to Capital Source',
-                                                           'Financial modeling fee',
-                                                           '$2,000',
-                                                           '$5,000',
-                                                           'Upon delivery of model',
-                                                           'Due diligence / document prep',
-                                                           '$3,000',
-                                                           '$6,000',
-                                                           'Upon performance',
-                                                           'Technology fee',
-                                                           '$250',
-                                                           '$500',
-                                                           'Upon engagement',
-                                                           'Third-party cost reimbursement',
-                                                           'At cost',
-                                                           'At cost',
-                                                           'Appraisal, environmental, title, '
-                                                           'search, filing',
                                                            'These amounts are Qualified '
                                                            "Commercial's standard fees and may be "
                                                            'increased on complex files. Complexity '
@@ -6911,7 +6997,36 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'each applicable fee type unless '
                                                            'Qualified Commercial produces a '
                                                            'writing establishing a different '
-                                                           'amount for that file.']},
+                                                           'amount for that file.'],
+                                           'columns': [ 'Fee Type',
+                                                        'Standard Low',
+                                                        'Standard High',
+                                                        'When Earned'],
+                                           'rows': [ [ 'Advisory / engagement fee',
+                                                       '$2,500',
+                                                       '$5,000',
+                                                       'Upon engagement (retainer)'],
+                                                     [ 'Underwriting & packaging fee',
+                                                       '$7,500',
+                                                       '$12,500',
+                                                       'Upon submission to Capital Source'],
+                                                     [ 'Financial modeling fee',
+                                                       '$2,000',
+                                                       '$5,000',
+                                                       'Upon delivery of model'],
+                                                     [ 'Due diligence / document prep',
+                                                       '$3,000',
+                                                       '$6,000',
+                                                       'Upon performance'],
+                                                     [ 'Technology fee',
+                                                       '$250',
+                                                       '$500',
+                                                       'Upon engagement'],
+                                                     [ 'Third-party cost reimbursement',
+                                                       'At cost',
+                                                       'At cost',
+                                                       'Appraisal, environmental, title, search, '
+                                                       'filing']]},
                                          { 'heading': 'SCHEDULE Part 3 — Payment Mechanics',
                                            'paragraphs': [ '(a)\u2003Success fees are earned upon '
                                                            'initial funding or first advance and '
@@ -6970,25 +7085,6 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'discrete deliverable independent of '
                                                            'whether the Transaction ultimately '
                                                            'funds:',
-                                                           'Milestone',
-                                                           'Fee Earned',
-                                                           'Cumulative',
-                                                           'Engagement and file intake',
-                                                           'Advisory + technology fee',
-                                                           '$2,750 – $5,500',
-                                                           'Financial model delivered',
-                                                           'Financial modeling fee',
-                                                           '$4,750 – $10,500',
-                                                           'Diligence and document package '
-                                                           'assembled',
-                                                           'Due diligence / doc prep fee',
-                                                           '$7,750 – $16,500',
-                                                           'Submission to Capital Source',
-                                                           'Underwriting & packaging fee',
-                                                           '$15,250 – $29,000',
-                                                           'Initial funding or first advance',
-                                                           'Success fee less amounts earned above',
-                                                           'Per Part 1',
                                                            'Cumulative amounts above are stated at '
                                                            'the standard low and standard high of '
                                                            'Part 2 and are illustrative of the '
@@ -6996,7 +7092,23 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'earned at each milestone is the amount '
                                                            'set in the applicable engagement '
                                                            'writing. Clawback allocation is '
-                                                           'governed by Section 16.8.']},
+                                                           'governed by Section 16.8.'],
+                                           'columns': ['Milestone', 'Fee Earned', 'Cumulative'],
+                                           'rows': [ [ 'Engagement and file intake',
+                                                       'Advisory + technology fee',
+                                                       '$2,750 – $5,500'],
+                                                     [ 'Financial model delivered',
+                                                       'Financial modeling fee',
+                                                       '$4,750 – $10,500'],
+                                                     [ 'Diligence and document package assembled',
+                                                       'Due diligence / doc prep fee',
+                                                       '$7,750 – $16,500'],
+                                                     [ 'Submission to Capital Source',
+                                                       'Underwriting & packaging fee',
+                                                       '$15,250 – $29,000'],
+                                                     [ 'Initial funding or first advance',
+                                                       'Success fee less amounts earned above',
+                                                       'Per Part 1']]},
                                          { 'heading': 'SCHEDULE Part 4 — Adjustment of Standard '
                                                       'Rates; Effect on Damages',
                                            'paragraphs': [ '(a)\u2003Adjustment permitted. '
@@ -7075,40 +7187,47 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'Commercial may update this Schedule '
                                                            'from time to time and shall provide '
                                                            'the Referral Partner with the '
-                                                           'then-current version upon request.',
-                                                           'Reg. No.',
-                                                           'Capital Source',
-                                                           'Program / Division',
-                                                           'Introduced Contact',
-                                                           'Client / Deal',
-                                                           'Date']},
+                                                           'then-current version upon request.'],
+                                           'columns': [ 'Reg. No.',
+                                                        'Capital Source',
+                                                        'Program / Division',
+                                                        'Introduced Contact',
+                                                        'Client / Deal',
+                                                        'Date'],
+                                           'rows': [['—', 'No entries yet.', '', '', '', '']]},
                                          { 'heading': 'EXHIBIT 1',
                                            'paragraphs': [ 'DEAL REGISTRATION AND INTRODUCTION '
                                                            'CONFIRMATION',
                                                            'Issued by Qualified Commercial LLC '
-                                                           'under Article 4 of the Agreement.',
-                                                           'Field',
-                                                           'Detail',
-                                                           'Registration Number',
-                                                           'QC-$deal_registration_number_prefix-$deal_registration_number_suffix',
-                                                           'Date and Time of Introduction',
-                                                           'Referral Partner',
-                                                           'Client / Borrower',
-                                                           'Financing Opportunity (type, amount, '
-                                                           'use of proceeds)',
-                                                           'Introduced Capital Source',
-                                                           'Introduced Program / Division',
-                                                           'Introduced Contact (name, title)',
-                                                           'Method of Introduction',
-                                                           '☐ Email ☐ Call ☐ Meeting ☐ Portal ☐ '
-                                                           'Other: '
-                                                           '$deal_registration_method_other_description',
-                                                           'Documents Transmitted',
-                                                           'Coded Designation (if staged '
-                                                           'disclosure)',
-                                                           'Capital Source No. '
-                                                           '$deal_registration_coded_capital_source_number',
-                                                           'Date Identity Disclosed']},
+                                                           'under Article 4 of the Agreement.'],
+                                           'columns': ['Field', 'Detail'],
+                                           'rows': [ [ 'Registration Number',
+                                                       'QC-$deal_registration_number_prefix-$deal_registration_number_suffix'],
+                                                     [ 'Date and Time of Introduction',
+                                                       '$deal_registration_introduced_at'],
+                                                     [ 'Referral Partner',
+                                                       '$referral_partner_legal_name'],
+                                                     [ 'Client / Borrower',
+                                                       '$deal_registration_client_borrower'],
+                                                     [ 'Financing Opportunity (type, amount, use '
+                                                       'of proceeds)',
+                                                       '$deal_registration_financing_opportunity'],
+                                                     [ 'Introduced Capital Source',
+                                                       '$deal_registration_introduced_capital_source'],
+                                                     [ 'Introduced Program / Division',
+                                                       '$deal_registration_introduced_program'],
+                                                     [ 'Introduced Contact (name, title)',
+                                                       '$deal_registration_introduced_contact'],
+                                                     [ 'Method of Introduction',
+                                                       '$deal_registration_method_of_introduction'],
+                                                     [ 'Documents Transmitted',
+                                                       '$deal_registration_documents_transmitted'],
+                                                     [ 'Coded Designation (if staged disclosure)',
+                                                       '$deal_registration_coded_designation'],
+                                                     [ 'Capital Source No.',
+                                                       '$deal_registration_coded_capital_source_number'],
+                                                     [ 'Date Identity Disclosed',
+                                                       '$deal_registration_date_identity_disclosed']]},
                                          { 'heading': 'EXHIBIT 2',
                                            'paragraphs': [ 'REPRESENTATIVE ACKNOWLEDGMENT AND '
                                                            'DIRECT UNDERTAKING',
@@ -7986,7 +8105,239 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                'in_scope_for_initial_signing': False,
                                                                                'raw_token': '',
                                                                                'field_type': 'text',
-                                                                               'row_group': None}}},
+                                                                               'row_group': None},
+                                             'deal_registration_introduced_at': { 'label': 'Deal '
+                                                                                           'Registration '
+                                                                                           '— '
+                                                                                           'Date/Time '
+                                                                                           'of '
+                                                                                           'Introduction',
+                                                                                  'default': '',
+                                                                                  'raw_token': '',
+                                                                                  'field_type': 'text',
+                                                                                  'row_group': None,
+                                                                                  'in_scope_for_initial_signing': False},
+                                             'deal_registration_client_borrower': { 'label': 'Deal '
+                                                                                             'Registration '
+                                                                                             '— '
+                                                                                             'Client '
+                                                                                             '/ '
+                                                                                             'Borrower',
+                                                                                    'default': '',
+                                                                                    'raw_token': '',
+                                                                                    'field_type': 'text',
+                                                                                    'row_group': None,
+                                                                                    'in_scope_for_initial_signing': False},
+                                             'deal_registration_financing_opportunity': { 'label': 'Deal '
+                                                                                                   'Registration '
+                                                                                                   '— '
+                                                                                                   'Financing '
+                                                                                                   'Opportunity',
+                                                                                          'default': '',
+                                                                                          'raw_token': '',
+                                                                                          'field_type': 'text',
+                                                                                          'row_group': None,
+                                                                                          'in_scope_for_initial_signing': False},
+                                             'deal_registration_introduced_capital_source': { 'label': 'Deal '
+                                                                                                       'Registration '
+                                                                                                       '— '
+                                                                                                       'Introduced '
+                                                                                                       'Capital '
+                                                                                                       'Source',
+                                                                                              'default': '',
+                                                                                              'raw_token': '',
+                                                                                              'field_type': 'text',
+                                                                                              'row_group': None,
+                                                                                              'in_scope_for_initial_signing': False},
+                                             'deal_registration_introduced_program': { 'label': 'Deal '
+                                                                                                'Registration '
+                                                                                                '— '
+                                                                                                'Introduced '
+                                                                                                'Program '
+                                                                                                '/ '
+                                                                                                'Division',
+                                                                                       'default': '',
+                                                                                       'raw_token': '',
+                                                                                       'field_type': 'text',
+                                                                                       'row_group': None,
+                                                                                       'in_scope_for_initial_signing': False},
+                                             'deal_registration_introduced_contact': { 'label': 'Deal '
+                                                                                                'Registration '
+                                                                                                '— '
+                                                                                                'Introduced '
+                                                                                                'Contact',
+                                                                                       'default': '',
+                                                                                       'raw_token': '',
+                                                                                       'field_type': 'text',
+                                                                                       'row_group': None,
+                                                                                       'in_scope_for_initial_signing': False},
+                                             'deal_registration_method_of_introduction': { 'label': 'Deal '
+                                                                                                    'Registration '
+                                                                                                    '— '
+                                                                                                    'Method '
+                                                                                                    'of '
+                                                                                                    'Introduction',
+                                                                                           'default': '',
+                                                                                           'raw_token': '',
+                                                                                           'field_type': 'text',
+                                                                                           'row_group': None,
+                                                                                           'in_scope_for_initial_signing': False},
+                                             'deal_registration_documents_transmitted': { 'label': 'Deal '
+                                                                                                   'Registration '
+                                                                                                   '— '
+                                                                                                   'Documents '
+                                                                                                   'Transmitted',
+                                                                                          'default': '',
+                                                                                          'raw_token': '',
+                                                                                          'field_type': 'text',
+                                                                                          'row_group': None,
+                                                                                          'in_scope_for_initial_signing': False},
+                                             'deal_registration_coded_designation': { 'label': 'Deal '
+                                                                                               'Registration '
+                                                                                               '— '
+                                                                                               'Coded '
+                                                                                               'Designation',
+                                                                                      'default': '',
+                                                                                      'raw_token': '',
+                                                                                      'field_type': 'text',
+                                                                                      'row_group': None,
+                                                                                      'in_scope_for_initial_signing': False},
+                                             'deal_registration_date_identity_disclosed': { 'label': 'Deal '
+                                                                                                     'Registration '
+                                                                                                     '— '
+                                                                                                     'Date '
+                                                                                                     'Identity '
+                                                                                                     'Disclosed',
+                                                                                            'default': '',
+                                                                                            'raw_token': '',
+                                                                                            'field_type': 'text',
+                                                                                            'row_group': None,
+                                                                                            'in_scope_for_initial_signing': False},
+                                             'schedule_a_institutional_rows': { 'label': 'Schedule '
+                                                                                         'A Part 1 '
+                                                                                         '— '
+                                                                                         'Institutional '
+                                                                                         'Relationships',
+                                                                                'default': '',
+                                                                                'raw_token': '',
+                                                                                'field_type': 'disclosure_rows',
+                                                                                'row_group': None,
+                                                                                'in_scope_for_initial_signing': True,
+                                                                                'table_columns': [ { 'key': 'institution',
+                                                                                                     'label': 'Institution',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'program_category',
+                                                                                                     'label': 'Program '
+                                                                                                              '/ '
+                                                                                                              'Category',
+                                                                                                     'input_type': 'select',
+                                                                                                     'options': [ 'SBA '
+                                                                                                                  '7(a) '
+                                                                                                                  '/ '
+                                                                                                                  'Express',
+                                                                                                                  'SBA '
+                                                                                                                  '504',
+                                                                                                                  'USDA '
+                                                                                                                  'B&I',
+                                                                                                                  'Commercial '
+                                                                                                                  'Real '
+                                                                                                                  'Estate '
+                                                                                                                  '/ '
+                                                                                                                  'DSCR',
+                                                                                                                  'Dealer '
+                                                                                                                  'Floorplan '
+                                                                                                                  '/ '
+                                                                                                                  'Dealer '
+                                                                                                                  'LOC',
+                                                                                                                  'Warranty '
+                                                                                                                  '/ '
+                                                                                                                  'Reinsurance '
+                                                                                                                  'Receivable',
+                                                                                                                  'Asset-Based '
+                                                                                                                  'Lending',
+                                                                                                                  'Bridge '
+                                                                                                                  '/ '
+                                                                                                                  'Private '
+                                                                                                                  'Credit',
+                                                                                                                  'Working '
+                                                                                                                  'Capital '
+                                                                                                                  '/ '
+                                                                                                                  'LOC',
+                                                                                                                  'Other']},
+                                                                                                   { 'key': 'division',
+                                                                                                     'label': 'Division '
+                                                                                                              '/ '
+                                                                                                              'Group',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'relationship_manager',
+                                                                                                     'label': 'Relationship '
+                                                                                                              'Manager',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'start_date',
+                                                                                                     'label': 'Start '
+                                                                                                              'Date',
+                                                                                                     'input_type': 'date'},
+                                                                                                   { 'key': 'active',
+                                                                                                     'label': 'Active?',
+                                                                                                     'input_type': 'checkbox'}]},
+                                             'schedule_a_other_capital_rows': { 'label': 'Schedule '
+                                                                                         'A Part 2 '
+                                                                                         '— Other '
+                                                                                         'Capital '
+                                                                                         'Relationships',
+                                                                                'default': '',
+                                                                                'raw_token': '',
+                                                                                'field_type': 'disclosure_rows',
+                                                                                'row_group': None,
+                                                                                'in_scope_for_initial_signing': True,
+                                                                                'table_columns': [ { 'key': 'counterparty',
+                                                                                                     'label': 'Counterparty',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'type',
+                                                                                                     'label': 'Type',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'program_facility',
+                                                                                                     'label': 'Program '
+                                                                                                              '/ '
+                                                                                                              'Facility',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'contact',
+                                                                                                     'label': 'Contact',
+                                                                                                     'input_type': 'text'},
+                                                                                                   { 'key': 'start_date',
+                                                                                                     'label': 'Start '
+                                                                                                              'Date',
+                                                                                                     'input_type': 'date'}]},
+                                             'schedule_a_pending_rows': { 'label': 'Schedule A '
+                                                                                   'Part 3 — '
+                                                                                   'Pending '
+                                                                                   'Applications '
+                                                                                   'and Active '
+                                                                                   'Pursuits',
+                                                                          'default': '',
+                                                                          'raw_token': '',
+                                                                          'field_type': 'disclosure_rows',
+                                                                          'row_group': None,
+                                                                          'in_scope_for_initial_signing': True,
+                                                                          'table_columns': [ { 'key': 'capital_source',
+                                                                                               'label': 'Capital '
+                                                                                                        'Source',
+                                                                                               'input_type': 'text'},
+                                                                                             { 'key': 'program_division',
+                                                                                               'label': 'Program '
+                                                                                                        '/ '
+                                                                                                        'Division',
+                                                                                               'input_type': 'text'},
+                                                                                             { 'key': 'date_submitted',
+                                                                                               'label': 'Date '
+                                                                                                        'Submitted '
+                                                                                                        'or '
+                                                                                                        'Initiated',
+                                                                                               'input_type': 'date'},
+                                                                                             { 'key': 'documentation_attached',
+                                                                                               'label': 'Documentation '
+                                                                                                        'Attached',
+                                                                                               'input_type': 'checkbox'}]}}},
   'platform_access': { 'cover': [ 'PLATFORM ACCESS AND',
                                   'TECHNOLOGY USE AGREEMENT',
                                   'QUALIFIED COMMERCIAL LLC',
@@ -8866,100 +9217,82 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'funded/committed amount, unless Underlying '
                                                       'Agreement is the SBA agreement, in which '
                                                       'case subject to the SOP cap)',
-                                           'paragraphs': [ 'Product / Program',
-                                                           'Minimum',
-                                                           'Maximum',
-                                                           'Rate for This File',
-                                                           'SBA 7(a) / 504 / USDA B&I',
-                                                           '1%',
-                                                           '3% (SOP cap governs)',
-                                                           '$success_fee_rate_sba_7a_504_usda',
-                                                           'Commercial Real Estate / DSCR',
-                                                           '3.5%',
-                                                           '5%',
-                                                           '$success_fee_rate_cre_dscr',
-                                                           'Dealer Floorplan / Dealer LOC',
-                                                           '3%',
-                                                           '5%',
-                                                           '$success_fee_rate_dealer_floorplan_loc',
-                                                           'Warranty / Reinsurance Receivable',
-                                                           '3.5%',
-                                                           '5%',
-                                                           '$success_fee_rate_warranty_reinsurance',
-                                                           'Asset-Based Lending',
-                                                           '3%',
-                                                           '5%',
-                                                           '$success_fee_rate_asset_based_lending',
-                                                           'Bridge / Private Credit',
-                                                           '5%',
-                                                           '10%',
-                                                           '$success_fee_rate_bridge_private_credit',
-                                                           'Working Capital / Line of Credit',
-                                                           '3.5%',
-                                                           '5%',
-                                                           '$success_fee_rate_working_capital_loc',
-                                                           'Other: $success_fee_other_product_name',
-                                                           '$success_fee_other_product_min_rate',
-                                                           '$success_fee_other_product_max_rate',
-                                                           '$success_fee_other_product_rate_this_file']},
+                                           'paragraphs': [],
+                                           'columns': [ 'Product / Program',
+                                                        'Minimum',
+                                                        'Maximum',
+                                                        'Rate for This File'],
+                                           'rows': [ [ 'SBA 7(a) / 504 / USDA B&I',
+                                                       '1%',
+                                                       '3% (SOP cap governs)',
+                                                       '$success_fee_rate_sba_7a_504_usda'],
+                                                     [ 'Commercial Real Estate / DSCR',
+                                                       '3.5%',
+                                                       '5%',
+                                                       '$success_fee_rate_cre_dscr'],
+                                                     [ 'Dealer Floorplan / Dealer LOC',
+                                                       '3%',
+                                                       '5%',
+                                                       '$success_fee_rate_dealer_floorplan_loc'],
+                                                     [ 'Warranty / Reinsurance Receivable',
+                                                       '3.5%',
+                                                       '5%',
+                                                       '$success_fee_rate_warranty_reinsurance'],
+                                                     [ 'Asset-Based Lending',
+                                                       '3%',
+                                                       '5%',
+                                                       '$success_fee_rate_asset_based_lending'],
+                                                     [ 'Bridge / Private Credit',
+                                                       '5%',
+                                                       '10%',
+                                                       '$success_fee_rate_bridge_private_credit'],
+                                                     [ 'Working Capital / Line of Credit',
+                                                       '3.5%',
+                                                       '5%',
+                                                       '$success_fee_rate_working_capital_loc'],
+                                                     [ 'Other: $success_fee_other_product_name',
+                                                       '$success_fee_other_product_min_rate',
+                                                       '$success_fee_other_product_max_rate',
+                                                       '$success_fee_other_product_rate_this_file']]},
                                          { 'heading': 'SCHEDULE Part 2 — Flat and Milestone Fee '
                                                       'Types',
-                                           'paragraphs': [ 'Fee Type',
-                                                           'Minimum',
-                                                           'Maximum',
-                                                           'Fee for This File',
-                                                           'Advisory / engagement fee',
-                                                           '$2,500',
-                                                           '$5,000',
-                                                           '$flat_fee_this_file_advisory_engagement',
-                                                           'Underwriting & packaging fee',
-                                                           '$7,500',
-                                                           '$12,500',
-                                                           '$flat_fee_this_file_underwriting_packaging',
-                                                           'Financial modeling fee',
-                                                           '$2,000',
-                                                           '$5,000',
-                                                           '$flat_fee_this_file_financial_modeling',
-                                                           'Due diligence / document prep',
-                                                           '$3,000',
-                                                           '$6,000',
-                                                           '$flat_fee_this_file_due_diligence_doc_prep',
-                                                           'Technology fee',
-                                                           '$250',
-                                                           '$500',
-                                                           '$flat_fee_this_file_technology',
-                                                           'Consulting services under Article 2',
-                                                           '$consulting_services_article2_fee_min',
-                                                           '$consulting_services_article2_fee_max',
-                                                           '$consulting_services_article2_fee_this_file',
-                                                           'Third-party cost reimbursement',
-                                                           'At cost',
-                                                           'At cost',
-                                                           'At cost']},
+                                           'paragraphs': [],
+                                           'columns': [ 'Fee Type',
+                                                        'Minimum',
+                                                        'Maximum',
+                                                        'Fee for This File'],
+                                           'rows': [ [ 'Advisory / engagement fee',
+                                                       '$2,500',
+                                                       '$5,000',
+                                                       '$flat_fee_this_file_advisory_engagement'],
+                                                     [ 'Underwriting & packaging fee',
+                                                       '$7,500',
+                                                       '$12,500',
+                                                       '$flat_fee_this_file_underwriting_packaging'],
+                                                     [ 'Financial modeling fee',
+                                                       '$2,000',
+                                                       '$5,000',
+                                                       '$flat_fee_this_file_financial_modeling'],
+                                                     [ 'Due diligence / document prep',
+                                                       '$3,000',
+                                                       '$6,000',
+                                                       '$flat_fee_this_file_due_diligence_doc_prep'],
+                                                     [ 'Technology fee',
+                                                       '$250',
+                                                       '$500',
+                                                       '$flat_fee_this_file_technology'],
+                                                     [ 'Consulting services under Article 2',
+                                                       '$consulting_services_article2_fee_min',
+                                                       '$consulting_services_article2_fee_max',
+                                                       '$consulting_services_article2_fee_this_file'],
+                                                     [ 'Third-party cost reimbursement',
+                                                       'At cost',
+                                                       'At cost',
+                                                       'At cost']]},
                                          { 'heading': 'SCHEDULE Part 3 — Retainer and Milestones',
                                            'paragraphs': [ 'Retainer due at execution of this '
                                                            'Addendum: '
                                                            '$retainer_due_at_execution_amount.',
-                                                           'Milestone',
-                                                           'Fee Earned',
-                                                           'Cumulative',
-                                                           'Engagement and file intake',
-                                                           'Advisory + technology fee',
-                                                           '$2,750 – $5,500',
-                                                           'Financial model delivered',
-                                                           'Financial modeling fee',
-                                                           '$4,750 – $10,500',
-                                                           'Diligence and document package '
-                                                           'assembled',
-                                                           'Due diligence / doc prep fee',
-                                                           '$7,750 – $16,500',
-                                                           'Submission to Capital Source / Program '
-                                                           'Lender',
-                                                           'Underwriting & packaging fee',
-                                                           '$15,250 – $29,000',
-                                                           'Initial funding or first advance',
-                                                           'Success fee less amounts earned above',
-                                                           'Per Part 1',
                                                            'Cumulative amounts are stated at the '
                                                            'standard minimum and maximum of Part 2 '
                                                            'and are illustrative; the amount '
@@ -8968,7 +9301,24 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'for this engagement.',
                                                            'Paid by: ☐ Lender ☐ Client ☐ Both, '
                                                            'allocated as follows: '
-                                                           '$retainer_payment_allocation_description']}],
+                                                           '$retainer_payment_allocation_description'],
+                                           'columns': ['Milestone', 'Fee Earned', 'Cumulative'],
+                                           'rows': [ [ 'Engagement and file intake',
+                                                       'Advisory + technology fee',
+                                                       '$2,750 – $5,500'],
+                                                     [ 'Financial model delivered',
+                                                       'Financial modeling fee',
+                                                       '$4,750 – $10,500'],
+                                                     [ 'Diligence and document package assembled',
+                                                       'Due diligence / doc prep fee',
+                                                       '$7,750 – $16,500'],
+                                                     [ 'Submission to Capital Source / Program '
+                                                       'Lender',
+                                                       'Underwriting & packaging fee',
+                                                       '$15,250 – $29,000'],
+                                                     [ 'Initial funding or first advance',
+                                                       'Success fee less amounts earned above',
+                                                       'Per Part 1']]}],
                            'field_schema': { 'client_legal_name': { 'label': 'Client legal name',
                                                                     'default': '',
                                                                     'raw_token': '[CLIENT LEGAL '
