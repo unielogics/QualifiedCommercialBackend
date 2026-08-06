@@ -3,7 +3,8 @@ scripts/apply_contract_field_renames.py +
 scripts/patch_qc_own_field_defaults.py + 
 scripts/patch_venue_county_default.py + 
 scripts/patch_schedule_b_retainer_defaults.py + 
-scripts/patch_qc_own_fields_out_of_scope.py from the source .docx contract
+scripts/patch_qc_own_fields_out_of_scope.py + 
+scripts/patch_signature_blocks.py from the source .docx contract
 text. Do not hand-edit generated dict literals directly here -- change
 contract_templates.py's post-processing instead, or re-run the generator
 against a corrected source .txt.
@@ -1480,6 +1481,20 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                          'independent legal counsel of its own '
                                                          'choosing, and executes it voluntarily '
                                                          'and without duress or undue influence.']},
+                                       { 'heading': 'SIGNATURES',
+                                         'paragraphs': [ 'IN WITNESS WHEREOF, the Parties have '
+                                                         'executed this Agreement as of the '
+                                                         'Effective Date.',
+                                                         'QUALIFIED COMMERCIAL LLC',
+                                                         'By: $qc_signatory_name',
+                                                         'Name: $qc_signatory_name',
+                                                         'Title: $qc_signatory_title',
+                                                         'Date: $effective_date',
+                                                         '$client_legal_name',
+                                                         'By: $counterparty_signatory_name',
+                                                         'Name: $counterparty_signatory_name',
+                                                         'Title: $counterparty_signatory_title',
+                                                         'Date: $effective_date']},
                                        { 'heading': 'SCHEDULE 1',
                                          'paragraphs': ['TRANSACTION DESCRIPTION AND FEE TERMS']},
                                        { 'heading': 'SCHEDULE Part 1 — The Financing Request',
@@ -2190,7 +2205,37 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                     'raw_token': '$________',
                                                                     'field_type': 'currency',
                                                                     'row_group': 'flat_milestone_fee_by_type',
-                                                                    'in_scope_for_initial_signing': True}}},
+                                                                    'in_scope_for_initial_signing': True},
+                                           'qc_signatory_name': { 'label': 'Qualified Commercial '
+                                                                           'Signatory Name',
+                                                                  'default': 'Jonathan Franco',
+                                                                  'in_scope_for_initial_signing': False,
+                                                                  'raw_token': '',
+                                                                  'field_type': 'text',
+                                                                  'row_group': None},
+                                           'qc_signatory_title': { 'label': 'Qualified Commercial '
+                                                                            'Signatory Title',
+                                                                   'default': 'Executive Partner',
+                                                                   'in_scope_for_initial_signing': False,
+                                                                   'raw_token': '',
+                                                                   'field_type': 'text',
+                                                                   'row_group': None},
+                                           'counterparty_signatory_name': { 'label': 'Counterparty '
+                                                                                     'Signatory '
+                                                                                     'Name',
+                                                                            'default': '',
+                                                                            'in_scope_for_initial_signing': False,
+                                                                            'raw_token': '',
+                                                                            'field_type': 'text',
+                                                                            'row_group': None},
+                                           'counterparty_signatory_title': { 'label': 'Counterparty '
+                                                                                      'Signatory '
+                                                                                      'Title',
+                                                                             'default': '',
+                                                                             'in_scope_for_initial_signing': False,
+                                                                             'raw_token': '',
+                                                                             'field_type': 'text',
+                                                                             'row_group': None}}},
   'sba_engagement': { 'cover': [ 'SBA ADVISORY AND',
                                  'PACKAGING ENGAGEMENT AGREEMENT',
                                  'QUALIFIED COMMERCIAL LLC',
@@ -3295,6 +3340,20 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                       'understands its terms, has had a full '
                                                       'opportunity to consult independent legal '
                                                       'counsel, and executes it voluntarily.']},
+                                    { 'heading': 'SIGNATURES',
+                                      'paragraphs': [ 'IN WITNESS WHEREOF, the Parties have '
+                                                      'executed this Agreement as of the Effective '
+                                                      'Date.',
+                                                      'QUALIFIED COMMERCIAL LLC',
+                                                      'By: $qc_signatory_name',
+                                                      'Name: $qc_signatory_name',
+                                                      'Title: $qc_signatory_title',
+                                                      'Date: $effective_date',
+                                                      '$client_legal_name',
+                                                      'By: $counterparty_signatory_name',
+                                                      'Name: $counterparty_signatory_name',
+                                                      'Title: $counterparty_signatory_title',
+                                                      'Date: $effective_date']},
                                     { 'heading': 'SCHEDULE 1',
                                       'paragraphs': ['TRANSACTION DESCRIPTION AND FEE TERMS']},
                                     { 'heading': 'SCHEDULE Part 1 — The Loan Request',
@@ -3652,7 +3711,36 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                             'raw_token': '____________________________',
                                                                             'field_type': 'text',
                                                                             'row_group': None,
-                                                                            'in_scope_for_initial_signing': False}}},
+                                                                            'in_scope_for_initial_signing': False},
+                                        'qc_signatory_name': { 'label': 'Qualified Commercial '
+                                                                        'Signatory Name',
+                                                               'default': 'Jonathan Franco',
+                                                               'in_scope_for_initial_signing': False,
+                                                               'raw_token': '',
+                                                               'field_type': 'text',
+                                                               'row_group': None},
+                                        'qc_signatory_title': { 'label': 'Qualified Commercial '
+                                                                         'Signatory Title',
+                                                                'default': 'Executive Partner',
+                                                                'in_scope_for_initial_signing': False,
+                                                                'raw_token': '',
+                                                                'field_type': 'text',
+                                                                'row_group': None},
+                                        'counterparty_signatory_name': { 'label': 'Counterparty '
+                                                                                  'Signatory Name',
+                                                                         'default': '',
+                                                                         'in_scope_for_initial_signing': False,
+                                                                         'raw_token': '',
+                                                                         'field_type': 'text',
+                                                                         'row_group': None},
+                                        'counterparty_signatory_title': { 'label': 'Counterparty '
+                                                                                   'Signatory '
+                                                                                   'Title',
+                                                                          'default': '',
+                                                                          'in_scope_for_initial_signing': False,
+                                                                          'raw_token': '',
+                                                                          'field_type': 'text',
+                                                                          'row_group': None}}},
   'referral_protection': { 'cover': [ 'STRATEGIC REFERRAL, CAPITAL ADVISORY',
                                       'AND BUSINESS RELATIONSHIP',
                                       'PROTECTION AGREEMENT',
@@ -6532,6 +6620,20 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'regarding this Agreement, and executes '
                                                            'it voluntarily and without duress or '
                                                            'undue influence.']},
+                                         { 'heading': 'SIGNATURES',
+                                           'paragraphs': [ 'IN WITNESS WHEREOF, the Parties have '
+                                                           'executed this Agreement as of the '
+                                                           'Effective Date.',
+                                                           'QUALIFIED COMMERCIAL LLC',
+                                                           'By: $qc_signatory_name',
+                                                           'Name: $qc_signatory_name',
+                                                           'Title: $qc_signatory_title',
+                                                           'Date: $effective_date',
+                                                           '$referral_partner_legal_name',
+                                                           'By: $counterparty_signatory_name',
+                                                           'Name: $counterparty_signatory_name',
+                                                           'Title: $counterparty_signatory_title',
+                                                           'Date: $effective_date']},
                                          { 'heading': 'SCHEDULE A',
                                            'paragraphs': [ 'DISCLOSURE OF EXISTING CAPITAL '
                                                            'RELATIONSHIPS AND FINANCING PROGRAMS',
@@ -7853,7 +7955,38 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                  'raw_token': '____________________________________',
                                                                                  'field_type': 'text',
                                                                                  'row_group': None,
-                                                                                 'in_scope_for_initial_signing': False}}},
+                                                                                 'in_scope_for_initial_signing': False},
+                                             'qc_signatory_name': { 'label': 'Qualified Commercial '
+                                                                             'Signatory Name',
+                                                                    'default': 'Jonathan Franco',
+                                                                    'in_scope_for_initial_signing': False,
+                                                                    'raw_token': '',
+                                                                    'field_type': 'text',
+                                                                    'row_group': None},
+                                             'qc_signatory_title': { 'label': 'Qualified '
+                                                                              'Commercial '
+                                                                              'Signatory Title',
+                                                                     'default': 'Executive Partner',
+                                                                     'in_scope_for_initial_signing': False,
+                                                                     'raw_token': '',
+                                                                     'field_type': 'text',
+                                                                     'row_group': None},
+                                             'counterparty_signatory_name': { 'label': 'Counterparty '
+                                                                                       'Signatory '
+                                                                                       'Name',
+                                                                              'default': '',
+                                                                              'in_scope_for_initial_signing': False,
+                                                                              'raw_token': '',
+                                                                              'field_type': 'text',
+                                                                              'row_group': None},
+                                             'counterparty_signatory_title': { 'label': 'Counterparty '
+                                                                                        'Signatory '
+                                                                                        'Title',
+                                                                               'default': '',
+                                                                               'in_scope_for_initial_signing': False,
+                                                                               'raw_token': '',
+                                                                               'field_type': 'text',
+                                                                               'row_group': None}}},
   'platform_access': { 'cover': [ 'PLATFORM ACCESS AND',
                                   'TECHNOLOGY USE AGREEMENT',
                                   'QUALIFIED COMMERCIAL LLC',
@@ -8149,7 +8282,27 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                        'unenforceable, it shall be modified to the '
                                                        'minimum extent necessary to be '
                                                        'enforceable, and the remainder shall '
-                                                       'continue in full force.']}],
+                                                       'continue in full force.']},
+                                     { 'heading': 'ACKNOWLEDGMENT',
+                                       'paragraphs': [ 'By signing below, User acknowledges having '
+                                                       'read this Agreement, understands that '
+                                                       'Platform access will not be granted or '
+                                                       'will be revoked absent a signed copy on '
+                                                       'file with Qualified Commercial, and agrees '
+                                                       'to be bound by its terms.',
+                                                       'USER',
+                                                       'Signature: $individual_name',
+                                                       'Print Name: $individual_name',
+                                                       'Title / Role at Referral Partner: '
+                                                       '$counterparty_signatory_title',
+                                                       'Referral Partner: '
+                                                       '$referral_partner_legal_name',
+                                                       'Date: $effective_date',
+                                                       'QUALIFIED COMMERCIAL LLC',
+                                                       'By: $qc_signatory_name',
+                                                       'Name: $qc_signatory_name',
+                                                       'Title: $qc_signatory_title',
+                                                       'Date: $effective_date']}],
                        'field_schema': { 'individual_name': { 'label': 'Individual (User) name',
                                                               'default': '',
                                                               'raw_token': '[INDIVIDUAL NAME]',
@@ -8191,7 +8344,36 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                               'raw_token': '______________',
                                                               'field_type': 'text',
                                                               'row_group': None,
-                                                              'in_scope_for_initial_signing': False}}},
+                                                              'in_scope_for_initial_signing': False},
+                                         'qc_signatory_name': { 'label': 'Qualified Commercial '
+                                                                         'Signatory Name',
+                                                                'default': 'Jonathan Franco',
+                                                                'in_scope_for_initial_signing': False,
+                                                                'raw_token': '',
+                                                                'field_type': 'text',
+                                                                'row_group': None},
+                                         'qc_signatory_title': { 'label': 'Qualified Commercial '
+                                                                          'Signatory Title',
+                                                                 'default': 'Executive Partner',
+                                                                 'in_scope_for_initial_signing': False,
+                                                                 'raw_token': '',
+                                                                 'field_type': 'text',
+                                                                 'row_group': None},
+                                         'counterparty_signatory_name': { 'label': 'Counterparty '
+                                                                                   'Signatory Name',
+                                                                          'default': '',
+                                                                          'in_scope_for_initial_signing': False,
+                                                                          'raw_token': '',
+                                                                          'field_type': 'text',
+                                                                          'row_group': None},
+                                         'counterparty_signatory_title': { 'label': 'Counterparty '
+                                                                                    'Signatory '
+                                                                                    'Title',
+                                                                           'default': '',
+                                                                           'in_scope_for_initial_signing': False,
+                                                                           'raw_token': '',
+                                                                           'field_type': 'text',
+                                                                           'row_group': None}}},
   'consulting_addendum': { 'cover': [ 'CONSULTING AND FEE SCHEDULE',
                                       'ADDENDUM',
                                       'QUALIFIED COMMERCIAL LLC',
@@ -8648,6 +8830,24 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                            'governing law, venue, and '
                                                            'dispute-resolution provisions as the '
                                                            'Underlying Agreement.']},
+                                         { 'heading': 'SIGNATURES',
+                                           'paragraphs': [ 'IN WITNESS WHEREOF, the parties have '
+                                                           'executed this Addendum as of the '
+                                                           'Effective Date, to attach to and be '
+                                                           'incorporated into the Underlying '
+                                                           'Agreement identified in Section 1.1.',
+                                                           'QUALIFIED COMMERCIAL LLC',
+                                                           'By: $qc_signatory_name',
+                                                           'Name: $qc_signatory_name',
+                                                           'Title: $qc_signatory_title',
+                                                           'Date: '
+                                                           '$underlying_agreement_effective_date',
+                                                           '$client_legal_name',
+                                                           'By: $counterparty_signatory_name',
+                                                           'Name: $counterparty_signatory_name',
+                                                           'Title: $counterparty_signatory_title',
+                                                           'Date: '
+                                                           '$underlying_agreement_effective_date']},
                                          { 'heading': 'SCHEDULE 1',
                                            'paragraphs': [ 'FEE SCHEDULE',
                                                            'This Schedule states Qualified '
@@ -9074,4 +9274,35 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                           'raw_token': '______________________________________',
                                                                                           'field_type': 'text',
                                                                                           'row_group': None,
-                                                                                          'in_scope_for_initial_signing': True}}}}
+                                                                                          'in_scope_for_initial_signing': True},
+                                             'qc_signatory_name': { 'label': 'Qualified Commercial '
+                                                                             'Signatory Name',
+                                                                    'default': 'Jonathan Franco',
+                                                                    'in_scope_for_initial_signing': False,
+                                                                    'raw_token': '',
+                                                                    'field_type': 'text',
+                                                                    'row_group': None},
+                                             'qc_signatory_title': { 'label': 'Qualified '
+                                                                              'Commercial '
+                                                                              'Signatory Title',
+                                                                     'default': 'Executive Partner',
+                                                                     'in_scope_for_initial_signing': False,
+                                                                     'raw_token': '',
+                                                                     'field_type': 'text',
+                                                                     'row_group': None},
+                                             'counterparty_signatory_name': { 'label': 'Counterparty '
+                                                                                       'Signatory '
+                                                                                       'Name',
+                                                                              'default': '',
+                                                                              'in_scope_for_initial_signing': False,
+                                                                              'raw_token': '',
+                                                                              'field_type': 'text',
+                                                                              'row_group': None},
+                                             'counterparty_signatory_title': { 'label': 'Counterparty '
+                                                                                        'Signatory '
+                                                                                        'Title',
+                                                                               'default': '',
+                                                                               'in_scope_for_initial_signing': False,
+                                                                               'raw_token': '',
+                                                                               'field_type': 'text',
+                                                                               'row_group': None}}}}
