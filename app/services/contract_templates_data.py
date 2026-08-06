@@ -8223,13 +8223,8 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                 'field_type': 'disclosure_rows',
                                                                                 'row_group': None,
                                                                                 'in_scope_for_initial_signing': True,
-                                                                                'table_columns': [ { 'key': 'institution',
-                                                                                                     'label': 'Institution',
-                                                                                                     'input_type': 'text'},
-                                                                                                   { 'key': 'program_category',
-                                                                                                     'label': 'Program '
-                                                                                                              '/ '
-                                                                                                              'Category',
+                                                                                'table_columns': [ { 'key': 'program',
+                                                                                                     'label': 'Program',
                                                                                                      'input_type': 'select',
                                                                                                      'options': [ 'SBA '
                                                                                                                   '7(a) '
@@ -8264,6 +8259,21 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                                                   '/ '
                                                                                                                   'LOC',
                                                                                                                   'Other']},
+                                                                                                   { 'key': 'bank_name',
+                                                                                                     'label': 'Bank '
+                                                                                                              '/ '
+                                                                                                              'Institution '
+                                                                                                              'Name '
+                                                                                                              '(must '
+                                                                                                              'be '
+                                                                                                              'a '
+                                                                                                              'bank '
+                                                                                                              '— '
+                                                                                                              'no '
+                                                                                                              'brokers '
+                                                                                                              'or '
+                                                                                                              'intermediaries)',
+                                                                                                     'input_type': 'text'},
                                                                                                    { 'key': 'division',
                                                                                                      'label': 'Division '
                                                                                                               '/ '
@@ -8290,16 +8300,47 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                                 'field_type': 'disclosure_rows',
                                                                                 'row_group': None,
                                                                                 'in_scope_for_initial_signing': True,
-                                                                                'table_columns': [ { 'key': 'counterparty',
+                                                                                'table_columns': [ { 'key': 'program',
+                                                                                                     'label': 'Program',
+                                                                                                     'input_type': 'select',
+                                                                                                     'options': [ 'SBA '
+                                                                                                                  '7(a) '
+                                                                                                                  '/ '
+                                                                                                                  'Express',
+                                                                                                                  'SBA '
+                                                                                                                  '504',
+                                                                                                                  'USDA '
+                                                                                                                  'B&I',
+                                                                                                                  'Commercial '
+                                                                                                                  'Real '
+                                                                                                                  'Estate '
+                                                                                                                  '/ '
+                                                                                                                  'DSCR',
+                                                                                                                  'Dealer '
+                                                                                                                  'Floorplan '
+                                                                                                                  '/ '
+                                                                                                                  'Dealer '
+                                                                                                                  'LOC',
+                                                                                                                  'Warranty '
+                                                                                                                  '/ '
+                                                                                                                  'Reinsurance '
+                                                                                                                  'Receivable',
+                                                                                                                  'Asset-Based '
+                                                                                                                  'Lending',
+                                                                                                                  'Bridge '
+                                                                                                                  '/ '
+                                                                                                                  'Private '
+                                                                                                                  'Credit',
+                                                                                                                  'Working '
+                                                                                                                  'Capital '
+                                                                                                                  '/ '
+                                                                                                                  'LOC',
+                                                                                                                  'Other']},
+                                                                                                   { 'key': 'counterparty',
                                                                                                      'label': 'Counterparty',
                                                                                                      'input_type': 'text'},
                                                                                                    { 'key': 'type',
                                                                                                      'label': 'Type',
-                                                                                                     'input_type': 'text'},
-                                                                                                   { 'key': 'program_facility',
-                                                                                                     'label': 'Program '
-                                                                                                              '/ '
-                                                                                                              'Facility',
                                                                                                      'input_type': 'text'},
                                                                                                    { 'key': 'contact',
                                                                                                      'label': 'Contact',
@@ -8319,14 +8360,45 @@ CONTRACT_RAW_DATA: dict = { 'client_engagement': { 'cover': [ 'CAPITAL ADVISORY 
                                                                           'field_type': 'disclosure_rows',
                                                                           'row_group': None,
                                                                           'in_scope_for_initial_signing': True,
-                                                                          'table_columns': [ { 'key': 'capital_source',
+                                                                          'table_columns': [ { 'key': 'program',
+                                                                                               'label': 'Program',
+                                                                                               'input_type': 'select',
+                                                                                               'options': [ 'SBA '
+                                                                                                            '7(a) '
+                                                                                                            '/ '
+                                                                                                            'Express',
+                                                                                                            'SBA '
+                                                                                                            '504',
+                                                                                                            'USDA '
+                                                                                                            'B&I',
+                                                                                                            'Commercial '
+                                                                                                            'Real '
+                                                                                                            'Estate '
+                                                                                                            '/ '
+                                                                                                            'DSCR',
+                                                                                                            'Dealer '
+                                                                                                            'Floorplan '
+                                                                                                            '/ '
+                                                                                                            'Dealer '
+                                                                                                            'LOC',
+                                                                                                            'Warranty '
+                                                                                                            '/ '
+                                                                                                            'Reinsurance '
+                                                                                                            'Receivable',
+                                                                                                            'Asset-Based '
+                                                                                                            'Lending',
+                                                                                                            'Bridge '
+                                                                                                            '/ '
+                                                                                                            'Private '
+                                                                                                            'Credit',
+                                                                                                            'Working '
+                                                                                                            'Capital '
+                                                                                                            '/ '
+                                                                                                            'LOC',
+                                                                                                            'Other']},
+                                                                                             { 'key': 'capital_source',
                                                                                                'label': 'Capital '
                                                                                                         'Source',
-                                                                                               'input_type': 'text'},
-                                                                                             { 'key': 'program_division',
-                                                                                               'label': 'Program '
-                                                                                                        '/ '
-                                                                                                        'Division',
                                                                                                'input_type': 'text'},
                                                                                              { 'key': 'date_submitted',
                                                                                                'label': 'Date '

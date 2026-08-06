@@ -11,10 +11,22 @@ render_contract_document() replaces their static rows with whatever the
 signer actually submits for that field (or a "None disclosed" placeholder
 row if nothing was submitted).
 
-Institutional Relationships' "program_category" column uses Schedule B's
-own product-category list (the categories of loan types this contract
-already defines), per the confirmed design -- not the unrelated real-estate
-LoanType enum.
+Program-first design (per explicit correction from the prior version of
+this patch, which led with the institution/counterparty/capital-source
+name): the business cares about which LENDING PROGRAM is being disclosed,
+not which bank holds it. Every one of the 3 tables now leads with a
+"Program" select column drawn from Schedule B's own product-category list
+(the categories of loan types this contract already defines -- not the
+unrelated real-estate LoanType enum), with the counterparty name as the
+SECOND column:
+  - Part 1 (Institutional Relationships): must be a bank/institution, no
+    broker/intermediary -- "Bank / Institution Name" is a plain required
+    text field (no separate broker-name option offered).
+  - Part 2 (Other Capital Relationships): non-bank sources by definition
+    (private credit funds, factors, floorplan providers, etc.) -- keeps its
+    "Counterparty" field as the second column.
+  - Part 3 (Pending Applications): "Capital Source" as the second column,
+    same program-first ordering.
 
 Usage: python scripts/patch_schedule_a_disclosure_fields.py
 Edits app/services/contract_templates_data.py in place.
@@ -50,8 +62,8 @@ DISCLOSURE_FIELDS = {
         "label": "Schedule A Part 1 — Institutional Relationships",
         "section_heading": "SCHEDULE Part 1 — Institutional Relationships",
         "table_columns": [
-            {"key": "institution", "label": "Institution", "input_type": "text"},
-            {"key": "program_category", "label": "Program / Category", "input_type": "select", "options": PROGRAM_CATEGORIES},
+            {"key": "program", "label": "Program", "input_type": "select", "options": PROGRAM_CATEGORIES},
+            {"key": "bank_name", "label": "Bank / Institution Name (must be a bank — no brokers or intermediaries)", "input_type": "text"},
             {"key": "division", "label": "Division / Group", "input_type": "text"},
             {"key": "relationship_manager", "label": "Relationship Manager", "input_type": "text"},
             {"key": "start_date", "label": "Start Date", "input_type": "date"},
@@ -67,9 +79,9 @@ DISCLOSURE_FIELDS = {
             "lessors, floorplan providers, warehouse lines, and any other source of capital or credit."
         ),
         "table_columns": [
+            {"key": "program", "label": "Program", "input_type": "select", "options": PROGRAM_CATEGORIES},
             {"key": "counterparty", "label": "Counterparty", "input_type": "text"},
             {"key": "type", "label": "Type", "input_type": "text"},
-            {"key": "program_facility", "label": "Program / Facility", "input_type": "text"},
             {"key": "contact", "label": "Contact", "input_type": "text"},
             {"key": "start_date", "label": "Start Date", "input_type": "date"},
         ],
@@ -82,8 +94,8 @@ DISCLOSURE_FIELDS = {
             "demonstrably pursuing, as of the Effective Date. Attach contemporaneous documentation for each."
         ),
         "table_columns": [
+            {"key": "program", "label": "Program", "input_type": "select", "options": PROGRAM_CATEGORIES},
             {"key": "capital_source", "label": "Capital Source", "input_type": "text"},
-            {"key": "program_division", "label": "Program / Division", "input_type": "text"},
             {"key": "date_submitted", "label": "Date Submitted or Initiated", "input_type": "date"},
             {"key": "documentation_attached", "label": "Documentation Attached", "input_type": "checkbox"},
         ],
@@ -119,11 +131,21 @@ if __name__ == "__main__":
             "table_columns": info["table_columns"],
         }
         sec = _find_section(sections, info["section_heading"])
-        # Every paragraph in these 3 sections up to and including the
-        # certification/signature lines is either a bare column-header
-        # string (now superseded by table_columns' own labels) or, for
-        # Part 3 only, the trailing CERTIFICATION/By:/Name:/Title:/Date:
-        # block, which must be preserved verbatim.
+        if sec.get("disclosure_field") == field_name:
+            # Already wired by a prior run of this script -- the raw
+            # column-header paragraphs were stripped then; re-stripping now
+            # against a DIFFERENT table_columns count (this run changes the
+            # column set) would eat real trailing content (Part 3's
+            # CERTIFICATION/By:/Name:/Title:/Date: block). Just refresh
+            # table_columns on the field_schema entry above; leave
+            # `paragraphs` untouched.
+            print(f"referral_protection: {sec['heading']!r} already wired -- refreshed table_columns only")
+            continue
+        # First-run only: every paragraph in these 3 sections up to and
+        # including the certification/signature lines is either a bare
+        # column-header string (now superseded by table_columns' own
+        # labels) or, for Part 3 only, the trailing CERTIFICATION/By:/
+        # Name:/Title:/Date: block, which must be preserved verbatim.
         header_count = len(info["table_columns"]) if field_name != "schedule_a_institutional_rows" else 6
         sec["paragraphs"] = sec["paragraphs"][header_count:]
         sec["disclosure_field"] = field_name
