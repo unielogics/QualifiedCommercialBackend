@@ -44,6 +44,14 @@ def scope_client_query(user, stmt: "Select") -> "Select":
         return stmt.where(Client.broker_id == user.broker.id)
     if user.role == Role.REGIONAL_MANAGER:
         return stmt.where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+    if user.role == Role.DEALER_PARTNER:
+        # No book-of-business (see Role.DEALER_PARTNER's own docstring in
+        # app/enums.py) -- this role's only client-relevant surface is its
+        # own broker_router endpoints, which query PublicUnderwritingIntake
+        # directly and never go through this helper. Deny by default rather
+        # than silently falling through to the SUPER_ADMIN/LOAN_EXEC
+        # unfiltered case below.
+        return stmt.where(sql_false())
     return stmt
 
 
@@ -51,7 +59,8 @@ def scope_loan_query(user, stmt: "Select") -> "Select":
     """Scope a `select(Loan)` to rows the calling user may see.
 
     SUPER_ADMIN and LOAN_EXEC see everything; BROKER is restricted to
-    their assigned loans; CLIENT is restricted to their own loans.
+    their assigned loans; CLIENT is restricted to their own loans;
+    DEALER_PARTNER has no book-of-business and sees nothing.
     """
     if user.role == Role.CLIENT:
         if user.client is None:
@@ -63,6 +72,8 @@ def scope_loan_query(user, stmt: "Select") -> "Select":
         return stmt.where(Loan.broker_id == user.broker.id)
     if user.role == Role.REGIONAL_MANAGER:
         return stmt.where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
+    if user.role == Role.DEALER_PARTNER:
+        return stmt.where(sql_false())
     return stmt
 
 

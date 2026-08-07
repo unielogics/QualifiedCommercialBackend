@@ -74,6 +74,10 @@ def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
             (CalendarEvent.loan_id.in_(loans_subq))
             | ((CalendarEvent.loan_id == None) & (CalendarEvent.owner_user_id == user.id))  # noqa: E711
         )
+    if user.role == Role.DEALER_PARTNER:
+        # No book-of-business, no calendar of their own -- deny by default
+        # rather than falling through to LOAN_EXEC's firm-wide visibility.
+        return stmt.where(sql_false())
     # LOAN_EXEC keeps firm-wide operator visibility.
     return stmt
 

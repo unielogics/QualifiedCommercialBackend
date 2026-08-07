@@ -22,7 +22,10 @@ router = APIRouter(prefix="/ai-tasks", tags=["ai-tasks"])
 async def list_tasks(
     user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[AITaskRead]:
-    if user.role == Role.CLIENT:
+    if user.role in (Role.CLIENT, Role.DEALER_PARTNER):
+        # DEALER_PARTNER has no book-of-business (see Role.DEALER_PARTNER's
+        # docstring in app/enums.py) -- deny by default rather than falling
+        # through to SUPER_ADMIN/LOAN_EXEC's firm-wide visibility below.
         return []
     stmt = (
         select(AITask)
