@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import or_, select
+from sqlalchemy import false as sql_false
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -33,19 +34,32 @@ async def search(
         return []
     pattern = f"%{q}%"
 
-    # Restrict scope by role
+    # Restrict scope by role. Any role not explicitly handled below (e.g.
+    # DEALER_PARTNER, which has no book-of-business -- see its docstring in
+    # app/enums.py) gets an unsatisfiable filter rather than silently
+    # falling through to the SUPER_ADMIN/LOAN_EXEC unfiltered, firm-wide
+    # search every other role here explicitly earns.
     client_filter = []
     loan_filter = []
     if user.role == Role.BROKER and user.broker:
         loan_filter.append(Loan.broker_id == user.broker.id)
         client_filter.append(Client.broker_id == user.broker.id)
-    if user.role == Role.REGIONAL_MANAGER:
+    elif user.role == Role.BROKER:
+        loan_filter.append(sql_false())
+        client_filter.append(sql_false())
+    elif user.role == Role.REGIONAL_MANAGER:
         broker_ids = regional_manager_broker_ids_subquery(user)
         loan_filter.append(Loan.broker_id.in_(broker_ids))
         client_filter.append(Client.broker_id.in_(broker_ids))
-    if user.role == Role.CLIENT and user.client:
+    elif user.role == Role.CLIENT and user.client:
         loan_filter.append(Loan.client_id == user.client.id)
         client_filter.append(Client.id == user.client.id)
+    elif user.role == Role.CLIENT:
+        loan_filter.append(sql_false())
+        client_filter.append(sql_false())
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        loan_filter.append(sql_false())
+        client_filter.append(sql_false())
 
     grouped: dict[UUID, list[SearchResult]] = defaultdict(list)
     client_names: dict[UUID, str] = {}
