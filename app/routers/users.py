@@ -54,6 +54,13 @@ class UserInvite(BaseModel):
 class UserPatch(BaseModel):
     role: Role | None = None
     name: str | None = None
+    # Required when setting role=DEALER_PARTNER on a user who has no
+    # referral_partner_company_id yet (e.g. promoting an existing user via
+    # the Team page's role dropdown, which -- unlike the invite flow --
+    # previously had no way to collect a company at all, permanently
+    # locking that user out of _require_dealer_partner's company-agreement
+    # check). Find-or-create by name, same as invite_user.
+    company_name: str | None = None
 
 
 @router.get(
@@ -202,6 +209,27 @@ async def update_user(
                 status.HTTP_400_BAD_REQUEST,
                 "Use /clients to convert a user to a borrower.",
             )
+        # DEALER_PARTNER is hard-blocked by _require_dealer_partner
+        # (dealer_ai_intake.py) until a linked ReferralPartnerCompany has a
+        # signed Referral Protection Agreement -- a user with no company
+        # link at all can never pass that check. Require one here, same as
+        # invite_user, rather than silently leaving the role unusable.
+        if body.role == Role.DEALER_PARTNER and user.referral_partner_company_id is None:
+            company_name = (body.company_name or "").strip()
+            if not company_name:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "Company name is required to set the Dealer Partner role — their company must have a "
+                    "signed Referral Protection Agreement on file.",
+                )
+            company = (
+                await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
+            ).scalar_one_or_none()
+            if company is None:
+                company = ReferralPartnerCompany(name=company_name)
+                db.add(company)
+                await db.flush()
+            user.referral_partner_company_id = company.id
         user.role = body.role
     if body.name is not None:
         user.name = body.name
