@@ -445,6 +445,34 @@ class AdminCreditPullRequest(BaseModel):
         return v
 
 
+class BankerSensitiveIdentifiers(BaseModel):
+    """Transient identifiers collected only at final banker-submission time
+    -- never persisted to intake_state or any DB column, mirroring
+    AdminCreditPullRequest.ssn's never-persisted convention. Forwarded
+    in-memory into build_banker_payload and returned once in the response;
+    the caller must never log or store the response."""
+
+    ssn: str | None = Field(default=None, description="9 digits, no dashes")
+    personal_tax_id: str | None = Field(default=None, description="9 digits, no dashes (ITIN)")
+
+    @field_validator("ssn", "personal_tax_id")
+    @classmethod
+    def _digits_only(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not v.isdigit() or len(v) != 9:
+            raise ValueError("Must be exactly 9 digits, no dashes")
+        return v
+
+
+class PrepareBankerSubmissionRequest(BaseModel):
+    identifiers: BankerSensitiveIdentifiers = Field(default_factory=BankerSensitiveIdentifiers)
+
+
+class PrepareBankerSubmissionResponse(BaseModel):
+    payload: dict[str, Any]
+
+
 class LeadCreditStatusResponse(BaseModel):
     authorization_requested: bool
     authorization_signed: bool
@@ -455,15 +483,34 @@ class LeadCreditStatusResponse(BaseModel):
     expires_at: datetime | None = None
 
 
+# Human-facing labels for every _compute_loan_program_fit key — the single
+# source of truth consumed by the admin panel, the lender-packet PDF section,
+# and the executive-summary "Eligible programs" metric splice, so a new
+# program only needs a label added here rather than 3 separate hardcoded
+# lists staying in sync by hand.
+PROGRAM_LABELS: dict[str, str] = {
+    "sba": "SBA",
+    "real_estate_backed": "Real-estate-backed",
+    "reinsurance_backed": "Reinsurance-backed",
+    "jumbo_dscr": "Jumbo / DSCR",
+    "term_loan_10_year": "10-Year Term Loan",
+    "term_loan_3_5_year": "3-5 Year Term Loan",
+    "term_loan_loc_hybrid": "Term Loan / LOC Hybrid",
+    "line_of_credit": "Line of Credit",
+    "equipment_financing": "Equipment Financing",
+    "merchant_processing": "Merchant Processing",
+    "transportation_factoring": "Transportation Factoring",
+    "debt_consulting": "Debt Consulting",
+}
+
+
 class LeadProgramFitResponse(BaseModel):
     """Admin-only read of the deterministic program-fit screen — mirrors
     LeadCreditStatusResponse's shape (a plain read-only status endpoint, not
-    routed through the redacted intake_state payload)."""
+    routed through the redacted intake_state payload). `programs` is keyed by
+    the same program keys as PROGRAM_LABELS/_compute_loan_program_fit."""
     computed: bool
-    sba: dict[str, Any] | None = None
-    real_estate_backed: dict[str, Any] | None = None
-    reinsurance_backed: dict[str, Any] | None = None
-    jumbo_dscr: dict[str, Any] | None = None
+    programs: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class DealerIntakePatch(BaseModel):
@@ -1391,6 +1438,24 @@ _REINSURANCE_CUSTOM_PRICING_THRESHOLD = 5_000_000
 _JUMBO_MIN_REVENUE = 750_000
 _JUMBO_MIN_DSCR = 1.25
 
+# Screening thresholds for the 10 programs added alongside the original 4
+# (sba/real_estate_backed/reinsurance_backed/jumbo_dscr above). Deterministic,
+# non-AI, computed from the same _key_metrics()/_dealer_details()/document-
+# checklist inputs the original 4 already use — a qualification-potential
+# screen, not a field-completeness form. Every threshold here is a
+# provisional screening cutoff pending lending-desk sign-off, same status as
+# the reinsurance/jumbo constants above when they were first added.
+_LOC_MIN_REVENUE = 100_000
+_TERM_3_5_MIN_REVENUE = 150_000
+_TERM_3_5_MIN_DSCR = 1.0
+_TERM_HYBRID_MIN_REVENUE = 200_000
+_TERM_HYBRID_MIN_DSCR = 1.1
+_TERM_10YR_MIN_REVENUE = 300_000
+_TERM_10YR_MIN_DSCR = 1.15
+_MERCHANT_PROCESSING_MIN_ANNUALIZED_DEPOSITS = 120_000
+_FACTORING_MIN_REVENUE = 100_000
+_DEBT_CONSULTING_MAX_DSCR = 1.0
+
 
 def _reinsurance_rate_for_amount(amount: float | None) -> tuple[float | None, bool]:
     """Returns (rate_percent, is_custom_priced). rate_percent is None until an
@@ -1416,6 +1481,14 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
     every chat turn (no AI call, no DB round trip beyond what's already
     loaded), so it never goes stale.
 
+    All 14 programs are screened from the SAME inputs — _key_metrics()
+    (AI-derived from uploaded documents: revenue, DSCR, cash flow, debt
+    burden, deposit velocity, PFS liquid assets), the document checklist, and
+    _dealer_details() (the handful of borrower-stated facts with no document
+    source). This is a qualification-potential screen over metrics the
+    document-analysis pipeline already computes, not a field-completeness
+    form — no program below requires a new borrower-facing field.
+
     - SBA: the default path. Eligible once the full enriched baseline is
       complete (tax returns/extension, current-year P&L, bank statements,
       debt schedule, PFS, and one ID per declared owner) — no size/DSCR
@@ -1429,13 +1502,38 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
       Carries the desk-supplied pricing table and doc-tier flag.
     - jumbo_dscr: eligible when revenue and the real (debt-schedule-derived)
       DSCR both clear their thresholds.
+    - term_loan_10_year / term_loan_3_5_year / term_loan_loc_hybrid: revenue
+      + DSCR bands, same shape as jumbo_dscr — longer terms carry a higher
+      bar on both.
+    - line_of_credit: a revenue/cash-flow floor with a lighter documentation
+      bar than the term programs (bank-derived deposit activity alone, not
+      the full enriched baseline SBA requires).
+    - equipment_financing: eligible once the borrower has stated equipment-
+      or-vehicle financing intent (no document source for pure intent) AND
+      cash flow is positive enough to support a payment.
+    - merchant_processing: a deposit-velocity floor from bank-statement
+      analysis — not a loan, so no DSCR requirement.
+    - transportation_factoring: a revenue floor, same cash-flow-based signal
+      as merchant processing (receivables-specific extraction not yet
+      available — revenue is the best current proxy).
+    - debt_consulting: triggered by a distress signal (DSCR at/below the
+      consulting threshold once a real debt schedule exists) — a "this file
+      would benefit from consolidation" flag, not a funding-amount rule.
     """
     km = _key_metrics(intake)
     revenue = km.get("ytd_annualized_revenue")
     dscr = km.get("estimated_dscr")
+    cash_flow = km.get("estimated_ebitda_or_cash_flow")
+    annualized_deposits = km.get("annualized_adjusted_deposits")
     liquid_assets = km.get("pfs_total_liquid_assets")
     details = _dealer_details(intake)
     requested_amount = float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None
+
+    def _meets(value: Any, threshold: float) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= threshold
+
+    def _clears(value: Any, threshold: float) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and value > threshold
 
     sba = {"eligible": not _missing_required_docs(intake.bucket)}
 
@@ -1449,8 +1547,8 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
         "reinsurance" in (doc.category or "").lower() and doc.id not in _uploaded_doc_ids(intake.bucket)
         for doc in intake.bucket.requested_documents
     )
-    reinsurance_liquidity_met = (isinstance(revenue, (int, float)) and revenue >= _REINSURANCE_MIN_REVENUE) or (
-        isinstance(liquid_assets, (int, float)) and liquid_assets >= _REINSURANCE_MIN_LIQUID_ASSETS
+    reinsurance_liquidity_met = _meets(revenue, _REINSURANCE_MIN_REVENUE) or _meets(
+        liquid_assets, _REINSURANCE_MIN_LIQUID_ASSETS
     )
     reinsurance_eligible = reinsurance_present and reinsurance_docs_uploaded and reinsurance_liquidity_met
     rate, custom_priced = _reinsurance_rate_for_amount(requested_amount)
@@ -1468,19 +1566,64 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
         ),
     }
 
-    jumbo_eligible = (
-        isinstance(revenue, (int, float))
-        and revenue > _JUMBO_MIN_REVENUE
-        and isinstance(dscr, (int, float))
-        and dscr > _JUMBO_MIN_DSCR
-    )
+    jumbo_eligible = _clears(revenue, _JUMBO_MIN_REVENUE) and _clears(dscr, _JUMBO_MIN_DSCR)
     jumbo_dscr = {"eligible": bool(jumbo_eligible), "revenue": revenue, "dscr": dscr}
+
+    term_loan_10_year = {
+        "eligible": bool(_meets(revenue, _TERM_10YR_MIN_REVENUE) and _meets(dscr, _TERM_10YR_MIN_DSCR)),
+        "revenue": revenue,
+        "dscr": dscr,
+    }
+    term_loan_3_5_year = {
+        "eligible": bool(_meets(revenue, _TERM_3_5_MIN_REVENUE) and _meets(dscr, _TERM_3_5_MIN_DSCR)),
+        "revenue": revenue,
+        "dscr": dscr,
+    }
+    term_loan_loc_hybrid = {
+        "eligible": bool(_meets(revenue, _TERM_HYBRID_MIN_REVENUE) and _meets(dscr, _TERM_HYBRID_MIN_DSCR)),
+        "revenue": revenue,
+        "dscr": dscr,
+    }
+    line_of_credit = {
+        "eligible": bool(_meets(revenue, _LOC_MIN_REVENUE) or _meets(annualized_deposits, _LOC_MIN_REVENUE)),
+        "revenue": revenue,
+        "annualized_deposits": annualized_deposits,
+    }
+    equipment_financing_intent = details.get("financing_equipment_or_vehicle") is True
+    equipment_financing = {
+        "eligible": bool(equipment_financing_intent and _clears(cash_flow, 0)),
+        "cash_flow": cash_flow,
+    }
+    merchant_processing = {
+        "eligible": bool(_meets(annualized_deposits, _MERCHANT_PROCESSING_MIN_ANNUALIZED_DEPOSITS)),
+        "annualized_deposits": annualized_deposits,
+    }
+    transportation_factoring = {
+        "eligible": bool(_meets(revenue, _FACTORING_MIN_REVENUE)),
+        "revenue": revenue,
+    }
+    debt_consulting_eligible = km.get("estimated_debt_burden") is not None and isinstance(
+        dscr, (int, float)
+    ) and not isinstance(dscr, bool) and dscr <= _DEBT_CONSULTING_MAX_DSCR
+    debt_consulting = {
+        "eligible": bool(debt_consulting_eligible),
+        "dscr": dscr,
+        "estimated_debt_burden": km.get("estimated_debt_burden"),
+    }
 
     return {
         "sba": sba,
         "real_estate_backed": real_estate_backed,
         "reinsurance_backed": reinsurance_backed,
         "jumbo_dscr": jumbo_dscr,
+        "term_loan_10_year": term_loan_10_year,
+        "term_loan_3_5_year": term_loan_3_5_year,
+        "term_loan_loc_hybrid": term_loan_loc_hybrid,
+        "line_of_credit": line_of_credit,
+        "equipment_financing": equipment_financing,
+        "merchant_processing": merchant_processing,
+        "transportation_factoring": transportation_factoring,
+        "debt_consulting": debt_consulting,
     }
 
 
@@ -1598,6 +1741,11 @@ _DEALER_DETAIL_KEYS = (
     "current_year_tax_filed",
     "reinsurance_account_present",
     "reinsurance_trading_platform",
+    # Equipment-financing intent has no natural document source (nothing to
+    # extract until an invoice/quote is uploaded) — same category as the
+    # boolean facts above: a borrower-stated signal used only to gate the
+    # equipment_financing program-fit rule, never a field-collection form.
+    "financing_equipment_or_vehicle",
 )
 
 
@@ -1642,7 +1790,7 @@ def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> di
             if owners:
                 accepted[key] = owners
             continue
-        if key in ("current_year_tax_filed", "reinsurance_account_present"):
+        if key in ("current_year_tax_filed", "reinsurance_account_present", "financing_equipment_or_vehicle"):
             if isinstance(value, bool):
                 accepted[key] = value
             continue
@@ -2752,6 +2900,18 @@ async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingI
         # model does not have to reconcile conflicting chat/prior-review values (it
         # was picking a stale earlier value). Authoritative when present.
         "authoritative_facts": _authoritative_facts_from_chat(chat_history, intake),
+        # Surfaced as explicit top-level keys (rather than left buried inside
+        # intake.intake_state above) so the executive-summary/prequalification
+        # prompt can reference eligible programs and program-specific facts by
+        # name without having to reach into a raw JSONB dump. Dealer-only —
+        # None for real-estate leads, same gate _prepend_program_fit_key_metric
+        # already uses. This is an admin/AI-internal artifact (the executive
+        # summary a human underwriter reads), not the borrower-facing chat —
+        # the "never disclose a program name to the borrower" rule governs the
+        # chat only, per this session's existing loan_program_fit convention.
+        "program_fit": _loan_program_fit(intake) if intake.variant != FUNDING_VARIANT else None,
+        "program_labels": PROGRAM_LABELS if intake.variant != FUNDING_VARIANT else None,
+        "dealer_details": _dealer_details(intake) if intake.variant != FUNDING_VARIANT else None,
     }
 
 
@@ -2921,7 +3081,15 @@ async def _generate_management_json(
             "When sources conflict, the MOST RECENT chat statement is authoritative and overrides any earlier chat "
             "message AND any figure in the prior 'latest_review' text (that prior review may be stale). "
             "If context.authoritative_facts.credit_score is present, you MUST use that exact credit score value "
-            "everywhere and ignore any other credit number in the evidence or prior review."
+            "everywhere and ignore any other credit number in the evidence or prior review. "
+            "If context.program_fit is present (dealer leads only), use context.program_labels to name every "
+            "program where program_fit[key].eligible is true, and weave the eligible programs and, where "
+            "requested_loan_amount or the program's own sizing fields support it, an estimate of total addressable "
+            "capital across those programs into 'recommended_approach' and/or the closing paragraph of "
+            "'executive_summary' — this executive summary is an internal document read by a human underwriter, "
+            "not the borrower-facing chat, so naming programs here is expected and required when eligible. Never "
+            "state a specific interest rate unless context.program_fit itself already contains one (e.g. "
+            "reinsurance_backed.rate_percent)."
         )
         system = (
             "You are a senior commercial credit officer writing an internal executive summary that a human underwriter "
@@ -3123,13 +3291,7 @@ def _prepend_program_fit_key_metric(summary: dict[str, Any], intake: PublicUnder
     fit = _loan_program_fit(intake)
     if not fit:
         return
-    labels = {
-        "sba": "SBA",
-        "real_estate_backed": "Real-estate-backed",
-        "reinsurance_backed": "Reinsurance-backed",
-        "jumbo_dscr": "Jumbo/DSCR",
-    }
-    eligible = [label for key, label in labels.items() if (fit.get(key) or {}).get("eligible")]
+    eligible = [label for key, label in PROGRAM_LABELS.items() if (fit.get(key) or {}).get("eligible")]
     if not eligible:
         return
     row = {"label": "Eligible programs", "value": ", ".join(eligible), "note": "Deterministic screen — confirm with underwriter"}
@@ -5823,23 +5985,17 @@ async def get_lead_program_fit(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> LeadProgramFitResponse:
-    """Admin-only read of the deterministic program-fit screen (SBA / real-
-    estate-backed / reinsurance-backed / jumbo-DSCR) — dealer leads only,
-    recomputed live from the current key_metrics/dealer_details rather than
-    relying on the possibly-stale intake_state snapshot, so the admin always
-    sees the latest figures without needing a chat turn or re-run first."""
+    """Admin-only read of the deterministic program-fit screen (all 14
+    programs in PROGRAM_LABELS) — dealer leads only, recomputed live from the
+    current key_metrics/dealer_details rather than relying on the possibly-
+    stale intake_state snapshot, so the admin always sees the latest figures
+    without needing a chat turn or re-run first."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     if intake.variant == FUNDING_VARIANT:
         return LeadProgramFitResponse(computed=False)
     fit = _compute_loan_program_fit(intake)
-    return LeadProgramFitResponse(
-        computed=True,
-        sba=fit.get("sba"),
-        real_estate_backed=fit.get("real_estate_backed"),
-        reinsurance_backed=fit.get("reinsurance_backed"),
-        jumbo_dscr=fit.get("jumbo_dscr"),
-    )
+    return LeadProgramFitResponse(computed=True, programs=fit)
 
 
 @admin_router.post("/{intake_id}/credit-pull", response_model=LeadCreditStatusResponse)
@@ -5941,6 +6097,38 @@ async def run_lead_credit_pull(
         pulled_at=pull.pulled_at,
         expires_at=pull.expires_at,
     )
+
+
+@admin_router.post("/{intake_id}/prepare-banker-submission", response_model=PrepareBankerSubmissionResponse)
+async def prepare_banker_submission(
+    intake_id: UUID,
+    payload: PrepareBankerSubmissionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PrepareBankerSubmissionResponse:
+    """Assembles the normalized JSON payload an admin would hand to the
+    banker's intake system -- shared borrower/entity fields, computed
+    key_metrics/program-fit, and (if supplied) transient sensitive
+    identifiers. Stateless: nothing in this request or response is
+    persisted -- no DB write, no intake_state mutation, no logging of the
+    identifiers. The real outbound POST to the banker's own API is future
+    work pending that integration's spec; this returns the assembled
+    payload for admin review/download today."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.variant == FUNDING_VARIANT:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Banker submission payloads are dealer leads only")
+    from app.services.banker_submission import build_banker_payload
+
+    built = build_banker_payload(
+        intake,
+        key_metrics=_key_metrics(intake),
+        program_fit=_compute_loan_program_fit(intake),
+        entity_structure=_entity_structure(intake),
+        owners=_dealer_details(intake).get("owners") or [],
+        sensitive_identifiers=payload.identifiers.model_dump(),
+    )
+    return PrepareBankerSubmissionResponse(payload=built)
 
 
 @admin_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)

@@ -734,48 +734,63 @@ def _credit_section(credit: dict[str, Any] | None) -> str:
     )
 
 
+def _program_fit_detail(key: str, program: dict[str, Any]) -> str:
+    """Program-specific one-line detail string for the PDF/admin-panel
+    display. Falls back to a generic revenue/DSCR/cash-flow summary for any
+    program without bespoke formatting below, so a newly-added program key
+    in _compute_loan_program_fit never needs a matching code change here."""
+    if key == "sba":
+        return "Complete enriched baseline"
+    if key == "real_estate_backed":
+        return escape(str(program.get("note") or "—"))
+    if key == "reinsurance_backed":
+        parts = []
+        if program.get("rate_percent") is not None:
+            parts.append(f"Indicative rate {program['rate_percent']}%")
+        elif program.get("custom_priced_5mm_plus"):
+            parts.append("Custom-priced (≥$5MM)")
+        if program.get("doc_tier"):
+            parts.append(f"Docs: {program['doc_tier'].replace('_', ' ')}")
+        if program.get("maturity_years"):
+            parts.append(f"{program['maturity_years']}-yr maturity")
+        return escape("; ".join(parts)) if parts else "—"
+    parts = []
+    if isinstance(program.get("revenue"), (int, float)):
+        parts.append(f"Revenue ${program['revenue']:,.0f}")
+    if isinstance(program.get("dscr"), (int, float)):
+        parts.append(f"DSCR {program['dscr']:.2f}")
+    if isinstance(program.get("annualized_deposits"), (int, float)):
+        parts.append(f"Annualized deposits ${program['annualized_deposits']:,.0f}")
+    if isinstance(program.get("cash_flow"), (int, float)):
+        parts.append(f"Cash flow ${program['cash_flow']:,.0f}")
+    if isinstance(program.get("estimated_debt_burden"), (int, float)):
+        parts.append(f"Debt burden ${program['estimated_debt_burden']:,.0f}")
+    return escape("; ".join(parts)) if parts else "—"
+
+
 def _program_fit_section(program_fit: dict[str, Any] | None) -> str:
-    """Renders the deterministic program-fit signal (SBA / real-estate-backed /
-    reinsurance-backed / jumbo-DSCR) for the admin/underwriter reading this
-    packet — dealer-only, computed by _compute_loan_program_fit. Omitted
-    entirely when program_fit is None (real-estate leads, or a dealer lead
-    with no computation yet)."""
+    """Renders the deterministic program-fit signal for the admin/underwriter
+    reading this packet — dealer-only, computed by
+    _compute_loan_program_fit. Omitted entirely when program_fit is None
+    (real-estate leads, or a dealer lead with no computation yet). Loops
+    generically over app.routers.dealer_ai_intake.PROGRAM_LABELS so adding a
+    program only requires a label there, not a matching block here."""
     if not isinstance(program_fit, dict) or not program_fit:
         return ""
+
+    from app.routers.dealer_ai_intake import PROGRAM_LABELS
 
     def _row(label: str, eligible: bool, detail: str) -> str:
         status = "Eligible" if eligible else "Not yet eligible"
         return f'<tr><td class="rowhead">{escape(label)}</td><td><strong>{escape(status)}</strong></td><td>{detail}</td></tr>'
 
-    sba = program_fit.get("sba") or {}
-    re_backed = program_fit.get("real_estate_backed") or {}
-    reinsurance = program_fit.get("reinsurance_backed") or {}
-    jumbo = program_fit.get("jumbo_dscr") or {}
-
-    reinsurance_detail_parts = []
-    if reinsurance.get("rate_percent") is not None:
-        reinsurance_detail_parts.append(f"Indicative rate {reinsurance['rate_percent']}%")
-    elif reinsurance.get("custom_priced_5mm_plus"):
-        reinsurance_detail_parts.append("Custom-priced (≥$5MM)")
-    if reinsurance.get("doc_tier"):
-        reinsurance_detail_parts.append(f"Docs: {reinsurance['doc_tier'].replace('_', ' ')}")
-    if reinsurance.get("maturity_years"):
-        reinsurance_detail_parts.append(f"{reinsurance['maturity_years']}-yr maturity")
-    reinsurance_detail = escape("; ".join(reinsurance_detail_parts)) if reinsurance_detail_parts else "—"
-
-    jumbo_detail_parts = []
-    if jumbo.get("revenue") is not None:
-        jumbo_detail_parts.append(f"Revenue ${jumbo['revenue']:,.0f}")
-    if jumbo.get("dscr") is not None:
-        jumbo_detail_parts.append(f"DSCR {jumbo['dscr']:.2f}")
-    jumbo_detail = escape("; ".join(jumbo_detail_parts)) if jumbo_detail_parts else "—"
-
-    rows = (
-        _row("SBA (default path)", bool(sba.get("eligible")), "Complete enriched baseline")
-        + _row("Real-estate-backed", bool(re_backed.get("eligible")), escape(str(re_backed.get("note") or "—")))
-        + _row("Reinsurance-backed", bool(reinsurance.get("eligible")), reinsurance_detail)
-        + _row("Jumbo / DSCR", bool(jumbo.get("eligible")), jumbo_detail)
+    rows = "".join(
+        _row(label, bool((program_fit.get(key) or {}).get("eligible")), _program_fit_detail(key, program_fit.get(key) or {}))
+        for key, label in PROGRAM_LABELS.items()
+        if key in program_fit
     )
+    if not rows:
+        return ""
     return (
         '<section class="card wide"><h2>Program fit — deterministic screen</h2>'
         '<table class="grid-table"><thead><tr><th>Program</th><th>Status</th><th>Detail</th></tr></thead>'

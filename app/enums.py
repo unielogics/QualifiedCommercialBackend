@@ -626,3 +626,26 @@ class ContractSubjectType(StrEnum):
     company with no single FK column that fits both."""
     USER = "user"
     COMPANY = "company"
+
+
+class LoanProgram(StrEnum):
+    """The financing programs a dealer AI-underwriter lead is deterministically
+    screened against — see dealer_ai_intake.py's _compute_program_fit. Labels
+    only; eligibility for every value is computed from _key_metrics()
+    (AI-derived from uploaded documents) + the document checklist +
+    _dealer_details(), never from a borrower-facing field-collection form.
+    SBA/REAL_ESTATE_BACKED/REINSURANCE_BACKED/JUMBO_DSCR predate this enum
+    (originally 4 bare dict keys); the other 10 extend the same screen to
+    match the lender's actual program catalog."""
+    SBA = "sba"
+    REAL_ESTATE_BACKED = "real_estate_backed"
+    REINSURANCE_BACKED = "reinsurance_backed"
+    JUMBO_DSCR = "jumbo_dscr"
+    TERM_LOAN_10_YEAR = "term_loan_10_year"
+    TERM_LOAN_3_5_YEAR = "term_loan_3_5_year"
+    TERM_LOAN_LOC_HYBRID = "term_loan_loc_hybrid"
+    LINE_OF_CREDIT = "line_of_credit"
+    EQUIPMENT_FINANCING = "equipment_financing"
+    MERCHANT_PROCESSING = "merchant_processing"
+    TRANSPORTATION_FACTORING = "transportation_factoring"
+    DEBT_CONSULTING = "debt_consulting"
