@@ -115,6 +115,23 @@ def _re_welcome_back(lang: str) -> str:
     return _RE_WELCOME_BACK.get(lang, _RE_WELCOME_BACK[Language.EN])
 
 
+def _admin_created_welcome(is_re: bool) -> str:
+    """Admin/broker-created-lead welcome — itemizes the baseline checklist by
+    name (REQUIRED_DOCUMENTS / REAL_ESTATE_REQUIRED_DOCUMENTS) so whoever
+    opens the lead first (the dealer partner, or the client once they log in)
+    knows exactly what to gather right away, instead of a generic placeholder.
+    English only — these leads are created by an internal admin/broker, not
+    the client, so there is no preferred_language context to honor here the
+    way _dealer_welcome() does for the self-serve flow."""
+    docs = REAL_ESTATE_REQUIRED_DOCUMENTS if is_re else REQUIRED_DOCUMENTS
+    bullets = "\n".join(f"- {doc['name']}" for doc in docs)
+    return (
+        "Lead created on behalf of the client. To get a preliminary screen, gather:\n"
+        f"{bullets}\n"
+        "Upload what you have now, or start the AI screen once ready."
+    )
+
+
 _DEALER_START_EMAIL_NOTE_OK = {
     Language.EN: " I also emailed you a secure resume link so you can come back later.",
     Language.ES: " También te envié por correo electrónico un enlace seguro para reanudar, para que puedas volver más tarde.",
@@ -430,6 +447,22 @@ class AdminCreditAuthorizationRequest(BaseModel):
 
     template_file_id: UUID | None = None  # an admin-uploaded blank form (e.g. dealer-specific doc)
     document_text: str | None = None  # overrides the built-in default disclosure when no template
+
+
+class RequestPfsOrDebtScheduleRequest(BaseModel):
+    """Admin/broker requests a Personal Financial Statement or Debt Schedule
+    on a dealer lead. Optional owner_name lets admin/broker request a SECOND
+    (or later) owner's PFS beyond the single baseline row every dealer lead
+    already gets at creation — _ensure_requested_document is idempotent on
+    the exact document name, so re-requesting the baseline document (no
+    owner_name) is always a safe no-op, never a duplicate."""
+
+    owner_name: str | None = Field(default=None, max_length=180)
+
+    @field_validator("owner_name", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: object) -> object:
+        return None if value == "" else value
 
 
 class AdminCreditPullRequest(BaseModel):
@@ -5256,10 +5289,7 @@ async def create_admin_ai_lead(
         public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
         include_management=True,
         admin_thread=True,
-        assistant_message=(
-            "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
-            + email_note
-        ),
+        assistant_message=_admin_created_welcome(is_re) + email_note,
     )
 
 
@@ -5413,10 +5443,7 @@ async def create_broker_ai_lead(
         public_path="/dealer-ai-underwriter",
         include_management=False,
         admin_thread=True,
-        assistant_message=(
-            "Lead created on behalf of the client. Upload documents or start the AI screen when ready."
-            + email_note
-        ),
+        assistant_message=_admin_created_welcome(False) + email_note,
     )
 
 
@@ -5534,6 +5561,35 @@ async def broker_dealer_lead_upload_complete(
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
 
 
+@broker_router.post("/{intake_id}/requested-documents/pfs", response_model=BucketFileRead)
+async def broker_submit_lead_pfs(
+    intake_id: UUID,
+    payload: DealerPfsSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    """Dealer partner fills out the on-screen PFS on behalf of their client —
+    same fallback available to the client themselves, usable here so a
+    broker can close out the checklist without waiting on the client."""
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _submit_pfs_form(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
+
+
+@broker_router.post("/{intake_id}/requested-documents/debt-schedule", response_model=BucketFileRead)
+async def broker_submit_lead_debt_schedule(
+    intake_id: UUID,
+    payload: DealerDebtScheduleSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _submit_debt_schedule_form(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
+
+
 @broker_router.post("/{intake_id}/run-review", response_model=ReviewRunStartResponse)
 async def rerun_broker_dealer_lead_review(
     intake_id: UUID,
@@ -5602,6 +5658,29 @@ async def broker_dealer_lead_review_progress(
         files_done=int(progress.get("files_done") or 0),
         error=review.error,
     )
+
+
+@broker_router.post("/{intake_id}/request-pfs", response_model=BucketRequestedDocumentRead)
+async def broker_request_lead_pfs(
+    intake_id: UUID,
+    payload: RequestPfsOrDebtScheduleRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _request_pfs(db, intake, payload.owner_name)
+
+
+@broker_router.post("/{intake_id}/request-debt-schedule", response_model=BucketRequestedDocumentRead)
+async def broker_request_lead_debt_schedule(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _request_debt_schedule(db, intake)
 
 
 @admin_router.post("/from-bucket/{bucket_id}", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
@@ -5864,6 +5943,69 @@ async def request_lead_credit_authorization(
     await db.commit()
     await db.refresh(doc)
     return doc
+
+
+async def _request_pfs(db: AsyncSession, intake: PublicUnderwritingIntake, owner_name: str | None) -> BucketRequestedDocument:
+    """Shared by admin+broker request-pfs endpoints. Idempotent via
+    _ensure_requested_document — requesting the baseline PFS again (no
+    owner_name) returns the existing row rather than duplicating; a distinct
+    owner_name creates a separate per-owner PFS request, same naming
+    convention as the per-owner ID documents in _apply_dealer_detail_documents."""
+    name = f"Personal financial statement — {owner_name}" if owner_name else "Personal financial statement"
+    description = (
+        f"Upload a completed personal financial statement (PFS) for {owner_name}. Use the blank form below if you need one."
+        if owner_name
+        else "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one."
+    )
+    doc = await _ensure_requested_document(db, intake.bucket, name=name, category="Personal Financials", description=description, allow_multiple_files=True)
+    await db.commit()
+    return doc
+
+
+async def _request_debt_schedule(db: AsyncSession, intake: PublicUnderwritingIntake) -> BucketRequestedDocument:
+    """Shared by admin+broker request-debt-schedule endpoints. Idempotent via
+    _ensure_requested_document — a lead only ever has one debt schedule, so
+    there is no owner_name variant here (unlike PFS)."""
+    doc = await _ensure_requested_document(
+        db,
+        intake.bucket,
+        name="Debt schedule",
+        category="Debts",
+        description="Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each.",
+    )
+    await db.commit()
+    return doc
+
+
+@admin_router.post("/{intake_id}/request-pfs", response_model=BucketRequestedDocumentRead)
+async def admin_request_lead_pfs(
+    intake_id: UUID,
+    payload: RequestPfsOrDebtScheduleRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    """Admin requests a PFS on this lead — either the baseline PFS (already
+    auto-created for most leads) or a second/later owner's PFS. Unlike
+    credit-authorization, there is no signature/template step: this just
+    ensures the requested-document exists so the client can upload a real
+    file or use the on-screen fill-in-online form. Dealer leads only —
+    PFS/debt-schedule are not a real-estate concept on this platform."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    _require_dealer_intake(intake)
+    return await _request_pfs(db, intake, payload.owner_name)
+
+
+@admin_router.post("/{intake_id}/request-debt-schedule", response_model=BucketRequestedDocumentRead)
+async def admin_request_lead_debt_schedule(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestedDocument:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    _require_dealer_intake(intake)
+    return await _request_debt_schedule(db, intake)
 
 
 _CONTRACT_DOC_NAME: dict[ContractType, str] = {
@@ -6352,6 +6494,35 @@ async def dealer_ai_lead_upload_complete(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _complete_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
+
+
+@admin_router.post("/{intake_id}/requested-documents/pfs", response_model=BucketFileRead)
+async def admin_submit_lead_pfs(
+    intake_id: UUID,
+    payload: DealerPfsSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    """Admin fills out the on-screen PFS on behalf of the client — same
+    fallback the client sees on the public/logged-in pages, usable here so an
+    admin can close out the checklist without waiting on the client."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _submit_pfs_form(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
+
+
+@admin_router.post("/{intake_id}/requested-documents/debt-schedule", response_model=BucketFileRead)
+async def admin_submit_lead_debt_schedule(
+    intake_id: UUID,
+    payload: DealerDebtScheduleSubmission,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _submit_debt_schedule_form(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
 
 
 @admin_router.post("/{intake_id}/files/ingest-from-drive", response_model=DriveIngestResponse)
