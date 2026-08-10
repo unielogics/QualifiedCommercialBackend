@@ -132,6 +132,24 @@ def _admin_created_welcome(is_re: bool) -> str:
     )
 
 
+def _persist_admin_welcome_message(bucket_id: UUID, content: str) -> BucketAIMessage:
+    """Writes the create-time welcome text as a real BucketAIMessage (audience
+    'admin', role 'assistant') instead of only returning it in the one-time
+    HTTP response. Without this, _response()'s message reload (which always
+    reads from the DB, never from the just-generated assistant_message text)
+    finds nothing on the next GET/reopen, and the welcome — including the
+    itemized document checklist — silently disappears the moment the admin
+    or broker closes and reopens the lead. Caller must db.add() the intake's
+    own changes and db.commit() as usual; this only stages the row."""
+    return BucketAIMessage(
+        bucket_id=bucket_id,
+        audience="admin",
+        role="assistant",
+        author_name="Bucket AI",
+        content=content,
+    )
+
+
 _DEALER_START_EMAIL_NOTE_OK = {
     Language.EN: " I also emailed you a secure resume link so you can come back later.",
     Language.ES: " También te envié por correo electrónico un enlace seguro para reanudar, para que puedas volver más tarde.",
@@ -5253,6 +5271,8 @@ async def create_admin_ai_lead(
         target_id=str(intake.id),
         detail=f"Admin created {payload.variant} lead for {intake.email}",
     )
+    welcome_text = _admin_created_welcome(is_re)
+    db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
 
@@ -5289,7 +5309,7 @@ async def create_admin_ai_lead(
         public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
         include_management=True,
         admin_thread=True,
-        assistant_message=_admin_created_welcome(is_re) + email_note,
+        assistant_message=welcome_text + email_note,
     )
 
 
@@ -5420,6 +5440,8 @@ async def create_broker_ai_lead(
         target_id=str(intake.id),
         detail=f"Broker {user.email} created dealer lead for {intake.email}",
     )
+    welcome_text = _admin_created_welcome(False)
+    db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
     await db.commit()
     intake = await _load_broker_dealer_lead(db, user, intake.id)
 
@@ -5443,7 +5465,7 @@ async def create_broker_ai_lead(
         public_path="/dealer-ai-underwriter",
         include_management=False,
         admin_thread=True,
-        assistant_message=_admin_created_welcome(False) + email_note,
+        assistant_message=welcome_text + email_note,
     )
 
 
