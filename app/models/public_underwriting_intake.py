@@ -66,12 +66,22 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     result_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Two-step delete: a broker (or admin) flags a lead for deletion here,
+    # which only hides it from the BROKER's own list — nothing is destroyed.
+    # Only a separate super-admin "confirm delete" action (which requires
+    # this to be set) actually hard-deletes the bucket/files/intake. Never
+    # filtered out of the admin list, so admin always sees pending requests.
+    delete_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delete_requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     client: Mapped[Client | None] = relationship()
     broker: Mapped[User | None] = relationship(foreign_keys=[broker_id])
     bucket: Mapped[Bucket] = relationship()
     bucket_upload_link: Mapped[BucketUploadLink | None] = relationship()
     latest_review: Mapped[BucketAIReview | None] = relationship()
+    delete_requested_by: Mapped[User | None] = relationship(foreign_keys=[delete_requested_by_user_id])
 
 
 class PublicUnderwritingIntakeArtifact(TimestampMixin, Base):

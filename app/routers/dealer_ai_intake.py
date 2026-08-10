@@ -36,6 +36,8 @@ from app.models.user import User
 from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
     _bucket_storage_config,
+    _client_ip,
+    _delete_s3_object,
     _generate_passcode,
     _hash_passcode,
     _log,
@@ -483,6 +485,30 @@ class RequestPfsOrDebtScheduleRequest(BaseModel):
         return None if value == "" else value
 
 
+class RequestLeadDeletionRequest(BaseModel):
+    """Flags a lead for deletion — sets delete_requested_at/by only, destroys
+    nothing. The requesting broker's own list filters this lead out
+    immediately; the admin list never does, so admin always sees pending
+    requests and must separately confirm before anything is destroyed."""
+
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class ConfirmLeadDeletionRequest(BaseModel):
+    """Admin's final confirmation for an irreversible hard delete — the
+    caller must type the lead's exact business_name or full_name (matched
+    case-insensitively) as a deliberate speed bump before anything is
+    destroyed. Mirrors this codebase's window.confirm(...) pattern for
+    destructive actions, but stronger given this is unrecoverable."""
+
+    confirm_name: str = Field(min_length=1, max_length=180)
+
+
 class AdminCreditPullRequest(BaseModel):
     ssn: str | None = Field(default=None, description="9 digits, no dashes; optional retry after no-hit")
 
@@ -879,6 +905,10 @@ class DealerAILeadRow(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime | None = None
+    # Two-step delete state — never null-filtered out of the admin list, so
+    # admin always sees pending requests and must separately confirm.
+    delete_requested_at: datetime | None = None
+    delete_requested_by: str | None = None
 
 
 class DealerAILeadListResponse(BaseModel):
@@ -4713,6 +4743,8 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         created_at=intake.created_at,
         updated_at=intake.updated_at,
         last_message_at=intake.last_message_at,
+        delete_requested_at=intake.delete_requested_at,
+        delete_requested_by=intake.delete_requested_by.name if intake.delete_requested_by else None,
     )
 
 
@@ -4727,6 +4759,7 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
                 selectinload(PublicUnderwritingIntake.bucket_upload_link),
                 selectinload(PublicUnderwritingIntake.latest_review),
+                selectinload(PublicUnderwritingIntake.delete_requested_by),
                 with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
@@ -4798,6 +4831,7 @@ async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
                 selectinload(PublicUnderwritingIntake.bucket_upload_link),
                 selectinload(PublicUnderwritingIntake.latest_review),
+                selectinload(PublicUnderwritingIntake.delete_requested_by),
                 with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
@@ -4985,6 +5019,7 @@ async def list_dealer_ai_leads(
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
             selectinload(PublicUnderwritingIntake.latest_review),
+            selectinload(PublicUnderwritingIntake.delete_requested_by),
             with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
         )
         .order_by(PublicUnderwritingIntake.updated_at.desc())
@@ -5057,6 +5092,116 @@ async def get_dealer_ai_lead(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
+@admin_router.post("/{intake_id}/request-deletion", response_model=DealerIntakeResponse)
+async def admin_request_lead_deletion(
+    intake_id: UUID,
+    payload: RequestLeadDeletionRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin flags a lead for deletion — same flag broker-side "request
+    deletion" sets, needed here for admin-created/self-serve leads that have
+    no broker to defer to. Destroys nothing; only gates the separate
+    confirm-deletion endpoint open."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    intake.delete_requested_at = _now()
+    intake.delete_requested_by_user_id = user.id
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_deletion_requested_by_admin", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.reason,
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
+@admin_router.post("/{intake_id}/cancel-deletion-request", response_model=DealerIntakeResponse)
+async def admin_cancel_lead_deletion(
+    intake_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin retracts a pending deletion request (their own, or a broker's)
+    without destroying anything — fully reversible."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    intake.delete_requested_at = None
+    intake.delete_requested_by_user_id = None
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_deletion_request_cancelled_by_admin", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id),
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+
+
+@admin_router.post("/{intake_id}/confirm-deletion", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_confirm_lead_deletion(
+    intake_id: UUID,
+    payload: ConfirmLeadDeletionRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Irreversible hard delete — only reachable on a lead a broker/admin has
+    already flagged via request-deletion (409 otherwise), and only with the
+    lead's exact name typed as a deliberate speed bump (400 on mismatch).
+
+    Deletes every BucketFile/artifact object from S3 (best-effort — a failed
+    object delete is logged but never blocks the DB delete, matching
+    _delete_s3_object's own internal exception-swallowing), then deletes the
+    Bucket row. public_underwriting_intakes.bucket_id is itself
+    ondelete="CASCADE" FROM buckets (the intake is the dependent side), so
+    deleting the bucket cascades to the intake and every other
+    bucket-scoped table (requested_documents, files, notes, activity_logs,
+    ai_reviews, ai_messages, upload_links, shares, vendor_access,
+    public_shares, file_analyses) in one statement — see
+    app/models/bucket.py's Bucket relationships, all already
+    cascade="all, delete-orphan" to match.
+
+    Never touches client_id/broker_id (already ON DELETE SET NULL on the
+    intake) or CreditPull rows (keyed to client_id, not intake_id) — a
+    deleted lead never takes its client or bureau history down with it.
+
+    The bucket's own BucketActivityLog is about to be destroyed by
+    definition, so this action is logged to the application logger instead
+    of _log(...) — there is no durable admin-wide audit trail in this
+    codebase to write a cross-bucket entry to."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.delete_requested_at is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This lead has not been flagged for deletion — request deletion first.",
+        )
+    confirm_target = (intake.business_name or intake.full_name or "").strip().lower()
+    if not confirm_target or payload.confirm_name.strip().lower() != confirm_target:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Typed name does not match this lead's business or full name.")
+
+    for file in intake.bucket.files:
+        status_result = _delete_s3_object(file.s3_key)
+        if status_result != "deleted":
+            log.warning("hard-delete: S3 object delete failed for BucketFile id=%s key=%s", file.id, file.s3_key)
+    artifacts = await _management_artifacts(db, intake.id)
+    for artifact in artifacts:
+        if artifact.s3_key:
+            status_result = _delete_s3_object(artifact.s3_key)
+            if status_result != "deleted":
+                log.warning("hard-delete: S3 object delete failed for artifact id=%s key=%s", artifact.id, artifact.s3_key)
+
+    log.warning(
+        "hard-delete: super_admin=%s (%s) permanently deleted dealer AI lead id=%s bucket_id=%s email=%s name=%s requested_by=%s at=%s ip=%s",
+        user.id, user.email, intake.id, intake.bucket_id, intake.email, confirm_target,
+        intake.delete_requested_by_user_id, intake.delete_requested_at, _client_ip(request),
+    )
+    await db.delete(intake.bucket)
+    await db.commit()
 
 
 @admin_router.get("/{intake_id}/notes", response_model=list[BucketNoteRead])
@@ -5336,13 +5481,21 @@ async def list_broker_dealer_leads(
     stmt = (
         select(PublicUnderwritingIntake)
         .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
-        .where(Bucket.archived_at.is_(None), PublicUnderwritingIntake.broker_id == user.id)
+        .where(
+            Bucket.archived_at.is_(None),
+            PublicUnderwritingIntake.broker_id == user.id,
+            # A broker's own deletion request hides the lead from their own
+            # board immediately — the lead stays fully intact and visible to
+            # admin (with a pending badge) until admin separately confirms.
+            PublicUnderwritingIntake.delete_requested_at.is_(None),
+        )
         .options(
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.files),
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
             selectinload(PublicUnderwritingIntake.latest_review),
+            selectinload(PublicUnderwritingIntake.delete_requested_by),
             with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
         )
         .order_by(PublicUnderwritingIntake.updated_at.desc())
@@ -5477,6 +5630,53 @@ async def get_broker_dealer_lead(
 ) -> DealerIntakeResponse:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+
+
+@broker_router.post("/{intake_id}/request-deletion", response_model=DealerIntakeResponse)
+async def broker_request_lead_deletion(
+    intake_id: UUID,
+    payload: RequestLeadDeletionRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Flags the broker's own lead for deletion. Destroys nothing — only
+    hides it from THIS broker's own list (list_broker_dealer_leads filters
+    delete_requested_at IS NULL); admin still sees the full lead, with a
+    pending-deletion badge, until admin separately confirms."""
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    intake.delete_requested_at = _now()
+    intake.delete_requested_by_user_id = user.id
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_deletion_requested_by_broker", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.reason,
+    )
+    await db.commit()
+    intake = await _load_broker_dealer_lead(db, user, intake.id)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+
+
+@broker_router.post("/{intake_id}/cancel-deletion-request", response_model=DealerIntakeResponse)
+async def broker_cancel_lead_deletion(
+    intake_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Lets a broker undo their own accidental deletion request before admin
+    acts on it — fully reversible, no confirmation needed."""
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    intake.delete_requested_at = None
+    intake.delete_requested_by_user_id = None
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_deletion_request_cancelled_by_broker", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id),
+    )
+    await db.commit()
+    intake = await _load_broker_dealer_lead(db, user, intake.id)
     return await _response(db, intake, token=None, include_management=False, admin_thread=True)
 
 
