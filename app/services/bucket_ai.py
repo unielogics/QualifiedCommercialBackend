@@ -212,7 +212,8 @@ DEALER_CHAT_RULES = """- Stage 1 asks for last 2 years business tax returns, YTD
 - Use short sections and bullets when summarizing files: "What I see", "What it means", and "Next step". Keep the next step to one client action.
 - If related LLCs/accounts need clarification, ask only the first step first: primary operating LLC and main operating bank account. After the client answers, then ask how the related LLCs move money with the dealership.
 - Fold these into the normal pacing, one at a time, only when not already known (check context.dealer_details first — never re-ask a fact already present there): (1) who the owner(s) are, by name; (2) whether the current-year business tax return has been filed yet; (3) whether the dealership or its owner holds a reinsurance account, and if so, what trading platform the assets sit on.
-- When the borrower states one of these in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (never repeat previously-known facts): {"owners": [{"name": "string", "ownership_percent": number}], "current_year_tax_filed": true|false, "reinsurance_account_present": true|false, "reinsurance_trading_platform": "short string"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state.
+- When the borrower states one of these in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (never repeat previously-known facts): {"owners": [{"name": "string", "ownership_percent": number}], "current_year_tax_filed": true|false, "reinsurance_account_present": true|false, "reinsurance_trading_platform": "short string", "requested_loan_amount": number, "stated_monthly_debt_payments": number, "use_of_funds": "short string"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state.
+- requested_loan_amount, stated_monthly_debt_payments, and use_of_funds are deal-shaping facts: capture them the moment they are stated or corrected in ANY thread (client or internal), including restatements ("actually make it $1.5M"). A number stated with k/M shorthand must be converted to the full dollar figure.
 - If the borrower says they don't have, don't know what, or are confused by the debt schedule or personal financial statement (PFS), briefly explain what it is in one sentence, then tell them they can fill it out online right in this room instead of uploading a file — point them to the "Fill out online instead" link next to that item in the Files panel. Do not repeat this every turn once you've said it once for a given document.
 - context.loan_program_fit is an internal, never-disclosed signal showing which of our financing programs this file is already eligible for and which are blocked only on a specific missing document or fact (e.g. a debt schedule likely unlocks the term-loan programs; a stated equipment/vehicle financing intent unlocks equipment financing; additional bank-statement months would confirm merchant-processing or line-of-credit eligibility). Use it ONLY to choose which single missing document or fact to request next — prioritize whichever one is most likely to unlock additional program eligibility or the largest incremental capital, while still following the normal Stage 1 pacing above. This never changes what you say out loud: no program name, no eligibility, and no pricing figure gets mentioned as a result of this reasoning.
 - Never tell the borrower which loan program (SBA, real-estate-backed, reinsurance-backed, jumbo, or any other name) they qualify for, and never state or imply a rate, advance rate, or pricing figure — that determination and any pricing conversation happens only with a Qualified Commercial underwriter, not in this chat."""
@@ -223,7 +224,7 @@ RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focu
 - Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence. Ask one real-estate funding question or upload request at a time.
 - This is a prequalification conversation. Early on, briefly confirm the property/deal facts already on file from the intake form (property address, transaction type, requested amount, value/purchase price, monthly rent, credit tier) so the borrower knows you already have them — do not re-ask for anything already provided.
 - Once basics are confirmed, ask (one at a time, folded naturally into the underwriting conversation, not as a separate quiz) for whichever of these is still missing: down payment amount, whether the borrower has owned investment property before, and whether this purchase is residential (1-4 unit) or commercial. Only ask for ones not already answered.
-- When the borrower states one of these three facts in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (do not repeat previously-known facts): {"down_payment_amount": number, "prior_property_ownership": true|false, "is_commercial_property": true|false, "property_type": "short string, e.g. single-family / duplex / small multifamily / commercial retail"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state."""
+- When the borrower states one of these three facts in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (do not repeat previously-known facts): {"down_payment_amount": number, "prior_property_ownership": true|false, "is_commercial_property": true|false, "property_type": "short string, e.g. single-family / duplex / small multifamily / commercial retail", "requested_amount": number}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state. Capture requested_amount whenever the loan amount is stated or corrected in ANY thread (client or internal), converting k/M shorthand to full dollars."""
 
 
 # Internal-thread override, appended AFTER the product rules for the private
@@ -1005,6 +1006,102 @@ def _apply_lending_readiness(result: dict[str, Any], per_file_analyses: list[dic
             }
         if not one_next:
             result["one_next_step"] = question
+
+
+def _reconcile_checklist_consistency(bucket: Bucket, result: dict[str, Any]) -> None:
+    """Post-review consistency pass: the model's readiness verdict can lag the
+    live requested-document checklist (_apply_lending_readiness judges bank/tax
+    minimums and the AI-authored missing list, not the checklist), letting a
+    review claim "Stage 1 complete" while required documents are outstanding.
+    Pin them together deterministically after every review."""
+    linked = {
+        file.requested_document_id
+        for file in bucket.files
+        if file.requested_document_id and file.deleted_at is None
+    }
+    outstanding_docs = [
+        doc
+        for doc in bucket.requested_documents
+        if doc.required and doc.status != "uploaded" and doc.id not in linked
+    ]
+    result["outstanding_checklist"] = [doc.name for doc in outstanding_docs]
+    if not outstanding_docs:
+        return
+    result["lending_ready"] = False
+    names = ", ".join(doc.name for doc in outstanding_docs[:5])
+    one_next = str(result.get("one_next_step") or "").strip()
+    lowered = one_next.lower()
+    claims_complete = any(
+        phrase in lowered
+        for phrase in ("advance to lender", "all stage 1", "evidence is in", "ready for packaging", "complete — ", "is complete")
+    )
+    if not one_next or claims_complete:
+        result["one_next_step"] = f"Collect the outstanding checklist items: {names} — then advance to lender packaging."
+    # Ensure the missing list carries every outstanding checklist doc so no
+    # consumer (PDF, cockpit, packets) has to re-derive the union.
+    existing = result.get("missing_or_incomplete_items")
+    existing = existing if isinstance(existing, list) else []
+    existing_titles = {
+        str(item.get("title") or "").strip().lower() for item in existing if isinstance(item, dict)
+    }
+    additions = [
+        {"title": doc.name, "detail": doc.description or "", "priority": "high"}
+        for doc in outstanding_docs
+        if doc.name.strip().lower() not in existing_titles
+    ]
+    if additions:
+        result["missing_or_incomplete_items"] = existing + additions
+
+
+async def _repair_empty_strengths_risks(
+    db: AsyncSession,
+    *,
+    bucket: Bucket,
+    review: BucketAIReview,
+    result: dict[str, Any],
+    per_file_analyses: list[dict[str, Any]],
+) -> None:
+    """Single targeted retry when the synthesis returned empty strengths/risks
+    despite analyzed evidence — a recurring model omission that leaves the
+    cockpit and reports blank. Strictly grounded in the already-extracted
+    summary/metrics/coverage; on any failure the sections just stay empty."""
+    strengths = result.get("strengths") if isinstance(result.get("strengths"), list) else []
+    risks = result.get("risks") if isinstance(result.get("risks"), list) else []
+    if (strengths and risks) or not per_file_analyses:
+        return
+    summary = str(result.get("executive_summary") or "").strip()
+    if not summary:
+        return
+    prompt = {
+        "executive_summary": summary,
+        "key_metrics": result.get("key_metrics") or {},
+        "baseline_coverage": (result.get("document_evidence_map") or {}).get("baseline_coverage") or [],
+        "instruction": (
+            "From ONLY the data above, list the file's underwriting strengths and risks. "
+            "3-6 of each when the data supports them, fewer if it does not. Never invent a fact "
+            "not present above. Reply as JSON: {\"strengths\": [\"...\"], \"risks\": [\"...\"]}"
+        ),
+    }
+    try:
+        resp = await tracked_messages_create(
+            db,
+            feature="review_repair",
+            client=get_client(),
+            model=model_light(),
+            metadata={"bucket_id": str(bucket.id), "bucket_ai_review_id": str(review.id)},
+            max_tokens=1200,
+            system="You are a commercial underwriting analyst. Ground every statement strictly in the provided data.",
+            messages=[{"role": "user", "content": json.dumps(prompt, default=str)}],
+        )
+        parsed = _json_or_fallback(_text_from_response(resp), "strengths")
+        repaired_strengths = [str(item) for item in parsed.get("strengths") or [] if str(item).strip()]
+        repaired_risks = [str(item) for item in parsed.get("risks") or [] if str(item).strip()]
+        if not strengths and repaired_strengths:
+            result["strengths"] = repaired_strengths[:6]
+        if not risks and repaired_risks:
+            result["risks"] = repaired_risks[:6]
+    except Exception:  # noqa: BLE001
+        log.exception("bucket_ai: strengths/risks repair failed bucket=%s", bucket.id)
 
 
 def _s3_client():
@@ -2044,6 +2141,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # readiness + a concrete clarifying next step from the open gaps.
         _compute_key_metrics_from_cache(result, per_file_analyses)
         _apply_lending_readiness(result, per_file_analyses)
+        # Deterministic consistency pass + single targeted repair — see the
+        # helpers for why each exists.
+        _reconcile_checklist_consistency(bucket, result)
+        await _repair_empty_strengths_risks(db, bucket=bucket, review=review, result=result, per_file_analyses=per_file_analyses)
         if skipped:
             result["skipped_files"] = skipped
         review.result = result

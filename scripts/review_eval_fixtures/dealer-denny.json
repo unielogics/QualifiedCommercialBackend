@@ -1,0 +1,2584 @@
+{
+  "name": "dealer-denny",
+  "review_type": "dealer_gatekeeper_v1",
+  "bucket": {
+    "name": "Denny Motors Dealer AI Intake",
+    "client_name": "Denny Motors",
+    "purpose": "Dealer financing AI intake",
+    "bucket_type": "dealer_ai_intake",
+    "description": "Public AI gatekeeper intake for dealer financing with real estate collateral."
+  },
+  "ai_context": {
+    "deal_type": "dealer financing with real estate collateral",
+    "asset_rows": [],
+    "chat_facts": [
+      {
+        "at": "2026-07-06T18:51:12.228951+00:00",
+        "text": "cant we do things without the bank statements?",
+        "source": "client_chat"
+      }
+    ],
+    "credit_pull": null,
+    "review_type": "dealer_gatekeeper_v1",
+    "client_email": "dennymatos15@gmail.com",
+    "loan_purpose": null,
+    "business_name": "Denny Motors",
+    "dealer_details": null,
+    "collateral_type": "real estate collateral and business assets",
+    "referral_source": null,
+    "entity_structure": {},
+    "loan_program_fit": null,
+    "recent_dealer_chat": [
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Not for a real credit decision. Bank statements are non-negotiable\u2014they're the only way to verify actual cash flow, monthly revenues, and your ability to service new debt. Tax returns show what you earned; bank statements show what actually landed in your account and how you spent it. Without them, I can't screen you past 'maybe,' and no lender will fund on guesses. The good news: this is a fast upload. Three months of EMG's main operating account, all pages, and we move forward.",
+        "audience": "uploader",
+        "created_at": "2026-07-06T18:51:12.203200+00:00"
+      },
+      {
+        "role": "user",
+        "author": "Denny Matos",
+        "content": "cant we do things without the bank statements?",
+        "audience": "uploader",
+        "created_at": "2026-07-06T18:51:12.203200+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Bank statements first\u2014that's the only thing blocking a preliminary screen right now. I can see you've got $39M\u2013$30M in dealership revenue, solid W-2 income, and a $2.2M property in appraisal. But I can't size up your monthly cash flow, debt service capacity, or floorplan load without seeing 3 months of your main operating account.\n\nOnce I have those statements, I'll know whether this file supports a real-estate-backed deal, what your DSCR looks like, and what comes next.",
+        "audience": "uploader",
+        "created_at": "2026-07-06T21:02:20.804024+00:00"
+      },
+      {
+        "role": "user",
+        "author": "Denny Matos",
+        "content": "okay what do we need to do then",
+        "audience": "uploader",
+        "created_at": "2026-07-06T21:02:20.804024+00:00"
+      }
+    ],
+    "underwriting_focus": "Strictly screen Stage 1 bankability for dealer capital without asking the client to choose a loan product. Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. Stage 1 focuses on business tax returns, YTD P&L, main operating bank statements, requested amount, detailed use of funds, stated monthly debt, and estimated credit. Do not ask for the full Stage 2 package until Stage 1 shows good probability. Treat real estate and related LLC/account structure as targeted follow-up clarifications after cash-flow context supports a path.",
+    "authoritative_facts": {},
+    "custom_instructions": "This is a public lead-magnet strict Stage 1 underwriter for car dealers. Ask first for last 2 years business tax returns, YTD P&L, last 6 months main operating bank statements, requested amount, a detailed use-of-funds breakdown, stated monthly debt payments, and estimated credit. The user may not know which lending product fits. Return one of these probability statuses: Good probability - book call, Promising but needs one clarification, Not enough evidence yet, or Poor probability based on current file. Set booking_recommended true only for Good probability - book call. Return a preliminary screen, not a commitment to lend.",
+    "documentation_level": "full doc",
+    "requested_loan_amount": null,
+    "estimated_credit_score": null,
+    "baseline_document_policy": {
+      "stage": "stage_1_bankability",
+      "allowed_document_categories": [
+        "last 2 years business tax returns (or current-year extension filing if not yet filed)",
+        "current year/YTD P&L",
+        "last 6 months main operating bank statements",
+        "debt schedule",
+        "personal financial statement for each owner",
+        "identification for each owner",
+        "requested amount",
+        "detailed use of funds with amount breakdown",
+        "stated current monthly debt payments",
+        "estimated credit tier/score"
+      ],
+      "stage_2_after_good_probability_only": [
+        "personal tax returns",
+        "dealer license",
+        "mortgage statements",
+        "property tax/insurance",
+        "entity docs",
+        "KYC/credit authorization",
+        "appraisal/BPO/title items when needed"
+      ],
+      "do_not_request_other_document_categories": true
+    }
+  },
+  "requested_documents": [
+    {
+      "id": "e04c8cd4-f449-4830-9e06-3969b1e66aa6",
+      "name": "Asset and real estate schedule",
+      "category": "Collateral",
+      "required": true,
+      "status": "requested",
+      "description": "List owned real estate and assets, including estimated property values and current loan balances."
+    },
+    {
+      "id": "3e533241-aa51-41a3-911c-3e15713f2070",
+      "name": "Mortgage notes or payoff statements",
+      "category": "Collateral",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload mortgage notes, payoff statements, or loan statements for real estate collateral where available."
+    },
+    {
+      "id": "94b2a9a2-016e-4e65-b154-8f24445cd2a9",
+      "name": "Current year P&L",
+      "category": "Financials",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload the current year profit and loss statement for the dealership/business."
+    },
+    {
+      "id": "ba2482b2-87c2-4728-8fac-98cfa15d3051",
+      "name": "Last 2 years tax returns",
+      "category": "Financials",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload business and personal tax returns for the last two years where available."
+    },
+    {
+      "id": "c0823ed5-f7ba-4ace-8719-429d9660b689",
+      "name": "Last 3 months bank statements",
+      "category": "Bank Statements",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload the last three months of business bank statements."
+    }
+  ],
+  "uploaded_files": [
+    {
+      "id": "7a83ec9a-a6dc-4a28-87c1-67a7430bf2f2",
+      "file_name": "TD July 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1135948
+    },
+    {
+      "id": "2801d1b7-0971-47bf-be51-fcd7269f7f17",
+      "file_name": "TD March 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1258627
+    },
+    {
+      "id": "8ccd55d7-8746-476b-ac3f-6580f1115cbb",
+      "file_name": "TD May 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1105348
+    },
+    {
+      "id": "cfb0ae40-2540-4f81-abb2-5fab7cc4d0ce",
+      "file_name": "Elias/Client Package_EMGAutoSalesInc_Initial.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 803945
+    },
+    {
+      "id": "902f8547-f1d7-4c7a-aa3e-16e46e03d3d9",
+      "file_name": "Elias/Rockland Na Floor Plan Current Balance 62930.xlsx",
+      "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "size_bytes": 172521
+    },
+    {
+      "id": "78a19c1c-6fe0-49ea-9dd4-c26732ae225a",
+      "file_name": "200 S Broadway Appraisal.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 3075488
+    },
+    {
+      "id": "3ecb8142-5891-45a8-82c0-32835ec96f0a",
+      "file_name": "1690 JFK Lease.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 2819575
+    },
+    {
+      "id": "0ecd09d3-29a1-490b-9335-bd05c17745ed",
+      "file_name": "486 Rahway Ave Lease Extension.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 387452
+    },
+    {
+      "id": "adb0328b-1221-465f-8703-dad0081129d8",
+      "file_name": "EMG Auto Sales 2023 Tax Return (2) (1).pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 705565
+    },
+    {
+      "id": "9a9c5087-d04e-4ea4-b053-25e7b468747d",
+      "file_name": "ELIAS GONZALES - EXTENTION.PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 222654
+    },
+    {
+      "id": "a33559ac-1529-4a57-9fb9-2d516538ca59",
+      "file_name": "Elias1.zip",
+      "content_type": "application/x-zip-compressed",
+      "size_bytes": 14220142
+    },
+    {
+      "id": "f7f3279b-172a-40b3-8e0c-8c071aa40e3e",
+      "file_name": "Elias.zip",
+      "content_type": "application/x-zip-compressed",
+      "size_bytes": 9105732
+    },
+    {
+      "id": "8ffaebc1-7af0-4735-af48-5431d66f319f",
+      "file_name": "EMG Auto Sales INC 2025 Tax return.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 697951
+    },
+    {
+      "id": "dae4737a-e7b8-4e9e-b577-b625ef573335",
+      "file_name": "Emg Auto Sales 2024 Tax Return.PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 716601
+    },
+    {
+      "id": "2d96d85a-5d7b-4133-ba23-ac4f49b1fb6f",
+      "file_name": "Elias/3 Seag 2024 Taz Return (1).PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 545927
+    },
+    {
+      "id": "a8a1c8e7-ef11-40ae-b6fa-0899b0963e48",
+      "file_name": "Elias/3 SEAG 2025 EXTENSION.PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 230736
+    },
+    {
+      "id": "9fa3aa3a-0e58-471c-b452-d419350b4828",
+      "file_name": "Elias/3 SEAG AMORTIZATION SCHEDULE (2).pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 5177426
+    },
+    {
+      "id": "87d2b8c1-4b02-4f81-86f7-32cd46ace487",
+      "file_name": "Elias/Auto Use Updated PFS Elias Gonzalez wet ink signed 62626.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 157829
+    },
+    {
+      "id": "eb689e13-a32b-472e-b566-7125d799086a",
+      "file_name": "Elias/Elias Gonzalez 2025 W2.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 23483
+    },
+    {
+      "id": "de1535e0-52e4-425a-8754-c02f26462fa7",
+      "file_name": "Elias/Elias Gonzalez Real Estate Schedule update.xlsx",
+      "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "size_bytes": 10176
+    },
+    {
+      "id": "dd26ca08-1a03-441c-b86a-d5d37dd46e3f",
+      "file_name": "Elias/Elias Personal 2024 Tax Return (1).PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 821302
+    },
+    {
+      "id": "a66d3a4b-d814-489a-8eeb-a99ef95337e4",
+      "file_name": "Elias/Elias Updated license2025.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1558516
+    },
+    {
+      "id": "096de2ef-008a-423f-a1bf-4e2faef4db36",
+      "file_name": "Elias/EMG Auto Sales Accounts Payable Schedule.xlsx",
+      "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "size_bytes": 13627
+    },
+    {
+      "id": "928164cf-5e5f-4dd7-a4ca-757bf182a491",
+      "file_name": "Elias/EMG Auto Sales May 2026 TB.xlsx",
+      "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "size_bytes": 23423
+    },
+    {
+      "id": "52c231c0-8018-4c42-af74-1240b2327ec5",
+      "file_name": "Elias/Maple Shade Property pay off Balance (2).pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 178612
+    },
+    {
+      "id": "94ffdee3-d939-4867-8d26-37cdea2e19e3",
+      "file_name": "Rockland March 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 5739014
+    },
+    {
+      "id": "61238490-90f5-4994-9f51-1844aae1a8be",
+      "file_name": "TD April 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1186129
+    },
+    {
+      "id": "abed6e8f-7699-46a2-9acf-2231bf637153",
+      "file_name": "TD June 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1094037
+    },
+    {
+      "id": "172ffdbe-808e-4724-a3c0-b882191e96fa",
+      "file_name": "Rockland July 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 4790569
+    },
+    {
+      "id": "4e0e7d4a-288a-4b01-8dea-3d41ffe4535f",
+      "file_name": "Elias Personal 2024 Tax Return.PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 821302
+    },
+    {
+      "id": "82f45210-1eb5-4a69-9aff-fc6d15bdb5a8",
+      "file_name": "200 S Broadway Deed.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 2843404
+    },
+    {
+      "id": "c555f1b9-879d-4c29-82ae-a95a913e0126",
+      "file_name": "Rockland April 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 6151968
+    },
+    {
+      "id": "5488dc4b-40fe-4b50-a72c-ab972aa408e0",
+      "file_name": "Rockland May 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 5690247
+    },
+    {
+      "id": "344e942a-35e6-4f57-92ac-2b6381add59e",
+      "file_name": "Elias Gonzalez 2023 Tax Return (5) (1).PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 803577
+    },
+    {
+      "id": "2a3367a2-164a-43e1-a184-47bd22dd323f",
+      "file_name": "Td Febraury 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1179643
+    },
+    {
+      "id": "3b8cda19-6d11-46be-becc-855fbc1bcff2",
+      "file_name": "Elias Gonzalez 2023 Tax Return (5).PDF",
+      "content_type": "application/pdf",
+      "size_bytes": 803577
+    },
+    {
+      "id": "fa1fadfe-b326-497f-8fa9-149e1180198f",
+      "file_name": "Rockland Statement June 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 5270791
+    },
+    {
+      "id": "893a5a9e-d790-48b8-848a-e7969c062493",
+      "file_name": "Rockland February 2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 5081548
+    }
+  ],
+  "per_file_analyses": [
+    {
+      "file_id": "7a83ec9a-a6dc-4a28-87c1-67a7430bf2f2",
+      "file_name": "TD July 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "2801d1b7-0971-47bf-be51-fcd7269f7f17",
+      "file_name": "TD March 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "8ccd55d7-8746-476b-ac3f-6580f1115cbb",
+      "file_name": "TD May 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "cfb0ae40-2540-4f81-abb2-5fab7cc4d0ce",
+      "file_name": "Elias/Client Package_EMGAutoSalesInc_Initial.pdf",
+      "ai_classification": "other",
+      "confidence": "high",
+      "summary": "Cigna Healthcare level-funded group health insurance renewal proposal for EMG Auto Sales, Inc., effective August 1, 2026, covering 22 enrolled employees. Shows plan options, rates ($33,515.65/month renewal), 12-month claims history, and signed acknowledgement pages. Not a lending document.",
+      "supports": [
+        "employee headcount (~22 covered lives)",
+        "recurring fixed overhead expense (health insurance)",
+        "entity name confirmation: EMG Auto Sales, Inc.",
+        "NJ situs confirmed"
+      ],
+      "baseline_categories_supported": [],
+      "red_flags": [
+        "Client Name line on final signature page is blank \u2014 only signature and CFO title present, name not printed",
+        "Renewal rate increase of 14.78% adds ~$4,316/month to operating overhead",
+        "Two large claimants ($31,894 and $28,331) signal ongoing health cost volatility"
+      ],
+      "limitations": [
+        "Does not establish revenue, cash flow, assets, liabilities, or debt service capacity",
+        "Not a tax return, P&L, bank statement, or any standard lending collateral document",
+        "Provides no information on floorplan line, inventory, or real estate collateral",
+        "Diagnosis codes redacted \u2014 health risk profile of workforce not fully disclosed"
+      ],
+      "key_facts": {
+        "entity": "EMG Auto Sales, Inc.",
+        "insurer": "Cigna Healthcare",
+        "situs_state": "NJ",
+        "proposal_date": "2026-05-27",
+        "effective_date": "2026-08-01",
+        "signature_date": "2026-06-16",
+        "signed_by_title": "CFO",
+        "experience_period": "2025-04-01 to 2026-03-31",
+        "large_claims_total": 60225.55,
+        "gap_funding_offered": false,
+        "renewal_increase_pct": "14.78%",
+        "total_paid_claims_12mo": 132180.52,
+        "current_monthly_premium": 29199.78,
+        "renewal_monthly_premium": 33515.65,
+        "large_claimants_over_25k": 2,
+        "total_enrolled_employees": 22,
+        "annual_health_insurance_overhead": null
+      }
+    },
+    {
+      "file_id": "902f8547-f1d7-4c7a-aa3e-16e46e03d3d9",
+      "file_name": "Elias/Rockland Na Floor Plan Current Balance 62930.xlsx",
+      "ai_classification": "floorplan_mca_inventory",
+      "confidence": "high",
+      "summary": "Rockland Bank floorplan line listing for Customer 167-, showing individual vehicle loans (Loan IDs ~38998\u201339336) with VINs, vehicle descriptions, original principal, and current principal balances. File title indicates total current balance of $62,930 across all active units.",
+      "supports": [
+        "Floorplan line outstanding balance",
+        "Inventory collateral detail (VINs, year/make/model)",
+        "Active vs. paid-off unit identification",
+        "Dealer liability to Rockland Bank"
+      ],
+      "baseline_categories_supported": [
+        "floorplan_mca_inventory",
+        "collateral_debt_evidence"
+      ],
+      "red_flags": [
+        "Only first 80 of 2,838 rows extracted \u2014 total balance of $62,930 cannot be independently verified from the visible data; full file must be reviewed",
+        "Multiple duplicate VINs with separate Loan IDs (e.g., 1C6HJTFG1NL117167 appears as both Approved loan 39109 and Deleted loan 39104), suggesting re-booking or data corrections that warrant clarification",
+        "Numerous units show $0 principal balance despite non-zero original principal \u2014 could indicate paid-off units still on the schedule or data entry gaps",
+        "Stock Number column is entirely blank across all visible rows",
+        "Effective dates cluster in April\u2013May 2026 only; no historical aging visible in extracted rows"
+      ],
+      "limitations": [
+        "Only 80 of 2,838 rows visible; aggregate balance, unit count, and aging cannot be fully confirmed",
+        "No curtailment schedule, interest rate, or maturity/due dates shown",
+        "No dealer name explicitly stated \u2014 only 'Customer 167-'",
+        "Stock numbers absent, limiting cross-reference to physical inventory or title records",
+        "No aging buckets (30/60/90-day past due) visible"
+      ],
+      "key_facts": {
+        "note": "Visible-row sum of $736,562.50 far exceeds the file-stated total of $62,930, confirming that the stated total reflects only net outstanding after payoffs across all 2,838 rows \u2014 full file review required to reconcile",
+        "lender": "Rockland Bank (Rockland Na)",
+        "rows_reviewed": 80,
+        "collateral_type": "EMG Used Auto / EMG Older Auto",
+        "total_rows_in_file": 2838,
+        "borrower_customer_id": "Customer 167-",
+        "deleted_loans_visible": 6,
+        "approved_loans_visible": 71,
+        "effective_date_range_visible": "2026-04-27 to 2026-05-18",
+        "file_stated_total_current_balance": 62930,
+        "sum_of_nonzero_balances_visible_rows": 736562.5,
+        "units_with_nonzero_principal_visible": [
+          {
+            "vin": "WAUFACF50RA093683",
+            "loan_id": "39336",
+            "description": "2024 AUDI A5 PREMIUM PLUS 45 HB",
+            "current_balance": 27099
+          },
+          {
+            "vin": "1FTBF4X81PKB00178",
+            "loan_id": "39333",
+            "description": "2023 FORD TRANSIT T-350 HD CG",
+            "current_balance": 34415
+          },
+          {
+            "vin": "1FAGP8UH3R5120907",
+            "loan_id": "39332",
+            "description": "2024 FORD MUSTANG CV",
+            "current_balance": 24489
+          },
+          {
+            "vin": "3C6URVJG0KE554544",
+            "loan_id": "39274",
+            "description": "2019 RAM PROMASTER 3500 HIGH CG",
+            "current_balance": 11605
+          },
+          {
+            "vin": "1FTYE2Y82MKA91597",
+            "loan_id": "39270",
+            "description": "2021 FORD TRANSIT T-150 CG",
+            "current_balance": 30825
+          },
+          {
+            "vin": "1GNERKKW5PJ214387",
+            "loan_id": "39252",
+            "description": "2023 CHEV TRAVERSE PREMIER UT",
+            "current_balance": 28745
+          },
+          {
+            "vin": "W1Y8ND3Y5RT190334",
+            "loan_id": "39249",
+            "description": "2024 MERZ SPRINTER 3500 CG",
+            "current_balance": 48772.5
+          },
+          {
+            "vin": "1C6RR6GG7RS127761",
+            "loan_id": "39247",
+            "description": "2024 RAM 1500 CLASSIC SLT PK",
+            "current_balance": 20599
+          },
+          {
+            "vin": "5YFB4MDE6RP107177",
+            "loan_id": "39244",
+            "description": "2024 TOYT COROLLA LE SD",
+            "current_balance": 16099
+          },
+          {
+            "vin": "5N1DR3BC6SC205061",
+            "loan_id": "39246",
+            "description": "2025 NISS PATHFINDER SV UT",
+            "current_balance": 27099
+          },
+          {
+            "vin": "4T1B11HK0KU734985",
+            "loan_id": "39177",
+            "description": "2019 TOYT CAMRY L SD",
+            "current_balance": 18060
+          },
+          {
+            "vin": "4T1DAACK2SU556397",
+            "loan_id": "39176",
+            "description": "2025 TOYT CAMRY XSE SD",
+            "current_balance": 29750
+          },
+          {
+            "vin": "5J6RS6H97SL003061",
+            "loan_id": "39169",
+            "description": "2025 HOND CR-V SPORT TOURING UT",
+            "current_balance": 29350
+          },
+          {
+            "vin": "7FARS6H56SE102495",
+            "loan_id": "39171",
+            "description": "2025 HOND CR-V SPORT UT",
+            "current_balance": 33080
+          },
+          {
+            "vin": "5UXCR4C01P9P60352",
+            "loan_id": "39172",
+            "description": "2023 BMW X5 SDRIVE 40I UT",
+            "current_balance": 32625
+          },
+          {
+            "vin": "1N4BL4CVXPN371524",
+            "loan_id": "39168",
+            "description": "2023 NISS ALTIMA SR SD",
+            "current_balance": 16399
+          },
+          {
+            "vin": "1FTEX1C80GFB71010",
+            "loan_id": "39165",
+            "description": "2016 FORD F150 SUPER CAB PK",
+            "current_balance": 13789
+          },
+          {
+            "vin": "1N6ED1CL3RN637032",
+            "loan_id": "39164",
+            "description": "2024 NISS FRONTIER S PK",
+            "current_balance": 21789
+          },
+          {
+            "vin": "3C6LRVVG6SE512837",
+            "loan_id": "39129",
+            "description": "2025 RAM PROMASTER 2500 STANDARD CG",
+            "current_balance": 30899
+          },
+          {
+            "vin": "2C4RC1S73RR103107",
+            "loan_id": "39127",
+            "description": "2024 CHRY PACIFICA HYBRID SELECT PV",
+            "current_balance": 21899
+          },
+          {
+            "vin": "5N1DL0MM1LC510460",
+            "loan_id": "39108",
+            "description": "2020 INFI QX60 LUXE UT",
+            "current_balance": 21500
+          },
+          {
+            "vin": "1FMEE5BP8MLA66794",
+            "loan_id": "39111",
+            "description": "2021 FORD BRONCO BASE UT",
+            "current_balance": 29095
+          },
+          {
+            "vin": "1C6HJTFG1NL117167",
+            "loan_id": "39109",
+            "description": "2022 JEEP GLADIATOR OVERLAND PK",
+            "current_balance": 32875
+          },
+          {
+            "vin": "1C4RJFAG2MC592573",
+            "loan_id": "39100",
+            "description": "2021 JEEP GRAND CHEROKEE LAREDO UT",
+            "current_balance": 19275
+          },
+          {
+            "vin": "WAUM2AF20KN064441",
+            "loan_id": "39101",
+            "description": "2019 AUDI A6 PRESTIGE SD",
+            "current_balance": 22410
+          },
+          {
+            "vin": "5TDGBRCH2NS538072",
+            "loan_id": "39098",
+            "description": "2022 TOYT HIGHLANDER HYBRID XLE UT",
+            "current_balance": 32625
+          },
+          {
+            "vin": "WBAJA5C55KWW19471",
+            "loan_id": "39000",
+            "description": "2019 BMW 530 I SD",
+            "current_balance": 15070
+          },
+          {
+            "vin": "WBAJA5C5XKBX88103",
+            "loan_id": "38999",
+            "description": "2019 BMW 530 I SD",
+            "current_balance": 16185
+          }
+        ]
+      }
+    },
+    {
+      "file_id": "78a19c1c-6fe0-49ea-9dd4-c26732ae225a",
+      "file_name": "200 S Broadway Appraisal.pdf",
+      "ai_classification": "collateral_debt_evidence",
+      "confidence": "high",
+      "summary": "CBRE MAI appraisal report dated January 28, 2026 (effective January 7, 2026) for Bayshore Pennsville Auto Sales & Service, 200 S. Broadway, Pennsville NJ. Concludes As-Is fee simple market value of $2,200,000 for a 26,581 SF pre-owned auto dealership on 5 net usable acres, ordered by Citizens Bank N.A. for collateral analysis.",
+      "supports": [
+        "As-Is market value of real estate collateral",
+        "Land value ($600,000)",
+        "Insurable replacement cost ($2,300,000)",
+        "Pending purchase contract analysis (EMG Auto Sales Inc at $1,700,000)",
+        "Collateral adequacy for Citizens Bank loan"
+      ],
+      "baseline_categories_supported": [
+        "Real estate collateral appraisal",
+        "Collateral valuation"
+      ],
+      "red_flags": [
+        "Appraised value ($2,200,000) is 29.4% above pending contract price ($1,700,000); appraiser attributes to seller motivation but spread is meaningful",
+        "Ford franchise was surrendered years ago; property operates as independent pre-owned dealer, reducing franchise premium and limiting buyer pool",
+        "Only 5 of 61.31 gross acres are usable due to wetlands; gross acreage could mislead if title/collateral description is not carefully reviewed",
+        "Building/floor plans and mechanical systems report were NOT provided to appraiser \u2014 extraordinary assumption used",
+        "Remaining economic life only 20 years; 55.6% accrued physical depreciation"
+      ],
+      "limitations": [
+        "No income approach developed (owner-user special-purpose property); no cap rate or NOI established",
+        "Environmental/hazmat analysis not performed; USTs possible on auto dealership site",
+        "Building structural integrity not independently verified",
+        "Traffic count data from 2019 \u2014 potentially stale",
+        "No title search; easements, encroachments, and deed restrictions listed as unknown"
+      ],
+      "key_facts": {
+        "client": "Citizens Bank, N.A.",
+        "zoning": "COM - Commercial",
+        "appraiser": "John J. Lynch, MAI",
+        "condition": "Average",
+        "flood_zone": "Zone X (Unshaded)",
+        "land_value": 600000,
+        "contract_date": "October 27, 2025",
+        "current_owner": "DKBGCT LLC",
+        "date_of_value": "January 7, 2026",
+        "property_name": "Bayshore Pennsville - Auto Sales & Service",
+        "property_type": "Pre-owned auto sales and service facility",
+        "appraisal_firm": "CBRE Valuation & Advisory Services",
+        "assessed_value": 2461000,
+        "contract_price": 1700000,
+        "date_of_report": "January 28, 2026",
+        "parcel_numbers": [
+          "09-02601-0000-00065",
+          "09-02601-0000-00064"
+        ],
+        "building_gla_sf": 26581,
+        "property_address": "200 S. Broadway, Pennsville Township, Salem County, NJ 08070",
+        "interest_appraised": "Fee Simple Estate",
+        "cost_approach_value": 2300000,
+        "effective_age_years": 25,
+        "buyer_under_contract": "EMG Auto Sales Inc",
+        "year_built_renovated": "1970 / 2016",
+        "gross_site_area_acres": 61.31,
+        "sales_comparison_value": 2100000,
+        "value_per_sf_concluded": 79.0,
+        "exposure_marketing_time": "6-9 months",
+        "annual_real_estate_taxes": 127947,
+        "insurable_replacement_cost": 2300000,
+        "net_usable_site_area_acres": 5.0,
+        "concluded_market_value_as_is": 2200000,
+        "remaining_economic_life_years": 20
+      }
+    },
+    {
+      "file_id": "3ecb8142-5891-45a8-82c0-32835ec96f0a",
+      "file_name": "1690 JFK Lease.pdf",
+      "ai_classification": "lease_or_rent",
+      "confidence": "high",
+      "summary": "Commercial lease dated June 6, 2024 between landlord Elias Gonzalez and tenants MbM Group LLC & Magdy S. Awad for a used car dealership at 1690 John F. Kennedy Blvd., Jersey City, NJ 07305. Five-year term (June 1, 2024\u2013May 31, 2029) with one 5-year renewal option; total base rent $468,360.",
+      "supports": [
+        "Business location / operating address for dealership",
+        "Lease term and expiration confirming ongoing occupancy rights",
+        "Monthly rent obligation for expense/cash-flow analysis",
+        "Tenant entity and individual guarantor identification",
+        "Permitted use restricted to used car dealership"
+      ],
+      "baseline_categories_supported": [
+        "Lease or rent agreement",
+        "Business address verification",
+        "Entity/vesting (MbM Group LLC and Magdy S. Awad as tenants)"
+      ],
+      "red_flags": [
+        "First two months' rent (June\u2013July 2024) waived as build-out period \u2014 reduces near-term cash outflow but should be noted in expense modeling",
+        "Renewal rental amount is at sole discretion of landlord \u2014 future rent exposure is uncapped",
+        "Lease signed by a third party with handwritten name 'George Abdelmalek' below Magdy S. Awad's individual tenant line \u2014 unclear authority/relationship",
+        "Lease execution date on cover says June 6, 2024 but body says 'day of JUNE, 2024' with blank day \u2014 minor document inconsistency"
+      ],
+      "limitations": [
+        "Does not confirm rent payments are current or that tenant is not in default",
+        "No certificate of occupancy or dealer license attached to verify compliant use",
+        "Security deposit of $15,000 confirmed in lease but no receipt or escrow evidence provided",
+        "Personal guaranty terms for Magdy S. Awad individually are not separately elaborated beyond his signature as individual tenant"
+      ],
+      "key_facts": {
+        "landlord": "Elias Gonzalez (885 US Highway 1, Avenel, NJ 07001)",
+        "late_fee": "5% of monthly rent if not received by 5th of month",
+        "lease_date": "June 6, 2024",
+        "governing_law": "New Jersey",
+        "permitted_use": "Used Car Dealership only",
+        "tenant_entity": "MbM Group LLC",
+        "renewal_option": "One 5-year option; renewal rent at sole landlord discretion",
+        "total_base_rent": 468360.0,
+        "lease_expiration": "May 31, 2029",
+        "lease_term_years": 5,
+        "property_address": "1690 John F. Kennedy Blvd., Jersey City, NJ 07305",
+        "rent_free_period": "June and July 2024 (first two months waived)",
+        "security_deposit": 15000.0,
+        "tenant_individual": "Magdy S. Awad (20 E 54th Street, Bayonne, NJ 07002)",
+        "lease_commencement": "June 1, 2024",
+        "monthly_rent_year1": 7500.0,
+        "monthly_rent_year2": 7650.0,
+        "monthly_rent_year3": 7803.0,
+        "monthly_rent_year4": 7959.0,
+        "monthly_rent_year5": 8118.0,
+        "returned_check_fee": 75.0
+      }
+    },
+    {
+      "file_id": "0ecd09d3-29a1-490b-9335-bd05c17745ed",
+      "file_name": "486 Rahway Ave Lease Extension.pdf",
+      "ai_classification": "lease_or_rent",
+      "confidence": "high",
+      "summary": "Two rent increase letters dated January 28, 2026 from landlord Elias Gonzalez to tenants at 486 Rahway Ave, Woodbridge NJ. Effective April 1, 2026: Apt 1st Floor rent increases to $2,300/mo; Apt 2nd Floor rent increases to $2,350/mo.",
+      "supports": [
+        "rental income verification",
+        "property income schedule",
+        "lease terms at 486 Rahway Ave"
+      ],
+      "baseline_categories_supported": [
+        "real estate schedule",
+        "lease_or_rent"
+      ],
+      "red_flags": [
+        "These are landlord-generated letters only \u2014 no signed tenant acknowledgment or countersignature from tenants",
+        "No underlying lease agreement provided to confirm original rent, lease term, or expiration date",
+        "File title says 'Lease Extension' but letters are rent increase notices, not a formal lease extension document"
+      ],
+      "limitations": [
+        "Does not establish lease expiration/term length",
+        "Does not confirm tenants accepted the increase",
+        "No original lease provided to verify prior rent amounts or lease commencement",
+        "Cannot confirm actual rent currently being collected or payment history"
+      ],
+      "key_facts": {
+        "landlord": "Elias Gonzalez",
+        "letter_date": "January 28, 2026",
+        "effective_date": "April 1, 2026",
+        "unit_1st_floor": {
+          "tenant": "Isaac Lora and Engerlina Pichardo",
+          "new_monthly_rent": 2300
+        },
+        "unit_2nd_floor": {
+          "tenant": "Anya Bell",
+          "new_monthly_rent": 2350
+        },
+        "lease_expiration": null,
+        "property_address": "486 Rahway Avenue, Woodbridge, NJ 07095",
+        "prior_rent_amounts": null,
+        "total_combined_monthly_rent_effective_april_2026": 4650
+      }
+    },
+    {
+      "file_id": "adb0328b-1221-465f-8703-dad0081129d8",
+      "file_name": "EMG Auto Sales 2023 Tax Return (2) (1).pdf",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2023 Federal Form 1120-S and NJ S-Corp returns (CBT-100S, PTE-100) for EMG Auto Sales Inc, EIN 22-3735917, a used car dealer in Avenel NJ. Prepared by Rosenfield & Company PLLC, filed electronically. Shows gross sales of $39.4M, ordinary business income of $616,657, and total assets of $10.07M.",
+      "supports": [
+        "2023 annual revenue and profitability of used car dealer",
+        "Floorplan interest expense ($719,833)",
+        "Shareholder/owner identity (Elias M. Gonzalez, 100% owner)",
+        "Business entity structure (S-Corp, single shareholder)",
+        "Balance sheet and total assets ($10.07M)"
+      ],
+      "baseline_categories_supported": [
+        "Business tax return (most recent year)",
+        "Entity/ownership verification"
+      ],
+      "red_flags": [
+        "Ordinary income declined YoY from $888,429 (2022) to $616,657 (2023), a 30.6% drop",
+        "Interest expense surged to $761,262 (2023) vs $433,265 (2022), driven by floorplan financing ($719,833)",
+        "Short-term debt (mortgages/notes payable <1 year) is $7.02M vs long-term of $500K \u2014 heavy reliance on short-term floorplan lines",
+        "This is a CLIENT'S COPY; no IRS acceptance confirmation or transcript visible",
+        "Extension filed (Form 7004); return due extended to 02/03/2025"
+      ],
+      "limitations": [
+        "Does not establish personal income or personal financial position of owner beyond K-1",
+        "No IRS tax transcript to confirm figures match filed return",
+        "No 2024 YTD financials; most recent data is 12/31/2023",
+        "Floorplan line details (lender, credit limit, advance rate) not shown in this return"
+      ],
+      "key_facts": {
+        "ein": "22-3735917",
+        "address": "885 US Highway 1, Avenel, NJ 07001",
+        "preparer": "Rosenfield & Company PLLC, Alan Ginsberg CPA",
+        "tax_year": "January 1, 2023 \u2013 December 31, 2023",
+        "advertising": 519027,
+        "entity_name": "EMG Auto Sales Inc",
+        "entity_type": "S Corporation",
+        "gross_sales": 39439284,
+        "shareholder": "Elias M. Gonzalez, 100% owner, SSN 140-80-8854",
+        "depreciation": 12920,
+        "gross_profit": 2478154,
+        "other_income": 3567026,
+        "rent_expense": 355764,
+        "total_income": 6045180,
+        "business_type": "Used Car Dealer",
+        "nj_pte_tax_paid": 39760,
+        "cash_end_of_year": 445152,
+        "total_deductions": 5428523,
+        "date_incorporated": "06/06/2000",
+        "cost_of_goods_sold": 36961130,
+        "long_term_debt_end": 500000,
+        "nj_cbt_minimum_tax": 3000,
+        "salaries_and_wages": 2223667,
+        "short_term_debt_end": 7022184,
+        "net_income_per_books": 583691,
+        "officer_compensation": 292262,
+        "s_election_effective": "09/01/2010",
+        "inventory_end_of_year": 7903825,
+        "retained_earnings_end": 1489137,
+        "section_199a_w2_wages": 4562539,
+        "interest_expense_total": 761262,
+        "prior_year_gross_sales": 34394935,
+        "accounts_receivable_end": 101463,
+        "ordinary_business_income": 616657,
+        "total_assets_end_of_year": 10068438,
+        "shareholder_distributions": 203594,
+        "floorplan_interest_expense": 719833,
+        "prior_year_ordinary_income": 888429,
+        "inventory_beginning_of_year": 7282805,
+        "section_199a_unadjusted_basis": 194950,
+        "total_shareholders_equity_end": 1995647,
+        "finance_and_insurance_income_net": 2516588
+      }
+    },
+    {
+      "file_id": "9a9c5087-d04e-4ea4-b053-25e7b468747d",
+      "file_name": "ELIAS GONZALES - EXTENTION.PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "IRS Form 4868 and NJ Form NJ-630 extension filings for Elias Gonzalez, tax year 2025, prepared by Rosenfield & Company PLLC. Extensions filed electronically; new filing deadline is October 15, 2026. No tax payment was required with the extension.",
+      "supports": [
+        "Confirms 2025 federal and NJ individual income tax returns are on extension",
+        "Identifies taxpayer name, address, and SSN",
+        "Shows estimated 2025 federal tax liability of $35,522 with $77,400 in payments already made"
+      ],
+      "baseline_categories_supported": [
+        "Tax return (extension in lieu of filed return)"
+      ],
+      "red_flags": [
+        "No actual 2025 tax return filed; only extension \u2014 income, deductions, and net taxable income are unknown and unverifiable until return is filed",
+        "File name references 'ELIAS GONZALES' but document shows 'ELIAS GONZALEZ' \u2014 minor name spelling discrepancy",
+        "Estimated federal tax liability ($35,522) vs. total payments ($77,400) suggests significant overpayment or estimated payment strategy \u2014 actual income not determinable from this document"
+      ],
+      "limitations": [
+        "Does not establish actual 2025 income, deductions, Schedule C/K-1 flows, or net taxable income",
+        "No W-2, 1099, or business income figures present",
+        "2025 return not yet filed; underwriter cannot use this as a substitute for a completed tax return",
+        "NJ estimated tax voucher (NJ-1040-ES-V) includes no payment amount"
+      ],
+      "key_facts": {
+        "address": "20 Evan Drive, Morganville, NJ 07751",
+        "preparer": "Rosenfield & Company, PLLC, 250 W. 34th Street, Suite 1705, New York, NY 10119",
+        "tax_year": "2025",
+        "ssn_last4": "8854",
+        "taxpayer_name": "Elias Gonzalez",
+        "nj_extension_form": "NJ-630",
+        "new_filing_deadline": "October 15, 2026",
+        "federal_extension_form": "Form 4868",
+        "total_2025_payments_made": 77400,
+        "balance_due_with_extension": 0,
+        "nj_estimated_tax_payment_amount": null,
+        "payment_amount_sent_with_extension": 0,
+        "estimated_federal_tax_liability_2025": 35522
+      }
+    },
+    {
+      "file_id": "8ffaebc1-7af0-4735-af48-5431d66f319f",
+      "file_name": "EMG Auto Sales INC 2025 Tax return.pdf",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "Federal Form 1120-S and NJ CBT-100S S corporation tax return package for EMG Auto Sales INC (EIN 22-3735917) for tax year ending December 31, 2025. Prepared by Rosenfield & Company, PLLC. Shows gross sales of $30.7M, ordinary business income of $384,084, and total assets of $8.8M.",
+      "supports": [
+        "Business revenue and profitability for calendar year 2025",
+        "Gross auto sales revenue and cost of goods sold (floorplan inventory turns)",
+        "Floor plan financing interest expense of $366,900",
+        "Balance sheet assets and liabilities as of 12/31/2025",
+        "100% ownership by Elias M. Gonzalez",
+        "Two-year revenue trend (prior year $33.6M vs. current $30.7M)"
+      ],
+      "baseline_categories_supported": [
+        "Business tax return (most recent year)",
+        "Entity/ownership verification"
+      ],
+      "red_flags": [
+        "Gross receipts declining year-over-year: $33.6M (prior) to $30.7M (current), a $2.9M drop",
+        "Other income (finance & insurance) also declined: $3.45M to $2.05M",
+        "Short-term liabilities (mortgages/notes <1 year) increased sharply from $3.4M to $4.6M",
+        "Long-term debt decreased from $1.07M to $441K \u2014 possible payoff or reclassification warrants verification",
+        "This is a client copy of a filed-extension return; federal extended due date is September 15, 2026 \u2014 IRS acceptance confirmation not in file"
+      ],
+      "limitations": [
+        "No IRS e-file acceptance confirmation included",
+        "No personal tax return (Form 1040) for owner Elias M. Gonzalez",
+        "Balance sheet does not break out floorplan line details or lender names",
+        "No accounts-receivable aging or floorplan curtailment schedule",
+        "Shareholder W-2/compensation appears to flow through salaries line, not officer comp line \u2014 personal cash flow may require addback analysis"
+      ],
+      "key_facts": {
+        "ein": "22-3735917",
+        "address": "885 US Highway 1, Avenel, NJ 07001",
+        "preparer": "Rosenfield & Company, PLLC / Alan Ginsberg, CPA",
+        "tax_year": "January 1, 2025 \u2013 December 31, 2025",
+        "advertising": 577691,
+        "entity_name": "EMG Auto Sales INC",
+        "entity_type": "S Corporation",
+        "gross_profit": 2709665,
+        "rent_expense": 542107,
+        "total_income": 4757765,
+        "cash_end_of_year": 905462,
+        "sole_shareholder": "Elias M. Gonzalez (100%)",
+        "total_deductions": 4373681,
+        "business_activity": "Used Car Dealer",
+        "date_incorporated": "06/06/2000",
+        "cost_of_goods_sold": 28032906,
+        "salaries_and_wages": 1729742,
+        "nj_pte_tax_paid_2025": 22029,
+        "section199a_w2_wages": 1873973,
+        "inventory_end_of_year": 5669481,
+        "federal_extension_filed": true,
+        "ordinary_business_income": 384084,
+        "total_assets_end_of_year": 8807208,
+        "federal_extended_due_date": "September 15, 2026",
+        "gross_receipts_prior_year": 33644166,
+        "floor_plan_interest_expense": 366900,
+        "gross_receipts_current_year": 30742571,
+        "inventory_beginning_of_year": 3775209,
+        "accounts_payable_end_of_year": 719135,
+        "section199a_unadjusted_basis": 128410,
+        "retained_earnings_end_of_year": 2227127,
+        "officer_compensation_on_return": 144231,
+        "total_assets_beginning_of_year": 7259641,
+        "mortgages_notes_1yr_or_more_end": 441512,
+        "shareholders_equity_end_of_year": 2733637,
+        "finance_and_insurance_income_net": 2048100,
+        "mortgages_notes_less_than_1yr_end": 4587656,
+        "accumulated_adjustments_account_end": 2213662
+      }
+    },
+    {
+      "file_id": "dae4737a-e7b8-4e9e-b577-b625ef573335",
+      "file_name": "Emg Auto Sales 2024 Tax Return.PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2024 federal Form 1120-S and NJ CBT-100S/PTE-100 S-corporation tax returns for EMG Auto Sales Inc (EIN 22-3735917), a used car dealer in Avenel, NJ. The returns show gross sales of $33.6M, total income of $5.27M, and ordinary business income of $387,416 for tax year ending December 31, 2024.",
+      "supports": [
+        "Business revenue and profitability for 2024",
+        "Floor plan financing interest expense ($501,381)",
+        "Two-year revenue trend (2023: $39.4M vs 2024: $33.6M gross sales)",
+        "Owner/officer identity and compensation (Elias M. Gonzalez, 100% owner, $212,308)",
+        "Balance sheet and inventory position",
+        "Finance & insurance income ($3.45M)"
+      ],
+      "baseline_categories_supported": [
+        "Business tax returns (most recent year)",
+        "Entity/ownership verification"
+      ],
+      "red_flags": [
+        "Gross sales declined $5.8M (-14.7%) year-over-year from $39.4M in 2023 to $33.6M in 2024",
+        "Ordinary business income declined $229,241 (-37%) from $616,657 in 2023 to $387,416 in 2024",
+        "Short-term notes payable (floor plan) declined dramatically from $7.02M to $3.40M \u2014 significant inventory reduction",
+        "Ending inventory dropped from $7.9M to $3.78M, suggesting major curtailment or paydown",
+        "Large 'Due from Related Parties' balance growing: $1.2M to $1.8M (potential undisclosed related-party obligations)",
+        "Document is CLIENT'S COPY only \u2014 not IRS-stamped or MeF acceptance confirmation visible in this copy"
+      ],
+      "limitations": [
+        "No IRS e-file acceptance confirmation attached (Form 8879-CORP unsigned in this copy)",
+        "Does not establish personal income/cash flow of Elias Gonzalez beyond K-1 pass-through",
+        "No detail on the $3.4M short-term notes payable (floor plan lender names, terms, balances)",
+        "Related-party receivable nature and collectibility not disclosed"
+      ],
+      "key_facts": {
+        "ein": "22-3735917",
+        "address": "885 US Highway 1, Avenel, NJ 07001",
+        "preparer": "Rosenfield & Company, PLLC (Alan Ginsberg, CPA)",
+        "tax_year": "January 1, 2024 to December 31, 2024",
+        "sole_owner": "Elias M. Gonzalez, 100%",
+        "advertising": 555861,
+        "entity_name": "EMG AUTO SALES INC",
+        "entity_type": "S Corporation",
+        "incorporated": "06/06/2000",
+        "rent_expense": 336500,
+        "s_election_date": "09/01/2010",
+        "cash_end_of_year": 982563,
+        "business_activity": "Used Car Dealer (NAICS 441120)",
+        "gross_profit_2024": 1820654,
+        "total_income_2024": 5270814,
+        "cash_distributions": 19466,
+        "salaries_and_wages": 2077210,
+        "gross_receipts_2023": 39439284,
+        "gross_receipts_2024": 33644166,
+        "net_income_per_books": 348250,
+        "nj_pte_tax_paid_2024": 20593,
+        "officer_compensation": 212308,
+        "inventory_end_of_year": 3775209,
+        "section_199a_w2_wages": 2289518,
+        "total_deductions_2024": 4883398,
+        "cost_of_goods_sold_2024": 31823512,
+        "total_assets_end_of_year": 7259641,
+        "floor_plan_interest_expense": 501381,
+        "inventory_beginning_of_year": 7903825,
+        "finance_and_insurance_income": 3450160,
+        "gross_receipts_2nd_prior_year": 34394935,
+        "gross_receipts_3rd_prior_year": 31542533,
+        "ordinary_business_income_2023": 616657,
+        "ordinary_business_income_2024": 387416,
+        "retained_earnings_end_of_year": 1856853,
+        "section_199a_unadjusted_basis": 180910,
+        "total_assets_beginning_of_year": 10068438,
+        "accounts_receivable_end_of_year": 343530,
+        "shareholders_equity_end_of_year": 2363363,
+        "long_term_notes_payable_end_of_year": 1068319,
+        "short_term_notes_payable_end_of_year": 3401187
+      }
+    },
+    {
+      "file_id": "2d96d85a-5d7b-4133-ba23-ac4f49b1fb6f",
+      "file_name": "Elias/3 Seag 2024 Taz Return (1).PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2024 Form 1120-S and NJ CBT-100S for 3 Seag LLC (EIN 47-4966623), a single-shareholder S-corp owning commercial property at 80 Tappen St, Woodbridge NJ. Reports $277,390 gross rents and $141,690 net rental income passing through 100% to sole shareholder Elias M. Gonzalez.",
+      "supports": [
+        "Business income/cash flow for guarantor Elias M. Gonzalez",
+        "Rental income from commercial real estate collateral",
+        "Entity structure and ownership (100% Gonzalez)",
+        "Mortgage/debt load on collateral property",
+        "Total assets and balance sheet strength"
+      ],
+      "baseline_categories_supported": [
+        "tax_return",
+        "real_estate_schedule"
+      ],
+      "red_flags": [
+        "Large disallowed business interest expense carryforward of $248,586 (Form 8990), suggesting mortgage debt significantly exceeds income capacity",
+        "Only $60,724 of $94,701 current-year interest was deductible; $33,977 booked but disallowed on Schedule M-1",
+        "Cash dropped sharply from $1,004,875 (BOY) to $379,430 (EOY), a $625,445 decline",
+        "'Due to related parties' liability declined from $680,197 to $260,467 \u2014 possible related-party cash distributions not labeled as distributions",
+        "No officer compensation reported on Schedule F despite Elias Gonzalez listed as President",
+        "Client's copy \u2014 no IRS or NJ filing acknowledgment stamps visible; Form 8879-CORP officer signature line is blank"
+      ],
+      "limitations": [
+        "Does not establish personal income of Elias Gonzalez (personal 1040 not included)",
+        "Mortgage payable balance ($1,322,682) shown but lender identity, rate, and maturity not detailed in this return",
+        "No rent roll or lease agreements to confirm rent continuity",
+        "Form 8879-CORP officer signature is blank \u2014 filing authentication not confirmed within this document"
+      ],
+      "key_facts": {
+        "ein": "47-4966623",
+        "cash_boy": 1004875,
+        "cash_eoy": 379430,
+        "tax_year": "2024 (calendar year ending December 31, 2024)",
+        "land_value": 446021,
+        "nj_tax_due": 750,
+        "entity_name": "3 Seag LLC",
+        "gross_rents": 277390,
+        "prepared_by": "Rosenfield & Company, PLLC, Orlando FL (Alan Ginsberg, CPA)",
+        "return_type": "Form 1120-S (S-Corporation) + NJ CBT-100S",
+        "depreciation": 45746,
+        "federal_tax_due": 0,
+        "property_address": "80 Tappen St, Woodbridge, NJ 07095 (Commercial, Code 4)",
+        "sole_shareholder": "Elias M. Gonzalez, 20 Evan Drive, Morganville NJ 07751 (SSN 140-80-8854), 100%",
+        "total_assets_boy": 2949312,
+        "total_assets_eoy": 2199661,
+        "building_cost_basis": 1784082,
+        "net_income_per_books": 107713,
+        "retained_earnings_boy": 407950,
+        "retained_earnings_eoy": 515663,
+        "total_rental_expenses": 135700,
+        "interest_expense_deducted": 60724,
+        "due_to_related_parties_boy": 680197,
+        "due_to_related_parties_eoy": 260467,
+        "section_199a_rental_income": 141690,
+        "accumulated_depreciation_eoy": 409872,
+        "net_rental_real_estate_income": 141690,
+        "disallowed_interest_carryforward": 248586,
+        "mortgage_notes_payable_gt1yr_boy": 1401631,
+        "mortgage_notes_payable_gt1yr_eoy": 1322682,
+        "accumulated_adjustments_account_eoy": 764249,
+        "section_199a_unadjusted_basis_of_assets": 1784082
+      }
+    },
+    {
+      "file_id": "a8a1c8e7-ef11-40ae-b6fa-0899b0963e48",
+      "file_name": "Elias/3 SEAG 2025 EXTENSION.PDF",
+      "ai_classification": "other",
+      "confidence": "high",
+      "summary": "IRS Form 7004 filed by 3 SEAG LLC (EIN 47-4966623) requesting an automatic extension of time to file its 2025 business tax return (Form 1120-S, code 25). No tax is due; tentative tax, payments, and balance are all $0.",
+      "supports": [
+        "Confirms entity name and EIN",
+        "Shows 2025 tax year filing obligation exists",
+        "Indicates S-corp election (Form 1120-S)"
+      ],
+      "baseline_categories_supported": [
+        "entity_or_vesting"
+      ],
+      "red_flags": [
+        "Actual 2025 tax return not yet filed \u2014 only an extension request; no income/expense data available",
+        "Zero tentative tax may indicate placeholder filing rather than accurate estimate"
+      ],
+      "limitations": [
+        "Does not provide any revenue, expense, or taxable income figures",
+        "Does not substitute for the actual 2025 Form 1120-S",
+        "Does not confirm ownership structure or members/shareholders"
+      ],
+      "key_facts": {
+        "ein": "47-4966623",
+        "address": "885 RT 1 South, Avenel, NJ 07001",
+        "tax_year": "2025",
+        "form_type": "Form 7004 (Extension Request)",
+        "balance_due": 0,
+        "entity_name": "3 SEAG LLC",
+        "date_created": "4/2/2025",
+        "tentative_total_tax": 0,
+        "return_being_extended": "Form 1120-S",
+        "total_payments_and_credits": 0
+      }
+    },
+    {
+      "file_id": "9fa3aa3a-0e58-471c-b452-d419350b4828",
+      "file_name": "Elias/3 SEAG AMORTIZATION SCHEDULE (2).pdf",
+      "ai_classification": "collateral_debt_evidence",
+      "confidence": "high",
+      "summary": "Third-party website-generated amortization schedule for a $2,000,000 loan at 6.50% annual interest over 20 years, starting 1/1/2016, with a monthly payment of $14,911.46. Documents projected payment, interest, principal, and remaining balance for all 240 periods through 01/01/2036.",
+      "supports": [
+        "Monthly debt service obligation on a $2M loan",
+        "Remaining balance at any point in the loan term",
+        "Interest rate and loan term confirmation",
+        "Debt service input for cash flow / coverage analysis"
+      ],
+      "baseline_categories_supported": [
+        "collateral_debt_evidence",
+        "debt_schedule"
+      ],
+      "red_flags": [
+        "Generated by a free public website (www.amortization-schedule.info) \u2014 not an official lender statement or payoff letter; cannot confirm actual loan exists or that payments are current",
+        "No borrower name, lender name, loan number, or property address identified anywhere in the document",
+        "Document printed 12/28/2015; loan start date 1/1/2016 \u2014 this is a pre-loan projection, not a current balance confirmation",
+        "No evidence of actual payment history or current outstanding balance"
+      ],
+      "limitations": [
+        "Does not confirm the loan was actually originated or is currently active",
+        "No lender, borrower, or collateral identification",
+        "Cannot substitute for a payoff statement or mortgage statement showing current balance",
+        "Does not prove payments are being made on time"
+      ],
+      "key_facts": {
+        "lender": null,
+        "source": "www.amortization-schedule.info (free online calculator)",
+        "borrower": null,
+        "loan_term": "20 years",
+        "loan_amount": 2000000.0,
+        "loan_number": null,
+        "total_payments": 3578751.66,
+        "current_balance": null,
+        "loan_start_date": "01/01/2016",
+        "monthly_payment": 14911.46,
+        "loan_payoff_date": "01/01/2036",
+        "property_address": null,
+        "total_interest_paid": 1578751.66,
+        "annual_interest_rate": "6.50%",
+        "document_generated_date": "12/28/2015"
+      }
+    },
+    {
+      "file_id": "87d2b8c1-4b02-4f81-86f7-32cd46ace487",
+      "file_name": "Elias/Auto Use Updated PFS Elias Gonzalez wet ink signed 62626.pdf",
+      "ai_classification": "personal_financial_statement",
+      "confidence": "high",
+      "summary": "Wet-ink signed Personal Financial Statement for Elias Gonzalez, dated 6/26/2026. Reports total assets of $24,713,816.06, total liabilities of $3,535,879.91, and net worth of $21,177,936.15, with cash of $443,816.06 and real estate as the dominant asset.",
+      "supports": [
+        "Guarantor net worth and liquidity",
+        "Personal real estate holdings reference",
+        "Income sources for debt service capacity",
+        "Contingent liability disclosure"
+      ],
+      "baseline_categories_supported": [
+        "Personal Financial Statement"
+      ],
+      "red_flags": [
+        "Total Liabilities & Net Worth ($21,177,936.15) does not equal Total Assets ($24,713,816.06) \u2014 arithmetic inconsistency on face of document",
+        "Real estate detail deferred to separate schedule not included in this file",
+        "Statement date 6/26/2026 is a future date, which may indicate a typo (possibly 6/26/2025 or 6/26/2024)",
+        "Automobiles and personal property listed at $650,000 with no supporting schedule",
+        "Net worth field populated with Total Assets figure ($24,713,816.06) rather than Assets minus Liabilities ($21,177,936.15) \u2014 possible form entry error"
+      ],
+      "limitations": [
+        "Real estate schedule referenced but not included; property-level detail unverifiable",
+        "No supporting documentation for $443,816.06 cash (no bank statements attached here)",
+        "No tax returns cross-referenced to validate $600,000 salary or $23,000 real estate income",
+        "Schedule A (securities), D (life insurance), and E (pledged assets) all marked n/a \u2014 cannot verify",
+        "Past/present finance sources section left blank"
+      ],
+      "key_facts": {
+        "net_worth": 21177936.15,
+        "subject_name": "Elias Gonzalez",
+        "total_assets": 24713816.06,
+        "annual_salary": 600000.0,
+        "legal_actions": "No",
+        "liquid_assets": 443816.06,
+        "assets_pledged": "n/a",
+        "statement_date": "2026-06-26",
+        "real_estate_owned": 23620000.0,
+        "total_liabilities": 3535879.91,
+        "bankruptcy_history": "No",
+        "total_annual_income": 623000.0,
+        "contingent_liabilities": "all n/a",
+        "annual_real_estate_income": 23000.0,
+        "cash_on_hand_and_in_banks": 443816.06,
+        "real_estate_mortgages_payable": 3535879.91,
+        "automobiles_and_personal_property": 650000.0
+      }
+    },
+    {
+      "file_id": "eb689e13-a32b-472e-b566-7125d799086a",
+      "file_name": "Elias/Elias Gonzalez 2025 W2.pdf",
+      "ai_classification": "other",
+      "confidence": "high",
+      "summary": "2025 W-2 Wage and Tax Statement for Elias M. Gonzalez from EMG Auto Sales Inc. Shows federal wages of $298,797.56 with $76,510.97 federal income tax withheld. Supports personal income verification for the guarantor/owner.",
+      "supports": [
+        "Personal income verification",
+        "Guarantor wage income",
+        "Employer identity confirmation"
+      ],
+      "baseline_categories_supported": [
+        "Personal income documentation"
+      ],
+      "red_flags": [
+        "W-2 is for tax year 2025, which is a future/current year \u2014 verify this is not fabricated or premature",
+        "Employee (Elias M. Gonzalez) shares surname with dealership (EMG Auto Sales Inc.) \u2014 potential owner/officer self-employment income reported as W-2 wages; scrutinize arm's-length nature",
+        "Social security wages ($176,100) are capped at SS wage base but Medicare wages ($298,797.56) are full \u2014 consistent, no anomaly",
+        "NJ state wages ($299,999.96) slightly exceed federal wages ($298,797.56) \u2014 minor discrepancy to confirm"
+      ],
+      "limitations": [
+        "Does not establish business revenue or dealership profitability",
+        "No corroborating pay stubs or employer tax filings provided",
+        "W-2 alone does not confirm continuity of employment beyond the statement year"
+      ],
+      "key_facts": {
+        "tax_year": 2025,
+        "employer_ein": "22-3735917",
+        "employee_name": "Elias M. Gonzalez",
+        "employer_name": "EMG Auto Sales Inc.",
+        "other_box14_di": 380.42,
+        "nj_fli_withheld": 545.82,
+        "employee_address": "20 Evan Drive, Morganville, NJ 07751",
+        "employer_address": "885 US Highway 1, Avenel, NJ 07001",
+        "employee_ssn_last4": "8854",
+        "federal_wages_box1": 298797.56,
+        "medicare_wages_box5": 298797.56,
+        "nj_state_wages_box16": 299999.96,
+        "other_box14_ui_hc_wd": 184.02,
+        "medicare_tax_withheld_box6": 5221.74,
+        "social_security_wages_box3": 176100.0,
+        "federal_income_tax_withheld_box2": 76510.97,
+        "social_security_tax_withheld_box4": 10918.2,
+        "nj_state_income_tax_withheld_box17": 18955.08
+      }
+    },
+    {
+      "file_id": "de1535e0-52e4-425a-8754-c02f26462fa7",
+      "file_name": "Elias/Elias Gonzalez Real Estate Schedule update.xlsx",
+      "ai_classification": "real_estate_schedule",
+      "confidence": "high",
+      "summary": "Real estate schedule for Elias Gonzalez listing 7 properties across NJ with a combined market value of $23,620,000, total debt of ~$3,535,880, and original cost basis of $9,777,500, implying substantial equity. Supports collateral and net worth analysis.",
+      "supports": [
+        "Borrower real estate equity position",
+        "Collateral identification",
+        "Personal financial statement cross-reference",
+        "Net worth / liquidity support"
+      ],
+      "baseline_categories_supported": [
+        "Real estate schedule",
+        "Collateral documentation"
+      ],
+      "red_flags": [
+        "885 Rt 1 South Avenel NJ amount owing entered as '1,000.000.00' \u2014 appears to be a formatting/data entry error; actual balance unclear",
+        "1590 JFK Jersey City LLC has no amount owing entered (blank, not zero) \u2014 possible omission",
+        "200 S Broadway Ave Pennsville NJ shows purchase date of 2026-03-16, which is a future date \u2014 likely a data entry error",
+        "No mortgage statements, appraisals, or third-party valuations provided to support market values",
+        "Schedule is self-prepared with no supporting documentation attached"
+      ],
+      "limitations": [
+        "No third-party appraisals or broker price opinions to validate market values",
+        "Monthly PITIA / debt service payments not listed \u2014 cannot calculate carrying costs",
+        "Ownership vesting and entity structure not confirmed (one property references an LLC)",
+        "No rental income or occupancy status disclosed",
+        "Tax assessments not included for value cross-check"
+      ],
+      "key_facts": {
+        "properties": [
+          {
+            "address": "200 S Broadway Ave, Pennsville, NJ",
+            "amount_owing": 0,
+            "market_value": 2300000,
+            "original_cost": 1800000,
+            "purchase_date": "2026-03-16 (likely data entry error)"
+          },
+          {
+            "address": "885 Rt 1 South, Avenel, NJ 07001",
+            "amount_owing": "1,000.000.00 (formatting error \u2014 balance unclear)",
+            "market_value": 5500000,
+            "original_cost": 2200000,
+            "purchase_date": "2016"
+          },
+          {
+            "address": "538 E Rt 38, Maple Shade, NJ 08052",
+            "amount_owing": 2100000,
+            "market_value": 6500000,
+            "original_cost": 3300000,
+            "purchase_date": "2021"
+          },
+          {
+            "address": "91 N Virginia Ave, Penns Grove, NJ",
+            "amount_owing": 875000,
+            "market_value": 5500000,
+            "original_cost": 1000000,
+            "purchase_date": "2021"
+          },
+          {
+            "address": "486 S Broadway, Rahway, NJ",
+            "amount_owing": 0,
+            "market_value": 820000,
+            "original_cost": 345000,
+            "purchase_date": "2019"
+          },
+          {
+            "address": "1590 JFK, Jersey City, LLC",
+            "amount_owing": null,
+            "market_value": 1200000,
+            "original_cost": 200000,
+            "purchase_date": "2003"
+          },
+          {
+            "address": "20 Evan Drive, Morganville, NJ 07751",
+            "amount_owing": 560879.91,
+            "market_value": 1800000,
+            "original_cost": 932500,
+            "purchase_date": "2016"
+          }
+        ],
+        "prepared_for": "Elias Gonzalez",
+        "total_properties": 7,
+        "total_amount_owing": 3535879.91,
+        "total_market_value": 23620000,
+        "total_original_cost": 9777500,
+        "implied_total_equity": 20084120.09
+      }
+    },
+    {
+      "file_id": "dd26ca08-1a03-441c-b86a-d5d37dd46e3f",
+      "file_name": "Elias/Elias Personal 2024 Tax Return (1).PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2024 Form 1040 for Elias Gonzalez (SSN 140-80-8854), prepared by Rosenfield & Company PLLC. Reports W-2 wages of $561,117, Schedule E passthrough loss of -$828,522 (largely from EMG Auto of Jersey City LLC), AGI of $228,401, and a federal refund of $110,801.",
+      "supports": [
+        "Borrower identity and SSN verification",
+        "2024 personal income \u2014 wages and passthrough income",
+        "Ownership/interest in EMG Auto of Jersey City LLC",
+        "Federal and NJ tax liability and payment status",
+        "Self-employed health insurance deduction confirming active business participation"
+      ],
+      "baseline_categories_supported": [
+        "Personal tax return (2024)",
+        "Identity / borrower name confirmation",
+        "Business ownership evidence (EMG Auto of Jersey City LLC)"
+      ],
+      "red_flags": [
+        "Massive Schedule E passthrough loss of -$828,522 in 2024 vs. +$707,353 in 2023 \u2014 a $1.54M swing, driven by EMG Auto of Jersey City LLC loss of $305,945 carried forward",
+        "Excess business loss carryforward to 2025 of $523,522 (Form 461) and NJ NOL carryforward of $1,398,132 signal significant business deterioration",
+        "AGI collapsed from $1,276,511 (2023) to $228,401 (2024) \u2014 82% decline year-over-year",
+        "2024 federal balance due (with penalties/interest) was $213,983 on prior year return \u2014 potential cash-flow stress",
+        "Passive activity losses carried forward on multiple Schedule E properties ($98K\u2013$28K per line) \u2014 real estate portfolio generating losses",
+        "Only 22 of 116 pages extracted; Schedule E detail pages, K-1s, and depreciation schedules not fully reviewed"
+      ],
+      "limitations": [
+        "K-1s for EMG Auto of Jersey City LLC not extracted \u2014 gross revenue, officer compensation, and business-level DSCR inputs unavailable",
+        "Schedule E rental property detail (addresses, rents, expenses) only partially extracted",
+        "Depreciation schedules not reviewed \u2014 add-back for cash-flow analysis not calculable from this extract",
+        "Pages 23\u2013116 not examined \u2014 additional entities or income sources may exist",
+        "No IRS transcript or tax-return-received confirmation; client copy only"
+      ],
+      "key_facts": {
+        "nj_tax": 35116,
+        "address": "20 Evan Drive, Morganville, NJ 07751",
+        "tax_year": 2024,
+        "taxpayer": "Elias Gonzalez",
+        "ssn_last4": "8854",
+        "federal_tax": 40265,
+        "prepared_by": "Rosenfield & Company, PLLC",
+        "total_income": 256117,
+        "filing_status": "Single",
+        "federal_refund": 110801,
+        "taxable_income": 195558,
+        "wages_salaries": 561117,
+        "nj_refund_or_due": "refund (overpayment applied / $2,430 to estimated tax)",
+        "tax_bracket_2023": "37%",
+        "tax_bracket_2024": "32%",
+        "nj_taxable_income": 560117,
+        "total_federal_tax": 43515,
+        "agi_prior_year_2023": 1276511,
+        "federal_withholding": 154316,
+        "itemized_deductions": 32843,
+        "key_business_entity": "EMG Auto of Jersey City LLC",
+        "adjusted_gross_income": 228401,
+        "wages_prior_year_2023": 596874,
+        "additional_medicare_tax": 3250,
+        "schedule_e_prior_year_2023": 707353,
+        "nj_nol_carryforward_to_2025": 1398132,
+        "prior_year_qbi_deduction_2023": 157211,
+        "emg_auto_passthrough_loss_2024": -305945,
+        "nol_carryforward_to_2025_federal": 523522,
+        "other_income_section_461_addback": 523522,
+        "schedule_e_passthrough_income_loss": -828522,
+        "self_employed_health_ins_deduction": 27716,
+        "prior_year_balance_due_with_penalty": 213983,
+        "qualified_business_income_deduction_2024": 0
+      }
+    },
+    {
+      "file_id": "a66d3a4b-d814-489a-8eeb-a99ef95337e4",
+      "file_name": "Elias/Elias Updated license2025.pdf",
+      "ai_classification": "identity",
+      "confidence": "high",
+      "summary": "New Jersey Auto Driver License for Elias Gonzalez, DOB 02-23-1972, issued 02-28-2025, expiring 02-23-2029. Confirms borrower identity and current address for underwriting purposes.",
+      "supports": [
+        "borrower identity verification",
+        "address confirmation",
+        "government-issued photo ID"
+      ],
+      "baseline_categories_supported": [
+        "identity document"
+      ],
+      "red_flags": [
+        "License is marked 'NOT FOR REAL ID PURPOSES' \u2014 may not satisfy federal identity requirements if applicable"
+      ],
+      "limitations": [
+        "Does not establish income, assets, creditworthiness, or business ownership",
+        "Not a REAL ID compliant document"
+      ],
+      "key_facts": {
+        "dob": "02-23-1972",
+        "class": "D",
+        "state": "New Jersey",
+        "gender": "M",
+        "height": "5'08\"",
+        "address": "20 Evan Dr, Morganville, NJ 07751-1063",
+        "dl_number": "G6459 20600 02722",
+        "full_name": "Elias Gonzalez",
+        "issue_date": "02-28-2025",
+        "expiration_date": "02-23-2029",
+        "real_id_compliant": false
+      }
+    },
+    {
+      "file_id": "096de2ef-008a-423f-a1bf-4e2faef4db36",
+      "file_name": "Elias/EMG Auto Sales Accounts Payable Schedule.xlsx",
+      "ai_classification": "debt_schedule",
+      "confidence": "high",
+      "summary": "EMG Auto Sales Accounts Payable Schedule listing ~80+ vendor/creditor balances as of an unspecified date (column header '2000' likely a year or ledger code). Largest single payable is Manheim at -$129,217.61, indicating a significant floor-plan/auction liability. Supports assessment of outstanding trade payables and dealer obligations.",
+      "supports": [
+        "Outstanding accounts payable obligations of EMG Auto Sales",
+        "Dealer auction/floorplan exposure (Manheim balance)",
+        "Parts and vendor trade payables",
+        "Individual payee obligations and credits"
+      ],
+      "baseline_categories_supported": [
+        "debt_schedule"
+      ],
+      "red_flags": [
+        "Manheim balance of -$129,217.61 is a large auction-floor liability that must be reconciled against any floorplan line",
+        "Parts Authority balance of -$19,323.09 is a significant parts-vendor payable",
+        "Multiple negative balances (credits owed TO EMG) mixed with payables \u2014 inconsistent sign convention may obscure true net exposure",
+        "Statement date is missing; column header '2000' is ambiguous and the schedule cannot be confirmed as current",
+        "Only first 80 of 98 rows were extracted \u2014 full liability total cannot be confirmed from this data",
+        "Chase Auto Finance payable of $5,434.30 listed as AP rather than a formal debt schedule line \u2014 may indicate past-due installment or floored vehicle"
+      ],
+      "limitations": [
+        "Last 18 rows not extracted \u2014 total AP balance cannot be fully summed",
+        "No statement/as-of date visible; schedule may be stale",
+        "Does not identify maturity dates, interest rates, or payment terms",
+        "Does not distinguish secured vs. unsecured payables",
+        "Negative balances are ambiguous \u2014 may represent credits, overpayments, or returns rather than assets"
+      ],
+      "key_facts": {
+        "note": "Full total cannot be computed; 18 rows missing from extraction. Partial visible balances only.",
+        "debts": [
+          {
+            "lender": "Manheim",
+            "maturity_date": null,
+            "current_balance": -129217.61,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Parts Authority",
+            "maturity_date": null,
+            "current_balance": -19323.09,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Chase Auto Finance",
+            "maturity_date": null,
+            "current_balance": 5434.3,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Assurance Auto Maintenance",
+            "maturity_date": null,
+            "current_balance": 4140.15,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Romero Tire Service",
+            "maturity_date": null,
+            "current_balance": 6005.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "AutoZone Inc",
+            "maturity_date": null,
+            "current_balance": -2471.26,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Lindo, Samir",
+            "maturity_date": null,
+            "current_balance": -2932.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Cosme, Wilmer R",
+            "maturity_date": null,
+            "current_balance": -8250.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Fayette Motors LLC",
+            "maturity_date": null,
+            "current_balance": 2100.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Garden State Auto Glass Repair LLC",
+            "maturity_date": null,
+            "current_balance": 1700.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "AFLAC",
+            "maturity_date": null,
+            "current_balance": 225.11,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Alava, Davian Francisco",
+            "maturity_date": null,
+            "current_balance": 935.72,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Margarita's Cleaning",
+            "maturity_date": null,
+            "current_balance": 933.32,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "L&A General Marketing Inc",
+            "maturity_date": null,
+            "current_balance": 1133.37,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "M&L Advanced Auto Detailing LLC",
+            "maturity_date": null,
+            "current_balance": 980.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "Malek, Mark",
+            "maturity_date": null,
+            "current_balance": -1716.0,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "AMEX",
+            "maturity_date": null,
+            "current_balance": -887.87,
+            "monthly_payment": null,
+            "original_amount": null
+          },
+          {
+            "lender": "IHFAZ, Azmine",
+            "maturity_date": null,
+            "current_balance": -1507.4,
+            "monthly_payment": null,
+            "original_amount": null
+          }
+        ],
+        "entity": "EMG Auto Sales",
+        "statement_date": null,
+        "total_outstanding_balance": null,
+        "total_monthly_debt_service": null
+      }
+    },
+    {
+      "file_id": "928164cf-5e5f-4dd7-a4ca-757bf182a491",
+      "file_name": "Elias/EMG Auto Sales May 2026 TB.xlsx",
+      "ai_classification": "current_p_and_l",
+      "confidence": "medium",
+      "summary": "May 2026 trial balance for EMG Auto Sales showing account-level beginning balances, period debits/credits, and ending balances through the asset section. Supports interim financial analysis for a used-car dealer, including inventory, cash, and receivable positions.",
+      "supports": [
+        "Balance sheet asset snapshot as of May 2026",
+        "Used vehicle inventory valuation (used cars + used trucks)",
+        "Cash and bank account balances (TD Operating, Rockland/GL)",
+        "Contracts-in-transit and F&I reserve receivables",
+        "Accounts receivable from affiliates (Pointe, Mapleshade)"
+      ],
+      "baseline_categories_supported": [
+        "current_p_and_l"
+      ],
+      "red_flags": [
+        "Account 1122 ACCOUNTS RECEIVABLE MAPLESHADE balance of $13.16M is very large relative to other receivables \u2014 possible intercompany or affiliated-party concentration risk",
+        "TD Operating account shows a negative beginning balance (-$33,787) suggesting a prior overdraft or book entry",
+        "Only first 80 of 295 rows extracted \u2014 income/expense accounts and liability/equity sections are not visible; full P&L and net worth cannot be determined",
+        "Multiple F&I reserve accounts across numerous lenders (Ally, Capital One, Santander, Wells Fargo, Westlake, Citizens, etc.) \u2014 chargeback exposure not determinable",
+        "Employee Advance balance of $22,243 with active activity warrants scrutiny"
+      ],
+      "limitations": [
+        "Document is truncated at row 80 of 295 \u2014 liability, equity, revenue, and expense accounts are not included in extracted data",
+        "No income statement or net profit figure can be derived from this partial export",
+        "DSCR cannot be calculated without complete P&L",
+        "Inventory costs shown are book values; no floor-plan payable or curtailment data visible in this extract"
+      ],
+      "key_facts": {
+        "note": "Only asset-section accounts available; full trial balance required for complete underwriting analysis",
+        "entity": "EMG Auto Sales",
+        "period": "May 2026 (month-to-date)",
+        "ar_pointe": 183550.62,
+        "ar_mapleshade": 13164433.47,
+        "leaseholds_net": 72992.1,
+        "statement_type": "Trial Balance",
+        "ally_fi_reserve": 10198.6,
+        "employee_advance": 22243.04,
+        "capone_fi_reserve": 21619.07,
+        "citizen_fi_reserve": 17747.84,
+        "used_cars_inventory": 890652.0,
+        "vehicle_receivables": 351581.54,
+        "westlake_fi_reserve": 5504.76,
+        "contracts_in_transit": 741842.62,
+        "credit_card_clearing": 47449.91,
+        "santander_fi_reserve": 34432.82,
+        "used_trucks_inventory": 2765510.75,
+        "wellsfargo_fi_reserve": 20585.35,
+        "furniture_fixtures_net": -25474.3,
+        "fi_reserves_total_visible": null,
+        "undeposited_cash_clearing": 138450.0,
+        "rockland_gl_ending_balance": 715650.66,
+        "td_operating_ending_balance": 51928.58,
+        "total_visible_vehicle_inventory": 3656162.75,
+        "revenue_expense_accounts_visible": false,
+        "liability_equity_accounts_visible": false
+      }
+    },
+    {
+      "file_id": "52c231c0-8018-4c42-af74-1240b2327ec5",
+      "file_name": "Elias/Maple Shade Property pay off Balance (2).pdf",
+      "ai_classification": "payoff_or_mortgage_statement",
+      "confidence": "high",
+      "summary": "Fulton Bank commercial loan statement for EMG Management Company on property at 538 Route 38 E, Maple Shade NJ. Shows current principal balance of $2,259,510.23 at 4.39% interest with a monthly payment of $16,545.60 due 06/01/2026.",
+      "supports": [
+        "Existing commercial real estate debt obligation",
+        "Monthly debt service for DSCR/cash flow analysis",
+        "Outstanding payoff/balance for collateral encumbrance review",
+        "Borrower entity identity (EMG Management Company)"
+      ],
+      "baseline_categories_supported": [
+        "payoff_or_mortgage_statement",
+        "collateral_debt_evidence"
+      ],
+      "red_flags": [
+        "Statement is titled 'Consumer Loans Only' on page 2 interest disclosure, yet account is labeled Commercial Loan \u2014 minor inconsistency in form boilerplate",
+        "Interest paid this year ($42,064.93) implies loan has been active for multiple months YTD; no maturity date shown to assess term risk",
+        "No payoff quote with per-diem provided \u2014 current balance only, not a formal payoff letter"
+      ],
+      "limitations": [
+        "No formal payoff quote or per-diem interest figure; balance as of 05/19/2026 only",
+        "Maturity date of the loan is not disclosed on this statement",
+        "Property address is the mailing address; no separate collateral legal description provided",
+        "Original loan amount and origination date not shown"
+      ],
+      "key_facts": {
+        "lender": "Fulton Bank, N.A.",
+        "borrower": "EMG Management Company",
+        "loan_number": "053297159001C",
+        "account_last4": "9001",
+        "interest_rate": "4.39%",
+        "maturity_date": null,
+        "statement_date": "05/19/2026",
+        "monthly_payment": 16545.6,
+        "past_due_amount": 0.0,
+        "late_charges_due": 0.0,
+        "payment_due_date": "06/01/2026",
+        "property_address": "538 Route 38 E, Maple Shade, NJ 08052",
+        "statement_period": "04/18/2026 through 05/19/2026",
+        "interest_paid_ytd": 42064.93,
+        "last_payment_date": "05/07/2026",
+        "last_payment_amount": 16545.6,
+        "original_loan_amount": null,
+        "current_principal_balance": 2259510.23,
+        "interest_paid_last_payment": 8298.15,
+        "principal_paid_last_payment": 8247.45
+      }
+    },
+    {
+      "file_id": "94ffdee3-d939-4867-8d26-37cdea2e19e3",
+      "file_name": "Rockland March 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking account (acct ending 8819) for EMG Auto Sales Inc, Avenel NJ, covering March 1\u201331, 2026. Shows $2.90M in deposits and $2.75M in withdrawals, with two negative-balance days driven by floorplan curtailment activity.",
+      "supports": [
+        "Operating cash flow and deposit volume for EMG Auto Sales Inc",
+        "Auto finance dealer funding receipts (Santander, Wells Fargo, Capital One, Westlake, Exeter)",
+        "Floorplan line curtailment payments to Bank 11 (BANK 11/FL DR & CR)",
+        "Payroll disbursements via Paychex",
+        "WorldPay/Car Revolution retail sales proceeds"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements \u2013 business operating account"
+      ],
+      "red_flags": [
+        "Two negative daily balances: Mar 02 (-$41,854.32) and Mar 17 (-$64,370.90)",
+        "Overdraft charges assessed Mar 02 ($805.00) and Mar 17 ($525.00); one uncollected-funds charge Mar 04 ($175.00)",
+        "Very low beginning balance ($59,353) relative to monthly throughput of ~$2.9M, indicating thin liquidity cushion",
+        "Large intra-month wire transfers to/from Pointe Buick GMC LLC and Lendbuzz Funding LLC require explanation",
+        "Multiple large remote deposits ($130K, $140K, $55K, $60K, $40K) with no payee detail \u2013 source unclear",
+        "BANK 11 floorplan debits total over $1.5M in one month; heavy floorplan reliance flagged for capacity analysis"
+      ],
+      "limitations": [
+        "Only one month provided; no prior months for trend/deposit consistency comparison",
+        "Remote deposit items lack payee identification",
+        "No average ledger balance published by bank on statement",
+        "Does not establish personal financials, tax liability, or profitability of the dealership"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 212794.65,
+        "service_charges": 180.23,
+        "number_of_checks": 221,
+        "statement_period": "2026-03-01 to 2026-03-31",
+        "beginning_balance": 59353.08,
+        "low_daily_balance": -64370.9,
+        "number_of_deposits": 102,
+        "returned_check_count": 0,
+        "notable_debit_sources": [
+          "BANK 11/FL DR & CR (floorplan curtailments, multiple, largest $257,135)",
+          "Paychex payroll (multiple, largest $117,634)",
+          "Wire debit to Pointe GMC LLC ($150,000 and $55,000)",
+          "Dealer Owned Warranty collections ($80,147 and $97,801)",
+          "Manheim auction payment ($13,051)",
+          "WorldPay monthly charges and excl. adjustments"
+        ],
+        "average_ledger_balance": null,
+        "negative_balance_dates": [
+          "2026-03-02",
+          "2026-03-17"
+        ],
+        "nsf_or_overdraft_count": 3,
+        "notable_deposit_sources": [
+          "Santander Bank/Consumer dealer payments (multiple, largest $62,406)",
+          "Wells Fargo Auto dealer funding (multiple, largest $82,250)",
+          "Capital One Auto dealer funding (multiple)",
+          "Westlake Financial dealer payments (multiple)",
+          "Exeter Finance dealer funding",
+          "WorldPay/Car Revolution retail card deposits",
+          "Wire credits from Pointe Buick GMC LLC ($40,000 and $58,000)",
+          "Wire credit from Lendbuzz Funding LLC ($17,686 and $44,274)",
+          "Remote deposits (unidentified payees, largest $140,000)"
+        ],
+        "total_deposits_and_credits": 2899188.49,
+        "total_withdrawals_and_debits": 2745746.92
+      }
+    },
+    {
+      "file_id": "61238490-90f5-4994-9f51-1844aae1a8be",
+      "file_name": "TD April 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "abed6e8f-7699-46a2-9acf-2231bf637153",
+      "file_name": "TD June 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "172ffdbe-808e-4724-a3c0-b882191e96fa",
+      "file_name": "Rockland July 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking statement for EMG Auto Sales Inc (acct XXXXXX8819), July 1\u201331, 2026. Shows $2.29M in deposits and $2.41M in withdrawals with a closing balance of $93,658. Deposits are dominated by auto lender payoffs (Santander, Wells Fargo, Capital One, Westlake, Upstart, Lendbuzz) consistent with active used-car retail sales.",
+      "supports": [
+        "Monthly deposit volume and cash flow for EMG Auto Sales Inc",
+        "Auto lender funding receipts confirming vehicle sale closings",
+        "Payroll cadence via Paychex ACH debits (~weekly, totaling ~$367K in July)",
+        "Floorplan curtailment payments to BANK 11/FL DR & CR (Avenel)",
+        "Operating account liquidity and average daily balance"
+      ],
+      "baseline_categories_supported": [
+        "bank_statement"
+      ],
+      "red_flags": [
+        "Withdrawals ($2,406,245) exceed deposits ($2,289,185) by ~$117K, drawing beginning balance down 56% to $93,658",
+        "Large recurring online transfers to internal account DD XX8652 totaling ~$789K in July \u2014 destination account not provided for review",
+        "Wire to 'EMG Auto of Jersey City LLC' ($30,000 on 7/14) indicates related-entity transactions not reconciled here",
+        "Two wires to Newmark Valuation & Advisory LLC totaling $42,000 (7/27 and 7/29) \u2014 purpose unclear, possible real estate appraisal fee",
+        "Numerous skipped check numbers flagged with asterisks, suggesting checks written from a separate checkbook or out-of-sequence issuance",
+        "Low daily balance reached $93,658 on 7/31 vs. beginning balance of $210,719 \u2014 month-end liquidity compression"
+      ],
+      "limitations": [
+        "Only one month provided; prior months not available for trend/consistency analysis",
+        "Transfers to DD XX8652 are not explained \u2014 that account's statement is absent",
+        "No NSF or overdraft indicator visible, but low-day balance data limited to daily summary (no intraday lows shown)",
+        "Statement does not disclose floorplan line balance, credit limit, or curtailment schedule",
+        "Remote deposits (no payee detail) totaling ~$149K cannot be sourced without backup"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "months": [
+          {
+            "ending_balance": 93658.48,
+            "number_of_checks": 138,
+            "statement_period": "2026-07-01 to 2026-07-31",
+            "beginning_balance": 210718.89,
+            "low_daily_balance": 93658.48,
+            "number_of_deposits": 87,
+            "returned_check_count": 0,
+            "average_ledger_balance": null,
+            "negative_balance_dates": [],
+            "nsf_or_overdraft_count": 0,
+            "total_deposits_and_credits": 2289184.92,
+            "total_withdrawals_and_debits": 2406245.33
+          }
+        ],
+        "address": "885 RT 1 South, Avenel, NJ 07001",
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 93658.48,
+        "service_charges": 399.92,
+        "number_of_checks": 138,
+        "statement_period": "2026-07-01 to 2026-07-31",
+        "beginning_balance": 210718.89,
+        "low_daily_balance": 93658.48,
+        "number_of_deposits": 87,
+        "notable_debit_items": [
+          "Paychex payroll EIB ~$367K total (4 payroll runs)",
+          "BANK 11/FL DR & CR Avenel floorplan payments ~$689K total",
+          "Online transfers to DD XX8652 ~$789K total",
+          "Cox Automotive/DealerTrack collections ~$36K total",
+          "Manheim auction payment $21,325",
+          "Newmark Valuation & Advisory wires $42,000 total",
+          "Wire to EMG Auto of Jersey City LLC $30,000"
+        ],
+        "returned_check_count": 0,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "notable_deposit_sources": [
+          "Santander Bank dealer payments",
+          "Wells Fargo Auto purchase payments",
+          "Capital One Auto dealer funding",
+          "Westlake Financial payables",
+          "Upstart Net ARL payments",
+          "Lendbuzz Funding wire credits",
+          "WorldPay combined deposits (Car Revolution)",
+          "Remote deposits",
+          "Bank of America wire credit"
+        ],
+        "total_deposits_and_credits": 2289184.92,
+        "total_withdrawals_and_debits": 2406245.33
+      }
+    },
+    {
+      "file_id": "4e0e7d4a-288a-4b01-8dea-3d41ffe4535f",
+      "file_name": "Elias Personal 2024 Tax Return.PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2024 Form 1040 for Elias Gonzalez (SSN 140-80-8854), prepared by Rosenfield & Company, PLLC. AGI dropped sharply to $228,401 from $1,276,511 in 2023, driven by a large Schedule E pass-through loss of ($828,522) primarily from EMG Auto of Jersey City LLC, resulting in a $110,801 federal refund.",
+      "supports": [
+        "Personal income verification for guarantor Elias Gonzalez",
+        "W-2 wage income of $561,117",
+        "Ownership/activity in EMG Auto of Jersey City LLC",
+        "Large pass-through loss carryforward into 2025",
+        "Federal and NJ state tax compliance for 2024"
+      ],
+      "baseline_categories_supported": [
+        "Personal tax return (2024)",
+        "Guarantor income documentation"
+      ],
+      "red_flags": [
+        "Massive year-over-year AGI decline: $1,276,511 (2023) vs $228,401 (2024) \u2014 $1,048,110 swing",
+        "Schedule E pass-through loss from EMG Auto of Jersey City LLC of ($305,945) carrying forward to 2025, plus NJ NOL carryforward of $1,398,132",
+        "Excess business loss carryforward of $523,522 (Form 461) indicates business generated losses exceeding IRS threshold",
+        "Total qualified business income loss of $739,230 on Form 8995 \u2014 no QBI deduction available",
+        "2024 federal return shows $43,515 total tax but $213,983 was due in 2023 with penalties/interest of $27,237, suggesting prior-year payment stress",
+        "Late payment/filing penalties of $27,237 assessed on 2023 return \u2014 pattern of underpayment"
+      ],
+      "limitations": [
+        "Only first 80 of 116 pages examined; Schedule E Part 2 (partnership detail), K-1s, and full balance sheet not confirmed",
+        "Business-level financials for EMG Auto of Jersey City LLC not visible in this personal return",
+        "Source of $523,522 'other income' (excess business loss adjustment) not fully detailed in extracted pages",
+        "W-2 sources and employer names not extracted from visible pages"
+      ],
+      "key_facts": {
+        "nj_tax": 35116,
+        "address": "20 Evan Drive, Morganville, NJ 07751",
+        "preparer": "Rosenfield & Company, PLLC / Alan Ginsberg",
+        "tax_year": 2024,
+        "taxpayer": "Elias Gonzalez",
+        "w2_wages": 561117,
+        "nj_refund": null,
+        "ssn_last4": "8854",
+        "total_tax": 43515,
+        "total_income": 256117,
+        "filing_status": "Single",
+        "qbi_deduction": 0,
+        "federal_refund": 110801,
+        "nj_balance_due": 0,
+        "taxable_income": 195558,
+        "nj_taxable_income": 560117,
+        "itemized_deductions": 32843,
+        "nj_nol_carryforward": 1398132,
+        "prior_year_agi_2023": 1276511,
+        "adjusted_gross_income": 228401,
+        "additional_medicare_tax": 3250,
+        "prior_year_total_tax_2023": 362195,
+        "mortgage_interest_deducted": 22843,
+        "primary_passthrough_entity": "EMG Auto of Jersey City LLC",
+        "state_local_taxes_deducted": 10000,
+        "total_qbi_loss_carryforward": 739230,
+        "emg_auto_loss_carryforward_federal": 305945,
+        "schedule_e_passthrough_income_loss": -828522,
+        "excess_business_loss_nol_carryforward": 523522,
+        "self_employed_health_insurance_deduction": 27716,
+        "other_income_excess_business_loss_adjustment": 523522
+      }
+    },
+    {
+      "file_id": "82f45210-1eb5-4a69-9aff-fc6d15bdb5a8",
+      "file_name": "200 S Broadway Deed.pdf",
+      "ai_classification": "real_estate_schedule",
+      "confidence": "high",
+      "summary": "Recorded deed conveying 200 S. Broadway, Pennsville, NJ 08070 (Block 2601, Lots 64 & 65) from DKBGCT, LLC to 3 Seag LLC for $1,700,000, dated March 4, 2026, recorded March 13, 2026 in Salem County. Package includes ALTA Owner's Title Insurance Policy (Westcor, Policy No. OP-72-NJ1214-18461149, $1,700,000 coverage) with Schedule B exceptions and NJ Survey Endorsement.",
+      "supports": [
+        "Confirmed vesting of 200 S. Broadway in 3 Seag LLC (NJ LLC) as fee simple owner",
+        "Purchase price / collateral value anchor of $1,700,000",
+        "Clean recorded deed with title insurance in borrower's name",
+        "Property identity and legal description for collateral file",
+        "Equalized assessed value of $3,631,587 (Class 4A commercial)"
+      ],
+      "baseline_categories_supported": [
+        "Real estate collateral evidence",
+        "Entity/vesting documentation",
+        "Insurance (title)"
+      ],
+      "red_flags": [
+        "Schedule B lists numerous easements, drainage rights, possible fence/curb/parking-area mislocation per NJ Survey Endorsement \u2014 physical encroachments noted on Tract I",
+        "Direct access to State Highway Route 49 is not guaranteed (Schedule B, item 18)",
+        "Lien for unpaid water/sewer charges and possible HOA dues excepted from coverage",
+        "Rights of tenants/parties in possession under unrecorded leases excepted",
+        "No mortgagee title policy present \u2014 lender's title insurance not yet issued per transmittal letter"
+      ],
+      "limitations": [
+        "No mortgagee/lender title insurance policy included; only owner's policy issued to 3 Seag LLC",
+        "Acreage/square footage not insured; no appraisal of current market value provided",
+        "Environmental condition of property unknown; subsurface conditions not covered",
+        "Does not establish income, DSCR, or existing mortgage balance on the property",
+        "Seller's residency certification and RTF affidavits are tax compliance documents; not collateral underwriting tools"
+      ],
+      "key_facts": {
+        "grantee": "3 Seag LLC, a New Jersey limited liability company",
+        "grantor": "DKBGCT, LLC, a Delaware limited liability company",
+        "insured": "3 Seag LLC, a New Jersey Limited Liability Company",
+        "tax_lots": "64 and 65",
+        "deed_date": "March 4, 2026",
+        "tax_block": "2601",
+        "estate_type": "Fee Simple",
+        "municipality": "Township of Pennsville, Salem County, NJ",
+        "consideration": 1700000.0,
+        "delivery_date": "March 6, 2026",
+        "rtf_total_tax": 34195.0,
+        "title_insurer": "Westcor Land Title Insurance Company",
+        "recording_book": "Book 4757, Page 1",
+        "recording_date": "March 13, 2026",
+        "property_address": "200 South Broadway, Pennsville, NJ 08070",
+        "instrument_number": "2026002092",
+        "survey_endorsement": "NJRB 5-01 issued March 13, 2026 (Tract I only); encroachments noted",
+        "title_issuing_agent": "Acres Land Title Agency, Inc.",
+        "prior_deed_reference": "Deed Book 1241, Page 326, June 8, 2006 (DKBGCT, LLC from Riverview Ford of Pennsville, Inc.)",
+        "title_insurance_amount": 1700000.0,
+        "mortgagee_policy_issued": false,
+        "title_insurance_policy_number": "OP-72-NJ1214-18461149",
+        "title_insurance_date_of_policy": "March 13, 2026",
+        "total_equalized_assessed_value": 3803276.15,
+        "equalized_assessed_value_class_1": 171689.07,
+        "equalized_assessed_value_class_4A": 3631587.0
+      }
+    },
+    {
+      "file_id": "c555f1b9-879d-4c29-82ae-a95a913e0126",
+      "file_name": "Rockland April 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking account (acct ending 8819) for EMG Auto Sales Inc, covering April 1\u201330, 2026. Shows $3.32M in deposits and $3.42M in withdrawals with high-velocity dealer funding receipts (Santander, Wells Fargo Auto, Capital One Auto, Westlake, Exeter) and floorplan/floor curtailment activity via Bank 11.",
+      "supports": [
+        "Business cash flow and deposit volume for April 2026",
+        "Dealer funding receipts from multiple finance sources",
+        "Floorplan payoff activity (Bank 11 debits)",
+        "Payroll processing via Paychex",
+        "Tax payment evidence (NJ Web PMT / Fanny Bayas)"
+      ],
+      "baseline_categories_supported": [
+        "bank_statement"
+      ],
+      "red_flags": [
+        "Negative daily balance on Apr 3 (-$26,577.41) \u2014 account went overdrawn",
+        "PD ITEM - OVERDRAFT CHARGE ($105.00) on Apr 3 confirms overdraft event",
+        "PD ITEM - UNCOLLECTED CHARGE ($70.00) on Apr 10",
+        "Net negative cash flow for month: deposits $3,318,788 vs withdrawals $3,420,961 (net -$102,173)",
+        "Large remote deposits ($110K, $120K, $60K, $150K, $100K) with no payee identified \u2014 source unclear",
+        "Large NJ tax payments ($251,786 on Apr 10 and $231,172 on Apr 23) in name of Fanny Bayas, not entity \u2014 unclear relationship"
+      ],
+      "limitations": [
+        "Only one month provided; no month-over-month deposit consistency can be assessed from this file alone",
+        "Remote deposit sources are unidentified and cannot be attributed to operations",
+        "No information on average ledger balance or low daily balance is explicitly stated; derived from daily balance table",
+        "Does not establish profitability, floorplan line availability, or inventory levels"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "months": [
+          {
+            "ending_balance": 110621.69,
+            "number_of_checks": 227,
+            "statement_period": "2026-04-01 to 2026-04-30",
+            "beginning_balance": 212794.65,
+            "low_daily_balance": -26577.41,
+            "number_of_deposits": 99,
+            "returned_check_count": 0,
+            "average_ledger_balance": null,
+            "negative_balance_dates": [
+              "2026-04-03"
+            ],
+            "nsf_or_overdraft_count": 2,
+            "total_deposits_and_credits": 3318788.39,
+            "total_withdrawals_and_debits": 3420961.35
+          }
+        ],
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 110621.69,
+        "notable_debits": [
+          "Bank 11 floorplan debits \u2014 recurring, totaling est. $1.66M+",
+          "Paychex payroll \u2014 $67,858 + $69,525 + $70,968 + $230,787 + $85,649",
+          "NJ Web PMT (tax) Fanny Bayas \u2014 $251,786 (Apr 10) + $231,172 (Apr 23)",
+          "Wire DR Pointe GMC LLC \u2014 $100,000 (Apr 7)",
+          "Southern Auto wire debit \u2014 $14,790 (Apr 27)"
+        ],
+        "notable_credits": [
+          "Santander Bank dealer payoffs \u2014 multiple, totaling est. $900K+",
+          "Wells Fargo Auto purchases \u2014 multiple, totaling est. $460K+",
+          "Capital One Auto dealer funding \u2014 multiple, totaling est. $205K+",
+          "Westlake Financial payables \u2014 multiple, totaling est. $314K+",
+          "Exeter Finance dealer funding \u2014 $32,364 + $14,506",
+          "Lendbuzz Funding LLC \u2014 $21,576 + $33,027",
+          "Remote deposits (unidentified) \u2014 $110K, $120K, $60K, $150K, $100K",
+          "Online transfers from DD XX8652 \u2014 $68K, $75K, $75K, $100K",
+          "Wire CR Pointe Buick GMC LLC \u2014 $130,000"
+        ],
+        "service_charges": 266.12,
+        "number_of_checks": 227,
+        "statement_period": "2026-04-01 to 2026-04-30",
+        "beginning_balance": 212794.65,
+        "low_daily_balance": -26577.41,
+        "number_of_deposits": 99,
+        "returned_check_count": 0,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [
+          "2026-04-03"
+        ],
+        "nsf_or_overdraft_count": 2,
+        "total_deposits_and_credits": 3318788.39,
+        "total_withdrawals_and_debits": 3420961.35
+      }
+    },
+    {
+      "file_id": "5488dc4b-40fe-4b50-a72c-ab972aa408e0",
+      "file_name": "Rockland May 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking statement for EMG Auto Sales Inc (acct ...8819), May 1\u201331 2026. Shows $3.77M in deposits and $3.69M in withdrawals from auto dealer operations including lender payoffs, WorldPay/floorplan receipts, and large Paychex payroll debits.",
+      "supports": [
+        "Operating cash flow verification for EMG Auto Sales Inc",
+        "Dealer funding receipts from Santander, Wells Fargo Auto, Capital One Auto, Westlake, Exeter",
+        "Floorplan/inventory payoff activity via BANK 11/FL DR & CR debits",
+        "Payroll disbursements via Paychex",
+        "Monthly deposit volume and average balance"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements \u2013 business operating account (May 2026)"
+      ],
+      "red_flags": [
+        "Account went deeply negative on May 1 (daily balance -$190,151.84), indicating overdraft",
+        "One PD ITEM - OVERDRAFT CHARGE ($350) posted May 1",
+        "Three PD ITEM - UNCOLLECTED CHARGE fees ($175 each) on May 13, May 21, and May 28",
+        "Large intra-account online transfers FROM DD XX8652 totaling $735,000 inflate deposit figures",
+        "Large online transfers TO DD XX8652 totaling $390,000 reduce ending balance; circular flow risk",
+        "Single check #3619 for $145,357.70 payable to Chase Auto Finance \u2014 large one-time payoff warrants verification"
+      ],
+      "limitations": [
+        "Only one month provided; prior months needed for trend/consistency analysis",
+        "DD XX8652 counterpart account not identified; transfers may represent inter-company or owner sweeps",
+        "No average ledger balance or low daily balance explicitly stated by bank; derived from daily balance schedule",
+        "Remote deposits (several large round-dollar amounts) lack payee detail; source unverifiable from this document alone"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 182718.07,
+        "service_charges": 224.19,
+        "number_of_checks": 228,
+        "statement_period": "2026-05-01 to 2026-05-31",
+        "beginning_balance": 110621.69,
+        "low_daily_balance": -190151.84,
+        "number_of_deposits": 113,
+        "notable_debit_items": [
+          "BANK 11/FL DR & CR 167_AVENEL (floorplan curtailments, multiple)",
+          "Paychex EIB payroll x4 (~$390,091 total)",
+          "Online Transfers to DD XX8652 (~$390,000 total)",
+          "Check 3619 to Chase Auto Finance $145,357.70"
+        ],
+        "returned_check_count": 0,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [
+          "2026-05-01"
+        ],
+        "nsf_or_overdraft_count": 4,
+        "notable_deposit_sources": [
+          "Santander Bank DLRPMT (multiple vehicle payoffs)",
+          "Wells Fargo Auto/Purchase",
+          "Capital One Auto/DealerFund",
+          "Westlake Financial/Payables",
+          "Exeter Finance/DLR Fund",
+          "WorldPay/Comb. Dep. (Car Revolution)",
+          "FirstHelp/NetProceed",
+          "Online Transfers from DD XX8652 (~$735,000 total)",
+          "WT CR Pointe Buick GMC LLC ($140,397)",
+          "Remote Deposits (multiple)"
+        ],
+        "total_deposits_and_credits": 3765573.62,
+        "total_withdrawals_and_debits": 3693477.24
+      }
+    },
+    {
+      "file_id": "344e942a-35e6-4f57-92ac-2b6381add59e",
+      "file_name": "Elias Gonzalez 2023 Tax Return (5) (1).PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2023 Federal and New Jersey individual income tax return for Elias Gonzalez (SSN 140-80-8854), prepared by Rosenfield & Company PLLC. Reports AGI of $1,276,511, total income of $1,304,227 dominated by W-2 wages ($596,874) and Schedule E pass-through/rental income ($707,353), with federal tax due of $362,195.",
+      "supports": [
+        "Borrower personal income verification (2023)",
+        "W-2 wages of $596,874",
+        "Schedule E / pass-through income of $707,353",
+        "AGI and taxable income for debt-service capacity analysis",
+        "Filing status (Single) and tax bracket (37%)"
+      ],
+      "baseline_categories_supported": [
+        "Personal tax returns (most recent year)"
+      ],
+      "red_flags": [
+        "Significant income decline year-over-year: total income dropped $1.74M from $3.04M (2022) to $1.30M (2023), primarily due to Schedule E falling from $2.44M to $707K",
+        "Large balance due: federal tax owed $213,983 (including late penalties/interest of $27,237) plus NJ balance due $29,312 \u2014 indicates potential liquidity strain",
+        "Estimated tax penalty assessed ($7,356 federal, Form 2210) suggesting prior underpayment",
+        "Filing status changed from Head of Household (2022) to Single (2023) \u2014 possible household/family change",
+        "Passive activity losses carried forward to 2024: $89,710 + $9,213 + $16,270 = $115,193 \u2014 not currently deductible",
+        "Return signed/transmitted 02/08/2025 under Hurricane Milton extension; late filing may raise scrutiny"
+      ],
+      "limitations": [
+        "Schedule E detail (individual properties/entities) not fully extracted \u2014 cannot confirm source or stability of $707K pass-through income",
+        "No Schedule C present; SE tax is zero in 2023, so no self-employment income this year",
+        "Only first 80 of 114 pages inspected; business entity returns (K-1 source entities) may be in remaining pages",
+        "No business tax returns (1065/1120S) included to corroborate pass-through income"
+      ],
+      "key_facts": {
+        "agi": 1276511,
+        "nj_tax": 148726,
+        "address": "20 Evan Drive, Morganville, NJ 07751",
+        "preparer": "Rosenfield & Company, PLLC / Alan Ginsberg",
+        "tax_year": 2023,
+        "taxpayer": "Elias Gonzalez",
+        "w2_wages": 596874,
+        "ssn_last4": "8854",
+        "federal_tax": 362195,
+        "total_income": 1304227,
+        "filing_status": "Single",
+        "nj_balance_due": 29312,
+        "taxable_income": 1076462,
+        "total_payments": 182805,
+        "nj_taxable_income": 1689791,
+        "schedule_e_income": 707353,
+        "prior_year_agi_2022": 3009751,
+        "two_year_income_change": -1738872,
+        "estimated_tax_penalty_2023": 7356,
+        "late_penalties_and_interest": 27237,
+        "prior_year_total_income_2022": 3043099,
+        "federal_balance_due_with_penalties": 213983,
+        "qualified_business_income_deduction": 157211,
+        "self_employed_health_insurance_deduction": 27716,
+        "passive_activity_losses_carryforward_to_2024": 115193
+      }
+    },
+    {
+      "file_id": "2a3367a2-164a-43e1-a184-47bd22dd323f",
+      "file_name": "Td Febraury 2026.pdf",
+      "ai_classification": "unreadable",
+      "confidence": null,
+      "summary": null,
+      "supports": [],
+      "baseline_categories_supported": [],
+      "red_flags": [],
+      "limitations": [],
+      "key_facts": {}
+    },
+    {
+      "file_id": "3b8cda19-6d11-46be-becc-855fbc1bcff2",
+      "file_name": "Elias Gonzalez 2023 Tax Return (5).PDF",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2023 Form 1040 for Elias Gonzalez (SSN 140-80-8854), prepared by Rosenfield & Company PLLC. Reports AGI of $1,276,511 driven by $596,874 wages and $707,353 Schedule E pass-through/rental income. Total federal tax liability $362,195 with balance due of $213,983.",
+      "supports": [
+        "Personal income verification for 2023",
+        "W-2 wage income of $596,874",
+        "Schedule E pass-through/rental income of $707,353",
+        "Adjusted Gross Income of $1,276,511",
+        "Tax filing status (Single) and filing history"
+      ],
+      "baseline_categories_supported": [
+        "Personal tax return (most recent year)"
+      ],
+      "red_flags": [
+        "Significant income decline year-over-year: total income dropped from $3,043,099 (2022) to $1,304,227 (2023), a decrease of $1,738,872 \u2014 primarily due to Schedule E collapse from $2,438,638 to $707,353",
+        "Large balance due of $213,983 plus late penalties and interest of $27,237 \u2014 indicates underpayment and possible cash flow stress",
+        "Substantial passive activity losses carried forward to 2024: $89,710 + $9,213 + $16,270 = $115,193, signaling rental/pass-through entities generating losses",
+        "Filing status changed from Head of Household (2022) to Single (2023) \u2014 may reflect changed household circumstances",
+        "Estimated tax penalty of $7,356 (Form 2210) \u2014 underpaid estimated taxes during the year",
+        "2024 estimated tax payment structure places entire $215,700 in Q4 (January 2025), with $0 in Q1\u2013Q3 \u2014 unusual deferral pattern"
+      ],
+      "limitations": [
+        "Schedule E detail (individual properties/entities, rental income breakdown) not fully extracted from the 114-page return \u2014 only first 80 pages inspected",
+        "No Schedule C visible; self-employment income appears to be zero in 2023 (SE tax deduction is $0 vs. $5,632 in 2022)",
+        "Business entity tax returns (K-1 sources) not included in this file",
+        "W-2 employer identity not visible in extracted text",
+        "No 2022 return included for side-by-side verification beyond the comparison worksheet"
+      ],
+      "key_facts": {
+        "address": "20 Evan Drive, Morganville, NJ 07751",
+        "preparer": "Rosenfield & Company, PLLC / Alan Ginsberg",
+        "tax_year": 2023,
+        "taxpayer": "Elias Gonzalez",
+        "ssn_last4": "8854",
+        "total_tax": 362195,
+        "balance_due": 213983,
+        "nj_tax_2023": 148726,
+        "tax_bracket": "37%",
+        "total_income": 1304227,
+        "capital_gains": 0,
+        "filing_status": "Single",
+        "qbi_deduction": 157211,
+        "taxable_income": 1076462,
+        "total_payments": 182805,
+        "schedule_e_income": 707353,
+        "estimated_2024_tax": 215700,
+        "itemized_deductions": 42838,
+        "nj_balance_due_2023": 29312,
+        "prior_year_agi_2022": 3009751,
+        "wages_salaries_tips": 596874,
+        "adjusted_gross_income": 1276511,
+        "adjustments_to_income": 27716,
+        "nj_taxable_income_2023": 1689791,
+        "federal_tax_withheld_w2": 179233,
+        "total_due_after_penalty": 213983,
+        "prior_year_filing_status": "Head of Household",
+        "estimated_tax_penalty_2210": 7356,
+        "federal_tax_withheld_other": 3572,
+        "prior_year_schedule_e_2022": 2438638,
+        "late_penalties_and_interest": 27237,
+        "prior_year_total_income_2022": 3043099,
+        "passive_activity_losses_carryforward_2024": 115193
+      }
+    },
+    {
+      "file_id": "fa1fadfe-b326-497f-8fa9-149e1180198f",
+      "file_name": "Rockland Statement June 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking statement for EMG Auto Sales Inc, acct ending 8819, covering June 1\u201330, 2026. Shows $4.85M in deposits and $4.82M in withdrawals with heavy dealer-funding inflows (Capital One Auto, Santander, Wells Fargo Auto, Westlake, Exeter, Upstart, LendBuzz) and large floorplan curtailment debits (Bank 11/FL DR & CR).",
+      "supports": [
+        "Monthly deposit volume and cash-flow velocity for car dealer",
+        "Lender funding receipts confirming active retail installment sales",
+        "Floorplan curtailment payment activity (Bank 11 DR&CR)",
+        "Payroll cadence via Paychex EIB debits",
+        "Operating account liquidity / ending cash balance"
+      ],
+      "baseline_categories_supported": [
+        "bank_statement"
+      ],
+      "red_flags": [
+        "Jun 01 daily balance was NEGATIVE (-$202,288.52) \u2014 deep overdraft on first business day of month",
+        "Jun 01 overdraft charge of $560.00 and Jun 02 uncollected funds charge of $175.00 confirm negative position",
+        "Jun 26 DEPOSITED ITEM RETURNED $90,000.00 \u2014 a large remote deposit was returned/bounced",
+        "Massive same-day floorplan DR on Jun 01 ($570,512.45) against insufficient collected funds created overdraft",
+        "Numerous large remote deposits ($120K, $90K, $95K, etc.) without payee detail \u2014 source/authenticity unclear",
+        "Frequent inter-account online transfers to/from DD XX8652 totaling hundreds of thousands \u2014 possible balance cycling"
+      ],
+      "limitations": [
+        "Only one month provided; no month-over-month deposit consistency can be assessed",
+        "Remote deposit payors not disclosed \u2014 cannot verify they are arm's-length vehicle sale proceeds",
+        "Average ledger balance and low daily balance not reported by bank; derived from daily balance table",
+        "No information on floorplan line limit, outstanding balance, or curtailment schedule",
+        "DD XX8652 account identity unknown; inter-account transfers may inflate apparent deposit volume"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "months": [
+          {
+            "ending_balance": 210718.89,
+            "number_of_checks": 181,
+            "statement_period": "2026-06-01 to 2026-06-30",
+            "beginning_balance": 182718.07,
+            "low_daily_balance": -202288.52,
+            "number_of_deposits": 154,
+            "returned_check_count": 1,
+            "average_ledger_balance": null,
+            "negative_balance_dates": [
+              "2026-06-01"
+            ],
+            "nsf_or_overdraft_count": 2,
+            "total_deposits_and_credits": 4848969.26,
+            "total_withdrawals_and_debits": 4820968.44
+          }
+        ],
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 210718.89,
+        "number_of_checks": 181,
+        "statement_period": "2026-06-01 to 2026-06-30",
+        "beginning_balance": 182718.07,
+        "low_daily_balance": -202288.52,
+        "number_of_deposits": 154,
+        "notable_outflow_uses": [
+          "Bank 11 floorplan DR&CR curtailments (multiple, largest $570,512.45)",
+          "Paychex payroll ($60K\u2013$80K weekly)",
+          "Online transfers to DD XX8652 (cumulative ~$1.2M+)",
+          "Manheim auction purchases",
+          "DEALER OWNED WAR/OPS collections",
+          "FlexProtect warranty product remittances"
+        ],
+        "returned_check_count": 1,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [
+          "2026-06-01"
+        ],
+        "notable_inflow_sources": [
+          "Capital One Auto Dealer Funding",
+          "Santander Bank DLR PMT",
+          "Wells Fargo Auto Purchase",
+          "Westlake Financial Payables",
+          "Exeter Finance DLR Fund",
+          "Upstart Net ARL",
+          "LendBuzz Funding LLC",
+          "WorldPay combined deposits (Car Revolution)",
+          "Pointe Buick GMC LLC wire",
+          "First Citizens Bank wire"
+        ],
+        "nsf_or_overdraft_count": 2,
+        "total_deposits_and_credits": 4848969.26,
+        "total_withdrawals_and_debits": 4820968.44
+      }
+    },
+    {
+      "file_id": "893a5a9e-d790-48b8-848a-e7969c062493",
+      "file_name": "Rockland February 2026.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Rockland Trust commercial checking statement for EMG Auto Sales Inc (acct ...8819), February 2026. Shows $2.05M in deposits and $2.32M in withdrawals, with large floorplan/dealer funding inflows and heavy Bank 11 floorplan payoff outflows consistent with active used-car dealership operations.",
+      "supports": [
+        "Business cash flow and deposit volume",
+        "Dealer funding receipts (Santander, Westlake, Capital One, Exeter, Wells Fargo Auto)",
+        "Floorplan payoff activity (Bank 11 FL DR & CR)",
+        "Payroll cadence via Paychex EIB",
+        "Inter-company transfers (EMG Auto of Jersey City LLC, Pointe Buick GMC LLC)"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements \u2013 business operating account"
+      ],
+      "red_flags": [
+        "Three overdraft/negative-balance days: Feb 9 (-$237,709), Feb 10 (-$15,682), Feb 19 (-$654); overdraft charges totaling $700 assessed",
+        "PD ITEM - UNCOLLECTED CHARGE on Feb 19 ($35) indicates an item presented against uncollected funds",
+        "Balance swings extremely wide (low -$237K to high ~$253K), suggesting reliance on incoming dealer-fund wires to cover floorplan payoffs same-day",
+        "Ending balance ($59,353) is significantly lower than beginning balance ($331,588), a $272K net decline in one month",
+        "Large inter-company wire credits from related entities (EMG Auto of Jersey City LLC $80K; Pointe Buick GMC LLC $125K) inflate deposit total and may not represent arms-length revenue",
+        "Online transfers FROM DD XX8652 ($75K + $112K + $15K + $120K = $322K) inflate gross deposits; circular if XX8652 is a related account"
+      ],
+      "limitations": [
+        "Only one month provided; no prior-period comparison to assess deposit trend or consistency",
+        "Net cash position declined materially; cannot determine if seasonal or structural without additional months",
+        "Identity of account XX8652 (source of $322K in online transfers) not established \u2014 could be owner or related entity funding operations",
+        "Average daily ledger balance and low daily balance not explicitly stated by bank; derived from daily balance schedule",
+        "No revenue breakdown; gross deposits include lender dealer-funding proceeds (loan payoffs) which are not operating revenue"
+      ],
+      "key_facts": {
+        "bank": "Rockland Trust",
+        "account_last4": "8819",
+        "account_holder": "EMG Auto Sales Inc",
+        "ending_balance": 59353.08,
+        "notable_debits": {
+          "dealer_owned_warranty_ops": 75000.0,
+          "Paychex_payroll_4_runs_approx": 283253.76,
+          "online_transfers_to_DD_XX8652": 105000.0,
+          "Bank11_floorplan_payoffs_total_approx": 1299392.85
+        },
+        "notable_credits": {
+          "Manheim_credits": 47965.0,
+          "wire_from_Pointe_Buick_GMC_LLC": 125000.0,
+          "online_transfers_from_DD_XX8652": 322000.0,
+          "wire_from_EMG_Auto_Jersey_City_LLC": 80000.0
+        },
+        "service_charges": 164.19,
+        "number_of_checks": 185,
+        "statement_period": "2026-02-01 to 2026-02-28",
+        "beginning_balance": 331588.01,
+        "low_daily_balance": -237709.34,
+        "number_of_deposits": 82,
+        "returned_check_count": 0,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [
+          "2026-02-09",
+          "2026-02-10",
+          "2026-02-19"
+        ],
+        "nsf_or_overdraft_count": 3,
+        "total_deposits_and_credits": 2049695.72,
+        "total_withdrawals_and_debits": 2321930.65
+      }
+    }
+  ],
+  "expectations": {
+    "key_metrics_ranges": {
+      "ytd_annualized_revenue": [
+        26131185,
+        35353957
+      ],
+      "pfs_total_liquid_assets": [
+        377244,
+        510388
+      ],
+      "annualized_adjusted_deposits": [
+        32591381,
+        44094221
+      ],
+      "estimated_ebitda_or_cash_flow": [
+        326471,
+        441697
+      ]
+    },
+    "require_strengths": true,
+    "require_risks": true
+  }
+}

@@ -1,0 +1,1133 @@
+{
+  "name": "dealer-venture",
+  "review_type": "dealer_gatekeeper_v1",
+  "bucket": {
+    "name": "venture auto sales Dealer AI Intake",
+    "client_name": "venture auto sales",
+    "purpose": "Dealer financing AI intake",
+    "bucket_type": "dealer_ai_intake",
+    "description": "Public AI gatekeeper intake for dealer financing with real estate collateral."
+  },
+  "ai_context": {
+    "deal_type": "dealer financing with real estate collateral",
+    "asset_rows": [],
+    "chat_facts": [
+      {
+        "at": "2026-08-10T20:37:38.252533+00:00",
+        "text": "I uploaded 6 statements from main account",
+        "source": "client_chat"
+      }
+    ],
+    "credit_pull": null,
+    "review_type": "dealer_gatekeeper_v1",
+    "client_email": "omaralghzali@ventureautosales.org",
+    "loan_purpose": null,
+    "business_name": "venture auto sales",
+    "dealer_details": null,
+    "collateral_type": "real estate collateral and business assets",
+    "referral_source": null,
+    "screening_stage": "stage_1_bankability",
+    "entity_structure": {},
+    "loan_program_fit": {
+      "sba": {
+        "eligible": false
+      },
+      "jumbo_dscr": {
+        "dscr": null,
+        "revenue": 3543568,
+        "eligible": false
+      },
+      "line_of_credit": {
+        "revenue": 3543568,
+        "eligible": true,
+        "annualized_deposits": 5476746
+      },
+      "debt_consulting": {
+        "dscr": null,
+        "eligible": false,
+        "estimated_debt_burden": null
+      },
+      "term_loan_10_year": {
+        "dscr": null,
+        "revenue": 3543568,
+        "eligible": false
+      },
+      "real_estate_backed": {
+        "note": "Advance rate and pricing pending admin review \u2014 no rules configured for this program yet.",
+        "eligible": false
+      },
+      "reinsurance_backed": {
+        "doc_tier": "pfs_only",
+        "eligible": false,
+        "rate_percent": null,
+        "maturity_years": 1,
+        "requested_amount": null,
+        "trading_platform": null,
+        "custom_priced_5mm_plus": false
+      },
+      "term_loan_3_5_year": {
+        "dscr": null,
+        "revenue": 3543568,
+        "eligible": false
+      },
+      "equipment_financing": {
+        "eligible": false,
+        "cash_flow": 405204
+      },
+      "merchant_processing": {
+        "eligible": true,
+        "annualized_deposits": 5476746
+      },
+      "term_loan_loc_hybrid": {
+        "dscr": null,
+        "revenue": 3543568,
+        "eligible": false
+      },
+      "transportation_factoring": {
+        "revenue": 3543568,
+        "eligible": true
+      }
+    },
+    "recent_dealer_chat": [
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Good \u2014 I see six months of Wells Fargo statements (Feb\u2013Jul 2026) for Venture Auto Group LLC showing $300\u2013530K monthly deposits with active floorplan curtailments to Nextgear and Westlake. That establishes you're running real dealer operations. However, I cannot calculate bankability or debt-service capacity yet because I'm missing the corporate tax returns for 2023 and 2024. The bank presentation PDF includes some internal P&Ls, but I need the actual filed 1120S or 1065 returns to verify revenue, expenses, and tax liability. Can you upload the last 2 years of your business tax returns?",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:37:38.232888+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "I uploaded 6 statements from main account",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:37:38.232888+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "I see the bank presentation includes tax return pages, but the text extraction didn't pull the corporate 1120S schedules clearly \u2014 I got your 2024 personal 1040 (AGI ~$337K) and internal P&Ls, but not the S-corp ordinary income and K-1 detail I need to match bank deposits against reported taxable income.\n\nCan you re-upload just the 2023 and 2024 **corporate tax returns** (Form 1120S or 1065, whichever your entity files) as separate PDF files? That way I can extract the Schedule K-1 figures, cost of goods sold, and operating expenses directly and cross-check them against your bank statements.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:38:07.784745+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "the bank prestantion has the tax returns attached as the last pages",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:38:07.784745+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "these are 2023 and 2024 taxes, we have extension of r2025",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:49:41.210760+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Got it \u2014 I see the 2023 and 2024 1120-S returns in the presentation file. You're right that 2025 is under extension. Here's what I can now confirm from your documents:\n\n**What I see:**\n- 2024: $3.54M revenue, $405K ordinary income (S-corp)\n- 2023: $1.78M revenue, $121K ordinary income (S-corp)\n- Six months of bank statements (Feb\u2013Jul 2026): $300\u2013530K monthly deposits, averaging ~$5.5M annualized\n- Current P&L (Jan 2025\u2013Jun 2026): $6.6M sales, $958K NOI\n- Floorplan debt: NextGear $750K (confirmed in presentation)\n- Heavy owner draws via Zelle: $40\u201353K/month\n\n**What it means:**\n- Your 2024 tax return shows blank balance sheet, which is incomplete for collateral/equity analysis\n- Bank deposits ($5.5M annualized) are higher than 2024 tax revenue ($3.54M), but inter-company transfers to Yo Automotive and Tristar Auto inflate this figure \u2014 I cannot isolate true arm's-length dealer revenue yet\n- Owner draws are significant and reduce liquidity available for debt service\n\n**Next step:**\nI need a **formal debt schedule** listing every outstanding loan, lender, current balance, and monthly payment (floorplan, any MCA, any business lines of credit, personal guarantees). The presentation mentions NextGear $750K and WSECU LOC $49K, but I need the complete list with payment amounts to calculate debt-service capacity.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:49:41.210760+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "the bank deposits are for 2026 business year which is going to have much higher revunue",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:50:39.352138+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Understood \u2014 you filed 2023 and 2024 on time, and 2025 is under extension. Your 2026 bank deposits are tracking much higher than prior years, which is a positive signal. However, I still need to lock down one critical missing piece before I can preliminarily screen this: a **formal debt schedule** with every outstanding obligation, lender name, current balance, and monthly payment amount. You mentioned NextGear $750K and WSECU LOC $49K in the presentation, but I need the complete list \u2014 any floorplan lines, MCAs, business credit cards, personal loans, or other debt tied to the business or your personal guarantee. Once I have that, I can calculate whether your 2026 cash flow supports the $1.5M request.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:50:39.352138+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Understood \u2014 2026 is tracking significantly higher revenue than 2024, which is encouraging. For the debt schedule, I need one line per debt obligation: (1) lender name, (2) current outstanding balance, (3) monthly payment amount, and (4) what the debt is for (e.g., NextGear floorplan, WSECU line of credit, MCA, business credit card, personal loan, vehicle loan, real estate mortgage). List them in a simple table or spreadsheet format \u2014 no fancy formatting needed. Start with NextGear $750K and WSECU $49K and add anything else the business or you personally owe.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:51:00.209646+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "what info do you need for formal debt schedule",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:51:00.209646+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "Wells Fargo ,44941.16, 1200 a month, remodel line of credit, that is",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:51:58.229200+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Got it \u2014 Wells Fargo remodel LOC at $44,941 with $1,200/month payment. So now I have NextGear $750K floorplan, WSECU $49K, and Wells Fargo $44,941 remodel line. Are there any other debts? For example: other floorplan lines (Westlake, Capital One, etc.), any merchant cash advances, business credit cards, personal auto loans, or real estate mortgage? Once I have the complete list, I can calculate your total monthly debt service and see how it stacks against your 2026 cash flow.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:51:58.229200+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "no more debt",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:52:17.066939+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Perfect \u2014 so your total monthly debt service is approximately $1,200 (Wells Fargo remodel LOC) plus whatever NextGear and WSECU require monthly. I need those two payment amounts to finalize the debt schedule. Looking at your bank statements, I see heavy NextGear curtailments every month (typically $15\u201325K), so NextGear's monthly payment is likely in that range, but I need the exact figure from NextGear or your loan agreement. Same for WSECU $49K \u2014 what's the monthly payment? Once I have those two numbers, I can calculate your total debt-service capacity against your 2026 revenue and assess bankability for the $1.5M request.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:52:17.066939+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "Got it\u2014so WSECU is $1,200/month fixed, and NextGear is a floorplan line where you pay as vehicles sell (variable, not a fixed monthly). That's $2,400/month in fixed debt service from Wells Fargo and WSECU, plus variable NextGear paydowns tied to inventory turnover. Your 2026 YTD bank deposits average ~$460K/month, which is strong, but I need one more piece before I can screen this: your **personal financial statement (PFS)** for you as the 100% owner. The PFS shows your personal net worth, liquid assets, and any other personal debt or liabilities\u2014it's a standard underwriting requirement and takes about 10 minutes to fill out. You can complete it online right in this room instead of uploading a file; look for the 'Fill out online instead' link next to the Personal Financial Statement item in the Files panel on the left. Once I have that and confirm your estimated personal credit score or tier, I can preliminarily screen the $1.5M request.",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:52:49.704212+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "wsecu is also 1200, next gear is a based on when the cars on that line of c credit sell, so no bare monthyl",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:52:49.704212+00:00"
+      },
+      {
+        "role": "user",
+        "author": "omar alghzali",
+        "content": "I don't see a fill online",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:53:47.108068+00:00"
+      },
+      {
+        "role": "assistant",
+        "author": "Bucket AI",
+        "content": "The online fill tool may not be visible depending on your browser or screen size. Look in the Files panel on the left side under 'Personal Financial Statement' \u2014 there should be an upload button or link. If you don't see a fill-online option, you can upload a completed PFS instead. A personal financial statement lists your personal assets (bank accounts, investments, real estate, vehicles), liabilities (personal loans, mortgages, credit cards), and net worth. If you have a blank form or want to complete it, I can walk you through what goes on it, or you can use your accountant's template. Do you have a PFS already prepared, or would you like me to tell you what to include?",
+        "audience": "uploader",
+        "created_at": "2026-08-10T20:53:47.108068+00:00"
+      }
+    ],
+    "underwriting_focus": "Strictly screen Stage 1 bankability for dealer capital without asking the client to choose a loan product. Infer likely paths such as real-estate-backed full doc, DSCR/collateral support, cash-out working capital, portfolio-backed funding, high-cost debt refinance, or floorplan support from the documents and answers. Stage 1 focuses on business tax returns, YTD P&L, main operating bank statements, requested amount, detailed use of funds, stated monthly debt, and estimated credit. Do not ask for the full Stage 2 package until Stage 1 shows good probability. Treat real estate and related LLC/account structure as targeted follow-up clarifications after cash-flow context supports a path.",
+    "authoritative_facts": {},
+    "custom_instructions": "This is a public lead-magnet strict Stage 1 underwriter for car dealers. Ask first for last 2 years business tax returns, YTD P&L, last 6 months main operating bank statements, requested amount, a detailed use-of-funds breakdown, stated monthly debt payments, and estimated credit. The user may not know which lending product fits. Return one of these probability statuses: Good probability - book call, Promising but needs one clarification, Not enough evidence yet, or Poor probability based on current file. Set booking_recommended true only for Good probability - book call. Return a preliminary screen, not a commitment to lend.",
+    "documentation_level": "full doc",
+    "requested_loan_amount": null,
+    "estimated_credit_score": null,
+    "stage_1_required_items": [
+      "last 2 years business tax returns (or current-year extension filing if not yet filed)",
+      "current year/YTD P&L",
+      "last 6 months main operating bank statements",
+      "debt schedule",
+      "personal financial statement for each owner",
+      "identification for each owner",
+      "requested amount",
+      "detailed use of funds with amount breakdown",
+      "stated current monthly debt payments",
+      "estimated credit tier/score"
+    ],
+    "baseline_document_policy": {
+      "stage": "stage_1_bankability",
+      "allowed_document_categories": [
+        "last 2 years business tax returns (or current-year extension filing if not yet filed)",
+        "current year/YTD P&L",
+        "last 6 months main operating bank statements",
+        "debt schedule",
+        "personal financial statement for each owner",
+        "identification for each owner",
+        "requested amount",
+        "detailed use of funds with amount breakdown",
+        "stated current monthly debt payments",
+        "estimated credit tier/score"
+      ],
+      "stage_2_after_good_probability_only": [
+        "personal tax returns",
+        "dealer license",
+        "mortgage statements",
+        "property tax/insurance",
+        "entity docs",
+        "KYC/credit authorization",
+        "appraisal/BPO/title items when needed"
+      ],
+      "do_not_request_other_document_categories": true
+    }
+  },
+  "requested_documents": [
+    {
+      "id": "57ea07ff-6826-486d-b4a8-86315679c81a",
+      "name": "Debt schedule",
+      "category": "Debts",
+      "required": true,
+      "status": "requested",
+      "description": "Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each."
+    },
+    {
+      "id": "2d017037-f7b2-44b5-a676-e68f82a802ce",
+      "name": "Current year P&L",
+      "category": "Financials",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload the current year profit and loss statement for the dealership/business."
+    },
+    {
+      "id": "4479ef92-0de6-4220-b486-3710e6f7ac90",
+      "name": "Last 6 months bank statements",
+      "category": "Bank Statements",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload the last six months of the main operating business bank statements."
+    },
+    {
+      "id": "dae5dbf6-7111-4d9b-b71e-ef0477790843",
+      "name": "Last 2 years business tax returns",
+      "category": "Financials",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload the dealership/business tax returns for the last two years."
+    },
+    {
+      "id": "abac2999-63c4-40ad-9c2d-1c38b18a3807",
+      "name": "Personal financial statement",
+      "category": "Personal Financials",
+      "required": true,
+      "status": "uploaded",
+      "description": "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one."
+    },
+    {
+      "id": "9d226720-6c3f-4043-87e2-7916e0588c8a",
+      "name": "Identification \u2014 Omar Alghzali",
+      "category": "Identity",
+      "required": true,
+      "status": "requested",
+      "description": "Upload a government-issued photo ID for Omar Alghzali."
+    },
+    {
+      "id": "709ae4f9-0fa9-407e-95fc-b402b294faba",
+      "name": "Current-year tax extension filing",
+      "category": "Financials",
+      "required": true,
+      "status": "requested",
+      "description": "Upload the current-year tax extension filing since the return has not yet been filed."
+    }
+  ],
+  "uploaded_files": [
+    {
+      "id": "d31baf74-274e-4aaa-8478-83ef767fb715",
+      "file_name": "Venture Auto Bank Presentation.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 14091437
+    },
+    {
+      "id": "886bf234-907f-4660-8382-034ab36aa20f",
+      "file_name": "Venture_Auto_Group_LLC_P_and_L_Jan2025-Jun2026.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 2074
+    },
+    {
+      "id": "1826f241-e3c0-4b60-8f6e-7e04daac8da4",
+      "file_name": " 073126 WellsFargo-2.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 229511
+    },
+    {
+      "id": "32328b97-161e-442e-a320-1de5b8f9b1b1",
+      "file_name": "12394ecd-6517-4c10-bcec-64dd0e123c01.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 372463
+    },
+    {
+      "id": "44cb9579-228a-471d-8460-4683036eaa54",
+      "file_name": "1f0fc1ef-9673-4dc2-a647-8090122c911a.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 217497
+    },
+    {
+      "id": "e97818e6-eb49-41f0-81b5-2010eb158169",
+      "file_name": "tax return venture 2024.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 3995619
+    },
+    {
+      "id": "97a8c170-63a0-45d7-90f5-3342bb8cb3b1",
+      "file_name": "e338d1a3-165c-4386-a693-fdaa865fdf6a.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 511605
+    },
+    {
+      "id": "d96ae068-f939-495d-ab32-63b2858e780a",
+      "file_name": "bd4d87ef-457d-43ed-b0d7-2f25cc5bd1b8.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 259775
+    },
+    {
+      "id": "3cc7d934-aecf-4513-b9fa-337b837d4bfe",
+      "file_name": " 063026 WellsFargo.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 244876
+    },
+    {
+      "id": "1795b169-023b-4f6c-bb1a-3e2aa8d90075",
+      "file_name": "VENTURE AUTO GROUP LLC 873163594-2024-04-24-152653 (2).pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 256304
+    },
+    {
+      "id": "494740cb-c459-4bad-b6ea-d2b954645ce4",
+      "file_name": "personal fincial statemnet.pdf",
+      "content_type": "application/pdf",
+      "size_bytes": 1951955
+    }
+  ],
+  "per_file_analyses": [
+    {
+      "file_id": "d31baf74-274e-4aaa-8478-83ef767fb715",
+      "file_name": "Venture Auto Bank Presentation.pdf",
+      "ai_classification": "other",
+      "confidence": "high",
+      "summary": "A professionally assembled bank/lender presentation package for Venture Auto Group LLC (Omar Alghzali, Lakewood WA) seeking $1.5M. Contains executive summary, debt schedule, pro forma projections (2026\u20132027), internal P&Ls (2023\u20132024), balance sheets, and individual/corporate tax returns (2023\u20132024).",
+      "supports": [
+        "Loan purpose and use-of-funds narrative",
+        "Current debt schedule (WSECU LOC $49K + NextGear $750K)",
+        "Internal P&L performance 2023\u20132024",
+        "2026\u20132027 pro forma revenue and income projections",
+        "Individual tax return income verification (Omar Alghzali 2024 AGI ~$337K)",
+        "Corporate entity and ownership structure"
+      ],
+      "baseline_categories_supported": [
+        "current_p_and_l",
+        "tax_return",
+        "debt_schedule",
+        "floorplan_mca_inventory",
+        "entity_or_vesting"
+      ],
+      "red_flags": [
+        "Internal P&Ls generated via RocketLawyer.com \u2014 not CPA-prepared or audited; 2023 P&L lists $0 for rent, insurance, salaries, and advertising, which is implausible",
+        "2023 P&L net income ($212,798) vs. 2024 P&L net income ($405,204) do not clearly reconcile to tax return Schedule K-1/1120S figures without further review",
+        "Pro forma projects $5.875M (2026) and $7.05M (2027) revenue vs. $3.6M actual 2024 \u2014 very aggressive growth assumptions (63%\u201396% above 2024 actuals)",
+        "NextGear Capital floorplan balance ($750K) is entire payoff target; floorplan curtailment history and aging not provided",
+        "2024 Form 1040 shows total income of $405,204 equal to business net profit \u2014 no W-2 wages listed, suggesting all income flows from S-corp; no Schedule E or K-1 included in extracted text",
+        "SSN fully visible on extracted tax return pages (PII exposure risk in document handling)"
+      ],
+      "limitations": [
+        "Balance sheet pages (pp. 17\u201323) were not extracted \u2014 asset/liability detail unconfirmed",
+        "2023 individual tax return (pp. 24\u201331) text not extracted \u2014 2023 personal income unverified",
+        "Corporate tax returns (1120S, pp. 43\u201366) not extracted \u2014 S-corp ordinary income, distributions, and K-1 amounts unconfirmed",
+        "No bank statements included \u2014 deposit consistency and cash flow cannot be independently verified",
+        "No floorplan aging schedule or curtailment history provided",
+        "Pro forma projections are management-prepared and unaudited; no third-party support"
+      ],
+      "key_facts": {
+        "owner": "Omar Alghzali",
+        "entity": "Venture Auto Group LLC",
+        "address": "11215 Pacific Hwy SW, Lakewood, WA 98499",
+        "loan_purpose": "Pay off NextGear Capital floorplan ($750K), purchase inventory ($500K), office remodel ($250K)",
+        "loan_request": 1500000,
+        "p_and_l_2023": {
+          "source": "Internal \u2014 RocketLawyer.com",
+          "net_profit": 212798,
+          "total_revenue": 1779189,
+          "total_expenses": 1566391
+        },
+        "p_and_l_2024": {
+          "source": "Internal \u2014 RocketLawyer.com",
+          "net_profit": 405204,
+          "total_revenue": 3603568,
+          "total_expenses": 3198364
+        },
+        "debt_schedule": {
+          "debts": [
+            {
+              "term": "3 Years",
+              "lender": "WSECU",
+              "loan_type": "Line of Credit",
+              "maturity_date": "10/2028",
+              "current_balance": 49000,
+              "monthly_payment": null,
+              "origination_date": "10/2025"
+            },
+            {
+              "lender": "NextGear Capital",
+              "loan_type": "Floorplan Line of Credit (Revolving)",
+              "maturity_date": null,
+              "current_balance": 750000,
+              "monthly_payment": null,
+              "origination_date": "10/2021"
+            }
+          ],
+          "total_outstanding_balance": 799000,
+          "total_monthly_debt_service": null
+        },
+        "pro_forma_2026": {
+          "total_overhead": 410754,
+          "projected_revenue": 5875000,
+          "projected_net_income": 764246,
+          "projected_gross_profit": 1175000
+        },
+        "pro_forma_2027": {
+          "total_overhead": 424317,
+          "projected_revenue": 7050000,
+          "projected_net_income": 985683,
+          "projected_gross_profit": 1410000
+        },
+        "requested_rate": "6\u20137% annually",
+        "requested_term": "10\u201325 years",
+        "second_location": "14910 Meridian East, Puyallup, WA",
+        "years_in_business": "Since 2021",
+        "stated_annual_revenue": "Over $11 million (management claim \u2014 not supported by extracted financials)",
+        "tax_return_2024_individual": {
+          "preparer": "NSA Tax & Business Services LLC / Heather Cartwright PTIN P01049041",
+          "taxpayer": "Omar Alghzali",
+          "ssn_last4": "2119",
+          "agi_line11": 337427,
+          "filing_status": "Single",
+          "total_tax_line24": 88474,
+          "total_income_line9": 405204,
+          "taxable_income_line15": null
+        }
+      }
+    },
+    {
+      "file_id": "886bf234-907f-4660-8382-034ab36aa20f",
+      "file_name": "Venture_Auto_Group_LLC_P_and_L_Jan2025-Jun2026.pdf",
+      "ai_classification": "current_p_and_l",
+      "confidence": "high",
+      "summary": "Venture Auto Group LLC internal P&L covering 18 months (Jan 2025\u2013Jun 2026). Shows $6.58M in sales revenue, 25.9% gross margin, and $957,683 net operating income over the period. No CPA compilation or tax preparer signature present.",
+      "supports": [
+        "Business revenue and profitability",
+        "Gross margin on vehicle sales",
+        "Operating expense structure",
+        "Annualized NOI for debt-service coverage analysis"
+      ],
+      "baseline_categories_supported": [
+        "Current P&L / Interim Financials"
+      ],
+      "red_flags": [
+        "No CPA compilation, review, or preparer signature \u2014 appears self-prepared",
+        "18-month period is non-standard; spans into future dates (through Jun 2026) raising authenticity concerns",
+        "Expense list is unusually sparse for an auto dealer (no floorplan interest, no payroll/benefits beyond commissions, no depreciation)",
+        "Round-dollar operating expenses suggest estimates rather than actual booked figures",
+        "No balance sheet or cash flow statement accompanying the P&L"
+      ],
+      "limitations": [
+        "Does not establish balance sheet position, assets, or liabilities",
+        "No floorplan interest expense shown \u2014 critical for auto dealer NOI analysis",
+        "Cannot confirm revenue is cash-collected vs. accrual booked",
+        "No month-by-month or quarterly breakdown to assess trend or seasonality",
+        "Not audited, reviewed, or compiled by a third party"
+      ],
+      "key_facts": {
+        "entity": "Venture Auto Group LLC",
+        "preparer": null,
+        "gross_profit": 1705205.65,
+        "cpa_signature": null,
+        "period_months": 18,
+        "sales_revenue": 6579425.92,
+        "gross_margin_pct": 25.9,
+        "statement_period": "January 1, 2025 \u2013 June 30, 2026",
+        "cost_of_goods_sold": 4874220.27,
+        "net_operating_income": 957682.65,
+        "utilities_per_period": 18000.0,
+        "annualized_noi_implied": 638455.1,
+        "rent_expense_per_period": 54000.0,
+        "total_operating_expenses": 747523.0,
+        "insurance_expense_per_period": 18000.0,
+        "sales_commissions_per_period": 441523.0,
+        "advertising_marketing_per_period": 216000.0
+      }
+    },
+    {
+      "file_id": "1826f241-e3c0-4b60-8f6e-7e04daac8da4",
+      "file_name": " 073126 WellsFargo-2.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Optimize Business Checking for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), account ending 8988, July 2026. Shows $508,996 in total credits and $556,801 in debits, with heavy floorplan (Nextgear, Westlake) and vehicle purchase funding activity typical of a used-car dealer.",
+      "supports": [
+        "Operating cash flow and deposit volume for July 2026",
+        "Floorplan debt service activity (Nextgear, Westlake)",
+        "Vehicle purchase funding receipts from credit unions and Capital One",
+        "Owner draw/distribution pattern via Zelle to Omar Alghzali",
+        "WA state sales tax remittances confirming retail sales activity"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements (most recent month)"
+      ],
+      "red_flags": [
+        "One returned/unpaid deposited item on 07/06 for $9,818.97 \u2014 same amount as a mobile deposit on 07/02, suggesting a bounced check from a customer",
+        "Frequent large Zelle transfers to 'Omar Alghzali' personal ($5K on 07/01, $5K+$10K on 07/03, $8K on 07/06, $2.5K+$5K on 07/10, $2K+$3K on 07/13, $500 07/09, $1K 07/17, $1K 07/20, $1K 07/20, $2K 07/31) \u2014 significant owner cash extraction",
+        "Ending balance ($20,413) is 70% below beginning balance ($68,218), with debits exceeding credits by ~$47,805",
+        "Inter-company transfers in from Yo Automotive Group LLC and Tristar Auto Group LLC \u2014 potential balance inflation from related entities",
+        "WA Dept Revenue tax payments of $14,250 and $41,282 on 07/29 \u2014 large tax obligations reducing liquidity",
+        "ATM cash deposit of $8,000 on 07/29 \u2014 source of funds unverified"
+      ],
+      "limitations": [
+        "Single month only \u2014 no prior months provided for trend analysis",
+        "Inter-company transfers inflate gross deposits; true arm's-length revenue cannot be isolated without related-entity statements",
+        "Low daily balance floor not directly stated; lowest visible daily balance is ~$24,645 (07/14)",
+        "No NSF fees visible but returned item on 07/06 warrants further inquiry",
+        "Floorplan curtailment schedule and total outstanding balances not determinable from this statement alone"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "address": "11215 Pacific Hwy SW, Lakewood WA 98499",
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 20413.12,
+        "notable_debits": {
+          "wa_dept_revenue_tax": 55532.94,
+          "returned_deposited_item": 9818.97,
+          "american_express_payments": "approx $16,406",
+          "owner_zelle_draws_to_omar": "approx $41,000",
+          "nextgear_floorplan_payments": "numerous ACH debits totaling estimated $200K+",
+          "westlake_floorplan_payments": "approx $31,601"
+        },
+        "notable_credits": {
+          "businessline_loc_draw": 9700.0,
+          "capital_one_dealerfund": "approx $46,096 across multiple dates",
+          "intercompany_from_tristar": 10000.0,
+          "wire_from_arc_infinite_capital": 29300.0,
+          "intercompany_from_yo_automotive": "approx $23,848",
+          "nextgear_vehicle_purchase_credits": "multiple (Nextgear/CU Direct/Whatcom ECU/Wash State EM CU vehicle purchase ACH credits)"
+        },
+        "number_of_checks": 15,
+        "statement_period": "2026-07-01 to 2026-07-31",
+        "beginning_balance": 68217.8,
+        "low_daily_balance": 20413.12,
+        "number_of_deposits": 9,
+        "returned_check_count": 1,
+        "average_ledger_balance": 51503.2,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "total_deposits_and_credits": 508996.08,
+        "total_withdrawals_and_debits": 556800.76
+      }
+    },
+    {
+      "file_id": "32328b97-161e-442e-a320-1de5b8f9b1b1",
+      "file_name": "12394ecd-6517-4c10-bcec-64dd0e123c01.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Navigate Business Checking statement for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), account ending 8988, for February 2026. Shows $298,660 in deposits and $350,400 in withdrawals with heavy Nextgear floorplan and Westlake payoff activity typical of a used-car dealer.",
+      "supports": [
+        "Business deposit volume and cash-flow activity for February 2026",
+        "Floorplan curtailment payments to Nextgear Capital",
+        "Vehicle purchase proceeds via CU Direct and Capital One Auto",
+        "Owner draws via Zelle to Omar Alghzali",
+        "Inter-company transfers to/from Yo Automotive Group LLC and Tristar Auto Group LLC"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements (most recent period)"
+      ],
+      "red_flags": [
+        "Withdrawals ($350,400) substantially exceed deposits ($298,660), drawing balance down from $77,956 to $26,216 \u2014 net cash consumption of ~$51,740 in one month",
+        "Frequent and large Zelle transfers to owner Omar Alghzali totaling ~$44,300 in February alone, raising owner-draw / liquidity concerns",
+        "Gaps in check sequence noted (1079, 1084, 1516) \u2014 checks skipped between issued numbers",
+        "Multiple inter-company transfers to Yo Automotive Group LLC and Tristar Auto Group LLC without clear business purpose documented on statement",
+        "Low daily balance touched $10,815.61 on 2/20, just barely above $10,000 service-fee threshold",
+        "Account has no Overdraft Protection per statement disclosure"
+      ],
+      "limitations": [
+        "Single month only \u2014 no prior months to assess deposit trend or consistency",
+        "Does not show profitability, gross margin, or inventory turnover",
+        "Inter-company transfer purposes are self-described memo fields only; not independently verified",
+        "No NSF fee detail line visible, but cannot confirm zero NSFs without full fee ledger"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "months": [
+          {
+            "bank": "Wells Fargo Bank, N.A.",
+            "account_last4": "8988",
+            "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+            "ending_balance": 26215.84,
+            "number_of_checks": 6,
+            "statement_period": "2026-02-01 to 2026-02-28",
+            "beginning_balance": 77956.03,
+            "low_daily_balance": 10815.61,
+            "number_of_deposits": null,
+            "returned_check_count": 0,
+            "average_ledger_balance": 44706.6,
+            "negative_balance_dates": [],
+            "nsf_or_overdraft_count": 0,
+            "total_deposits_and_credits": 298659.98,
+            "total_withdrawals_and_debits": 350400.17
+          }
+        ],
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 26215.84,
+        "number_of_checks": 6,
+        "statement_period": "2026-02-01 to 2026-02-28",
+        "beginning_balance": 77956.03,
+        "low_daily_balance": 10815.61,
+        "number_of_deposits": null,
+        "returned_check_count": 0,
+        "average_ledger_balance": 44706.6,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "total_deposits_and_credits": 298659.98,
+        "total_withdrawals_and_debits": 350400.17
+      }
+    },
+    {
+      "file_id": "44cb9579-228a-471d-8460-4683036eaa54",
+      "file_name": "1f0fc1ef-9673-4dc2-a647-8090122c911a.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Optimize Business Checking for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), May 2026. Shows $425K in credits and $406K in debits with active floorplan (Nextgear, Westlake), Capital One dealer funding, and CU Direct vehicle purchase proceeds.",
+      "supports": [
+        "Business cash flow and deposit volume for car dealer",
+        "Active floorplan line usage (Nextgear, Westlake Financial)",
+        "Capital One auto dealer funding receipts",
+        "CU Direct vehicle purchase/admin fee receipts",
+        "Inter-company transfers (Yo Automotive Group, Tristar Auto Group)",
+        "Owner draw activity via Zelle to Omar Alghzali"
+      ],
+      "baseline_categories_supported": [
+        "bank_statement"
+      ],
+      "red_flags": [
+        "Heavy Zelle transfers to Omar Alghzali personally throughout the month (totaling ~$53,550+), suggesting significant owner draws commingled in business account",
+        "Multiple inter-company transfers to/from Yo Automotive Group LLC and Tristar Auto Group LLC \u2014 related-party flow-through inflates gross deposit figures",
+        "BusinessLine Line of Credit draws ($2,400 + $5,100 + $6,000 = $13,500) included in credits, inflating operating deposit total",
+        "Large WA Dept Revenue tax payments on 05/28 ($11,257.66 + $37,341.51 = $48,599.17) suggest prior-period tax liability being settled",
+        "Gaps in check sequence (1131, 1134, 1138, 1140, 1145, 1147) \u2014 missing checks not explained",
+        "Only one month provided; no prior period for deposit trend comparison"
+      ],
+      "limitations": [
+        "Single month only \u2014 cannot assess deposit consistency or seasonality",
+        "Gross credits include inter-company transfers and LOC draws; net organic dealer revenue is materially lower than $425K total credits",
+        "No NSF/overdraft detail provided but low balance on 05/28 ($13,860.58) warrants attention",
+        "Cannot determine true net cash flow without stripping related-party transfers and LOC proceeds"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "address": "11215 Pacific Hwy SW, Lakewood WA 98499-5182",
+        "principal": "Omar W Alghzali",
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 40043.42,
+        "notable_debits": {
+          "american_express_payments": "multiple debits to Omar Alghzali AmEx accounts",
+          "westlake_floorplan_payoffs": "multiple VIN-specific payoffs throughout month",
+          "nextgear_floorplan_payments": "numerous \u2014 significant portion of $362K electronic debits",
+          "zelle_to_omar_alghzali_personal": "~53550 estimated across multiple transfers",
+          "wa_dept_revenue_tax_payments_05_28": 48599.17
+        },
+        "notable_credits": {
+          "businessline_loc_draws": 13500.0,
+          "nextgear_funding_credits": 53282.29,
+          "total_electronic_deposits": 351553.39,
+          "capital_one_dealer_funding": 24575.33,
+          "total_check_deposits_mobile": 73495.78,
+          "yo_automotive_group_transfers_in": 94360.32,
+          "cu_direct_vehicle_purchase_credits": 63443.78
+        },
+        "number_of_checks": 14,
+        "related_entities": [
+          "Yo Automotive Group LLC",
+          "Tristar Auto Group LLC",
+          "Venture Auto Sales II",
+          "Venture Auto Sales III"
+        ],
+        "statement_period": "2026-05-01 to 2026-05-31",
+        "beginning_balance": 21841.85,
+        "low_daily_balance": 13860.58,
+        "number_of_deposits": 7,
+        "returned_check_count": 0,
+        "average_ledger_balance": 40162.02,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "total_deposits_and_credits": 425049.17,
+        "total_withdrawals_and_debits": 406847.6
+      }
+    },
+    {
+      "file_id": "e97818e6-eb49-41f0-81b5-2010eb158169",
+      "file_name": "tax return venture 2024.pdf",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2024 Form 1120-S for Venture Auto Group, LLC (EIN 87-3163594), an auto sales S-corp in Puyallup, WA. Reports $3,543,568 gross sales, $2,786,968 COGS, and $405,204 ordinary business income. Sole shareholder Omar Alghzali holds 100% interest.",
+      "supports": [
+        "Business revenue and profitability for 2024",
+        "Entity type and ownership structure (100% Omar Alghzali)",
+        "Cost of goods sold / inventory throughput for auto dealer",
+        "Sublease income of $60,000",
+        "Shareholder K-1 income passthrough for personal income analysis"
+      ],
+      "baseline_categories_supported": [
+        "Business tax returns (most recent year)",
+        "Entity/ownership verification"
+      ],
+      "red_flags": [
+        "Balance sheet (Schedule L) shows total assets of only $1 \u2014 appears to be a placeholder/rounding entry, not reflective of actual business assets; no inventory, receivables, or fixed assets reported on balance sheet despite $2.8M COGS",
+        "Cover page lists address as 11215 Pacific Hwy SW, Lakewood WA 98499, but the 1120-S and K-1 list 14910 Meridian Ave E, Puyallup WA 98375 \u2014 address discrepancy",
+        "Prepared and signed June 10, 2025 \u2014 filed after standard deadline; no extension visible in file",
+        "No officer compensation reported on Line 7 despite $178,500 salaries/wages on Line 8",
+        "Cash accounting method used; COGS equals purchases with zero beginning/ending inventory reported \u2014 unusual for an auto dealer"
+      ],
+      "limitations": [
+        "No prior-year return to assess revenue/income trends",
+        "Balance sheet not substantively completed \u2014 cannot assess leverage or working capital",
+        "No depreciation schedule (Form 4562) included",
+        "No state return included",
+        "Actual distributions to shareholder not shown"
+      ],
+      "key_facts": {
+        "ein": "87-3163594",
+        "address": "14910 Meridian Ave E, Puyallup, WA 98375",
+        "preparer": "Heather M Cartwright / NSA Tax & Business Services LLC",
+        "supplies": 40000,
+        "tax_year": "2024",
+        "form_type": "1120-S",
+        "utilities": 13200,
+        "advertising": 54200,
+        "entity_name": "Venture Auto Group, LLC",
+        "entity_type": "S-Corporation",
+        "gross_profit": 756600,
+        "preparer_ein": "81-5109807",
+        "rent_expense": 95496,
+        "total_income": 816600,
+        "gross_receipts": 3543568,
+        "sole_shareholder": "Omar Alghzali",
+        "total_deductions": 411396,
+        "accounting_method": "Cash",
+        "business_activity": "Auto Sales",
+        "date_incorporated": "10/19/2021",
+        "cost_of_goods_sold": 2786968,
+        "salaries_and_wages": 178500,
+        "preparer_signed_date": "06/10/2025",
+        "other_income_sublease": 60000,
+        "shareholder_ssn_last4": "2119",
+        "other_deductions_total": 53200,
+        "repairs_and_maintenance": 30000,
+        "ordinary_business_income": 405204,
+        "s_election_effective_date": "10/19/2021",
+        "shareholder_ownership_pct": "100%",
+        "total_assets_per_balance_sheet": 1,
+        "shareholder_stock_basis_end_of_year": 405204
+      }
+    },
+    {
+      "file_id": "97a8c170-63a0-45d7-90f5-3342bb8cb3b1",
+      "file_name": "e338d1a3-165c-4386-a693-fdaa865fdf6a.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Navigate Business Checking for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), covering March 1\u201331, 2026. Shows $529,350 in deposits and $482,521 in withdrawals, with heavy floorplan activity (Nextgear, Westlake) and daily vehicle purchase/admin fee credits consistent with an active used-car dealer.",
+      "supports": [
+        "Business deposit volume and cash flow for March 2026",
+        "Active floorplan curtailment payments to Nextgear and Westlake",
+        "Vehicle sale proceeds via CU Direct, Capital One Auto, Foursight, and bankcard deposits",
+        "Owner draw pattern via repeated Zelle transfers to Omar Alghzali",
+        "Intercompany transfers with Yo Automotive Group LLC and Tristar Auto Group LLC"
+      ],
+      "baseline_categories_supported": [
+        "Bank statements (most recent period)"
+      ],
+      "red_flags": [
+        "Minimum daily balance dipped to $8,918.47 on 3/30, below $10,000 threshold \u2014 balance swings are volatile",
+        "Frequent large Zelle transfers to Omar Alghzali personally (totaling ~$40,600 for the month) suggest heavy owner draws reducing liquidity",
+        "Multiple intercompany transfers to/from Yo Automotive Group LLC and Tristar Auto Group LLC without clear documentation of nature; commingling risk",
+        "Two large checks #1096 ($23,441.83) and #1097 ($27,440.59) cleared same day 3/12 \u2014 payees not identified on statement",
+        "Cash withdrawals of $4,000, $3,750, $12,500, and $2,150 in branch during month \u2014 significant untraced cash outflows",
+        "Gap in check sequence noted (1083, 1086, 1088, 1091, 1094, 1105 asterisked as gaps)"
+      ],
+      "limitations": [
+        "Only one month of statements provided; trend analysis requires prior months",
+        "Intercompany transfer purposes are partially described but not formally documented here",
+        "Payees for large checks #1096 and #1097 are not identified",
+        "No NSF/overdraft fee line items visible, but statement notes overdraft protection is NOT active \u2014 any near-zero balance days carry risk",
+        "Total Nextgear and Westlake floorplan obligations cannot be determined from this statement alone"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 73044.61,
+        "business_address": "11215 Pacific Hwy SW, Lakewood WA 98499",
+        "number_of_checks": 17,
+        "statement_period": "2026-03-01 to 2026-03-31",
+        "beginning_balance": 26215.84,
+        "low_daily_balance": 8918.47,
+        "number_of_deposits": null,
+        "returned_check_count": 0,
+        "average_ledger_balance": 50345.94,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "notable_recurring_debits": "Nextgear floorplan payments (multiple daily); Westlake Floorplan payments (multiple); Zelle to Omar Alghzali (~$40,600 total); WA Dept Revenue tax payments $13,590.77 + $24,217.13 on 3/30",
+        "total_deposits_and_credits": 529350.18,
+        "total_withdrawals_and_debits": 482521.41
+      }
+    },
+    {
+      "file_id": "d96ae068-f939-495d-ab32-63b2858e780a",
+      "file_name": "bd4d87ef-457d-43ed-b0d7-2f25cc5bd1b8.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Optimize Business Checking for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), account ending 8988, covering April 1\u201330, 2026. Shows $485K in credits and $536K in debits, reflecting active floorplan curtailments (Nextgear, Westlake), dealer funding receipts (Capital One Auto, CU Direct), and significant personal Zelle draws.",
+      "supports": [
+        "Business cash flow / deposit volume for April 2026",
+        "Floorplan payment activity (Nextgear Capital, Westlake Floorplan)",
+        "Dealer funding receipts (Capital One Auto, CU Direct, Whatcom ECU, Sound CU)",
+        "Inter-company transfer activity (Yo Automotive Group LLC, Tristar Auto Group LLC)",
+        "Owner draw / personal transfer volume (Zelle to Omar Alghzali)"
+      ],
+      "baseline_categories_supported": [
+        "bank_statement"
+      ],
+      "red_flags": [
+        "Average daily ledger balance reported as $0.00 on the statement \u2014 data anomaly; actual daily balances ranged from ~$4,859 to ~$95,787, suggesting a system/print error",
+        "Very low balance on 04/10 ($4,858.96) indicating thin liquidity mid-month",
+        "Large frequent Zelle transfers to Omar Alghzali personally throughout the month (totaling well over $50K) \u2014 possible unreported owner compensation or undisclosed personal draws",
+        "Debits ($536K) significantly exceed credits ($485K) causing a net balance decline of ~$51K in one month",
+        "Gaps in check sequence (missing 1105, 1112, 1117) \u2014 unaccounted checks",
+        "Inter-company transfers from Yo Automotive Group LLC and Tristar Auto Group LLC inflate deposit totals; circular cash flow risk"
+      ],
+      "limitations": [
+        "Only one month of history provided; no trend comparison possible",
+        "Average daily ledger balance field shows $0.00 \u2014 cannot rely on bank-reported average",
+        "No information on other bank accounts the borrower may hold",
+        "Personal financial position of Omar Alghzali not established by this document"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 21841.85,
+        "number_of_checks": 19,
+        "statement_period": "2026-04-01 to 2026-04-30",
+        "beginning_balance": 73044.61,
+        "low_daily_balance": 4858.96,
+        "number_of_deposits": 9,
+        "returned_check_count": 0,
+        "average_ledger_balance": null,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "total_deposits_and_credits": 485275.54,
+        "total_withdrawals_and_debits": 536478.3
+      }
+    },
+    {
+      "file_id": "3cc7d934-aecf-4513-b9fa-337b837d4bfe",
+      "file_name": " 063026 WellsFargo.pdf",
+      "ai_classification": "bank_statement",
+      "confidence": "high",
+      "summary": "Wells Fargo Optimize Business Checking for Venture Auto Group LLC / Venture Auto Sales III (Omar W Alghzali), account ending 8988, for June 2026. Shows $491K total credits and $462K total debits with active floorplan (Nextgear, Westlake) and vehicle purchase funding activity.",
+      "supports": [
+        "Business deposit volume and cash flow for June 2026",
+        "Active floorplan curtailment payments to Nextgear and Westlake",
+        "Vehicle sale proceeds via CU Direct, Capital One Auto, FourSight, and Bankcard deposits",
+        "Owner draw pattern via Zelle to Omar Alghzali",
+        "Inter-company transfers to/from Tristar Auto Group and Yo Automotive Group"
+      ],
+      "baseline_categories_supported": [
+        "Bank Statements"
+      ],
+      "red_flags": [
+        "Heavy owner draws via Zelle to Omar Alghzali totaling approximately $43,650 in one month \u2014 reduces net business liquidity",
+        "Transfers to/from related entities (Tristar Auto Group, Yo Automotive Group) without clear business purpose documentation; commingling risk",
+        "Two draws from BusinessLine of Credit ($10K on 06/25 and $9.5K on 06/29) deposited into operating account, inflating credit totals",
+        "Low daily balance of $11,858.52 on 06/05, indicating periodic liquidity tightness",
+        "Gaps in check sequence (missing 1138\u20131145, 1147\u20131148, 1152, 1166, 1168) \u2014 unaccounted checks",
+        "Single-month statement only; no prior months provided for trend analysis"
+      ],
+      "limitations": [
+        "Only one month of statements provided \u2014 cannot assess deposit consistency or seasonal trends",
+        "Inter-company transfer purposes are not fully documented on the statement",
+        "No average balance data for prior periods to benchmark against",
+        "Loan-to-value or DSCR inputs cannot be derived from this statement alone"
+      ],
+      "key_facts": {
+        "bank": "Wells Fargo Bank, N.A.",
+        "address": "11215 Pacific Hwy SW, Lakewood WA 98499",
+        "account_last4": "8988",
+        "account_holder": "Venture Auto Group LLC DBA Venture Auto Sales III / Omar W Alghzali",
+        "ending_balance": 68217.8,
+        "notable_debits": {
+          "manheim_auction_payment": 11340.0,
+          "wa_dept_revenue_tax_payment": 26038.89,
+          "transfers_to_tristar_auto_group": 21359.0,
+          "transfers_to_yo_automotive_group": 6500.0,
+          "nextgear_floorplan_payments_approx": "multiple ACH debits throughout month \u2014 dominant debit category",
+          "westlake_floorplan_payments_approx": "multiple ACH debits",
+          "zelle_to_omar_alghzali_total_approx": 43650.0
+        },
+        "notable_credits": {
+          "mobile_deposits_total": 126516.95,
+          "electronic_deposits_total": 364525.19,
+          "inter_company_transfers_in": 30910.41,
+          "line_of_credit_draws_included_in_credits": 19500.0
+        },
+        "number_of_checks": 20,
+        "statement_period": "2026-06-01 to 2026-06-30",
+        "beginning_balance": 40043.42,
+        "low_daily_balance": 11858.52,
+        "number_of_deposits": 7,
+        "returned_check_count": 0,
+        "average_ledger_balance": 35612.37,
+        "negative_balance_dates": [],
+        "nsf_or_overdraft_count": 0,
+        "total_deposits_and_credits": 491042.14,
+        "total_withdrawals_and_debits": 462867.76
+      }
+    },
+    {
+      "file_id": "1795b169-023b-4f6c-bb1a-3e2aa8d90075",
+      "file_name": "VENTURE AUTO GROUP LLC 873163594-2024-04-24-152653 (2).pdf",
+      "ai_classification": "tax_return",
+      "confidence": "high",
+      "summary": "2023 Form 1120-S federal tax return for Venture Auto Group, LLC (EIN 87-3163594), an S-corp auto dealer in Puyallup, WA. Reports gross sales of $1,779,189, COGS of $1,380,391, gross profit of $398,798, and ordinary business income of $120,798 after $278,000 in deductions.",
+      "supports": [
+        "2023 business revenue and profitability",
+        "Cost of goods sold / vehicle inventory purchases",
+        "Shareholder income pass-through to Omar Alghzali (100% owner)",
+        "Depreciation on 2021 RAM 1500 ($98,000 cost, 80% bonus depreciation taken)",
+        "Entity structure and EIN verification"
+      ],
+      "baseline_categories_supported": [
+        "Business tax returns (most recent year)",
+        "Entity documentation (EIN, business activity, S-corp election date)"
+      ],
+      "red_flags": [
+        "Officer signature line on Form 1120-S is blank (date not filled in), though ERO signed 04/06/2024",
+        "Schedule L (balance sheet) is entirely blank \u2014 no asset/liability detail provided",
+        "Schedule M-1 and M-2 are blank \u2014 no book-to-tax reconciliation completed",
+        "Rent deduction of $180,000 is large relative to income ($120,798 net); no lease detail in return",
+        "Beginning inventory is $0 on Form 1125-A, suggesting no carry-in inventory \u2014 unusual for an auto dealer",
+        "Single depreciable asset (2021 RAM 1500, acquired 12/28/23) with 80% bonus depreciation inflates depreciation deduction to $82,320"
+      ],
+      "limitations": [
+        "No balance sheet data \u2014 cannot assess leverage, debt load, or working capital",
+        "No prior-year return included; single year of history limits trend analysis",
+        "Cash accounting method means revenue recognition may not reflect economic performance",
+        "No floorplan line, MCA balances, or other debt obligations visible in this filing",
+        "Shareholder K-1 shows 100% ownership to Omar Alghzali but no personal tax return included"
+      ],
+      "key_facts": {
+        "ein": "87-3163594",
+        "address": "14910 Meridian Ave E, Puyallup, WA 98375",
+        "preparer": "NSA Tax and Business Services LLC / Linda L Higley",
+        "tax_year": "2023",
+        "entity_name": "Venture Auto Group, LLC",
+        "return_type": "Form 1120-S (S-Corporation)",
+        "gross_profit": 398798,
+        "gross_receipts": 1779189,
+        "rent_deduction": 180000,
+        "shareholder_name": "Omar Alghzali",
+        "total_deductions": 278000,
+        "accounting_method": "Cash",
+        "business_activity": "Auto Sales (NAICS 441120)",
+        "date_incorporated": "10/19/2021",
+        "depreciable_asset": "2021 RAM 1500, acquired 12/28/2023, cost $98,000, bonus depreciation $78,400",
+        "return_filed_date": "04/06/2024",
+        "cost_of_goods_sold": 1380391,
+        "shareholder_address": "509 Golden Gate Ave, Tacoma, WA 98466",
+        "inventory_end_of_year": 0,
+        "depreciation_deduction": 98000,
+        "number_of_shareholders": 1,
+        "vehicle_purchases_cogs": 1359391,
+        "total_assets_per_return": 163887,
+        "ordinary_business_income": 120798,
+        "s_election_effective_date": "10/19/2021",
+        "shareholder_ownership_pct": "100%",
+        "inventory_beginning_of_year": 0,
+        "shareholder_k1_ordinary_income": 120798
+      }
+    },
+    {
+      "file_id": "494740cb-c459-4bad-b6ea-d2b954645ce4",
+      "file_name": "personal fincial statemnet.pdf",
+      "ai_classification": "personal_financial_statement",
+      "confidence": "high",
+      "summary": "SBA Form 413 Personal Financial Statement for Omar Alghzali, owner of Venture Auto Sales, dated 08/10/2026. Shows total assets of approximately $4,930,000 against total liabilities of $2,719,900, yielding a stated net worth of $0 \u2014 a clear calculation error.",
+      "supports": [
+        "Guarantor net worth assessment",
+        "Personal liquidity analysis",
+        "Guarantor real estate and auto asset holdings",
+        "Liability exposure of principal"
+      ],
+      "baseline_categories_supported": [
+        "Personal Financial Statement"
+      ],
+      "red_flags": [
+        "Net worth stated as $0 despite assets (~$4,930,000) far exceeding liabilities ($2,719,900) \u2014 math error or intentional misstatement",
+        "Total assets column appears blank/not summed on the form",
+        "Unpaid taxes of $95,000 noted \u2014 potential IRS/state lien exposure",
+        "Automobiles listed at $2,300,000 \u2014 consistent with dealer inventory but may be double-counting business assets",
+        "No income figures provided in Section 1 (salary, investment, real estate income all blank)",
+        "Statement date 08/10/2026 is a future date \u2014 verify authenticity"
+      ],
+      "limitations": [
+        "No income sources documented; debt service coverage cannot be assessed",
+        "Supporting schedules (Sections 2\u20138) not included in this upload",
+        "Net worth calculation is incorrect as presented; true net worth cannot be confirmed",
+        "Business type checked as Corporation but no entity documentation provided here"
+      ],
+      "key_facts": {
+        "note": "Net worth stated as $0 on the form is arithmetically incorrect; implied net worth is approximately $2,210,100. Statement date appears to be in the future.",
+        "net_worth": 0,
+        "home_address": "14217 76th Ave E, Puyallup, WA 98373",
+        "total_assets": 4930000,
+        "assets_detail": {
+          "automobiles": 2300000,
+          "real_estate": 1850000,
+          "other_assets": 500000,
+          "ira_retirement": 0,
+          "savings_accounts": 0,
+          "stocks_and_bonds": 0,
+          "life_insurance_csv": 0,
+          "cash_on_hand_and_banks": 50000,
+          "other_personal_property": 200000,
+          "accounts_and_notes_receivable": 30000
+        },
+        "business_name": "Venture Auto Sales",
+        "liquid_assets": 50000,
+        "statement_date": "2026-08-10",
+        "individual_name": "Omar Alghzali",
+        "business_address": "11215 Pacific Hwy SW, Lakewood, WA 98499",
+        "total_liabilities": 2719900,
+        "liabilities_detail": {
+          "unpaid_taxes": 95000,
+          "accounts_payable": 20000,
+          "other_liabilities": null,
+          "installment_auto_balance": 250000,
+          "mortgages_on_real_estate": 1300000,
+          "installment_other_balance": 82500,
+          "loans_against_life_insurance": 0,
+          "notes_payable_banks_and_others": 972400,
+          "installment_auto_monthly_payment": 4800,
+          "installment_other_monthly_payment": 25000
+        }
+      }
+    }
+  ],
+  "expectations": {
+    "key_metrics_ranges": {
+      "ytd_annualized_revenue": [
+        3012033,
+        4075103
+      ],
+      "pfs_total_liquid_assets": [
+        42500,
+        57500
+      ],
+      "annualized_adjusted_deposits": [
+        4655234,
+        6298258
+      ],
+      "estimated_ebitda_or_cash_flow": [
+        344423,
+        465985
+      ]
+    },
+    "require_strengths": true,
+    "require_risks": true
+  }
+}

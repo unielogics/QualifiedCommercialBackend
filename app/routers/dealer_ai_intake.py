@@ -1375,8 +1375,17 @@ def _uploaded_doc_ids(bucket: Bucket) -> set[UUID]:
 
 
 def _missing_required_docs(bucket: Bucket) -> list[BucketRequestedDocument]:
+    """Required checklist items not yet satisfied. A doc is satisfied either by
+    a directly-linked upload OR by the review-time reconciliation that flips
+    status to "uploaded" when an analyzed file's classification matches the
+    category (chat-room drag-drops rarely link a requested_document_id, so
+    status is the only signal for them)."""
     uploaded = _uploaded_doc_ids(bucket)
-    return [doc for doc in bucket.requested_documents if doc.required and doc.id not in uploaded]
+    return [
+        doc
+        for doc in bucket.requested_documents
+        if doc.required and doc.status != "uploaded" and doc.id not in uploaded
+    ]
 
 
 # Which of the frontend's 8 fixed PFS asset-row labels count toward
@@ -1723,12 +1732,92 @@ def _apply_loan_program_fit(intake: PublicUnderwritingIntake) -> None:
 # in the output so every consumer (admin panel, AI context, packets) shows the
 # same math. Mirrors the program-fit pattern: cheap, idempotent, recomputed
 # live rather than trusted from a snapshot.
-_DSCR_RATE_BANDS = (0.0675, 0.075, 0.0825)  # candidate 30-yr fixed DSCR note rates
+_DSCR_RATE_BANDS = (0.0675, 0.075, 0.0825)  # fallback 30-yr fixed DSCR note rates
 _DSCR_AMORT_MONTHS = 360
 _DSCR_TARGETS = (1.0, 1.10, 1.25)
 # When no tax/insurance/HOA evidence is uploaded yet, estimate carrying costs
 # as an annual percentage of property value (≈1.1% taxes + 0.5% insurance).
 _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE = 0.016
+
+# Admin-configurable DSCR pricing (AppSettings.data["dscr_pricing"], see
+# DscrPricingSettings). Cached at module level with a short TTL so the sync
+# context builders can price without a DB round trip; async endpoints refresh
+# it opportunistically. Falls back to the constants above when never loaded.
+_DSCR_PRICING_TTL_SECONDS = 60.0
+_dscr_pricing_cache: dict[str, Any] = {}
+_dscr_pricing_cache_at: float = 0.0
+
+
+async def _refresh_dscr_pricing(db: AsyncSession) -> None:
+    global _dscr_pricing_cache, _dscr_pricing_cache_at
+    now = time.monotonic()
+    if _dscr_pricing_cache and now - _dscr_pricing_cache_at < _DSCR_PRICING_TTL_SECONDS:
+        return
+    from app.models.app_settings import AppSettings
+    from app.schemas.settings import DscrPricingSettings
+
+    row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+    raw = (row.data or {}).get("dscr_pricing") if row else None
+    try:
+        parsed = DscrPricingSettings.model_validate(raw) if isinstance(raw, dict) else DscrPricingSettings()
+    except Exception:  # noqa: BLE001 — a malformed blob must never break pricing
+        parsed = DscrPricingSettings()
+    _dscr_pricing_cache = parsed.model_dump()
+    _dscr_pricing_cache_at = now
+
+
+def _dscr_fico_estimate(intake: PublicUnderwritingIntake) -> tuple[int | None, str]:
+    """Best available credit signal: soft-pull FICO first, then the stated
+    credit tier text ("720-759", "Mid Credit", "excellent", a bare score)."""
+    pulled = _credit_pull_state(intake).get("fico")
+    if isinstance(pulled, (int, float)) and not isinstance(pulled, bool) and 300 <= pulled <= 850:
+        return int(pulled), "soft credit pull"
+    basics_raw = _intake_state(intake).get("funding_review_basics")
+    basics = basics_raw if isinstance(basics_raw, dict) else {}
+    tier_text = str(basics.get("estimated_credit_tier") or getattr(intake, "estimated_credit_score", None) or "").strip().lower()
+    if not tier_text:
+        return None, "no credit signal"
+    match = re.search(r"\d{3}", tier_text)
+    if match:
+        score = int(match.group())
+        if 300 <= score <= 850:
+            return score, f"stated tier '{tier_text}'"
+    for keyword, score in (("excellent", 780), ("prime", 760), ("good", 720), ("mid", 700), ("fair", 660), ("low", 620), ("poor", 580)):
+        if keyword in tier_text:
+            return score, f"stated tier '{tier_text}'"
+    return None, "no credit signal"
+
+
+def _dscr_rate_bands_for(intake: PublicUnderwritingIntake) -> tuple[tuple[float, ...], int, float, str]:
+    """(rate_bands, amortization_months, tax_ins_pct, credit_note) from the
+    cached admin pricing config and the file's credit signal."""
+    pricing = _dscr_pricing_cache
+    if not pricing:
+        return _DSCR_RATE_BANDS, _DSCR_AMORT_MONTHS, _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE, "default pricing (settings not loaded)"
+    fico, fico_source = _dscr_fico_estimate(intake)
+    tiers = sorted(pricing.get("rate_tiers") or [], key=lambda tier: -int(tier.get("min_fico", 0)))
+    base = None
+    tier_note = ""
+    if tiers:
+        chosen = None
+        if fico is not None:
+            for tier in tiers:
+                if fico >= int(tier.get("min_fico", 0)):
+                    chosen = tier
+                    break
+        if chosen is None:
+            chosen = tiers[len(tiers) // 2]
+            tier_note = f"mid tier assumed ({fico_source})"
+        else:
+            tier_note = f"tier ≥{chosen.get('min_fico')} FICO via {fico_source}"
+        base = float(chosen.get("annual_rate", _DSCR_RATE_BANDS[1]))
+    if base is None:
+        return _DSCR_RATE_BANDS, _DSCR_AMORT_MONTHS, _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE, "default pricing (no tiers configured)"
+    spread = float(pricing.get("band_spread") or 0.0075)
+    bands = tuple(rate for rate in (base - spread, base, base + spread) if rate > 0)
+    months = int(pricing.get("amortization_months") or _DSCR_AMORT_MONTHS)
+    tax_pct = float(pricing.get("tax_insurance_annual_pct_of_value") or _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE)
+    return bands, months, tax_pct, tier_note
 
 
 def _dscr_monthly_payment(principal: float, annual_rate: float, months: int = _DSCR_AMORT_MONTHS) -> float:
@@ -1752,6 +1841,24 @@ def _km_number(km: dict[str, Any], *keys: str) -> float | None:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
             return float(value)
     return None
+
+
+async def _merge_thread_borrower_facts(db: AsyncSession, intake: PublicUnderwritingIntake, assistant_message: BucketAIMessage) -> None:
+    """Persist model-proposed borrower facts from ANY thread's assistant reply
+    (client, admin cockpit, or broker portal) into the intake — the operator
+    states deal-shaping facts ("client wants $1.5M") in the internal thread as
+    often as the borrower does in theirs. Variant-routed to the correct
+    validator; refreshes the deterministic program-fit snapshot for dealers."""
+    raw = assistant_message.metadata_json.get("raw") if isinstance(assistant_message.metadata_json, dict) else None
+    proposed = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
+    if not proposed:
+        return
+    if intake.variant == FUNDING_VARIANT:
+        _merge_funding_review_details(intake, proposed)
+    else:
+        newly_accepted = _merge_dealer_details(intake, proposed)
+        await _apply_dealer_detail_documents(db, intake, newly_accepted)
+        _apply_loan_program_fit(intake)
 
 
 def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -1802,19 +1909,21 @@ def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     if missing:
         return {"computed": False, "missing": missing}
 
+    rate_bands, amort_months, tax_ins_pct, credit_note = _dscr_rate_bands_for(intake)
+
     if extracted_carry is not None:
         monthly_tax_ins = extracted_carry
         carry_source = "documents"
     else:
-        monthly_tax_ins = property_value * _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE / 12.0
-        carry_source = f"assumed {_DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE:.1%} of value per year"
+        monthly_tax_ins = property_value * tax_ins_pct / 12.0
+        carry_source = f"assumed {tax_ins_pct:.1%} of value per year"
 
     ltv = requested / property_value if property_value else None
-    mid_rate = _DSCR_RATE_BANDS[len(_DSCR_RATE_BANDS) // 2]
+    mid_rate = rate_bands[len(rate_bands) // 2]
 
     scenarios = []
-    for rate in _DSCR_RATE_BANDS:
-        pi = _dscr_monthly_payment(requested, rate)
+    for rate in rate_bands:
+        pi = _dscr_monthly_payment(requested, rate, amort_months)
         pitia = pi + monthly_tax_ins
         scenarios.append(
             {
@@ -1827,10 +1936,10 @@ def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
 
     max_loans = {}
     required_rents = {}
-    requested_pitia_mid = _dscr_monthly_payment(requested, mid_rate) + monthly_tax_ins
+    requested_pitia_mid = _dscr_monthly_payment(requested, mid_rate, amort_months) + monthly_tax_ins
     for target in _DSCR_TARGETS:
         supportable_pi = monthly_rent / target - monthly_tax_ins
-        max_loan = _dscr_principal_for_payment(supportable_pi, mid_rate) if supportable_pi > 0 else 0.0
+        max_loan = _dscr_principal_for_payment(supportable_pi, mid_rate, amort_months) if supportable_pi > 0 else 0.0
         max_loans[f"{target:.2f}"] = {
             "max_loan": round(max_loan, 0),
             "implied_ltv": round(max_loan / property_value, 3) if property_value else None,
@@ -1855,10 +1964,11 @@ def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "down_payment_amount": details.get("down_payment_amount"),
         },
         "assumptions": {
-            "amortization_months": _DSCR_AMORT_MONTHS,
-            "rate_bands": list(_DSCR_RATE_BANDS),
+            "amortization_months": amort_months,
+            "rate_bands": list(rate_bands),
             "benchmark_rate": mid_rate,
-            "note": "Fixed-rate fully-amortizing P&I; taxes/insurance from documents when uploaded, otherwise estimated from property value. Deterministic screen, not a quote.",
+            "credit_pricing": credit_note,
+            "note": "Fixed-rate fully-amortizing P&I; rate band from the file's credit signal and admin DSCR pricing settings; taxes/insurance from documents when uploaded, otherwise estimated from property value. Deterministic screen, not a quote.",
         },
         "ltv": round(ltv, 3) if ltv is not None else None,
         "dscr_at_requested": dscr_mid,
@@ -1874,6 +1984,7 @@ _FUNDING_REVIEW_DETAIL_KEYS = (
     "prior_property_ownership",
     "is_commercial_property",
     "property_type",
+    "requested_amount",
 )
 
 
@@ -1906,6 +2017,10 @@ def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: An
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 accepted[key] = float(value)
             continue
+        if key == "requested_amount":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 500_000_000:
+                accepted[key] = float(value)
+            continue
         if key == "property_type":
             text = str(value).strip()
             if text:
@@ -1918,6 +2033,14 @@ def _merge_funding_review_details(intake: PublicUnderwritingIntake, proposed: An
     merged = dict(existing) if isinstance(existing, dict) else {}
     merged.update(accepted)
     state["funding_review_details"] = merged
+    # A restated amount supersedes the intake-form figure everywhere (DSCR
+    # potential, PDF, packets) — keep the column and the basics in sync.
+    if "requested_amount" in accepted:
+        intake.requested_loan_amount = accepted["requested_amount"]
+        basics = state.get("funding_review_basics")
+        if isinstance(basics, dict):
+            basics["requested_amount"] = accepted["requested_amount"]
+            state["funding_review_basics"] = basics
     intake.intake_state = state
 
 
@@ -1969,6 +2092,10 @@ def _has_real_estate_schedule(intake: PublicUnderwritingIntake) -> bool:
     )
 
 
+# Deal-shaping facts stated conversationally (any thread) that must land on
+# the intake columns themselves — requested amount, monthly debt, use of funds
+# — so the PDF, program fit, packets, and lists stop showing "—" for numbers
+# the AI already knows.
 _DEALER_DETAIL_KEYS = (
     "owners",
     "current_year_tax_filed",
@@ -1979,6 +2106,9 @@ _DEALER_DETAIL_KEYS = (
     # boolean facts above: a borrower-stated signal used only to gate the
     # equipment_financing program-fit rule, never a field-collection form.
     "financing_equipment_or_vehicle",
+    "requested_loan_amount",
+    "stated_monthly_debt_payments",
+    "use_of_funds",
 )
 
 
@@ -2032,6 +2162,15 @@ def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> di
             if text:
                 accepted[key] = text[:180]
             continue
+        if key in ("requested_loan_amount", "stated_monthly_debt_payments"):
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 500_000_000:
+                accepted[key] = float(value)
+            continue
+        if key == "use_of_funds":
+            text = str(value).strip()
+            if text:
+                accepted[key] = text[:500]
+            continue
     if not accepted:
         return {}
     state = _intake_state(intake)
@@ -2040,6 +2179,14 @@ def _merge_dealer_details(intake: PublicUnderwritingIntake, proposed: Any) -> di
     merged.update(accepted)
     state["dealer_details"] = merged
     intake.intake_state = state
+    # Deal-shaping facts land on the intake columns too, so every consumer
+    # (PDF, program fit, packets, lead list) sees them without digging into
+    # intake_state. Stated facts are authoritative over blank columns; a
+    # newly-stated amount also supersedes an older stated amount.
+    if "requested_loan_amount" in accepted:
+        intake.requested_loan_amount = accepted["requested_loan_amount"]
+    if "use_of_funds" in accepted and not (intake.loan_purpose or "").strip():
+        intake.loan_purpose = accepted["use_of_funds"][:255]
     return accepted
 
 
@@ -5229,6 +5376,8 @@ async def download_admin_dealer_intelligence_pdf(
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     missing_docs = _missing_required_docs(intake.bucket)
     is_re = intake.variant == FUNDING_VARIANT
+    if is_re:
+        await _refresh_dscr_pricing(db)
     pdf_bytes = await asyncio.to_thread(
         render_dealer_intelligence_pdf,
         intake=intake,
@@ -5902,6 +6051,8 @@ async def broker_dealer_lead_chat(
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     assistant_message = None
     if payload.message and payload.message.strip():
+        if intake.variant == FUNDING_VARIANT:
+            await _refresh_dscr_pricing(db)
         context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
@@ -5914,6 +6065,7 @@ async def broker_dealer_lead_chat(
         )
         if chat_messages:
             assistant_message = chat_messages[-1].content
+            await _merge_thread_borrower_facts(db, intake, chat_messages[-1])
         _record_chat_fact(intake, payload.message, source="broker_chat")
     await db.commit()
     intake = await _load_broker_dealer_lead(db, user, intake_id)
@@ -6554,6 +6706,7 @@ async def get_lead_dscr_potential(
     intake = await _load_admin_dealer_lead(db, intake_id)
     if intake.variant != FUNDING_VARIANT:
         return LeadDscrPotentialResponse(computed=False)
+    await _refresh_dscr_pricing(db)
     potential = _compute_dscr_potential(intake)
     return LeadDscrPotentialResponse(computed=bool(potential.get("computed")), potential=potential)
 
@@ -6781,6 +6934,8 @@ async def dealer_ai_lead_chat(
         # Refresh the product AI context first so the internal thread reasons
         # over current deterministic figures (dscr_potential, program fit)
         # rather than the snapshot from the last client-side sync.
+        if intake.variant == FUNDING_VARIANT:
+            await _refresh_dscr_pricing(db)
         context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
@@ -6793,6 +6948,7 @@ async def dealer_ai_lead_chat(
         )
         if chat_messages:
             assistant_message = chat_messages[-1].content
+            await _merge_thread_borrower_facts(db, intake, chat_messages[-1])
         # Persist the operator's stated facts (requested amount, credit tier, use
         # of funds, …) so the next review/summary sees them — the client path
         # already records into chat_facts; the admin path did not until now.

@@ -260,6 +260,30 @@ _DEFAULT_TRANSACTION_CHECKLISTS: dict[str, "LoanTypeChecklist"] = {
 }
 
 
+class DscrRateTier(BaseModel):
+    """One credit tier for DSCR-potential pricing: files at or above min_fico
+    (and below the next-higher tier) price from annual_rate (decimal)."""
+    min_fico: int = Field(ge=300, le=850)
+    annual_rate: float = Field(gt=0.0, lt=0.30)
+
+
+class DscrPricingSettings(BaseModel):
+    """Rate assumptions for the deterministic DSCR-potential screen on
+    real-estate leads (app/routers/dealer_ai_intake.py::_compute_dscr_potential).
+    Admin-editable so pricing moves without a deploy. The screen shows three
+    scenarios: base rate for the file's credit tier ± band_spread."""
+    rate_tiers: list[DscrRateTier] = Field(
+        default_factory=lambda: [
+            DscrRateTier(min_fico=760, annual_rate=0.0675),
+            DscrRateTier(min_fico=700, annual_rate=0.075),
+            DscrRateTier(min_fico=300, annual_rate=0.0825),
+        ]
+    )
+    band_spread: float = Field(default=0.0075, ge=0.0, lt=0.05)
+    amortization_months: int = Field(default=360, ge=60, le=480)
+    tax_insurance_annual_pct_of_value: float = Field(default=0.016, gt=0.0, lt=0.10)
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -280,6 +304,7 @@ class AppSettingsData(BaseModel):
     letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
     prequal_auto_approval: PrequalAutoApprovalSettings = Field(default_factory=PrequalAutoApprovalSettings)
     property_intelligence: PropertyIntelligenceSettings = Field(default_factory=PropertyIntelligenceSettings)
+    dscr_pricing: DscrPricingSettings = Field(default_factory=DscrPricingSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -300,6 +325,7 @@ class AppSettingsUpdate(BaseModel):
     letterhead: LetterheadSettings | None = None
     prequal_auto_approval: PrequalAutoApprovalSettings | None = None
     property_intelligence: PropertyIntelligenceSettings | None = None
+    dscr_pricing: DscrPricingSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------
