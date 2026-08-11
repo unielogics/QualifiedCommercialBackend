@@ -5228,12 +5228,18 @@ async def download_admin_dealer_intelligence_pdf(
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
     files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
     missing_docs = _missing_required_docs(intake.bucket)
+    is_re = intake.variant == FUNDING_VARIANT
     pdf_bytes = await asyncio.to_thread(
         render_dealer_intelligence_pdf,
         intake=intake,
         files=files,
         missing_docs=missing_docs,
         result=latest_result,
+        # Internal-only sections — never passed on the public/borrower exports.
+        program_fit=None if is_re else _compute_loan_program_fit(intake),
+        dscr_potential=_compute_dscr_potential(intake) if is_re else None,
+        credit=_credit_pull_state(intake) or None,
+        internal=True,
     )
     filename = _safe_filename(f"dealer-intelligence-{intake.business_name or intake.full_name or 'review'}.pdf")
     return Response(
