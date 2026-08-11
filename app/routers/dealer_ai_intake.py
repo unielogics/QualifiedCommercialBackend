@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -58,7 +58,7 @@ from app.schemas.bucket import (
     BucketRequestedDocumentRead,
 )
 from app.schemas.common import ORMModel
-from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION, create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
+from app.services.bucket_ai import CHAT_TURN_ORDER, CURRENT_FILE_ANALYSIS_VERSION, create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
@@ -1716,6 +1716,158 @@ def _apply_loan_program_fit(intake: PublicUnderwritingIntake) -> None:
     intake.intake_state = state
 
 
+# ---------------------------------------------------------------------------
+# DSCR potential — deterministic math for real_estate_dscr_v1 leads. The AI
+# review/chat can reason about DSCR, but the numbers themselves come from this
+# arithmetic, never from the model. Assumption constants are surfaced verbatim
+# in the output so every consumer (admin panel, AI context, packets) shows the
+# same math. Mirrors the program-fit pattern: cheap, idempotent, recomputed
+# live rather than trusted from a snapshot.
+_DSCR_RATE_BANDS = (0.0675, 0.075, 0.0825)  # candidate 30-yr fixed DSCR note rates
+_DSCR_AMORT_MONTHS = 360
+_DSCR_TARGETS = (1.0, 1.10, 1.25)
+# When no tax/insurance/HOA evidence is uploaded yet, estimate carrying costs
+# as an annual percentage of property value (≈1.1% taxes + 0.5% insurance).
+_DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE = 0.016
+
+
+def _dscr_monthly_payment(principal: float, annual_rate: float, months: int = _DSCR_AMORT_MONTHS) -> float:
+    """Amortizing monthly P&I for a fixed-rate note."""
+    monthly_rate = annual_rate / 12.0
+    factor = (monthly_rate * (1 + monthly_rate) ** months) / ((1 + monthly_rate) ** months - 1)
+    return principal * factor
+
+
+def _dscr_principal_for_payment(payment: float, annual_rate: float, months: int = _DSCR_AMORT_MONTHS) -> float:
+    """Inverse of _dscr_monthly_payment: the loan size a monthly P&I supports."""
+    monthly_rate = annual_rate / 12.0
+    factor = (monthly_rate * (1 + monthly_rate) ** months) / ((1 + monthly_rate) ** months - 1)
+    return payment / factor
+
+
+def _km_number(km: dict[str, Any], *keys: str) -> float | None:
+    """First numeric value among the given key_metrics keys (bool excluded)."""
+    for key in keys:
+        value = km.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    return None
+
+
+def _compute_dscr_potential(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """Deterministic DSCR-potential screen for a real-estate lead.
+
+    Combines the intake basics (borrower-stated rent/value/amount), the
+    conversationally-gathered funding_review_details, and any document-derived
+    key_metrics from the latest review, preferring extracted evidence over
+    stated values. Produces, with the math shown:
+      - LTV at the requested amount
+      - projected PITIA and DSCR at each candidate rate band
+      - max supportable loan (and implied LTV) at DSCR targets 1.00/1.10/1.25
+      - the monthly rent required to carry the requested amount at each target
+    """
+    basics_raw = _intake_state(intake).get("funding_review_basics")
+    basics = basics_raw if isinstance(basics_raw, dict) else {}
+    details = _funding_review_details(intake)
+    km = _key_metrics(intake)
+
+    def _stated(key: str) -> float | None:
+        value = basics.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+        return None
+
+    extracted_rent = _km_number(km, "monthly_rent", "in_place_monthly_rent", "market_monthly_rent", "gross_monthly_rent")
+    monthly_rent = extracted_rent or _stated("monthly_rent")
+    rent_source = "documents" if extracted_rent else ("stated" if monthly_rent else None)
+
+    extracted_value = _km_number(km, "estimated_property_value", "property_value", "purchase_price", "appraised_value")
+    property_value = extracted_value or _stated("estimated_value_or_purchase_price")
+    value_source = "documents" if extracted_value else ("stated" if property_value else None)
+
+    requested = float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else _stated("requested_amount")
+
+    extracted_carry = _km_number(km, "monthly_tax_insurance_hoa", "monthly_taxes_insurance", "monthly_pitia_taxes_insurance")
+    extracted_pitia = _km_number(km, "monthly_pitia", "estimated_pitia", "pitia")
+
+    missing = [
+        label
+        for label, value in (
+            ("monthly rent (lease, rent roll, or stated)", monthly_rent),
+            ("property value or purchase price", property_value),
+            ("requested loan amount", requested),
+        )
+        if value is None
+    ]
+    if missing:
+        return {"computed": False, "missing": missing}
+
+    if extracted_carry is not None:
+        monthly_tax_ins = extracted_carry
+        carry_source = "documents"
+    else:
+        monthly_tax_ins = property_value * _DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE / 12.0
+        carry_source = f"assumed {_DSCR_TAX_INS_ANNUAL_PCT_OF_VALUE:.1%} of value per year"
+
+    ltv = requested / property_value if property_value else None
+    mid_rate = _DSCR_RATE_BANDS[len(_DSCR_RATE_BANDS) // 2]
+
+    scenarios = []
+    for rate in _DSCR_RATE_BANDS:
+        pi = _dscr_monthly_payment(requested, rate)
+        pitia = pi + monthly_tax_ins
+        scenarios.append(
+            {
+                "annual_rate": rate,
+                "monthly_principal_interest": round(pi, 2),
+                "monthly_pitia": round(pitia, 2),
+                "dscr": round(monthly_rent / pitia, 3) if pitia else None,
+            }
+        )
+
+    max_loans = {}
+    required_rents = {}
+    requested_pitia_mid = _dscr_monthly_payment(requested, mid_rate) + monthly_tax_ins
+    for target in _DSCR_TARGETS:
+        supportable_pi = monthly_rent / target - monthly_tax_ins
+        max_loan = _dscr_principal_for_payment(supportable_pi, mid_rate) if supportable_pi > 0 else 0.0
+        max_loans[f"{target:.2f}"] = {
+            "max_loan": round(max_loan, 0),
+            "implied_ltv": round(max_loan / property_value, 3) if property_value else None,
+            "at_annual_rate": mid_rate,
+        }
+        required_rents[f"{target:.2f}"] = round(requested_pitia_mid * target, 2)
+
+    dscr_mid = next(s["dscr"] for s in scenarios if s["annual_rate"] == mid_rate)
+    return {
+        "computed": True,
+        "inputs": {
+            "monthly_rent": monthly_rent,
+            "monthly_rent_source": rent_source,
+            "property_value": property_value,
+            "property_value_source": value_source,
+            "requested_loan_amount": requested,
+            "monthly_tax_insurance_hoa": round(monthly_tax_ins, 2),
+            "tax_insurance_source": carry_source,
+            "extracted_monthly_pitia": extracted_pitia,
+            "transaction_type": basics.get("transaction_type"),
+            "estimated_credit_tier": basics.get("estimated_credit_tier"),
+            "down_payment_amount": details.get("down_payment_amount"),
+        },
+        "assumptions": {
+            "amortization_months": _DSCR_AMORT_MONTHS,
+            "rate_bands": list(_DSCR_RATE_BANDS),
+            "benchmark_rate": mid_rate,
+            "note": "Fixed-rate fully-amortizing P&I; taxes/insurance from documents when uploaded, otherwise estimated from property value. Deterministic screen, not a quote.",
+        },
+        "ltv": round(ltv, 3) if ltv is not None else None,
+        "dscr_at_requested": dscr_mid,
+        "scenarios": scenarios,
+        "max_loan_at_target_dscr": max_loans,
+        "required_monthly_rent_at_requested": required_rents,
+    }
+
+
 # Fields the real-estate chat may populate on funding_review_details.
 _FUNDING_REVIEW_DETAIL_KEYS = (
     "down_payment_amount",
@@ -2249,6 +2401,7 @@ def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "estimated_value_or_purchase_price": basics.get("estimated_value_or_purchase_price"),
         "monthly_rent": basics.get("monthly_rent"),
         "funding_review_details": _funding_review_details(intake) or None,
+        "dscr_potential": _compute_dscr_potential(intake),
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
             "stage": "stage_1_dscr_property_screen",
@@ -2319,7 +2472,7 @@ async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake
                 BucketAIMessage.bucket_id == intake.bucket_id,
                 BucketAIMessage.audience.in_(["uploader", "admin"]),
             )
-            .order_by(BucketAIMessage.created_at.desc())
+            .order_by(BucketAIMessage.created_at.desc(), CHAT_TURN_ORDER.desc())
             .limit(32)
         )
     ).scalars().all()
@@ -3719,6 +3872,7 @@ async def _response(
     empty_message: str | None = None,
     include_management: bool = False,
     admin_thread: bool = False,
+    thread_user: User | None = None,
     prequalification_widget: dict[str, Any] | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
@@ -3745,6 +3899,12 @@ async def _response(
                 BucketAIMessage.bucket_id == intake.bucket_id,
                 BucketAIMessage.audience == "admin",
             ]
+            if thread_user is not None:
+                # Each internal viewer (super admin, dealer partner) keeps a
+                # PRIVATE thread with the AI on this lead — threads are never
+                # shared between users. NULL-user rows are system welcomes,
+                # visible to every internal viewer.
+                filters.append(or_(BucketAIMessage.user_id == thread_user.id, BucketAIMessage.user_id.is_(None)))
         else:
             filters = [
                 BucketAIMessage.bucket_id == intake.bucket_id,
@@ -3755,7 +3915,7 @@ async def _response(
             await db.execute(
                 select(BucketAIMessage)
                 .where(*filters)
-                .order_by(BucketAIMessage.created_at.desc())
+                .order_by(BucketAIMessage.created_at.desc(), CHAT_TURN_ORDER.desc())
                 .limit(50)
             )
         ).scalars().all()
@@ -5091,7 +5251,7 @@ async def get_dealer_ai_lead(
 ) -> DealerIntakeResponse:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
 @admin_router.post("/{intake_id}/request-deletion", response_model=DealerIntakeResponse)
@@ -5116,7 +5276,7 @@ async def admin_request_lead_deletion(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
 @admin_router.post("/{intake_id}/cancel-deletion-request", response_model=DealerIntakeResponse)
@@ -5138,7 +5298,7 @@ async def admin_cancel_lead_deletion(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
 @admin_router.post("/{intake_id}/confirm-deletion", status_code=status.HTTP_204_NO_CONTENT)
@@ -5264,7 +5424,7 @@ async def update_lead_outcome_status(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
 @admin_router.patch("/{intake_id}/language", response_model=DealerIntakeResponse)
@@ -5288,7 +5448,7 @@ async def update_lead_language(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
 @admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
@@ -5454,6 +5614,7 @@ async def create_admin_ai_lead(
         public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
         include_management=True,
         admin_thread=True,
+        thread_user=user,
         assistant_message=welcome_text + email_note,
     )
 
@@ -5618,6 +5779,7 @@ async def create_broker_ai_lead(
         public_path="/dealer-ai-underwriter",
         include_management=False,
         admin_thread=True,
+        thread_user=user,
         assistant_message=welcome_text + email_note,
     )
 
@@ -5630,7 +5792,7 @@ async def get_broker_dealer_lead(
 ) -> DealerIntakeResponse:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
-    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True, thread_user=user)
 
 
 @broker_router.post("/{intake_id}/request-deletion", response_model=DealerIntakeResponse)
@@ -5655,7 +5817,7 @@ async def broker_request_lead_deletion(
     )
     await db.commit()
     intake = await _load_broker_dealer_lead(db, user, intake.id)
-    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True, thread_user=user)
 
 
 @broker_router.post("/{intake_id}/cancel-deletion-request", response_model=DealerIntakeResponse)
@@ -5677,7 +5839,7 @@ async def broker_cancel_lead_deletion(
     )
     await db.commit()
     intake = await _load_broker_dealer_lead(db, user, intake.id)
-    return await _response(db, intake, token=None, include_management=False, admin_thread=True)
+    return await _response(db, intake, token=None, include_management=False, admin_thread=True, thread_user=user)
 
 
 @broker_router.get("/{intake_id}/notes", response_model=list[BucketNoteRead])
@@ -5734,6 +5896,8 @@ async def broker_dealer_lead_chat(
     intake = await _load_broker_dealer_lead(db, user, intake_id)
     assistant_message = None
     if payload.message and payload.message.strip():
+        context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+        intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
             db,
             bucket=intake.bucket,
@@ -5754,6 +5918,7 @@ async def broker_dealer_lead_chat(
         include_management=False,
         assistant_message=assistant_message,
         admin_thread=True,
+        thread_user=user,
     )
 
 
@@ -6055,6 +6220,7 @@ async def create_admin_ai_lead_from_bucket(
         public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
         include_management=True,
         admin_thread=True,
+        thread_user=user,
         assistant_message=(
             "Lead created from the existing bucket — its files are already attached. "
             "Run the AI review when ready." + email_note
@@ -6362,6 +6528,30 @@ async def get_lead_program_fit(
     return LeadProgramFitResponse(computed=True, programs=fit)
 
 
+class LeadDscrPotentialResponse(BaseModel):
+    """Admin-only read of the deterministic DSCR-potential screen for a
+    real-estate lead — same live-recompute pattern as LeadProgramFitResponse
+    so the admin always sees figures derived from the current facts."""
+    computed: bool
+    potential: dict[str, Any] = Field(default_factory=dict)
+
+
+@admin_router.get("/{intake_id}/dscr-potential", response_model=LeadDscrPotentialResponse)
+async def get_lead_dscr_potential(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> LeadDscrPotentialResponse:
+    """Deterministic DSCR/LTV/max-loan math for real-estate leads only —
+    dealer leads have the program-fit screen instead."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.variant != FUNDING_VARIANT:
+        return LeadDscrPotentialResponse(computed=False)
+    potential = _compute_dscr_potential(intake)
+    return LeadDscrPotentialResponse(computed=bool(potential.get("computed")), potential=potential)
+
+
 @admin_router.post("/{intake_id}/credit-pull", response_model=LeadCreditStatusResponse)
 async def run_lead_credit_pull(
     intake_id: UUID,
@@ -6582,6 +6772,11 @@ async def dealer_ai_lead_chat(
     intake = await _load_admin_dealer_lead(db, intake_id)
     assistant_message = None
     if payload.message and payload.message.strip():
+        # Refresh the product AI context first so the internal thread reasons
+        # over current deterministic figures (dscr_potential, program fit)
+        # rather than the snapshot from the last client-side sync.
+        context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+        intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
             db,
             bucket=intake.bucket,
@@ -6605,6 +6800,7 @@ async def dealer_ai_lead_chat(
         include_management=True,
         assistant_message=assistant_message,
         admin_thread=True,
+        thread_user=user,
     )
 
 
@@ -6618,7 +6814,7 @@ async def _client_thread_messages(db: AsyncSession, intake: PublicUnderwritingIn
                 BucketAIMessage.audience == "uploader",
                 BucketAIMessage.upload_link_id == intake.bucket_upload_link_id,
             )
-            .order_by(BucketAIMessage.created_at.desc())
+            .order_by(BucketAIMessage.created_at.desc(), CHAT_TURN_ORDER.desc())
             .limit(80)
         )
     ).scalars().all()

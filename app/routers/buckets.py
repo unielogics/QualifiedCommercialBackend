@@ -101,6 +101,7 @@ from app.schemas.bucket import (
 )
 from app.services import clerk as clerk_service
 from app.services.bucket_ai import (
+    CHAT_TURN_ORDER,
     create_chat_reply,
     latest_review,
     log_bucket_ai_activity,
@@ -910,15 +911,21 @@ async def get_ai_review(
 @router.get("/admin/{bucket_id}/ai-chat", response_model=list[BucketAIMessageRead])
 async def list_admin_ai_chat(
     bucket_id: UUID,
-    _: User = Depends(require_role(Role.SUPER_ADMIN)),
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> list[BucketAIMessage]:
     await _load_bucket_or_404(db, bucket_id)
     return (
         await db.execute(
             select(BucketAIMessage)
-            .where(BucketAIMessage.bucket_id == bucket_id, BucketAIMessage.audience == "admin")
-            .order_by(BucketAIMessage.created_at.asc())
+            .where(
+                BucketAIMessage.bucket_id == bucket_id,
+                BucketAIMessage.audience == "admin",
+                # Internal threads are private per user; NULL-user rows are
+                # system welcomes visible to every internal viewer.
+                or_(BucketAIMessage.user_id == user.id, BucketAIMessage.user_id.is_(None)),
+            )
+            .order_by(BucketAIMessage.created_at.asc(), CHAT_TURN_ORDER.asc())
             .limit(100)
         )
     ).scalars().all()

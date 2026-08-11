@@ -16,7 +16,7 @@ import boto3
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
-from sqlalchemy import or_, select
+from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -38,6 +38,12 @@ from app.models.bucket import (
 )
 from app.models.user import User
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
+
+# The user and assistant rows of one chat turn are flushed together and share
+# a single created_at, so timestamp-only ordering can render an answer above
+# its question. Tiebreak chronologically: user first, assistant second. Use
+# .asc() on ascending queries and .desc() on descending-then-reversed ones.
+CHAT_TURN_ORDER = case((BucketAIMessage.role == "user", 0), else_=1)
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 
 log = logging.getLogger(__name__)
@@ -220,6 +226,17 @@ RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focu
 - When the borrower states one of these three facts in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (do not repeat previously-known facts): {"down_payment_amount": number, "prior_property_ownership": true|false, "is_commercial_property": true|false, "property_type": "short string, e.g. single-family / duplex / small multifamily / commercial retail"}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state."""
 
 
+# Internal-thread override, appended AFTER the product rules for the private
+# admin/broker thread only. The borrower never sees that thread, so the
+# client-facing disclosure and pacing restrictions above do not apply there.
+ADMIN_THREAD_CHAT_RULES = """This conversation is the INTERNAL underwriting thread with a Qualified Commercial operator (super admin) or partner broker — the borrower is NOT in this thread and never sees it.
+- Full internal disclosure applies and supersedes any never-disclose rule written for the borrower-facing thread: openly name loan programs and their eligibility or blockers, discuss program fit, rate/pricing considerations, internal risk assessment, red flags, and bankability reasoning when asked.
+- Skip client pacing: answer multi-part questions completely, list every missing item at once when asked, and never hold back analysis to advance a funnel.
+- When asked for DSCR, LTV, PITIA, NOI, max supportable loan, equity, or cash-to-close, compute them and show the math: inputs used, assumptions made, formula, result. Use context.dscr_potential when present — it contains deterministic, pre-computed figures; prefer its numbers over re-deriving them.
+- Never invent a value: every input must come from the file, the context, or an explicitly labeled assumption. When an input is missing, name the document or fact that would supply it, then still run the scenario with a clearly labeled assumption when a reasonable one exists.
+- Treat operator statements in this thread as authoritative corrections to the file."""
+
+
 def build_review_system(review_type: str | None) -> str:
     """Return the review system prompt for exactly one product persona.
 
@@ -235,8 +252,8 @@ def build_review_system(review_type: str | None) -> str:
     return f"{REVIEW_PREAMBLE}\n{REVIEW_LIMITS}\n"
 
 
-def build_chat_system(review_type: str | None, *, client_language: str | None = None) -> str:
-    """Return the chat system prompt for exactly one product persona.
+def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None) -> str:
+    """Return the chat prompt for exactly one product persona and audience.
 
     Mirrors build_review_system: dealer and real-estate chat rules are never
     combined, and an unknown/None review_type gets the neutral preamble only.
@@ -245,6 +262,10 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
     chat audience — see create_chat_reply. It must never be set for the
     admin/broker-facing ("admin") audience, so that thread stays English
     regardless of the lead's preferred language.
+
+    audience="admin" appends ADMIN_THREAD_CHAT_RULES: the private internal
+    thread answers like a colleague underwriter (programs, pricing, DSCR math
+    disclosed) instead of applying borrower-facing disclosure limits.
     """
     if review_type == "dealer_gatekeeper_v1":
         base = f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
@@ -252,6 +273,8 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
         base = f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
     else:
         base = f"{CHAT_PREAMBLE}\n"
+    if audience == "admin":
+        base += f"\n{ADMIN_THREAD_CHAT_RULES}\n"
     if client_language == "es":
         base += (
             "\n\nThe client's preferred language is Spanish. Respond ONLY in professional, natural "
@@ -2313,6 +2336,7 @@ async def _recent_thread_messages(
     bucket_id: UUID,
     audience: str,
     upload_link_id: UUID | None,
+    thread_user_id: UUID | None = None,
     exclude_id: UUID | None = None,
     limit: int = 20,
 ) -> list[BucketAIMessage]:
@@ -2329,13 +2353,17 @@ async def _recent_thread_messages(
     ]
     if audience == "uploader":
         filters.append(BucketAIMessage.upload_link_id == upload_link_id)
+    if audience == "admin" and thread_user_id is not None:
+        # Each admin/broker keeps a private thread on the lead; rows with a NULL
+        # user_id are system welcomes shared by every internal viewer.
+        filters.append(or_(BucketAIMessage.user_id == thread_user_id, BucketAIMessage.user_id.is_(None)))
     if exclude_id is not None:
         filters.append(BucketAIMessage.id != exclude_id)
     rows = (
         await db.execute(
             select(BucketAIMessage)
             .where(*filters)
-            .order_by(BucketAIMessage.created_at.desc())
+            .order_by(BucketAIMessage.created_at.desc(), CHAT_TURN_ORDER.desc())
             .limit(limit)
         )
     ).scalars().all()
@@ -2406,6 +2434,7 @@ async def create_chat_reply(
         bucket_id=bucket.id,
         audience=audience,
         upload_link_id=upload_link.id if upload_link else None,
+        thread_user_id=user.id if user else None,
         exclude_id=user_row.id,
     )
     convo = _thread_turns_for_model(history)
@@ -2442,6 +2471,7 @@ async def create_chat_reply(
             system=build_chat_system(
                 review_type,
                 client_language=preferred_language if audience == "uploader" else None,
+                audience=audience,
             ),
             messages=chat_messages_arg,
         )
@@ -2464,6 +2494,7 @@ async def create_chat_reply(
             upload_link_id=upload_link.id if upload_link else None,
             share_id=share.id if share else None,
             vendor_access_id=vendor_access.id if vendor_access else None,
+            user_id=user.id if user else None,
             audience=audience,
             role="assistant",
             author_name="Bucket AI",
@@ -2485,6 +2516,7 @@ async def create_chat_reply(
             upload_link_id=upload_link.id if upload_link else None,
             share_id=share.id if share else None,
             vendor_access_id=vendor_access.id if vendor_access else None,
+            user_id=user.id if user else None,
             audience=audience,
             role="assistant",
             author_name="Bucket AI",
