@@ -278,6 +278,55 @@ Full internal disclosure applies and supersedes any never-disclose rule written 
 - Treat an operator's explicit correction ("the value is actually $900K") as authoritative for the file, but a question or hypothetical from the operator is not a file fact."""
 
 
+# Per-turn HARD floor appended to the admin system prompt when the operator's
+# message is a plain factual lookup. Deterministic detection (below) decides when
+# it applies; the caller also strips proposed_* side-effects on the same turn, so
+# a lookup can never spawn tasks, context patches, or borrower-fact merges.
+ADMIN_LOOKUP_FLOOR = """
+
+=== HARD RULE FOR THIS TURN (overrides everything above) ===
+The operator's message is a direct factual lookup, not a request for analysis. Reply with ONLY the specific fact(s) requested, taken from the file/context, in at most two short sentences. If a requested fact is not on file, say exactly that and name the document that would carry it. Do NOT add a next step, a follow-up question, a missing-item or Stage 1 request, a screening or analysis offer, or any commentary. Set proposed_action_items to [], and proposed_context_patch and proposed_borrower_facts to null."""
+
+_LOOKUP_TRIGGERS = (
+    "what is", "what's", "whats", "what was", "what are", "what date", "do we have",
+    "do we know", "is there", "are there", "where is", "where's", "when is", "when's",
+    "when did", "who is", "who's", "who are", "give me the", "pull the", "find the",
+    "show me the", "list the", "whats the", "what's the",
+    # imperative / request forms — "i need the contact info", "get me the address"
+    "i need the", "i need ", "need the", "get me the", "grab the", "provide the",
+    "share the", "can you pull", "can you find", "can you get", "please provide",
+    "please send", "look up the", "lookup the",
+)
+_LOOKUP_FIELDS = (
+    "dob", "date of birth", "birth date", "birthdate", "ssn", "social security",
+    "address", "phone", "cell", "mobile number", "email", "contact", "ein", "tin ",
+    "license", "account number", "routing", "zip code", "full name", "legal name",
+)
+# Any of these means the operator wants analysis/judgment — never floor those.
+_ANALYSIS_MARKERS = (
+    "dscr", "ltv", "ltc", "arv", "noi", "pitia", "screen", "analyz", "assess",
+    "underwrit", "eligib", "program", "pricing", "rate", "risk", "recommend",
+    "compare", "summar", "compute", "calculate", "supportable", "cash-to-close",
+    "cash to close", "next", "missing", "why", "explain", "should", "how much can",
+    "qualif", "structure", "strateg", "opinion", "think", "review", "evaluat",
+)
+
+
+def is_admin_lookup(message: str) -> bool:
+    """True when an internal-thread message is a plain factual lookup (retrieve a
+    field from the file), not a request for analysis. Deliberately narrow: short,
+    no analysis markers, and either lookup phrasing or a field reference on a
+    question. Used to hard-floor the reply so it cannot run the intake funnel."""
+    m = (message or "").strip().lower()
+    if not m or len(m) > 160 or len(m.split()) > 22:
+        return False
+    if any(a in m for a in _ANALYSIS_MARKERS):
+        return False
+    has_trigger = any(tr in m for tr in _LOOKUP_TRIGGERS)
+    has_field = any(f in m for f in _LOOKUP_FIELDS)
+    return has_trigger or (has_field and m.endswith("?"))
+
+
 def build_review_system(review_type: str | None) -> str:
     """Return the review system prompt for exactly one product persona.
 
@@ -2634,6 +2683,10 @@ async def create_chat_reply(
     review_type = (bucket.ai_context or {}).get("review_type")
     model = model_light()
 
+    # Hard floor: a plain factual lookup in the internal thread gets a bare
+    # answer and zero funnel side-effects — enforced in code, not just prompt.
+    admin_lookup = audience == "admin" and is_admin_lookup(message)
+
     # Conversation memory: thread the prior turns (audience-scoped) so the AI does
     # not re-ask what was already answered. The context/document blob rides on the
     # opening user turn; then the real transcript; then the current message last.
@@ -2680,11 +2733,19 @@ async def create_chat_reply(
                 review_type,
                 client_language=preferred_language if audience == "uploader" else None,
                 audience=audience,
-            ),
+            )
+            + (ADMIN_LOOKUP_FLOOR if admin_lookup else ""),
             messages=chat_messages_arg,
         )
         raw_text = _text_from_response(resp)
         parsed = _json_or_fallback(raw_text, "answer")
+        # Guarantee the lookup floor regardless of what the model returned: a
+        # bare factual answer can never carry tasks, a context patch, or a
+        # borrower-fact merge (the latter rides in metadata_json.raw below).
+        if admin_lookup and isinstance(parsed, dict):
+            parsed["proposed_action_items"] = []
+            parsed["proposed_context_patch"] = None
+            parsed["proposed_borrower_facts"] = None
         # Never surface raw JSON scaffolding: prefer the parsed answer, then a
         # targeted answer-string extraction, and only then the raw text if it does
         # not itself look like a JSON object.
