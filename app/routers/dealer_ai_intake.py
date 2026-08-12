@@ -117,7 +117,7 @@ def _re_welcome_back(lang: str) -> str:
     return _RE_WELCOME_BACK.get(lang, _RE_WELCOME_BACK[Language.EN])
 
 
-def _admin_created_welcome(is_re: bool) -> str:
+def _admin_created_welcome(variant: str | bool) -> str:
     """Admin/broker-created-lead welcome — itemizes the baseline checklist by
     name (REQUIRED_DOCUMENTS / REAL_ESTATE_REQUIRED_DOCUMENTS) so whoever
     opens the lead first (the dealer partner, or the client once they log in)
@@ -125,7 +125,20 @@ def _admin_created_welcome(is_re: bool) -> str:
     English only — these leads are created by an internal admin/broker, not
     the client, so there is no preferred_language context to honor here the
     way _dealer_welcome() does for the self-serve flow."""
-    docs = REAL_ESTATE_REQUIRED_DOCUMENTS if is_re else REQUIRED_DOCUMENTS
+    # Accepts the old boolean for call sites not yet migrated: True meant
+    # real estate, False meant dealer.
+    if variant is True:
+        variant = FUNDING_VARIANT
+    elif variant is False:
+        variant = DEALER_VARIANT
+    if variant == FUNDING_VARIANT:
+        docs = REAL_ESTATE_REQUIRED_DOCUMENTS
+    elif variant == MAIN_STREET_VARIANT:
+        from app.services.main_street_programs import MAIN_STREET_REQUIRED_DOCUMENTS
+
+        docs = MAIN_STREET_REQUIRED_DOCUMENTS
+    else:
+        docs = REQUIRED_DOCUMENTS
     bullets = "\n".join(f"- {doc['name']}" for doc in docs)
     return (
         "Lead created on behalf of the client. To get a preliminary screen, gather:\n"
@@ -2327,7 +2340,7 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
         return "The preliminary screen is ready. Choose one of the available call times so Qualified Commercial can validate the file and next steps with you."
     if kind == "prequalification_result":
         return str(widget.get("description") or "Your preliminary prequalification is ready — review it below.")
-    return "How can I help with this dealer financing file?"
+    return "How can I help with this file?"
 
 
 def _short_text(value: Any, *, max_len: int = 260) -> str:
@@ -2530,6 +2543,150 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
             "Set booking_recommended true only for Good probability - book call. Return a preliminary screen, not a commitment to lend."
         ),
     }
+
+
+def _main_street_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """Borrower-stated facts with no document source, for the Main Street
+    vertical. Mirrors _dealer_details but keyed to an operating business."""
+    state = _intake_state(intake)
+    raw = state.get("main_street_details")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """AI context for an operating-business file.
+
+    Deliberately does NOT carry the dealer's floorplan/MCA framing or the
+    real-estate file's rent/PITIA framing. Industry and intent are first-class
+    here because they decide which documents are even appropriate to ask for —
+    see app/services/main_street_programs.py, which owns that mapping.
+    """
+    from app.services.main_street_programs import (
+        MAIN_STREET_INDUSTRIES,
+        intent_kind,
+        normalize_industry,
+        normalize_intent,
+    )
+
+    state = _intake_state(intake)
+    details = _main_street_details(intake)
+    intent = normalize_intent(details.get("intent"))
+    industry = normalize_industry(details.get("industry"))
+    kind = intent_kind(intent)
+
+    context: dict[str, Any] = {
+        "review_type": "main_street_v1",
+        "deal_type": "operating business funding review",
+        "documentation_level": "preliminary operating-business screen",
+        "collateral_type": "business cash flow",
+        "intent": intent,
+        "intent_kind": kind,
+        "industry": industry,
+        "industry_label": MAIN_STREET_INDUSTRIES[industry]["en"],
+        "loan_purpose": intake.loan_purpose,
+        "requested_loan_amount": float(intake.requested_loan_amount)
+        if intake.requested_loan_amount is not None
+        else None,
+        "estimated_credit_score": intake.estimated_credit_score,
+        "credit_pull": _credit_pull_state(intake) or None,
+        "business_name": intake.business_name,
+        "referral_source": intake.referral_source,
+        "entity_structure": _entity_structure(intake),
+        "main_street_details": details or None,
+        "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
+    }
+
+    if kind == "non_lending":
+        # No lending package, no program fit, no fundability verdict. Asking a
+        # point-of-sale enquiry for two years of tax returns loses the lead, and
+        # scoring it for fundability would be meaningless.
+        context["baseline_document_policy"] = {
+            "stage": "non_lending_enquiry",
+            "allowed_document_categories": (
+                ["merchant processing statements — last 3 months"]
+                if intent == "merchant_services"
+                else []
+            ),
+            "do_not_request_other_document_categories": True,
+        }
+        context["underwriting_focus"] = (
+            "This borrower did not come for a loan. Assess fit for the product they "
+            "asked about, then move toward booking a call. Do not run a lending "
+            "screen, do not request an underwriting package, and do not state or "
+            "imply a fundability verdict."
+        )
+        context["custom_instructions"] = (
+            "Non-lending enquiry. For merchant services, ask only for the last three "
+            "monthly processing statements and read the current effective rate and "
+            "monthly volume off them. For a business-systems enquiry, ask for nothing "
+            "at all — it is a qualification conversation. Booking a call is the goal "
+            "state, not a review."
+        )
+        return context
+
+    context["loan_program_fit"] = _loan_program_fit(intake) or None
+    context["baseline_document_policy"] = {
+        "stage": "stage_1_operating_business",
+        "allowed_document_categories": [
+            "last 6 months business bank statements",
+            "last 2 years business tax returns (or the current-year extension filing)",
+            "year-to-date P&L and balance sheet",
+            "business debt schedule",
+        ],
+        "do_not_request_other_document_categories": True,
+        "conditional_after_industry_known": [
+            "merchant processing statements",
+            "operating authority, IFTA filings and a fleet schedule (transportation only)",
+            "equipment schedules and vendor quotes",
+            "licences and permits for the trade",
+            "lease or deed for the operating location",
+            "accounts receivable aging",
+        ],
+        "max_new_conditional_documents_per_turn": 2,
+        "stage_2_after_good_probability_only": [
+            "personal financial statement for each 20%+ owner",
+            "owner resume",
+            "use-of-proceeds breakdown",
+            "identification for each owner",
+            "KYC/credit authorization",
+        ],
+    }
+    context["underwriting_focus"] = (
+        "Screen Stage 1 capacity for an ordinary operating business without asking the "
+        "borrower to choose a loan product. Deposits and their consistency, filed tax "
+        "years, and the debt schedule carry the screen. Time in business, industry, and "
+        "whether the operating location is owned or leased are decisive and frequently "
+        "missing — name them as the blocking gap rather than requesting more documents. "
+        "Industry-specific documents are conditional and come only after the industry is "
+        "known and the baseline is at least half satisfied."
+    )
+    context["custom_instructions"] = (
+        "Public lead-magnet Stage 1 screener for operating businesses. Ask first for the "
+        "four baseline items: six months of business bank statements, two years of business "
+        "tax returns or the current-year extension, YTD P&L and balance sheet, and a "
+        "business debt schedule. The borrower may not know which product fits. Return one "
+        "of: Good probability - book call, Promising but needs one clarification, Not "
+        "enough evidence yet, or Poor probability based on current file. Set "
+        "booking_recommended true only for Good probability - book call. This is a "
+        "preliminary screen, not a commitment to lend."
+    )
+    return context
+
+
+def _context_fn_for(intake: PublicUnderwritingIntake):
+    """Pick the AI context builder for an intake's variant.
+
+    Replaces five separate `_funding_review_context if is_funding else
+    _dealer_context` ternaries. Each of those silently defaulted anything that
+    was not the real-estate variant to the DEALER context — so a Main Street
+    file would have been screened with floorplan and MCA framing. Route through
+    here so a new vertical cannot inherit dealer's context by omission.
+    """
+    if intake.variant == FUNDING_VARIANT:
+        return _funding_review_context
+    if intake.variant == MAIN_STREET_VARIANT:
+        return _main_street_context
+    return _dealer_context
 
 
 def _funding_review_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
@@ -2939,7 +3096,7 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     # onto a real-estate intake (this is reached from dealer chat/patch, the
     # client portal, and funding chat). Keys off the RE variant, which is stable
     # across the variant-normalization migration.
-    context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+    context_fn = _context_fn_for(intake)
     intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
 
 
@@ -3435,7 +3592,7 @@ async def _generate_management_json(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context = await _lead_management_context(db, intake)
-    variant_label = "real estate DSCR/investor" if intake.variant.startswith("real_estate") else "dealer capital"
+    variant_label = _variant_label(intake.variant)
     if purpose == "executive_summary":
         schema = {
             "title": "short title (borrower name + deal in a few words)",
@@ -5169,7 +5326,7 @@ async def _execute_intake_review(
     Picks the AI context by variant so a real-estate lead is never re-run with
     dealer context (and vice-versa). Returns the fresh review (or None)."""
     is_funding = intake.variant == FUNDING_VARIANT
-    context_fn = _funding_review_context if is_funding else _dealer_context
+    context_fn = _context_fn_for(intake)
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
     recent_chat = await _recent_dealer_chat(db, intake)
     review_context = {
@@ -5235,7 +5392,7 @@ async def _create_queued_review(
     by variant. The heavy pass runs separately (background) so the request
     returns immediately and the UI can poll progress."""
     is_funding = intake.variant == FUNDING_VARIANT
-    context_fn = _funding_review_context if is_funding else _dealer_context
+    context_fn = _context_fn_for(intake)
     recent_key = "recent_funding_review_chat" if is_funding else "recent_dealer_chat"
     recent_chat = await _recent_dealer_chat(db, intake)
     review_context = {
@@ -5742,10 +5899,13 @@ async def create_admin_ai_lead(
     and the intake carries client_id. Reuses the same creation helpers as the
     public /start flows via lightweight adapter payloads. No terms/throttle."""
     _require_super_admin(user)
-    if payload.variant not in ("dealer", "real_estate"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
+    if payload.variant not in _ADMIN_VARIANT_CONSTANTS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"variant must be one of {', '.join(sorted(_ADMIN_VARIANT_CONSTANTS))}",
+        )
     is_re = payload.variant == "real_estate"
-    variant_const = FUNDING_VARIANT if is_re else DEALER_VARIANT
+    variant_const = _ADMIN_VARIANT_CONSTANTS[payload.variant]
 
     # Duplicate policy: unless force_new, surface the existing active lead so the
     # operator opens it instead of creating a duplicate bucket for the same email.
@@ -5854,7 +6014,7 @@ async def create_admin_ai_lead(
         target_id=str(intake.id),
         detail=f"Admin created {payload.variant} lead for {intake.email}",
     )
-    welcome_text = _admin_created_welcome(is_re)
+    welcome_text = _admin_created_welcome(variant_const)
     db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
@@ -6032,7 +6192,7 @@ async def create_broker_ai_lead(
         target_id=str(intake.id),
         detail=f"Broker {user.email} created dealer lead for {intake.email}",
     )
-    welcome_text = _admin_created_welcome(False)
+    welcome_text = _admin_created_welcome(DEALER_VARIANT)
     db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
     await db.commit()
     intake = await _load_broker_dealer_lead(db, user, intake.id)
@@ -6176,7 +6336,7 @@ async def broker_dealer_lead_chat(
     if payload.message and payload.message.strip():
         if intake.variant == FUNDING_VARIANT:
             await _refresh_dscr_pricing(db)
-        context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+        context_fn = _context_fn_for(intake)
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
             db,
@@ -6368,10 +6528,13 @@ async def create_admin_ai_lead_from_bucket(
     and any BucketRequestedDocument checklist it already has stay exactly as-is.
     File association is automatic (_active_files just filters bucket.files)."""
     _require_super_admin(user)
-    if payload.variant not in ("dealer", "real_estate"):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "variant must be 'dealer' or 'real_estate'")
+    if payload.variant not in _ADMIN_VARIANT_CONSTANTS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"variant must be one of {', '.join(sorted(_ADMIN_VARIANT_CONSTANTS))}",
+        )
     is_re = payload.variant == "real_estate"
-    variant_const = FUNDING_VARIANT if is_re else DEALER_VARIANT
+    variant_const = _ADMIN_VARIANT_CONSTANTS[payload.variant]
 
     bucket = (
         await db.execute(
@@ -7059,7 +7222,7 @@ async def dealer_ai_lead_chat(
         # rather than the snapshot from the last client-side sync.
         if intake.variant == FUNDING_VARIANT:
             await _refresh_dscr_pricing(db)
-        context_fn = _funding_review_context if intake.variant == FUNDING_VARIANT else _dealer_context
+        context_fn = _context_fn_for(intake)
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **context_fn(intake)}
         chat_messages, _, _ = await create_chat_reply(
             db,
@@ -8216,6 +8379,33 @@ def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
 
 
 DEALER_VARIANT = "dealer_gatekeeper_v1"
+MAIN_STREET_VARIANT = "main_street_v1"
+
+# Admin/broker lead creation accepts short names; map them explicitly rather
+# than with a boolean. The previous `FUNDING_VARIANT if is_re else
+# DEALER_VARIANT` meant widening the validator alone would have silently made a
+# main_street payload create a DEALER lead.
+_ADMIN_VARIANT_CONSTANTS: dict[str, str] = {
+    "dealer": DEALER_VARIANT,
+    "real_estate": FUNDING_VARIANT,
+    "main_street": MAIN_STREET_VARIANT,
+}
+
+_VARIANT_LABELS: dict[str, str] = {
+    DEALER_VARIANT: "dealer capital",
+    FUNDING_VARIANT: "real estate DSCR/investor",
+    MAIN_STREET_VARIANT: "operating business",
+}
+
+
+def _variant_label(variant: str | None) -> str:
+    """Human label used in executive summaries and lender emails.
+
+    Was a two-way ternary defaulting to "dealer capital", which mislabelled every
+    Main Street lead in customer-visible output.
+    """
+    return _VARIANT_LABELS.get(variant or "", "commercial capital")
+
 
 
 def _require_dealer_intake(intake: PublicUnderwritingIntake) -> None:
