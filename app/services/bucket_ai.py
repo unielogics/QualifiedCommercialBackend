@@ -54,6 +54,15 @@ log = logging.getLogger(__name__)
 # at the new version. A model upgrade alone does NOT invalidate the cache.
 # v2: adds the scanned-PDF vision fallback + per-month bank-statement facts.
 # Bumping invalidates v1 rows so files cached as "unreadable"/skipped re-analyze.
+# NOT bumped for the Main Street enum additions, deliberately. The version keys
+# cache reuse on (file, content_hash, version), so bumping would force a
+# one-time re-analysis of every cached file across all three verticals — real,
+# unbudgeted Bedrock spend on production. Nothing is incorrect without it:
+# already-analyzed dealer and real-estate files carry valid classifications from
+# the previous enum, and Main Street files are new so they have no cache entry
+# to hit and get the new prompt on first analysis. The only cost of leaving it
+# is that the number no longer uniquely identifies the prompt text. Bump it if
+# and when existing files genuinely need reclassifying under the new tokens.
 CURRENT_FILE_ANALYSIS_VERSION = 2
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -105,7 +114,7 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
       {
         "file_id": "...",
         "file_name": "...",
-        "ai_classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|other|unreadable",
+        "ai_classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|other|unreadable",
         "supports": ["..."],
         "baseline_categories_supported": ["..."],
         "confidence": "high|medium|low",
@@ -174,6 +183,16 @@ Calculate key_metrics when documents allow it: DSCR, LTV, estimated property val
 Classify uploaded files by readable content and filename. Treat leases, rent rolls, appraisal/value evidence, purchase contracts, payoff statements, mortgage statements, tax bills, insurance declarations, HOA statements, and settlement statements as useful partial evidence even when the selected category is wrong.
 For client-facing summaries, use short sections and bullets: "What I see", "What it means", and "Next step". Ask only one next question or upload request at a time. If evidence is missing, say exactly which DSCR/LTV/PITIA/cash-to-close assumption is unsupported."""
 
+# Main Street (operating-business) review rules. Never combined with the dealer
+# or real-estate rules above.
+MAIN_STREET_REVIEW_RULES = """Act as a strict Stage 1 screener for an ordinary operating business — a restaurant, mechanic shop, grocery or commodities operation, trucking company, manufacturer, retailer, contractor, or professional practice. This is not a car dealer review and not a real-estate investor review. Never ask about dealership name, floorplan, MCA exposure, dealer inventory or dealer gross receipts, and never frame the file around rent rolls, PITIA, DSCR-on-a-property, or property LTV unless the borrower has actually pledged real estate.
+The Stage 1 baseline is four items: last 6 months business bank statements, last 2 years business tax returns (or the current-year extension filing), year-to-date P&L and balance sheet, and a business debt schedule. Ask for these before anything else. Industry-specific documents — merchant processing statements, DOT/MC operating authority, IFTA filings, a fleet schedule, equipment schedules, licenses and permits, a lease, or A/R aging — are conditional, and only once the industry is known and the baseline is at least half satisfied. Never open by asking a restaurant owner for a fleet schedule.
+Set screening_stage to "stage_1_operating_business" and choose exactly one probability_status from: "Good probability - book call", "Promising but needs one clarification", "Not enough evidence yet", or "Poor probability based on current file". Set booking_recommended true only when the file has good lending probability and a human call should be offered now.
+ALWAYS calculate key_metrics as NUMBERS when the documents support them. From bank statements compute annualized_adjusted_deposits (average monthly total deposits x 12), estimated_ebitda_or_cash_flow (average monthly deposits minus withdrawals x 12), and count distinct statement months and any NSF/overdraft occurrences. From tax returns set ytd_annualized_revenue to the most recent year's gross receipts, describe revenue_trend across the two years, and count distinct filed years. Populate estimated_debt_burden and estimated_dscr from the debt schedule or bank-visible loan payments. Where merchant processing statements are present, also capture annualized card volume and the current effective rate. Every key_metrics number MUST be a bare number, no currency symbol and no commas.
+Time in business, industry, and whether the borrower owns or leases the operating location are decisive for this vertical and are frequently missing. When they are, name them as the blocking gap rather than asking for more documents.
+Uploaded files are often miscategorized. Classify from readable content and filename first, not from requested_document_id. Say exactly what the uploaded files prove and what is still missing, rather than reporting that every category is absent when some evidence exists.
+For client-facing summaries use short sections: what the files prove, whether the file appears fundable or cannot yet be determined, what still blocks a decision, and one next step. Ask for one thing at a time."""
+
 CHAT_PREAMBLE = """You are the Bucket AI assistant for a secure Qualified Commercial document room.
 
 Return ONLY JSON in this shape:
@@ -227,6 +246,21 @@ RE_CHAT_RULES = """- Answer like a real-estate investor / DSCR underwriter. Focu
 - When the borrower states one of these three facts in their message, populate proposed_borrower_facts with ONLY the field(s) they just stated (do not repeat previously-known facts): {"down_payment_amount": number, "prior_property_ownership": true|false, "is_commercial_property": true|false, "property_type": "short string, e.g. single-family / duplex / small multifamily / commercial retail", "requested_amount": number}. Omit any key not stated this turn. Never guess or infer a value the borrower did not state. Capture requested_amount whenever the loan amount is stated or corrected in ANY thread (client or internal), converting k/M shorthand to full dollars."""
 
 
+# Main Street (operating-business) chat rules. Never combined with the dealer or
+# real-estate rules above. Program names stay internal here, exactly as they do
+# for the dealer persona — loan_program_fit paces which document to ask for
+# next, and is never quoted to the borrower.
+MAIN_STREET_CHAT_RULES = """- Answer like an underwriter screening an ordinary operating business: a restaurant, mechanic shop, grocery or commodities operation, trucking company, manufacturer, retailer, contractor, or professional practice.
+- Do not mention dealership, floorplan, MCA exposure, dealer inventory, or dealer gross receipts. Do not frame the conversation around rent rolls, PITIA, or property DSCR/LTV unless the borrower has actually pledged real estate.
+- The Stage 1 baseline is: last 6 months business bank statements, last 2 years business tax returns (or the current-year extension), YTD P&L and balance sheet, and a business debt schedule. Ask for one missing baseline item at a time.
+- Industry-specific documents are conditional. Only request them once the industry is known and the baseline is at least half satisfied, and never more than one or two in a single turn. A borrower who is shown a long unfamiliar checklist on turn one leaves.
+- Time in business, industry, and whether the operating location is owned or leased are the three facts most often missing and most decisive. Ask for whichever is still unknown, folded naturally into the conversation rather than as a quiz.
+- When the borrower states a fact, populate proposed_borrower_facts with ONLY the field(s) stated this turn: {"industry": "one of the known industry slugs", "intent": "working_capital|equipment|refinance_debt|merchant_services|business_systems", "years_in_business": number, "owns_operating_property": true|false, "financing_equipment_or_vehicle": true|false, "franchise": true|false, "requested_amount": number, "estimated_credit_score": number}. Omit any key not stated. Never guess a value the borrower did not give.
+- context.loan_program_fit is an INTERNAL signal. Use it only to decide which single missing document or fact to request next. Never tell the borrower which program they qualify for, never name a program, never state or imply a rate, an amount they can borrow, or approval odds.
+- If the borrower came for merchant processing or business systems rather than a loan, do not put them through a lending package. Ask for the current processing statements, or nothing at all for a systems enquiry, and move toward booking a call. There is no fundability verdict on those files, so never imply one.
+- Use "What I see", "What it means", and "Next step" sections when summarizing uploaded evidence."""
+
+
 # Internal-thread override, appended AFTER the product rules for the private
 # admin/broker thread only. The borrower never sees that thread, so the
 # client-facing disclosure and pacing restrictions above do not apply there.
@@ -241,8 +275,9 @@ ADMIN_THREAD_CHAT_RULES = """This conversation is the INTERNAL underwriting thre
 def build_review_system(review_type: str | None) -> str:
     """Return the review system prompt for exactly one product persona.
 
-    No returned string ever contains both the dealer and the real-estate rules:
-    car-dealer and real-estate/DSCR underwriting are kept fully isolated. An
+    No returned string ever contains more than one of the dealer, real-estate
+    and Main Street rule sets: the three product personas are kept fully
+    isolated from each other. An
     unknown/None review_type (e.g. a generic admin document room) gets the
     neutral preamble only, with no product-specific rules.
     """
@@ -250,14 +285,16 @@ def build_review_system(review_type: str | None) -> str:
         return f"{REVIEW_PREAMBLE}\n{DEALER_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
     if review_type == "real_estate_dscr_v1":
         return f"{REVIEW_PREAMBLE}\n{RE_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
+    if review_type == "main_street_v1":
+        return f"{REVIEW_PREAMBLE}\n{MAIN_STREET_REVIEW_RULES}\n{REVIEW_LIMITS}\n"
     return f"{REVIEW_PREAMBLE}\n{REVIEW_LIMITS}\n"
 
 
 def build_chat_system(review_type: str | None, *, client_language: str | None = None, audience: str | None = None) -> str:
     """Return the chat prompt for exactly one product persona and audience.
 
-    Mirrors build_review_system: dealer and real-estate chat rules are never
-    combined, and an unknown/None review_type gets the neutral preamble only.
+    Mirrors build_review_system: the dealer, real-estate and Main Street chat
+    rules are never combined, and an unknown/None review_type gets the neutral preamble only.
 
     client_language is ONLY ever passed for the client-facing ("uploader")
     chat audience — see create_chat_reply. It must never be set for the
@@ -272,6 +309,8 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
         base = f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
     elif review_type == "real_estate_dscr_v1":
         base = f"{CHAT_PREAMBLE}\n{RE_CHAT_RULES}\n"
+    elif review_type == "main_street_v1":
+        base = f"{CHAT_PREAMBLE}\n{MAIN_STREET_CHAT_RULES}\n"
     else:
         base = f"{CHAT_PREAMBLE}\n"
     if audience == "admin":
@@ -294,7 +333,7 @@ FILE_ANALYSIS_PREAMBLE = """You are a senior commercial lending underwriter clas
 
 Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
 {
-  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|debt_schedule|personal_financial_statement|other|unreadable",
+  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|debt_schedule|personal_financial_statement|other|unreadable",
   "confidence": "high|medium|low",
   "summary": "1-3 sentence plain-English summary of what this document is and what it proves for underwriting",
   "supports": ["short phrases naming what this file supports"],
@@ -317,13 +356,18 @@ DEALER_FILE_ANALYSIS_HINT = """This document belongs to a car-dealer financing f
 RE_FILE_ANALYSIS_HINT = """This document belongs to a real-estate / DSCR investor file. Read it as lease / rent roll / appraisal / purchase contract / payoff / mortgage statement / tax / insurance / HOA / entity evidence where applicable. Never classify it with dealer floorplan/MCA/inventory categories."""
 
 
+MAIN_STREET_FILE_ANALYSIS_HINT = """This document belongs to an operating-business financing file — a restaurant, mechanic shop, grocery, trucking company, manufacturer, retailer, contractor, or professional practice. Read it as bank-statement / tax-return / P&L / balance-sheet / debt-schedule / merchant-processing / equipment / fleet / operating-authority / license / lease / receivables evidence where applicable. Never classify it with dealer floorplan/MCA/inventory categories, and do not ask DSCR/rent questions unless the file actually concerns pledged real estate."""
+
+
 def build_file_analysis_system(review_type: str | None) -> str:
     """Per-file analysis prompt, product-aware but single-persona (never mixes
-    dealer and real-estate guidance), mirroring build_review_system."""
+    the dealer, real-estate and Main Street guidance), mirroring build_review_system."""
     if review_type == "dealer_gatekeeper_v1":
         return f"{FILE_ANALYSIS_PREAMBLE}\n{DEALER_FILE_ANALYSIS_HINT}\n"
     if review_type == "real_estate_dscr_v1":
         return f"{FILE_ANALYSIS_PREAMBLE}\n{RE_FILE_ANALYSIS_HINT}\n"
+    if review_type == "main_street_v1":
+        return f"{FILE_ANALYSIS_PREAMBLE}\n{MAIN_STREET_FILE_ANALYSIS_HINT}\n"
     return f"{FILE_ANALYSIS_PREAMBLE}\n"
 
 
@@ -338,6 +382,49 @@ def _now() -> datetime:
 def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
     context = bucket.ai_context or {}
     review_type = context.get("review_type")
+    if review_type == "main_street_v1":
+        return {
+            "review_type": "main_street_v1",
+            "deal_type": context.get("deal_type") or "operating business funding review",
+            "documentation_level": context.get("documentation_level")
+            or "preliminary operating-business screen",
+            "collateral_type": context.get("collateral_type") or "business cash flow",
+            "industry": context.get("industry"),
+            "intent": context.get("intent"),
+            "underwriter_persona": (
+                "Speak like a senior commercial underwriter screening an ordinary "
+                "operating business. Be practical, direct and evidence-driven, and "
+                "use the borrower's own vocabulary for their trade."
+            ),
+            "operating_business_knowledge": [
+                "Deposits and their consistency, not a single revenue claim, are what "
+                "establish capacity on this vertical.",
+                "Time in business, industry and whether the operating location is owned "
+                "or leased are decisive and are frequently missing.",
+                "Industry-specific documents are conditional: a restaurant should never "
+                "be asked for a fleet schedule, and a trucking company should never be "
+                "asked for a liquor license.",
+            ],
+            "baseline_document_policy": {
+                "stage": "stage_1_operating_business",
+                "allowed_document_categories": [
+                    "last 6 months business bank statements",
+                    "last 2 years business tax returns or the current-year extension",
+                    "year-to-date P&L and balance sheet",
+                    "business debt schedule",
+                ],
+                "conditional_after_industry_known": [
+                    "merchant processing statements",
+                    "operating authority, IFTA filings and a fleet schedule (transportation)",
+                    "equipment schedules and vendor quotes",
+                    "licenses and permits",
+                    "lease or deed for the operating location",
+                    "accounts receivable aging",
+                ],
+                "do_not_request_dealer_documents": True,
+                "max_new_conditional_documents_per_turn": 2,
+            },
+        }
     if review_type == "real_estate_dscr_v1":
         return {
             "review_type": "real_estate_dscr_v1",
@@ -697,6 +784,21 @@ _CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
     "debt schedule": {"debt_schedule"},
     "personal financial statement": {"personal_financial_statement"},
     "pfs": {"personal_financial_statement"},
+    # Main Street conditional documents. Keyed on substrings that appear in the
+    # document names seeded by app/services/main_street_programs.py.
+    "merchant processing": {"merchant_processing_statement"},
+    "vendor quote": {"equipment_quote_or_invoice"},
+    "equipment schedule": {"equipment_quote_or_invoice"},
+    "fleet schedule": {"fleet_or_vehicle_schedule"},
+    "operating authority": {"transportation_authority"},
+    "ifta": {"transportation_authority"},
+    "license": {"business_license_or_permit"},
+    "permit": {"business_license_or_permit"},
+    "franchise": {"franchise_agreement"},
+    "lease": {"commercial_lease"},
+    "receivable": {"accounts_receivable_aging"},
+    "purchase ledger": {"inventory_or_purchase_ledger"},
+    "payroll": {"payroll_report"},
 }
 
 
