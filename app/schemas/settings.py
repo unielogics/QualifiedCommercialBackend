@@ -284,6 +284,14 @@ class DscrPricingSettings(BaseModel):
     tax_insurance_annual_pct_of_value: float = Field(default=0.016, gt=0.0, lt=0.10)
 
 
+class AdminNotificationSettings(BaseModel):
+    """Client/broker activity email digest for super admins
+    (services/admin_activity.py). recipients empty = every super admin."""
+    enabled: bool = True
+    recipients: list[str] = Field(default_factory=list)
+    max_lookback_hours: int = Field(default=24, ge=1, le=168)
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -305,6 +313,7 @@ class AppSettingsData(BaseModel):
     prequal_auto_approval: PrequalAutoApprovalSettings = Field(default_factory=PrequalAutoApprovalSettings)
     property_intelligence: PropertyIntelligenceSettings = Field(default_factory=PropertyIntelligenceSettings)
     dscr_pricing: DscrPricingSettings = Field(default_factory=DscrPricingSettings)
+    admin_notifications: AdminNotificationSettings = Field(default_factory=AdminNotificationSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -326,6 +335,7 @@ class AppSettingsUpdate(BaseModel):
     prequal_auto_approval: PrequalAutoApprovalSettings | None = None
     property_intelligence: PropertyIntelligenceSettings | None = None
     dscr_pricing: DscrPricingSettings | None = None
+    admin_notifications: AdminNotificationSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------

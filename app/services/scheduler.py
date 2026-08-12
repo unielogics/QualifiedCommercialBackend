@@ -71,6 +71,16 @@ def start_scheduler() -> None:
     # 2 minutes. Picks up pending requests, runs the deterministic
     # gate, and either auto-approves (renders the PDF, flips status)
     # or stamps blockers on admin_notes for operator review.
+    # Client/broker activity email digest for super admins — coalesces
+    # everything since the last successful send into one email per tick.
+    scheduler.add_job(
+        _wrap(job_admin_activity_digest),
+        "interval",
+        minutes=5,
+        id="admin_activity_digest",
+        replace_existing=True,
+    )
+
     scheduler.add_job(
         _wrap(job_evaluate_pending_prequals),
         "interval",
@@ -344,6 +354,13 @@ async def job_summary_dirty_drain() -> None:
     from app.services.activity_log import drain_summary_dirty  # local import to avoid circular
 
     await drain_summary_dirty(limit=20)
+
+
+async def job_admin_activity_digest() -> None:
+    """Email super admins a digest of client/broker platform activity."""
+    from app.services.admin_activity import run_admin_activity_digest  # local import to avoid circular
+
+    await run_admin_activity_digest()
 
 
 async def job_evaluate_pending_prequals() -> None:

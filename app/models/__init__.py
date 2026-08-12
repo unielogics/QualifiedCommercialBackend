@@ -30,6 +30,7 @@ from app.models.ai_token_usage import AITokenUsage  # noqa: F401
 from app.models.ai_task_assignment import AITaskAssignment  # noqa: F401
 from app.models.ai_usage_event import AIUsageEvent  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
+from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.booking_settings import BookingSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401

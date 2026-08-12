@@ -909,6 +909,8 @@ class DealerAILeadRow(BaseModel):
     # admin always sees pending requests and must separately confirm.
     delete_requested_at: datetime | None = None
     delete_requested_by: str | None = None
+    # Client/broker activity this admin hasn't seen yet (admin_activity_seen).
+    unseen_activity_count: int = 0
 
 
 class DealerAILeadListResponse(BaseModel):
@@ -5355,8 +5357,32 @@ async def list_dealer_ai_leads(
         ]
     total = len(rows)
     page = rows[offset:offset + limit]
+    items = [_lead_row(row) for row in page]
+    # NEW badges: unseen client/broker activity per lead for THIS admin,
+    # against their per-lead seen cursors (default window: last 7 days for
+    # leads never opened).
+    from app.models.admin_activity import AdminActivitySeen
+    from app.services.admin_activity import unseen_counts_by_bucket
+
+    seen_rows = (
+        await db.execute(
+            select(AdminActivitySeen).where(
+                AdminActivitySeen.user_id == user.id,
+                AdminActivitySeen.intake_id.in_([row.id for row in page] or [UUID(int=0)]),
+            )
+        )
+    ).scalars().all()
+    seen_by_intake = {row.intake_id: row.seen_at for row in seen_rows if row.intake_id}
+    counts = await unseen_counts_by_bucket(
+        db,
+        seen_by_intake=seen_by_intake,
+        bucket_to_intake={row.bucket_id: row.id for row in page},
+        default_since=_now() - timedelta(days=7),
+    )
+    for item in items:
+        item.unseen_activity_count = counts.get(item.bucket_id, 0)
     return DealerAILeadListResponse(
-        items=[_lead_row(row) for row in page],
+        items=items,
         total=total,
         limit=limit,
         offset=offset,
@@ -5398,6 +5424,102 @@ async def download_admin_dealer_intelligence_pdf(
     )
 
 
+async def _mark_lead_seen(db: AsyncSession, user: User, intake_id: UUID) -> None:
+    """Upsert this admin's per-lead seen cursor — opening a lead clears its
+    NEW badge. Commits its own tiny write so read-only GETs stay side-effect
+    safe for the caller."""
+    from app.models.admin_activity import AdminActivitySeen
+
+    row = (
+        await db.execute(
+            select(AdminActivitySeen).where(
+                AdminActivitySeen.user_id == user.id,
+                AdminActivitySeen.intake_id == intake_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        db.add(AdminActivitySeen(user_id=user.id, intake_id=intake_id, seen_at=_now()))
+    else:
+        row.seen_at = _now()
+    await db.commit()
+
+
+class WhatsNewItem(BaseModel):
+    event_id: str
+    intake_id: UUID | None = None
+    lead_name: str | None = None
+    variant: str | None = None
+    action: str
+    label: str
+    actor_name: str | None = None
+    actor_role: str | None = None
+    detail: str | None = None
+    created_at: datetime
+
+
+class WhatsNewResponse(BaseModel):
+    items: list[WhatsNewItem] = []
+    unseen_count: int = 0
+    feed_seen_at: datetime | None = None
+
+
+@admin_router.get("/whats-new", response_model=WhatsNewResponse)
+async def get_whats_new(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> WhatsNewResponse:
+    """Recent client/broker platform activity (uploads, messages, forms,
+    bookings, new intakes) across all leads, with this admin's unseen count
+    against their feed cursor."""
+    _require_super_admin(user)
+    from app.models.admin_activity import AdminActivitySeen
+    from app.services.admin_activity import client_activity_rows
+
+    since = _now() - timedelta(days=7)
+    items = await client_activity_rows(db, since=since, limit=60)
+    cursor = (
+        await db.execute(
+            select(AdminActivitySeen).where(
+                AdminActivitySeen.user_id == user.id,
+                AdminActivitySeen.intake_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    feed_seen_at = cursor.seen_at if cursor else None
+    unseen = sum(1 for item in items if feed_seen_at is None or item["created_at"] > feed_seen_at)
+    return WhatsNewResponse(
+        items=[WhatsNewItem(**{key: value for key, value in item.items() if key != "bucket_id"}) for item in items],
+        unseen_count=unseen,
+        feed_seen_at=feed_seen_at,
+    )
+
+
+@admin_router.post("/whats-new/seen", response_model=WhatsNewResponse)
+async def mark_whats_new_seen(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> WhatsNewResponse:
+    """Advance this admin's feed cursor to now (Mark all seen)."""
+    _require_super_admin(user)
+    from app.models.admin_activity import AdminActivitySeen
+
+    cursor = (
+        await db.execute(
+            select(AdminActivitySeen).where(
+                AdminActivitySeen.user_id == user.id,
+                AdminActivitySeen.intake_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if cursor is None:
+        db.add(AdminActivitySeen(user_id=user.id, intake_id=None, seen_at=_now()))
+    else:
+        cursor.seen_at = _now()
+    await db.commit()
+    return await get_whats_new(user, db)
+
+
 @admin_router.get("/{intake_id}", response_model=DealerIntakeResponse)
 async def get_dealer_ai_lead(
     intake_id: UUID,
@@ -5406,6 +5528,7 @@ async def get_dealer_ai_lead(
 ) -> DealerIntakeResponse:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
+    await _mark_lead_seen(db, user, intake.id)
     return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
