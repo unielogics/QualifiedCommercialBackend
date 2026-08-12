@@ -924,6 +924,10 @@ class DealerAILeadRow(BaseModel):
     delete_requested_by: str | None = None
     # Client/broker activity this admin hasn't seen yet (admin_activity_seen).
     unseen_activity_count: int = 0
+    # Unread messages in the team<->partner communication channel for THIS
+    # viewer (dealer_lead_channel_seen). Distinct from unseen_activity_count,
+    # which counts all bucket activity, not just channel messages.
+    channel_unread_count: int = 0
 
 
 class DealerAILeadListResponse(BaseModel):
@@ -5536,8 +5540,10 @@ async def list_dealer_ai_leads(
         bucket_to_intake={row.bucket_id: row.id for row in page},
         default_since=_now() - timedelta(days=7),
     )
+    channel_unread = await _channel_unread_by_intake(db, user=user, intakes=page)
     for item in items:
         item.unseen_activity_count = counts.get(item.bucket_id, 0)
+        item.channel_unread_count = channel_unread.get(item.id, 0)
     return DealerAILeadListResponse(
         items=items,
         total=total,
@@ -5600,6 +5606,149 @@ async def _mark_lead_seen(db: AsyncSession, user: User, intake_id: UUID) -> None
     else:
         row.seen_at = _now()
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Dealer-lead communication channel (the shared BucketNote(visibility="admin")
+# thread between the internal team and the lead's dealer partner). Read-state
+# and inbox live here; see models/dealer_lead_channel_seen.py.
+# ---------------------------------------------------------------------------
+
+
+class DealerLeadMessagePreview(BaseModel):
+    content: str
+    author_name: str | None = None
+    author_role: str | None = None
+    created_at: datetime
+
+
+class DealerLeadInboxItem(BaseModel):
+    intake_id: UUID
+    name: str
+    business_name: str | None = None
+    full_name: str
+    status: str
+    outcome_status: str = "submitted"
+    unread_count: int = 0
+    last_message: DealerLeadMessagePreview | None = None
+    last_message_at: datetime | None = None
+
+
+class DealerLeadInboxResponse(BaseModel):
+    items: list[DealerLeadInboxItem] = []
+    total_unread: int = 0
+
+
+class ChannelSeenResponse(BaseModel):
+    intake_id: UUID
+    seen_at: datetime
+
+
+def _channel_side(role) -> str:
+    """The two sides of a dealer-lead channel: the lead's partner vs the
+    internal team. Unread = messages authored by the OTHER side. Accepts a Role
+    enum or a raw role string (BucketNote.author_role stores the string)."""
+    role_str = getattr(role, "value", role)
+    return "partner" if role_str == Role.DEALER_PARTNER.value else "team"
+
+
+def _channel_last_message(intake: PublicUnderwritingIntake) -> DealerLeadMessagePreview | None:
+    notes = sorted(
+        (n for n in intake.bucket.notes if n.visibility == "admin"),
+        key=lambda n: n.created_at,
+    )
+    if not notes:
+        return None
+    last = notes[-1]
+    return DealerLeadMessagePreview(
+        content=last.content,
+        author_name=last.author_name,
+        author_role=last.author_role,
+        created_at=last.created_at,
+    )
+
+
+async def _channel_unread_by_intake(
+    db: AsyncSession,
+    *,
+    user: User,
+    intakes: list[PublicUnderwritingIntake],
+) -> dict[UUID, int]:
+    """Per-lead count of channel messages from the OTHER side that `user` has
+    not seen. Mirrors admin_activity.unseen_counts_by_bucket, but over the
+    BucketNote(visibility='admin') thread and the dealer_lead_channel_seen
+    cursor (which — unlike admin_activity_seen — also covers dealer partners).
+    A lead never opened counts every other-side message as unread."""
+    from app.models.dealer_lead_channel_seen import DealerLeadChannelSeen
+
+    if not intakes:
+        return {}
+    viewer_side = _channel_side(user.role)
+    bucket_to_intake = {i.bucket_id: i.id for i in intakes}
+
+    seen_rows = (
+        await db.execute(
+            select(DealerLeadChannelSeen).where(
+                DealerLeadChannelSeen.user_id == user.id,
+                DealerLeadChannelSeen.intake_id.in_([i.id for i in intakes]),
+            )
+        )
+    ).scalars().all()
+    seen_by_intake = {r.intake_id: r.seen_at for r in seen_rows}
+
+    note_rows = (
+        await db.execute(
+            select(BucketNote.bucket_id, BucketNote.author_role, BucketNote.created_at).where(
+                BucketNote.bucket_id.in_(list(bucket_to_intake.keys())),
+                BucketNote.visibility == "admin",
+            )
+        )
+    ).all()
+    counts: dict[UUID, int] = {}
+    for bucket_id, author_role, created_at in note_rows:
+        intake_id = bucket_to_intake.get(bucket_id)
+        if intake_id is None or _channel_side(author_role) == viewer_side:
+            continue  # your own side's messages are never "unread" to you
+        seen_at = seen_by_intake.get(intake_id)
+        if seen_at is None or created_at > seen_at:
+            counts[intake_id] = counts.get(intake_id, 0) + 1
+    return counts
+
+
+async def _mark_channel_seen(db: AsyncSession, user: User, intake_id: UUID) -> datetime:
+    """Upsert the caller's channel read cursor for one lead. Commits its own
+    tiny write so it's safe to call from a GET."""
+    from app.models.dealer_lead_channel_seen import DealerLeadChannelSeen
+
+    row = (
+        await db.execute(
+            select(DealerLeadChannelSeen).where(
+                DealerLeadChannelSeen.intake_id == intake_id,
+                DealerLeadChannelSeen.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    now = _now()
+    if row is None:
+        db.add(DealerLeadChannelSeen(intake_id=intake_id, user_id=user.id, seen_at=now))
+    else:
+        row.seen_at = now
+    await db.commit()
+    return now
+
+
+def _inbox_item(intake: PublicUnderwritingIntake, unread: int) -> DealerLeadInboxItem:
+    return DealerLeadInboxItem(
+        intake_id=intake.id,
+        name=intake.business_name or intake.full_name,
+        business_name=intake.business_name,
+        full_name=intake.full_name,
+        status=intake.status,
+        outcome_status=intake.outcome_status,
+        unread_count=unread,
+        last_message=_channel_last_message(intake),
+        last_message_at=intake.last_message_at,
+    )
 
 
 class WhatsNewItem(BaseModel):
@@ -5675,6 +5824,24 @@ async def mark_whats_new_seen(
         cursor.seen_at = _now()
     await db.commit()
     return await get_whats_new(user, db)
+
+
+@admin_router.get("/messages", response_model=DealerLeadInboxResponse)
+async def admin_dealer_channel_inbox(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLeadInboxResponse:
+    """Internal team's dealer-lead message inbox across every lead. Registered
+    before GET /{intake_id} so the literal path isn't captured as an intake_id."""
+    _require_super_admin(user)
+    stmt = (
+        select(PublicUnderwritingIntake)
+        .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+        .where(Bucket.archived_at.is_(None))
+        .options(selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes))
+    )
+    intakes = list((await db.execute(stmt)).scalars().unique().all())
+    return await _build_channel_inbox(db, user, intakes)
 
 
 @admin_router.get("/{intake_id}", response_model=DealerIntakeResponse)
@@ -5832,6 +5999,7 @@ async def create_admin_lead_note(
         content=payload.content,
     )
     db.add(note)
+    intake.last_message_at = _now()
     await db.flush()
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
     await db.commit()
@@ -6113,7 +6281,70 @@ async def list_broker_dealer_leads(
         rows = [row for row in rows if str(_lead_result(row).get("probability_status") or "") == probability_status]
     total = len(rows)
     page = rows[offset:offset + limit]
-    return DealerAILeadListResponse(items=[_lead_row(row) for row in page], total=total, limit=limit, offset=offset)
+    items = [_lead_row(row) for row in page]
+    channel_unread = await _channel_unread_by_intake(db, user=user, intakes=page)
+    for item in items:
+        item.channel_unread_count = channel_unread.get(item.id, 0)
+    return DealerAILeadListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@broker_router.get("/messages", response_model=DealerLeadInboxResponse)
+async def broker_dealer_channel_inbox(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLeadInboxResponse:
+    """Dealer partner's whole communication inbox: one row per owned lead that
+    has a team<->partner thread, newest activity first, with this partner's
+    unread count. Each row clicks through to that lead's Messages tab in the UI."""
+    await _require_dealer_partner(user, db)
+    stmt = (
+        select(PublicUnderwritingIntake)
+        .join(Bucket, PublicUnderwritingIntake.bucket_id == Bucket.id)
+        .where(
+            Bucket.archived_at.is_(None),
+            PublicUnderwritingIntake.broker_id == user.id,
+            PublicUnderwritingIntake.delete_requested_at.is_(None),
+        )
+        .options(selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes))
+    )
+    intakes = list((await db.execute(stmt)).scalars().unique().all())
+    return await _build_channel_inbox(db, user, intakes)
+
+
+async def _build_channel_inbox(
+    db: AsyncSession, user: User, intakes: list[PublicUnderwritingIntake]
+) -> DealerLeadInboxResponse:
+    # Only leads that actually have a team<->partner thread belong in the inbox.
+    threaded = [i for i in intakes if any(n.visibility == "admin" for n in i.bucket.notes)]
+    unread = await _channel_unread_by_intake(db, user=user, intakes=threaded)
+    items = [_inbox_item(i, unread.get(i.id, 0)) for i in threaded]
+    items.sort(key=lambda it: it.last_message_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return DealerLeadInboxResponse(items=items, total_unread=sum(it.unread_count for it in items))
+
+
+@broker_router.post("/{intake_id}/messages/seen", response_model=ChannelSeenResponse)
+async def broker_mark_channel_seen(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ChannelSeenResponse:
+    """Dealer partner opened the Messages tab on this lead — clear its unread."""
+    await _require_dealer_partner(user, db)
+    intake = await _load_broker_dealer_lead(db, user, intake_id)
+    seen_at = await _mark_channel_seen(db, user, intake.id)
+    return ChannelSeenResponse(intake_id=intake.id, seen_at=seen_at)
+
+
+@admin_router.post("/{intake_id}/messages/seen", response_model=ChannelSeenResponse)
+async def admin_mark_channel_seen(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ChannelSeenResponse:
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    seen_at = await _mark_channel_seen(db, user, intake.id)
+    return ChannelSeenResponse(intake_id=intake.id, seen_at=seen_at)
 
 
 @broker_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
@@ -6312,6 +6543,7 @@ async def create_broker_lead_note(
         content=payload.content,
     )
     db.add(note)
+    intake.last_message_at = _now()
     await db.flush()
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
     await db.commit()
