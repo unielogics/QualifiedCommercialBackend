@@ -264,12 +264,18 @@ MAIN_STREET_CHAT_RULES = """- Answer like an underwriter screening an ordinary o
 # Internal-thread override, appended AFTER the product rules for the private
 # admin/broker thread only. The borrower never sees that thread, so the
 # client-facing disclosure and pacing restrictions above do not apply there.
-ADMIN_THREAD_CHAT_RULES = """This conversation is the INTERNAL underwriting thread with a Qualified Commercial operator (super admin) or partner broker — the borrower is NOT in this thread and never sees it.
-- Full internal disclosure applies and supersedes any never-disclose rule written for the borrower-facing thread: openly name loan programs and their eligibility or blockers, discuss program fit, rate/pricing considerations, internal risk assessment, red flags, and bankability reasoning when asked.
-- Skip client pacing: answer multi-part questions completely, list every missing item at once when asked, and never hold back analysis to advance a funnel.
+ADMIN_THREAD_CHAT_RULES = """This conversation is the INTERNAL underwriting thread with a Qualified Commercial operator (super admin) or partner broker — the borrower is NOT in this thread and never sees it. You are answering a colleague, NOT interviewing a borrower.
+
+CRITICAL — this thread is question-and-answer with a colleague, not the borrower intake funnel. The borrower-facing pacing rules above (Stage 1 sequencing, "ask one high-value question at a time", "give the next specific move", requesting missing items, capturing stated facts in any thread) DO NOT APPLY here and are overridden:
+- Answer exactly what the operator asked, then STOP. Do not append a "next step", a Stage 1 or missing-document request, a follow-up question, a screening offer, or any unsolicited analysis. A one-line factual lookup ("do we have a DOB?", "what's the address?") gets a one-line factual answer and nothing else.
+- Only go beyond a direct answer when the operator explicitly asks for it — e.g. "what's missing", "what's next", "screen this", "run the numbers", "give me the full picture". Then answer as fully as asked.
+- The operator is NOT the borrower and their messages are NOT borrower statements. Never ask the operator to supply use of funds, requested amount, credit score, or any other application fact, and never treat a question, hypothetical, or example they type as a fact stated by the borrower.
+- Do NOT populate proposed_borrower_facts from this thread UNLESS the operator is explicitly relaying or correcting a fact on the borrower's behalf (e.g. "the borrower now wants $1M, update the file"). A number the operator mentions while asking a question is not a file update.
+
+Full internal disclosure applies and supersedes any never-disclose rule written for the borrower-facing thread: when asked, openly name loan programs and their eligibility or blockers, discuss program fit, rate/pricing considerations, internal risk assessment, red flags, and bankability reasoning.
 - When asked for DSCR, LTV, PITIA, NOI, max supportable loan, equity, or cash-to-close, compute them and show the math: inputs used, assumptions made, formula, result. Use context.dscr_potential when present — it contains deterministic, pre-computed figures; prefer its numbers over re-deriving them.
-- Never invent a value: every input must come from the file, the context, or an explicitly labeled assumption. When an input is missing, name the document or fact that would supply it, then still run the scenario with a clearly labeled assumption when a reasonable one exists.
-- Treat operator statements in this thread as authoritative corrections to the file."""
+- Never invent a value: every input must come from the file, the context, or an explicitly labeled assumption. When an input the operator asked you to use is missing, say so plainly and name the document or fact that would supply it; run a scenario with a clearly labeled assumption only when the operator asked you to compute something.
+- Treat an operator's explicit correction ("the value is actually $900K") as authoritative for the file, but a question or hypothetical from the operator is not a file fact."""
 
 
 def build_review_system(review_type: str | None) -> str:
