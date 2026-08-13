@@ -375,6 +375,9 @@ class AdminLeadCreate(BaseModel):
     notify_client: bool = False  # email the client a secure resume/login link now
     force_new: bool = False  # create a second lead even if one already exists for this email
     preferred_language: Language = Language.EN
+    # Optionally assign the file to a dealer partner at creation, so the team's
+    # first message on it reaches that partner's channel. Must be a dealer_partner.
+    broker_user_id: UUID | None = None
 
     @field_validator("variant", mode="before")
     @classmethod
@@ -5843,6 +5846,68 @@ async def mark_whats_new_seen(
     return await get_whats_new(user, db)
 
 
+class DealerPartnerOption(BaseModel):
+    id: UUID
+    name: str
+    email: str
+
+
+class AssignPartnerRequest(BaseModel):
+    broker_user_id: UUID | None = None
+
+
+async def _load_dealer_partner_user(db: AsyncSession, user_id: UUID) -> User:
+    partner = await db.get(User, user_id)
+    if partner is None or partner.role != Role.DEALER_PARTNER or partner.deleted_at is not None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected user is not an active dealer partner.")
+    return partner
+
+
+@admin_router.get("/dealer-partners", response_model=list[DealerPartnerOption])
+async def list_dealer_partners(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerPartnerOption]:
+    """Dealer partners the team can assign a file to / start a conversation with.
+    Registered before GET /{intake_id} so the literal path isn't captured."""
+    _require_super_admin(user)
+    rows = (
+        await db.execute(
+            select(User)
+            .where(User.role == Role.DEALER_PARTNER, User.deleted_at.is_(None))
+            .order_by(User.name)
+        )
+    ).scalars().all()
+    return [DealerPartnerOption(id=r.id, name=r.name or r.email, email=r.email) for r in rows]
+
+
+@admin_router.patch("/{intake_id}/assign-partner", response_model=DealerIntakeResponse)
+async def assign_lead_partner(
+    intake_id: UUID,
+    payload: AssignPartnerRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Assign (or clear) the dealer partner on a file so the team's messages on
+    it reach that partner's channel. Setting None detaches the partner."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if payload.broker_user_id is None:
+        intake.broker_id = None
+    else:
+        partner = await _load_dealer_partner_user(db, payload.broker_user_id)
+        intake.broker_id = partner.id
+    await _log(
+        db, intake.bucket_id, "dealer_ai_lead_partner_assigned", request=request, user=user,
+        target_type="public_underwriting_intake", target_id=str(intake.id),
+        detail=str(payload.broker_user_id) if payload.broker_user_id else "detached",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
+
+
 @admin_router.get("/messages", response_model=DealerLeadInboxResponse)
 async def admin_dealer_channel_inbox(
     user: CurrentUser,
@@ -6183,6 +6248,9 @@ async def create_admin_ai_lead(
         ),
         intake_state=intake_state,
     )
+    if payload.broker_user_id is not None:
+        partner = await _load_dealer_partner_user(db, payload.broker_user_id)
+        intake.broker_id = partner.id
     db.add(intake)
     await _log(
         db,
