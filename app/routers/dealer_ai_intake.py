@@ -2800,7 +2800,17 @@ async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake
 
 async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -> Client:
     email = _normalize_email(str(payload.email))
-    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
+    # Email match is inherently fragile (same email can belong to more than one
+    # client record). Harden the selection: among same-email candidates, prefer
+    # one already originated from a dealer AI intake so a new intake reuses the
+    # dealer-intake client instead of hijacking an unrelated agent-book client;
+    # otherwise fall back to the most recent.
+    candidates = (
+        await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))
+    ).scalars().all()
+    client = next((c for c in candidates if c.source_channel == "dealer_ai_intake"), None) or (
+        candidates[0] if candidates else None
+    )
     owner = await primary_super_admin(db)
     if client is None:
         client = Client(
@@ -2832,6 +2842,13 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
         client.name = payload.full_name.strip()
     if client.current_agent_id is None and owner is not None:
         client.current_agent_id = owner.id
+    # Non-destructively tag a reused client so it's identifiable as dealer-AI
+    # sourced — only when empty, so an existing agent/referral attribution is
+    # never overwritten.
+    if not client.source_channel:
+        client.source_channel = "dealer_ai_intake"
+    if not client.referral_source:
+        client.referral_source = "dealer_ai_intake"
     intake = dict(client.lead_intake or {})
     intake.update({"source": "dealer_ai_intake", "business_name": payload.business_name or intake.get("business_name")})
     client.lead_intake = intake
