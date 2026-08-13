@@ -513,13 +513,13 @@ class RequestLeadDeletionRequest(BaseModel):
 
 
 class ConfirmLeadDeletionRequest(BaseModel):
-    """Admin's final confirmation for an irreversible hard delete — the
-    caller must type the lead's exact business_name or full_name (matched
-    case-insensitively) as a deliberate speed bump before anything is
-    destroyed. Mirrors this codebase's window.confirm(...) pattern for
-    destructive actions, but stronger given this is unrecoverable."""
+    """Super-admin's confirmation for an irreversible hard delete. The
+    frontend gates this behind a themed danger confirm dialog, so the API no
+    longer requires a prior deletion-request flag or a typed-name speed bump —
+    a super admin can delete in one action. confirm_name is accepted but
+    optional (kept for backward compatibility / audit)."""
 
-    confirm_name: str = Field(min_length=1, max_length=180)
+    confirm_name: str | None = Field(default=None, max_length=180)
 
 
 class AdminCreditPullRequest(BaseModel):
@@ -5937,14 +5937,10 @@ async def admin_confirm_lead_deletion(
     codebase to write a cross-bucket entry to."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    if intake.delete_requested_at is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "This lead has not been flagged for deletion — request deletion first.",
-        )
+    # One-click super-admin delete: no prior request flag and no typed-name
+    # required — the frontend danger dialog is the safeguard. (Brokers still
+    # can only request; only a super admin reaches this hard-delete.)
     confirm_target = (intake.business_name or intake.full_name or "").strip().lower()
-    if not confirm_target or payload.confirm_name.strip().lower() != confirm_target:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Typed name does not match this lead's business or full name.")
 
     for file in intake.bucket.files:
         status_result = _delete_s3_object(file.s3_key)
