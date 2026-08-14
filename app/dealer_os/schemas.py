@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -81,3 +81,76 @@ class TargetRead(ORM):
 class TargetOverride(BaseModel):
     metric_key: str = Field(min_length=1, max_length=48)
     admin_value: float | None = None  # None clears the override back to the AI proposal
+
+
+# --- Stream 2: ingestion & normalization -----------------------------------
+
+
+class CashEventRow(BaseModel):
+    occurred_on: date
+    description: str = Field(min_length=1, max_length=320)
+    amount: float
+    invoice_date: date | None = None
+    due_date: date | None = None
+
+
+class CashImport(BaseModel):
+    rows: list[CashEventRow] = Field(max_length=5000)
+
+
+class CashImportResult(BaseModel):
+    imported: int
+    periods: int
+
+
+class CashEventRead(ORM):
+    id: UUID
+    period: date
+    occurred_on: date
+    description: str
+    amount: float
+    category: str
+    flags: dict | None = None
+    categorized_by: str | None = None
+    source: str
+
+
+class CashEventPatch(BaseModel):
+    category: str | None = None
+    flags: dict | None = None
+
+
+class PeriodRead(ORM):
+    id: UUID
+    period: date
+    revenue: float | None = None
+    net_income: float | None = None
+    ebitda_reported: float | None = None
+    ebitda_adjusted: float | None = None
+    ebitda_bankable: float | None = None
+    debt_service: float | None = None
+    deposits: float | None = None
+    withdrawals: float | None = None
+    ending_balance: float | None = None
+    low_balance: float | None = None
+    avg_daily_balance: float | None = None
+    nsf_count: int
+    liquidity: dict | None = None
+    source: str
+    reconciled: bool
+
+
+class PeriodUpsert(BaseModel):
+    revenue: float | None = None
+    net_income: float | None = None
+    ebitda_reported: float | None = None
+    ebitda_adjusted: float | None = None
+    ebitda_bankable: float | None = None
+    debt_service: float | None = None
+    deposits: float | None = None
+    withdrawals: float | None = None
+    ending_balance: float | None = None
+    low_balance: float | None = None
+    avg_daily_balance: float | None = None
+    nsf_count: int | None = None
+    reconciled: bool | None = None

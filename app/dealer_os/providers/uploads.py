@@ -20,6 +20,10 @@ class UploadsProvider(FeedProvider):
     kind = "uploads"
 
     async def sync(self, db: AsyncSession, dealer_id: UUID) -> dict:
-        # Parsing lands in Stream 2; uploads are pushed via the upload endpoints
-        # rather than pulled, so sync is a no-op reconcile hook for this provider.
+        """No-op reconcile hook: uploads are pushed via the cash-events import
+        endpoint rather than pulled. Reconciliation itself is
+        app.dealer_os.services.normalize.rebuild_periods — every push path
+        calls it after mutating events, so a pull-style sync has nothing to do
+        for this provider.
+        """
         return {"periods": 0, "events": 0}

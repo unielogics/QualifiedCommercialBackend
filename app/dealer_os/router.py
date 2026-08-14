@@ -7,10 +7,10 @@ ledger, plan, forecast, messaging land in Streams 2-5 on this same router.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,8 +18,31 @@ from app.db import get_db
 from app.deps import CurrentUser
 
 from .deps import load_dealer, require_team
-from .models import DealerAlert, DealerBusiness, DealerMetricSnapshot, DealerMetricTarget, DealerSourceConnection
-from .schemas import DealerCreate, DealerListItem, DealerRead, DealerUpdate, TargetOverride, TargetRead
+from .models import (
+    DealerAddback,
+    DealerAlert,
+    DealerBusiness,
+    DealerCashEvent,
+    DealerFinancialPeriod,
+    DealerMetricSnapshot,
+    DealerMetricTarget,
+    DealerSourceConnection,
+)
+from .schemas import (
+    CashEventPatch,
+    CashEventRead,
+    CashImport,
+    CashImportResult,
+    DealerCreate,
+    DealerListItem,
+    DealerRead,
+    DealerUpdate,
+    PeriodRead,
+    PeriodUpsert,
+    TargetOverride,
+    TargetRead,
+)
+from .services.normalize import classify_event, period_of, rebuild_periods
 from .services.targets import propose_targets
 
 router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
@@ -155,3 +178,163 @@ async def override_target(
     await db.commit()
     await db.refresh(row)
     return _target_read(row)
+
+
+# --- Stream 2: ingestion & normalization -----------------------------------
+
+
+@router.post(
+    "/dealers/{dealer_id}/cash-events/import",
+    response_model=CashImportResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def import_cash_events(
+    dealer_id: UUID, payload: CashImport, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> CashImportResult:
+    """Bulk-import statement/CSV lines. Each row is AI-classified via the
+    normalization rules, then the affected monthly periods are rebuilt."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    periods: set[date] = set()
+    for row in payload.rows:
+        category, flags = classify_event(row.description, row.amount)
+        period = period_of(row.occurred_on)
+        periods.add(period)
+        db.add(
+            DealerCashEvent(
+                dealer_id=dealer.id,
+                period=period,
+                occurred_on=row.occurred_on,
+                description=row.description,
+                amount=row.amount,
+                category=category,
+                flags=flags,
+                invoice_date=row.invoice_date,
+                due_date=row.due_date,
+                categorized_by="ai",
+                source="upload",
+            )
+        )
+    await db.flush()
+    touched = await rebuild_periods(db, dealer.id, periods)
+    await db.commit()
+    return CashImportResult(imported=len(payload.rows), periods=touched)
+
+
+@router.get("/dealers/{dealer_id}/cash-events", response_model=list[CashEventRead])
+async def list_cash_events(
+    dealer_id: UUID,
+    user: CurrentUser,
+    period: date | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerCashEvent]:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    q = select(DealerCashEvent).where(DealerCashEvent.dealer_id == dealer.id)
+    if period is not None:
+        q = q.where(DealerCashEvent.period == period)
+    q = q.order_by(DealerCashEvent.occurred_on.asc()).limit(limit)
+    return (await db.execute(q)).scalars().all()
+
+
+@router.patch("/dealers/{dealer_id}/cash-events/{event_id}", response_model=CashEventRead)
+async def patch_cash_event(
+    dealer_id: UUID,
+    event_id: UUID,
+    payload: CashEventPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerCashEvent:
+    """Admin recategorization. Moving a line to owner_personal/one_time also
+    seeds a candidate add-back (once per source event)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    event = (
+        await db.execute(
+            select(DealerCashEvent).where(
+                DealerCashEvent.id == event_id, DealerCashEvent.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+    if payload.category is not None:
+        event.category = payload.category
+    if payload.flags is not None:
+        event.flags = payload.flags
+    event.categorized_by = "admin"
+
+    if payload.category in ("owner_personal", "one_time"):
+        existing = (
+            await db.execute(select(DealerAddback).where(DealerAddback.source_event_id == event.id))
+        ).scalar_one_or_none()
+        if existing is None:
+            amt = abs(float(event.amount))
+            is_owner = payload.category == "owner_personal"
+            db.add(
+                DealerAddback(
+                    dealer_id=dealer.id,
+                    title=event.description[:200],
+                    monthly_amount=amt if is_owner else None,
+                    annual_amount=amt * 12 if is_owner else amt,
+                    status="candidate",
+                    evidence=f"Flagged from statement line {event.occurred_on}",
+                    source_event_id=event.id,
+                )
+            )
+    await rebuild_periods(db, dealer.id, {event.period})
+    await db.commit()
+    await db.refresh(event)
+    return event
+
+
+@router.get("/dealers/{dealer_id}/periods", response_model=list[PeriodRead])
+async def list_periods(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerFinancialPeriod]:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerFinancialPeriod)
+                .where(DealerFinancialPeriod.dealer_id == dealer.id)
+                .order_by(DealerFinancialPeriod.period.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.put("/dealers/{dealer_id}/periods/{period}", response_model=PeriodRead)
+async def upsert_period(
+    dealer_id: UUID,
+    period: date,
+    payload: PeriodUpsert,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerFinancialPeriod:
+    """Manual month upsert — source becomes 'manual' and manual wins: later
+    event-driven rebuilds only recompute deposits/withdrawals, never the
+    manually entered balance/EBITDA/revenue fields."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    fp = (
+        await db.execute(
+            select(DealerFinancialPeriod).where(
+                DealerFinancialPeriod.dealer_id == dealer.id,
+                DealerFinancialPeriod.period == period,
+            )
+        )
+    ).scalar_one_or_none()
+    if fp is None:
+        fp = DealerFinancialPeriod(dealer_id=dealer.id, period=period)
+        db.add(fp)
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(fp, k, v)
+    fp.source = "manual"
+    await db.commit()
+    await db.refresh(fp)
+    return fp
