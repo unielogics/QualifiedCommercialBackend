@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.models.user import User
+from app.services import clerk as clerk_service
 from app.enums import Role
 
 from .deps import load_dealer, require_team, require_team_or_dealer, resolve_dealer_scope
@@ -35,6 +37,8 @@ from .models import (
     DealerSourceConnection,
 )
 from .schemas import (
+    DealerInvite,
+    DealerInviteResult,
     AddbackRead,
     AlertRead,
     CashEventPatch,
@@ -150,6 +154,55 @@ async def update_dealer(
     await db.commit()
     await db.refresh(dealer)
     return dealer
+
+
+@router.post("/dealers/{dealer_id}/invite", response_model=DealerInviteResult, status_code=status.HTTP_201_CREATED)
+async def invite_dealer_login(
+    dealer_id: UUID, payload: DealerInvite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerInviteResult:
+    """Invite (or link) the dealer's self-serve login. Creates the local User
+    row with Role.DEALER (clerk_id JIT-bound on first sign-in, same pattern as
+    the operator invite flow), links it via dealer_user_id, and best-effort
+    sends a Clerk invitation email that lands on audit.qualifiedcommercial.com."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    email = payload.email.strip().lower()
+    existing = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+    clerk_sent = False
+    if existing is not None and existing.deleted_at is None:
+        if existing.role != Role.DEALER:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"That email belongs to an existing {existing.role.value} account — use a different email.",
+            )
+        target, result_status = existing, "linked"
+    else:
+        if existing is not None:  # soft-deleted: resurrect as dealer
+            existing.deleted_at = None
+            existing.name = payload.name or existing.name
+            existing.role = Role.DEALER
+            existing.clerk_id = None
+            target = existing
+        else:
+            target = User(
+                email=email,
+                name=payload.name or f"{dealer.name} owner",
+                role=Role.DEALER,
+                clerk_id=None,
+            )
+            db.add(target)
+        await db.flush()
+        result_status = "invited"
+        sent = await clerk_service.invite_user(
+            email=email,
+            name=target.name or dealer.name,
+            role=Role.DEALER,
+            redirect_url="https://audit.qualifiedcommercial.com/sign-in",
+        )
+        clerk_sent = sent is not None
+    dealer.dealer_user_id = target.id
+    await db.commit()
+    return DealerInviteResult(status=result_status, email=email, user_id=target.id, clerk_sent=clerk_sent)
 
 
 def _target_read(t: DealerMetricTarget) -> TargetRead:

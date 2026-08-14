@@ -42,6 +42,7 @@ class DealerUpdate(BaseModel):
 class DealerRead(ORM):
     id: UUID
     name: str
+    dealer_user_id: UUID | None = None
     legal_name: str | None = None
     ein: str | None = None
     email: str | None = None
@@ -329,3 +330,15 @@ class LenderPackageRead(BaseModel):
     plan: list[PlanActionRead] = []
     forecast: ForecastRead | None = None
     paths: PathsRead | None = None
+
+
+class DealerInvite(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    name: str | None = None
+
+
+class DealerInviteResult(BaseModel):
+    status: str  # invited | linked
+    email: str
+    user_id: UUID
+    clerk_sent: bool = False
