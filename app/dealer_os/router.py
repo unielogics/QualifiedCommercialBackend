@@ -11,7 +11,7 @@ import logging
 from datetime import date, datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,7 @@ from .models import (
     DealerAlert,
     DealerBusiness,
     DealerCashEvent,
+    DealerDocument,
     DealerFinancialPeriod,
     DealerMessage,
     DealerMetricLineage,
@@ -49,6 +50,7 @@ from .schemas import (
     DealerListItem,
     DealerRead,
     DealerUpdate,
+    DocumentRead,
     ForecastRead,
     GlobalAlertRead,
     HealthRead,
@@ -67,7 +69,9 @@ from .schemas import (
     TargetOverride,
     TargetRead,
 )
+from .services import storage
 from .services.engines import recompute_snapshot
+from .services.extract import extract_document
 from .services.forecast import compute_forecast
 from .services.normalize import classify_event, period_of, rebuild_periods
 from .services.paths import compute_ladder, compute_paths
@@ -430,6 +434,112 @@ async def upsert_period(
     await db.commit()
     await db.refresh(fp)
     return fp
+
+
+# --- Stream 7: document ingestion --------------------------------------------
+
+MAX_DOCUMENT_BYTES = 15 * 1024 * 1024  # 15MB
+_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "other"}
+
+
+@router.post(
+    "/dealers/{dealer_id}/documents",
+    response_model=DocumentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_document(
+    dealer_id: UUID,
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    kind: str = Form(default="statement"),
+    db: AsyncSession = Depends(get_db),
+) -> DealerDocument:
+    """Upload one financial document, archive it to S3 best-effort, and run
+    extraction inline — the response carries the final status (extracted or
+    failed with a human-readable error). Extraction always normalizes through
+    classify_event -> rebuild_periods -> recompute_snapshot, same as every
+    other ingestion path."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if kind not in _DOCUMENT_KINDS:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"kind must be one of: {', '.join(sorted(_DOCUMENT_KINDS))}",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The uploaded file is empty")
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File exceeds the 15MB document limit"
+        )
+    filename = storage.safe_filename(file.filename)
+    content_type = (file.content_type or "application/octet-stream")[:120]
+    key = storage.build_key(dealer.id, filename)
+    s3_key = key if storage.put_bytes(key, raw, content_type) else None
+
+    doc = DealerDocument(
+        dealer_id=dealer.id,
+        filename=filename,
+        content_type=content_type,
+        size_bytes=len(raw),
+        s3_key=s3_key,
+        kind=kind,
+        status="uploaded",
+    )
+    db.add(doc)
+    await db.flush()
+    await extract_document(db, doc, raw)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+@router.get("/dealers/{dealer_id}/documents", response_model=list[DocumentRead])
+async def list_documents(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerDocument]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerDocument)
+                .where(DealerDocument.dealer_id == dealer.id)
+                .order_by(DealerDocument.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post("/dealers/{dealer_id}/documents/{doc_id}/extract", response_model=DocumentRead)
+async def reextract_document(
+    dealer_id: UUID, doc_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDocument:
+    """Re-run extraction from the S3 archive. 409 when the original bytes were
+    never archived (S3 unconfigured at upload time) — re-upload instead."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    doc = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.id == doc_id, DealerDocument.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+    if not doc.s3_key:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The original file was not archived to S3 — upload the document again to re-extract it",
+        )
+    await extract_document(db, doc)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
 
 
 # --- Stream 3: engines, lineage & alerts -----------------------------------

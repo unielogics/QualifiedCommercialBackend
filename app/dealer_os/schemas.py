@@ -332,6 +332,24 @@ class LenderPackageRead(BaseModel):
     paths: PathsRead | None = None
 
 
+# --- Stream 7: document ingestion --------------------------------------------
+
+
+class DocumentRead(ORM):
+    id: UUID
+    dealer_id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    s3_key: str | None = None
+    kind: str
+    status: str
+    error: str | None = None
+    extracted: dict | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class DealerInvite(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     name: str | None = None

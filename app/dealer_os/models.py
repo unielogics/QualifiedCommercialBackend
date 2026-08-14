@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -265,6 +265,30 @@ class DealerSession(TimestampMixin, Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class DealerDocument(TimestampMixin, Base):
+    """Uploaded financial document (bank statement, P&L, tax return, debt
+    schedule). Bytes are archived to S3 best-effort (s3_key nullable — when S3
+    is unconfigured we extract in-memory and keep only the summary); the
+    normalized output always flows through the same classify_event /
+    rebuild_periods / recompute_snapshot pipeline as every other source."""
+
+    __tablename__ = "dos_documents"
+    __table_args__ = (Index("ix_dos_documents_dealer_created", "dealer_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    filename: Mapped[str] = mapped_column(String(260), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    s3_key: Mapped[str | None] = mapped_column(String(400))
+    kind: Mapped[str] = mapped_column(String(24), default="statement", server_default="statement")  # statement|pl|tax|debt_schedule|other
+    status: Mapped[str] = mapped_column(String(16), default="uploaded", server_default="uploaded")  # uploaded|extracting|extracted|failed
+    error: Mapped[str | None] = mapped_column(Text)
+    extracted: Mapped[dict | None] = mapped_column(JSONB)  # {months: [...], transactions_count, notes}
 
 
 class DealerSourceConnection(TimestampMixin, Base):
