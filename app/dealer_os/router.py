@@ -28,6 +28,7 @@ from .models import (
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
+    DealerPlanAction,
     DealerSourceConnection,
 )
 from .schemas import (
@@ -40,15 +41,22 @@ from .schemas import (
     DealerListItem,
     DealerRead,
     DealerUpdate,
+    ForecastRead,
     HealthRead,
+    PathsRead,
     PeriodRead,
     PeriodUpsert,
+    PlanActionCreate,
+    PlanActionRead,
+    PlanActionUpdate,
     SnapshotRead,
     TargetOverride,
     TargetRead,
 )
 from .services.engines import recompute_snapshot
+from .services.forecast import compute_forecast
 from .services.normalize import classify_event, period_of, rebuild_periods
+from .services.paths import compute_ladder, compute_paths
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -438,3 +446,176 @@ async def resolve_alert(
     await db.commit()
     await db.refresh(alert)
     return alert
+
+
+# --- Stream 4: plan, forecast & funding paths --------------------------------
+
+
+async def _load_plan_action(db: AsyncSession, dealer_id: UUID, action_id: UUID) -> DealerPlanAction:
+    action = (
+        await db.execute(
+            select(DealerPlanAction).where(
+                DealerPlanAction.id == action_id, DealerPlanAction.dealer_id == dealer_id
+            )
+        )
+    ).scalar_one_or_none()
+    if action is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan action not found for this dealer")
+    return action
+
+
+async def _latest_snapshot_metrics(db: AsyncSession, dealer_id: UUID) -> dict:
+    """Latest snapshot's metrics dict, or 400 with a clear next step."""
+    snapshot = (
+        await db.execute(
+            select(DealerMetricSnapshot)
+            .where(DealerMetricSnapshot.dealer_id == dealer_id)
+            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if snapshot is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "No metric snapshot exists for this dealer yet — import financials or "
+            "POST /dealers/{id}/recompute first",
+        )
+    return snapshot.metrics or {}
+
+
+@router.get("/dealers/{dealer_id}/plan", response_model=list[PlanActionRead])
+async def list_plan_actions(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerPlanAction]:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerPlanAction)
+                .where(DealerPlanAction.dealer_id == dealer.id)
+                .order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/plan", response_model=PlanActionRead, status_code=status.HTTP_201_CREATED
+)
+async def create_plan_action(
+    dealer_id: UUID, payload: PlanActionCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerPlanAction:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    action = DealerPlanAction(dealer_id=dealer.id, **payload.model_dump())
+    db.add(action)
+    await db.commit()
+    await db.refresh(action)
+    return action
+
+
+@router.patch("/dealers/{dealer_id}/plan/{action_id}", response_model=PlanActionRead)
+async def update_plan_action(
+    dealer_id: UUID,
+    action_id: UUID,
+    payload: PlanActionUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPlanAction:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    action = await _load_plan_action(db, dealer.id, action_id)
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(action, k, v)
+    await db.commit()
+    await db.refresh(action)
+    return action
+
+
+@router.delete("/dealers/{dealer_id}/plan/{action_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_plan_action(
+    dealer_id: UUID, action_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    action = await _load_plan_action(db, dealer.id, action_id)
+    await db.delete(action)
+    await db.commit()
+
+
+@router.post("/dealers/{dealer_id}/plan/publish", response_model=list[PlanActionRead])
+async def publish_plan(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerPlanAction]:
+    """Publish the whole plan to the dealer portal (sets published=true on all)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    actions = (
+        (
+            await db.execute(
+                select(DealerPlanAction)
+                .where(DealerPlanAction.dealer_id == dealer.id)
+                .order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for a in actions:
+        a.published = True
+    await db.commit()
+    return actions
+
+
+@router.get("/dealers/{dealer_id}/forecast", response_model=ForecastRead)
+async def dealer_forecast(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ForecastRead:
+    """12-month baseline vs plan-adjusted projection from the latest snapshot."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    metrics = await _latest_snapshot_metrics(db, dealer.id)
+    open_actions = (
+        (
+            await db.execute(
+                select(DealerPlanAction).where(
+                    DealerPlanAction.dealer_id == dealer.id, DealerPlanAction.status != "done"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    plan_actions = [
+        {"category": a.category, "status": a.status, "due_on": a.due_on} for a in open_actions
+    ]
+    return ForecastRead(**compute_forecast(metrics, plan_actions))
+
+
+@router.get("/dealers/{dealer_id}/paths", response_model=PathsRead)
+async def dealer_paths(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PathsRead:
+    """Funding-path readiness + credit-ladder position from the latest snapshot."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    metrics = await _latest_snapshot_metrics(db, dealer.id)
+    target_rows = (
+        (
+            await db.execute(
+                select(DealerMetricTarget).where(DealerMetricTarget.dealer_id == dealer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    targets = {
+        t.metric_key: (float(t.effective_value) if t.effective_value is not None else None)
+        for t in target_rows
+    }
+    return PathsRead(
+        paths=compute_paths(metrics, targets), ladder=compute_ladder(metrics, targets)
+    )

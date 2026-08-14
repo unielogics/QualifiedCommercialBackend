@@ -183,3 +183,85 @@ class HealthRead(BaseModel):
     targets: list[TargetRead] = []
     alerts: list[AlertRead] = []
     lineage_count: int = 0
+
+
+# --- Stream 4: plan, forecast & funding paths --------------------------------
+
+
+class PlanActionRead(ORM):
+    id: UUID
+    sort: int
+    title: str
+    detail: str | None = None
+    category: str
+    owner: str | None = None
+    timeline: str | None = None
+    due_on: date | None = None
+    status: str
+    expected_effect: str | None = None
+    published: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlanActionCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    detail: str | None = None
+    sort: int = 0
+    category: str = Field(default="liquidity", max_length=24)
+    owner: str | None = Field(default=None, max_length=80)
+    timeline: str | None = Field(default=None, max_length=80)
+    due_on: date | None = None
+    status: str = Field(default="todo", pattern="^(todo|prog|done)$")
+    expected_effect: str | None = Field(default=None, max_length=120)
+
+
+class PlanActionUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    detail: str | None = None
+    sort: int | None = None
+    category: str | None = Field(default=None, max_length=24)
+    owner: str | None = Field(default=None, max_length=80)
+    timeline: str | None = Field(default=None, max_length=80)
+    due_on: date | None = None
+    status: str | None = Field(default=None, pattern="^(todo|prog|done)$")
+    expected_effect: str | None = Field(default=None, max_length=120)
+
+
+class ForecastRead(BaseModel):
+    months: list[str]
+    baseline: dict[str, list[float | None]]
+    adjusted: dict[str, list[float | None]]
+    fundable_month: str | None = None
+    uplift_pct: float | None = None
+    assumptions: list[str] = []
+
+
+class PathRequirement(BaseModel):
+    label: str
+    met: bool
+    detail: str
+
+
+class FundingPath(BaseModel):
+    key: str
+    label: str
+    readiness_pct: float
+    requirements: list[PathRequirement]
+
+
+class LadderTier(BaseModel):
+    name: str
+    requirements: list[PathRequirement]
+    met: bool
+    status: str  # current|next|done|future
+
+
+class LadderRead(BaseModel):
+    current_tier: str
+    tiers: list[LadderTier]
+
+
+class PathsRead(BaseModel):
+    paths: list[FundingPath]
+    ladder: LadderRead
