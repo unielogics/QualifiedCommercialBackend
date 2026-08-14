@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.dealer_os import router as dealer_os_router
 from app.routers import (
     admin as admin_router,
     agent_tasks,
@@ -140,6 +141,7 @@ async def ready() -> dict[str, str]:
 # Mount all routers under /api/v1
 api_prefix = "/api/v1"
 for r in [
+    dealer_os_router.router,
     meta.router,
     auth.router,
     admin_router.router,

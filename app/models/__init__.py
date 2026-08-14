@@ -120,3 +120,4 @@ from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.regional_manager import RegionalManagerAgent  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401
+from app.dealer_os import models as dealer_os_models  # noqa: F401  (Dealer OS — isolated dos_* tables)
