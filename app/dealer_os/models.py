@@ -45,6 +45,12 @@ class DealerBusiness(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     notes: Mapped[str | None] = mapped_column(Text)
+    # Linked document Bucket (Phase 2) — either adopted from the dealer's AI
+    # underwriter intake (matched by email) or created lazily as an audit
+    # bucket. SET NULL so deleting a bucket never cascades into the dealer.
+    bucket_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
+    )
 
 
 class DealerFinancialPeriod(TimestampMixin, Base):
@@ -289,6 +295,12 @@ class DealerDocument(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="uploaded", server_default="uploaded")  # uploaded|extracting|extracted|failed
     error: Mapped[str | None] = mapped_column(Text)
     extracted: Mapped[dict | None] = mapped_column(JSONB)  # {months: [...], transactions_count, notes}
+    # Mirror row in the dealer's linked Bucket (Phase 2). Set on push (upload
+    # -> bucket) and on pull (bucket file ingested -> Dealer OS). SET NULL so
+    # bucket-file deletion never destroys the extraction record.
+    bucket_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
+    )
 
 
 class DealerSourceConnection(TimestampMixin, Base):

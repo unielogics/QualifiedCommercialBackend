@@ -21,12 +21,18 @@ from app.models.user import User
 from app.services import clerk as clerk_service
 from app.enums import Role
 
+# READ-ONLY reuse: bucket models are queried/appended, never altered; the
+# analysis-version constant keeps cache lookups aligned with the bucket AI.
+from app.models.bucket import BucketFile, BucketFileAnalysis
+from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
+
 from .deps import load_dealer, require_team, require_team_or_dealer, resolve_dealer_scope
 from .models import (
     DealerAddback,
     DealerAlert,
     DealerBusiness,
     DealerCashEvent,
+    DealerCreditProfile,
     DealerDocument,
     DealerFinancialPeriod,
     DealerMessage,
@@ -36,10 +42,18 @@ from .models import (
     DealerPlanAction,
     DealerSession,
     DealerSourceConnection,
+    DealerTaxFiling,
 )
 from .schemas import (
+    AIInsightsAccept,
+    AIInsightsRead,
+    BucketFileItem,
+    CreditRead,
+    CreditUpsert,
     DealerInvite,
     DealerInviteResult,
+    TaxFilingUpsert,
+    TaxYearRead,
     AddbackRead,
     AlertRead,
     CashEventPatch,
@@ -69,9 +83,9 @@ from .schemas import (
     TargetOverride,
     TargetRead,
 )
-from .services import storage
+from .services import analyst, buckets_link, storage
 from .services.engines import recompute_snapshot
-from .services.extract import extract_document
+from .services.extract import _persist_plan, apply_extraction, extract_document
 from .services.forecast import compute_forecast
 from .services.normalize import classify_event, period_of, rebuild_periods
 from .services.paths import compute_ladder, compute_paths
@@ -490,6 +504,12 @@ async def upload_document(
     db.add(doc)
     await db.flush()
     await extract_document(db, doc, raw)
+    # Best-effort mirror into the dealer's linked bucket — never fail the
+    # upload because the bucket bridge hiccuped.
+    try:
+        await buckets_link.push_document(db, dealer, doc, len(raw))
+    except Exception:
+        logger.exception("dealer-os: bucket push failed for document %s", doc.id)
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -499,18 +519,15 @@ async def upload_document(
 async def list_documents(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerDocument]:
+    """Team sees every row; a DEALER login sees all non-failed rows (failed
+    extractions are an internal operational detail, not dealer-facing)."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
+    if user.role == Role.DEALER:
+        q = q.where(DealerDocument.status != "failed")
     return (
-        (
-            await db.execute(
-                select(DealerDocument)
-                .where(DealerDocument.dealer_id == dealer.id)
-                .order_by(DealerDocument.created_at.desc())
-            )
-        )
-        .scalars()
-        .all()
+        (await db.execute(q.order_by(DealerDocument.created_at.desc()))).scalars().all()
     )
 
 
@@ -537,6 +554,174 @@ async def reextract_document(
             "The original file was not archived to S3 — upload the document again to re-extract it",
         )
     await extract_document(db, doc)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+# --- Phase 2: linked-bucket pull (bucket file -> Dealer OS ingest) -----------
+
+
+@router.get("/dealers/{dealer_id}/bucket-files", response_model=list[BucketFileItem])
+async def list_bucket_files(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[BucketFileItem]:
+    """Files in the dealer's linked bucket (ensure_bucket resolves/creates the
+    link first). has_analysis marks files whose cached BucketFileAnalysis can
+    be ingested without a model call; already_ingested marks files a
+    DealerDocument already references."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    bucket = await buckets_link.ensure_bucket(db, dealer)
+    await db.commit()  # persist the adoption/creation before the read
+    files = (
+        await db.execute(
+            select(BucketFile)
+            .where(BucketFile.bucket_id == bucket.id, BucketFile.deleted_at.is_(None))
+            .order_by(BucketFile.created_at.desc())
+        )
+    ).scalars().all()
+    if not files:
+        return []
+    ids = [f.id for f in files]
+    analysis_rows = (
+        await db.execute(
+            select(BucketFileAnalysis.bucket_file_id, BucketFileAnalysis.content_hash).where(
+                BucketFileAnalysis.bucket_file_id.in_(ids),
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+                BucketFileAnalysis.status == "completed",
+            )
+        )
+    ).all()
+    analyzed_pairs = {(fid, ch) for fid, ch in analysis_rows}
+    analyzed_ids = {fid for fid, _ in analysis_rows}
+    ingested_ids = set(
+        (
+            await db.execute(
+                select(DealerDocument.bucket_file_id).where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.bucket_file_id.in_(ids),
+                )
+            )
+        ).scalars().all()
+    )
+    return [
+        BucketFileItem(
+            id=f.id,
+            file_name=f.file_name,
+            content_type=f.content_type,
+            size_bytes=f.size_bytes,
+            created_at=f.created_at,
+            has_analysis=(
+                (f.id, f.content_hash) in analyzed_pairs
+                if f.content_hash
+                else f.id in analyzed_ids
+            ),
+            already_ingested=f.id in ingested_ids,
+        )
+        for f in files
+    ]
+
+
+@router.post(
+    "/dealers/{dealer_id}/bucket-files/{file_id}/ingest",
+    response_model=DocumentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def ingest_bucket_file(
+    dealer_id: UUID, file_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDocument:
+    """Pull one linked-bucket file into Dealer OS. When a cached
+    BucketFileAnalysis exists for the file's content_hash at the current
+    analysis version, its JSON is adapted into the canonical extraction shape
+    and persisted through the SAME plan path — zero model tokens. Otherwise
+    the raw bytes are fetched from S3 and run through the normal extract
+    pipeline (model call for PDF/image, pure parse for CSV/XLSX)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    bucket = await buckets_link.ensure_bucket(db, dealer)
+    bucket_file = (
+        await db.execute(
+            select(BucketFile).where(
+                BucketFile.id == file_id,
+                BucketFile.bucket_id == bucket.id,
+                BucketFile.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if bucket_file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found in this dealer's linked bucket")
+
+    analysis_q = select(BucketFileAnalysis).where(
+        BucketFileAnalysis.bucket_file_id == bucket_file.id,
+        BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+        BucketFileAnalysis.status == "completed",
+    )
+    if bucket_file.content_hash:
+        analysis_q = analysis_q.where(BucketFileAnalysis.content_hash == bucket_file.content_hash)
+    analysis_row = (
+        await db.execute(analysis_q.order_by(BucketFileAnalysis.created_at.desc()).limit(1))
+    ).scalar_one_or_none()
+
+    doc = DealerDocument(
+        dealer_id=dealer.id,
+        filename=bucket_file.file_name[:260],
+        content_type=(bucket_file.content_type or "application/octet-stream")[:120],
+        size_bytes=int(bucket_file.size_bytes or 0),
+        # Same S3 object — kept only when it fits our column so re-extract works.
+        s3_key=bucket_file.s3_key if len(bucket_file.s3_key) <= 400 else None,
+        kind=buckets_link.guess_document_kind(bucket_file.file_name),
+        status="uploaded",
+        bucket_file_id=bucket_file.id,
+    )
+    db.add(doc)
+    await db.flush()
+
+    source_note = f"Ingested from linked bucket file '{bucket_file.file_name}'"
+    if analysis_row is not None and isinstance(analysis_row.analysis, dict):
+        # Cache path — asserts no model call: adapt the stored analysis JSON
+        # into the canonical extraction dict and persist via the same plan.
+        extraction = buckets_link.adapt_analysis_to_extraction(analysis_row.analysis)
+        plan = apply_extraction(extraction)
+        cache_note = f"{source_note} via cached analysis (no model call)"
+        if plan["events"] or plan["period_upserts"]:
+            await _persist_plan(db, dealer.id, plan)
+            doc.extracted = {
+                "months": plan["months"],
+                "transactions_count": len(plan["events"]),
+                "notes": ([cache_note] + plan["notes"])[:50],
+                "parser": "bucket_analysis_cache",
+            }
+            doc.status = "extracted"
+            doc.error = None
+        else:
+            doc.status = "failed"
+            doc.error = "Cached analysis holds no usable monthly financial data"
+            doc.extracted = {
+                "months": [],
+                "transactions_count": 0,
+                "notes": ([cache_note] + plan["notes"])[:50],
+                "parser": "bucket_analysis_cache",
+            }
+    else:
+        raw = storage.get_bytes(bucket_file.s3_key)
+        if raw is None:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "Could not fetch the bucket file from S3 — try again or re-upload it to Dealer OS directly",
+            )
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "Bucket file exceeds the 15MB document limit",
+            )
+        await extract_document(db, doc, raw)
+        if doc.extracted is not None:
+            notes = list(doc.extracted.get("notes") or [])
+            doc.extracted = {**doc.extracted, "notes": ([source_note] + notes)[:50]}
+        elif doc.status == "failed":
+            doc.extracted = {"months": [], "transactions_count": 0, "notes": [source_note]}
+
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -917,6 +1102,157 @@ async def list_global_alerts(
     return out
 
 
+# --- Phase 2: credit profile & IRS/tax alignment -----------------------------
+
+
+@router.get("/dealers/{dealer_id}/credit", response_model=CreditRead)
+async def get_credit_profile(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> CreditRead:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerCreditProfile).where(DealerCreditProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return CreditRead()
+    return CreditRead(
+        business_history=row.business_history or [],
+        personal_score=row.personal_score,
+        personal_tier=row.personal_tier,
+        updated_at=row.updated_at,
+    )
+
+
+@router.put("/dealers/{dealer_id}/credit", response_model=CreditRead)
+async def upsert_credit_profile(
+    dealer_id: UUID, payload: CreditUpsert, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> CreditRead:
+    """Upsert the one dos_credit_profiles row. Only fields present in the
+    payload change; business_history items are free-form (extras preserved)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerCreditProfile).where(DealerCreditProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DealerCreditProfile(dealer_id=dealer.id)
+        db.add(row)
+    data = payload.model_dump(exclude_unset=True)
+    if "business_history" in data:
+        row.business_history = data["business_history"]
+    if "personal_score" in data:
+        row.personal_score = data["personal_score"]
+    if "personal_tier" in data:
+        row.personal_tier = data["personal_tier"]
+    await db.commit()
+    await db.refresh(row)
+    return CreditRead(
+        business_history=row.business_history or [],
+        personal_score=row.personal_score,
+        personal_tier=row.personal_tier,
+        updated_at=row.updated_at,
+    )
+
+
+async def _deposits_by_year(db: AsyncSession, dealer_id: UUID) -> dict[int, float]:
+    """Observed deposits per calendar year = sum of period deposits."""
+    periods = (
+        await db.execute(
+            select(DealerFinancialPeriod.period, DealerFinancialPeriod.deposits).where(
+                DealerFinancialPeriod.dealer_id == dealer_id,
+                DealerFinancialPeriod.deposits.is_not(None),
+            )
+        )
+    ).all()
+    totals: dict[int, float] = {}
+    for period, deposits in periods:
+        totals[period.year] = totals.get(period.year, 0.0) + float(deposits)
+    return {y: round(v, 2) for y, v in totals.items()}
+
+
+def _tax_year_read(
+    year: int, filing: DealerTaxFiling | None, observed: float | None
+) -> TaxYearRead:
+    reported = (
+        float(filing.revenue_reported)
+        if filing is not None and filing.revenue_reported is not None
+        else None
+    )
+    discrepancy_pct = (
+        round((observed - reported) / reported * 100.0, 1)
+        if observed is not None and reported
+        else None
+    )
+    return TaxYearRead(
+        year=year,
+        filed=bool(filing.filed) if filing is not None else False,
+        revenue_reported=reported,
+        deposits_observed=observed,
+        discrepancy_pct=discrepancy_pct,
+        filing_id=filing.id if filing is not None else None,
+    )
+
+
+@router.get("/dealers/{dealer_id}/tax", response_model=list[TaxYearRead])
+async def list_tax_years(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[TaxYearRead]:
+    """Filed years joined with observed deposits per calendar year (sum of the
+    dealer's period deposits). Years that have observed deposits but no filing
+    row still appear (filed=false, filing_id=null) so gaps are visible."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    filings = (
+        await db.execute(
+            select(DealerTaxFiling)
+            .where(DealerTaxFiling.dealer_id == dealer.id)
+            .order_by(DealerTaxFiling.year.asc())
+        )
+    ).scalars().all()
+    observed = await _deposits_by_year(db, dealer.id)
+    by_year = {f.year: f for f in filings}
+    years = sorted(set(by_year) | set(observed))
+    return [_tax_year_read(y, by_year.get(y), observed.get(y)) for y in years]
+
+
+@router.put("/dealers/{dealer_id}/tax/{year}", response_model=TaxYearRead)
+async def upsert_tax_filing(
+    dealer_id: UUID,
+    year: int,
+    payload: TaxFilingUpsert,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> TaxYearRead:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if not 2000 <= year <= 2100:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "year must be between 2000 and 2100")
+    filing = (
+        await db.execute(
+            select(DealerTaxFiling).where(
+                DealerTaxFiling.dealer_id == dealer.id, DealerTaxFiling.year == year
+            )
+        )
+    ).scalar_one_or_none()
+    if filing is None:
+        filing = DealerTaxFiling(dealer_id=dealer.id, year=year)
+        db.add(filing)
+    data = payload.model_dump(exclude_unset=True)
+    if "filed" in data and data["filed"] is not None:
+        filing.filed = data["filed"]
+    if "revenue_reported" in data:
+        filing.revenue_reported = data["revenue_reported"]
+    await db.commit()
+    await db.refresh(filing)
+    observed = (await _deposits_by_year(db, dealer.id)).get(year)
+    return _tax_year_read(year, filing, observed)
+
+
 @router.get("/dealers/{dealer_id}/lender-package", response_model=LenderPackageRead)
 async def lender_package(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -926,7 +1262,12 @@ async def lender_package(
     brand-new dealer still renders a partial package."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return await _build_lender_package(db, dealer)
 
+
+async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> LenderPackageRead:
+    """Assemble the full lender bundle for one dealer — shared by the
+    lender-package endpoint and the AI analyst (same facts, one code path)."""
     snapshot = (
         await db.execute(
             select(DealerMetricSnapshot)
@@ -1008,3 +1349,66 @@ async def lender_package(
         forecast=forecast,
         paths=paths,
     )
+
+
+# --- Phase 2: AI Analyst ------------------------------------------------------
+
+
+@router.post("/dealers/{dealer_id}/ai/insights", response_model=AIInsightsRead)
+async def ai_insights(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> AIInsightsRead:
+    """Run the AI analyst over the SAME bundle the lender package renders.
+    Guardrailed to legitimate treasury/structuring advice only (never
+    statement window-dressing). Nothing is persisted except tracked AI usage —
+    accepting suggestions is a separate explicit call."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    bundle = (await _build_lender_package(db, dealer)).model_dump(mode="json")
+    try:
+        insights = await analyst.generate_insights(db, dealer, bundle)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"AI analyst returned unusable output: {exc}"
+        ) from exc
+    await db.commit()  # persist the tracked usage row
+    return AIInsightsRead(**insights)
+
+
+@router.post(
+    "/dealers/{dealer_id}/ai/insights/accept",
+    response_model=list[PlanActionRead],
+    status_code=status.HTTP_201_CREATED,
+)
+async def accept_ai_insights(
+    dealer_id: UUID, payload: AIInsightsAccept, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerPlanAction]:
+    """Materialize accepted analyst suggestions as plan actions (status=todo,
+    sort appended after the current plan, unpublished until plan publish)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    max_sort = (
+        await db.execute(
+            select(func.max(DealerPlanAction.sort)).where(DealerPlanAction.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    base = int(max_sort) if max_sort is not None else 0
+    created: list[DealerPlanAction] = []
+    for offset, action in enumerate(payload.actions, start=1):
+        row = DealerPlanAction(
+            dealer_id=dealer.id,
+            sort=base + offset,
+            title=action.title,
+            detail=action.rationale,
+            category=action.category,
+            owner=action.owner,
+            timeline=action.timeline,
+            expected_effect=action.expected_effect,
+            status="todo",
+        )
+        db.add(row)
+        created.append(row)
+    await db.commit()
+    for row in created:
+        await db.refresh(row)
+    return created

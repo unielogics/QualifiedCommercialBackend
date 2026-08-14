@@ -52,6 +52,7 @@ class DealerRead(ORM):
     industry: str
     status: str
     notes: str | None = None
+    bucket_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -346,8 +347,81 @@ class DocumentRead(ORM):
     status: str
     error: str | None = None
     extracted: dict | None = None
+    bucket_file_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# --- Phase 2: bucket link, credit & IRS, AI analyst --------------------------
+
+
+class BucketFileItem(BaseModel):
+    """One file in the dealer's linked bucket, with ingest affordances."""
+
+    id: UUID
+    file_name: str
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+    has_analysis: bool = False       # cached BucketFileAnalysis usable (no model call needed)
+    already_ingested: bool = False   # a DealerDocument already references this bucket file
+
+
+class CreditHistoryItem(BaseModel):
+    """Free-form trade/merchant-processor line — extras are preserved."""
+
+    model_config = ConfigDict(extra="allow")
+
+    label: str = Field(min_length=1, max_length=200)
+    months_on_time: int | None = None
+    note: str | None = None
+
+
+class CreditRead(BaseModel):
+    business_history: list[dict] = []
+    personal_score: int | None = None
+    personal_tier: str | None = None
+    updated_at: datetime | None = None
+
+
+class CreditUpsert(BaseModel):
+    business_history: list[CreditHistoryItem] | None = None
+    personal_score: int | None = Field(default=None, ge=300, le=850)
+    personal_tier: str | None = Field(default=None, pattern="^(tier1|tier2)$")
+
+
+class TaxYearRead(BaseModel):
+    year: int
+    filed: bool = False
+    revenue_reported: float | None = None
+    deposits_observed: float | None = None   # sum of period deposits for the calendar year
+    discrepancy_pct: float | None = None     # (observed - reported) / reported * 100
+    filing_id: UUID | None = None            # None when the year has deposits but no filing row
+
+
+class TaxFilingUpsert(BaseModel):
+    filed: bool | None = None
+    revenue_reported: float | None = None
+
+
+class AISuggestedAction(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    category: str = Field(default="liquidity", pattern="^(dscr|ebitda|liquidity|docs)$")
+    owner: str | None = Field(default=None, max_length=80)
+    timeline: str | None = Field(default=None, max_length=80)
+    expected_effect: str | None = Field(default=None, max_length=120)
+    rationale: str | None = None
+
+
+class AIInsightsRead(BaseModel):
+    narrative: str
+    strengths: list[str] = []
+    risks: list[str] = []
+    suggested_actions: list[AISuggestedAction] = []
+
+
+class AIInsightsAccept(BaseModel):
+    actions: list[AISuggestedAction] = Field(min_length=1, max_length=20)
 
 
 class DealerInvite(BaseModel):
