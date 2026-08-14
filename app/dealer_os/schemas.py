@@ -265,3 +265,65 @@ class LadderRead(BaseModel):
 class PathsRead(BaseModel):
     paths: list[FundingPath]
     ladder: LadderRead
+
+
+# --- Stream 5: messaging, sessions & lender package --------------------------
+
+
+class MessageRead(ORM):
+    id: UUID
+    author_user_id: UUID | None = None
+    author_name: str | None = None
+    body: str
+    internal: bool
+    created_at: datetime
+
+
+class MessageCreate(BaseModel):
+    body: str = Field(min_length=1)
+    internal: bool = False
+
+
+class SessionRead(ORM):
+    id: UUID
+    title: str
+    kind: str
+    starts_at: datetime
+    join_url: str | None = None
+    notes: str | None = None
+    created_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SessionCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    kind: str = Field(default="call", pattern="^(training|call|review)$")
+    starts_at: datetime
+    join_url: str | None = Field(default=None, max_length=500)
+    notes: str | None = None
+
+
+class GlobalAlertRead(AlertRead):
+    dealer_id: UUID
+    dealer_name: str
+
+
+class AddbackRead(ORM):
+    id: UUID
+    title: str
+    monthly_amount: float | None = None
+    annual_amount: float | None = None
+    status: str
+    evidence: str | None = None
+
+
+class LenderPackageRead(BaseModel):
+    dealer: DealerRead
+    snapshot: SnapshotRead | None = None
+    targets: list[TargetRead] = []
+    periods: list[PeriodRead] = []
+    addbacks: list[AddbackRead] = []
+    plan: list[PlanActionRead] = []
+    forecast: ForecastRead | None = None
+    paths: PathsRead | None = None

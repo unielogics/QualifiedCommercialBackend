@@ -25,13 +25,16 @@ from .models import (
     DealerBusiness,
     DealerCashEvent,
     DealerFinancialPeriod,
+    DealerMessage,
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
     DealerPlanAction,
+    DealerSession,
     DealerSourceConnection,
 )
 from .schemas import (
+    AddbackRead,
     AlertRead,
     CashEventPatch,
     CashEventRead,
@@ -42,13 +45,19 @@ from .schemas import (
     DealerRead,
     DealerUpdate,
     ForecastRead,
+    GlobalAlertRead,
     HealthRead,
+    LenderPackageRead,
+    MessageCreate,
+    MessageRead,
     PathsRead,
     PeriodRead,
     PeriodUpsert,
     PlanActionCreate,
     PlanActionRead,
     PlanActionUpdate,
+    SessionCreate,
+    SessionRead,
     SnapshotRead,
     TargetOverride,
     TargetRead,
@@ -618,4 +627,220 @@ async def dealer_paths(
     }
     return PathsRead(
         paths=compute_paths(metrics, targets), ladder=compute_ladder(metrics, targets)
+    )
+
+
+# --- Stream 5: messaging, sessions, global alerts & lender package -----------
+
+
+@router.get("/dealers/{dealer_id}/messages", response_model=list[MessageRead])
+async def list_messages(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerMessage]:
+    """Full thread, oldest first. Internal notes are included — this is the
+    team app; the dealer portal (Stream 6) must filter internal=false."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerMessage)
+                .where(DealerMessage.dealer_id == dealer.id)
+                .order_by(DealerMessage.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/messages", response_model=MessageRead, status_code=status.HTTP_201_CREATED
+)
+async def create_message(
+    dealer_id: UUID, payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerMessage:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    message = DealerMessage(
+        dealer_id=dealer.id,
+        author_user_id=user.id,
+        author_name=user.name,
+        body=payload.body,
+        internal=payload.internal,
+    )
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+    return message
+
+
+@router.get("/dealers/{dealer_id}/sessions", response_model=list[SessionRead])
+async def list_sessions(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerSession]:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerSession)
+                .where(DealerSession.dealer_id == dealer.id)
+                .order_by(DealerSession.starts_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED
+)
+async def create_session(
+    dealer_id: UUID, payload: SessionCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerSession:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    session = DealerSession(dealer_id=dealer.id, created_by_user_id=user.id, **payload.model_dump())
+    db.add(session)
+    await db.commit()
+    await db.refresh(session)
+    return session
+
+
+@router.delete("/dealers/{dealer_id}/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session(
+    dealer_id: UUID, session_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    session = (
+        await db.execute(
+            select(DealerSession).where(
+                DealerSession.id == session_id, DealerSession.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found for this dealer")
+    await db.delete(session)
+    await db.commit()
+
+
+@router.get("/alerts", response_model=list[GlobalAlertRead])
+async def list_global_alerts(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[GlobalAlertRead]:
+    """Global team view: every unresolved alert across all dealers, newest first."""
+    require_team(user)
+    rows = (
+        await db.execute(
+            select(DealerAlert, DealerBusiness.name)
+            .join(DealerBusiness, DealerBusiness.id == DealerAlert.dealer_id)
+            .where(DealerAlert.resolved_at.is_(None))
+            .order_by(DealerAlert.created_at.desc())
+        )
+    ).all()
+    out: list[GlobalAlertRead] = []
+    for alert, dealer_name in rows:
+        item = GlobalAlertRead(
+            **AlertRead.model_validate(alert).model_dump(),
+            dealer_id=alert.dealer_id,
+            dealer_name=dealer_name,
+        )
+        out.append(item)
+    return out
+
+
+@router.get("/dealers/{dealer_id}/lender-package", response_model=LenderPackageRead)
+async def lender_package(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> LenderPackageRead:
+    """One-call JSON bundle powering the print-ready lender report. Sections
+    that need a snapshot (forecast, paths) come back None — never 400 — so a
+    brand-new dealer still renders a partial package."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+
+    snapshot = (
+        await db.execute(
+            select(DealerMetricSnapshot)
+            .where(DealerMetricSnapshot.dealer_id == dealer.id)
+            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    target_rows = (
+        (
+            await db.execute(
+                select(DealerMetricTarget)
+                .where(DealerMetricTarget.dealer_id == dealer.id)
+                .order_by(DealerMetricTarget.metric_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    periods = (
+        (
+            await db.execute(
+                select(DealerFinancialPeriod)
+                .where(DealerFinancialPeriod.dealer_id == dealer.id)
+                .order_by(DealerFinancialPeriod.period.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    addbacks = (
+        (
+            await db.execute(
+                select(DealerAddback)
+                .where(DealerAddback.dealer_id == dealer.id)
+                .order_by(DealerAddback.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    plan = (
+        (
+            await db.execute(
+                select(DealerPlanAction)
+                .where(DealerPlanAction.dealer_id == dealer.id)
+                .order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    forecast: ForecastRead | None = None
+    paths: PathsRead | None = None
+    if snapshot is not None:
+        metrics = snapshot.metrics or {}
+        open_actions = [
+            {"category": a.category, "status": a.status, "due_on": a.due_on}
+            for a in plan
+            if a.status != "done"
+        ]
+        forecast = ForecastRead(**compute_forecast(metrics, open_actions))
+        targets_map = {
+            t.metric_key: (float(t.effective_value) if t.effective_value is not None else None)
+            for t in target_rows
+        }
+        paths = PathsRead(
+            paths=compute_paths(metrics, targets_map), ladder=compute_ladder(metrics, targets_map)
+        )
+
+    return LenderPackageRead(
+        dealer=DealerRead.model_validate(dealer),
+        snapshot=SnapshotRead.model_validate(snapshot) if snapshot is not None else None,
+        targets=[_target_read(t) for t in target_rows],
+        periods=[PeriodRead.model_validate(p) for p in periods],
+        addbacks=[AddbackRead.model_validate(a) for a in addbacks],
+        plan=[PlanActionRead.model_validate(a) for a in plan],
+        forecast=forecast,
+        paths=paths,
     )

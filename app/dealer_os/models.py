@@ -230,6 +230,43 @@ class DealerTaxFiling(TimestampMixin, Base):
     discrepancy: Mapped[str | None] = mapped_column(Text)
 
 
+class DealerMessage(TimestampMixin, Base):
+    """Dealer workspace message. internal=True rows are team-only notes and
+    must never be surfaced to the dealer portal (Stream 6)."""
+
+    __tablename__ = "dos_messages"
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    author_name: Mapped[str | None] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+
+class DealerSession(TimestampMixin, Base):
+    """Scheduled touchpoint with the dealer — training | call | review."""
+
+    __tablename__ = "dos_sessions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), default="call", server_default="call")  # training|call|review
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    join_url: Mapped[str | None] = mapped_column(String(500))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
 class DealerSourceConnection(TimestampMixin, Base):
     __tablename__ = "dos_source_connections"
     __table_args__ = (UniqueConstraint("dealer_id", "kind", name="uq_dos_source"),)
