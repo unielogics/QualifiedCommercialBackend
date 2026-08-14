@@ -7,6 +7,7 @@ ledger, plan, forecast, messaging land in Streams 2-5 on this same router.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timezone
 from uuid import UUID
 
@@ -24,11 +25,13 @@ from .models import (
     DealerBusiness,
     DealerCashEvent,
     DealerFinancialPeriod,
+    DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
     DealerSourceConnection,
 )
 from .schemas import (
+    AlertRead,
     CashEventPatch,
     CashEventRead,
     CashImport,
@@ -37,13 +40,18 @@ from .schemas import (
     DealerListItem,
     DealerRead,
     DealerUpdate,
+    HealthRead,
     PeriodRead,
     PeriodUpsert,
+    SnapshotRead,
     TargetOverride,
     TargetRead,
 )
+from .services.engines import recompute_snapshot
 from .services.normalize import classify_event, period_of, rebuild_periods
 from .services.targets import propose_targets
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
 
@@ -217,6 +225,11 @@ async def import_cash_events(
         )
     await db.flush()
     touched = await rebuild_periods(db, dealer.id, periods)
+    # Best-effort engine refresh — never fail the ingest on engine errors.
+    try:
+        await recompute_snapshot(db, dealer.id)
+    except Exception:
+        logger.exception("dealer-os: snapshot recompute failed after cash import for %s", dealer.id)
     await db.commit()
     return CashImportResult(imported=len(payload.rows), periods=touched)
 
@@ -335,6 +348,93 @@ async def upsert_period(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(fp, k, v)
     fp.source = "manual"
+    # Best-effort engine refresh — never fail the ingest on engine errors.
+    try:
+        await recompute_snapshot(db, dealer.id)
+    except Exception:
+        logger.exception("dealer-os: snapshot recompute failed after period upsert for %s", dealer.id)
     await db.commit()
     await db.refresh(fp)
     return fp
+
+
+# --- Stream 3: engines, lineage & alerts -----------------------------------
+
+
+@router.post("/dealers/{dealer_id}/recompute", response_model=SnapshotRead)
+async def recompute_dealer(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerMetricSnapshot:
+    """Force a fresh metric snapshot (with lineage + alerts) for the dealer."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    snapshot = await recompute_snapshot(db, dealer.id)
+    await db.commit()
+    await db.refresh(snapshot)
+    return snapshot
+
+
+@router.get("/dealers/{dealer_id}/health", response_model=HealthRead)
+async def dealer_health(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> HealthRead:
+    """Cockpit read: latest snapshot + targets + unresolved alerts + lineage size."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    snapshot = (
+        await db.execute(
+            select(DealerMetricSnapshot)
+            .where(DealerMetricSnapshot.dealer_id == dealer.id)
+            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    targets = (
+        await db.execute(
+            select(DealerMetricTarget)
+            .where(DealerMetricTarget.dealer_id == dealer.id)
+            .order_by(DealerMetricTarget.metric_key)
+        )
+    ).scalars().all()
+    alerts = (
+        await db.execute(
+            select(DealerAlert)
+            .where(DealerAlert.dealer_id == dealer.id, DealerAlert.resolved_at.is_(None))
+            .order_by(DealerAlert.created_at.desc())
+        )
+    ).scalars().all()
+    lineage_count = 0
+    if snapshot is not None:
+        lineage_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(DealerMetricLineage)
+                .where(DealerMetricLineage.snapshot_id == snapshot.id)
+            )
+        ).scalar_one()
+    return HealthRead(
+        snapshot=SnapshotRead.model_validate(snapshot) if snapshot is not None else None,
+        targets=[_target_read(t) for t in targets],
+        alerts=[AlertRead.model_validate(a) for a in alerts],
+        lineage_count=int(lineage_count),
+    )
+
+
+@router.post("/dealers/{dealer_id}/alerts/{alert_id}/resolve", response_model=AlertRead)
+async def resolve_alert(
+    dealer_id: UUID, alert_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerAlert:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    alert = (
+        await db.execute(
+            select(DealerAlert).where(DealerAlert.id == alert_id, DealerAlert.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if alert is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found for this dealer")
+    if alert.resolved_at is None:
+        alert.resolved_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(alert)
+    return alert

@@ -154,3 +154,32 @@ class PeriodUpsert(BaseModel):
     avg_daily_balance: float | None = None
     nsf_count: int | None = None
     reconciled: bool | None = None
+
+
+# --- Stream 3: engines, lineage & alerts -----------------------------------
+
+
+class SnapshotRead(ORM):
+    id: UUID
+    as_of: date
+    metrics: dict
+    score: float | None = None
+    tier: str | None = None
+
+
+class AlertRead(ORM):
+    id: UUID
+    kind: str
+    severity: str
+    message: str
+    ref_kind: str | None = None
+    ref_id: UUID | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+
+
+class HealthRead(BaseModel):
+    snapshot: SnapshotRead | None = None
+    targets: list[TargetRead] = []
+    alerts: list[AlertRead] = []
+    lineage_count: int = 0
