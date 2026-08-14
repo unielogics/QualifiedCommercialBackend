@@ -17,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.enums import Role
 
-from .deps import load_dealer, require_team
+from .deps import load_dealer, require_team, require_team_or_dealer, resolve_dealer_scope
 from .models import (
     DealerAddback,
     DealerAlert,
@@ -75,10 +76,13 @@ router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
 
 @router.get("/dealers", response_model=list[DealerListItem])
 async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[DealerListItem]:
-    require_team(user)
-    dealers = (
-        await db.execute(select(DealerBusiness).order_by(DealerBusiness.created_at.desc()))
-    ).scalars().all()
+    # Team sees the whole book; a DEALER login sees only businesses linked to it
+    # (dealer_user_id) — this is what powers the self-serve "My business" view.
+    require_team_or_dealer(user)
+    stmt = select(DealerBusiness).order_by(DealerBusiness.created_at.desc())
+    if user.role == Role.DEALER:
+        stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
+    dealers = (await db.execute(stmt)).scalars().all()
     if not dealers:
         return []
     ids = [d.id for d in dealers]
@@ -131,8 +135,8 @@ async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSessi
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
 async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
-    require_team(user)
-    return await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    return await resolve_dealer_scope(db, user, dealer_id)
 
 
 @router.patch("/dealers/{dealer_id}", response_model=DealerRead)
@@ -156,8 +160,8 @@ def _target_read(t: DealerMetricTarget) -> TargetRead:
 
 @router.get("/dealers/{dealer_id}/targets", response_model=list[TargetRead])
 async def list_targets(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[TargetRead]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows = (
         await db.execute(
             select(DealerMetricTarget)
@@ -259,8 +263,8 @@ async def list_cash_events(
     limit: int = Query(default=500, ge=1, le=5000),
     db: AsyncSession = Depends(get_db),
 ) -> list[DealerCashEvent]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerCashEvent).where(DealerCashEvent.dealer_id == dealer.id)
     if period is not None:
         q = q.where(DealerCashEvent.period == period)
@@ -323,8 +327,8 @@ async def patch_cash_event(
 async def list_periods(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerFinancialPeriod]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
             await db.execute(
@@ -396,8 +400,8 @@ async def dealer_health(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> HealthRead:
     """Cockpit read: latest snapshot + targets + unresolved alerts + lineage size."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     snapshot = (
         await db.execute(
             select(DealerMetricSnapshot)
@@ -496,8 +500,8 @@ async def _latest_snapshot_metrics(db: AsyncSession, dealer_id: UUID) -> dict:
 async def list_plan_actions(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerPlanAction]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
             await db.execute(
@@ -584,8 +588,8 @@ async def dealer_forecast(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ForecastRead:
     """12-month baseline vs plan-adjusted projection from the latest snapshot."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     open_actions = (
         (
@@ -609,8 +613,8 @@ async def dealer_paths(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> PathsRead:
     """Funding-path readiness + credit-ladder position from the latest snapshot."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     target_rows = (
         (
@@ -637,20 +641,15 @@ async def dealer_paths(
 async def list_messages(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerMessage]:
-    """Full thread, oldest first. Internal notes are included — this is the
-    team app; the dealer portal (Stream 6) must filter internal=false."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    """Full thread, oldest first. Team sees internal notes; a DEALER login
+    only ever gets internal=false rows."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    q = select(DealerMessage).where(DealerMessage.dealer_id == dealer.id)
+    if user.role == Role.DEALER:
+        q = q.where(DealerMessage.internal.is_(False))
     return (
-        (
-            await db.execute(
-                select(DealerMessage)
-                .where(DealerMessage.dealer_id == dealer.id)
-                .order_by(DealerMessage.created_at.asc())
-            )
-        )
-        .scalars()
-        .all()
+        (await db.execute(q.order_by(DealerMessage.created_at.asc()))).scalars().all()
     )
 
 
@@ -660,14 +659,16 @@ async def list_messages(
 async def create_message(
     dealer_id: UUID, payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerMessage:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    # A dealer can never author an internal note, whatever the payload says.
+    internal = False if user.role == Role.DEALER else payload.internal
     message = DealerMessage(
         dealer_id=dealer.id,
         author_user_id=user.id,
         author_name=user.name,
         body=payload.body,
-        internal=payload.internal,
+        internal=internal,
     )
     db.add(message)
     await db.commit()
@@ -679,8 +680,8 @@ async def create_message(
 async def list_sessions(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerSession]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
             await db.execute(
@@ -760,8 +761,8 @@ async def lender_package(
     """One-call JSON bundle powering the print-ready lender report. Sections
     that need a snapshot (forecast, paths) come back None — never 400 — so a
     brand-new dealer still renders a partial package."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     snapshot = (
         await db.execute(

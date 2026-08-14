@@ -20,6 +20,7 @@ class Role(StrEnum):
     # External loan-referral partner, scoped to the dealer AI-intake tool only —
     # no book-of-business (/loans, /clients, /reports) like Role.BROKER has.
     DEALER_PARTNER = "dealer_partner"
+    DEALER = "dealer"  # Dealer OS self-serve (audit.qualifiedcommercial.com)
 
 
 class Language(StrEnum):

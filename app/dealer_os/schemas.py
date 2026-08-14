@@ -35,6 +35,8 @@ class DealerUpdate(BaseModel):
     industry: str | None = None
     status: str | None = None
     notes: str | None = None
+    # Team links (or unlinks) a dealer self-serve login to this business.
+    dealer_user_id: UUID | None = None
 
 
 class DealerRead(ORM):
