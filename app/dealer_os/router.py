@@ -1613,6 +1613,10 @@ async def _ingest_bucket_file_core(
                 upserted = await _route_tax_years(db, dealer.id, tax_years, notes)
                 years = ", ".join(str(t["year"]) for t in tax_years)
                 notes.append(f"Business tax return {years}: upserted {upserted} filing(s).")
+                # Keep the return's own figures (0117) so EBITDA can be rebuilt
+                # from the filing — bank statements carry no income statement,
+                # and without this the whole EBITDA -> DSCR chain stays null.
+                await _store_tax_detail(db, dealer.id, tax_years, cached)
             else:
                 # An owner's personal return: stored and classified, but it
                 # never writes the business's filing row (dos_tax_filings is
@@ -3149,6 +3153,36 @@ async def lender_package_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+async def _store_tax_detail(
+    db: AsyncSession, dealer_id: UUID, tax_years: list[dict], analysis: dict
+) -> None:
+    """Persist a business return's key_facts onto its dos_tax_filings row.
+
+    Fill-only-null on the identity columns, same precedence law as everywhere
+    else; `detail` is refreshed because it is the AI's own reading of the
+    document, never a human's entry."""
+    facts = analysis.get("key_facts") if isinstance(analysis, dict) else None
+    if not isinstance(facts, dict):
+        return
+    for item in tax_years:
+        row = (
+            await db.execute(
+                select(DealerTaxFiling).where(
+                    DealerTaxFiling.dealer_id == dealer_id,
+                    DealerTaxFiling.year == item["year"],
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            continue
+        row.detail = facts
+        if row.entity_name is None:
+            row.entity_name = str(facts.get("entity_name") or "")[:180] or None
+        if row.form_type is None:
+            row.form_type = str(facts.get("form_type") or facts.get("form") or "")[:32] or None
+    await db.flush()
 
 
 # --- Vendor report & debt schedule (0116) ------------------------------------

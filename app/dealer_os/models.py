@@ -294,6 +294,11 @@ class DealerTaxFiling(TimestampMixin, Base):
     revenue_reported: Mapped[float | None] = mapped_column(Numeric(14, 2))
     deposits_observed: Mapped[float | None] = mapped_column(Numeric(14, 2))
     discrepancy: Mapped[str | None] = mapped_column(Text)
+    # 0117: the return's own figures, kept so EBITDA can be rebuilt from the
+    # filing when no P&L has been uploaded.
+    entity_name: Mapped[str | None] = mapped_column(String(180))
+    form_type: Mapped[str | None] = mapped_column(String(32))
+    detail: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class DealerMessage(TimestampMixin, Base):

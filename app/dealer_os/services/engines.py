@@ -15,7 +15,7 @@ from datetime import date
 from typing import Iterable
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import (
@@ -61,17 +61,84 @@ def _gap(target: float | None, current: float | None) -> float | None:
     return round(max(0.0, target - current), 2)
 
 
+
+# EBITDA components as they appear on a business return. Names vary by form and
+# preparer, so each maps to a list of accepted keys.
+_TAX_EBITDA_FIELDS: dict[str, tuple[str, ...]] = {
+    "base": ("ordinary_business_income", "net_income", "taxable_income", "book_income"),
+    "interest": ("interest_expense", "floor_plan_interest_expense", "mortgage_interest"),
+    "depreciation": ("depreciation", "depreciation_expense", "depreciation_amortization"),
+    "amortization": ("amortization", "amortization_expense"),
+    "taxes": ("taxes_paid", "income_tax_expense"),
+}
+
+
+def _tax_ebitda(filing) -> float | None:
+    """Rebuild annual EBITDA from a business tax return's stored figures.
+
+    EBITDA = ordinary business income + interest + taxes + depreciation +
+    amortization. Officer compensation is deliberately NOT added back here:
+    it is an add-back only when the owner's pay is above market, which is a
+    human judgement that belongs in the add-back editor with evidence — not a
+    silent boost to the headline number a lender sees.
+
+    Returns None when the filing carries no usable base figure, so the metric
+    stays honestly null rather than showing a fabricated zero."""
+    if filing is None or not isinstance(getattr(filing, "detail", None), dict):
+        return None
+    detail = filing.detail
+
+    def pick(keys: tuple[str, ...]) -> float | None:
+        for k in keys:
+            v = detail.get(k)
+            if v is None:
+                continue
+            try:
+                return float(str(v).replace(",", "").replace("$", ""))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    base = pick(_TAX_EBITDA_FIELDS["base"])
+    if base is None:
+        return None
+    total = base
+    for part in ("interest", "depreciation", "amortization", "taxes"):
+        v = pick(_TAX_EBITDA_FIELDS[part])
+        if v is not None:
+            total += abs(v)
+    return round(total, 2)
+
+
 def compute_metrics(
     periods: list[dict],
     addbacks_annual_verified: float,
     targets: dict[str, float | None],
+    fallbacks: dict[str, float | None] | None = None,
 ) -> dict:
     """Pure metric engine over up to 6 trailing monthly periods.
 
     ``periods`` is most-recent-first; each dict carries ebitda_reported,
     debt_service, avg_daily_balance, ending_balance, low_balance, nsf_count,
     deposits (floats or None). Deterministic — same inputs, same output.
+
+    ``fallbacks`` supplies figures bank statements cannot carry, so the two
+    headline pillars are not permanently null on a statements-only dealer:
+
+      tax_ebitda_annual     EBITDA rebuilt from the latest business tax return
+                            (ordinary income + interest + D&A). Bank statements
+                            have no income statement, so without this
+                            ebitda_reported is NULL on every period and the
+                            whole EBITDA -> DSCR chain never computes.
+      debt_schedule_monthly Total monthly payment from the debt schedule
+                            (dos_debts), used when no period carries observed
+                            debt service.
+
+    A fallback is only consulted when the observed value is missing — anything
+    extracted from a statement or set by a human always wins. Each metric
+    reports its `source` so the UI can show where the number came from.
     """
+    fallbacks = fallbacks or {}
     ebitda_target = targets.get("ebitda_target")
     dscr_target = targets.get("dscr_target")
     dscr_floor = targets.get("dscr_floor")
@@ -83,6 +150,14 @@ def compute_metrics(
     # --- EBITDA ladder: reported TTM -> adjusted -> bankable ---------------
     monthly_ebitda = _avg(p.get("ebitda_reported") for p in periods)
     ebitda_reported_ttm = _round2(monthly_ebitda * 12) if monthly_ebitda is not None else None
+    ebitda_source = "periods"
+    if ebitda_reported_ttm is None:
+        tax_ebitda = fallbacks.get("tax_ebitda_annual")
+        if tax_ebitda is not None:
+            ebitda_reported_ttm = _round2(float(tax_ebitda))
+            ebitda_source = "tax_return"
+        else:
+            ebitda_source = "none"
     ebitda_adjusted = (
         _round2(ebitda_reported_ttm + float(addbacks_annual_verified or 0.0))
         if ebitda_reported_ttm is not None
@@ -92,6 +167,14 @@ def compute_metrics(
 
     # --- DSCR --------------------------------------------------------------
     monthly_ds = _avg(p.get("debt_service") for p in periods)
+    ds_source = "periods"
+    if monthly_ds is None:
+        drafted = fallbacks.get("debt_schedule_monthly")
+        if drafted is not None and float(drafted) > 0:
+            monthly_ds = float(drafted)
+            ds_source = "debt_schedule"
+        else:
+            ds_source = "none"
     annual_ds = _round2(monthly_ds * 12) if monthly_ds is not None else None
     dscr = (
         round(ebitda_bankable / annual_ds, 3)
@@ -113,6 +196,29 @@ def compute_metrics(
     liquidity_excess = (
         _round2(liquidity_current - liquidity_floor)
         if liquidity_current is not None and liquidity_floor is not None
+        else None
+    )
+    # Deployable cash is computed HERE, once, and read everywhere. The Treasury
+    # chart used to derive its own — subtracting the operating floor AND the
+    # debt reserve — while this block subtracted only the operating floor, so
+    # the same dealer showed "excess $25,851" on one screen and "deployable $0"
+    # on another. Deployable is the stricter figure (what is genuinely free
+    # after every required reserve) and is floored at zero: you cannot deploy
+    # cash you do not have.
+    debt_reserve = targets.get("liquidity_debt_reserve")
+    required_reserve = _round2(
+        sum(v for v in (liquidity_floor, debt_reserve) if v is not None)
+    ) if (liquidity_floor is not None or debt_reserve is not None) else None
+    deployable = (
+        _round2(max(0.0, liquidity_current - (required_reserve or 0.0)))
+        if liquidity_current is not None
+        else None
+    )
+    # Negative headroom is the number that actually matters to an operator —
+    # how far BELOW the required reserves they are — and clamping hides it.
+    reserve_shortfall = (
+        _round2(max(0.0, (required_reserve or 0.0) - liquidity_current))
+        if liquidity_current is not None and required_reserve is not None
         else None
     )
 
@@ -155,6 +261,7 @@ def compute_metrics(
         "score": score,
         "tier": tier,
         "ebitda": {
+            "source": ebitda_source,
             "reported_ttm": ebitda_reported_ttm,
             "adjusted": ebitda_adjusted,
             "bankable": ebitda_bankable,
@@ -162,6 +269,8 @@ def compute_metrics(
             "gap": _gap(ebitda_target, ebitda_bankable),
         },
         "dscr": {
+            "source": ds_source,
+            "monthly_debt_service": _round2(monthly_ds),
             "current": dscr,
             "target": dscr_target,
             "floor": dscr_floor,
@@ -177,6 +286,10 @@ def compute_metrics(
             "current": liquidity_current,
             "floor": liquidity_floor,
             "excess": liquidity_excess,
+            "debt_reserve": debt_reserve,
+            "required_reserve": required_reserve,
+            "deployable": deployable,
+            "reserve_shortfall": reserve_shortfall,
         },
         "nsf": {
             "count_6mo": nsf_6mo,
@@ -343,7 +456,42 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
         for p in period_rows
     ]
 
-    metrics = compute_metrics(periods, addbacks_annual_verified, targets)
+    # Fallbacks for figures bank statements cannot carry. Observed values
+    # always win; these only fill a gap that would otherwise leave the metric
+    # permanently null.
+    from ..models import DealerDebt, DealerTaxFiling
+
+    drafted_monthly = float(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(DealerDebt.monthly_payment), 0)).where(
+                    DealerDebt.dealer_id == dealer_id, DealerDebt.status == "active"
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    latest_filing = (
+        await db.execute(
+            select(DealerTaxFiling)
+            .where(
+                DealerTaxFiling.dealer_id == dealer_id,
+                DealerTaxFiling.revenue_reported.is_not(None),
+            )
+            .order_by(DealerTaxFiling.year.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    metrics = compute_metrics(
+        periods,
+        addbacks_annual_verified,
+        targets,
+        fallbacks={
+            "debt_schedule_monthly": drafted_monthly or None,
+            "tax_ebitda_annual": _tax_ebitda(latest_filing),
+        },
+    )
 
     snapshot = DealerMetricSnapshot(
         dealer_id=dealer_id,
