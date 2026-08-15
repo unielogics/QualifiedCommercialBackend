@@ -366,8 +366,25 @@ class DocumentRead(ORM):
     extracted: dict | None = None
     bucket_file_id: UUID | None = None
     account_id: UUID | None = None
+    # Doc hub (0114): ZIP expansion parent link + AI classification outputs.
+    parent_document_id: UUID | None = None
+    detected_kind: str | None = None
+    doc_meta: dict | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class DocumentCoverageRead(BaseModel):
+    """Intake completeness rollup for the Documents tab — what the team still
+    needs to collect vs. what the extracted documents already cover."""
+
+    statement_months: list[str] = []   # distinct "YYYY-MM" covered by statements/periods
+    statement_target: int = 6
+    tax_years: list[int] = []          # years with a dos_tax_filings row
+    tax_target: int = 2
+    has_pl: bool = False
+    has_debt_schedule: bool = False
+    open_doc_requests: int = 0
 
 
 # --- Phase 2: bucket link, credit & IRS, AI analyst --------------------------

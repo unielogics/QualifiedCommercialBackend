@@ -339,10 +339,20 @@ class DealerDocument(TimestampMixin, Base):
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     s3_key: Mapped[str | None] = mapped_column(String(400))
-    kind: Mapped[str] = mapped_column(String(24), default="statement", server_default="statement")  # statement|pl|tax|debt_schedule|other
+    kind: Mapped[str] = mapped_column(String(24), default="statement", server_default="statement")  # statement|pl|tax|debt_schedule|other|archive
     status: Mapped[str] = mapped_column(String(16), default="uploaded", server_default="uploaded")  # uploaded|extracting|extracted|failed
     error: Mapped[str | None] = mapped_column(Text)
     extracted: Mapped[dict | None] = mapped_column(JSONB)  # {months: [...], transactions_count, notes}
+    # Doc hub (0114): children of an expanded ZIP archive point at their parent
+    # row — CASCADE so deleting the parent removes the whole expansion.
+    parent_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="CASCADE")
+    )
+    # AI-classified type (bank_statement|tax_return|profit_and_loss|
+    # balance_sheet|debt_schedule|credit_report|other|archive). The uploader-
+    # declared `kind` above is never touched by classification.
+    detected_kind: Mapped[str | None] = mapped_column(String(24))
+    doc_meta: Mapped[dict | None] = mapped_column(JSONB)  # classifier payload summary
     # Mirror row in the dealer's linked Bucket (Phase 2). Set on push (upload
     # -> bucket) and on pull (bucket file ingested -> Dealer OS). SET NULL so
     # bucket-file deletion never destroys the extraction record.

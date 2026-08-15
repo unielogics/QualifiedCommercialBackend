@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import io
 import logging
+import re
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
@@ -85,6 +87,7 @@ from .schemas import (
     DocRequestCreate,
     DocRequestPatch,
     DocRequestRead,
+    DocumentCoverageRead,
     DocumentRead,
     DocumentReject,
     ForecastRead,
@@ -107,7 +110,7 @@ from .schemas import (
     TargetOverride,
     TargetRead,
 )
-from .services import analyst, buckets_link, handoff as handoff_service, report_pdf, rollups, storage
+from .services import analyst, archive, buckets_link, handoff as handoff_service, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
@@ -613,7 +616,7 @@ async def upsert_period(
 # --- Stream 7: document ingestion --------------------------------------------
 
 MAX_DOCUMENT_BYTES = 15 * 1024 * 1024  # 15MB
-_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "other"}
+_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "other", "archive"}
 
 
 async def _auto_fulfill_doc_request(
@@ -654,6 +657,146 @@ async def _auto_fulfill_doc_request(
         after={"status": "fulfilled", "fulfilled_document_id": str(doc.id), "title": match.title},
     )
     return match
+
+
+async def _ingest_zip_upload(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    user: User,
+    is_dealer: bool,
+    kind: str,
+    filename: str,
+    content_type: str,
+    raw: bytes,
+) -> DealerDocument:
+    """Expand a ZIP upload in memory into a PARENT DealerDocument (the archive
+    itself, kind='archive', no account) plus one CHILD row per usable entry.
+
+    Zip-bomb guards run on ZipInfo metadata BEFORE any entry bytes are read
+    (services/archive.plan_zip_entries). TEAM children land status='uploaded'
+    and are NOT extracted inline — a 40-file archive would blow the request
+    timeout — EXCEPT children whose S3 archive failed (s3_key None): their
+    bytes would be unrecoverable, so those extract inline immediately. DEALER
+    children are quarantined as status='pending_review' (the existing approve
+    flow extracts from S3). Returns the PARENT row; the frontend refetches the
+    list to render the children."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except (zipfile.BadZipFile, zipfile.LargeZipFile):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "The file is not a readable ZIP archive"
+        ) from None
+    with zf:
+        try:
+            usable, skipped = archive.plan_zip_entries(zf.infolist(), MAX_DOCUMENT_BYTES)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+        if not usable:
+            reasons = "; ".join(f"{s['name']} ({s['reason']})" for s in skipped[:5])
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The ZIP contains no usable documents"
+                + (f" — skipped: {reasons}" if reasons else ""),
+            )
+        entries: list[tuple[zipfile.ZipInfo, bytes]] = []
+        for info in usable:
+            try:
+                entry_raw = zf.read(info.filename)
+            except Exception:
+                skipped.append({"name": info.filename, "reason": "unreadable"})
+                continue
+            if not entry_raw or len(entry_raw) > MAX_DOCUMENT_BYTES:
+                # The declared size lied — treat like any other bad entry.
+                skipped.append({"name": info.filename, "reason": "declared_size_mismatch"})
+                continue
+            entries.append((info, entry_raw))
+    if not entries:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "No entry in the ZIP could be read"
+        )
+
+    # PARENT: the archive row itself — original zip archived best-effort.
+    parent_key = storage.build_key(dealer.id, filename)
+    parent = DealerDocument(
+        dealer_id=dealer.id,
+        filename=filename,
+        content_type=content_type,
+        size_bytes=len(raw),
+        s3_key=parent_key if storage.put_bytes(parent_key, raw, content_type) else None,
+        kind="archive",
+        status="extracted",
+        detected_kind="archive",
+        extracted={
+            "entries": [info.filename for info, _ in entries],
+            "skipped": skipped,
+        },
+    )
+    db.add(parent)
+    await db.flush()
+
+    children: list[tuple[DealerDocument, bytes]] = []
+    for info, entry_raw in entries:
+        child_name = storage.safe_filename(info.filename.rsplit("/", 1)[-1])
+        child_ct = archive.content_type_for(info.filename)
+        child_key = storage.build_key(dealer.id, child_name)
+        child = DealerDocument(
+            dealer_id=dealer.id,
+            filename=child_name,
+            content_type=child_ct,
+            size_bytes=len(entry_raw),
+            s3_key=child_key if storage.put_bytes(child_key, entry_raw, child_ct) else None,
+            # The uploader-declared kind carries to children ('archive' itself
+            # would be meaningless on a child — those fall back to 'other').
+            kind=kind if kind != "archive" else "other",
+            status="pending_review" if is_dealer else "uploaded",
+            parent_document_id=parent.id,
+        )
+        db.add(child)
+        children.append((child, entry_raw))
+    await db.flush()
+
+    if not is_dealer:
+        for child, entry_raw in children:
+            if child.s3_key is None:
+                # Bytes would be unrecoverable after this request — extract
+                # inline now (the exception to the no-inline-extract rule).
+                # SAVEPOINT: extract_document's failure recovery can roll the
+                # session back, which without a savepoint would discard the
+                # parent + sibling rows this request already flushed.
+                try:
+                    async with db.begin_nested():
+                        await extract_document(db, child, entry_raw)
+                except Exception:
+                    logger.exception(
+                        "dealer-os: inline archive extraction failed for %s", child.id
+                    )
+                    child.status = "failed"
+                    child.error = "Extraction failed inside the archive — upload this file individually."
+                    await db.flush()
+                if child.status == "extracted":
+                    await _auto_fulfill_doc_request(db, dealer.id, child, user)
+        # Best-effort bucket mirror while the bytes are in hand — mirrors the
+        # single-file upload path (push_document no-ops without an s3_key).
+        for child, entry_raw in children:
+            try:
+                await buckets_link.push_document(db, dealer, child, len(entry_raw))
+            except Exception:
+                logger.exception("dealer-os: bucket push failed for document %s", child.id)
+
+    await log_action(
+        db, dealer.id, user, "document.zip_upload", "document",
+        entity_id=parent.id,
+        after={
+            "filename": parent.filename,
+            "size_bytes": parent.size_bytes,
+            "children": len(children),
+            "skipped": len(skipped),
+            "dealer_upload": is_dealer,
+        },
+    )
+    await db.commit()
+    await db.refresh(parent)
+    return parent
 
 
 @router.post(
@@ -719,6 +862,16 @@ async def upload_document(
         )
     filename = storage.safe_filename(file.filename)
     content_type = (file.content_type or "application/octet-stream")[:120]
+
+    # Doc hub (0114): a ZIP expands into a parent 'archive' row + one child
+    # row per usable entry (returned row = the PARENT; the list endpoint
+    # carries the children). account pinning is a single-statement affordance
+    # and does not apply to archives — children go through AI detection.
+    if archive.is_zip_upload(content_type, filename):
+        return await _ingest_zip_upload(
+            db, dealer, user, is_dealer, kind, filename, content_type, raw
+        )
+
     key = storage.build_key(dealer.id, filename)
     s3_key = key if storage.put_bytes(key, raw, content_type) else None
 
@@ -774,6 +927,91 @@ async def list_documents(
         q = q.where(DealerDocument.status != "failed")
     return (
         (await db.execute(q.order_by(DealerDocument.created_at.desc()))).scalars().all()
+    )
+
+
+_COVERAGE_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+# Legacy declared kinds mapped onto the classifier vocabulary — used when a
+# document predates detected_kind (0114) and only `kind` is available.
+_KIND_TO_DETECTED = {
+    "statement": "bank_statement",
+    "pl": "profit_and_loss",
+    "tax": "tax_return",
+    "debt_schedule": "debt_schedule",
+}
+
+
+@router.get("/dealers/{dealer_id}/documents/coverage", response_model=DocumentCoverageRead)
+async def document_coverage(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DocumentCoverageRead:
+    """Intake completeness for the Documents tab: which statement months are
+    covered (extracted statement docs OR period rows with statement flow
+    data), which tax years have a filing row, whether a P&L / debt schedule
+    has landed, and how many doc requests are still open."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    months: set[str] = set()
+    period_rows = (
+        await db.execute(
+            select(
+                DealerFinancialPeriod.period,
+                DealerFinancialPeriod.deposits,
+                DealerFinancialPeriod.withdrawals,
+            ).where(DealerFinancialPeriod.dealer_id == dealer.id)
+        )
+    ).all()
+    for period, deposits, withdrawals in period_rows:
+        if deposits is not None or withdrawals is not None:
+            months.add(f"{period.year:04d}-{period.month:02d}")
+
+    has_pl = False
+    has_debt_schedule = False
+    doc_rows = (
+        await db.execute(
+            select(
+                DealerDocument.kind, DealerDocument.detected_kind, DealerDocument.extracted
+            ).where(
+                DealerDocument.dealer_id == dealer.id, DealerDocument.status == "extracted"
+            )
+        )
+    ).all()
+    for kind, detected_kind, extracted in doc_rows:
+        effective = detected_kind or _KIND_TO_DETECTED.get(kind)
+        if effective == "bank_statement":
+            for m in (extracted or {}).get("months") or []:
+                key = str(m.get("month") or "") if isinstance(m, dict) else ""
+                if _COVERAGE_MONTH_RE.match(key):
+                    months.add(key)
+        elif effective == "profit_and_loss":
+            has_pl = True
+        elif effective == "debt_schedule":
+            has_debt_schedule = True
+
+    tax_years = sorted(
+        (
+            await db.execute(
+                select(DealerTaxFiling.year).where(DealerTaxFiling.dealer_id == dealer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    open_doc_requests = (
+        await db.execute(
+            select(func.count())
+            .select_from(DealerDocRequest)
+            .where(DealerDocRequest.dealer_id == dealer.id, DealerDocRequest.status == "open")
+        )
+    ).scalar_one()
+
+    return DocumentCoverageRead(
+        statement_months=sorted(months),
+        tax_years=tax_years,
+        has_pl=has_pl,
+        has_debt_schedule=has_debt_schedule,
+        open_doc_requests=int(open_doc_requests or 0),
     )
 
 

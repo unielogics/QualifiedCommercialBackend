@@ -43,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.ai.bedrock_client import get_client, model_heavy
 from app.services.ai.usage import tracked_messages_create
 
-from ..models import DealerCashEvent, DealerDocument, DealerFinancialPeriod
+from ..models import DealerCashEvent, DealerDocument, DealerFinancialPeriod, DealerTaxFiling
 from .accounts import match_or_create_account
 from .engines import recompute_snapshot
 from .normalize import classify_with_rules, load_active_rules, period_of, rebuild_periods
@@ -354,14 +354,299 @@ async def _persist_plan(
         logger.exception("dealer-os: snapshot recompute failed after document extract for %s", dealer_id)
 
 
+# --- doc-type classification & routing (doc hub, 0114) -----------------------
+
+# The model's classification vocabulary. detected_kind additionally allows
+# 'archive' (set by the router for ZIP parents, never by the model).
+_DOC_TYPES = {
+    "bank_statement",
+    "tax_return",
+    "profit_and_loss",
+    "balance_sheet",
+    "debt_schedule",
+    "credit_report",
+    "other",
+}
+_MAX_TAX_YEARS = 12
+_MAX_PL_MONTHS = 36
+_MAX_DEBTS = 40
+_DEBT_TRAILING_MONTHS = 12
+
+
+def _normalize_doc_type(raw: Any) -> str | None:
+    s = str(raw or "").strip().lower()
+    return s if s in _DOC_TYPES else None
+
+
+def _clean_tax_years(raw: Any) -> list[dict[str, Any]]:
+    """[{"year": int, "revenue": float|None}], deduped, capped, sane years."""
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:_MAX_TAX_YEARS]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            year = int(float(item.get("year")))
+        except (TypeError, ValueError):
+            continue
+        if not 1990 <= year <= 2100 or year in seen:
+            continue
+        seen.add(year)
+        out.append({"year": year, "revenue": _num(item.get("revenue"))})
+    return out
+
+
+def _clean_pl_months(raw: Any) -> list[dict[str, Any]]:
+    """[{"month": "YYYY-MM", "revenue": float|None, "net_income": float|None}]."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:_MAX_PL_MONTHS]:
+        if not isinstance(item, dict):
+            continue
+        match = _MONTH_RE.match(str(item.get("month") or "").strip())
+        if not match:
+            continue
+        y, mo = int(match.group(1)), int(match.group(2))
+        if not 1 <= mo <= 12:
+            continue
+        key = f"{y:04d}-{mo:02d}"
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {
+            "month": key,
+            "revenue": _num(item.get("revenue")),
+            "net_income": _num(item.get("net_income")),
+        }
+        if entry["revenue"] is None and entry["net_income"] is None:
+            continue
+        out.append(entry)
+    return out
+
+
+def _clean_debts(raw: Any) -> list[dict[str, Any]]:
+    """[{"lender": str, "monthly_payment": float|None, "balance": float|None}]."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:_MAX_DEBTS]:
+        if not isinstance(item, dict):
+            continue
+        lender = str(item.get("lender") or "").strip()[:160]
+        monthly = _num(item.get("monthly_payment"))
+        balance = _num(item.get("balance"))
+        if not lender and monthly is None and balance is None:
+            continue
+        out.append({"lender": lender or "(unnamed lender)", "monthly_payment": monthly, "balance": balance})
+    return out
+
+
+def _build_doc_meta(
+    doc_type: str | None,
+    tax_years: list[dict[str, Any]],
+    pl_months: list[dict[str, Any]],
+    debts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compact classifier payload persisted on the row — the _clean_* helpers
+    already capped every list/string, so this stays JSONB-friendly."""
+    meta: dict[str, Any] = {"doc_type": doc_type}
+    if tax_years:
+        meta["tax_years"] = tax_years
+    if pl_months:
+        meta["pl_months"] = pl_months
+    if debts:
+        meta["debts"] = debts
+        total = _debts_monthly_total(debts)
+        if total > 0:
+            meta["total_monthly_debt_service"] = total
+    return meta
+
+
+def _debts_monthly_total(debts: list[dict[str, Any]]) -> float:
+    return round(
+        sum(float(d["monthly_payment"]) for d in debts if d.get("monthly_payment") is not None), 2
+    )
+
+
+def merge_tax_filings(
+    existing_by_year: dict[int, Any],
+    tax_years: list[dict[str, Any]],
+    notes: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Pure precedence-law merge of AI tax years onto the dealer's filings.
+
+    PRODUCT LAW: a human's entry always wins and is never overwritten.
+    - Missing year -> a create payload {"year", "filed": True, "revenue_reported"}.
+    - Existing row -> fill ONLY NULL fields: revenue_reported is set only when
+      currently None (a differing document value is noted, never applied);
+      filed may move False -> True (the return itself evidences filing) but
+      NEVER True -> False.
+
+    Mutates the existing row objects in place (attribute-level, so bare test
+    objects work). Returns (to_create, changed_existing_count).
+    """
+    to_create: list[dict[str, Any]] = []
+    changed = 0
+    for item in tax_years:
+        year = item["year"]
+        revenue = item.get("revenue")
+        row = existing_by_year.get(year)
+        if row is None:
+            to_create.append({"year": year, "filed": True, "revenue_reported": revenue})
+            continue
+        row_changed = False
+        current = getattr(row, "revenue_reported", None)
+        if current is None:
+            if revenue is not None:
+                row.revenue_reported = revenue
+                row_changed = True
+        elif revenue is not None and abs(float(current) - float(revenue)) >= 0.01:
+            if notes is not None:
+                notes.append(
+                    f"Tax {year}: kept existing reported revenue {float(current):,.2f} "
+                    f"(document said {float(revenue):,.2f})"
+                )
+        if not bool(getattr(row, "filed", False)):
+            row.filed = True
+            row_changed = True
+        if row_changed:
+            changed += 1
+    return to_create, changed
+
+
+async def _route_tax_years(
+    db: AsyncSession, dealer_id: UUID, tax_years: list[dict[str, Any]], notes: list[str]
+) -> int:
+    """Upsert dos_tax_filings from an extracted tax return (fill-only-null)."""
+    if not tax_years:
+        return 0
+    years = [t["year"] for t in tax_years]
+    existing = (
+        (
+            await db.execute(
+                select(DealerTaxFiling).where(
+                    DealerTaxFiling.dealer_id == dealer_id, DealerTaxFiling.year.in_(years)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    to_create, changed = merge_tax_filings({f.year: f for f in existing}, tax_years, notes)
+    for payload in to_create:
+        db.add(DealerTaxFiling(dealer_id=dealer_id, **payload))
+    await db.flush()
+    return changed + len(to_create)
+
+
+async def _route_pl_months(
+    db: AsyncSession, dealer_id: UUID, pl_months: list[dict[str, Any]], notes: list[str]
+) -> int:
+    """Upsert revenue/net_income from a monthly P&L onto dos_financial_periods.
+
+    P&L is dealer-level: rows land in the (dealer, account NULL) scope — the
+    same null-account path _persist_plan uses for unattributed documents.
+    Fill-only-null: a field already populated (statement/manual entry) is kept
+    and the conflict is noted, never overwritten."""
+    updated = 0
+    for m in pl_months:
+        y, mo = (int(p) for p in m["month"].split("-"))
+        period = date(y, mo, 1)
+        fp = (
+            await db.execute(
+                select(DealerFinancialPeriod).where(
+                    DealerFinancialPeriod.dealer_id == dealer_id,
+                    DealerFinancialPeriod.period == period,
+                    DealerFinancialPeriod.account_id.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if fp is None:
+            fp = DealerFinancialPeriod(
+                dealer_id=dealer_id, period=period, account_id=None, source="document"
+            )
+            db.add(fp)
+        changed = False
+        for field in ("revenue", "net_income"):
+            value = m.get(field)
+            if value is None:
+                continue
+            current = getattr(fp, field)
+            if current is None:
+                setattr(fp, field, value)
+                changed = True
+            elif abs(float(current) - float(value)) >= 0.01:
+                notes.append(
+                    f"P&L {m['month']}: kept existing {field} {float(current):,.2f} "
+                    f"(document said {float(value):,.2f})"
+                )
+        if changed:
+            updated += 1
+    await db.flush()
+    return updated
+
+
+async def _route_debt_schedule(
+    db: AsyncSession, dealer_id: UUID, debts: list[dict[str, Any]], notes: list[str]
+) -> int:
+    """Apply a debt schedule's total monthly debt service to the dealer's
+    EXISTING trailing period months — one row per month (debt_service is
+    preference-merged across account rows in the engine, never summed), only
+    where currently NULL. Never creates period rows and never overwrites a
+    value that statements or a human already set."""
+    total = _debts_monthly_total(debts)
+    if total <= 0:
+        notes.append("Debt schedule stored — no monthly payment amounts to apply.")
+        return 0
+    rows = (
+        (
+            await db.execute(
+                select(DealerFinancialPeriod)
+                .where(DealerFinancialPeriod.dealer_id == dealer_id)
+                .order_by(DealerFinancialPeriod.period.desc())
+                .limit(36)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_month: dict[date, list[DealerFinancialPeriod]] = {}
+    for r in rows:
+        by_month.setdefault(r.period, []).append(r)
+    updated = 0
+    for month in sorted(by_month, reverse=True)[:_DEBT_TRAILING_MONTHS]:
+        # Dealer-level number: prefer the null-account row as the carrier.
+        target = sorted(by_month[month], key=lambda r: 0 if r.account_id is None else 1)[0]
+        if target.debt_service is None:
+            target.debt_service = total
+            updated += 1
+    await db.flush()
+    if updated:
+        notes.append(
+            f"Applied {total:,.2f}/mo total debt service to {updated} month(s) "
+            "(only months that had no debt service yet)."
+        )
+    else:
+        notes.append(
+            f"Debt schedule total {total:,.2f}/mo — every existing month already "
+            "has debt service, nothing overwritten."
+        )
+    return updated
+
+
 # --- PDF/image path: same Bedrock vision model as the intake pipeline --------
 
 _EXTRACT_SYSTEM = """You are a financial-document extraction engine for commercial underwriting.
-The user message contains ONE document (a bank statement, P&L, tax return, or debt schedule) as a PDF or image.
+The user message contains ONE document (bank statement, tax return, P&L / income statement, balance sheet, debt schedule, credit report, ...) as a PDF or image.
 Read EVERY page/month — never summarize only the first month.
 
 Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 {
+  "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|debt_schedule|credit_report|other",
   "months": [
     {"month": "YYYY-MM", "total_deposits": number|null, "total_withdrawals": number|null,
      "ending_balance": number|null, "average_ledger_balance": number|null,
@@ -371,16 +656,23 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
     {"date": "YYYY-MM-DD", "description": "string", "amount": number}
   ],
   "account": {"institution": "string|null", "name_hint": "string|null",
-              "mask": "string|null", "kind_hint": "string|null"}
+              "mask": "string|null", "kind_hint": "string|null"},
+  "tax_years": [{"year": number, "revenue": number|null}],
+  "pl_months": [{"month": "YYYY-MM", "revenue": number|null, "net_income": number|null}],
+  "debts": [{"lender": "string", "monthly_payment": number|null, "balance": number|null}]
 }
 
 Rules:
-- One months[] entry per statement month present in the document.
+- "doc_type" is REQUIRED: classify what the document actually IS, regardless of what the uploader called it. Use "other" only when none of the listed types fits.
+- months[] and transactions[] are for BANK STATEMENTS: one months[] entry per statement month present in the document. For any non-statement document return "months": [] and "transactions": [].
 - "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
+- "tax_years" is for TAX RETURNS: one entry per tax year covered, revenue = gross receipts / total revenue as reported on the return (null when not stated). [] for other documents.
+- "pl_months" is for P&L / INCOME STATEMENTS with a monthly breakdown: one entry per month with revenue and net_income when stated. If the P&L is annual/quarterly only, return [] rather than inventing a monthly split.
+- "debts" is for DEBT SCHEDULES: one entry per obligation — lender as printed, monthly_payment = the recurring MONTHLY payment (convert only when the document states the payment frequency; null when unknown), balance = current outstanding balance.
 - Every number is a bare number: no currency symbols, no commas. Withdrawals in total_withdrawals are a positive magnitude.
 - transactions[] is best-effort: include individual lines when they are legible, with deposits positive and withdrawals/debits NEGATIVE. If lines are not reliably legible, return "transactions": [].
-- Use null for any month field the document does not state. Never invent numbers.
-- If the document contains no monthly financial data at all, return {"months": [], "transactions": []}."""
+- Use null for any field the document does not state. Never invent numbers.
+- If the document contains no extractable financial data at all, still return the classified doc_type with every array empty."""
 
 
 def _media_type(content_type: str, filename: str) -> str | None:
@@ -425,7 +717,7 @@ async def _extract_via_model(
         {
             "type": "text",
             "text": f"Document: {doc.filename} (declared kind: {doc.kind}). "
-            "Extract the monthly financials and transactions. Return only the required JSON.",
+            "Classify the document type and extract its financial data. Return only the required JSON.",
         },
         {"type": block_type, "source": {"type": "base64", "media_type": media, "data": encoded}},
     ]
@@ -513,41 +805,108 @@ async def extract_document(
         rules = await load_active_rules(db, doc.dealer_id)
         plan = apply_extraction(extraction, rules=rules)
         notes.extend(plan["notes"])
-        if not plan["events"] and not plan["period_upserts"]:
+
+        # --- classify (doc hub, 0114) ------------------------------------
+        has_statement_data = bool(plan["events"] or plan["period_upserts"])
+        if source == "model":
+            detected = _normalize_doc_type(extraction.get("doc_type"))
+            classified = detected is not None
+            tax_years = _clean_tax_years(extraction.get("tax_years"))
+            pl_months = _clean_pl_months(extraction.get("pl_months"))
+            debts = _clean_debts(extraction.get("debts"))
+            if detected is None:
+                # No usable label — fall back to whichever payload the model
+                # actually produced, so real data still routes.
+                if has_statement_data:
+                    detected = "bank_statement"
+                elif tax_years:
+                    detected = "tax_return"
+                elif pl_months:
+                    detected = "profit_and_loss"
+                elif debts:
+                    detected = "debt_schedule"
+        else:
+            # CSV/XLSX are transaction imports by definition — but a parser
+            # label is not a model classification, so an empty file still fails.
+            detected, classified = "bank_statement", False
+            tax_years, pl_months, debts = [], [], []
+
+        # Validity: fail only when there is neither statement data, nor tax
+        # years, nor P&L months, nor debts, nor a recognized classification.
+        if (
+            not has_statement_data
+            and not tax_years
+            and not pl_months
+            and not debts
+            and not classified
+        ):
             raise ValueError(
                 "No usable financial data found in the document"
                 + (f" ({'; '.join(notes[:3])})" if notes else "")
             )
 
-        # Resolve the bank account: explicit admin choice wins; else the
-        # model's account hint drives match_or_create (AI proposal only —
-        # admin-set roles are never overwritten by a rematch).
-        resolved_account_id = account_id
-        account_hint = extraction.get("account")
-        if resolved_account_id is None and isinstance(account_hint, dict) and any(
-            str(account_hint.get(k) or "").strip()
-            for k in ("institution", "name_hint", "mask", "kind_hint")
-        ):
-            try:
-                account = await match_or_create_account(
-                    db, doc.dealer_id, account_hint, plan["months"]
-                )
-                resolved_account_id = account.id
-                notes.append(
-                    f"Matched to account '{account.name}'"
-                    + (f" ****{account.mask}" if account.mask else "")
-                )
-            except Exception:
-                logger.exception("dealer-os: account match failed for document %s", doc.id)
-        doc.account_id = resolved_account_id
+        doc.detected_kind = detected
+        doc.doc_meta = _build_doc_meta(detected, tax_years, pl_months, debts)
 
-        await _persist_plan(db, doc.dealer_id, plan, account_id=resolved_account_id)
+        # --- route by detected type --------------------------------------
+        if detected == "bank_statement":
+            # Existing statement pipeline, unchanged. Resolve the bank
+            # account: explicit admin choice wins; else the model's account
+            # hint drives match_or_create (AI proposal only — admin-set roles
+            # are never overwritten by a rematch).
+            resolved_account_id = account_id
+            account_hint = extraction.get("account")
+            if resolved_account_id is None and isinstance(account_hint, dict) and any(
+                str(account_hint.get(k) or "").strip()
+                for k in ("institution", "name_hint", "mask", "kind_hint")
+            ):
+                try:
+                    account = await match_or_create_account(
+                        db, doc.dealer_id, account_hint, plan["months"]
+                    )
+                    resolved_account_id = account.id
+                    notes.append(
+                        f"Matched to account '{account.name}'"
+                        + (f" ****{account.mask}" if account.mask else "")
+                    )
+                except Exception:
+                    logger.exception("dealer-os: account match failed for document %s", doc.id)
+            doc.account_id = resolved_account_id
+            await _persist_plan(db, doc.dealer_id, plan, account_id=resolved_account_id)
+        elif detected == "tax_return":
+            upserted = await _route_tax_years(db, doc.dealer_id, tax_years, notes)
+            notes.append(f"Tax return: upserted {upserted} tax year(s) (existing entries kept).")
+        elif detected == "profit_and_loss":
+            updated = await _route_pl_months(db, doc.dealer_id, pl_months, notes)
+            notes.append(f"P&L: filled revenue/net income on {updated} month(s).")
+            try:
+                await recompute_snapshot(db, doc.dealer_id)
+            except Exception:
+                logger.exception(
+                    "dealer-os: snapshot recompute failed after P&L extract for %s", doc.dealer_id
+                )
+        elif detected == "debt_schedule":
+            await _route_debt_schedule(db, doc.dealer_id, debts, notes)
+            try:
+                await recompute_snapshot(db, doc.dealer_id)
+            except Exception:
+                logger.exception(
+                    "dealer-os: snapshot recompute failed after debt-schedule extract for %s",
+                    doc.dealer_id,
+                )
+        else:
+            # balance_sheet | credit_report | other — a classified document
+            # with a stored summary is a SUCCESS, not a failure.
+            notes.append(
+                f"Classified as {detected or 'unrecognized'} — summary stored, no ledger rows written."
+            )
 
         doc.extracted = {
             "months": plan["months"],
             "transactions_count": len(plan["events"]),
             "notes": notes[:50],
             "parser": source,
+            "doc_type": detected,
         }
         doc.status = "extracted"
         doc.error = None
