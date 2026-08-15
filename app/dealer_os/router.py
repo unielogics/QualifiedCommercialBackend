@@ -45,6 +45,7 @@ from .models import (
     DealerTaxFiling,
 )
 from .schemas import (
+    BucketSearchItem,
     AIInsightsAccept,
     AIInsightsRead,
     BucketFileItem,
@@ -155,6 +156,53 @@ async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSessi
     return dealer
 
 
+
+async def _dealer_read(db: AsyncSession, dealer: DealerBusiness) -> DealerRead:
+    r = DealerRead.model_validate(dealer)
+    if dealer.bucket_id is not None:
+        r.bucket_name = (
+            await db.execute(select(Bucket.name).where(Bucket.id == dealer.bucket_id))
+        ).scalar_one_or_none()
+    return r
+
+@router.get("/buckets/search", response_model=list[BucketSearchItem])
+async def search_buckets(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = "") -> list[Bucket]:
+    """Team-only bucket picker for manual dealer<->bucket linking."""
+    require_team(user)
+    stmt = select(Bucket).order_by(Bucket.created_at.desc()).limit(20)
+    needle = q.strip()
+    if needle:
+        like = f"%{needle.lower()}%"
+        stmt = stmt.where(func.lower(Bucket.name).like(like) | func.lower(Bucket.client_name).like(like))
+    return (await db.execute(stmt)).scalars().all()
+
+
+@router.post("/dealers/{dealer_id}/bucket/match", response_model=DealerRead)
+async def match_bucket_by_email(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerRead:
+    """Explicitly find this dealer's intake bucket by email (no bucket creation —
+    manual linking or ensure_bucket handle the rest)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if not dealer.email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Dealer has no email on file — add one, or link a bucket manually.")
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(func.lower(PublicUnderwritingIntake.email) == dealer.email.strip().lower())
+            .order_by(PublicUnderwritingIntake.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if intake is None or intake.bucket_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No intake bucket found for this email — link one manually.")
+    dealer.bucket_id = intake.bucket_id
+    await db.commit()
+    await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
+
+
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
 async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
     require_team_or_dealer(user)
@@ -171,7 +219,7 @@ async def update_dealer(
         setattr(dealer, k, v)
     await db.commit()
     await db.refresh(dealer)
-    return dealer
+    return await _dealer_read(db, dealer)
 
 
 @router.post("/dealers/{dealer_id}/invite", response_model=DealerInviteResult, status_code=status.HTTP_201_CREATED)

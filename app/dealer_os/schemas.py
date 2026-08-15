@@ -26,6 +26,7 @@ class DealerCreate(BaseModel):
 
 class DealerUpdate(BaseModel):
     name: str | None = None
+    bucket_id: UUID | None = None  # manual bucket link/unlink (PATCH with null unlinks)
     legal_name: str | None = None
     ein: str | None = None
     email: str | None = None
@@ -43,6 +44,7 @@ class DealerRead(ORM):
     id: UUID
     name: str
     dealer_user_id: UUID | None = None
+    bucket_name: str | None = None
     legal_name: str | None = None
     ein: str | None = None
     email: str | None = None
@@ -434,3 +436,10 @@ class DealerInviteResult(BaseModel):
     email: str
     user_id: UUID
     clerk_sent: bool = False
+
+
+class BucketSearchItem(ORM):
+    id: UUID
+    name: str
+    client_name: str | None = None
+    created_at: datetime
