@@ -19,13 +19,17 @@ Flushes, never commits — callers own the transaction boundary.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import DealerAccount, DealerFinancialPeriod
+
+logger = logging.getLogger(__name__)
 
 _PAYROLL_KEYWORDS = ("payroll", "paychex", "adp", "gusto")
 _SAVINGS_KEYWORDS = ("savings", "money market", "mmkt", "reserve savings")
@@ -174,17 +178,55 @@ async def match_or_create_account(
         return account
 
     name = (name_hint or institution or (f"Account ****{mask}" if mask else "Bank account"))[:160]
-    account = DealerAccount(
-        dealer_id=dealer_id,
-        name=name,
-        institution=institution[:160] if institution else None,
-        mask=mask,
-        role=role,
-        ai_proposed_role=role,
-        ai_rationale=rationale,
-        role_set_by="ai",
-        status="active",
-    )
-    db.add(account)
-    await db.flush()
-    return account
+
+    # Race-safe create. Two ingest sweeps running concurrently (linking a
+    # bucket schedules one, "ingest all" schedules another) both reach the
+    # select above, both miss, and both insert — which is how a dealer ends up
+    # with two identical accounts and their statements split across the pair,
+    # so primary-operating ADB reads from half the data. uq_dos_account_mask
+    # makes the second insert fail; the savepoint keeps the surrounding
+    # extraction alive so we can adopt the winner.
+    def _build() -> DealerAccount:
+        return DealerAccount(
+            dealer_id=dealer_id,
+            name=name,
+            institution=institution[:160] if institution else None,
+            mask=mask,
+            role=role,
+            ai_proposed_role=role,
+            ai_rationale=rationale,
+            role_set_by="ai",
+            status="active",
+        )
+
+    if not mask:
+        # No mask means no uniqueness guarantee to race against.
+        account = _build()
+        db.add(account)
+        await db.flush()
+        return account
+
+    try:
+        async with db.begin_nested():
+            account = _build()
+            db.add(account)
+            await db.flush()
+        return account
+    except IntegrityError:
+        winner = (
+            await db.execute(
+                select(DealerAccount)
+                .where(DealerAccount.dealer_id == dealer_id, DealerAccount.mask == mask)
+                .order_by(DealerAccount.created_at.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise
+        logger.info(
+            "dealer-os: account create raced for dealer %s mask %s — adopted %s",
+            dealer_id, mask, winner.id,
+        )
+        apply_proposal(winner, role, rationale)
+        await db.flush()
+        return winner

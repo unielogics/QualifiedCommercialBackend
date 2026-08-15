@@ -117,7 +117,7 @@ from .services import analyst, archive, buckets_link, handoff as handoff_service
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
-from .services.extract import _persist_plan, apply_extraction, extract_document
+from .services.extract import _persist_plan, _route_tax_years, apply_extraction, extract_document
 from .services.forecast import compute_forecast
 from .services.normalize import (
     classify_with_rules,
@@ -1468,50 +1468,120 @@ async def _ingest_bucket_file_core(
     await db.flush()
 
     source_note = f"Ingested from linked bucket file '{bucket_file.file_name}'"
-    if analysis_row is not None and isinstance(analysis_row.analysis, dict):
+    cached = analysis_row.analysis if analysis_row is not None else None
+    # The cache only serves documents it can actually classify. Anything else
+    # falls through to a full re-extract below — a cache miss is an extra model
+    # call, never a failed document.
+    cached_kind = (
+        buckets_link.classify_cached_analysis(cached) if isinstance(cached, dict) else None
+    )
+    if cached_kind is not None:
         # Cache path — asserts no model call: adapt the stored analysis JSON
         # into the canonical extraction dict and persist via the same plan.
-        extraction = buckets_link.adapt_analysis_to_extraction(analysis_row.analysis)
+        #
+        # Routing mirrors extract.extract_document exactly: a statement writes
+        # ledger rows, a tax return upserts dos_tax_filings, and any other
+        # classified document is a SUCCESS with its summary stored. Treating a
+        # tax return as "failed" because it has no monthly bank data was the
+        # old behaviour and it discarded fully-extracted filings.
+        extraction = buckets_link.adapt_analysis_to_extraction(cached)
         rules = await load_active_rules(db, dealer.id)
         plan = apply_extraction(extraction, rules=rules)
-        cache_note = f"{source_note} via cached analysis (no model call)"
-        if plan["events"] or plan["period_upserts"]:
+        notes = [f"{source_note} via cached analysis (no model call)"] + plan["notes"]
+        doc.detected_kind = cached_kind
+        routed = True
+
+        if cached_kind == "bank_statement" and (plan["events"] or plan["period_upserts"]):
             await _persist_plan(db, dealer.id, plan)
+        elif cached_kind == "tax_return":
+            tax_years = buckets_link.adapt_analysis_to_tax_years(cached)
+            if not tax_years:
+                # Classified as a return but carrying no readable year — let
+                # the model have a look rather than dropping it.
+                routed = False
+            elif buckets_link.is_business_return(cached):
+                upserted = await _route_tax_years(db, dealer.id, tax_years, notes)
+                years = ", ".join(str(t["year"]) for t in tax_years)
+                notes.append(f"Business tax return {years}: upserted {upserted} filing(s).")
+            else:
+                # An owner's personal return: stored and classified, but it
+                # never writes the business's filing row (dos_tax_filings is
+                # one row per year and drives deposit reconciliation).
+                years = ", ".join(str(t["year"]) for t in tax_years)
+                notes.append(
+                    f"Personal tax return {years} — stored for the owner's file; "
+                    "no business filing row written."
+                )
+        elif cached_kind == "bank_statement":
+            # Classified as a statement but the cache held no usable months.
+            routed = False
+        else:
+            notes.append(
+                f"Classified as {cached_kind} — summary stored, no ledger rows written."
+            )
+
+        if routed:
             doc.extracted = {
                 "months": plan["months"],
                 "transactions_count": len(plan["events"]),
-                "notes": ([cache_note] + plan["notes"])[:50],
+                "notes": notes[:50],
                 "parser": "bucket_analysis_cache",
+                "doc_type": cached_kind,
             }
             doc.status = "extracted"
             doc.error = None
-        else:
-            doc.status = "failed"
-            doc.error = "Cached analysis holds no usable monthly financial data"
-            doc.extracted = {
-                "months": [],
-                "transactions_count": 0,
-                "notes": ([cache_note] + plan["notes"])[:50],
-                "parser": "bucket_analysis_cache",
-            }
-    else:
-        raw = storage.get_bytes(bucket_file.s3_key)
-        if raw is None:
-            raise HTTPException(
-                status.HTTP_502_BAD_GATEWAY,
-                "Could not fetch the bucket file from S3 — try again or re-upload it to Dealer OS directly",
-            )
-        if len(raw) > MAX_DOCUMENT_BYTES:
-            raise HTTPException(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                "Bucket file exceeds the 15MB document limit",
-            )
-        await extract_document(db, doc, raw)
-        if doc.extracted is not None:
-            notes = list(doc.extracted.get("notes") or [])
-            doc.extracted = {**doc.extracted, "notes": ([source_note] + notes)[:50]}
-        elif doc.status == "failed":
-            doc.extracted = {"months": [], "transactions_count": 0, "notes": [source_note]}
+            await db.flush()
+            return doc
+        logger.info(
+            "dealer-os: cached analysis for bucket file %s classified as %s but held no "
+            "usable payload — falling back to full extract",
+            bucket_file.id, cached_kind,
+        )
+
+    raw = storage.get_bytes(bucket_file.s3_key)
+    if raw is None:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Could not fetch the bucket file from S3 — try again or re-upload it to Dealer OS directly",
+        )
+    if len(raw) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "Bucket file exceeds the 15MB document limit",
+        )
+
+    # A ZIP in the bucket is an archive, not an unsupported file. Do NOT
+    # expand it here: the intake pipeline already expands archives on the
+    # bucket side into one BucketFile per entry (they arrive with their path
+    # prefix, e.g. 'TAX RETURNS/2024 return.pdf') and those entries ingest on
+    # their own. Expanding again would create a second copy of every statement
+    # inside and double-count its deposits into ADB and EBITDA. Record it as a
+    # catalogued archive so the row reads as handled rather than failed.
+    if archive.is_zip_upload(doc.content_type, doc.filename):
+        doc.kind = "archive"
+        doc.detected_kind = "archive"
+        doc.status = "extracted"
+        doc.error = None
+        doc.extracted = {
+            "months": [],
+            "transactions_count": 0,
+            "notes": [
+                source_note,
+                "Archive catalogued — its contents were ingested individually from the "
+                "bucket, so the archive itself writes no ledger rows.",
+            ],
+            "parser": "archive_catalogued",
+            "doc_type": "archive",
+        }
+        await db.flush()
+        return doc
+
+    await extract_document(db, doc, raw)
+    if doc.extracted is not None:
+        notes = list(doc.extracted.get("notes") or [])
+        doc.extracted = {**doc.extracted, "notes": ([source_note] + notes)[:50]}
+    elif doc.status == "failed":
+        doc.extracted = {"months": [], "transactions_count": 0, "notes": [source_note]}
 
     await db.flush()
     return doc

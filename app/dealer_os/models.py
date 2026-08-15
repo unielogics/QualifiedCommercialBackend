@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -66,7 +66,19 @@ class DealerAccount(TimestampMixin, Base):
     again — newer proposals only land in ai_proposed_role/ai_rationale."""
 
     __tablename__ = "dos_accounts"
-    __table_args__ = (Index("ix_dos_accounts_dealer", "dealer_id"),)
+    __table_args__ = (
+        Index("ix_dos_accounts_dealer", "dealer_id"),
+        # The last-4 IS the account's identity within a dealer, and it is what
+        # stops two concurrent ingest sweeps from creating the same account
+        # twice (0115). Partial because a NULL mask carries no identity.
+        Index(
+            "uq_dos_account_mask",
+            "dealer_id",
+            "mask",
+            unique=True,
+            postgresql_where=text("mask IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
     dealer_id: Mapped[uuid.UUID] = mapped_column(

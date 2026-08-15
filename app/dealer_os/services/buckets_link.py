@@ -192,3 +192,114 @@ def guess_document_kind(file_name: str | None) -> str:
     if any(k in lower for k in ("statement", "stmt", "bank", "checking", "chase", "wells", "boa")):
         return "statement"
     return "other"
+
+
+# --- Cached-analysis classification -------------------------------------------
+#
+# The intake pipeline's analysis JSON has no doc_type field — its shape is
+# {baseline_categories_supported, key_facts, limitations, red_flags, supports}.
+# So classification reads the key_facts SHAPE first (structural and reliable:
+# a tax return carries tax_year/form_type, a statement carries
+# statement_period/ending_balance) and falls back to keyword-matching the
+# free-text baseline categories. Both are pure and deterministic, which keeps
+# the cache path's guarantee that it never costs a model call.
+
+_TAX_FACT_KEYS = ("tax_year", "form_type", "gross_receipts", "ordinary_business_income")
+_STATEMENT_FACT_KEYS = (
+    "statement_period",
+    "ending_balance",
+    "average_ledger_balance",
+    "total_deposits_and_credits",
+)
+
+
+def _facts_of(analysis: dict[str, Any]) -> dict[str, Any]:
+    facts = analysis.get("key_facts") if isinstance(analysis, dict) else None
+    return facts if isinstance(facts, dict) else {}
+
+
+def _baseline_text(analysis: dict[str, Any]) -> str:
+    """All baseline-category labels lowercased into one searchable string."""
+    raw = analysis.get("baseline_categories_supported") if isinstance(analysis, dict) else None
+    if isinstance(raw, list):
+        return " ".join(str(x) for x in raw).lower()
+    return str(raw or "").lower()
+
+
+def classify_cached_analysis(analysis: dict[str, Any]) -> str | None:
+    """Best-effort document type for a cached BucketFileAnalysis.
+
+    Returns one of extract._normalize_doc_type's labels ('bank_statement',
+    'tax_return', 'profit_and_loss', 'balance_sheet', 'debt_schedule') or None
+    when the analysis carries no recognizable signal — in which case the
+    caller should fall back to a full re-extract rather than declaring the
+    document failed."""
+    facts = _facts_of(analysis)
+    if any(k in facts for k in _STATEMENT_FACT_KEYS):
+        return "bank_statement"
+    if any(k in facts for k in _TAX_FACT_KEYS):
+        return "tax_return"
+
+    text = _baseline_text(analysis)
+    if "bank statement" in text or "bank_statement" in text:
+        return "bank_statement"
+    if "tax return" in text or "tax_return" in text or "k-1" in text:
+        return "tax_return"
+    if "profit" in text and "loss" in text:
+        return "profit_and_loss"
+    if "balance sheet" in text:
+        return "balance_sheet"
+    if "debt schedule" in text:
+        return "debt_schedule"
+    return None
+
+
+_BUSINESS_FORMS = ("1120", "1065", "1040-c", "schedule c")
+_PERSONAL_FORMS = ("1040",)
+
+
+def is_business_return(analysis: dict[str, Any]) -> bool:
+    """True when a tax-return analysis is the BUSINESS's own return.
+
+    dos_tax_filings is UNIQUE per (dealer, year) and exists to reconcile the
+    business's reported revenue against its observed deposits. An owner's
+    personal 1040 for the same year would collide with the business return and
+    — since merge_tax_filings fills only NULLs — could land the owner's
+    personal income as the company's revenue. A K-1 is likewise excluded: it
+    reports a shareholder's share, not the entity's return, even though it
+    names the entity.
+
+    The discriminator is entity_name (business returns carry it, personal ones
+    don't), with form_type as a cross-check."""
+    facts = _facts_of(analysis)
+    form = str(facts.get("form_type") or facts.get("form") or "").lower()
+    if "k-1" in form or "k1" in form:
+        return False
+    if any(f in form for f in _BUSINESS_FORMS):
+        return True
+    if form and any(f in form for f in _PERSONAL_FORMS):
+        return False
+    return bool(str(facts.get("entity_name") or "").strip())
+
+
+def adapt_analysis_to_tax_years(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Adapt a cached tax-return analysis into extract._route_tax_years' shape:
+    [{"year": int, "revenue": float|None}].
+
+    Revenue is the filing's top line — gross receipts for an 1120/1120-S/1065 —
+    because the IRS module reconciles *reported revenue* against observed bank
+    deposits. total_income/total_revenue are accepted as fallbacks."""
+    facts = _facts_of(analysis)
+    raw_year = facts.get("tax_year") or facts.get("year")
+    try:
+        year = int(float(str(raw_year).strip()[:4]))
+    except (TypeError, ValueError):
+        return []
+    if not 1990 <= year <= 2100:
+        return []
+    revenue = None
+    for key in ("gross_receipts", "total_revenue", "total_income", "revenue"):
+        revenue = _parse_amount(facts.get(key))
+        if revenue is not None:
+            break
+    return [{"year": year, "revenue": revenue}]
