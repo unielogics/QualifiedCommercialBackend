@@ -16,7 +16,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -41,6 +41,7 @@ from .models import (
     DealerCashEvent,
     DealerCategoryRule,
     DealerCreditProfile,
+    DealerDebt,
     DealerDocRequest,
     DealerDocument,
     DealerFinancialPeriod,
@@ -76,6 +77,10 @@ from .schemas import (
     DealerListItem,
     DealerRead,
     DealerUpdate,
+    DebtCreate,
+    DebtDraftResult,
+    DebtPatch,
+    DebtRead,
     DocRequestCreate,
     DocRequestPatch,
     DocRequestRead,
@@ -113,8 +118,11 @@ from .schemas import (
     TargetRead,
     TaxFilingUpsert,
     TaxYearRead,
+    VendorCategoryPatch,
+    VendorReportRead,
+    VendorRowRead,
 )
-from .services import analyst, archive, buckets_link, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, archive, buckets_link, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
@@ -3141,3 +3149,289 @@ async def lender_package_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+# --- Vendor report & debt schedule (0116) ------------------------------------
+
+
+async def _vendor_rollup(db: AsyncSession, dealer: DealerBusiness):
+    """Shared: load the dealer's events + admin category rules and roll up."""
+    rows = (
+        (
+            await db.execute(
+                select(DealerCashEvent).where(DealerCashEvent.dealer_id == dealer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    overrides = {
+        r.pattern: r.category
+        for r in (
+            (
+                await db.execute(
+                    select(DealerCategoryRule).where(
+                        or_(
+                            DealerCategoryRule.dealer_id == dealer.id,
+                            DealerCategoryRule.dealer_id.is_(None),
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    self_names = [n for n in (dealer.name, dealer.legal_name) if n]
+    events = [
+        vendors.VendorEvent(r.occurred_on, r.description or "", float(r.amount or 0))
+        for r in rows
+    ]
+    return vendors.rollup_vendors(events, overrides=overrides, self_names=self_names), len(events)
+
+
+@router.get("/dealers/{dealer_id}/vendors", response_model=VendorReportRead)
+async def vendor_report(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> VendorReportRead:
+    """Per-vendor activity rollup — who the money actually moves with.
+
+    Grouped on vendor identity rather than a cadence band, because the old
+    recurrence engine required a regular interval and therefore returned zero
+    groups on a real dealer's 414 events."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rolled, analyzed = await _vendor_rollup(db, dealer)
+    return VendorReportRead(
+        vendors=[VendorRowRead(**{k: v for k, v in vars(r).items() if not k.startswith("_")}) for r in rolled],
+        categories=list(vendors.CATEGORIES),
+        recurring_count=sum(1 for r in rolled if r.is_recurring),
+        one_off_count=sum(1 for r in rolled if not r.is_recurring),
+        events_analyzed=analyzed,
+    )
+
+
+@router.post("/dealers/{dealer_id}/vendors/category", response_model=VendorReportRead)
+async def set_vendor_category(
+    dealer_id: UUID,
+    body: VendorCategoryPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> VendorReportRead:
+    """Correct a vendor's category. Stored as a dealer-scoped rule so it
+    survives re-classification — the AI never overwrites it."""
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if body.category not in vendors.CATEGORIES:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"category must be one of: {', '.join(vendors.CATEGORIES)}",
+        )
+    existing = (
+        await db.execute(
+            select(DealerCategoryRule).where(
+                DealerCategoryRule.dealer_id == dealer.id,
+                DealerCategoryRule.pattern == body.vendor_key,
+            )
+        )
+    ).scalar_one_or_none()
+    before = {"category": existing.category} if existing else None
+    if existing is None:
+        db.add(
+            DealerCategoryRule(
+                dealer_id=dealer.id, pattern=body.vendor_key, category=body.category
+            )
+        )
+    else:
+        existing.category = body.category
+    await log_action(
+        db, dealer.id, user, "vendor.categorize", "vendor",
+        before=before, after={"vendor_key": body.vendor_key, "category": body.category},
+    )
+    await db.commit()
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rolled, analyzed = await _vendor_rollup(db, dealer)
+    return VendorReportRead(
+        vendors=[VendorRowRead(**{k: v for k, v in vars(r).items() if not k.startswith("_")}) for r in rolled],
+        categories=list(vendors.CATEGORIES),
+        recurring_count=sum(1 for r in rolled if r.is_recurring),
+        one_off_count=sum(1 for r in rolled if not r.is_recurring),
+        events_analyzed=analyzed,
+    )
+
+
+@router.get("/dealers/{dealer_id}/debts", response_model=list[DebtRead])
+async def list_debts(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerDebt]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.monthly_payment.desc().nullslast())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post("/dealers/{dealer_id}/debts/draft", response_model=DebtDraftResult)
+async def draft_debt_schedule(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DebtDraftResult:
+    """Draft the debt schedule from observed vendor activity.
+
+    A baseline, not an answer: every row is editable and a row a human has
+    touched (origin='admin') is never rewritten. Dismissed rows stay dismissed
+    so a re-draft does not resurrect something the admin rejected."""
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rolled, _ = await _vendor_rollup(db, dealer)
+    proposals = vendors.draft_debt_rows(rolled)
+
+    existing = {
+        d.vendor_key: d
+        for d in (
+            (
+                await db.execute(
+                    select(DealerDebt).where(
+                        DealerDebt.dealer_id == dealer.id, DealerDebt.vendor_key.is_not(None)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+
+    created = updated = skipped = 0
+    for p in proposals:
+        evidence = {
+            "observed_months": p["observed_months"],
+            "observed_count": p["observed_count"],
+            "cadence": p["cadence"],
+            "amount_stable": p["amount_stable"],
+            "rationale": p["rationale"],
+            "last_seen": p["last_seen"].isoformat(),
+        }
+        row = existing.get(p["vendor_key"])
+        if row is None:
+            db.add(
+                DealerDebt(
+                    dealer_id=dealer.id,
+                    lender=p["lender"],
+                    category=p["category"],
+                    monthly_payment=p["monthly_payment"],
+                    origin="ai_draft",
+                    status="active",
+                    vendor_key=p["vendor_key"],
+                    evidence=evidence,
+                )
+            )
+            created += 1
+        elif row.origin == "admin" or row.status == "dismissed":
+            skipped += 1
+        else:
+            row.monthly_payment = p["monthly_payment"]
+            row.category = p["category"]
+            row.evidence = evidence
+            updated += 1
+
+    await log_action(
+        db, dealer.id, user, "debts.draft", "debt",
+        after={"created": created, "updated": updated, "skipped_admin": skipped},
+    )
+    await db.commit()
+
+    rows = list(
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.monthly_payment.desc().nullslast())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return DebtDraftResult(
+        created=created,
+        updated=updated,
+        skipped_admin=skipped,
+        total_monthly=round(sum(float(r.monthly_payment or 0) for r in rows), 2),
+        debts=[DebtRead.model_validate(r) for r in rows],
+    )
+
+
+@router.post("/dealers/{dealer_id}/debts", response_model=DebtRead, status_code=status.HTTP_201_CREATED)
+async def create_debt(
+    dealer_id: UUID, body: DebtCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDebt:
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = DealerDebt(dealer_id=dealer.id, origin="admin", status="active", **body.model_dump())
+    db.add(row)
+    await log_action(db, dealer.id, user, "debts.create", "debt", after=body.model_dump(mode="json"))
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.patch("/dealers/{dealer_id}/debts/{debt_id}", response_model=DebtRead)
+async def patch_debt(
+    dealer_id: UUID,
+    debt_id: UUID,
+    body: DebtPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerDebt:
+    """Edit a debt row. Any human edit promotes origin to 'admin', which is
+    what stops a later re-draft from overwriting the correction."""
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerDebt).where(DealerDebt.id == debt_id, DealerDebt.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+    patch = body.model_dump(exclude_unset=True)
+    before = {k: getattr(row, k) for k in patch}
+    for k, v in patch.items():
+        setattr(row, k, v)
+    row.origin = "admin"
+    await log_action(
+        db, dealer.id, user, "debts.update", "debt",
+        entity_id=row.id, before=jsonable_encoder(before), after=jsonable_encoder(patch),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.delete("/dealers/{dealer_id}/debts/{debt_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_debt(
+    dealer_id: UUID, debt_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    """Delete a hand-added row; a DRAFTED row is dismissed instead so the next
+    draft does not resurrect it."""
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerDebt).where(DealerDebt.id == debt_id, DealerDebt.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+    if row.vendor_key:
+        row.status = "dismissed"
+    else:
+        await db.delete(row)
+    await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
+    await db.commit()

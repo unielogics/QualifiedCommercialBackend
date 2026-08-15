@@ -445,6 +445,36 @@ class DealerCategoryRule(TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
 
+class DealerDebt(TimestampMixin, Base):
+    """One obligation on the dealer's debt schedule (0116).
+
+    Drafted from the vendor rollup, then owned by the admin: origin='ai_draft'
+    rows may be refreshed by a re-draft, but origin='admin' is never
+    overwritten — the same precedence law as metric targets and account roles.
+    Dismissing a drafted row keeps it from returning without deleting the
+    evidence that it was proposed."""
+
+    __tablename__ = "dos_debts"
+    __table_args__ = (Index("ix_dos_debts_dealer", "dealer_id"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    lender: Mapped[str] = mapped_column(String(180), nullable=False)
+    category: Mapped[str] = mapped_column(String(24), default="loan", server_default="loan")
+    monthly_payment: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    rate: Mapped[float | None] = mapped_column(Numeric(6, 3))
+    term_months: Mapped[int | None] = mapped_column(Integer)
+    maturity_on: Mapped[date | None] = mapped_column(Date)
+    origin: Mapped[str] = mapped_column(String(16), default="ai_draft", server_default="ai_draft")
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
+    vendor_key: Mapped[str | None] = mapped_column(String(60))
+    evidence: Mapped[dict | None] = mapped_column(JSONB)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
 class DealerSourceConnection(TimestampMixin, Base):
     __tablename__ = "dos_source_connections"
     __table_args__ = (UniqueConstraint("dealer_id", "kind", name="uq_dos_source"),)

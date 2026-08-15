@@ -691,3 +691,90 @@ class ProgressRead(BaseModel):
     improved: list[str] = []
     slipped: list[str] = []
     actions_completed: list[str] = []
+
+
+class VendorRowRead(BaseModel):
+    """One counterparty's activity rollup — the per-vendor report."""
+
+    key: str
+    sample_description: str
+    direction: int                 # +1 money in, -1 money out
+    category: str
+    category_source: str           # "rule" (admin-set) | "heuristic"
+    rationale: str
+    count: int
+    months: int
+    first_seen: date
+    last_seen: date
+    total: float
+    median_amount: float
+    monthly_average: float
+    cadence: str
+    is_recurring: bool
+    amount_stable: bool
+    debt_like: bool
+
+
+class VendorReportRead(BaseModel):
+    vendors: list[VendorRowRead] = []
+    categories: list[str] = []
+    recurring_count: int = 0
+    one_off_count: int = 0
+    events_analyzed: int = 0
+
+
+class VendorCategoryPatch(BaseModel):
+    """Admin correction of a vendor's category — persisted as a rule so it
+    survives re-classification and applies to future events."""
+
+    vendor_key: str
+    category: str
+
+
+class DebtRead(BaseModel):
+    id: UUID
+    lender: str
+    category: str
+    monthly_payment: float | None = None
+    balance: float | None = None
+    rate: float | None = None
+    term_months: int | None = None
+    maturity_on: date | None = None
+    origin: str
+    status: str
+    vendor_key: str | None = None
+    evidence: dict | None = None
+    notes: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DebtCreate(BaseModel):
+    lender: str = Field(min_length=1, max_length=180)
+    category: str = "loan"
+    monthly_payment: float | None = None
+    balance: float | None = None
+    rate: float | None = None
+    term_months: int | None = None
+    maturity_on: date | None = None
+    notes: str | None = None
+
+
+class DebtPatch(BaseModel):
+    lender: str | None = Field(default=None, min_length=1, max_length=180)
+    category: str | None = None
+    monthly_payment: float | None = None
+    balance: float | None = None
+    rate: float | None = None
+    term_months: int | None = None
+    maturity_on: date | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+class DebtDraftResult(BaseModel):
+    created: int = 0
+    updated: int = 0
+    skipped_admin: int = 0     # rows a human owns — never touched
+    total_monthly: float = 0.0
+    debts: list[DebtRead] = []
