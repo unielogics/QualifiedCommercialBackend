@@ -385,6 +385,45 @@ class DocumentCoverageRead(BaseModel):
     has_pl: bool = False
     has_debt_schedule: bool = False
     open_doc_requests: int = 0
+    # Freshness (deterministic date math vs. today — services.recurrence):
+    current_through: str | None = None  # latest covered "YYYY-MM", null = no coverage
+    expected_months: list[str] = []     # the 6 most recent COMPLETED months
+    missing_months: list[str] = []      # expected minus covered, sorted
+    is_current: bool = False            # the most recent completed month is covered
+    days_since_latest: int | None = None  # days from END of latest covered month to today
+
+
+class RecurringGroupRead(BaseModel):
+    """One detected recurring payment/deposit group (deterministic engine)."""
+
+    key: str
+    sample_description: str
+    cadence: str                 # weekly|biweekly|monthly|quarterly
+    occurrences: int
+    avg_amount: float
+    amount_stable: bool
+    first_seen: date
+    last_seen: date
+    next_expected_on: date
+    overdue: bool                # next_expected_on < today
+    monthly_equivalent: float    # avg_amount normalized to monthly by cadence
+    direction: str               # inflow|outflow
+
+
+class IrregularEventRead(BaseModel):
+    """A large one-off outflow outside every recurring group."""
+
+    event_id: UUID
+    occurred_on: date
+    description: str
+    amount: float
+    category: str
+
+
+class RecurringRead(BaseModel):
+    groups: list[RecurringGroupRead] = []
+    irregular: list[IrregularEventRead] = []
+    computed_at: date
 
 
 # --- Phase 2: bucket link, credit & IRS, AI analyst --------------------------

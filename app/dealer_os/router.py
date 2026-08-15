@@ -104,13 +104,16 @@ from .schemas import (
     PlanActionCreate,
     PlanActionRead,
     PlanActionUpdate,
+    IrregularEventRead,
+    RecurringGroupRead,
+    RecurringRead,
     SessionCreate,
     SessionRead,
     SnapshotRead,
     TargetOverride,
     TargetRead,
 )
-from .services import analyst, archive, buckets_link, handoff as handoff_service, report_pdf, rollups, storage
+from .services import analyst, archive, buckets_link, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
@@ -280,6 +283,84 @@ async def match_bucket_by_email(dealer_id: UUID, user: CurrentUser, db: AsyncSes
     if intake is None or intake.bucket_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No intake bucket found for this email — link one manually.")
     dealer.bucket_id = intake.bucket_id
+    await db.commit()
+    await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
+
+
+@router.post("/dealers/{dealer_id}/bucket/create", response_model=DealerRead)
+async def create_dealer_bucket(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerRead:
+    """Create-and-link a dedicated bucket for this dealer (team only).
+
+    No bucket linked -> exactly the standard ensure_bucket resolution (adopt
+    the intake bucket matched by email, else create a fresh audit bucket).
+    Already linked -> a BRAND-NEW "Audit — {name}" bucket is created (same row
+    shape ensure_bucket uses) and the dealer is repointed at it; the previous
+    bucket row is left untouched — never deleted. Manual linking to an
+    arbitrary existing bucket stays where it already lives: PATCH /dealers
+    with DealerUpdate.bucket_id."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    before_bucket_id = dealer.bucket_id
+    if dealer.bucket_id is None:
+        bucket = await buckets_link.ensure_bucket(db, dealer)
+    else:
+        # Idempotency: a double-click on an already-dedicated EMPTY audit
+        # bucket should not mint junk buckets — keep the current link.
+        current = await db.get(Bucket, dealer.bucket_id)
+        if current is not None and (current.name or "").startswith("Audit — "):
+            file_count = (
+                await db.execute(
+                    select(func.count()).select_from(BucketFile).where(
+                        BucketFile.bucket_id == current.id
+                    )
+                )
+            ).scalar_one()
+            if file_count == 0:
+                await db.commit()
+                await db.refresh(dealer)
+                return await _dealer_read(db, dealer)
+        # Mirror ensure_bucket's fresh-audit-bucket row shape (name/client_name
+        # only; bucket_type/purpose stay at their model defaults).
+        bucket = Bucket(
+            name=f"Audit — {dealer.name}"[:180],
+            client_name=(dealer.name or "")[:180] or None,
+        )
+        db.add(bucket)
+        await db.flush()
+        dealer.bucket_id = bucket.id
+        await db.flush()
+        # Backfill: re-mirror the dealer's archived documents into the NEW
+        # bucket so "assign a new bucket" moves the file set with it (the old
+        # bucket keeps its rows — same S3 objects, never deleted).
+        docs = (
+            (
+                await db.execute(
+                    select(DealerDocument).where(
+                        DealerDocument.dealer_id == dealer.id,
+                        DealerDocument.s3_key.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for doc in docs:
+            try:
+                doc.bucket_file_id = None  # force a fresh mirror in the new bucket
+                await buckets_link.push_document(db, dealer, doc, doc.size_bytes or 0)
+            except Exception:
+                logger.exception(
+                    "dealer-os: bucket backfill failed for document %s", doc.id
+                )
+    await log_action(
+        db, dealer.id, user, "dealer.bucket_create", "dealer",
+        entity_id=dealer.id,
+        before={"bucket_id": before_bucket_id},
+        after={"bucket_id": bucket.id},
+    )
     await db.commit()
     await db.refresh(dealer)
     return await _dealer_read(db, dealer)
@@ -467,6 +548,10 @@ async def import_cash_events(
         await recompute_snapshot(db, dealer.id)
     except Exception:
         logger.exception("dealer-os: snapshot recompute failed after cash import for %s", dealer.id)
+    try:
+        await recurrence.stamp_recurrence(db, dealer.id)
+    except Exception:
+        logger.exception("dealer-os: recurrence stamp failed after cash import for %s", dealer.id)
     await db.commit()
     return CashImportResult(imported=len(payload.rows), periods=touched)
 
@@ -555,6 +640,74 @@ async def patch_cash_event(
     await db.commit()
     await db.refresh(event)
     return event
+
+
+@router.get("/dealers/{dealer_id}/recurring", response_model=RecurringRead)
+async def recurring_view(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> RecurringRead:
+    """Deterministic recurring-payment view: groups detected live from the
+    event ledger via the pure recurrence core (stale stamps are never trusted
+    for this response), plus large irregular one-off outflows. Groups are
+    sorted by |monthly_equivalent| desc; irregular is capped at 40, newest
+    first."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = (
+        await db.execute(
+            select(
+                DealerCashEvent.id,
+                DealerCashEvent.occurred_on,
+                DealerCashEvent.description,
+                DealerCashEvent.amount,
+                DealerCashEvent.category,
+            )
+            .where(DealerCashEvent.dealer_id == dealer.id)
+            # Newest window — over-cap ledgers drop the OLDEST rows, never the
+            # newest (otherwise every group reads as frozen/overdue).
+            .order_by(DealerCashEvent.occurred_on.desc())
+            .limit(recurrence.MAX_EVENTS)
+        )
+    ).all()
+    today = date.today()
+    lite = [
+        recurrence.EventLite(rid, occurred_on, description or "", float(amount or 0))
+        for rid, occurred_on, description, amount, _category in rows
+    ]
+    category_by_id = {rid: category for rid, _o, _d, _a, category in rows}
+    groups = recurrence.detect_groups(lite)  # already sorted by |monthly_equivalent| desc
+    irregular = recurrence.classify_irregular(lite, groups)
+    irregular.sort(key=lambda e: e.occurred_on, reverse=True)
+    return RecurringRead(
+        groups=[
+            RecurringGroupRead(
+                key=g.key,
+                sample_description=g.sample_description,
+                cadence=g.cadence,
+                occurrences=g.occurrences,
+                avg_amount=g.avg_amount,
+                amount_stable=g.amount_stable,
+                first_seen=g.first_seen,
+                last_seen=g.last_seen,
+                next_expected_on=g.next_expected_on,
+                overdue=g.next_expected_on < today,
+                monthly_equivalent=g.monthly_equivalent,
+                direction=g.direction,
+            )
+            for g in groups
+        ],
+        irregular=[
+            IrregularEventRead(
+                event_id=e.id,
+                occurred_on=e.occurred_on,
+                description=e.description,
+                amount=e.amount,
+                category=category_by_id.get(e.id) or "uncategorized",
+            )
+            for e in irregular[:40]
+        ],
+        computed_at=today,
+    )
 
 
 @router.get("/dealers/{dealer_id}/periods", response_model=list[PeriodRead])
@@ -1012,6 +1165,8 @@ async def document_coverage(
         has_pl=has_pl,
         has_debt_schedule=has_debt_schedule,
         open_doc_requests=int(open_doc_requests or 0),
+        # Deterministic freshness vs. today (pure helper — services.recurrence).
+        **recurrence.compute_freshness(months, date.today()),
     )
 
 
@@ -2130,7 +2285,13 @@ async def create_rule(
             if event.category == rule.category:
                 continue
             event.category = rule.category
-            event.flags = flags_for(rule.category)
+            base = event.flags if isinstance(event.flags, dict) else {}
+            kept = {
+                k: base[k]
+                for k in ("recurring", "cadence", "recurrence_key", "irregular")
+                if k in base
+            }
+            event.flags = {**flags_for(rule.category), **kept}
             event.categorized_by = "rule"
             scopes.setdefault(event.account_id, set()).add(event.period)
             retro_applied += 1

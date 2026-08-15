@@ -47,6 +47,7 @@ from ..models import DealerCashEvent, DealerDocument, DealerFinancialPeriod, Dea
 from .accounts import match_or_create_account
 from .engines import recompute_snapshot
 from .normalize import classify_with_rules, load_active_rules, period_of, rebuild_periods
+from .recurrence import stamp_recurrence
 from . import storage
 
 logger = logging.getLogger(__name__)
@@ -352,6 +353,14 @@ async def _persist_plan(
         await recompute_snapshot(db, dealer_id)
     except Exception:
         logger.exception("dealer-os: snapshot recompute failed after document extract for %s", dealer_id)
+
+    # Deterministic recurrence stamping (system regulates the AI-extracted
+    # data) — best-effort, a recurrence failure never fails an extraction.
+    if plan["events"]:
+        try:
+            await stamp_recurrence(db, dealer_id)
+        except Exception:
+            logger.exception("dealer-os: recurrence stamp failed after document extract for %s", dealer_id)
 
 
 # --- doc-type classification & routing (doc hub, 0114) -----------------------
