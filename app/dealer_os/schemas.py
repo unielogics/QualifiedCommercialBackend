@@ -119,6 +119,7 @@ class CashEventRead(ORM):
     flags: dict | None = None
     categorized_by: str | None = None
     source: str
+    account_id: UUID | None = None
 
 
 class CashEventPatch(BaseModel):
@@ -129,6 +130,7 @@ class CashEventPatch(BaseModel):
 class PeriodRead(ORM):
     id: UUID
     period: date
+    account_id: UUID | None = None
     revenue: float | None = None
     net_income: float | None = None
     ebitda_reported: float | None = None
@@ -322,6 +324,8 @@ class AddbackRead(ORM):
     annual_amount: float | None = None
     status: str
     evidence: str | None = None
+    source_event_id: UUID | None = None
+    document_id: UUID | None = None
 
 
 class LenderPackageRead(BaseModel):
@@ -350,6 +354,7 @@ class DocumentRead(ORM):
     error: str | None = None
     extracted: dict | None = None
     bucket_file_id: UUID | None = None
+    account_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -443,3 +448,89 @@ class BucketSearchItem(ORM):
     name: str
     client_name: str | None = None
     created_at: datetime
+
+
+# --- Phase 3 Wave 1: accounts, audit, rules, lineage, add-back evidence ------
+
+_ACCOUNT_ROLES = "^(primary_operating|secondary|payroll|savings|floorplan_reserve|other)$"
+
+
+class AccountRead(ORM):
+    id: UUID
+    name: str
+    institution: str | None = None
+    mask: str | None = None
+    role: str
+    ai_proposed_role: str | None = None
+    ai_rationale: str | None = None
+    role_set_by: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AccountPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    institution: str | None = Field(default=None, max_length=160)
+    role: str | None = Field(default=None, pattern=_ACCOUNT_ROLES)
+    status: str | None = Field(default=None, pattern="^(active|closed)$")
+
+
+class RuleRead(ORM):
+    id: UUID
+    dealer_id: UUID | None = None  # None = global rule
+    pattern: str
+    category: str
+    active: bool
+    created_at: datetime
+
+
+class RuleCreate(BaseModel):
+    pattern: str = Field(min_length=2, max_length=160)
+    category: str = Field(min_length=1, max_length=48)
+    apply_retroactive: bool = False
+
+
+class RuleCreateResult(BaseModel):
+    rule: RuleRead
+    retro_applied: int = 0
+
+
+class AuditRead(ORM):
+    id: UUID
+    actor_user_id: UUID | None = None
+    actor_name: str
+    action: str
+    entity_kind: str
+    entity_id: UUID | None = None
+    before: dict | None = None
+    after: dict | None = None
+    created_at: datetime
+
+
+class LineageEdgeRead(BaseModel):
+    metric_key: str
+    ref_kind: str
+    ref_id: UUID | None = None
+    period: date | None = None
+    # Resolved context for cash_event refs
+    description: str | None = None
+    amount: float | None = None
+
+
+class LineageRead(BaseModel):
+    snapshot_id: UUID | None = None
+    as_of: date | None = None
+    edges: list[LineageEdgeRead] = []
+
+
+class EventFeedsRead(BaseModel):
+    event_id: UUID
+    snapshot_id: UUID | None = None
+    metric_keys: list[str] = []      # metrics referencing the event directly
+    via_addbacks: list[str] = []     # metrics fed via an add-back sourced from it
+
+
+class AddbackPatch(BaseModel):
+    status: str | None = Field(default=None, pattern="^(verified|candidate|review|excluded)$")
+    document_id: UUID | None = None

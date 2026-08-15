@@ -23,15 +23,18 @@ from app.enums import Role
 
 # READ-ONLY reuse: bucket models are queried/appended, never altered; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
-from app.models.bucket import BucketFile, BucketFileAnalysis
+from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import load_dealer, require_team, require_team_or_dealer, resolve_dealer_scope
 from .models import (
+    DealerAccount,
     DealerAddback,
     DealerAlert,
+    DealerAuditLog,
     DealerBusiness,
     DealerCashEvent,
+    DealerCategoryRule,
     DealerCreditProfile,
     DealerDocument,
     DealerFinancialPeriod,
@@ -45,7 +48,17 @@ from .models import (
     DealerTaxFiling,
 )
 from .schemas import (
+    AccountPatch,
+    AccountRead,
+    AddbackPatch,
+    AuditRead,
     BucketSearchItem,
+    EventFeedsRead,
+    LineageEdgeRead,
+    LineageRead,
+    RuleCreate,
+    RuleCreateResult,
+    RuleRead,
     AIInsightsAccept,
     AIInsightsRead,
     BucketFileItem,
@@ -85,10 +98,17 @@ from .schemas import (
     TargetRead,
 )
 from .services import analyst, buckets_link, storage
+from .services.audit import log_action
 from .services.engines import recompute_snapshot
 from .services.extract import _persist_plan, apply_extraction, extract_document
 from .services.forecast import compute_forecast
-from .services.normalize import classify_event, period_of, rebuild_periods
+from .services.normalize import (
+    classify_with_rules,
+    flags_for,
+    load_active_rules,
+    period_of,
+    rebuild_periods,
+)
 from .services.paths import compute_ladder, compute_paths
 from .services.targets import propose_targets
 
@@ -215,8 +235,15 @@ async def update_dealer(
 ) -> DealerBusiness:
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    before = {k: getattr(dealer, k) for k in changes}
+    for k, v in changes.items():
         setattr(dealer, k, v)
+    if changes:
+        await log_action(
+            db, dealer.id, user, "dealer.update", "dealer",
+            entity_id=dealer.id, before=before, after=changes,
+        )
     await db.commit()
     await db.refresh(dealer)
     return await _dealer_read(db, dealer)
@@ -319,10 +346,17 @@ async def override_target(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown metric for this dealer — propose targets first")
+    before = {"metric_key": row.metric_key, "admin_value": row.admin_value, "status": row.status}
     row.admin_value = payload.admin_value
     row.admin_set_by_user_id = user.id
     row.admin_set_at = datetime.now(timezone.utc)
     row.status = "overridden" if payload.admin_value is not None else "ai_proposed"
+    await log_action(
+        db, dealer.id, user, "target.override", "target",
+        entity_id=row.id,
+        before=before,
+        after={"metric_key": row.metric_key, "admin_value": row.admin_value, "status": row.status},
+    )
     await db.commit()
     await db.refresh(row)
     return _target_read(row)
@@ -343,9 +377,10 @@ async def import_cash_events(
     normalization rules, then the affected monthly periods are rebuilt."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
+    rules = await load_active_rules(db, dealer.id)  # loaded once per request
     periods: set[date] = set()
     for row in payload.rows:
-        category, flags = classify_event(row.description, row.amount)
+        category, flags, rule_matched = classify_with_rules(rules, row.description, row.amount)
         period = period_of(row.occurred_on)
         periods.add(period)
         db.add(
@@ -359,7 +394,7 @@ async def import_cash_events(
                 flags=flags,
                 invoice_date=row.invoice_date,
                 due_date=row.due_date,
-                categorized_by="ai",
+                categorized_by="rule" if rule_matched else "ai",
                 source="upload",
             )
         )
@@ -412,11 +447,18 @@ async def patch_cash_event(
     ).scalar_one_or_none()
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+    before = {"category": event.category, "flags": event.flags, "categorized_by": event.categorized_by}
     if payload.category is not None:
         event.category = payload.category
     if payload.flags is not None:
         event.flags = payload.flags
-    event.categorized_by = "admin"
+    event.categorized_by = "admin"  # human correction wins — retro rules skip these
+    await log_action(
+        db, dealer.id, user, "cash_event.recategorize", "cash_event",
+        entity_id=event.id,
+        before=before,
+        after={"category": event.category, "flags": event.flags, "categorized_by": "admin"},
+    )
 
     if payload.category in ("owner_personal", "one_time"):
         existing = (
@@ -425,18 +467,29 @@ async def patch_cash_event(
         if existing is None:
             amt = abs(float(event.amount))
             is_owner = payload.category == "owner_personal"
-            db.add(
-                DealerAddback(
-                    dealer_id=dealer.id,
-                    title=event.description[:200],
-                    monthly_amount=amt if is_owner else None,
-                    annual_amount=amt * 12 if is_owner else amt,
-                    status="candidate",
-                    evidence=f"Flagged from statement line {event.occurred_on}",
-                    source_event_id=event.id,
-                )
+            addback = DealerAddback(
+                dealer_id=dealer.id,
+                title=event.description[:200],
+                monthly_amount=amt if is_owner else None,
+                annual_amount=amt * 12 if is_owner else amt,
+                status="candidate",
+                evidence=f"Flagged from statement line {event.occurred_on}",
+                source_event_id=event.id,
             )
-    await rebuild_periods(db, dealer.id, {event.period})
+            db.add(addback)
+            await db.flush()
+            await log_action(
+                db, dealer.id, user, "addback.create", "addback",
+                entity_id=addback.id,
+                after={
+                    "title": addback.title,
+                    "status": addback.status,
+                    "annual_amount": addback.annual_amount,
+                    "source_event_id": event.id,
+                },
+            )
+    # Rebuild only the (dealer, account) scope the event lives in.
+    await rebuild_periods(db, dealer.id, {event.period}, account_id=event.account_id)
     await db.commit()
     await db.refresh(event)
     return event
@@ -514,13 +567,16 @@ async def upload_document(
     user: CurrentUser,
     file: UploadFile = File(...),
     kind: str = Form(default="statement"),
+    account_id: str = Form(default=""),
     db: AsyncSession = Depends(get_db),
 ) -> DealerDocument:
     """Upload one financial document, archive it to S3 best-effort, and run
     extraction inline — the response carries the final status (extracted or
     failed with a human-readable error). Extraction always normalizes through
-    classify_event -> rebuild_periods -> recompute_snapshot, same as every
-    other ingestion path."""
+    classify -> rebuild_periods -> recompute_snapshot, same as every other
+    ingestion path. account_id (optional form field): '' = AI-detect the bank
+    account from the statement; a UUID pins the document to that account and
+    skips detection (admin choice wins)."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
     if kind not in _DOCUMENT_KINDS:
@@ -528,6 +584,24 @@ async def upload_document(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"kind must be one of: {', '.join(sorted(_DOCUMENT_KINDS))}",
         )
+    pinned_account_id: UUID | None = None
+    if account_id.strip():
+        try:
+            pinned_account_id = UUID(account_id.strip())
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "account_id must be a UUID (or empty for AI detection)",
+            ) from None
+        account = (
+            await db.execute(
+                select(DealerAccount).where(
+                    DealerAccount.id == pinned_account_id, DealerAccount.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
     raw = await file.read()
     if not raw:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The uploaded file is empty")
@@ -551,7 +625,7 @@ async def upload_document(
     )
     db.add(doc)
     await db.flush()
-    await extract_document(db, doc, raw)
+    await extract_document(db, doc, raw, account_id=pinned_account_id)
     # Best-effort mirror into the dealer's linked bucket — never fail the
     # upload because the bucket bridge hiccuped.
     try:
@@ -730,7 +804,8 @@ async def ingest_bucket_file(
         # Cache path — asserts no model call: adapt the stored analysis JSON
         # into the canonical extraction dict and persist via the same plan.
         extraction = buckets_link.adapt_analysis_to_extraction(analysis_row.analysis)
-        plan = apply_extraction(extraction)
+        rules = await load_active_rules(db, dealer.id)
+        plan = apply_extraction(extraction, rules=rules)
         cache_note = f"{source_note} via cached analysis (no model call)"
         if plan["events"] or plan["period_upserts"]:
             await _persist_plan(db, dealer.id, plan)
@@ -1460,3 +1535,418 @@ async def accept_ai_insights(
     for row in created:
         await db.refresh(row)
     return created
+
+
+# --- Phase 3 Wave 1: accounts, rules, audit, lineage, add-back evidence ------
+
+
+@router.get("/dealers/{dealer_id}/accounts", response_model=list[AccountRead])
+async def list_accounts(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerAccount]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerAccount)
+                .where(DealerAccount.dealer_id == dealer.id)
+                .order_by(DealerAccount.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.patch("/dealers/{dealer_id}/accounts/{account_id}", response_model=AccountRead)
+async def patch_account(
+    dealer_id: UUID,
+    account_id: UUID,
+    payload: AccountPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerAccount:
+    """Admin account edit. A role change flips role_set_by='admin' — from then
+    on AI rematches never touch the role again (proposals only land in
+    ai_proposed_role). Every change lands in the audit log."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    account = (
+        await db.execute(
+            select(DealerAccount).where(
+                DealerAccount.id == account_id, DealerAccount.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
+    changes = payload.model_dump(exclude_unset=True)
+    changes = {k: v for k, v in changes.items() if v is not None}
+    if not changes:
+        return account
+    before = {k: getattr(account, k) for k in changes}
+    before["role_set_by"] = account.role_set_by
+    for k, v in changes.items():
+        setattr(account, k, v)
+    if "role" in changes:
+        account.role_set_by = "admin"  # human correction wins, permanently
+    await log_action(
+        db, dealer.id, user, "account.update", "account",
+        entity_id=account.id,
+        before=before,
+        after={**changes, "role_set_by": account.role_set_by},
+    )
+    await db.commit()
+    await db.refresh(account)
+    return account
+
+
+@router.get("/dealers/{dealer_id}/rules", response_model=list[RuleRead])
+async def list_rules(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerCategoryRule]:
+    """The dealer's effective rule set: dealer-scoped rows plus global
+    (dealer_id NULL) rows, active first, newest first."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerCategoryRule)
+                .where(
+                    (DealerCategoryRule.dealer_id == dealer.id)
+                    | (DealerCategoryRule.dealer_id.is_(None))
+                )
+                .order_by(
+                    DealerCategoryRule.active.desc(),
+                    DealerCategoryRule.dealer_id.is_(None).asc(),
+                    DealerCategoryRule.created_at.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/rules", response_model=RuleCreateResult, status_code=status.HTTP_201_CREATED
+)
+async def create_rule(
+    dealer_id: UUID, payload: RuleCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> RuleCreateResult:
+    """Create a dealer-scoped category rule (lowercase substring -> category).
+    apply_retroactive=true also re-categorizes the dealer's existing matching
+    events — EXCEPT admin-corrected ones (categorized_by='admin' is a human
+    decision and is never overwritten) — and rebuilds the affected periods."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    pattern = payload.pattern.strip().lower()
+    if not pattern:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "pattern must not be blank")
+    rule = DealerCategoryRule(
+        dealer_id=dealer.id,
+        pattern=pattern[:160],
+        category=payload.category.strip()[:48],
+        created_by_user_id=user.id,
+        active=True,
+    )
+    db.add(rule)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "rule.create", "rule",
+        entity_id=rule.id,
+        after={"pattern": rule.pattern, "category": rule.category, "retroactive": payload.apply_retroactive},
+    )
+
+    retro_applied = 0
+    if payload.apply_retroactive:
+        # Human correction wins: admin-corrected events are excluded.
+        events = (
+            await db.execute(
+                select(DealerCashEvent).where(
+                    DealerCashEvent.dealer_id == dealer.id,
+                    func.lower(DealerCashEvent.description).contains(pattern),
+                    (DealerCashEvent.categorized_by != "admin")
+                    | (DealerCashEvent.categorized_by.is_(None)),
+                )
+            )
+        ).scalars().all()
+        scopes: dict[UUID | None, set[date]] = {}
+        for event in events:
+            if event.category == rule.category:
+                continue
+            event.category = rule.category
+            event.flags = flags_for(rule.category)
+            event.categorized_by = "rule"
+            scopes.setdefault(event.account_id, set()).add(event.period)
+            retro_applied += 1
+        for scope_account_id, scope_periods in scopes.items():
+            await rebuild_periods(db, dealer.id, scope_periods, account_id=scope_account_id)
+        if retro_applied:
+            # Best-effort engine refresh — never fail the request on engine errors.
+            try:
+                await recompute_snapshot(db, dealer.id)
+            except Exception:
+                logger.exception(
+                    "dealer-os: snapshot recompute failed after retroactive rule for %s", dealer.id
+                )
+    await db.commit()
+    await db.refresh(rule)
+    return RuleCreateResult(rule=RuleRead.model_validate(rule), retro_applied=retro_applied)
+
+
+@router.delete("/dealers/{dealer_id}/rules/{rule_id}", response_model=RuleRead)
+async def deactivate_rule(
+    dealer_id: UUID, rule_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerCategoryRule:
+    """Soft-delete: sets active=false (rules are never hard-deleted so the
+    audit trail keeps pointing at real rows). Only dealer-scoped rules can be
+    deactivated here — global rules are shared and managed elsewhere."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    rule = (
+        await db.execute(
+            select(DealerCategoryRule).where(
+                DealerCategoryRule.id == rule_id, DealerCategoryRule.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if rule is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Rule not found for this dealer (global rules cannot be deactivated here)"
+        )
+    if rule.active:
+        rule.active = False
+        await log_action(
+            db, dealer.id, user, "rule.deactivate", "rule",
+            entity_id=rule.id,
+            before={"active": True},
+            after={"active": False},
+        )
+    await db.commit()
+    await db.refresh(rule)
+    return rule
+
+
+@router.get("/dealers/{dealer_id}/audit", response_model=list[AuditRead])
+async def list_audit_log(
+    dealer_id: UUID,
+    user: CurrentUser,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerAuditLog]:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerAuditLog)
+                .where(DealerAuditLog.dealer_id == dealer.id)
+                .order_by(DealerAuditLog.created_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _latest_snapshot_row(db: AsyncSession, dealer_id: UUID) -> DealerMetricSnapshot | None:
+    return (
+        await db.execute(
+            select(DealerMetricSnapshot)
+            .where(DealerMetricSnapshot.dealer_id == dealer_id)
+            .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+@router.get("/dealers/{dealer_id}/lineage", response_model=LineageRead)
+async def read_lineage(
+    dealer_id: UUID,
+    user: CurrentUser,
+    metric_key: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+) -> LineageRead:
+    """The latest snapshot's lineage edges (optionally one metric family),
+    with cash_event refs resolved to description/amount so 'why is this number
+    what it is' is answerable without extra round-trips."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    snapshot = await _latest_snapshot_row(db, dealer.id)
+    if snapshot is None:
+        return LineageRead()
+    q = select(DealerMetricLineage).where(DealerMetricLineage.snapshot_id == snapshot.id)
+    if metric_key:
+        q = q.where(DealerMetricLineage.metric_key == metric_key)
+    edges = (
+        (await db.execute(q.order_by(DealerMetricLineage.metric_key.asc()).limit(limit)))
+        .scalars()
+        .all()
+    )
+    event_ids = [e.ref_id for e in edges if e.ref_kind == "cash_event" and e.ref_id is not None]
+    events: dict[UUID, DealerCashEvent] = {}
+    if event_ids:
+        events = {
+            ev.id: ev
+            for ev in (
+                await db.execute(select(DealerCashEvent).where(DealerCashEvent.id.in_(event_ids)))
+            ).scalars()
+        }
+    out: list[LineageEdgeRead] = []
+    for e in edges:
+        item = LineageEdgeRead(
+            metric_key=e.metric_key, ref_kind=e.ref_kind, ref_id=e.ref_id, period=e.period
+        )
+        ev = events.get(e.ref_id) if e.ref_kind == "cash_event" and e.ref_id is not None else None
+        if ev is not None:
+            item.description = ev.description
+            item.amount = float(ev.amount)
+            item.period = item.period or ev.period
+        out.append(item)
+    return LineageRead(snapshot_id=snapshot.id, as_of=snapshot.as_of, edges=out)
+
+
+@router.get("/dealers/{dealer_id}/cash-events/{event_id}/feeds", response_model=EventFeedsRead)
+async def cash_event_feeds(
+    dealer_id: UUID, event_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> EventFeedsRead:
+    """Reverse lineage for one statement line: which metrics reference it in
+    the latest snapshot — directly (ref_kind='cash_event') and indirectly via
+    add-backs sourced from it."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    event = (
+        await db.execute(
+            select(DealerCashEvent).where(
+                DealerCashEvent.id == event_id, DealerCashEvent.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+    snapshot = await _latest_snapshot_row(db, dealer.id)
+    if snapshot is None:
+        return EventFeedsRead(event_id=event.id)
+    direct = (
+        await db.execute(
+            select(DealerMetricLineage.metric_key)
+            .where(
+                DealerMetricLineage.snapshot_id == snapshot.id,
+                DealerMetricLineage.ref_kind == "cash_event",
+                DealerMetricLineage.ref_id == event.id,
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    addback_ids = (
+        await db.execute(
+            select(DealerAddback.id).where(
+                DealerAddback.dealer_id == dealer.id, DealerAddback.source_event_id == event.id
+            )
+        )
+    ).scalars().all()
+    via_addbacks: list[str] = []
+    if addback_ids:
+        via_addbacks = (
+            await db.execute(
+                select(DealerMetricLineage.metric_key)
+                .where(
+                    DealerMetricLineage.snapshot_id == snapshot.id,
+                    DealerMetricLineage.ref_kind == "addback",
+                    DealerMetricLineage.ref_id.in_(addback_ids),
+                )
+                .distinct()
+            )
+        ).scalars().all()
+    return EventFeedsRead(
+        event_id=event.id,
+        snapshot_id=snapshot.id,
+        metric_keys=sorted(direct),
+        via_addbacks=sorted(via_addbacks),
+    )
+
+
+@router.get("/dealers/{dealer_id}/addbacks", response_model=list[AddbackRead])
+async def list_addbacks(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerAddback]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerAddback)
+                .where(DealerAddback.dealer_id == dealer.id)
+                .order_by(DealerAddback.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.patch("/dealers/{dealer_id}/addbacks/{addback_id}", response_model=AddbackRead)
+async def patch_addback(
+    dealer_id: UUID,
+    addback_id: UUID,
+    payload: AddbackPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerAddback:
+    """Admin add-back decision: status (verified/candidate/review/excluded)
+    and/or evidence document link. Status changes stamp decided_by_user_id and
+    a verified/excluded flip changes bankable EBITDA, so the snapshot is
+    recomputed best-effort. Every change lands in the audit log."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    addback = (
+        await db.execute(
+            select(DealerAddback).where(
+                DealerAddback.id == addback_id, DealerAddback.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if addback is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Add-back not found for this dealer")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return addback
+    before = {k: getattr(addback, k) for k in changes}
+    status_changed = False
+    if "status" in changes and changes["status"] is not None:
+        status_changed = changes["status"] != addback.status
+        addback.status = changes["status"]
+        addback.decided_by_user_id = user.id
+    if "document_id" in changes:
+        document_id = changes["document_id"]
+        if document_id is not None:
+            doc = (
+                await db.execute(
+                    select(DealerDocument).where(
+                        DealerDocument.id == document_id, DealerDocument.dealer_id == dealer.id
+                    )
+                )
+            ).scalar_one_or_none()
+            if doc is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence document not found for this dealer")
+        addback.document_id = document_id
+    await log_action(
+        db, dealer.id, user, "addback.decide", "addback",
+        entity_id=addback.id, before=before, after=changes,
+    )
+    if status_changed:
+        # Verified add-backs feed bankable EBITDA — refresh best-effort.
+        try:
+            await recompute_snapshot(db, dealer.id)
+        except Exception:
+            logger.exception(
+                "dealer-os: snapshot recompute failed after addback decision for %s", dealer.id
+            )
+    await db.commit()
+    await db.refresh(addback)
+    return addback

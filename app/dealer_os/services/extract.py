@@ -44,8 +44,9 @@ from app.services.ai.bedrock_client import get_client, model_heavy
 from app.services.ai.usage import tracked_messages_create
 
 from ..models import DealerCashEvent, DealerDocument, DealerFinancialPeriod
+from .accounts import match_or_create_account
 from .engines import recompute_snapshot
-from .normalize import classify_event, period_of, rebuild_periods
+from .normalize import classify_with_rules, load_active_rules, period_of, rebuild_periods
 from . import storage
 
 logger = logging.getLogger(__name__)
@@ -179,18 +180,23 @@ def parse_xlsx_bytes(raw: bytes) -> tuple[list[dict[str, Any]], list[str]]:
 # --- pure normalization plan (db-free, unit-testable) ------------------------
 
 
-def apply_extraction(extraction: dict[str, Any]) -> dict[str, Any]:
+def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None) -> dict[str, Any]:
     """Transform one canonical extraction dict into the exact rows the engine
     ingests. Pure — returns a plan, touches no DB:
 
     {
-      "events":  [{occurred_on, period, description, amount, category, flags}],
+      "events":  [{occurred_on, period, description, amount, category, flags,
+                   categorized_by}],
       "period_upserts": {date(period): {deposits?, withdrawals?, ending_balance?,
                                         low_balance?, avg_daily_balance?, nsf_count?}},
       "event_periods": set[date],   # months whose ledger changed -> rebuild_periods
       "months": [...],              # normalized month summaries for doc.extracted
       "notes": [...],
     }
+
+    ``rules`` (Phase 3) is the dealer's pre-loaded dos_category_rules list —
+    a matching rule wins over the heuristics and marks the event
+    categorized_by='rule' (otherwise 'ai').
 
     deposits/withdrawals from the month summary are only planned for months
     with NO inserted transactions — where events exist, rebuild_periods
@@ -211,7 +217,7 @@ def apply_extraction(extraction: dict[str, Any]) -> dict[str, Any]:
                 notes.append(f"Skipped transaction with unparseable date/amount: {t!r:.120}")
                 continue
             description = str(t.get("description") or "").strip()[:320] or "(no description)"
-            category, flags = classify_event(description, amount)
+            category, flags, rule_matched = classify_with_rules(rules or [], description, amount)
             period = period_of(d)
             event_periods.add(period)
             events.append(
@@ -222,6 +228,7 @@ def apply_extraction(extraction: dict[str, Any]) -> dict[str, Any]:
                     "amount": round(amount, 2),
                     "category": category,
                     "flags": flags,
+                    "categorized_by": "rule" if rule_matched else "ai",
                 }
             )
         if isinstance(txns, list) and len(txns) > MAX_TRANSACTIONS:
@@ -286,34 +293,48 @@ def apply_extraction(extraction: dict[str, Any]) -> dict[str, Any]:
 # --- DB persistence through the existing engine ------------------------------
 
 
-async def _persist_plan(db: AsyncSession, dealer_id: UUID, plan: dict[str, Any]) -> None:
+async def _persist_plan(
+    db: AsyncSession, dealer_id: UUID, plan: dict[str, Any], account_id: UUID | None = None
+) -> None:
+    """Persist one extraction plan, scoped to one (dealer, account) pair.
+    account_id=None keeps everything in the legacy null-account scope —
+    existing null-account rows are matched and preserved, never migrated."""
     for e in plan["events"]:
         db.add(
             DealerCashEvent(
                 dealer_id=dealer_id,
+                account_id=account_id,
                 period=e["period"],
                 occurred_on=e["occurred_on"],
                 description=e["description"],
                 amount=e["amount"],
                 category=e["category"],
                 flags=e["flags"],
-                categorized_by="ai",
+                categorized_by=e.get("categorized_by") or "ai",
                 source="document",
             )
         )
     await db.flush()
 
+    account_clause = (
+        DealerFinancialPeriod.account_id == account_id
+        if account_id is not None
+        else DealerFinancialPeriod.account_id.is_(None)
+    )
     for period, fields in sorted(plan["period_upserts"].items()):
         fp = (
             await db.execute(
                 select(DealerFinancialPeriod).where(
                     DealerFinancialPeriod.dealer_id == dealer_id,
                     DealerFinancialPeriod.period == period,
+                    account_clause,
                 )
             )
         ).scalar_one_or_none()
         if fp is None:
-            fp = DealerFinancialPeriod(dealer_id=dealer_id, period=period, source="document")
+            fp = DealerFinancialPeriod(
+                dealer_id=dealer_id, period=period, account_id=account_id, source="document"
+            )
             db.add(fp)
         for k, v in fields.items():
             # Manual wins (mirrors rebuild_periods): never clobber a non-null
@@ -324,7 +345,7 @@ async def _persist_plan(db: AsyncSession, dealer_id: UUID, plan: dict[str, Any])
     await db.flush()
 
     if plan["event_periods"]:
-        await rebuild_periods(db, dealer_id, plan["event_periods"])
+        await rebuild_periods(db, dealer_id, plan["event_periods"], account_id=account_id)
 
     # Best-effort engine refresh — never fail the ingest on engine errors.
     try:
@@ -348,11 +369,14 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
   ],
   "transactions": [
     {"date": "YYYY-MM-DD", "description": "string", "amount": number}
-  ]
+  ],
+  "account": {"institution": "string|null", "name_hint": "string|null",
+              "mask": "string|null", "kind_hint": "string|null"}
 }
 
 Rules:
 - One months[] entry per statement month present in the document.
+- "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
 - Every number is a bare number: no currency symbols, no commas. Withdrawals in total_withdrawals are a positive magnitude.
 - transactions[] is best-effort: include individual lines when they are legible, with deposits positive and withdrawals/debits NEGATIVE. If lines are not reliably legible, return "transactions": [].
 - Use null for any month field the document does not state. Never invent numbers.
@@ -436,13 +460,21 @@ def _is_xlsx(content_type: str, filename: str) -> bool:
 
 
 async def extract_document(
-    db: AsyncSession, doc: DealerDocument, raw: bytes | None = None
+    db: AsyncSession, doc: DealerDocument, raw: bytes | None = None, account_id: UUID | None = None
 ) -> dict[str, Any]:
     """Extract + normalize one document through the engine pipeline.
 
     raw may be passed directly (upload path — bytes are already in hand);
     otherwise they are fetched from the S3 archive via doc.s3_key. Updates
     doc.status/extracted/error in place. Flushes, never commits.
+
+    Phase 3 account threading: an explicit account_id (admin picked one at
+    upload) wins outright; otherwise, when the model returns an "account" hint
+    for a statement, match_or_create_account resolves/creates the dos_accounts
+    row (AI proposal; admin roles never overwritten). The resolved account is
+    stamped onto the document, its cash events, and its period upserts, and
+    the rebuild runs scoped to that (dealer, account) pair — documents with no
+    account signal stay in the legacy null-account scope.
     """
     doc.status = "extracting"
     doc.error = None
@@ -478,14 +510,38 @@ async def extract_document(
             extraction = await _extract_via_model(db, doc, raw, media)
             source = "model"
 
-        plan = apply_extraction(extraction)
+        rules = await load_active_rules(db, doc.dealer_id)
+        plan = apply_extraction(extraction, rules=rules)
         notes.extend(plan["notes"])
         if not plan["events"] and not plan["period_upserts"]:
             raise ValueError(
                 "No usable financial data found in the document"
                 + (f" ({'; '.join(notes[:3])})" if notes else "")
             )
-        await _persist_plan(db, doc.dealer_id, plan)
+
+        # Resolve the bank account: explicit admin choice wins; else the
+        # model's account hint drives match_or_create (AI proposal only —
+        # admin-set roles are never overwritten by a rematch).
+        resolved_account_id = account_id
+        account_hint = extraction.get("account")
+        if resolved_account_id is None and isinstance(account_hint, dict) and any(
+            str(account_hint.get(k) or "").strip()
+            for k in ("institution", "name_hint", "mask", "kind_hint")
+        ):
+            try:
+                account = await match_or_create_account(
+                    db, doc.dealer_id, account_hint, plan["months"]
+                )
+                resolved_account_id = account.id
+                notes.append(
+                    f"Matched to account '{account.name}'"
+                    + (f" ****{account.mask}" if account.mask else "")
+                )
+            except Exception:
+                logger.exception("dealer-os: account match failed for document %s", doc.id)
+        doc.account_id = resolved_account_id
+
+        await _persist_plan(db, doc.dealer_id, plan, account_id=resolved_account_id)
 
         doc.extracted = {
             "months": plan["months"],

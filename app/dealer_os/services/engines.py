@@ -227,18 +227,78 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
 
     Flushes but does NOT commit — the caller owns the transaction boundary.
     """
-    period_rows = (
+    # Per-account rows mean one calendar month can span several rows. Fetch a
+    # wider window, collapse to one dict per month (flow fields summed across
+    # accounts, balance fields preferring the primary operating account, then
+    # legacy null-account rows), THEN take the trailing 6 months — so tagged and
+    # legacy rows never double-count.
+    raw_rows = (
         (
             await db.execute(
                 select(DealerFinancialPeriod)
                 .where(DealerFinancialPeriod.dealer_id == dealer_id)
                 .order_by(DealerFinancialPeriod.period.desc())
-                .limit(6)
+                .limit(36)
             )
         )
         .scalars()
         .all()
     )
+    from ..models import DealerAccount
+
+    primary_ids = {
+        r[0]
+        for r in (
+            await db.execute(
+                select(DealerAccount.id).where(
+                    DealerAccount.dealer_id == dealer_id,
+                    DealerAccount.role == "primary_operating",
+                )
+            )
+        ).all()
+    }
+
+    def _rank(row) -> int:  # lower = preferred for balance-type fields
+        if row.account_id in primary_ids:
+            return 0
+        if row.account_id is None:
+            return 1
+        return 2
+
+    by_month: dict = {}
+    for row in raw_rows:
+        by_month.setdefault(row.period, []).append(row)
+    period_rows = []
+    for month in sorted(by_month, reverse=True)[:6]:
+        rows = sorted(by_month[month], key=_rank)
+        merged = rows[0]
+        if len(rows) > 1:
+            import types
+
+            def _sum(field):
+                vals = [float(getattr(r, field)) for r in rows if getattr(r, field) is not None]
+                return sum(vals) if vals else None
+
+            def _pref(field):
+                for r in rows:
+                    v = getattr(r, field)
+                    if v is not None:
+                        return float(v)
+                return None
+
+            merged = types.SimpleNamespace(
+                id=rows[0].id,
+                period=month,
+                deposits=_sum("deposits"),
+                withdrawals=_sum("withdrawals"),
+                nsf_count=sum(int(r.nsf_count or 0) for r in rows),
+                ebitda_reported=_pref("ebitda_reported"),
+                debt_service=_pref("debt_service"),
+                avg_daily_balance=_pref("avg_daily_balance"),
+                ending_balance=_pref("ending_balance"),
+                low_balance=_pref("low_balance"),
+            )
+        period_rows.append(merged)
     addback_rows = (
         (
             await db.execute(

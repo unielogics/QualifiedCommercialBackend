@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -51,17 +51,55 @@ class DealerBusiness(TimestampMixin, Base):
     bucket_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
     )
+    # Phase 3: breadcrumb to the AI-underwriter intake this dealer was handed
+    # off from. Plain UUID on purpose — NO FK across to intakes (coupling
+    # avoidance; the intake table lives outside the dos_ isolation boundary).
+    handoff_intake_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+
+
+class DealerAccount(TimestampMixin, Base):
+    """One bank account of the dealer (Phase 3). Roles are AI-proposed with a
+    hard precedence contract: role_set_by='ai' rows may be re-proposed, but
+    once an admin sets the role (role_set_by='admin') the AI never changes it
+    again — newer proposals only land in ai_proposed_role/ai_rationale."""
+
+    __tablename__ = "dos_accounts"
+    __table_args__ = (Index("ix_dos_accounts_dealer", "dealer_id"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    institution: Mapped[str | None] = mapped_column(String(160))
+    mask: Mapped[str | None] = mapped_column(String(8))  # last-4 digits
+    # primary_operating|secondary|payroll|savings|floorplan_reserve|other
+    role: Mapped[str] = mapped_column(String(24), default="other", server_default="other")
+    ai_proposed_role: Mapped[str | None] = mapped_column(String(24))
+    ai_rationale: Mapped[str | None] = mapped_column(Text)
+    role_set_by: Mapped[str] = mapped_column(String(8), default="ai", server_default="ai")  # ai|admin
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
 
 
 class DealerFinancialPeriod(TimestampMixin, Base):
     """One normalized month of financials, source-agnostic."""
 
     __tablename__ = "dos_financial_periods"
-    __table_args__ = (UniqueConstraint("dealer_id", "period", name="uq_dos_period"),)
+    # Uniqueness (Phase 3) is a FUNCTIONAL unique index created in migration
+    # 0112_dos_phase3 — not expressible as a declarative UniqueConstraint:
+    #   CREATE UNIQUE INDEX uq_dos_period_acct ON dos_financial_periods
+    #     (dealer_id, coalesce(account_id, '00000000-...0000'::uuid), period)
+    # i.e. one row per (dealer, account, month), where legacy null-account rows
+    # collapse onto the zero-uuid sentinel (one legacy row per dealer-month).
+    # The old uq_dos_period (dealer_id, period) constraint was dropped there.
 
     id: Mapped[uuid.UUID] = _pk()
     dealer_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    # Phase 3: which bank account this month belongs to; NULL = legacy/blended.
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_accounts.id", ondelete="SET NULL")
     )
     period: Mapped[date] = mapped_column(Date, nullable=False)  # first of month
     revenue: Mapped[float | None] = mapped_column(Numeric(14, 2))
@@ -89,6 +127,10 @@ class DealerCashEvent(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = _pk()
     dealer_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    # Phase 3: source bank account of the line; NULL = legacy/unattributed.
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_accounts.id", ondelete="SET NULL")
     )
     period: Mapped[date] = mapped_column(Date, nullable=False)
     occurred_on: Mapped[date] = mapped_column(Date, nullable=False)
@@ -119,6 +161,10 @@ class DealerAddback(TimestampMixin, Base):
     )
     decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    # Phase 3: evidence document backing the add-back (SET NULL on doc delete).
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
     )
 
 
@@ -301,6 +347,78 @@ class DealerDocument(TimestampMixin, Base):
     bucket_file_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
     )
+    # Phase 3: bank account the document was matched to (statement uploads).
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_accounts.id", ondelete="SET NULL")
+    )
+
+
+class DealerDocRequest(TimestampMixin, Base):
+    """Team-requested document (Phase 3 Wave 1 schema; Wave 3 consumes it)."""
+
+    __tablename__ = "dos_doc_requests"
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), default="statement", server_default="statement")
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_accounts.id", ondelete="SET NULL")
+    )
+    due_on: Mapped[date | None] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(16), default="open", server_default="open")  # open|fulfilled|cancelled
+    fulfilled_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class DealerAuditLog(Base):
+    """Append-only action trail (Phase 3): who changed what, before/after.
+    created_at only — audit rows are never updated."""
+
+    __tablename__ = "dos_audit_log"
+    __table_args__ = (Index("ix_dos_audit_dealer_created", "dealer_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    actor_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    action: Mapped[str] = mapped_column(String(48), nullable=False)  # e.g. target.override, cash_event.recategorize
+    entity_kind: Mapped[str] = mapped_column(String(24), nullable=False)  # target|cash_event|addback|account|rule|dealer
+    entity_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    before: Mapped[dict | None] = mapped_column(JSONB)
+    after: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class DealerCategoryRule(TimestampMixin, Base):
+    """Substring -> category rule (Phase 3). dealer_id NULL = global rule.
+    At classify time rules beat heuristics, dealer-scoped rules beat global,
+    and admin-corrected events (categorized_by='admin') are never retro-touched
+    — human correction wins."""
+
+    __tablename__ = "dos_category_rules"
+    __table_args__ = (Index("ix_dos_category_rules_dealer", "dealer_id"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE")
+    )
+    pattern: Mapped[str] = mapped_column(String(160), nullable=False)  # lowercase substring
+    category: Mapped[str] = mapped_column(String(48), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
 
 class DealerSourceConnection(TimestampMixin, Base):
