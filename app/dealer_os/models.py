@@ -57,6 +57,11 @@ class DealerBusiness(TimestampMixin, Base):
     # off from. Plain UUID on purpose — NO FK across to intakes (coupling
     # avoidance; the intake table lives outside the dos_ isolation boundary).
     handoff_intake_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    # 0118: the profile facts underwriting asks for first.
+    started_on: Mapped[date | None] = mapped_column(Date)
+    entity_type: Mapped[str | None] = mapped_column(String(32))  # llc|s_corp|c_corp|partnership|sole_prop
+    naics_code: Mapped[str | None] = mapped_column(String(8))
+    naics_label: Mapped[str | None] = mapped_column(String(180))
 
 
 class DealerAccount(TimestampMixin, Base):
@@ -477,6 +482,39 @@ class DealerDebt(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
     vendor_key: Mapped[str | None] = mapped_column(String(60))
     evidence: Mapped[dict | None] = mapped_column(JSONB)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class DealerOwner(TimestampMixin, Base):
+    """A principal of the business (0118).
+
+    Owners are who a personal credit pull is ABOUT — without a row per owner
+    there is nobody to pull for. Only the pull's summary is echoed here;
+    the FCRA-governed record stays in credit_pulls and no SSN is stored."""
+
+    __tablename__ = "dos_owners"
+    __table_args__ = (Index("ix_dos_owners_dealer", "dealer_id"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    first_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320))
+    phone: Mapped[str | None] = mapped_column(String(48))
+    ownership_pct: Mapped[float | None] = mapped_column(Numeric(5, 2))
+    is_guarantor: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    dob: Mapped[date | None] = mapped_column(Date)
+    street: Mapped[str | None] = mapped_column(String(240))
+    city: Mapped[str | None] = mapped_column(String(120))
+    state: Mapped[str | None] = mapped_column(String(8))
+    zip: Mapped[str | None] = mapped_column(String(12))
+    credit_score: Mapped[int | None] = mapped_column(Integer)
+    credit_tier: Mapped[str | None] = mapped_column(String(16))
+    credit_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credit_pull_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    credit_summary: Mapped[dict | None] = mapped_column(JSONB)
     notes: Mapped[str | None] = mapped_column(Text)
 
 

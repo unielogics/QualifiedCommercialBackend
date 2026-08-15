@@ -42,6 +42,10 @@ class DealerUpdate(BaseModel):
     notes: str | None = None
     # Team links (or unlinks) a dealer self-serve login to this business.
     dealer_user_id: UUID | None = None
+    started_on: date | None = None
+    entity_type: str | None = None
+    naics_code: str | None = None
+    naics_label: str | None = None
 
 
 class DealerRead(ORM):
@@ -63,6 +67,10 @@ class DealerRead(ORM):
     bucket_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
+    started_on: date | None = None
+    entity_type: str | None = None
+    naics_code: str | None = None
+    naics_label: str | None = None
 
 
 class DealerListItem(ORM):
@@ -778,3 +786,84 @@ class DebtDraftResult(BaseModel):
     skipped_admin: int = 0     # rows a human owns — never touched
     total_monthly: float = 0.0
     debts: list[DebtRead] = []
+
+
+class OwnerRead(ORM):
+    id: UUID
+    first_name: str
+    last_name: str
+    email: str | None = None
+    phone: str | None = None
+    ownership_pct: float | None = None
+    is_guarantor: bool = True
+    dob: date | None = None
+    street: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    credit_score: int | None = None
+    credit_tier: str | None = None
+    credit_pulled_at: datetime | None = None
+    credit_summary: dict | None = None
+    notes: str | None = None
+
+
+class OwnerCreate(BaseModel):
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    email: str | None = None
+    phone: str | None = None
+    ownership_pct: float | None = None
+    is_guarantor: bool = True
+    dob: date | None = None
+    street: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    notes: str | None = None
+
+
+class OwnerPatch(BaseModel):
+    first_name: str | None = Field(default=None, min_length=1, max_length=80)
+    last_name: str | None = Field(default=None, min_length=1, max_length=80)
+    email: str | None = None
+    phone: str | None = None
+    ownership_pct: float | None = None
+    is_guarantor: bool | None = None
+    dob: date | None = None
+    street: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    notes: str | None = None
+
+
+class SoftPullRequest(BaseModel):
+    """FCRA consent is a hard precondition: the gateway is never called
+    without an explicit, recorded permissible-purpose acknowledgement."""
+
+    fcra_consent: bool = False
+    ssn: str | None = None  # optional; improves hit rate, never persisted here
+
+
+class SoftPullResult(BaseModel):
+    ok: bool
+    owner: OwnerRead | None = None
+    detail: str | None = None
+
+
+class BusinessCreditRead(BaseModel):
+    """Business credit built from observed payment behaviour.
+
+    A bureau file is not required to say something true about how this business
+    pays: the ledger already shows every recurring obligation and whether it
+    was paid on time and in full."""
+
+    tradelines: int = 0
+    on_time_pct: float | None = None
+    months_observed: int = 0
+    total_monthly_obligations: float = 0.0
+    nsf_6mo: int = 0
+    oldest_tradeline_months: int | None = None
+    grade: str | None = None          # A..D, deterministic from the fields above
+    factors: list[str] = []

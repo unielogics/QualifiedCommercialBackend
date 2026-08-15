@@ -49,6 +49,7 @@ from .models import (
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
+    DealerOwner,
     DealerPlanAction,
     DealerSession,
     DealerSourceConnection,
@@ -65,6 +66,7 @@ from .schemas import (
     AuditRead,
     BucketFileItem,
     BucketSearchItem,
+    BusinessCreditRead,
     CashEventPatch,
     CashEventRead,
     CashImport,
@@ -98,6 +100,9 @@ from .schemas import (
     LineageRead,
     MessageCreate,
     MessageRead,
+    OwnerCreate,
+    OwnerPatch,
+    OwnerRead,
     PathsRead,
     PeriodRead,
     PeriodUpsert,
@@ -114,6 +119,8 @@ from .schemas import (
     SessionCreate,
     SessionRead,
     SnapshotRead,
+    SoftPullRequest,
+    SoftPullResult,
     TargetOverride,
     TargetRead,
     TaxFilingUpsert,
@@ -122,7 +129,7 @@ from .schemas import (
     VendorReportRead,
     VendorRowRead,
 )
-from .services import analyst, archive, buckets_link, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, archive, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
@@ -3469,3 +3476,233 @@ async def delete_debt(
         await db.delete(row)
     await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
     await db.commit()
+
+
+# --- Owners, business profile & credit (0118) ---------------------------------
+
+
+@router.get("/dealers/{dealer_id}/owners", response_model=list[OwnerRead])
+async def list_owners(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerOwner]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerOwner)
+                .where(DealerOwner.dealer_id == dealer.id)
+                .order_by(DealerOwner.ownership_pct.desc().nullslast(), DealerOwner.last_name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post("/dealers/{dealer_id}/owners", response_model=OwnerRead, status_code=status.HTTP_201_CREATED)
+async def create_owner(
+    dealer_id: UUID, body: OwnerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerOwner:
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = DealerOwner(dealer_id=dealer.id, **body.model_dump())
+    db.add(row)
+    await log_action(db, dealer.id, user, "owner.create", "owner", after=body.model_dump(mode="json"))
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.patch("/dealers/{dealer_id}/owners/{owner_id}", response_model=OwnerRead)
+async def patch_owner(
+    dealer_id: UUID,
+    owner_id: UUID,
+    body: OwnerPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerOwner:
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+    patch = body.model_dump(exclude_unset=True)
+    for k, v in patch.items():
+        setattr(row, k, v)
+    await log_action(
+        db, dealer.id, user, "owner.update", "owner",
+        entity_id=row.id, after=jsonable_encoder(patch),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.delete("/dealers/{dealer_id}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_owner(
+    dealer_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+    await db.delete(row)
+    await log_action(db, dealer.id, user, "owner.delete", "owner", entity_id=owner_id)
+    await db.commit()
+
+
+@router.get("/dealers/{dealer_id}/business-credit", response_model=BusinessCreditRead)
+async def business_credit(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BusinessCreditRead:
+    """Business credit read off observed payment behaviour.
+
+    No commercial bureau file is required to say something true about how this
+    business pays — the ledger already shows every recurring obligation and
+    whether it was met."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rolled, _ = await _vendor_rollup(db, dealer)
+    nsf = int(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(DealerFinancialPeriod.nsf_count), 0))
+                .where(DealerFinancialPeriod.dealer_id == dealer.id)
+                .order_by()
+            )
+        ).scalar_one()
+        or 0
+    )
+    return BusinessCreditRead(**business_credit_svc.summarize(rolled, today=date.today(), nsf_6mo=nsf))
+
+
+@router.post("/dealers/{dealer_id}/owners/{owner_id}/soft-pull", response_model=SoftPullResult)
+async def owner_soft_pull(
+    dealer_id: UUID,
+    owner_id: UUID,
+    body: SoftPullRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SoftPullResult:
+    """Run a personal soft pull on one owner through the existing iSoftPull
+    gateway (app.services.credit_pull_core), imported read-only.
+
+    FCRA consent is a hard precondition — the gateway is never called without
+    an explicit, recorded acknowledgement. Only the RESULT SUMMARY is echoed
+    onto the owner row; the governed record stays in credit_pulls and no SSN
+    is persisted here."""
+    require_team(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    owner = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+    if not body.fcra_consent:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "FCRA permissible-purpose consent is required before a credit pull",
+        )
+    missing = [
+        f for f in ("dob", "street", "city", "state", "zip") if getattr(owner, f, None) in (None, "")
+    ]
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"The bureau needs these owner fields first: {', '.join(missing)}",
+        )
+
+    from app.services.credit_pull_core import (  # imported read-only
+        SoftPullApplicant,
+        SoftPullDenied,
+        SoftPullUnavailable,
+        run_soft_pull,
+    )
+
+    client = await _resolve_owner_client(db, dealer, owner)
+    try:
+        pull = await run_soft_pull(
+            db,
+            client=client,
+            applicant=SoftPullApplicant(
+                legal_first_name=owner.first_name,
+                legal_last_name=owner.last_name,
+                dob=owner.dob,
+                street=owner.street,
+                city=owner.city,
+                state=owner.state,
+                zip=owner.zip,
+                ssn=body.ssn,
+            ),
+            actor=user,
+        )
+    except SoftPullUnavailable as exc:
+        await db.rollback()
+        return SoftPullResult(ok=False, detail=str(exc))
+    except SoftPullDenied as exc:
+        await db.rollback()
+        return SoftPullResult(ok=False, detail=str(exc))
+    except Exception as exc:  # transport/validation — surfaced, never swallowed
+        await db.rollback()
+        logger.exception("dealer-os: soft pull failed for owner %s", owner_id)
+        return SoftPullResult(ok=False, detail=f"Credit pull failed: {exc}")
+
+    owner.credit_score = getattr(pull, "score", None)
+    owner.credit_tier = _credit_tier(getattr(pull, "score", None))
+    owner.credit_pulled_at = datetime.now(timezone.utc)
+    owner.credit_pull_id = pull.id
+    await log_action(
+        db, dealer.id, user, "owner.soft_pull", "owner",
+        entity_id=owner.id, after={"score": owner.credit_score, "tier": owner.credit_tier},
+    )
+    await db.commit()
+    await db.refresh(owner)
+    return SoftPullResult(ok=True, owner=OwnerRead.model_validate(owner))
+
+
+def _credit_tier(score: int | None) -> str | None:
+    """Tier 1 / Tier 2 as the capital-path rules read them."""
+    if score is None:
+        return None
+    if score >= 720:
+        return "Tier 1"
+    if score >= 660:
+        return "Tier 2"
+    return "Tier 3"
+
+
+async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
+    """run_soft_pull keys its record to a Client. Find or create the one that
+    represents this owner so the pull lands against a stable subject rather
+    than a throwaway row."""
+    from app.models.client import Client
+
+    if owner.email:
+        existing = (
+            await db.execute(
+                select(Client).where(func.lower(Client.email) == owner.email.lower()).limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+    client = Client(
+        first_name=owner.first_name,
+        last_name=owner.last_name,
+        email=owner.email or f"owner-{owner.id}@dealer-os.local",
+        phone=owner.phone,
+    )
+    db.add(client)
+    await db.flush()
+    return client
