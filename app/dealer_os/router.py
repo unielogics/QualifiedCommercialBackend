@@ -7,13 +7,16 @@ ledger, plan, forecast, messaging land in Streams 2-5 on this same router.
 
 from __future__ import annotations
 
+import io
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.deps import CurrentUser
@@ -36,6 +39,7 @@ from .models import (
     DealerCashEvent,
     DealerCategoryRule,
     DealerCreditProfile,
+    DealerDocRequest,
     DealerDocument,
     DealerFinancialPeriod,
     DealerMessage,
@@ -78,8 +82,14 @@ from .schemas import (
     DealerListItem,
     DealerRead,
     DealerUpdate,
+    DocRequestCreate,
+    DocRequestPatch,
+    DocRequestRead,
     DocumentRead,
+    DocumentReject,
     ForecastRead,
+    HandoffRead,
+    ProgressRead,
     GlobalAlertRead,
     HealthRead,
     LenderPackageRead,
@@ -97,8 +107,9 @@ from .schemas import (
     TargetOverride,
     TargetRead,
 )
-from .services import analyst, buckets_link, storage
+from .services import analyst, buckets_link, handoff as handoff_service, report_pdf, rollups, storage
 from .services.audit import log_action
+from .services.progress import compute_progress
 from .services.engines import recompute_snapshot
 from .services.extract import _persist_plan, apply_extraction, extract_document
 from .services.forecast import compute_forecast
@@ -149,6 +160,48 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
             )
         ).all()
     )
+    # Phase 3 Wave 2 attention rollups — all batched, never per-dealer queries.
+    today = date.today()
+    last_month = rollups.last_calendar_month(today)
+    has_last_month_period = set(
+        (
+            await db.execute(
+                select(DealerFinancialPeriod.dealer_id)
+                .where(
+                    DealerFinancialPeriod.dealer_id.in_(ids),
+                    DealerFinancialPeriod.period == last_month,
+                )
+                .distinct()
+            )
+        ).scalars().all()
+    )
+    overdue = dict(
+        (
+            await db.execute(
+                select(DealerPlanAction.dealer_id, func.count())
+                .where(
+                    DealerPlanAction.dealer_id.in_(ids),
+                    DealerPlanAction.status != "done",
+                    DealerPlanAction.due_on.is_not(None),
+                    DealerPlanAction.due_on < today,
+                )
+                .group_by(DealerPlanAction.dealer_id)
+            )
+        ).all()
+    )
+    fundable = dict(
+        (
+            await db.execute(
+                select(DealerAlert.dealer_id, func.count())
+                .where(
+                    DealerAlert.dealer_id.in_(ids),
+                    DealerAlert.resolved_at.is_(None),
+                    DealerAlert.kind.like("fundability_%"),
+                )
+                .group_by(DealerAlert.dealer_id)
+            )
+        ).all()
+    )
     out: list[DealerListItem] = []
     for d in dealers:
         item = DealerListItem.model_validate(d)
@@ -157,6 +210,12 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
             item.score = float(snap.score) if snap.score is not None else None
             item.tier = snap.tier
         item.open_alerts = int(alerts.get(d.id, 0))
+        item.missing_statement = d.id not in has_last_month_period
+        item.overdue_actions = int(overdue.get(d.id, 0))
+        item.fundable_paths = int(fundable.get(d.id, 0))
+        item.attention_score = rollups.attention_score(
+            item.open_alerts, item.missing_statement, item.overdue_actions, item.fundable_paths
+        )
         out.append(item)
     return out
 
@@ -557,6 +616,46 @@ MAX_DOCUMENT_BYTES = 15 * 1024 * 1024  # 15MB
 _DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "other"}
 
 
+async def _auto_fulfill_doc_request(
+    db: AsyncSession, dealer_id: UUID, doc: DealerDocument, user: User
+) -> DealerDocRequest | None:
+    """Phase 3 Wave 2: a successfully extracted document satisfies the FIRST
+    (oldest) open request of the same kind — a request pinned to an account
+    only matches a document resolved to that account. Audit-logged."""
+    if doc.status != "extracted":
+        return None
+    open_requests = (
+        (
+            await db.execute(
+                select(DealerDocRequest)
+                .where(
+                    DealerDocRequest.dealer_id == dealer_id,
+                    DealerDocRequest.status == "open",
+                    DealerDocRequest.kind == doc.kind,
+                )
+                .order_by(DealerDocRequest.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    match = next(
+        (r for r in open_requests if r.account_id is None or r.account_id == doc.account_id),
+        None,
+    )
+    if match is None:
+        return None
+    match.status = "fulfilled"
+    match.fulfilled_document_id = doc.id
+    await log_action(
+        db, dealer_id, user, "doc_request.fulfill", "doc_request",
+        entity_id=match.id,
+        before={"status": "open"},
+        after={"status": "fulfilled", "fulfilled_document_id": str(doc.id), "title": match.title},
+    )
+    return match
+
+
 @router.post(
     "/dealers/{dealer_id}/documents",
     response_model=DocumentRead,
@@ -570,22 +669,31 @@ async def upload_document(
     account_id: str = Form(default=""),
     db: AsyncSession = Depends(get_db),
 ) -> DealerDocument:
-    """Upload one financial document, archive it to S3 best-effort, and run
-    extraction inline — the response carries the final status (extracted or
-    failed with a human-readable error). Extraction always normalizes through
-    classify -> rebuild_periods -> recompute_snapshot, same as every other
-    ingestion path. account_id (optional form field): '' = AI-detect the bank
+    """Upload one financial document, archive it to S3 best-effort.
+
+    TEAM uploads run extraction inline — the response carries the final status
+    (extracted or failed with a human-readable error) — then auto-fulfill any
+    matching open doc request and mirror into the linked bucket best-effort.
+
+    DEALER self-uploads (Phase 3 Wave 2) are quarantined: the file is stored
+    and the row lands as status='pending_review' with NO extraction — nothing
+    a dealer uploads touches the ledger or metrics until a team member
+    approves it (POST .../documents/{doc_id}/approve). account_id pinning is a
+    team affordance and is ignored for dealer uploads.
+
+    account_id (optional form field, team only): '' = AI-detect the bank
     account from the statement; a UUID pins the document to that account and
     skips detection (admin choice wins)."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    is_dealer = user.role == Role.DEALER
     if kind not in _DOCUMENT_KINDS:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"kind must be one of: {', '.join(sorted(_DOCUMENT_KINDS))}",
         )
     pinned_account_id: UUID | None = None
-    if account_id.strip():
+    if account_id.strip() and not is_dealer:
         try:
             pinned_account_id = UUID(account_id.strip())
         except ValueError:
@@ -621,11 +729,25 @@ async def upload_document(
         size_bytes=len(raw),
         s3_key=s3_key,
         kind=kind,
-        status="uploaded",
+        status="pending_review" if is_dealer else "uploaded",
     )
     db.add(doc)
     await db.flush()
+
+    if is_dealer:
+        # No extraction, no bucket push — quarantined until team review.
+        await log_action(
+            db, dealer.id, user, "dealer_upload", "document",
+            entity_id=doc.id,
+            after={"filename": doc.filename, "kind": doc.kind, "status": doc.status,
+                   "size_bytes": doc.size_bytes},
+        )
+        await db.commit()
+        await db.refresh(doc)
+        return doc
+
     await extract_document(db, doc, raw, account_id=pinned_account_id)
+    await _auto_fulfill_doc_request(db, dealer.id, doc, user)
     # Best-effort mirror into the dealer's linked bucket — never fail the
     # upload because the bucket bridge hiccuped.
     try:
@@ -642,7 +764,9 @@ async def list_documents(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerDocument]:
     """Team sees every row; a DEALER login sees all non-failed rows (failed
-    extractions are an internal operational detail, not dealer-facing)."""
+    extractions are an internal operational detail, not dealer-facing).
+    Rejected self-uploads STAY visible to the dealer — status='rejected' with
+    the reviewer's note in `error` is the dealer-facing outcome."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
@@ -676,6 +800,96 @@ async def reextract_document(
             "The original file was not archived to S3 — upload the document again to re-extract it",
         )
     await extract_document(db, doc)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+# --- Phase 3 Wave 2: dealer self-upload review -------------------------------
+
+
+async def _load_document(db: AsyncSession, dealer_id: UUID, doc_id: UUID) -> DealerDocument:
+    doc = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.id == doc_id, DealerDocument.dealer_id == dealer_id
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+    return doc
+
+
+@router.post("/dealers/{dealer_id}/documents/{doc_id}/approve", response_model=DocumentRead)
+async def approve_dealer_document(
+    dealer_id: UUID, doc_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDocument:
+    """Team approves a dealer self-upload: runs the SAME extraction pipeline
+    as team uploads (incl. bank-account detection, classify -> rebuild_periods
+    -> recompute_snapshot) from the S3 archive. The response carries the final
+    status (extracted, or failed with a human-readable error). A previously
+    rejected document may be re-approved. Auto-fulfills a matching open doc
+    request and mirrors into the linked bucket best-effort."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    doc = await _load_document(db, dealer.id, doc_id)
+    if doc.status not in ("pending_review", "rejected"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Document is not awaiting review (status: {doc.status})",
+        )
+    if not doc.s3_key:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The original file was not archived to S3 — ask the dealer to upload it again",
+        )
+    before_status = doc.status
+    doc.error = None
+    await extract_document(db, doc)  # fetches bytes from S3; account detect included
+    await log_action(
+        db, dealer.id, user, "dealer_doc.approve", "document",
+        entity_id=doc.id,
+        before={"status": before_status},
+        after={"status": doc.status, "account_id": str(doc.account_id) if doc.account_id else None},
+    )
+    await _auto_fulfill_doc_request(db, dealer.id, doc, user)
+    try:
+        await buckets_link.push_document(db, dealer, doc, doc.size_bytes)
+    except Exception:
+        logger.exception("dealer-os: bucket push failed for document %s", doc.id)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+@router.post("/dealers/{dealer_id}/documents/{doc_id}/reject", response_model=DocumentRead)
+async def reject_dealer_document(
+    dealer_id: UUID,
+    doc_id: UUID,
+    payload: DocumentReject,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerDocument:
+    """Team rejects a dealer self-upload with a required note. The row stays
+    visible to the dealer (status='rejected', error=note) so the outcome and
+    the reason are self-serve — nothing ever reached the ledger."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    doc = await _load_document(db, dealer.id, doc_id)
+    if doc.status != "pending_review":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Only documents awaiting review can be rejected (status: {doc.status})",
+        )
+    doc.status = "rejected"
+    doc.error = payload.note.strip()[:2000]
+    await log_action(
+        db, dealer.id, user, "dealer_doc.reject", "document",
+        entity_id=doc.id,
+        before={"status": "pending_review"},
+        after={"status": "rejected", "note": doc.error},
+    )
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -1950,3 +2164,259 @@ async def patch_addback(
     await db.commit()
     await db.refresh(addback)
     return addback
+
+
+# --- Phase 3 Wave 2: handoff, doc requests, progress, PDF --------------------
+
+
+@router.post("/dealers/{dealer_id}/handoff", response_model=HandoffRead)
+async def start_dealer_handoff(
+    dealer_id: UUID, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> HandoffRead:
+    """Start (or return the existing) AI-underwriter funding file for this
+    dealer. Idempotent: while dos_dealers.handoff_intake_id points at a live
+    intake, that intake is returned; otherwise a new one is created through
+    the same path the admin dealer-variant lead creation uses."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    intake_id = await handoff_service.start_handoff(db, dealer, user, request)
+    await db.commit()
+    return HandoffRead(intake_id=intake_id, url=handoff_service.handoff_url(intake_id))
+
+
+@router.get("/dealers/{dealer_id}/handoff", response_model=HandoffRead)
+async def get_dealer_handoff(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> HandoffRead:
+    """The dealer's existing funding file, 404 when none was started (or the
+    intake it pointed at has since been deleted)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    intake_id = await handoff_service.find_existing_handoff(db, dealer)
+    if intake_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No funding file has been started for this dealer")
+    return HandoffRead(intake_id=intake_id, url=handoff_service.handoff_url(intake_id))
+
+
+async def _load_doc_request(db: AsyncSession, dealer_id: UUID, req_id: UUID) -> DealerDocRequest:
+    req = (
+        await db.execute(
+            select(DealerDocRequest).where(
+                DealerDocRequest.id == req_id, DealerDocRequest.dealer_id == dealer_id
+            )
+        )
+    ).scalar_one_or_none()
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document request not found for this dealer")
+    return req
+
+
+@router.get("/dealers/{dealer_id}/doc-requests", response_model=list[DocRequestRead])
+async def list_doc_requests(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerDocRequest]:
+    """All document requests for the dealer, open ones first (then newest).
+    Dealer-visible by design — this IS the dealer's to-do list."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return (
+        (
+            await db.execute(
+                select(DealerDocRequest)
+                .where(DealerDocRequest.dealer_id == dealer.id)
+                .order_by(
+                    (DealerDocRequest.status == "open").desc(),
+                    DealerDocRequest.created_at.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/doc-requests",
+    response_model=DocRequestRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_doc_request(
+    dealer_id: UUID, payload: DocRequestCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDocRequest:
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if payload.account_id is not None:
+        account = (
+            await db.execute(
+                select(DealerAccount).where(
+                    DealerAccount.id == payload.account_id, DealerAccount.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
+    req = DealerDocRequest(
+        dealer_id=dealer.id,
+        title=payload.title.strip(),
+        kind=payload.kind,
+        account_id=payload.account_id,
+        due_on=payload.due_on,
+        note=payload.note,
+        status="open",
+    )
+    db.add(req)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "doc_request.create", "doc_request",
+        entity_id=req.id,
+        after={"title": req.title, "kind": req.kind, "due_on": req.due_on,
+               "account_id": str(req.account_id) if req.account_id else None},
+    )
+    await db.commit()
+    await db.refresh(req)
+    return req
+
+
+@router.patch("/dealers/{dealer_id}/doc-requests/{req_id}", response_model=DocRequestRead)
+async def update_doc_request(
+    dealer_id: UUID,
+    req_id: UUID,
+    payload: DocRequestPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerDocRequest:
+    """Team edit: status / note / due_on, or manually pin the fulfilling
+    document (which must belong to this dealer). Setting fulfilled_document_id
+    without a status also flips the request to fulfilled."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    req = await _load_doc_request(db, dealer.id, req_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return req
+    before = {k: getattr(req, k) for k in changes}
+    if "fulfilled_document_id" in changes and changes["fulfilled_document_id"] is not None:
+        await _load_document(db, dealer.id, changes["fulfilled_document_id"])  # 404 unless owned
+        if "status" not in changes:
+            changes["status"] = "fulfilled"
+            before.setdefault("status", req.status)
+    for k, v in changes.items():
+        setattr(req, k, v)
+    await log_action(
+        db, dealer.id, user, "doc_request.update", "doc_request",
+        entity_id=req.id, before=before, after=changes,
+    )
+    await db.commit()
+    await db.refresh(req)
+    return req
+
+
+@router.delete("/dealers/{dealer_id}/doc-requests/{req_id}", response_model=DocRequestRead)
+async def cancel_doc_request(
+    dealer_id: UUID, req_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerDocRequest:
+    """Soft-cancel: requests are never hard-deleted (audit trail keeps pointing
+    at real rows) — DELETE flips status to cancelled."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    req = await _load_doc_request(db, dealer.id, req_id)
+    if req.status != "cancelled":
+        before = {"status": req.status}
+        req.status = "cancelled"
+        await log_action(
+            db, dealer.id, user, "doc_request.cancel", "doc_request",
+            entity_id=req.id, before=before, after={"status": "cancelled"},
+        )
+    await db.commit()
+    await db.refresh(req)
+    return req
+
+
+@router.get("/dealers/{dealer_id}/progress", response_model=ProgressRead)
+async def dealer_progress(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ProgressRead:
+    """Month-over-month progress: the latest snapshot vs the closest snapshot
+    at least 21 days older (fallback: the two latest; a single snapshot
+    compares with itself, all deltas zero). Deterministic strings via the pure
+    services.progress engine; actions_completed lists plan actions marked done
+    between the two snapshots."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    snaps = (
+        (
+            await db.execute(
+                select(DealerMetricSnapshot)
+                .where(DealerMetricSnapshot.dealer_id == dealer.id)
+                .order_by(DealerMetricSnapshot.as_of.desc(), DealerMetricSnapshot.created_at.desc())
+                .limit(60)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not snaps:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "No metric snapshot exists for this dealer yet — import financials or "
+            "POST /dealers/{id}/recompute first",
+        )
+    latest = snaps[0]
+    cutoff = latest.as_of - timedelta(days=21)
+    baseline = next((s for s in snaps[1:] if s.as_of <= cutoff), None)
+    if baseline is None:
+        baseline = snaps[1] if len(snaps) > 1 else latest
+    data = compute_progress(
+        baseline.as_of,
+        latest.as_of,
+        baseline.metrics or {},
+        latest.metrics or {},
+        float(baseline.score) if baseline.score is not None else None,
+        float(latest.score) if latest.score is not None else None,
+    )
+    actions_completed = (
+        (
+            await db.execute(
+                select(DealerPlanAction.title)
+                .where(
+                    DealerPlanAction.dealer_id == dealer.id,
+                    DealerPlanAction.status == "done",
+                    DealerPlanAction.updated_at >= baseline.created_at,
+                    DealerPlanAction.updated_at <= latest.created_at,
+                )
+                .order_by(DealerPlanAction.updated_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+        if baseline.id != latest.id
+        else []
+    )
+    return ProgressRead(**data, actions_completed=list(actions_completed))
+
+
+@router.get("/dealers/{dealer_id}/lender-package.pdf")
+async def lender_package_pdf(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> StreamingResponse:
+    """Print-ready PDF of the SAME _build_lender_package bundle the JSON
+    endpoint serves (one code path for the facts). 501 when the runtime lacks
+    weasyprint's native stack — the JSON endpoint remains the fallback."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    bundle = (await _build_lender_package(db, dealer)).model_dump(mode="json")
+    html_doc = report_pdf.build_html(bundle)
+    try:
+        pdf_bytes = await run_in_threadpool(report_pdf.render_pdf, html_doc)
+    except report_pdf.PDFUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED,
+            "PDF rendering is unavailable in this runtime — use GET "
+            "/dealers/{id}/lender-package (JSON) instead",
+        ) from exc
+    filename = storage.safe_filename(f"lender-package-{dealer.name}.pdf") or "lender-package.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )

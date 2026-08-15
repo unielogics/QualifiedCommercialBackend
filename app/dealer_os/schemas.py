@@ -70,6 +70,11 @@ class DealerListItem(ORM):
     score: float | None = None
     tier: str | None = None
     open_alerts: int = 0
+    # Phase 3 Wave 2 attention rollups (batched in the router, never N+1)
+    missing_statement: bool = False   # no period row at all for the last calendar month
+    overdue_actions: int = 0          # open plan actions past their due_on
+    fundable_paths: int = 0           # unresolved fundability_* alerts
+    attention_score: int = 0          # deterministic weighted sort key (services.rollups)
 
 
 class TargetRead(ORM):
@@ -534,3 +539,65 @@ class EventFeedsRead(BaseModel):
 class AddbackPatch(BaseModel):
     status: str | None = Field(default=None, pattern="^(verified|candidate|review|excluded)$")
     document_id: UUID | None = None
+
+
+# --- Phase 3 Wave 2: handoff, doc requests, review, progress -----------------
+
+
+class HandoffRead(BaseModel):
+    intake_id: UUID
+    url: str
+
+
+_DOC_KINDS_PATTERN = "^(statement|pl|tax|debt_schedule|other)$"
+
+
+class DocRequestRead(ORM):
+    id: UUID
+    title: str
+    kind: str
+    account_id: UUID | None = None
+    due_on: date | None = None
+    status: str
+    fulfilled_document_id: UUID | None = None
+    note: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocRequestCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    kind: str = Field(default="statement", pattern=_DOC_KINDS_PATTERN)
+    account_id: UUID | None = None
+    due_on: date | None = None
+    note: str | None = None
+
+
+class DocRequestPatch(BaseModel):
+    status: str | None = Field(default=None, pattern="^(open|fulfilled|cancelled)$")
+    note: str | None = None
+    due_on: date | None = None
+    fulfilled_document_id: UUID | None = None
+
+
+class DocumentReject(BaseModel):
+    note: str = Field(min_length=1, max_length=2000)
+
+
+class MetricDelta(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_value: float | None = Field(default=None, alias="from")
+    to_value: float | None = Field(default=None, alias="to")
+    delta: float | None = None
+
+
+class ProgressRead(BaseModel):
+    from_date: date
+    to_date: date
+    score_from: float | None = None
+    score_to: float | None = None
+    deltas: dict[str, MetricDelta] = {}
+    improved: list[str] = []
+    slipped: list[str] = []
+    actions_completed: list[str] = []

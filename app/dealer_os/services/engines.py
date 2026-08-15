@@ -30,6 +30,9 @@ from ..models import (
 # 4% lender haircut: bankable EBITDA = adjusted * 0.96
 BANKABLE_FACTOR = 0.96
 
+# A funding path at or above this readiness raises a fundability_<key> alert.
+FUNDABILITY_READINESS_PCT = 90.0
+
 # metric_key of a target row -> metric family it feeds (for lineage edges).
 # Targets outside this map (e.g. reconcile_sla_days) are not consumed here.
 _TARGET_LINEAGE: dict[str, str] = {
@@ -423,6 +426,26 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
             ref_kind="snapshot",
             ref_id=snapshot.id,
         )
+
+    # --- Fundability alerts (Phase 3 Wave 2): a path at >= 90% readiness is a
+    # positive, actionable signal — surface it once (deduped by kind via
+    # _ensure_alert) so the team starts a funding file while the window is open.
+    from .paths import compute_paths  # local import — paths is pure, no cycle risk
+
+    for path in compute_paths(metrics, targets):
+        readiness = float(path.get("readiness_pct") or 0.0)
+        if readiness >= FUNDABILITY_READINESS_PCT:
+            await _ensure_alert(
+                db,
+                dealer_id,
+                kind=f"fundability_{path['key']}",
+                severity="info",
+                message=(
+                    f"{path['label']} readiness {readiness:.0f}% — ready to start a funding file"
+                ),
+                ref_kind="path",
+                ref_id=None,
+            )
 
     await db.flush()
     return snapshot
