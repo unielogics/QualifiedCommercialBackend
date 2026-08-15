@@ -393,6 +393,34 @@ class DocumentCoverageRead(BaseModel):
     days_since_latest: int | None = None  # days from END of latest covered month to today
 
 
+class PipelineStatusRead(BaseModel):
+    """Live ingestion state for the cockpit header.
+
+    Covers the work the browser CANNOT see: background bucket auto-ingest, and
+    documents another team member is putting through right now. A client's own
+    in-flight uploads are not visible here — a team upload holds one
+    transaction until extraction finishes, so its 'extracting' status is never
+    externally readable — which is why the header merges this with its local
+    upload queue rather than relying on it alone."""
+
+    # Committed document states.
+    extracted: int = 0
+    failed: int = 0
+    pending_review: int = 0     # dealer self-uploads awaiting team approval
+    in_flight: int = 0          # rows sitting at uploaded/extracting
+    # Linked-bucket files with no DealerDocument yet — queued work.
+    bucket_pending: int = 0
+    # True when anything is moving: the header shows its live state on this.
+    active: bool = False
+    # Most recent document completion, so the header can show "just now".
+    last_completed_at: datetime | None = None
+    last_completed_name: str | None = None
+    # What the ingest produced, for the "mapped" half of the readout.
+    months_covered: int = 0
+    tax_years_covered: int = 0
+    accounts: int = 0
+
+
 class RecurringGroupRead(BaseModel):
     """One detected recurring payment/deposit group (deterministic engine)."""
 

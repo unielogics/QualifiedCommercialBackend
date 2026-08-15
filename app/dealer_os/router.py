@@ -57,30 +57,22 @@ from .schemas import (
     AccountPatch,
     AccountRead,
     AddbackPatch,
-    AuditRead,
-    BucketSearchItem,
-    EventFeedsRead,
-    LineageEdgeRead,
-    LineageRead,
-    RuleCreate,
-    RuleCreateResult,
-    RuleRead,
+    AddbackRead,
     AIInsightsAccept,
     AIInsightsRead,
-    BucketFileItem,
-    CreditRead,
-    CreditUpsert,
-    DealerInvite,
-    DealerInviteResult,
-    TaxFilingUpsert,
-    TaxYearRead,
-    AddbackRead,
     AlertRead,
+    AuditRead,
+    BucketFileItem,
+    BucketSearchItem,
     CashEventPatch,
     CashEventRead,
     CashImport,
     CashImportResult,
+    CreditRead,
+    CreditUpsert,
     DealerCreate,
+    DealerInvite,
+    DealerInviteResult,
     DealerListItem,
     DealerRead,
     DealerUpdate,
@@ -90,28 +82,37 @@ from .schemas import (
     DocumentCoverageRead,
     DocumentRead,
     DocumentReject,
+    EventFeedsRead,
     ForecastRead,
-    HandoffRead,
-    ProgressRead,
     GlobalAlertRead,
+    HandoffRead,
     HealthRead,
+    IrregularEventRead,
     LenderPackageRead,
+    LineageEdgeRead,
+    LineageRead,
     MessageCreate,
     MessageRead,
     PathsRead,
     PeriodRead,
     PeriodUpsert,
+    PipelineStatusRead,
     PlanActionCreate,
     PlanActionRead,
     PlanActionUpdate,
-    IrregularEventRead,
+    ProgressRead,
     RecurringGroupRead,
     RecurringRead,
+    RuleCreate,
+    RuleCreateResult,
+    RuleRead,
     SessionCreate,
     SessionRead,
     SnapshotRead,
     TargetOverride,
     TargetRead,
+    TaxFilingUpsert,
+    TaxYearRead,
 )
 from .services import analyst, archive, buckets_link, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
@@ -1206,6 +1207,107 @@ async def document_coverage(
         open_doc_requests=int(open_doc_requests or 0),
         # Deterministic freshness vs. today (pure helper — services.recurrence).
         **recurrence.compute_freshness(months, date.today()),
+    )
+
+
+@router.get("/dealers/{dealer_id}/pipeline", response_model=PipelineStatusRead)
+async def pipeline_status(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PipelineStatusRead:
+    """Live ingestion state for the cockpit header.
+
+    Deliberately cheap — the header polls this while work is moving. Five
+    counting queries, no payload scans."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    by_status: dict[str, int] = {
+        str(s): int(n)
+        for s, n in (
+            await db.execute(
+                select(DealerDocument.status, func.count())
+                .where(DealerDocument.dealer_id == dealer.id)
+                .group_by(DealerDocument.status)
+            )
+        ).all()
+    }
+
+    # Linked-bucket files not yet pulled = queued work the browser can't see.
+    bucket_pending = 0
+    if dealer.bucket_id is not None:
+        bucket_pending = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(BucketFile)
+                    .where(
+                        BucketFile.bucket_id == dealer.bucket_id,
+                        BucketFile.deleted_at.is_(None),
+                        ~select(DealerDocument.id)
+                        .where(
+                            DealerDocument.dealer_id == dealer.id,
+                            DealerDocument.bucket_file_id == BucketFile.id,
+                        )
+                        .exists(),
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+
+    last = (
+        await db.execute(
+            select(DealerDocument.filename, DealerDocument.updated_at)
+            .where(DealerDocument.dealer_id == dealer.id, DealerDocument.status == "extracted")
+            .order_by(DealerDocument.updated_at.desc())
+            .limit(1)
+        )
+    ).first()
+
+    months = int(
+        (
+            await db.execute(
+                select(func.count(func.distinct(DealerFinancialPeriod.period))).where(
+                    DealerFinancialPeriod.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    tax_years = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(DealerTaxFiling).where(
+                    DealerTaxFiling.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    accounts = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(DealerAccount).where(
+                    DealerAccount.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+
+    in_flight = by_status.get("uploaded", 0) + by_status.get("extracting", 0)
+    return PipelineStatusRead(
+        extracted=by_status.get("extracted", 0),
+        failed=by_status.get("failed", 0),
+        pending_review=by_status.get("pending_review", 0),
+        in_flight=in_flight,
+        bucket_pending=bucket_pending,
+        active=bool(in_flight or bucket_pending),
+        last_completed_at=last[1] if last else None,
+        last_completed_name=last[0] if last else None,
+        months_covered=months,
+        tax_years_covered=tax_years,
+        accounts=accounts,
     )
 
 
