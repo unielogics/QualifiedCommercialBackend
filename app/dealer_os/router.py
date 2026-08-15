@@ -254,7 +254,9 @@ async def _dealer_read(db: AsyncSession, dealer: DealerBusiness) -> DealerRead:
 async def search_buckets(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = "") -> list[Bucket]:
     """Team-only bucket picker for manual dealer<->bucket linking."""
     require_team(user)
-    stmt = select(Bucket).order_by(Bucket.created_at.desc()).limit(20)
+    # Empty q = browse: the picker lists everything up front (newest first)
+    # and search only narrows it.
+    stmt = select(Bucket).order_by(Bucket.created_at.desc()).limit(200)
     needle = q.strip()
     if needle:
         like = f"%{needle.lower()}%"
