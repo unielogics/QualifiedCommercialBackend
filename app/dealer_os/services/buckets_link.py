@@ -42,6 +42,14 @@ logger = logging.getLogger(__name__)
 _UPLOADED_BY = "Dealer OS"
 
 
+def audit_bucket_name(dealer: DealerBusiness) -> str:
+    """Bucket naming convention: '{dealer} — {City}, {ST}' (location parts
+    dropped when absent). Instantly identifiable in the shared bucket console."""
+    loc = ", ".join(p for p in ((dealer.city or "").strip(), (dealer.state or "").strip()) if p)
+    base = (dealer.name or "Dealer").strip()
+    return (f"{base} — {loc}" if loc else base)[:180]
+
+
 async def ensure_bucket(db: AsyncSession, dealer: DealerBusiness) -> Bucket:
     """Resolve (and persist) the dealer's linked Bucket. Flushes, never commits."""
     if dealer.bucket_id is not None:
@@ -74,7 +82,7 @@ async def ensure_bucket(db: AsyncSession, dealer: DealerBusiness) -> Bucket:
 
     # No intake to adopt — create a fresh audit bucket. Only `name` is
     # required on Bucket; bucket_type/purpose stay at their model defaults.
-    bucket = Bucket(name=f"Audit — {dealer.name}"[:180], client_name=(dealer.name or "")[:180] or None)
+    bucket = Bucket(name=audit_bucket_name(dealer), client_name=(dealer.name or "")[:180] or None)
     db.add(bucket)
     await db.flush()
     dealer.bucket_id = bucket.id

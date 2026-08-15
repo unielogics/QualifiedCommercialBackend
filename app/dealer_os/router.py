@@ -288,6 +288,33 @@ async def match_bucket_by_email(dealer_id: UUID, user: CurrentUser, db: AsyncSes
     return await _dealer_read(db, dealer)
 
 
+async def _remirror_documents(db: AsyncSession, dealer: DealerBusiness) -> int:
+    """Re-mirror every archived document into the CURRENTLY linked bucket —
+    the active connection owns the file set. Old bucket rows are left behind
+    untouched (same S3 objects). Best-effort per document; flushes only."""
+    docs = (
+        (
+            await db.execute(
+                select(DealerDocument).where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.s3_key.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    moved = 0
+    for doc in docs:
+        try:
+            doc.bucket_file_id = None  # force a fresh mirror in the active bucket
+            if await buckets_link.push_document(db, dealer, doc, doc.size_bytes or 0):
+                moved += 1
+        except Exception:
+            logger.exception("dealer-os: bucket re-mirror failed for document %s", doc.id)
+    return moved
+
+
 @router.post("/dealers/{dealer_id}/bucket/create", response_model=DealerRead)
 async def create_dealer_bucket(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -310,7 +337,10 @@ async def create_dealer_bucket(
         # Idempotency: a double-click on an already-dedicated EMPTY audit
         # bucket should not mint junk buckets — keep the current link.
         current = await db.get(Bucket, dealer.bucket_id)
-        if current is not None and (current.name or "").startswith("Audit — "):
+        dedicated_name = buckets_link.audit_bucket_name(dealer)
+        if current is not None and (
+            (current.name or "").startswith("Audit — ") or current.name == dedicated_name
+        ):
             file_count = (
                 await db.execute(
                     select(func.count()).select_from(BucketFile).where(
@@ -325,36 +355,15 @@ async def create_dealer_bucket(
         # Mirror ensure_bucket's fresh-audit-bucket row shape (name/client_name
         # only; bucket_type/purpose stay at their model defaults).
         bucket = Bucket(
-            name=f"Audit — {dealer.name}"[:180],
+            name=dedicated_name,
             client_name=(dealer.name or "")[:180] or None,
         )
         db.add(bucket)
         await db.flush()
         dealer.bucket_id = bucket.id
         await db.flush()
-        # Backfill: re-mirror the dealer's archived documents into the NEW
-        # bucket so "assign a new bucket" moves the file set with it (the old
-        # bucket keeps its rows — same S3 objects, never deleted).
-        docs = (
-            (
-                await db.execute(
-                    select(DealerDocument).where(
-                        DealerDocument.dealer_id == dealer.id,
-                        DealerDocument.s3_key.is_not(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for doc in docs:
-            try:
-                doc.bucket_file_id = None  # force a fresh mirror in the new bucket
-                await buckets_link.push_document(db, dealer, doc, doc.size_bytes or 0)
-            except Exception:
-                logger.exception(
-                    "dealer-os: bucket backfill failed for document %s", doc.id
-                )
+        # The active connection owns the file set — move the mirrors with it.
+        await _remirror_documents(db, dealer)
     await log_action(
         db, dealer.id, user, "dealer.bucket_create", "dealer",
         entity_id=dealer.id,
@@ -380,8 +389,19 @@ async def update_dealer(
     dealer = await load_dealer(db, dealer_id)
     changes = payload.model_dump(exclude_unset=True)
     before = {k: getattr(dealer, k) for k in changes}
+    bucket_changed = (
+        "bucket_id" in changes and changes["bucket_id"] != dealer.bucket_id
+    )
+    if bucket_changed and changes["bucket_id"] is not None:
+        target = await db.get(Bucket, changes["bucket_id"])
+        if target is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket not found")
     for k, v in changes.items():
         setattr(dealer, k, v)
+    if bucket_changed and dealer.bucket_id is not None:
+        # Whichever bucket is the active connection receives the documents —
+        # re-mirror the file set into the newly linked bucket.
+        await _remirror_documents(db, dealer)
     if changes:
         await log_action(
             db, dealer.id, user, "dealer.update", "dealer",
