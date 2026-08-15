@@ -34,8 +34,10 @@ class DealerBusiness(TimestampMixin, Base):
     ein: Mapped[str | None] = mapped_column(String(24))
     email: Mapped[str | None] = mapped_column(String(320))
     phone: Mapped[str | None] = mapped_column(String(48))
+    address: Mapped[str | None] = mapped_column(String(240))  # street line (Geoapify-validated in UI)
     city: Mapped[str | None] = mapped_column(String(120))
-    state: Mapped[str | None] = mapped_column(String(8))
+    state: Mapped[str | None] = mapped_column(String(8))  # USPS 2-letter code (dropdown-regulated in UI)
+    zip: Mapped[str | None] = mapped_column(String(12))
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(

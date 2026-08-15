@@ -18,8 +18,10 @@ class DealerCreate(BaseModel):
     ein: str | None = None
     email: str | None = None
     phone: str | None = None
+    address: str | None = None
     city: str | None = None
     state: str | None = None
+    zip: str | None = None
     industry: str = "auto_dealer"
     notes: str | None = None
 
@@ -31,8 +33,10 @@ class DealerUpdate(BaseModel):
     ein: str | None = None
     email: str | None = None
     phone: str | None = None
+    address: str | None = None
     city: str | None = None
     state: str | None = None
+    zip: str | None = None
     industry: str | None = None
     status: str | None = None
     notes: str | None = None
@@ -49,8 +53,10 @@ class DealerRead(ORM):
     ein: str | None = None
     email: str | None = None
     phone: str | None = None
+    address: str | None = None
     city: str | None = None
     state: str | None = None
+    zip: str | None = None
     industry: str
     status: str
     notes: str | None = None
