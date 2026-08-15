@@ -14,13 +14,13 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.deps import CurrentUser
 from app.models.user import User
 from app.services import clerk as clerk_service
@@ -265,7 +265,9 @@ async def search_buckets(user: CurrentUser, db: AsyncSession = Depends(get_db), 
 
 
 @router.post("/dealers/{dealer_id}/bucket/match", response_model=DealerRead)
-async def match_bucket_by_email(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerRead:
+async def match_bucket_by_email(
+    dealer_id: UUID, background: BackgroundTasks, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerRead:
     """Explicitly find this dealer's intake bucket by email (no bucket creation —
     manual linking or ensure_bucket handle the rest)."""
     require_team(user)
@@ -285,8 +287,10 @@ async def match_bucket_by_email(dealer_id: UUID, user: CurrentUser, db: AsyncSes
     if intake is None or intake.bucket_id is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No intake bucket found for this email — link one manually.")
     dealer.bucket_id = intake.bucket_id
+    await _remirror_documents(db, dealer)
     await db.commit()
     await db.refresh(dealer)
+    background.add_task(_background_ingest_bucket_files, dealer.id)
     return await _dealer_read(db, dealer)
 
 
@@ -319,7 +323,10 @@ async def _remirror_documents(db: AsyncSession, dealer: DealerBusiness) -> int:
 
 @router.post("/dealers/{dealer_id}/bucket/create", response_model=DealerRead)
 async def create_dealer_bucket(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
 ) -> DealerRead:
     """Create-and-link a dedicated bucket for this dealer (team only).
 
@@ -374,19 +381,25 @@ async def create_dealer_bucket(
     )
     await db.commit()
     await db.refresh(dealer)
+    background.add_task(_background_ingest_bucket_files, dealer.id)
     return await _dealer_read(db, dealer)
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
-async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
+async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerRead:
     require_team_or_dealer(user)
-    return await resolve_dealer_scope(db, user, dealer_id)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return await _dealer_read(db, dealer)
 
 
 @router.patch("/dealers/{dealer_id}", response_model=DealerRead)
 async def update_dealer(
-    dealer_id: UUID, payload: DealerUpdate, user: CurrentUser, db: AsyncSession = Depends(get_db)
-) -> DealerBusiness:
+    dealer_id: UUID,
+    payload: DealerUpdate,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRead:
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
     changes = payload.model_dump(exclude_unset=True)
@@ -411,6 +424,10 @@ async def update_dealer(
         )
     await db.commit()
     await db.refresh(dealer)
+    if bucket_changed and dealer.bucket_id is not None:
+        # Ingestion is not optional: a newly linked bucket's files flow into
+        # the pipeline automatically (idempotent, background, capped).
+        background.add_task(_background_ingest_bucket_files, dealer.id)
     return await _dealer_read(db, dealer)
 
 
@@ -1390,6 +1407,28 @@ async def ingest_bucket_file(
     pipeline (model call for PDF/image, pure parse for CSV/XLSX)."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
+    doc = await _ingest_bucket_file_core(db, dealer, file_id)
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+async def _ingest_bucket_file_core(
+    db: AsyncSession, dealer: DealerBusiness, file_id: UUID
+) -> DealerDocument:
+    """Shared ingest core (endpoint + background auto-ingest). Idempotent: a
+    bucket file already referenced by a DealerDocument is returned as-is,
+    never double-counted. Flushes; the caller commits."""
+    existing = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.bucket_file_id == file_id,
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        return existing
     bucket = await buckets_link.ensure_bucket(db, dealer)
     bucket_file = (
         await db.execute(
@@ -1474,9 +1513,98 @@ async def ingest_bucket_file(
         elif doc.status == "failed":
             doc.extracted = {"months": [], "transactions_count": 0, "notes": [source_note]}
 
-    await db.commit()
-    await db.refresh(doc)
+    await db.flush()
     return doc
+
+
+MAX_AUTO_INGEST = 60
+
+
+async def _background_ingest_bucket_files(dealer_id: UUID) -> None:
+    """Auto-ingest every not-yet-ingested file in the dealer's linked bucket.
+    Ingestion is not optional — linking a bucket IS the instruction to pull
+    its data into the metrics pipeline. Own session per file so one failure
+    never poisons the rest; cached analyses map with zero model calls."""
+    try:
+        async with SessionLocal() as db:
+            dealer = await db.get(DealerBusiness, dealer_id)
+            if dealer is None or dealer.bucket_id is None:
+                return
+            ingested = set(
+                (
+                    await db.execute(
+                        select(DealerDocument.bucket_file_id).where(
+                            DealerDocument.dealer_id == dealer_id,
+                            DealerDocument.bucket_file_id.is_not(None),
+                        )
+                    )
+                ).scalars().all()
+            )
+            file_ids = [
+                fid
+                for fid in (
+                    await db.execute(
+                        select(BucketFile.id)
+                        .where(
+                            BucketFile.bucket_id == dealer.bucket_id,
+                            BucketFile.deleted_at.is_(None),
+                        )
+                        .order_by(BucketFile.created_at.asc())
+                    )
+                ).scalars().all()
+                if fid not in ingested
+            ][:MAX_AUTO_INGEST]
+        for fid in file_ids:
+            async with SessionLocal() as db:
+                try:
+                    dealer = await db.get(DealerBusiness, dealer_id)
+                    if dealer is None:
+                        return
+                    await _ingest_bucket_file_core(db, dealer, fid)
+                    await db.commit()
+                except Exception:
+                    logger.exception(
+                        "dealer-os: auto-ingest failed for bucket file %s (dealer %s)",
+                        fid, dealer_id,
+                    )
+    except Exception:
+        logger.exception("dealer-os: auto-ingest sweep failed for dealer %s", dealer_id)
+
+
+@router.post("/dealers/{dealer_id}/bucket-files/ingest-all")
+async def ingest_all_bucket_files(
+    dealer_id: UUID,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Schedule background ingestion of every pending bucket file (idempotent
+    — already-ingested files are skipped). Returns the pending count."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if dealer.bucket_id is None:
+        return {"pending": 0, "scheduled": False}
+    ingested = set(
+        (
+            await db.execute(
+                select(DealerDocument.bucket_file_id).where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.bucket_file_id.is_not(None),
+                )
+            )
+        ).scalars().all()
+    )
+    all_ids = (
+        await db.execute(
+            select(BucketFile.id).where(
+                BucketFile.bucket_id == dealer.bucket_id, BucketFile.deleted_at.is_(None)
+            )
+        )
+    ).scalars().all()
+    pending = len([f for f in all_ids if f not in ingested])
+    if pending:
+        background.add_task(_background_ingest_bucket_files, dealer.id)
+    return {"pending": pending, "scheduled": bool(pending)}
 
 
 # --- Stream 3: engines, lineage & alerts -----------------------------------
