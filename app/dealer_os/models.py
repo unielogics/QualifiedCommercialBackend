@@ -38,6 +38,10 @@ class DealerBusiness(TimestampMixin, Base):
     city: Mapped[str | None] = mapped_column(String(120))
     state: Mapped[str | None] = mapped_column(String(8))  # USPS 2-letter code (dropdown-regulated in UI)
     zip: Mapped[str | None] = mapped_column(String(12))
+    # How much funding the client is looking for (0119) — drives program
+    # sizing and reverse-engineered metric targets.
+    funding_goal: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -142,6 +146,10 @@ class DealerCashEvent(TimestampMixin, Base):
     """Transaction-level cash line (statement/CSV now; Plaid/QBO later)."""
 
     __tablename__ = "dos_cash_events"
+    __table_args__ = (
+        Index("ix_dos_cash_events_dealer_document", "dealer_id", "document_id"),
+        Index("ix_dos_cash_events_dealer_occurred", "dealer_id", "occurred_on"),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
     dealer_id: Mapped[uuid.UUID] = mapped_column(
@@ -161,6 +169,11 @@ class DealerCashEvent(TimestampMixin, Base):
     due_date: Mapped[date | None] = mapped_column(Date)
     categorized_by: Mapped[str | None] = mapped_column(String(24))  # ai|admin|dealer|rule
     source: Mapped[str] = mapped_column(String(24), default="upload", server_default="upload")
+    # Which document this line was extracted from (0119) — the "reference the
+    # PDF" backbone. NULL for legacy rows and CSV bulk imports.
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
+    )
 
 
 class DealerAddback(TimestampMixin, Base):
@@ -299,6 +312,10 @@ class DealerTaxFiling(TimestampMixin, Base):
     revenue_reported: Mapped[float | None] = mapped_column(Numeric(14, 2))
     deposits_observed: Mapped[float | None] = mapped_column(Numeric(14, 2))
     discrepancy: Mapped[str | None] = mapped_column(Text)
+    # The tax-return document this filing row was read from (0119).
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
+    )
     # 0117: the return's own figures, kept so EBITDA can be rebuilt from the
     # filing when no P&L has been uploaded.
     entity_name: Mapped[str | None] = mapped_column(String(180))

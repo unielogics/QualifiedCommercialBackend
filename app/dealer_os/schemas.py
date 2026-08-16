@@ -12,6 +12,11 @@ class ORM(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# 0119: what the client is raising money FOR — drives program sizing and the
+# reverse-engineered metric targets.
+_FUNDING_PURPOSES = "^(working_capital|equipment|real_estate|refinance|floorplan|other)$"
+
+
 class DealerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
     legal_name: str | None = None
@@ -24,6 +29,8 @@ class DealerCreate(BaseModel):
     zip: str | None = None
     industry: str = "auto_dealer"
     notes: str | None = None
+    funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
+    funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
 
 
 class DealerUpdate(BaseModel):
@@ -46,6 +53,8 @@ class DealerUpdate(BaseModel):
     entity_type: str | None = None
     naics_code: str | None = None
     naics_label: str | None = None
+    funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
+    funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
 
 
 class DealerRead(ORM):
@@ -71,6 +80,8 @@ class DealerRead(ORM):
     entity_type: str | None = None
     naics_code: str | None = None
     naics_label: str | None = None
+    funding_goal: float | None = None
+    funding_purpose: str | None = None
 
 
 class DealerListItem(ORM):
@@ -144,6 +155,20 @@ class CashEventRead(ORM):
 class CashEventPatch(BaseModel):
     category: str | None = None
     flags: dict | None = None
+
+
+class CashEventSearchRow(CashEventRead):
+    """CashEventRead + source-document provenance (0119) for the explorer."""
+
+    document_id: UUID | None = None
+    document_filename: str | None = None
+
+
+class CashEventSearchRead(BaseModel):
+    total: int = 0
+    offset: int = 0
+    limit: int = 75
+    rows: list[CashEventSearchRow] = []
 
 
 class PeriodRead(ORM):
@@ -275,6 +300,14 @@ class FundingPath(BaseModel):
     label: str
     readiness_pct: float
     requirements: list[PathRequirement]
+    # 0119: additive program sizing (PROVISIONAL — pending lending-desk
+    # sign-off). Amounts are null when the path can't be sized from the data
+    # on file; sizing_basis says which model produced the numbers.
+    funding_min: float | None = None
+    funding_typical: float | None = None
+    funding_max: float | None = None
+    sizing_basis: str = "insufficient data"
+    sizing_constraints: list[str] = []
 
 
 class LadderTier(BaseModel):
@@ -507,6 +540,9 @@ class TaxYearRead(BaseModel):
     deposits_observed: float | None = None   # sum of period deposits for the calendar year
     discrepancy_pct: float | None = None     # (observed - reported) / reported * 100
     filing_id: UUID | None = None            # None when the year has deposits but no filing row
+    # 0119: the tax-return document this filing was read from (provenance).
+    document_id: UUID | None = None
+    document_filename: str | None = None
 
 
 class TaxFilingUpsert(BaseModel):
@@ -682,6 +718,15 @@ class DocumentReject(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
 
 
+class DocumentUrlRead(BaseModel):
+    """Short-lived presigned URL for previewing/downloading archived bytes."""
+
+    url: str
+    expires_in: int = 900
+    filename: str
+    content_type: str
+
+
 class MetricDelta(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -737,6 +782,24 @@ class VendorCategoryPatch(BaseModel):
 
     vendor_key: str
     category: str
+
+
+class VendorAccountRead(BaseModel):
+    """Per-account attribution of one vendor's activity (count desc)."""
+
+    account_id: UUID | None = None    # None = legacy/unattributed events
+    account_name: str | None = None
+    count: int = 0
+    total: float = 0.0
+
+
+class VendorDetailRead(BaseModel):
+    """Vendor drill-down (0119): the rollup row, its account attribution and
+    the underlying ledger lines with document provenance."""
+
+    vendor: VendorRowRead | None = None
+    accounts: list[VendorAccountRead] = []
+    events: list[CashEventSearchRow] = []
 
 
 class DebtRead(BaseModel):
@@ -852,6 +915,22 @@ class SoftPullResult(BaseModel):
     detail: str | None = None
 
 
+class TradelineRead(BaseModel):
+    """One observed credit relationship (0119) — a repeating outbound
+    obligation in a credit-shaped category, with dominant-account attribution."""
+
+    vendor_key: str
+    sample_description: str
+    category: str
+    monthly_payment: float
+    months: int
+    first_seen: date
+    last_seen: date
+    on_time_pct: float | None = None
+    account_id: UUID | None = None
+    account_name: str | None = None
+
+
 class BusinessCreditRead(BaseModel):
     """Business credit built from observed payment behaviour.
 
@@ -867,3 +946,40 @@ class BusinessCreditRead(BaseModel):
     oldest_tradeline_months: int | None = None
     grade: str | None = None          # A..D, deterministic from the fields above
     factors: list[str] = []
+    # 0119: the individual tradelines behind the scalar summary. INVARIANT:
+    # len(tradeline_rows) == tradelines (same select_tradelines predicate).
+    tradeline_rows: list[TradelineRead] = []
+
+
+# --- Funding goal + reverse engineering (0119) --------------------------------
+
+
+class FundingRangeRead(BaseModel):
+    min: float | None = None
+    typical: float | None = None
+    max: float | None = None
+
+
+class RequirementRead(BaseModel):
+    """One reverse-engineered requirement: what a metric must reach for the
+    dealer's funding goal to be fundable on a path."""
+
+    metric_key: str
+    label: str
+    required_value: float | None = None
+    current_value: float | None = None
+    gap: float | None = None
+    met: bool = False
+
+
+class PathFundingRead(BaseModel):
+    path_key: str
+    fundable_now: FundingRangeRead | None = None   # None when the path can't be sized yet
+    goal_feasible: bool | None = None              # None when no goal is set (or nothing to invert)
+    requirements: list[RequirementRead] = []
+
+
+class FundingPlanRead(BaseModel):
+    goal: float | None = None
+    purpose: str | None = None
+    paths: list[PathFundingRead] = []

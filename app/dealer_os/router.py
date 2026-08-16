@@ -69,6 +69,8 @@ from .schemas import (
     BusinessCreditRead,
     CashEventPatch,
     CashEventRead,
+    CashEventSearchRead,
+    CashEventSearchRow,
     CashImport,
     CashImportResult,
     CreditRead,
@@ -89,8 +91,11 @@ from .schemas import (
     DocumentCoverageRead,
     DocumentRead,
     DocumentReject,
+    DocumentUrlRead,
     EventFeedsRead,
     ForecastRead,
+    FundingPlanRead,
+    FundingRangeRead,
     GlobalAlertRead,
     HandoffRead,
     HealthRead,
@@ -103,6 +108,7 @@ from .schemas import (
     OwnerCreate,
     OwnerPatch,
     OwnerRead,
+    PathFundingRead,
     PathsRead,
     PeriodRead,
     PeriodUpsert,
@@ -125,7 +131,10 @@ from .schemas import (
     TargetRead,
     TaxFilingUpsert,
     TaxYearRead,
+    TradelineRead,
+    VendorAccountRead,
     VendorCategoryPatch,
+    VendorDetailRead,
     VendorReportRead,
     VendorRowRead,
 )
@@ -142,7 +151,13 @@ from .services.normalize import (
     period_of,
     rebuild_periods,
 )
-from .services.paths import compute_ladder, compute_paths
+from .services.paths import (
+    PATH_KEYS,
+    compute_ladder,
+    compute_paths,
+    requirements_for_amount,
+    size_program,
+)
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -626,6 +641,97 @@ async def list_cash_events(
         q = q.where(DealerCashEvent.period == period)
     q = q.order_by(DealerCashEvent.occurred_on.asc()).limit(limit)
     return (await db.execute(q)).scalars().all()
+
+
+_MONTH_PARAM_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+
+def _search_row(event: DealerCashEvent, document_filename: str | None) -> CashEventSearchRow:
+    row = CashEventSearchRow.model_validate(event)
+    row.document_filename = document_filename
+    return row
+
+
+@router.get("/dealers/{dealer_id}/cash-events/search", response_model=CashEventSearchRead)
+async def search_cash_events(
+    dealer_id: UUID,
+    user: CurrentUser,
+    q: str = Query(default=""),
+    month: str = Query(default=""),
+    account_id: UUID | None = Query(default=None),
+    unassigned: bool = Query(default=False),
+    category: str = Query(default=""),
+    direction: str = Query(default="", pattern="^(|in|out)$"),
+    flag: str = Query(default=""),
+    document_id: UUID | None = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=75, ge=1, le=75),
+    db: AsyncSession = Depends(get_db),
+) -> CashEventSearchRead:
+    """Activity explorer (0119): paged, filterable ledger search with source-
+    document provenance joined in. The old list endpoint stays untouched —
+    this is the composable read the frontend explorer codes against.
+
+    Ordered occurred_on DESC, id DESC. One count query + one page query."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    filters = [DealerCashEvent.dealer_id == dealer.id]
+    needle = q.strip().lower()
+    if needle:
+        filters.append(func.lower(DealerCashEvent.description).contains(needle, autoescape=True))
+    month_key = month.strip()
+    if month_key:
+        m = _MONTH_PARAM_RE.match(month_key)
+        if m is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "month must be YYYY-MM")
+        y, mo = int(m.group(1)), int(m.group(2))
+        if not 1 <= mo <= 12:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "month must be YYYY-MM")
+        try:
+            filters.append(DealerCashEvent.period == date(y, mo, 1))
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "month must be a real YYYY-MM month"
+            ) from None
+    if unassigned:
+        filters.append(DealerCashEvent.account_id.is_(None))
+    elif account_id is not None:
+        filters.append(DealerCashEvent.account_id == account_id)
+    if category.strip():
+        filters.append(DealerCashEvent.category == category.strip())
+    if direction == "in":
+        filters.append(DealerCashEvent.amount > 0)
+    elif direction == "out":
+        filters.append(DealerCashEvent.amount < 0)
+    if flag.strip():
+        # JSONB `?` (has_key) — presence of the flag key, whatever its value.
+        filters.append(DealerCashEvent.flags.has_key(flag.strip()))
+    if document_id is not None:
+        filters.append(DealerCashEvent.document_id == document_id)
+
+    total = int(
+        (
+            await db.execute(select(func.count()).select_from(DealerCashEvent).where(*filters))
+        ).scalar_one()
+        or 0
+    )
+    page = (
+        await db.execute(
+            select(DealerCashEvent, DealerDocument.filename)
+            .outerjoin(DealerDocument, DealerDocument.id == DealerCashEvent.document_id)
+            .where(*filters)
+            .order_by(DealerCashEvent.occurred_on.desc(), DealerCashEvent.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    return CashEventSearchRead(
+        total=total,
+        offset=offset,
+        limit=limit,
+        rows=[_search_row(ev, filename) for ev, filename in page],
+    )
 
 
 @router.patch("/dealers/{dealer_id}/cash-events/{event_id}", response_model=CashEventRead)
@@ -1138,6 +1244,60 @@ async def list_documents(
     )
 
 
+_DOCUMENT_URL_TTL = 900  # seconds — matches the buckets presign posture
+
+
+@router.get("/dealers/{dealer_id}/documents/{doc_id}/url", response_model=DocumentUrlRead)
+async def document_url(
+    dealer_id: UUID,
+    doc_id: UUID,
+    user: CurrentUser,
+    download: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentUrlRead:
+    """Short-lived presigned URL for the document's original bytes (0119) —
+    the 'open the PDF' bridge for provenance links. Key resolution: the
+    document's own archive first, else the mirrored bucket file's object.
+    409 when neither holds bytes; 503 when presigning is unavailable."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    doc = await _load_document(db, dealer.id, doc_id)
+    if user.role == Role.DEALER and doc.status == "failed":
+        # Parity with list_documents: failed rows are not dealer-facing.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+    key = doc.s3_key
+    if not key and doc.bucket_file_id is not None:
+        key = (
+            await db.execute(
+                select(BucketFile.s3_key).where(
+                    BucketFile.id == doc.bucket_file_id, BucketFile.deleted_at.is_(None)
+                )
+            )
+        ).scalar_one_or_none()
+    if not key:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The original bytes were not archived — re-upload to enable preview",
+        )
+    url = storage.presign_get(
+        key,
+        ttl=_DOCUMENT_URL_TTL,
+        disposition="attachment" if download else "inline",
+        content_type=doc.content_type,
+    )
+    if url is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Document preview is unavailable — S3 presigning is not configured",
+        )
+    return DocumentUrlRead(
+        url=url,
+        expires_in=_DOCUMENT_URL_TTL,
+        filename=doc.filename,
+        content_type=doc.content_type,
+    )
+
+
 _COVERAGE_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 # Legacy declared kinds mapped onto the classifier vocabulary — used when a
 # document predates detected_kind (0114) and only `kind` is available.
@@ -1348,7 +1508,36 @@ async def reextract_document(
             status.HTTP_409_CONFLICT,
             "The original file was not archived to S3 — upload the document again to re-extract it",
         )
+    # Replace, never append: drop this document's prior ledger lines first
+    # (document_id makes the ownership exact), remember their months, and
+    # rebuild any month the fresh extraction no longer covers.
+    old_periods = set(
+        (
+            await db.execute(
+                select(DealerCashEvent.period).where(
+                    DealerCashEvent.dealer_id == dealer.id,
+                    DealerCashEvent.document_id == doc.id,
+                )
+            )
+        ).scalars().all()
+    )
+    if old_periods:
+        from sqlalchemy import delete as sa_delete
+
+        await db.execute(
+            sa_delete(DealerCashEvent).where(
+                DealerCashEvent.dealer_id == dealer.id,
+                DealerCashEvent.document_id == doc.id,
+            )
+        )
+        await db.flush()
     await extract_document(db, doc)
+    if old_periods:
+        try:
+            await rebuild_periods(db, dealer.id, sorted(old_periods))
+            await recompute_snapshot(db, dealer.id)
+        except Exception:
+            logger.exception("dealer-os: post-reextract rebuild failed for %s", doc.id)
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -1508,6 +1697,58 @@ async def list_bucket_files(
     ]
 
 
+@router.get("/dealers/{dealer_id}/bucket-files/{file_id}/url", response_model=DocumentUrlRead)
+async def bucket_file_url(
+    dealer_id: UUID,
+    file_id: UUID,
+    user: CurrentUser,
+    download: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentUrlRead:
+    """Presigned URL for a file in the dealer's LINKED bucket (team only —
+    bucket contents are not dealer-facing). The file must belong to the linked
+    bucket and not be deleted. Same shape/TTL as the document URL."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    bucket_file = None
+    if dealer.bucket_id is not None:
+        bucket_file = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.id == file_id,
+                    BucketFile.bucket_id == dealer.bucket_id,
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+    if bucket_file is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "File not found in this dealer's linked bucket"
+        )
+    if not bucket_file.s3_key:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The original bytes were not archived — re-upload to enable preview",
+        )
+    url = storage.presign_get(
+        bucket_file.s3_key,
+        ttl=_DOCUMENT_URL_TTL,
+        disposition="attachment" if download else "inline",
+        content_type=bucket_file.content_type,
+    )
+    if url is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "File preview is unavailable — S3 presigning is not configured",
+        )
+    return DocumentUrlRead(
+        url=url,
+        expires_in=_DOCUMENT_URL_TTL,
+        filename=bucket_file.file_name,
+        content_type=bucket_file.content_type or "application/octet-stream",
+    )
+
+
 @router.post(
     "/dealers/{dealer_id}/bucket-files/{file_id}/ingest",
     response_model=DocumentRead,
@@ -1609,7 +1850,7 @@ async def _ingest_bucket_file_core(
         routed = True
 
         if cached_kind == "bank_statement" and (plan["events"] or plan["period_upserts"]):
-            await _persist_plan(db, dealer.id, plan)
+            await _persist_plan(db, dealer.id, plan, document_id=doc.id)
         elif cached_kind == "tax_return":
             tax_years = buckets_link.adapt_analysis_to_tax_years(cached)
             if not tax_years:
@@ -1617,13 +1858,13 @@ async def _ingest_bucket_file_core(
                 # the model have a look rather than dropping it.
                 routed = False
             elif buckets_link.is_business_return(cached):
-                upserted = await _route_tax_years(db, dealer.id, tax_years, notes)
+                upserted = await _route_tax_years(db, dealer.id, tax_years, notes, document_id=doc.id)
                 years = ", ".join(str(t["year"]) for t in tax_years)
                 notes.append(f"Business tax return {years}: upserted {upserted} filing(s).")
                 # Keep the return's own figures (0117) so EBITDA can be rebuilt
                 # from the filing — bank statements carry no income statement,
                 # and without this the whole EBITDA -> DSCR chain stays null.
-                await _store_tax_detail(db, dealer.id, tax_years, cached)
+                await _store_tax_detail(db, dealer.id, tax_years, cached, document_id=doc.id)
             else:
                 # An owner's personal return: stored and classified, but it
                 # never writes the business's filing row (dos_tax_filings is
@@ -2027,6 +2268,45 @@ async def dealer_forecast(
     return ForecastRead(**compute_forecast(metrics, plan_actions))
 
 
+async def _monthly_deposits_avg(db: AsyncSession, dealer_id: UUID) -> float | None:
+    """Average monthly deposits over the trailing 6 observed months, collapsed
+    per calendar month across accounts (same never-double-count posture as the
+    snapshot engine). Feeds the deposit-multiple program sizing."""
+    rows = (
+        await db.execute(
+            select(
+                DealerFinancialPeriod.period,
+                func.sum(DealerFinancialPeriod.deposits),
+            )
+            .where(
+                DealerFinancialPeriod.dealer_id == dealer_id,
+                DealerFinancialPeriod.deposits.is_not(None),
+            )
+            .group_by(DealerFinancialPeriod.period)
+            .order_by(DealerFinancialPeriod.period.desc())
+            .limit(6)
+        )
+    ).all()
+    vals = [float(total) for _, total in rows if total is not None]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
+async def _effective_targets(db: AsyncSession, dealer_id: UUID) -> dict[str, float | None]:
+    target_rows = (
+        (
+            await db.execute(
+                select(DealerMetricTarget).where(DealerMetricTarget.dealer_id == dealer_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        t.metric_key: (float(t.effective_value) if t.effective_value is not None else None)
+        for t in target_rows
+    }
+
+
 @router.get("/dealers/{dealer_id}/paths", response_model=PathsRead)
 async def dealer_paths(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -2035,22 +2315,51 @@ async def dealer_paths(
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
-    target_rows = (
-        (
-            await db.execute(
-                select(DealerMetricTarget).where(DealerMetricTarget.dealer_id == dealer.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    targets = {
-        t.metric_key: (float(t.effective_value) if t.effective_value is not None else None)
-        for t in target_rows
-    }
+    targets = await _effective_targets(db, dealer.id)
+    # 0119: deposit history feeds the deposit-multiple sizing (additive fields
+    # on each path row) — injected here, never stored on the snapshot.
+    metrics = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
     return PathsRead(
         paths=compute_paths(metrics, targets), ladder=compute_ladder(metrics, targets)
     )
+
+
+@router.get("/dealers/{dealer_id}/funding-plan", response_model=FundingPlanRead)
+async def funding_plan(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> FundingPlanRead:
+    """The dealer's funding goal reverse-engineered per path (0119): what each
+    program could fund today, and — when a goal is set — the metric levels the
+    goal requires (typical-case assumptions, PROVISIONAL sizing constants).
+    No goal => every path carries empty requirements and null feasibility."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    metrics = await _latest_snapshot_metrics(db, dealer.id)
+    targets = await _effective_targets(db, dealer.id)
+    metrics = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
+    goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
+
+    paths_out: list[PathFundingRead] = []
+    for key in PATH_KEYS:
+        sized = size_program(key, metrics, targets)
+        fundable = None
+        if sized["funding_typical"] is not None:
+            fundable = FundingRangeRead(
+                min=sized["funding_min"],
+                typical=sized["funding_typical"],
+                max=sized["funding_max"],
+            )
+        requirements = requirements_for_amount(key, goal, metrics) if goal is not None else []
+        feasible = all(r["met"] for r in requirements) if requirements else None
+        paths_out.append(
+            PathFundingRead(
+                path_key=key,
+                fundable_now=fundable,
+                goal_feasible=feasible,
+                requirements=requirements,
+            )
+        )
+    return FundingPlanRead(goal=goal, purpose=dealer.funding_purpose, paths=paths_out)
 
 
 # --- Stream 5: messaging, sessions, global alerts & lender package -----------
@@ -2247,7 +2556,10 @@ async def _deposits_by_year(db: AsyncSession, dealer_id: UUID) -> dict[int, floa
 
 
 def _tax_year_read(
-    year: int, filing: DealerTaxFiling | None, observed: float | None
+    year: int,
+    filing: DealerTaxFiling | None,
+    observed: float | None,
+    document_filename: str | None = None,
 ) -> TaxYearRead:
     reported = (
         float(filing.revenue_reported)
@@ -2266,6 +2578,23 @@ def _tax_year_read(
         deposits_observed=observed,
         discrepancy_pct=discrepancy_pct,
         filing_id=filing.id if filing is not None else None,
+        document_id=filing.document_id if filing is not None else None,
+        document_filename=document_filename,
+    )
+
+
+async def _document_filenames(db: AsyncSession, doc_ids: list[UUID]) -> dict[UUID, str]:
+    """Batch id -> filename lookup (0119 provenance joins — never N+1)."""
+    if not doc_ids:
+        return {}
+    return dict(
+        (
+            await db.execute(
+                select(DealerDocument.id, DealerDocument.filename).where(
+                    DealerDocument.id.in_(doc_ids)
+                )
+            )
+        ).all()
     )
 
 
@@ -2286,9 +2615,22 @@ async def list_tax_years(
         )
     ).scalars().all()
     observed = await _deposits_by_year(db, dealer.id)
+    names = await _document_filenames(
+        db, [f.document_id for f in filings if f.document_id is not None]
+    )
     by_year = {f.year: f for f in filings}
     years = sorted(set(by_year) | set(observed))
-    return [_tax_year_read(y, by_year.get(y), observed.get(y)) for y in years]
+    return [
+        _tax_year_read(
+            y,
+            by_year.get(y),
+            observed.get(y),
+            document_filename=(
+                names.get(by_year[y].document_id) if y in by_year else None
+            ),
+        )
+        for y in years
+    ]
 
 
 @router.put("/dealers/{dealer_id}/tax/{year}", response_model=TaxYearRead)
@@ -2321,7 +2663,12 @@ async def upsert_tax_filing(
     await db.commit()
     await db.refresh(filing)
     observed = (await _deposits_by_year(db, dealer.id)).get(year)
-    return _tax_year_read(year, filing, observed)
+    names = await _document_filenames(
+        db, [filing.document_id] if filing.document_id is not None else []
+    )
+    return _tax_year_read(
+        year, filing, observed, document_filename=names.get(filing.document_id)
+    )
 
 
 @router.get("/dealers/{dealer_id}/lender-package", response_model=LenderPackageRead)
@@ -3163,13 +3510,18 @@ async def lender_package_pdf(
 
 
 async def _store_tax_detail(
-    db: AsyncSession, dealer_id: UUID, tax_years: list[dict], analysis: dict
+    db: AsyncSession,
+    dealer_id: UUID,
+    tax_years: list[dict],
+    analysis: dict,
+    document_id: UUID | None = None,
 ) -> None:
     """Persist a business return's key_facts onto its dos_tax_filings row.
 
     Fill-only-null on the identity columns, same precedence law as everywhere
     else; `detail` is refreshed because it is the AI's own reading of the
-    document, never a human's entry."""
+    document, never a human's entry. document_id (0119) is stamped where the
+    source document is known and the column is still NULL."""
     facts = analysis.get("key_facts") if isinstance(analysis, dict) else None
     if not isinstance(facts, dict):
         return
@@ -3189,14 +3541,19 @@ async def _store_tax_detail(
             row.entity_name = str(facts.get("entity_name") or "")[:180] or None
         if row.form_type is None:
             row.form_type = str(facts.get("form_type") or facts.get("form") or "")[:32] or None
+        if document_id is not None and row.document_id is None:
+            row.document_id = document_id
     await db.flush()
 
 
 # --- Vendor report & debt schedule (0116) ------------------------------------
 
 
-async def _vendor_rollup(db: AsyncSession, dealer: DealerBusiness):
-    """Shared: load the dealer's events + admin category rules and roll up."""
+async def _load_vendor_inputs(
+    db: AsyncSession, dealer: DealerBusiness
+) -> tuple[list[DealerCashEvent], dict[str, str], list[str]]:
+    """Shared loader: the dealer's full event ledger + admin category rules +
+    self names — one load feeding the rollup, the drill and the tradelines."""
     rows = (
         (
             await db.execute(
@@ -3224,11 +3581,38 @@ async def _vendor_rollup(db: AsyncSession, dealer: DealerBusiness):
         )
     }
     self_names = [n for n in (dealer.name, dealer.legal_name) if n]
+    return rows, overrides, self_names
+
+
+def _rollup_from_inputs(
+    rows: list[DealerCashEvent], overrides: dict[str, str], self_names: list[str]
+):
     events = [
         vendors.VendorEvent(r.occurred_on, r.description or "", float(r.amount or 0))
         for r in rows
     ]
     return vendors.rollup_vendors(events, overrides=overrides, self_names=self_names), len(events)
+
+
+async def _vendor_rollup(db: AsyncSession, dealer: DealerBusiness):
+    """Shared: load the dealer's events + admin category rules and roll up."""
+    rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
+    return _rollup_from_inputs(rows, overrides, self_names)
+
+
+async def _account_names(db: AsyncSession, dealer_id: UUID, account_ids: list[UUID]) -> dict[UUID, str]:
+    if not account_ids:
+        return {}
+    return dict(
+        (
+            await db.execute(
+                select(DealerAccount.id, DealerAccount.name).where(
+                    DealerAccount.dealer_id == dealer_id,
+                    DealerAccount.id.in_(account_ids),
+                )
+            )
+        ).all()
+    )
 
 
 @router.get("/dealers/{dealer_id}/vendors", response_model=VendorReportRead)
@@ -3249,6 +3633,69 @@ async def vendor_report(
         recurring_count=sum(1 for r in rolled if r.is_recurring),
         one_off_count=sum(1 for r in rolled if not r.is_recurring),
         events_analyzed=analyzed,
+    )
+
+
+@router.get("/dealers/{dealer_id}/vendors/{vendor_key}/events", response_model=VendorDetailRead)
+async def vendor_events(
+    dealer_id: UUID,
+    vendor_key: str,
+    user: CurrentUser,
+    direction: str = Query(default="all", pattern="^(all|in|out)$"),
+    db: AsyncSession = Depends(get_db),
+) -> VendorDetailRead:
+    """Vendor drill-down (0119): the ledger lines behind one rollup row, with
+    per-account attribution (count desc) and source-document provenance.
+    Membership uses the SAME normalize_vendor identity the rollup groups on,
+    so the drill can never disagree with the report."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
+    rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
+
+    key = vendor_key.strip()
+    matching = [r for r in rows if vendors.normalize_vendor(r.description or "") == key]
+    if direction == "in":
+        matching = [r for r in matching if float(r.amount or 0) > 0]
+    elif direction == "out":
+        matching = [r for r in matching if float(r.amount or 0) < 0]
+    matching.sort(key=lambda r: (r.occurred_on, str(r.id)), reverse=True)
+
+    # The matching rollup row: honor the direction filter; on 'all' the rollup
+    # order (abs total desc) picks the dominant side of the relationship.
+    wanted = {"in": (1,), "out": (-1,)}.get(direction, (1, -1))
+    vendor_row = next((v for v in rolled if v.key == key and v.direction in wanted), None)
+
+    # Dominant-account attribution: count desc, then |total| desc.
+    stats: dict[UUID | None, list[float]] = {}
+    for r in matching:
+        s = stats.setdefault(r.account_id, [0, 0.0])
+        s[0] += 1
+        s[1] += float(r.amount or 0)
+    names = await _account_names(db, dealer.id, [a for a in stats if a is not None])
+    accounts = [
+        VendorAccountRead(
+            account_id=acct_id,
+            account_name=names.get(acct_id) if acct_id is not None else None,
+            count=int(count),
+            total=round(total, 2),
+        )
+        for acct_id, (count, total) in sorted(
+            stats.items(), key=lambda kv: (-kv[1][0], -abs(kv[1][1]))
+        )
+    ]
+
+    doc_names = await _document_filenames(
+        db, list({r.document_id for r in matching if r.document_id is not None})
+    )
+    return VendorDetailRead(
+        vendor=(
+            VendorRowRead(**{k: v for k, v in vars(vendor_row).items() if not k.startswith("_")})
+            if vendor_row is not None
+            else None
+        ),
+        accounts=accounts,
+        events=[_search_row(r, doc_names.get(r.document_id)) for r in matching],
     )
 
 
@@ -3572,7 +4019,8 @@ async def business_credit(
     whether it was met."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    rolled, _ = await _vendor_rollup(db, dealer)
+    rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
+    rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
     nsf = int(
         (
             await db.execute(
@@ -3583,7 +4031,53 @@ async def business_credit(
         ).scalar_one()
         or 0
     )
-    return BusinessCreditRead(**business_credit_svc.summarize(rolled, today=date.today(), nsf_6mo=nsf))
+    summary = business_credit_svc.summarize(rolled, today=date.today(), nsf_6mo=nsf)
+
+    # 0119: the tradeline rows behind the scalar summary — the SAME
+    # select_tradelines predicate summarize() counts, so
+    # len(tradeline_rows) == summary["tradelines"] always holds.
+    tradelines = business_credit_svc.select_tradelines(rolled)
+    # key -> {account_id: [count, |total|]} in ONE pass over outbound events.
+    acct_stats: dict[str, dict[UUID | None, list[float]]] = {}
+    for r in rows:
+        amt = float(r.amount or 0)
+        if amt >= 0:
+            continue
+        k = vendors.normalize_vendor(r.description or "")
+        if not k:
+            continue
+        s = acct_stats.setdefault(k, {}).setdefault(r.account_id, [0, 0.0])
+        s[0] += 1
+        s[1] += abs(amt)
+
+    def dominant_account(key: str) -> UUID | None:
+        stats = acct_stats.get(key) or {}
+        if not stats:
+            return None
+        return max(stats.items(), key=lambda kv: (kv[1][0], kv[1][1]))[0]
+
+    dominants = {v.key: dominant_account(v.key) for v in tradelines}
+    names = await _account_names(
+        db, dealer.id, list({a for a in dominants.values() if a is not None})
+    )
+    tradeline_rows = [
+        TradelineRead(
+            vendor_key=v.key,
+            sample_description=v.sample_description,
+            category=v.category,
+            monthly_payment=round(abs(v.monthly_average), 2),
+            months=v.months,
+            first_seen=v.first_seen,
+            last_seen=v.last_seen,
+            on_time_pct=business_credit_svc.on_time_pct_for(v),
+            account_id=dominants.get(v.key),
+            account_name=(
+                names.get(dominants[v.key]) if dominants.get(v.key) is not None else None
+            ),
+        )
+        for v in tradelines
+    ]
+    return BusinessCreditRead(**summary, tradeline_rows=tradeline_rows)
 
 
 @router.post("/dealers/{dealer_id}/owners/{owner_id}/soft-pull", response_model=SoftPullResult)

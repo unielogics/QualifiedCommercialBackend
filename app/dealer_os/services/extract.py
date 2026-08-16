@@ -295,11 +295,18 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
 
 
 async def _persist_plan(
-    db: AsyncSession, dealer_id: UUID, plan: dict[str, Any], account_id: UUID | None = None
+    db: AsyncSession,
+    dealer_id: UUID,
+    plan: dict[str, Any],
+    account_id: UUID | None = None,
+    document_id: UUID | None = None,
 ) -> None:
     """Persist one extraction plan, scoped to one (dealer, account) pair.
     account_id=None keeps everything in the legacy null-account scope —
-    existing null-account rows are matched and preserved, never migrated."""
+    existing null-account rows are matched and preserved, never migrated.
+
+    document_id (0119) stamps provenance onto every cash event created here —
+    the "reference the PDF" backbone. CSV bulk import stays document-less."""
     for e in plan["events"]:
         db.add(
             DealerCashEvent(
@@ -313,6 +320,7 @@ async def _persist_plan(
                 flags=e["flags"],
                 categorized_by=e.get("categorized_by") or "ai",
                 source="document",
+                document_id=document_id,
             )
         )
     await db.flush()
@@ -528,9 +536,17 @@ def merge_tax_filings(
 
 
 async def _route_tax_years(
-    db: AsyncSession, dealer_id: UUID, tax_years: list[dict[str, Any]], notes: list[str]
+    db: AsyncSession,
+    dealer_id: UUID,
+    tax_years: list[dict[str, Any]],
+    notes: list[str],
+    document_id: UUID | None = None,
 ) -> int:
-    """Upsert dos_tax_filings from an extracted tax return (fill-only-null)."""
+    """Upsert dos_tax_filings from an extracted tax return (fill-only-null).
+
+    document_id (0119): stamped on filing rows this routing creates, and
+    refreshed on rows it changes — same posture as the detail refresh (the
+    provenance pointer is the AI's own reading, never a human's entry)."""
     if not tax_years:
         return 0
     years = [t["year"] for t in tax_years]
@@ -545,9 +561,14 @@ async def _route_tax_years(
         .scalars()
         .all()
     )
+    before = {f.year: (f.revenue_reported, f.filed) for f in existing}
     to_create, changed = merge_tax_filings({f.year: f for f in existing}, tax_years, notes)
+    if document_id is not None:
+        for f in existing:
+            if (f.revenue_reported, f.filed) != before[f.year]:
+                f.document_id = document_id
     for payload in to_create:
-        db.add(DealerTaxFiling(dealer_id=dealer_id, **payload))
+        db.add(DealerTaxFiling(dealer_id=dealer_id, document_id=document_id, **payload))
     await db.flush()
     return changed + len(to_create)
 
@@ -881,9 +902,11 @@ async def extract_document(
                 except Exception:
                     logger.exception("dealer-os: account match failed for document %s", doc.id)
             doc.account_id = resolved_account_id
-            await _persist_plan(db, doc.dealer_id, plan, account_id=resolved_account_id)
+            await _persist_plan(
+                db, doc.dealer_id, plan, account_id=resolved_account_id, document_id=doc.id
+            )
         elif detected == "tax_return":
-            upserted = await _route_tax_years(db, doc.dealer_id, tax_years, notes)
+            upserted = await _route_tax_years(db, doc.dealer_id, tax_years, notes, document_id=doc.id)
             notes.append(f"Tax return: upserted {upserted} tax year(s) (existing entries kept).")
         elif detected == "profit_and_loss":
             updated = await _route_pl_months(db, doc.dealer_id, pl_months, notes)

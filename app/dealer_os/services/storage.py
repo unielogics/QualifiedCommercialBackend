@@ -69,6 +69,71 @@ def put_bytes(key: str, raw: bytes, content_type: str) -> bool:
         return False
 
 
+# Content types the browser may safely render inline. Anything else (notably
+# text/html, image/svg+xml, xml, javascript) can execute script in the S3
+# origin when previewed inline, so it is neutralized to a download.
+# MIRRORS app/routers/buckets.py:_INLINE_SAFE_CONTENT_TYPES (read-only copy —
+# keep the two lists in sync).
+_INLINE_SAFE_CONTENT_TYPES = frozenset(
+    {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/webp",
+        "text/plain",
+        "text/csv",
+    }
+)
+
+
+def _sanitize_content_type(content_type: str | None) -> str:
+    """Coerce a stored/attacker-influenced content-type to a safe served type.
+    MIRRORS app/routers/buckets.py:_sanitize_upload_content_type (read-only
+    copy): executable/markup types become application/octet-stream so the
+    object can never be served as active content."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return "application/octet-stream"
+    if any(token in ct for token in ("html", "svg", "xml", "javascript", "script", "xhtml")):
+        return "application/octet-stream"
+    return ct
+
+
+def presign_get(
+    key: str,
+    *,
+    ttl: int = 900,
+    disposition: str = "inline",
+    content_type: str | None = None,
+) -> str | None:
+    """Presigned GET URL for an archived object — the preview/download bridge.
+
+    Mirrors app/routers/buckets.py:_download_url: only known-inline-safe
+    content types may render inline; anything else is forced to an
+    attachment download served as application/octet-stream. Never raises —
+    returns None when S3 is unconfigured or presigning fails (callers map
+    that to a 503)."""
+    cfg = get_settings()
+    if not cfg.s3_bucket:
+        return None
+    params: dict = {"Bucket": cfg.s3_bucket, "Key": key}
+    if (
+        disposition == "inline"
+        and content_type is not None
+        and _sanitize_content_type(content_type) not in _INLINE_SAFE_CONTENT_TYPES
+    ):
+        disposition = "attachment"
+        params["ResponseContentType"] = "application/octet-stream"
+    params["ResponseContentDisposition"] = disposition
+    try:
+        return _s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
+    except Exception:
+        logger.exception("dealer-os: presign failed for %s", key)
+        return None
+
+
 def get_bytes(key: str) -> bytes | None:
     """Fetch archived bytes back for a re-extract. None if unavailable."""
     cfg = get_settings()

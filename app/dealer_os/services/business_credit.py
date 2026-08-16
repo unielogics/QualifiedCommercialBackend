@@ -30,6 +30,28 @@ def _months_between(a: date, b: date) -> int:
     return (b.year - a.year) * 12 + (b.month - a.month)
 
 
+def select_tradelines(vendors: Sequence[VendorRollup]) -> list[VendorRollup]:
+    """The vendors that behave like credit relationships: repeating outbound
+    obligations in a credit-shaped category. Shared by summarize() and the
+    per-tradeline rows endpoint so the two can never disagree on what counts."""
+    return [
+        v
+        for v in vendors
+        if v.direction < 0
+        and v.category in _TRADELINE_CATEGORIES
+        and v.months >= _MIN_TRADELINE_MONTHS
+    ]
+
+
+def on_time_pct_for(v: VendorRollup) -> float | None:
+    """Share of expected monthly payments actually observed for ONE tradeline —
+    the same arithmetic summarize() aggregates across the whole file."""
+    span = _months_between(v.first_seen, v.last_seen) + 1
+    if span <= 0:
+        return None
+    return round(100.0 * min(v.months, span) / span, 1)
+
+
 def summarize(
     vendors: Sequence[VendorRollup],
     *,
@@ -42,13 +64,7 @@ def summarize(
     appeared: a tradeline seen across N months but present in only M of them
     has (N - M) misses. This is intentionally strict — a lender reading the
     statements will do the same arithmetic."""
-    tradelines = [
-        v
-        for v in vendors
-        if v.direction < 0
-        and v.category in _TRADELINE_CATEGORIES
-        and v.months >= _MIN_TRADELINE_MONTHS
-    ]
+    tradelines = select_tradelines(vendors)
 
     expected = 0
     observed = 0

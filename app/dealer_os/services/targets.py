@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import DealerBusiness, DealerFinancialPeriod, DealerMetricTarget
+from .paths import monthly_payment_for_goal
 
 # metric_key -> (default value, rationale template)
 DEFAULT_RUBRIC: dict[str, tuple[float, str]] = {
@@ -52,11 +53,41 @@ async def propose_targets(db: AsyncSession, dealer: DealerBusiness) -> list[Deal
     ).scalars().all()
     rubric = dict(DEFAULT_RUBRIC)
     ds = [float(p.debt_service) for p in periods if p.debt_service is not None]
+    monthly_ds = sum(ds) / len(ds) if ds else 0.0
     if ds:
-        monthly_ds = sum(ds) / len(ds)
         rubric["adb_target"] = (
             max(rubric["adb_target"][0], round(monthly_ds * 1.6, -3)),
             f"1.6× observed avg monthly debt service (${monthly_ds:,.0f}) across {len(ds)} months",
+        )
+
+    # 0119: a stated funding goal reshapes the proposals — the targets should
+    # describe the bank profile that SUPPORTS the goal, not just today's book.
+    # Same typical-case assumptions the program sizing uses; admin overrides
+    # keep absolute precedence (this only ever touches ai_proposed_value).
+    goal = float(dealer.funding_goal) if dealer.funding_goal is not None else 0.0
+    goal_payment = monthly_payment_for_goal(goal) if goal > 0 else None
+    if goal_payment is not None:
+        obligations = monthly_ds + goal_payment
+        rubric["adb_target"] = (
+            max(rubric["adb_target"][0], round(obligations * 1.6, -3)),
+            (
+                f"1.6× fixed obligations including ~${goal_payment:,.0f}/mo for the proposed "
+                f"facility — sized to support the ${goal:,.0f} goal"
+            ),
+        )
+        rubric["dscr_target"] = (
+            rubric["dscr_target"][0],
+            (
+                "Typical underwriting DSCR for the requested facility — "
+                f"sized to support the ${goal:,.0f} goal"
+            ),
+        )
+        rubric["liquidity_debt_reserve"] = (
+            max(rubric["liquidity_debt_reserve"][0], round(2 * obligations, -3)),
+            (
+                "Next 60 days of scheduled debt service including the proposed facility — "
+                f"sized to support the ${goal:,.0f} goal"
+            ),
         )
 
     rows: list[DealerMetricTarget] = []
