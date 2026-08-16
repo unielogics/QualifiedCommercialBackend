@@ -18,6 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -32,7 +33,13 @@ from app.enums import Role
 from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
-from .deps import load_dealer, require_team, require_team_or_dealer, resolve_dealer_scope
+from .deps import (
+    load_dealer,
+    require_super_admin,
+    require_team,
+    require_team_or_dealer,
+    resolve_dealer_scope,
+)
 from .models import (
     DealerAccount,
     DealerAddback,
@@ -46,12 +53,15 @@ from .models import (
     DealerDocRequest,
     DealerDocument,
     DealerFinancialPeriod,
+    DealerGroup,
     DealerMessage,
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
     DealerOwner,
+    DealerPaymentShift,
     DealerPlanAction,
+    DealerProgramSetting,
     DealerSession,
     DealerSourceConnection,
     DealerTaxFiling,
@@ -98,6 +108,9 @@ from .schemas import (
     FundingPlanRead,
     FundingRangeRead,
     GlobalAlertRead,
+    GroupCreate,
+    GroupPatch,
+    GroupRead,
     HandoffRead,
     HealthRead,
     IrregularEventRead,
@@ -111,12 +124,19 @@ from .schemas import (
     OwnerRead,
     PathFundingRead,
     PathsRead,
+    PaymentShiftCreate,
+    PaymentShiftPatch,
+    PaymentShiftRead,
+    PaymentTimingRead,
     PeriodRead,
     PeriodUpsert,
     PipelineStatusRead,
     PlanActionCreate,
     PlanActionRead,
     PlanActionUpdate,
+    ProgramSettingRead,
+    ProgramSettingsRead,
+    ProgramSettingUpdate,
     ProgressRead,
     RecurringGroupRead,
     RecurringRead,
@@ -153,12 +173,20 @@ from .services.normalize import (
     rebuild_periods,
 )
 from .services.paths import (
+    DEFAULT_REQUIREMENTS,
+    DEFAULT_SIZING,
     PATH_KEYS,
+    PATH_LABELS,
     compute_ladder,
     compute_paths,
+    merged_settings,
+    path_model,
     requirements_for_amount,
     size_program,
+    validate_requirements,
+    validate_sizing,
 )
+from .services import payment_timing
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -171,10 +199,17 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     # Team sees the whole book; a DEALER login sees only businesses linked to it
     # (dealer_user_id) — this is what powers the self-serve "My business" view.
     require_team_or_dealer(user)
-    stmt = select(DealerBusiness).order_by(DealerBusiness.created_at.desc())
+    # 0120: one outerjoin carries the client-file (group) name onto each row.
+    stmt = (
+        select(DealerBusiness, DealerGroup.name)
+        .outerjoin(DealerGroup, DealerBusiness.group_id == DealerGroup.id)
+        .order_by(DealerBusiness.created_at.desc())
+    )
     if user.role == Role.DEALER:
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
-    dealers = (await db.execute(stmt)).scalars().all()
+    pairs = (await db.execute(stmt)).all()
+    dealers = [d for d, _ in pairs]
+    group_names = {d.id: name for d, name in pairs}
     if not dealers:
         return []
     ids = [d.id for d in dealers]
@@ -243,6 +278,7 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     out: list[DealerListItem] = []
     for d in dealers:
         item = DealerListItem.model_validate(d)
+        item.group_name = group_names.get(d.id)
         snap = latest.get(d.id)
         if snap is not None:
             item.score = float(snap.score) if snap.score is not None else None
@@ -258,9 +294,18 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     return out
 
 
+async def _require_group(db: AsyncSession, group_id: UUID) -> DealerGroup:
+    group = await db.get(DealerGroup, group_id)
+    if group is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Group not found")
+    return group
+
+
 @router.post("/dealers", response_model=DealerRead, status_code=status.HTTP_201_CREATED)
 async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
     require_team(user)
+    if payload.group_id is not None:
+        await _require_group(db, payload.group_id)
     dealer = DealerBusiness(**payload.model_dump(), owner_user_id=user.id)
     db.add(dealer)
     await db.flush()
@@ -446,6 +491,8 @@ async def update_dealer(
         target = await db.get(Bucket, changes["bucket_id"])
         if target is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket not found")
+    if changes.get("group_id") is not None:
+        await _require_group(db, changes["group_id"])
     for k, v in changes.items():
         setattr(dealer, k, v)
     if bucket_changed and dealer.bucket_id is not None:
@@ -2321,6 +2368,13 @@ async def _effective_targets(db: AsyncSession, dealer_id: UUID) -> dict[str, flo
     }
 
 
+async def _global_program_settings(db: AsyncSession) -> dict:
+    """Desk-approved program overrides (0120) merged over the code defaults —
+    the settings dict every paths.* computation takes."""
+    rows = (await db.execute(select(DealerProgramSetting))).scalars().all()
+    return merged_settings(rows)
+
+
 @router.get("/dealers/{dealer_id}/paths", response_model=PathsRead)
 async def dealer_paths(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -2330,11 +2384,13 @@ async def dealer_paths(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     targets = await _effective_targets(db, dealer.id)
+    settings = await _global_program_settings(db)
     # 0119: deposit history feeds the deposit-multiple sizing (additive fields
     # on each path row) — injected here, never stored on the snapshot.
     metrics = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
     return PathsRead(
-        paths=compute_paths(metrics, targets), ladder=compute_ladder(metrics, targets)
+        paths=compute_paths(metrics, targets, settings=settings),
+        ladder=compute_ladder(metrics, targets),
     )
 
 
@@ -2350,12 +2406,13 @@ async def funding_plan(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     targets = await _effective_targets(db, dealer.id)
+    settings = await _global_program_settings(db)
     metrics = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
     goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
 
     paths_out: list[PathFundingRead] = []
     for key in PATH_KEYS:
-        sized = size_program(key, metrics, targets)
+        sized = size_program(key, metrics, targets, settings=settings)
         fundable = None
         if sized["funding_typical"] is not None:
             fundable = FundingRangeRead(
@@ -2363,7 +2420,11 @@ async def funding_plan(
                 typical=sized["funding_typical"],
                 max=sized["funding_max"],
             )
-        requirements = requirements_for_amount(key, goal, metrics) if goal is not None else []
+        requirements = (
+            requirements_for_amount(key, goal, metrics, settings=settings)
+            if goal is not None
+            else []
+        )
         feasible = all(r["met"] for r in requirements) if requirements else None
         paths_out.append(
             PathFundingRead(
@@ -2768,7 +2829,8 @@ async def _build_lender_package(db: AsyncSession, dealer: DealerBusiness) -> Len
             for t in target_rows
         }
         paths = PathsRead(
-            paths=compute_paths(metrics, targets_map), ladder=compute_ladder(metrics, targets_map)
+            paths=compute_paths(metrics, targets_map, settings=await _global_program_settings(db)),
+            ladder=compute_ladder(metrics, targets_map),
         )
 
     return LenderPackageRead(
@@ -4214,3 +4276,389 @@ async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
     db.add(client)
     await db.flush()
     return client
+
+
+# --- Desk admin (0120): program settings, groups, payment timing & shifts -----
+
+
+def _program_setting_read(
+    path_key: str, row: DealerProgramSetting | None, by_name: str | None
+) -> ProgramSettingRead:
+    return ProgramSettingRead(
+        path_key=path_key,
+        label=PATH_LABELS[path_key],
+        model=path_model(path_key),
+        sizing_default=DEFAULT_SIZING.get(path_key),
+        sizing_override=row.sizing if row is not None else None,
+        requirements_default=DEFAULT_REQUIREMENTS.get(path_key, []),
+        requirements_override=row.requirements if row is not None else None,
+        approved_at=row.approved_at if row is not None else None,
+        updated_by_name=by_name,
+    )
+
+
+@router.get("/program-settings", response_model=ProgramSettingsRead)
+async def list_program_settings(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ProgramSettingsRead:
+    """Every program: code defaults side by side with the desk override.
+    Team-readable; writes are super-admin only."""
+    require_team(user)
+    rows = {
+        r.path_key: r
+        for r in (await db.execute(select(DealerProgramSetting))).scalars()
+    }
+    editor_ids = [r.updated_by_user_id for r in rows.values() if r.updated_by_user_id is not None]
+    names: dict[UUID, str] = {}
+    if editor_ids:
+        names = {
+            uid: (name or email)
+            for uid, name, email in (
+                await db.execute(
+                    select(User.id, User.name, User.email).where(User.id.in_(editor_ids))
+                )
+            ).all()
+        }
+    programs = [
+        _program_setting_read(
+            key,
+            rows.get(key),
+            names.get(rows[key].updated_by_user_id) if key in rows else None,
+        )
+        for key in PATH_KEYS
+    ]
+    return ProgramSettingsRead(programs=programs)
+
+
+@router.put("/program-settings/{path_key}", response_model=ProgramSettingRead)
+async def update_program_setting(
+    path_key: str,
+    payload: ProgramSettingUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProgramSettingRead:
+    """Desk-approve a program override (super-admin only). Each field present
+    in the body replaces the stored override WHOLESALE (never a deep merge);
+    an explicit null clears that field back to the code default. 422 on any
+    shape violation — collateral paths accept requirements but never sizing."""
+    require_super_admin(user)
+    if path_key not in PATH_KEYS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown program")
+    fields = payload.model_dump(exclude_unset=True)
+    try:
+        if fields.get("sizing") is not None:
+            fields["sizing"] = validate_sizing(path_key, fields["sizing"])
+        if fields.get("requirements") is not None:
+            fields["requirements"] = validate_requirements(fields["requirements"])
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    row = (
+        await db.execute(
+            select(DealerProgramSetting).where(DealerProgramSetting.path_key == path_key)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DealerProgramSetting(path_key=path_key)
+        db.add(row)
+        try:
+            await db.flush()
+        except IntegrityError:
+            # Concurrent first write for the same program — take the winner's row.
+            await db.rollback()
+            row = (
+                await db.execute(
+                    select(DealerProgramSetting).where(
+                        DealerProgramSetting.path_key == path_key
+                    )
+                )
+            ).scalar_one()
+    if "sizing" in fields:
+        row.sizing = fields["sizing"]
+    if "requirements" in fields:
+        row.requirements = fields["requirements"]
+    now = datetime.now(timezone.utc)
+    row.approved_at = now
+    row.updated_by_user_id = user.id
+    by_name = (user.name or user.email or "")[:120]
+    # The row carries its own change history (dos_audit_log is dealer-scoped
+    # and cannot record global actions) — capped at the last 20 approvals.
+    entry = {
+        "at": now.isoformat(),
+        "by_name": by_name,
+        "sizing": row.sizing,
+        "requirements": row.requirements,
+    }
+    row.history = ((row.history or []) + [entry])[-20:]
+    await db.commit()
+    await db.refresh(row)
+    return _program_setting_read(path_key, row, by_name or None)
+
+
+@router.delete("/program-settings/{path_key}", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_program_setting(
+    path_key: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    """Reset one program to the code defaults (super-admin only). Idempotent —
+    resetting an untouched program is already a 204."""
+    require_super_admin(user)
+    if path_key not in PATH_KEYS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown program")
+    row = (
+        await db.execute(
+            select(DealerProgramSetting).where(DealerProgramSetting.path_key == path_key)
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
+
+
+# --- Dealer groups (client files) ---------------------------------------------
+
+
+@router.get("/groups", response_model=list[GroupRead])
+async def list_groups(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[GroupRead]:
+    require_team(user)
+    rows = (
+        await db.execute(
+            select(DealerGroup, func.count(DealerBusiness.id))
+            .outerjoin(DealerBusiness, DealerBusiness.group_id == DealerGroup.id)
+            .group_by(DealerGroup.id)
+            .order_by(DealerGroup.name.asc())
+        )
+    ).all()
+    return [GroupRead(id=g.id, name=g.name, member_count=int(count)) for g, count in rows]
+
+
+def _clean_group_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Group name cannot be blank")
+    return cleaned
+
+
+@router.post("/groups", response_model=GroupRead, status_code=status.HTTP_201_CREATED)
+async def create_group(
+    payload: GroupCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> GroupRead:
+    require_team(user)
+    group = DealerGroup(name=_clean_group_name(payload.name))
+    db.add(group)
+    await db.commit()
+    await db.refresh(group)
+    return GroupRead(id=group.id, name=group.name, member_count=0)
+
+
+@router.patch("/groups/{group_id}", response_model=GroupRead)
+async def rename_group(
+    group_id: UUID, payload: GroupPatch, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> GroupRead:
+    require_team(user)
+    group = await _require_group(db, group_id)
+    group.name = _clean_group_name(payload.name)
+    await db.commit()
+    await db.refresh(group)
+    member_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DealerBusiness)
+            .where(DealerBusiness.group_id == group.id)
+        )
+    ).scalar_one()
+    return GroupRead(id=group.id, name=group.name, member_count=int(member_count))
+
+
+@router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_group(
+    group_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    require_team(user)
+    group = await _require_group(db, group_id)
+    member_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DealerBusiness)
+            .where(DealerBusiness.group_id == group.id)
+        )
+    ).scalar_one()
+    if member_count:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Group still has member businesses — detach them first",
+        )
+    await db.delete(group)
+    await db.commit()
+
+
+# --- Payment timing & shifts --------------------------------------------------
+
+_TIMING_WINDOW_MONTHS = 6
+_TIMING_WINDOW_DAYS = 183
+_TIMING_EVENT_CAP = 5000
+
+
+@router.get("/dealers/{dealer_id}/payment-timing", response_model=PaymentTimingRead)
+async def dealer_payment_timing(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PaymentTimingRead:
+    """When in the month money actually moves (trailing 6 months): per-day
+    in/out totals, the big outflow days with their dominant vendors, and the
+    recurring/debt-like vendors that are payment-shift candidates."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    # One ledger load feeds both the full-history rollup (vendor identity,
+    # cadence, debt flags) and the windowed day-of-month analysis.
+    rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
+    rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
+    cutoff = date.today() - timedelta(days=_TIMING_WINDOW_DAYS)
+    windowed = sorted(
+        (r for r in rows if r.occurred_on >= cutoff),
+        key=lambda r: r.occurred_on,
+        reverse=True,
+    )[:_TIMING_EVENT_CAP]
+    return PaymentTimingRead(
+        **payment_timing.analyze_timing(windowed, rolled, months_window=_TIMING_WINDOW_MONTHS)
+    )
+
+
+def _shift_estimate(monthly_amount, from_day: int, to_day: int) -> float | None:
+    if monthly_amount is None:
+        return None
+    return payment_timing.adb_impact(float(monthly_amount), from_day, to_day)
+
+
+async def _load_shift(db: AsyncSession, dealer_id: UUID, shift_id: UUID) -> DealerPaymentShift:
+    shift = await db.get(DealerPaymentShift, shift_id)
+    if shift is None or shift.dealer_id != dealer_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Payment shift not found")
+    return shift
+
+
+@router.get("/dealers/{dealer_id}/payment-shifts", response_model=list[PaymentShiftRead])
+async def list_payment_shifts(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerPaymentShift]:
+    """Team sees the whole pipeline; a DEALER login never sees drafts."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    q = select(DealerPaymentShift).where(DealerPaymentShift.dealer_id == dealer.id)
+    if user.role == Role.DEALER:
+        q = q.where(DealerPaymentShift.status != "draft")
+    return (
+        (await db.execute(q.order_by(DealerPaymentShift.created_at.desc()))).scalars().all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/payment-shifts",
+    response_model=PaymentShiftRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_payment_shift(
+    dealer_id: UUID,
+    payload: PaymentShiftCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPaymentShift:
+    """Draft a payment-date shift (team only). est_adb_impact is always
+    computed server-side from monthly_amount and the day move."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    if payload.from_day == payload.to_day:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_day and to_day must differ")
+    label = payload.label.strip()
+    if not label:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "label cannot be blank")
+    shift = DealerPaymentShift(
+        dealer_id=dealer.id,
+        vendor_key=payload.vendor_key,
+        label=label,
+        from_day=payload.from_day,
+        to_day=payload.to_day,
+        monthly_amount=payload.monthly_amount,
+        est_adb_impact=_shift_estimate(payload.monthly_amount, payload.from_day, payload.to_day),
+        rationale=payload.rationale,
+        created_by_user_id=user.id,
+    )
+    db.add(shift)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "payment_shift.create", "payment_shift",
+        entity_id=shift.id,
+        after={
+            "label": label,
+            "from_day": payload.from_day,
+            "to_day": payload.to_day,
+            "monthly_amount": payload.monthly_amount,
+        },
+    )
+    await db.commit()
+    await db.refresh(shift)
+    return shift
+
+
+@router.patch("/dealers/{dealer_id}/payment-shifts/{shift_id}", response_model=PaymentShiftRead)
+async def update_payment_shift(
+    dealer_id: UUID,
+    shift_id: UUID,
+    payload: PaymentShiftPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPaymentShift:
+    """Edit days/rationale or move the shift through its lifecycle
+    (draft -> proposed -> done|dismissed; terminal states only reopen to
+    proposed). The ADB estimate is recomputed whenever a day changes."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    shift = await _load_shift(db, dealer.id, shift_id)
+    changes = payload.model_dump(exclude_unset=True)
+    new_status = changes.get("status")
+    if new_status is not None and new_status != shift.status:
+        if not payment_timing.can_transition(shift.status, new_status):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Cannot move a '{shift.status}' shift to '{new_status}'",
+            )
+    from_day = changes.get("from_day") or shift.from_day
+    to_day = changes.get("to_day") or shift.to_day
+    if from_day == to_day:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_day and to_day must differ")
+    days_changed = from_day != shift.from_day or to_day != shift.to_day
+    shift.from_day = from_day
+    shift.to_day = to_day
+    if "rationale" in changes:
+        shift.rationale = changes["rationale"]
+    if days_changed:
+        shift.est_adb_impact = _shift_estimate(shift.monthly_amount, from_day, to_day)
+    if new_status is not None and new_status != shift.status:
+        before_status = shift.status
+        shift.status = new_status
+        await log_action(
+            db, dealer.id, user, "payment_shift.status", "payment_shift",
+            entity_id=shift.id,
+            before={"status": before_status},
+            after={"status": new_status},
+        )
+    await db.commit()
+    await db.refresh(shift)
+    return shift
+
+
+@router.delete(
+    "/dealers/{dealer_id}/payment-shifts/{shift_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_payment_shift(
+    dealer_id: UUID, shift_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    """Only drafts are deletable — anything the dealer may have seen is
+    dismissed (audited), never erased."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    shift = await _load_shift(db, dealer.id, shift_id)
+    if shift.status != "draft":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "Only draft shifts can be deleted — dismiss instead"
+        )
+    await db.delete(shift)
+    await db.commit()

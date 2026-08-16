@@ -25,6 +25,7 @@ from ..models import (
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
+    DealerProgramSetting,
 )
 
 # 4% lender haircut: bankable EBITDA = adjusted * 0.96
@@ -578,9 +579,10 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
     # --- Fundability alerts (Phase 3 Wave 2): a path at >= 90% readiness is a
     # positive, actionable signal — surface it once (deduped by kind via
     # _ensure_alert) so the team starts a funding file while the window is open.
-    from .paths import compute_paths  # local import — paths is pure, no cycle risk
+    from .paths import compute_paths, merged_settings  # local import — paths is pure, no cycle risk
 
-    for path in compute_paths(metrics, targets):
+    program_rows = (await db.execute(select(DealerProgramSetting))).scalars().all()
+    for path in compute_paths(metrics, targets, settings=merged_settings(program_rows)):
         readiness = float(path.get("readiness_pct") or 0.0)
         if readiness >= FUNDABILITY_READINESS_PCT:
             await _ensure_alert(

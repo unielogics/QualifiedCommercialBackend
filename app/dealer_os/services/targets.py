@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import DealerBusiness, DealerFinancialPeriod, DealerMetricTarget
-from .paths import monthly_payment_for_goal
+from ..models import DealerBusiness, DealerFinancialPeriod, DealerMetricTarget, DealerProgramSetting
+from .paths import merged_settings, monthly_payment_for_goal
 
 # metric_key -> (default value, rationale template)
 DEFAULT_RUBRIC: dict[str, tuple[float, str]] = {
@@ -65,7 +65,12 @@ async def propose_targets(db: AsyncSession, dealer: DealerBusiness) -> list[Deal
     # Same typical-case assumptions the program sizing uses; admin overrides
     # keep absolute precedence (this only ever touches ai_proposed_value).
     goal = float(dealer.funding_goal) if dealer.funding_goal is not None else 0.0
-    goal_payment = monthly_payment_for_goal(goal) if goal > 0 else None
+    goal_payment = None
+    if goal > 0:
+        # Desk overrides (0120) change the typical-case rate/term the goal
+        # payment assumes — thread them in, defaults when no rows exist.
+        program_rows = (await db.execute(select(DealerProgramSetting))).scalars().all()
+        goal_payment = monthly_payment_for_goal(goal, settings=merged_settings(program_rows))
     if goal_payment is not None:
         obligations = monthly_ds + goal_payment
         rubric["adb_target"] = (

@@ -26,6 +26,12 @@ def require_team(user: User) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required for Dealer OS")
 
 
+def require_super_admin(user: User) -> None:
+    """Desk-policy writes (program settings) are super-admin only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+
+
 def require_team_or_dealer(user: User) -> None:
     if user.role not in _TEAM_ROLES and user.role != Role.DEALER:
         raise HTTPException(

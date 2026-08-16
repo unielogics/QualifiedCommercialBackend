@@ -40,6 +40,11 @@ class DealerBusiness(TimestampMixin, Base):
     zip: Mapped[str | None] = mapped_column(String(12))
     # How much funding the client is looking for (0119) — drives program
     # sizing and reverse-engineered metric targets.
+    # One client "file" can hold an owner's multiple LLCs (0120). Metrics are
+    # entirely per-dealer; the group is a console/reporting concept.
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealer_groups.id", ondelete="SET NULL")
+    )
     funding_goal: Mapped[float | None] = mapped_column(Numeric(14, 2))
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
@@ -547,3 +552,58 @@ class DealerSourceConnection(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     encrypted_tokens: Mapped[str | None] = mapped_column(Text)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerGroup(TimestampMixin, Base):
+    """A client file: one owner's set of LLCs audited together (0120)."""
+
+    __tablename__ = "dos_dealer_groups"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+
+
+class DealerProgramSetting(TimestampMixin, Base):
+    """Desk-approved override of one program's sizing/readiness constants.
+
+    Absent row = the PROVISIONAL code defaults in services/paths.py. The row
+    carries its own change history (dos_audit_log is dealer-scoped and cannot
+    record global actions)."""
+
+    __tablename__ = "dos_program_settings"
+
+    id: Mapped[uuid.UUID] = _pk()
+    path_key: Mapped[str] = mapped_column(String(24), nullable=False, unique=True)
+    sizing: Mapped[dict | None] = mapped_column(JSONB)
+    requirements: Mapped[list | None] = mapped_column(JSONB)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    history: Mapped[list | None] = mapped_column(JSONB)
+
+
+class DealerPaymentShift(TimestampMixin, Base):
+    """Team-authored payment-date shift: move a regular withdrawal later in
+    the month (under real vendor terms — never statement-date window
+    dressing) to raise average daily balance. status='draft' rows are
+    team-only; dealers see proposed/done/dismissed."""
+
+    __tablename__ = "dos_payment_shifts"
+    __table_args__ = (Index("ix_dos_payment_shifts_dealer_status", "dealer_id", "status"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    vendor_key: Mapped[str | None] = mapped_column(String(120))
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    from_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    monthly_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    est_adb_impact: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    rationale: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")  # draft|proposed|done|dismissed
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )

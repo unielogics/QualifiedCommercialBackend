@@ -31,6 +31,7 @@ class DealerCreate(BaseModel):
     notes: str | None = None
     funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
     funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
+    group_id: UUID | None = None  # 0120: client file this LLC belongs to
 
 
 class DealerUpdate(BaseModel):
@@ -55,6 +56,7 @@ class DealerUpdate(BaseModel):
     naics_label: str | None = None
     funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
     funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
+    group_id: UUID | None = None  # 0120: client file link (PATCH null detaches)
 
 
 class DealerRead(ORM):
@@ -82,6 +84,7 @@ class DealerRead(ORM):
     naics_label: str | None = None
     funding_goal: float | None = None
     funding_purpose: str | None = None
+    group_id: UUID | None = None
 
 
 class DealerListItem(ORM):
@@ -91,6 +94,9 @@ class DealerListItem(ORM):
     state: str | None = None
     status: str
     created_at: datetime
+    # 0120: client-file grouping (group_name filled by the router's outerjoin)
+    group_id: UUID | None = None
+    group_name: str | None = None
     # rollups filled by the router (no snapshot may exist yet)
     score: float | None = None
     tier: str | None = None
@@ -983,3 +989,111 @@ class FundingPlanRead(BaseModel):
     goal: float | None = None
     purpose: str | None = None
     paths: list[PathFundingRead] = []
+
+
+# --- Desk admin (0120): program settings, groups, payment timing & shifts -----
+
+
+class ProgramSettingRead(BaseModel):
+    """One program row: the code defaults side by side with the desk override
+    (override is None when the desk has not touched the program)."""
+
+    path_key: str
+    label: str
+    model: str  # dscr|deposit|collateral
+    sizing_default: dict | None = None
+    sizing_override: dict | None = None
+    requirements_default: list[dict] = []
+    requirements_override: list[dict] | None = None
+    approved_at: datetime | None = None
+    updated_by_name: str | None = None
+
+
+class ProgramSettingsRead(BaseModel):
+    programs: list[ProgramSettingRead] = []
+
+
+class ProgramSettingUpdate(BaseModel):
+    """PUT body: only the fields present are replaced (each WHOLESALE); an
+    explicit null clears that override back to the code default. Shape
+    validation happens in services.paths (422 on violation)."""
+
+    sizing: dict | None = None
+    requirements: list[dict] | None = None
+
+
+class GroupRead(BaseModel):
+    id: UUID
+    name: str
+    member_count: int = 0
+
+
+class GroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class GroupPatch(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class TimingDayRead(BaseModel):
+    day: int
+    out_total: float = 0.0
+    out_avg_month: float = 0.0
+    in_total: float = 0.0
+    count: int = 0
+
+
+class TimingBigDayRead(BaseModel):
+    day: int
+    out_avg_month: float
+    top_vendors: list[str] = []
+
+
+class TimingRecurringRead(BaseModel):
+    """A recurring/debt-like outflow vendor — a payment-shift candidate."""
+
+    vendor_key: str
+    label: str
+    cadence: str | None = None
+    typical_day: int
+    day_spread: list[float] = []  # [p25, p75] day-of-month
+    monthly_amount: float
+    account_id: UUID | None = None
+
+
+class PaymentTimingRead(BaseModel):
+    days: list[TimingDayRead] = []
+    big_days: list[TimingBigDayRead] = []
+    recurring: list[TimingRecurringRead] = []
+    window_months: int
+    computed_at: datetime
+
+
+class PaymentShiftRead(ORM):
+    id: UUID
+    vendor_key: str | None = None
+    label: str
+    from_day: int
+    to_day: int
+    monthly_amount: float | None = None
+    est_adb_impact: float | None = None
+    rationale: str | None = None
+    status: str
+    created_at: datetime
+
+
+class PaymentShiftCreate(BaseModel):
+    vendor_key: str | None = Field(default=None, max_length=120)
+    label: str = Field(min_length=1, max_length=200)
+    from_day: int = Field(ge=1, le=31)
+    to_day: int = Field(ge=1, le=31)
+    monthly_amount: float | None = Field(default=None, gt=0)
+    rationale: str | None = None
+
+
+class PaymentShiftPatch(BaseModel):
+    from_day: int | None = Field(default=None, ge=1, le=31)
+    to_day: int | None = Field(default=None, ge=1, le=31)
+    rationale: str | None = None
+    status: str | None = Field(default=None, pattern="^(draft|proposed|done|dismissed)$")

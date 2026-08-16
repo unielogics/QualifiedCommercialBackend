@@ -111,106 +111,139 @@ def _req_score(v: dict, minimum: float) -> dict:
     return _req(f"Health score ≥ {minimum:.0f}", met, detail)
 
 
-# --- 7 funding paths (PROVISIONAL boxes) -------------------------------------
+# --- 7 funding paths (PROVISIONAL boxes, data-driven since 0120) --------------
+#
+# 0120: the inline path specs became DEFAULT_REQUIREMENTS / DEFAULT_SIZING data
+# tables so the lending desk can override any program (dos_program_settings)
+# without a deploy. A stored override replaces the default WHOLESALE per path
+# (never a deep merge); absent row = these code defaults, unchanged behavior.
 
-def compute_paths(metrics: dict, targets: dict) -> list[dict]:
-    """Grade the dealer against 7 product paths. Readiness = % of requirements met."""
+PATH_KEYS: tuple[str, ...] = (
+    "sba",
+    "conventional",
+    "loc",
+    "cre",
+    "equipment",
+    "working_capital",
+    "floorplan",
+)
+
+PATH_LABELS: dict[str, str] = {
+    "sba": "SBA 7(a)",
+    "conventional": "Conventional term loan",
+    "loc": "Business line of credit",
+    "cre": "Commercial real estate",
+    "equipment": "Equipment financing",
+    "working_capital": "Working capital",
+    "floorplan": "Floorplan line",
+}
+
+# ReqSpec kind -> builder. nsf/history thresholds are integer-valued.
+_BUILDERS = {
+    "dscr": _req_dscr,
+    "ebitda": _req_ebitda,
+    "adb": _req_adb,
+    "nsf": _req_nsf,
+    "liquidity": _req_liquidity,
+    "score": _req_score,
+    "history": _req_history,
+}
+_INT_KINDS = frozenset({"nsf", "history"})
+_TARGET_KEYS = frozenset({"dscr_target", "adb_target", "liquidity_floor"})
+
+# Default ReqSpecs per path: {kind, threshold, target_key?}. A spec carrying a
+# target_key resolves its threshold from the dealer's effective targets first,
+# with the literal threshold as the fallback — the same "v[key] or fallback"
+# the inline specs used before 0120.
+DEFAULT_REQUIREMENTS: dict[str, list[dict]] = {
+    "sba": [
+        {"kind": "dscr", "threshold": 1.25},
+        {"kind": "ebitda", "threshold": 250_000},
+        {"kind": "nsf", "threshold": 2},
+        {"kind": "liquidity", "threshold": 50_000},
+        {"kind": "history", "threshold": 6},
+    ],
+    "conventional": [
+        {"kind": "dscr", "threshold": 1.35, "target_key": "dscr_target"},
+        {"kind": "ebitda", "threshold": 500_000},
+        {"kind": "adb", "threshold": 500_000, "target_key": "adb_target"},
+        {"kind": "nsf", "threshold": 0},
+        {"kind": "score", "threshold": 85},
+    ],
+    "loc": [
+        {"kind": "dscr", "threshold": 1.20},
+        {"kind": "adb", "threshold": 250_000},
+        {"kind": "nsf", "threshold": 1},
+        {"kind": "liquidity", "threshold": 100_000, "target_key": "liquidity_floor"},
+        {"kind": "score", "threshold": 75},
+    ],
+    "cre": [
+        {"kind": "dscr", "threshold": 1.25},
+        {"kind": "ebitda", "threshold": 750_000},
+        {"kind": "liquidity", "threshold": 150_000},
+        {"kind": "score", "threshold": 80},
+        {"kind": "history", "threshold": 6},
+    ],
+    "equipment": [
+        {"kind": "dscr", "threshold": 1.15},
+        {"kind": "ebitda", "threshold": 100_000},
+        {"kind": "adb", "threshold": 100_000},
+        {"kind": "nsf", "threshold": 3},
+        {"kind": "history", "threshold": 3},
+    ],
+    "working_capital": [
+        {"kind": "dscr", "threshold": 1.05},
+        {"kind": "adb", "threshold": 75_000},
+        {"kind": "nsf", "threshold": 3},
+        {"kind": "liquidity", "threshold": 25_000},
+        {"kind": "history", "threshold": 3},
+    ],
+    "floorplan": [
+        {"kind": "dscr", "threshold": 1.20},
+        {"kind": "adb", "threshold": 200_000},
+        {"kind": "nsf", "threshold": 1},
+        {"kind": "liquidity", "threshold": 100_000},
+        {"kind": "score", "threshold": 70},
+    ],
+}
+
+
+def _build_requirement(v: dict, spec: dict) -> dict | None:
+    """One ReqSpec -> the graded {label, met, detail} row (None = unknown kind
+    in a stored override — skipped rather than crashing a live console)."""
+    kind = spec.get("kind")
+    builder = _BUILDERS.get(kind)
+    if builder is None:
+        return None
+    threshold = spec.get("threshold")
+    target_key = spec.get("target_key")
+    if target_key in _TARGET_KEYS:
+        threshold = v.get(target_key) or threshold
+    if threshold is None:
+        return None
+    return builder(v, int(threshold) if kind in _INT_KINDS else float(threshold))
+
+
+def compute_paths(metrics: dict, targets: dict, settings: dict | None = None) -> list[dict]:
+    """Grade the dealer against the 7 product paths. Readiness = % of
+    requirements met. settings is a merged_settings() dict (None = the code
+    defaults); each path's requirement list and sizing come from it wholesale."""
     v = _values(metrics, targets)
-    dscr_target = v["dscr_target"] or 1.35
-
-    specs: list[tuple[str, str, list[dict]]] = [
-        (
-            "sba",
-            "SBA 7(a)",
-            [
-                _req_dscr(v, 1.25),
-                _req_ebitda(v, 250_000),
-                _req_nsf(v, 2),
-                _req_liquidity(v, 50_000),
-                _req_history(v, 6),
-            ],
-        ),
-        (
-            "conventional",
-            "Conventional term loan",
-            [
-                _req_dscr(v, dscr_target),
-                _req_ebitda(v, 500_000),
-                _req_adb(v, v["adb_target"] or 500_000),
-                _req_nsf(v, 0),
-                _req_score(v, 85),
-            ],
-        ),
-        (
-            "loc",
-            "Business line of credit",
-            [
-                _req_dscr(v, 1.20),
-                _req_adb(v, 250_000),
-                _req_nsf(v, 1),
-                _req_liquidity(v, v["liquidity_floor"] or 100_000),
-                _req_score(v, 75),
-            ],
-        ),
-        (
-            "cre",
-            "Commercial real estate",
-            [
-                _req_dscr(v, 1.25),
-                _req_ebitda(v, 750_000),
-                _req_liquidity(v, 150_000),
-                _req_score(v, 80),
-                _req_history(v, 6),
-            ],
-        ),
-        (
-            "equipment",
-            "Equipment financing",
-            [
-                _req_dscr(v, 1.15),
-                _req_ebitda(v, 100_000),
-                _req_adb(v, 100_000),
-                _req_nsf(v, 3),
-                _req_history(v, 3),
-            ],
-        ),
-        (
-            "working_capital",
-            "Working capital",
-            [
-                _req_dscr(v, 1.05),
-                _req_adb(v, 75_000),
-                _req_nsf(v, 3),
-                _req_liquidity(v, 25_000),
-                _req_history(v, 3),
-            ],
-        ),
-        (
-            "floorplan",
-            "Floorplan line",
-            [
-                _req_dscr(v, 1.20),
-                _req_adb(v, 200_000),
-                _req_nsf(v, 1),
-                _req_liquidity(v, 100_000),
-                _req_score(v, 70),
-            ],
-        ),
-    ]
-
     out: list[dict] = []
-    for key, label, requirements in specs:
+    for key in PATH_KEYS:
+        specs = _requirement_specs(key, settings)
+        requirements = [r for r in (_build_requirement(v, s) for s in specs) if r is not None]
         met = sum(1 for r in requirements if r["met"])
         out.append(
             {
                 "key": key,
-                "label": label,
-                "readiness_pct": round(100.0 * met / len(requirements), 0),
+                "label": PATH_LABELS[key],
+                "readiness_pct": round(100.0 * met / max(len(requirements), 1), 0),
                 "requirements": requirements,
                 # 0119: additive program sizing (PROVISIONAL — see the sizing
                 # block below). Callers with deposit history inject
                 # metrics["deposits_monthly_avg"] before calling.
-                **size_program(key, metrics, targets),
+                **size_program(key, metrics, targets, settings=settings),
             }
         )
     return out
@@ -280,46 +313,43 @@ def compute_ladder(metrics: dict, targets: dict) -> dict:
 # spirit as the path boxes above — shaped like typical lender programs, NOT
 # credit policy. Replace with per-lender programs when the network lands.
 
-PATH_KEYS: tuple[str, ...] = (
-    "sba",
-    "conventional",
-    "loc",
-    "cre",
-    "equipment",
-    "working_capital",
-    "floorplan",
-)
-
-# DSCR-capacity paths: principal is what the bankable-EBITDA-per-month can
-# carry at a DSCR floor, amortized. Triplets run conservative -> typical ->
-# aggressive, so amounts come out min <= typical <= max by construction.
-_SIZING_DSCR: dict[str, dict] = {
+# Default sizing model per path (0120: JSON-shaped so a stored override is the
+# same object shape).
+# - dscr model: principal is what the bankable-EBITDA-per-month can carry at a
+#   DSCR floor, amortized. Triplets run conservative -> typical -> aggressive,
+#   so amounts come out min <= typical <= max by construction.
+# - deposit model: revenue-based sizing off observed bank activity.
+DEFAULT_SIZING: dict[str, dict] = {
     "sba": {
-        "dscr": (1.50, 1.35, 1.25),
-        "term_months": (84, 120, 120),
+        "model": "dscr",
+        "dscr": [1.50, 1.35, 1.25],
+        "term_months": [84, 120, 120],
         "annual_rate": 0.105,
         "ceiling": 5_000_000,  # SBA 7(a) statutory program maximum
     },
     "conventional": {
-        "dscr": (1.60, 1.40, 1.25),
-        "term_months": (48, 60, 84),
+        "model": "dscr",
+        "dscr": [1.60, 1.40, 1.25],
+        "term_months": [48, 60, 84],
         "annual_rate": 0.095,
         "ceiling": 10_000_000,
     },
     "equipment": {
-        "dscr": (1.40, 1.25, 1.15),
-        "term_months": (36, 48, 60),
+        "model": "dscr",
+        "dscr": [1.40, 1.25, 1.15],
+        "term_months": [36, 48, 60],
         "annual_rate": 0.115,
         "ceiling": 2_000_000,
     },
-}
-
-# Deposit-multiple paths: revenue-based sizing off observed bank activity.
-_SIZING_DEPOSIT: dict[str, dict] = {
     # ~0.6-1.2x average monthly deposits.
-    "working_capital": {"input": "deposits_monthly_avg", "multiples": (0.6, 0.9, 1.2), "ceiling": 500_000},
+    "working_capital": {
+        "model": "deposit",
+        "input": "deposits_monthly_avg",
+        "multiples": [0.6, 0.9, 1.2],
+        "ceiling": 500_000,
+    },
     # ~1-2x average daily balance.
-    "loc": {"input": "adb", "multiples": (1.0, 1.5, 2.0), "ceiling": 1_000_000},
+    "loc": {"model": "deposit", "input": "adb", "multiples": [1.0, 1.5, 2.0], "ceiling": 1_000_000},
 }
 
 # Collateral paths cannot be sized from bank/EBITDA data alone — name what is
@@ -335,15 +365,170 @@ _SIZING_COLLATERAL_MISSING: dict[str, list[str]] = {
     ],
 }
 
-# Months of normalized statements a lender file needs per program (mirrors the
-# _req_history thresholds in the path boxes above).
-_STATEMENT_MONTHS_REQUIRED: dict[str, int] = {
-    "sba": 6,
-    "conventional": 6,
-    "loc": 3,
-    "equipment": 3,
-    "working_capital": 3,
-}
+
+def path_model(path_key: str) -> str:
+    """dscr | deposit | collateral — which sizing family a path belongs to."""
+    spec = DEFAULT_SIZING.get(path_key)
+    return spec["model"] if spec is not None else "collateral"
+
+
+def merged_settings(rows) -> dict[str, dict]:
+    """PURE: dos_program_settings rows -> {path_key: {sizing, requirements}}.
+
+    A stored override replaces the code default WHOLESALE for that field of
+    that path (no deep merge); paths without a row (or with a null field) keep
+    the defaults. Rows may be ORM objects or plain dicts."""
+
+    def _get(row, key):
+        return row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+
+    out = {
+        key: {
+            "sizing": DEFAULT_SIZING.get(key),
+            "requirements": DEFAULT_REQUIREMENTS.get(key, []),
+        }
+        for key in PATH_KEYS
+    }
+    for row in rows or ():
+        entry = out.get(_get(row, "path_key"))
+        if entry is None:
+            continue
+        sizing = _get(row, "sizing")
+        requirements = _get(row, "requirements")
+        if sizing is not None:
+            entry["sizing"] = sizing
+        if requirements is not None:
+            entry["requirements"] = requirements
+    return out
+
+
+def _sizing_spec(path_key: str, settings: dict | None) -> dict | None:
+    if settings is None:
+        return DEFAULT_SIZING.get(path_key)
+    return (settings.get(path_key) or {}).get("sizing")
+
+
+def _requirement_specs(path_key: str, settings: dict | None) -> list[dict]:
+    if settings is None:
+        return DEFAULT_REQUIREMENTS.get(path_key, [])
+    return (settings.get(path_key) or {}).get("requirements") or []
+
+
+# --- Desk-override validation (0120) ------------------------------------------
+#
+# Pure shape validators for PUT /program-settings payloads. They raise
+# ValueError (the router maps it to a 422) and return the NORMALIZED object
+# that gets stored — always carrying its "model" so a stored override can
+# never be ambiguous about which sizing family it belongs to.
+
+_DEPOSIT_INPUTS = frozenset({"deposits_monthly_avg", "adb"})
+_MAX_TERM_MONTHS = 360
+
+
+def _number(value, name: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if positive and value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return float(value)
+
+
+def _triplet(value, name: str) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{name} must be a list of exactly 3 numbers")
+    return [_number(item, name, positive=True) for item in value]
+
+
+def validate_sizing(path_key: str, sizing) -> dict:
+    """Validate + normalize one sizing override. Raises ValueError on any
+    shape violation; collateral paths (cre, floorplan) accept none at all."""
+    model = path_model(path_key)
+    if model == "collateral":
+        raise ValueError(f"'{path_key}' is collateral-sized — sizing overrides are not accepted")
+    if not isinstance(sizing, dict):
+        raise ValueError("sizing must be an object")
+    declared = sizing.get("model", model)
+    if declared != model:
+        raise ValueError(f"sizing model must be '{model}' for '{path_key}'")
+
+    if model == "dscr":
+        allowed = {"model", "dscr", "term_months", "annual_rate", "ceiling"}
+        unknown = set(sizing) - allowed
+        if unknown:
+            raise ValueError(f"unknown sizing keys: {sorted(unknown)}")
+        dscr = _triplet(sizing.get("dscr"), "dscr")
+        if not (dscr[0] >= dscr[1] >= dscr[2]):
+            raise ValueError("dscr triplet must run conservative >= typical >= aggressive")
+        terms = sizing.get("term_months")
+        if not isinstance(terms, (list, tuple)) or len(terms) != 3:
+            raise ValueError("term_months must be a list of exactly 3 integers")
+        term_months: list[int] = []
+        for t in terms:
+            if isinstance(t, bool) or not isinstance(t, int):
+                raise ValueError("term_months must be integers")
+            if not 0 < t <= _MAX_TERM_MONTHS:
+                raise ValueError(f"term_months must be in 1..{_MAX_TERM_MONTHS}")
+            term_months.append(t)
+        if not (term_months[0] <= term_months[1] <= term_months[2]):
+            raise ValueError(
+                "term_months must be non-decreasing (conservative <= typical <= aggressive) — "
+                "with the descending DSCR triplet this keeps min <= typical <= max"
+            )
+        annual_rate = _number(sizing.get("annual_rate"), "annual_rate")
+        if not 0 < annual_rate < 0.5:
+            raise ValueError("annual_rate must be between 0 and 0.5 (exclusive)")
+        ceiling = _number(sizing.get("ceiling"), "ceiling", positive=True)
+        return {
+            "model": "dscr",
+            "dscr": dscr,
+            "term_months": term_months,
+            "annual_rate": annual_rate,
+            "ceiling": ceiling,
+        }
+
+    allowed = {"model", "input", "multiples", "ceiling"}
+    unknown = set(sizing) - allowed
+    if unknown:
+        raise ValueError(f"unknown sizing keys: {sorted(unknown)}")
+    source = sizing.get("input")
+    if source not in _DEPOSIT_INPUTS:
+        raise ValueError(f"input must be one of {sorted(_DEPOSIT_INPUTS)}")
+    multiples = _triplet(sizing.get("multiples"), "multiples")
+    if not (multiples[0] <= multiples[1] <= multiples[2]):
+        raise ValueError("multiples must be positive and ascending")
+    ceiling = _number(sizing.get("ceiling"), "ceiling", positive=True)
+    return {"model": "deposit", "input": source, "multiples": multiples, "ceiling": ceiling}
+
+
+def validate_requirements(specs) -> list[dict]:
+    """Validate + normalize a ReqSpec list override. Raises ValueError."""
+    if not isinstance(specs, (list, tuple)) or not specs:
+        raise ValueError("requirements must be a non-empty list")
+    out: list[dict] = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            raise ValueError("each requirement must be an object")
+        unknown = set(spec) - {"kind", "threshold", "target_key"}
+        if unknown:
+            raise ValueError(f"unknown requirement keys: {sorted(unknown)}")
+        kind = spec.get("kind")
+        if kind not in _BUILDERS:
+            raise ValueError(f"unknown requirement kind '{kind}'")
+        threshold = _number(spec.get("threshold"), "threshold")
+        if threshold < 0:
+            raise ValueError("threshold must be >= 0")
+        if kind in _INT_KINDS:
+            if threshold != int(threshold):
+                raise ValueError(f"{kind} threshold must be an integer")
+            threshold = int(threshold)
+        normalized: dict = {"kind": kind, "threshold": threshold}
+        target_key = spec.get("target_key")
+        if target_key is not None:
+            if target_key not in _TARGET_KEYS:
+                raise ValueError(f"unknown target_key '{target_key}'")
+            normalized["target_key"] = target_key
+        out.append(normalized)
+    return out
 
 # Relative tolerance when checking a requirement against the current value —
 # absorbs the round-to-$1k on sized amounts so a goal equal to the computed
@@ -366,11 +551,13 @@ def _payment_for_principal(principal: float, annual_rate: float, months: int) ->
     return principal / _principal_for_payment(1.0, annual_rate, months)
 
 
-def monthly_payment_for_goal(goal: float, path_key: str = "conventional") -> float | None:
+def monthly_payment_for_goal(
+    goal: float, path_key: str = "conventional", settings: dict | None = None
+) -> float | None:
     """Typical-case monthly P&I a funding goal implies (used by the target
     proposal service to align ADB/liquidity proposals to the goal)."""
-    spec = _SIZING_DSCR.get(path_key)
-    if spec is None or goal is None or goal <= 0:
+    spec = _sizing_spec(path_key, settings)
+    if spec is None or spec.get("model") != "dscr" or goal is None or goal <= 0:
         return None
     return round(_payment_for_principal(float(goal), spec["annual_rate"], spec["term_months"][1]), 2)
 
@@ -392,21 +579,25 @@ def _floor_1k(x: float) -> float:
     return float(int(x // 1000) * 1000)
 
 
-def size_program(path_key: str, metrics: dict, targets: dict) -> dict:
+def size_program(
+    path_key: str, metrics: dict, targets: dict, settings: dict | None = None
+) -> dict:
     """PURE program sizing: what this dealer could fund on each path today.
 
     Returns {funding_min, funding_typical, funding_max, sizing_basis,
     sizing_constraints}. Amounts are None when the path cannot be sized from
     the data on file; sizing_basis says which model produced the numbers.
+    settings is a merged_settings() dict (None = code defaults).
 
     metrics is the snapshot metric tree; callers that have it may inject
     metrics["deposits_monthly_avg"] (average monthly deposits) — without it
     the deposit-multiple path reports insufficient data instead of guessing.
     """
     v = _values(metrics, targets)
+    spec = _sizing_spec(path_key, settings)
+    model = (spec or {}).get("model")
 
-    if path_key in _SIZING_DSCR:
-        spec = _SIZING_DSCR[path_key]
+    if model == "dscr":
         ebitda_annual = v["ebitda"]
         if ebitda_annual is None or ebitda_annual <= 0:
             return _insufficient(
@@ -434,8 +625,7 @@ def size_program(path_key: str, metrics: dict, targets: dict) -> dict:
             "sizing_constraints": constraints,
         }
 
-    if path_key in _SIZING_DEPOSIT:
-        spec = _SIZING_DEPOSIT[path_key]
+    if model == "deposit":
         if spec["input"] == "adb":
             base = v["adb"]
             missing = "no balance data yet — average daily balance is not computable"
@@ -492,7 +682,15 @@ def _requirement(
     }
 
 
-def requirements_for_amount(path_key: str, goal: float, metrics: dict) -> list[dict]:
+# Statement-months fallback for paths whose requirement list has no history
+# spec (their checklist trades history for score) — the goal gate keeps the
+# original bar.
+_DEFAULT_STATEMENT_MONTHS: dict[str, int] = {"conventional": 6}
+
+
+def requirements_for_amount(
+    path_key: str, goal: float, metrics: dict, settings: dict | None = None
+) -> list[dict]:
     """PURE inversion of size_program: what the metrics would have to be for
     ``goal`` to be fundable on this path (typical-case assumptions).
 
@@ -507,7 +705,16 @@ def requirements_for_amount(path_key: str, goal: float, metrics: dict) -> list[d
     rows: list[dict] = []
 
     def months_row() -> dict:
-        required = _STATEMENT_MONTHS_REQUIRED.get(path_key, 3)
+        # Statement history a lender file needs = the path's own history
+        # requirement in the merged settings; paths that carry no history
+        # spec fall back per-path (conventional demanded 6 pre-refactor —
+        # its checklist uses score instead of history, but the funding-plan
+        # gate keeps the stricter bar).
+        required = _DEFAULT_STATEMENT_MONTHS.get(path_key, 3)
+        for spec in _requirement_specs(path_key, settings):
+            if spec.get("kind") == "history" and spec.get("threshold") is not None:
+                required = int(spec["threshold"])
+                break
         return _requirement(
             "months_statements",
             f"Months of statements on file ≥ {required}",
@@ -526,8 +733,11 @@ def requirements_for_amount(path_key: str, goal: float, metrics: dict) -> list[d
             "met": goal <= ceiling * (1 + _REQ_EPSILON),
         }
 
-    if path_key in _SIZING_DSCR:
-        spec = _SIZING_DSCR[path_key]
+    sizing = _sizing_spec(path_key, settings)
+    model = (sizing or {}).get("model")
+
+    if model == "dscr":
+        spec = sizing
         rate, term, dscr = spec["annual_rate"], spec["term_months"][1], spec["dscr"][1]
         payment = _payment_for_principal(goal, rate, term)
         required_ebitda_annual = payment * dscr * 12.0
@@ -544,8 +754,8 @@ def requirements_for_amount(path_key: str, goal: float, metrics: dict) -> list[d
         rows.append(ceiling_row(spec["ceiling"]))
         return rows
 
-    if path_key in _SIZING_DEPOSIT:
-        spec = _SIZING_DEPOSIT[path_key]
+    if model == "deposit":
+        spec = sizing
         typical_multiple = spec["multiples"][1]
         required_base = goal / typical_multiple
         if spec["input"] == "adb":
