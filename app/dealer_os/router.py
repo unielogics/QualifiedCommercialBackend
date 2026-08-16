@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -420,7 +421,10 @@ async def create_dealer_bucket(
 async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerRead:
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    return await _dealer_read(db, dealer)
+    r = await _dealer_read(db, dealer)
+    if user.role == Role.DEALER:
+        r.notes = None  # internal advisor commentary is team-only
+    return r
 
 
 @router.patch("/dealers/{dealer_id}", response_model=DealerRead)
@@ -1239,9 +1243,16 @@ async def list_documents(
     q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
     if user.role == Role.DEALER:
         q = q.where(DealerDocument.status != "failed")
-    return (
+    rows = (
         (await db.execute(q.order_by(DealerDocument.created_at.desc()))).scalars().all()
     )
+    if user.role == Role.DEALER:
+        # Storage keys are an internal detail — previews go through /url.
+        out = [DocumentRead.model_validate(r) for r in rows]
+        for r in out:
+            r.s3_key = None
+        return out
+    return rows
 
 
 _DOCUMENT_URL_TTL = 900  # seconds — matches the buckets presign posture
@@ -2162,12 +2173,15 @@ async def list_plan_actions(
 ) -> list[DealerPlanAction]:
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    q = select(DealerPlanAction).where(DealerPlanAction.dealer_id == dealer.id)
+    if user.role == Role.DEALER:
+        # Drafts and AI-accepted actions stay team-side until the advisor
+        # publishes — publishing IS the share step.
+        q = q.where(DealerPlanAction.published.is_(True))
     return (
         (
             await db.execute(
-                select(DealerPlanAction)
-                .where(DealerPlanAction.dealer_id == dealer.id)
-                .order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
+                q.order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
             )
         )
         .scalars()
