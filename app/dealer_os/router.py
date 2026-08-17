@@ -2489,6 +2489,22 @@ async def simulate_dealer(
             .all()
         )
         shifts_added = simulate.proposed_shifts_adb(shift_rows)
+    if payload.shifts:
+        # Staged (unsaved) shifts — same first-order ADB math the stored
+        # rows use, folded into the same pool and drawn on the same curve.
+        staged = [
+            s_
+            for s_ in payload.shifts
+            if s_.from_day != s_.to_day
+        ]
+        shifts_added += round(
+            sum(
+                payment_timing.adb_impact(s_.monthly_amount, s_.from_day, s_.to_day)
+                for s_ in staged
+            ),
+            2,
+        )
+        shift_rows = list(shift_rows) + staged
 
     adb_delta = float(payload.adb_delta) + shifts_added
     ebitda_delta = float(payload.ebitda_annual_delta) + addbacks_added

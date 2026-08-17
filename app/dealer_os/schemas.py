@@ -1119,6 +1119,16 @@ class PaymentShiftPatch(BaseModel):
 _SIM_DELTA_LIMIT = 1_000_000_000
 
 
+class SimulateShift(BaseModel):
+    """An ad-hoc (staged, not yet saved) payment-date shift for live
+    preview — e.g. a chip dragged on the Timing calendar before the team
+    commits it as a dos_payment_shift row."""
+
+    from_day: int = Field(ge=1, le=31)
+    to_day: int = Field(ge=1, le=31)
+    monthly_amount: float = Field(gt=0, le=1e9)
+
+
 class SimulateRequest(BaseModel):
     """Levers of POST /dealers/{id}/simulate. Every field is optional; an
     empty body is a no-op scenario that reproduces the baseline exactly."""
@@ -1132,6 +1142,9 @@ class SimulateRequest(BaseModel):
     )
     ebitda_annual_delta: float = Field(default=0.0, ge=-_SIM_DELTA_LIMIT, le=_SIM_DELTA_LIMIT)
     nsf_zero: bool = False
+    # Staged shifts simulated alongside (independently of) the stored
+    # proposed rows — capped to keep the preview bounded.
+    shifts: list[SimulateShift] = Field(default_factory=list, max_length=20)
     verify_all_addbacks: bool = False
     apply_proposed_shifts: bool = False
     statement_months: int | None = Field(default=None, ge=0, le=36)
