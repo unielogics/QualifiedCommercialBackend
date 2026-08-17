@@ -55,6 +55,7 @@ from .models import (
     DealerFinancialPeriod,
     DealerGroup,
     DealerMessage,
+    DealerMessageSeen,
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
@@ -2764,6 +2765,53 @@ async def simulate_dealer(
 # --- Stream 5: messaging, sessions, global alerts & lender package -----------
 
 
+@router.get("/dealers/{dealer_id}/messages/unread-count")
+async def messages_unread_count(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Messages this viewer hasn't seen: created after their seen marker, by
+    someone else; dealers never count internal notes."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    seen = (
+        await db.execute(
+            select(DealerMessageSeen.seen_at).where(
+                DealerMessageSeen.dealer_id == dealer.id, DealerMessageSeen.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    q = select(func.count()).select_from(DealerMessage).where(
+        DealerMessage.dealer_id == dealer.id,
+        DealerMessage.author_user_id != user.id,
+    )
+    if user.role == Role.DEALER:
+        q = q.where(DealerMessage.internal.is_(False))
+    if seen is not None:
+        q = q.where(DealerMessage.created_at > seen)
+    return {"unread": int((await db.execute(q)).scalar_one())}
+
+
+@router.post("/dealers/{dealer_id}/messages/seen", status_code=status.HTTP_204_NO_CONTENT)
+async def mark_messages_seen(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerMessageSeen).where(
+                DealerMessageSeen.dealer_id == dealer.id, DealerMessageSeen.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        db.add(DealerMessageSeen(dealer_id=dealer.id, user_id=user.id, seen_at=now))
+    else:
+        row.seen_at = now
+    await db.commit()
+
+
 @router.get("/dealers/{dealer_id}/messages", response_model=list[MessageRead])
 async def list_messages(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -4351,7 +4399,9 @@ async def list_owners(
 async def create_owner(
     dealer_id: UUID, body: OwnerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerOwner:
-    require_team(user)
+    # Dealers may DISCLOSE owners on their own file (the >= 20% principals a
+    # lender file requires); edits/deletes stay team-only.
+    require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = DealerOwner(dealer_id=dealer.id, **body.model_dump())
     db.add(row)
@@ -4494,8 +4544,10 @@ async def owner_soft_pull(
     FCRA consent is a hard precondition — the gateway is never called without
     an explicit, recorded acknowledgement. Only the RESULT SUMMARY is echoed
     onto the owner row; the governed record stays in credit_pulls and no SSN
-    is persisted here."""
-    require_team(user)
+    is persisted here. A DEALER login may run this for owners of their OWN
+    file — the consent attestation they record is the permissible-purpose
+    basis, same as the advisor-initiated path."""
+    require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     owner = (
         await db.execute(

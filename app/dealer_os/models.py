@@ -640,3 +640,19 @@ class DealerPlanComment(TimestampMixin, Base):
     author_role: Mapped[str] = mapped_column(String(16), nullable=False)  # team|dealer
     author_name: Mapped[str | None] = mapped_column(String(120))
     body: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class DealerMessageSeen(TimestampMixin, Base):
+    """When a viewer last opened the dealer's message thread (0124)."""
+
+    __tablename__ = "dos_message_seen"
+    __table_args__ = (UniqueConstraint("dealer_id", "user_id", name="uq_dos_message_seen"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
