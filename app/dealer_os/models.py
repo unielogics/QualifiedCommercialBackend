@@ -274,6 +274,10 @@ class DealerPlanAction(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(16), default="todo", server_default="todo")
     expected_effect: Mapped[str | None] = mapped_column(String(120))  # "DSCR +0.09x"
     published: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Client response (0123): the dealer accepts or declines each published
+    # action; declining feeds back into the simulation via the linked shift.
+    client_response: Mapped[str | None] = mapped_column(String(16))  # accepted|declined
+    client_response_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerAlert(TimestampMixin, Base):
@@ -615,3 +619,24 @@ class DealerPaymentShift(TimestampMixin, Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class DealerPlanComment(TimestampMixin, Base):
+    """Per-action discussion between the team and the client (0123)."""
+
+    __tablename__ = "dos_plan_comments"
+    __table_args__ = (Index("ix_dos_plan_comments_action", "action_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    action_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_plan_actions.id", ondelete="CASCADE"), nullable=False
+    )
+    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    author_role: Mapped[str] = mapped_column(String(16), nullable=False)  # team|dealer
+    author_name: Mapped[str | None] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(Text, nullable=False)

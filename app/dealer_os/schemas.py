@@ -258,6 +258,9 @@ class PlanActionRead(ORM):
     status: str
     expected_effect: str | None = None
     published: bool
+    client_response: str | None = None  # accepted|declined (0123)
+    client_response_at: datetime | None = None
+    comments_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -1274,3 +1277,23 @@ class SimulateRead(BaseModel):
     paths: list[SimulatePathRead] = []
     goal: float | None = None
     daily_curve: SimulateCurveRead | None = None
+
+
+class PlanRespond(BaseModel):
+    """Client's answer to a published plan action."""
+
+    response: str = Field(pattern="^(accepted|declined)$")
+    comment: str | None = Field(default=None, max_length=4000)
+
+
+class PlanCommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class PlanCommentRead(ORM):
+    id: UUID
+    action_id: UUID
+    author_role: str
+    author_name: str | None = None
+    body: str
+    created_at: datetime

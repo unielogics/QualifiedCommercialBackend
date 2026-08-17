@@ -97,13 +97,14 @@ def unverified_addbacks_annual(addback_rows: Iterable) -> float:
 
 
 def proposed_shifts_adb(shifts: Iterable) -> float:
-    """Summed est_adb_impact of status='proposed' payment shifts — the ADB
-    gained if every proposal currently on the dealer's table lands."""
+    """Summed est_adb_impact of proposed AND done payment shifts — a change
+    the client has executed keeps counting until real statements absorb it;
+    declined/dismissed rows drop out immediately."""
     return round(
         sum(
             float(s.est_adb_impact)
             for s in shifts
-            if getattr(s, "status", None) == "proposed"
+            if getattr(s, "status", None) in ("proposed", "done")
             and getattr(s, "est_adb_impact", None) is not None
         ),
         2,

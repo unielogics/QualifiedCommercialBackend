@@ -61,6 +61,7 @@ from .models import (
     DealerOwner,
     DealerPaymentShift,
     DealerPlanAction,
+    DealerPlanComment,
     DealerProgramSetting,
     DealerSession,
     DealerSourceConnection,
@@ -134,6 +135,9 @@ from .schemas import (
     PlanActionCreate,
     PlanActionRead,
     PlanActionUpdate,
+    PlanCommentCreate,
+    PlanCommentRead,
+    PlanRespond,
     ProgramSettingRead,
     ProgramSettingsRead,
     ProgramSettingUpdate,
@@ -2232,7 +2236,7 @@ async def list_plan_actions(
         # Drafts and AI-accepted actions stay team-side until the advisor
         # publishes — publishing IS the share step.
         q = q.where(DealerPlanAction.published.is_(True))
-    return (
+    actions = (
         (
             await db.execute(
                 q.order_by(DealerPlanAction.sort.asc(), DealerPlanAction.created_at.asc())
@@ -2241,6 +2245,21 @@ async def list_plan_actions(
         .scalars()
         .all()
     )
+    counts = dict(
+        (
+            await db.execute(
+                select(DealerPlanComment.action_id, func.count()).where(
+                    DealerPlanComment.dealer_id == dealer.id
+                ).group_by(DealerPlanComment.action_id)
+            )
+        ).all()
+    )
+    out = []
+    for a in actions:
+        r = PlanActionRead.model_validate(a)
+        r.comments_count = int(counts.get(a.id, 0))
+        out.append(r)
+    return out
 
 
 @router.post(
@@ -2269,8 +2288,23 @@ async def update_plan_action(
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for k, v in changes.items():
         setattr(action, k, v)
+    # Reverse sync: completing the plan action completes its payment shift —
+    # the simulation keeps counting the lift until real statements absorb it.
+    if changes.get("status") == "done":
+        shift = (
+            await db.execute(
+                select(DealerPaymentShift).where(
+                    DealerPaymentShift.dealer_id == dealer.id,
+                    DealerPaymentShift.plan_action_id == action.id,
+                    DealerPaymentShift.status == "proposed",
+                )
+            )
+        ).scalar_one_or_none()
+        if shift is not None:
+            shift.status = "done"
     await db.commit()
     await db.refresh(action)
     return action
@@ -2285,6 +2319,123 @@ async def delete_plan_action(
     action = await _load_plan_action(db, dealer.id, action_id)
     await db.delete(action)
     await db.commit()
+
+
+@router.post("/dealers/{dealer_id}/plan/{action_id}/respond", response_model=PlanActionRead)
+async def respond_plan_action(
+    dealer_id: UUID,
+    action_id: UUID,
+    payload: PlanRespond,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PlanActionRead:
+    """The client's answer to a published action (DEALER role; team may record
+    it on the client's behalf). Declining feeds straight back into the
+    simulation: the linked payment shift is dismissed, so its ADB lift leaves
+    the optimized scenario on the next recompute. Re-responding is allowed —
+    accepting again after a decline re-proposes a dismissed linked shift."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    action = await _load_plan_action(db, dealer.id, action_id)
+    if not action.published:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+    action.client_response = payload.response
+    action.client_response_at = datetime.now(timezone.utc)
+    if payload.comment and payload.comment.strip():
+        db.add(
+            DealerPlanComment(
+                dealer_id=dealer.id,
+                action_id=action.id,
+                author_user_id=user.id,
+                author_role="dealer" if user.role == Role.DEALER else "team",
+                author_name=(user.name or user.email or None),
+                body=payload.comment.strip(),
+            )
+        )
+    shift = (
+        await db.execute(
+            select(DealerPaymentShift).where(
+                DealerPaymentShift.dealer_id == dealer.id,
+                DealerPaymentShift.plan_action_id == action.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if shift is not None:
+        if payload.response == "declined" and shift.status == "proposed":
+            shift.status = "dismissed"
+        elif payload.response == "accepted" and shift.status == "dismissed":
+            shift.status = "proposed"
+    await log_action(
+        db, dealer.id, user, "plan.client_response", "plan_action",
+        entity_id=action.id,
+        after={"response": payload.response, "title": action.title},
+    )
+    await db.commit()
+    await db.refresh(action)
+    r = PlanActionRead.model_validate(action)
+    r.comments_count = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(DealerPlanComment).where(
+                    DealerPlanComment.action_id == action.id
+                )
+            )
+        ).scalar_one()
+    )
+    return r
+
+
+@router.get("/dealers/{dealer_id}/plan/{action_id}/comments", response_model=list[PlanCommentRead])
+async def list_plan_comments(
+    dealer_id: UUID, action_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerPlanComment]:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    action = await _load_plan_action(db, dealer.id, action_id)
+    if user.role == Role.DEALER and not action.published:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+    return (
+        (
+            await db.execute(
+                select(DealerPlanComment)
+                .where(DealerPlanComment.action_id == action.id)
+                .order_by(DealerPlanComment.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/plan/{action_id}/comments",
+    response_model=PlanCommentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_plan_comment(
+    dealer_id: UUID,
+    action_id: UUID,
+    payload: PlanCommentCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPlanComment:
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    action = await _load_plan_action(db, dealer.id, action_id)
+    if user.role == Role.DEALER and not action.published:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+    comment = DealerPlanComment(
+        dealer_id=dealer.id,
+        action_id=action.id,
+        author_user_id=user.id,
+        author_role="dealer" if user.role == Role.DEALER else "team",
+        author_name=(user.name or user.email or None),
+        body=payload.body.strip(),
+    )
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+    return comment
 
 
 @router.post("/dealers/{dealer_id}/plan/publish", response_model=list[PlanActionRead])
@@ -2482,7 +2633,7 @@ async def simulate_dealer(
                 await db.execute(
                     select(DealerPaymentShift).where(
                         DealerPaymentShift.dealer_id == dealer.id,
-                        DealerPaymentShift.status == "proposed",
+                        DealerPaymentShift.status.in_(("proposed", "done")),
                     )
                 )
             )
