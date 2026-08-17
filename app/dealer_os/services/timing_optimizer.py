@@ -23,6 +23,9 @@ NEVER_MOVE: frozenset[str] = frozenset(
 NON_ACTIONABLE: frozenset[str] = frozenset({"transfer", "bank_fees"})
 
 _MIN_AMOUNT = 1000.0  # below this the ADB impact is noise, not a move
+# Inflow categories that are NOT receivables — never deposit-acceleration
+# candidates (loan/floorplan proceeds, owner money, internal transfers).
+_NON_RECEIVABLE_IN = frozenset({"loan", "floorplan", "credit_card", "owner_draw", "transfer", "bank_fees"})
 _MAX_MOVES = 6
 
 # Outflows already paid after this day gain too little from moving; deposits
@@ -43,12 +46,14 @@ def shift_key(direction: str, vendor_key: str | None, label: str) -> str:
     return f"{direction}:{vendor_key or 'label:' + (label or '')}"
 
 
-def _safe_day(cutoffs: list[dict]) -> int:
+def _safe_day(cutoffs: list[dict]) -> int | None:
     """Latest day an outflow can safely move to: a few days clear of the
-    earliest statement cutoff, never past day 26, never before day 5."""
+    earliest statement cutoff, never past day 26. None when no safe landing
+    day exists (a first-week cutoff) — drafting a payment onto the cutoff
+    day itself would be the statement-date timing the product forbids."""
     days = [int(c["cutoff_day"]) for c in cutoffs if c.get("cutoff_day") is not None]
     safe = min(min(days) - _SAFE_MARGIN, _DEFAULT_SAFE_DAY) if days else _DEFAULT_SAFE_DAY
-    return max(_MIN_SAFE_DAY, safe)
+    return safe if safe >= _MIN_SAFE_DAY else None
 
 
 def draft_optimized_shifts(
@@ -78,6 +83,8 @@ def draft_optimized_shifts(
             continue
 
         if direction == "out":
+            if safe_day is None:
+                continue  # no landing day clear of the cutoff exists
             category = row.get("category")
             if category in NEVER_MOVE or category in NON_ACTIONABLE:
                 continue
@@ -93,7 +100,12 @@ def draft_optimized_shifts(
                 f"(≈ +${est:,.0f} ADB)."
             )
         elif direction == "in":
-            if td < _LATE_IN_DAY:
+            # Only genuine receivables accelerate: inbound loan/floorplan
+            # proceeds, owner contributions and transfers are not
+            # collections and must never be "tightened".
+            if row.get("category") in _NON_RECEIVABLE_IN:
+                continue
+            if td < _LATE_IN_DAY or amt < _MIN_AMOUNT:
                 continue
             spread = row.get("day_spread") or []
             if len(spread) < 2 or float(spread[1]) - float(spread[0]) > _MAX_IN_SPREAD:

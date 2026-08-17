@@ -240,7 +240,11 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
     # outright — moving money between the dealer's own accounts is never a
     # receivables change.
     for v in vendors_rollup:
-        if v.direction != 1 or not v.is_recurring or v.category == "transfer":
+        # Deposit candidates are receivable-ish inflows only — loan/floorplan
+        # proceeds, owner money and transfers are not collections.
+        if v.direction != 1 or not v.is_recurring or v.category in (
+            "transfer", "loan", "floorplan", "credit_card", "owner_draw", "bank_fees"
+        ):
             continue
         observed = vendor_days_in.get(v.key)
         if not observed:
