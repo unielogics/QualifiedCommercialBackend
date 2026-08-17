@@ -190,6 +190,7 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
             "out_total": round(day_out.get(day, 0.0), 2),
             "out_avg_month": round(day_out.get(day, 0.0) / months_observed, 2),
             "in_total": round(day_in.get(day, 0.0), 2),
+            "in_avg_month": round(day_in.get(day, 0.0) / months_observed, 2),
             "count": day_count.get(day, 0),
         }
         for day in range(1, 32)
@@ -210,6 +211,14 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
                 "top_vendors": [labels.get(key, key) for key, _ in top],
             }
         )
+
+    # --- big deposit days + monthly deposit volume -------------------------
+    big_deposit_days = []
+    for row in sorted(days, key=lambda d: (-d["in_avg_month"], d["day"]))[:_BIG_DAYS]:
+        if row["in_avg_month"] <= 0:
+            continue
+        big_deposit_days.append({"day": row["day"], "in_avg_month": row["in_avg_month"]})
+    deposits_monthly_total = round(sum(d["in_avg_month"] for d in days), 2)
 
     # --- recurring outflow vendors (shift candidates) ----------------------
     recurring = []
@@ -267,6 +276,8 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
 
     return {
         "days": days,
+        "big_deposit_days": big_deposit_days,
+        "deposits_monthly_total": deposits_monthly_total,
         "big_days": big_days,
         "recurring": recurring,
         "window_months": months_window,

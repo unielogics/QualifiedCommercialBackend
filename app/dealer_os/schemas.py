@@ -1041,7 +1041,13 @@ class TimingDayRead(BaseModel):
     out_total: float = 0.0
     out_avg_month: float = 0.0
     in_total: float = 0.0
+    in_avg_month: float = 0.0
     count: int = 0
+
+
+class TimingBigDepositDayRead(BaseModel):
+    day: int
+    in_avg_month: float
 
 
 class TimingBigDayRead(BaseModel):
@@ -1081,6 +1087,8 @@ class TimingCutoffRead(BaseModel):
 class PaymentTimingRead(BaseModel):
     days: list[TimingDayRead] = []
     big_days: list[TimingBigDayRead] = []
+    big_deposit_days: list[TimingBigDepositDayRead] = []
+    deposits_monthly_total: float = 0.0
     recurring: list[TimingRecurringRead] = []
     cutoffs: list[TimingCutoffRead] = []
     window_months: int
@@ -1096,6 +1104,7 @@ class PaymentShiftRead(ORM):
     to_day: int
     monthly_amount: float | None = None
     est_adb_impact: float | None = None
+    plan_action_id: UUID | None = None  # the Plan action this proposal created
     rationale: str | None = None
     status: str
     created_at: datetime

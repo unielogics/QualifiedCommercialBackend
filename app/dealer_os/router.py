@@ -4837,6 +4837,62 @@ async def create_payment_shift(
     return shift
 
 
+async def _sync_shift_plan_action(
+    db: AsyncSession, dealer: DealerBusiness, shift: DealerPaymentShift, new_status: str
+) -> None:
+    """Keep the Plan of Action in lockstep with the shift lifecycle.
+
+    proposed  -> create (once) a PUBLISHED per-vendor action: "Call {vendor}:
+                 move the payment date" — proposing IS telling the client, so
+                 it appears on their plan immediately.
+    done      -> the linked action completes.
+    dismissed | pulled back to draft -> an action the client hasn't completed
+                 is withdrawn (deleted); a completed one stays as history.
+    Flushes, never commits."""
+    if new_status == "proposed" and shift.plan_action_id is None:
+        est = float(shift.est_adb_impact or 0.0)
+        if shift.direction == "out":
+            title = f"Call {shift.label}: move the payment date"[:200]
+            detail = (
+                f"Request a payment-date change under the vendor's terms: pay on day "
+                f"{shift.to_day} instead of ~day {shift.from_day}. "
+                + (shift.rationale or "Real vendor terms — never statement-date window dressing.")
+            )
+        else:
+            title = f"Tighten collections with {shift.label}"[:200]
+            detail = (
+                f"Adjust invoicing/collection terms so this deposit lands ~day "
+                f"{shift.to_day} instead of ~day {shift.from_day}. "
+                + (shift.rationale or "Real receivables change — never statement-date timing.")
+            )
+        action = DealerPlanAction(
+            dealer_id=dealer.id,
+            title=title,
+            detail=detail,
+            category="liquidity",
+            owner="Dealer",
+            timeline="next billing cycle",
+            status="todo",
+            expected_effect=(f"ADB {'+' if est >= 0 else '-'}${abs(est):,.0f}" if est else None),
+            published=True,
+        )
+        db.add(action)
+        await db.flush()
+        shift.plan_action_id = action.id
+        return
+    if shift.plan_action_id is None:
+        return
+    action = await db.get(DealerPlanAction, shift.plan_action_id)
+    if action is None:
+        shift.plan_action_id = None
+        return
+    if new_status == "done":
+        action.status = "done"
+    elif new_status in ("dismissed", "draft") and action.status != "done":
+        await db.delete(action)
+        shift.plan_action_id = None
+
+
 @router.patch("/dealers/{dealer_id}/payment-shifts/{shift_id}", response_model=PaymentShiftRead)
 async def update_payment_shift(
     dealer_id: UUID,
@@ -4882,6 +4938,7 @@ async def update_payment_shift(
     if new_status is not None and new_status != shift.status:
         before_status = shift.status
         shift.status = new_status
+        await _sync_shift_plan_action(db, dealer, shift, new_status)
         await log_action(
             db, dealer.id, user, "payment_shift.status", "payment_shift",
             entity_id=shift.id,

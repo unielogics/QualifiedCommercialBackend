@@ -607,6 +607,11 @@ class DealerPaymentShift(TimestampMixin, Base):
     est_adb_impact: Mapped[float | None] = mapped_column(Numeric(14, 2))
     rationale: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default="draft", server_default="draft")  # draft|proposed|done|dismissed
+    # The Plan action this proposal materialized as (0122): proposing a shift
+    # IS telling the client to call the vendor — it lands on the Plan page.
+    plan_action_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_plan_actions.id", ondelete="SET NULL")
+    )
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
