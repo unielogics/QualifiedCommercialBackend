@@ -535,6 +535,39 @@ def merge_tax_filings(
     return to_create, changed
 
 
+async def _fill_business_identity(
+    db: AsyncSession, dealer_id, extraction: dict, notes: list[str]
+) -> None:
+    """Fill the always-required business-profile fields from what the
+    document itself prints — legal name, EIN, NAICS. FILL-ONLY-NULL: anything
+    the advisor or the client already entered is never overwritten. Flushes,
+    never commits; failures never fail the extraction."""
+    ident = extraction.get("business_identity")
+    if not isinstance(ident, dict):
+        return
+    try:
+        from ..models import DealerBusiness
+
+        dealer = await db.get(DealerBusiness, dealer_id)
+        if dealer is None:
+            return
+        filled = []
+        for src, attr, cap in (
+            ("legal_name", "legal_name", 180),
+            ("ein", "ein", 24),
+            ("naics_code", "naics_code", 8),
+        ):
+            value = ident.get(src)
+            if isinstance(value, str) and value.strip() and getattr(dealer, attr, None) in (None, ""):
+                setattr(dealer, attr, value.strip()[:cap])
+                filled.append(attr)
+        if filled:
+            await db.flush()
+            notes.append(f"Business profile auto-filled from the document: {', '.join(filled)}")
+    except Exception:
+        logger.exception("dealer-os: business-identity fill failed for dealer %s", dealer_id)
+
+
 async def _route_tax_years(
     db: AsyncSession,
     dealer_id: UUID,
@@ -688,6 +721,7 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
   "account": {"institution": "string|null", "name_hint": "string|null",
               "mask": "string|null", "kind_hint": "string|null"},
   "tax_years": [{"year": number, "revenue": number|null}],
+  "business_identity": {"legal_name": "string|null", "ein": "string|null", "naics_code": "string|null"},
   "pl_months": [{"month": "YYYY-MM", "revenue": number|null, "net_income": number|null}],
   "debts": [{"lender": "string", "monthly_payment": number|null, "balance": number|null}]
 }
@@ -697,6 +731,7 @@ Rules:
 - months[] and transactions[] are for BANK STATEMENTS: one months[] entry per statement month present in the document. For any non-statement document return "months": [] and "transactions": [].
 - "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
 - "tax_years" is for TAX RETURNS: one entry per tax year covered, revenue = gross receipts / total revenue as reported on the return (null when not stated). [] for other documents.
+- "business_identity" is best-effort from ANY document that states it (tax returns and statements print these): legal_name = the entity's legal name as printed; ein = employer identification number formatted XX-XXXXXXX; naics_code = the business activity code when the return shows one. Null anything not clearly printed — never guess.
 - "pl_months" is for P&L / INCOME STATEMENTS with a monthly breakdown: one entry per month with revenue and net_income when stated. If the P&L is annual/quarterly only, return [] rather than inventing a monthly split.
 - "debts" is for DEBT SCHEDULES: one entry per obligation — lender as printed, monthly_payment = the recurring MONTHLY payment (convert only when the document states the payment frequency; null when unknown), balance = current outstanding balance.
 - Every number is a bare number: no currency symbols, no commas. Withdrawals in total_withdrawals are a positive magnitude.
@@ -907,6 +942,7 @@ async def extract_document(
             )
         elif detected == "tax_return":
             upserted = await _route_tax_years(db, doc.dealer_id, tax_years, notes, document_id=doc.id)
+            await _fill_business_identity(db, doc.dealer_id, extraction, notes)
             notes.append(f"Tax return: upserted {upserted} tax year(s) (existing entries kept).")
         elif detected == "profit_and_loss":
             updated = await _route_pl_months(db, doc.dealer_id, pl_months, notes)

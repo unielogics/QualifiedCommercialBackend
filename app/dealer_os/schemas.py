@@ -873,6 +873,13 @@ class OwnerRead(ORM):
     city: str | None = None
     state: str | None = None
     zip: str | None = None
+    # 0125: is_primary marks the login's own person (self-pull allowed once);
+    # has_invite reflects an outstanding consent link — the token hash itself
+    # is NEVER exposed (model property `has_invite` feeds it via ORM mode).
+    is_primary: bool = False
+    invite_sent_at: datetime | None = None
+    invite_opened_at: datetime | None = None
+    has_invite: bool = False
     credit_score: int | None = None
     credit_tier: str | None = None
     credit_pulled_at: datetime | None = None
@@ -892,6 +899,9 @@ class OwnerCreate(BaseModel):
     city: str | None = None
     state: str | None = None
     zip: str | None = None
+    # 0125: at most ONE primary owner per dealer (the login's own person) —
+    # create_owner 422s when true and another primary already exists.
+    is_primary: bool = False
     notes: str | None = None
 
 
@@ -922,6 +932,52 @@ class SoftPullResult(BaseModel):
     ok: bool
     owner: OwnerRead | None = None
     detail: str | None = None
+
+
+# --- Owner credit-consent invites (0125) --------------------------------------
+# Additional (non-primary) owners consent to their own pull through a one-time
+# secure link the advisor shares with them directly — consent must come from
+# the person the pull is ABOUT, never from the client on their behalf.
+
+
+class CreditInviteResult(BaseModel):
+    """Returned ONCE at mint time — only the sha256 of the token is stored."""
+
+    token: str
+    path: str  # "/credit-consent#t={token}" (fragment: token never hits server logs)
+
+
+class PublicConsentView(BaseModel):
+    """What an unauthenticated consent page may know: enough for the owner to
+    recognize themself and the business, and which fields we still need.
+    Never scores, summaries, or other owners."""
+
+    first_name: str
+    last_initial: str
+    dealer_name: str
+    fields_needed: list[str]  # subset of dob/street/city/state/zip still missing
+    completed: bool
+
+
+class PublicConsentSubmit(BaseModel):
+    """FCRA consent is a hard precondition; profile fields fill ONLY currently
+    empty owner columns (never overwrite what the advisor already has)."""
+
+    fcra_consent: bool = False
+    dob: date | None = None
+    street: str | None = Field(default=None, max_length=240)
+    city: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=8)
+    zip: str | None = Field(default=None, max_length=12)
+
+
+class PublicConsentResult(BaseModel):
+    """Public echo after a consent-link pull: tier + a 50-point band only —
+    the exact score never renders on an unauthenticated page."""
+
+    credit_tier: str | None = None
+    credit_score_band: str | None = None  # e.g. "700–749"
+    completed: bool = True
 
 
 class TradelineRead(BaseModel):

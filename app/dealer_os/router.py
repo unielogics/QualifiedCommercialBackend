@@ -7,9 +7,11 @@ ledger, plan, forecast, messaging land in Streams 2-5 on this same router.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import re
+import secrets
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
@@ -18,6 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, or_
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -86,6 +89,7 @@ from .schemas import (
     CashEventSearchRow,
     CashImport,
     CashImportResult,
+    CreditInviteResult,
     CreditRead,
     CreditUpsert,
     DealerCreate,
@@ -143,6 +147,9 @@ from .schemas import (
     ProgramSettingsRead,
     ProgramSettingUpdate,
     ProgressRead,
+    PublicConsentResult,
+    PublicConsentSubmit,
+    PublicConsentView,
     RecurringGroupRead,
     RecurringRead,
     RuleCreate,
@@ -492,7 +499,32 @@ async def update_dealer(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRead:
-    require_team(user)
+    require_team_or_dealer(user)
+    if user.role == Role.DEALER:
+        # A client may complete the always-required business-profile fields
+        # on their OWN file — nothing else.
+        dealer = await resolve_dealer_scope(db, user, dealer_id)
+        changes = payload.model_dump(exclude_unset=True)
+        allowed = {"legal_name", "ein", "naics_code", "entity_type", "started_on"}
+        illegal = sorted(set(changes) - allowed)
+        if illegal:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"These fields are maintained by your advisor: {', '.join(illegal)}",
+            )
+        before = {k: getattr(dealer, k) for k in changes}
+        for k, v in changes.items():
+            setattr(dealer, k, v)
+        if changes:
+            await log_action(
+                db, dealer.id, user, "dealer.profile_update", "dealer",
+                entity_id=dealer.id, before=before, after=changes,
+            )
+        await db.commit()
+        await db.refresh(dealer)
+        r = await _dealer_read(db, dealer)
+        r.notes = None
+        return r
     dealer = await load_dealer(db, dealer_id)
     changes = payload.model_dump(exclude_unset=True)
     before = {k: getattr(dealer, k) for k in changes}
@@ -4395,6 +4427,12 @@ async def list_owners(
     )
 
 
+def _primary_owner_conflict(requested_primary: bool, dealer_has_primary: bool) -> bool:
+    """Pure (0125): a second primary owner is never allowed — is_primary marks
+    the login's own person and there is exactly one of those per dealer."""
+    return requested_primary and dealer_has_primary
+
+
 @router.post("/dealers/{dealer_id}/owners", response_model=OwnerRead, status_code=status.HTTP_201_CREATED)
 async def create_owner(
     dealer_id: UUID, body: OwnerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -4403,12 +4441,49 @@ async def create_owner(
     # lender file requires); edits/deletes stay team-only.
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if body.is_primary:
+        # 0125: at most ONE primary per dealer — is_primary marks the login's
+        # own person, and there is only one of those.
+        existing_primary = (
+            await db.execute(
+                select(DealerOwner.id)
+                .where(DealerOwner.dealer_id == dealer.id, DealerOwner.is_primary.is_(True))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if _primary_owner_conflict(body.is_primary, existing_primary is not None):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This dealer already has a primary owner",
+            )
     row = DealerOwner(dealer_id=dealer.id, **body.model_dump())
     db.add(row)
     await log_action(db, dealer.id, user, "owner.create", "owner", after=body.model_dump(mode="json"))
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # uq_dos_owners_one_primary — a concurrent create won the primary slot.
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "This dealer already has a primary owner"
+        ) from None
     await db.refresh(row)
     return row
+
+
+# 0125: the only owner field a DEALER login may PATCH. Everything else
+# (identity, address, DOB, primary flag) stays team-curated so the consent
+# and credit story is never rewritten from the client side.
+_DEALER_PATCHABLE_OWNER_FIELDS = frozenset({"ownership_pct"})
+
+
+def _dealer_owner_patch_violation(fields: set[str] | frozenset[str]) -> str | None:
+    """Pure guard: which PATCHed fields a dealer is not allowed to touch.
+    Returns a 422 detail string, or None when the patch is acceptable."""
+    blocked = sorted(set(fields) - _DEALER_PATCHABLE_OWNER_FIELDS)
+    if blocked:
+        return "Dealers may only update ownership_pct on an owner (not: " + ", ".join(blocked) + ")"
+    return None
 
 
 @router.patch("/dealers/{dealer_id}/owners/{owner_id}", response_model=OwnerRead)
@@ -4419,7 +4494,9 @@ async def patch_owner(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerOwner:
-    require_team(user)
+    # 0125: DEALER logins may now PATCH, but ONLY ownership_pct — the split
+    # is a disclosure fact the client owns; everything else stays team-only.
+    require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -4429,6 +4506,10 @@ async def patch_owner(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
     patch = body.model_dump(exclude_unset=True)
+    if user.role == Role.DEALER:
+        violation = _dealer_owner_patch_violation(set(patch))
+        if violation is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, violation)
     for k, v in patch.items():
         setattr(row, k, v)
     await log_action(
@@ -4530,6 +4611,115 @@ async def business_credit(
     return BusinessCreditRead(**summary, tradeline_rows=tradeline_rows)
 
 
+_OWNER_PULL_REQUIRED_FIELDS = ("dob", "street", "city", "state", "zip")
+
+_ADDITIONAL_OWNER_CONSENT_DETAIL = (
+    "Additional owners consent through a secure link your advisor shares with them directly."
+)
+_ALREADY_PULLED_DETAIL = (
+    "Credit was already run for this owner — ask your advisor if a refresh is needed."
+)
+
+
+def _owner_missing_pull_fields(owner: object) -> list[str]:
+    """Pure: which bureau-required owner fields are still empty."""
+    return [
+        f for f in _OWNER_PULL_REQUIRED_FIELDS if getattr(owner, f, None) in (None, "")
+    ]
+
+
+def _dealer_self_pull_violation(
+    is_primary: bool, credit_pulled_at: datetime | None
+) -> tuple[int, str] | None:
+    """Pure guard for a DEALER-initiated pull (0125): the client may pull the
+    PRIMARY owner (their own person) exactly once. Additional owners consent
+    through their own secure link — never via the client on their behalf.
+    Returns (http_status, detail) when blocked, None when allowed."""
+    if not is_primary:
+        return (status.HTTP_422_UNPROCESSABLE_ENTITY, _ADDITIONAL_OWNER_CONSENT_DETAIL)
+    if credit_pulled_at is not None:
+        return (status.HTTP_409_CONFLICT, _ALREADY_PULLED_DETAIL)
+    return None
+
+
+async def _run_owner_soft_pull(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    owner: DealerOwner,
+    consent_recorded_by: str,
+    *,
+    ssn: str | None = None,
+    actor: User | None = None,
+) -> SoftPullResult:
+    """Shared soft-pull execution core (0125): field-completeness check, the
+    credit_pull_core gateway call, and the summary echo onto the owner row.
+    Both the authed endpoint and the public consent link run THIS one path.
+
+    Callers must have validated FCRA consent already — consent_recorded_by
+    names whose acknowledgement authorized the pull and lands in the audit
+    trail. On gateway failure the transaction is rolled back and ok=False is
+    returned; on success changes are FLUSHED, not committed — the caller owns
+    the commit so it can bundle its own writes (e.g. token consumption)
+    atomically with the pull echo."""
+    missing = _owner_missing_pull_fields(owner)
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"The bureau needs these owner fields first: {', '.join(missing)}",
+        )
+
+    from app.services.credit_pull_core import (  # imported read-only
+        SoftPullApplicant,
+        SoftPullDenied,
+        SoftPullUnavailable,
+        run_soft_pull,
+    )
+
+    owner_pk = owner.id  # captured pre-rollback: expired instances can't lazy-load async
+    client = await _resolve_owner_client(db, dealer, owner)
+    try:
+        pull = await run_soft_pull(
+            db,
+            client=client,
+            applicant=SoftPullApplicant(
+                legal_first_name=owner.first_name,
+                legal_last_name=owner.last_name,
+                dob=owner.dob,
+                street=owner.street,
+                city=owner.city,
+                state=owner.state,
+                zip=owner.zip,
+                ssn=ssn,
+            ),
+            actor=actor,
+        )
+    except SoftPullUnavailable as exc:
+        await db.rollback()
+        return SoftPullResult(ok=False, detail=str(exc))
+    except SoftPullDenied as exc:
+        await db.rollback()
+        return SoftPullResult(ok=False, detail=str(exc))
+    except Exception as exc:  # transport/validation — surfaced, never swallowed
+        await db.rollback()
+        logger.exception("dealer-os: soft pull failed for owner %s", owner_pk)
+        return SoftPullResult(ok=False, detail=f"Credit pull failed: {exc}")
+
+    owner.credit_score = getattr(pull, "score", None)
+    owner.credit_tier = _credit_tier(getattr(pull, "score", None))
+    owner.credit_pulled_at = datetime.now(timezone.utc)
+    owner.credit_pull_id = pull.id
+    await log_action(
+        db, dealer.id, actor, "owner.soft_pull", "owner",
+        entity_id=owner.id,
+        after={
+            "score": owner.credit_score,
+            "tier": owner.credit_tier,
+            "consent_recorded_by": consent_recorded_by,
+        },
+    )
+    return SoftPullResult(ok=True)
+
+
 @router.post("/dealers/{dealer_id}/owners/{owner_id}/soft-pull", response_model=SoftPullResult)
 async def owner_soft_pull(
     dealer_id: UUID,
@@ -4544,9 +4734,10 @@ async def owner_soft_pull(
     FCRA consent is a hard precondition — the gateway is never called without
     an explicit, recorded acknowledgement. Only the RESULT SUMMARY is echoed
     onto the owner row; the governed record stays in credit_pulls and no SSN
-    is persisted here. A DEALER login may run this for owners of their OWN
-    file — the consent attestation they record is the permissible-purpose
-    basis, same as the advisor-initiated path."""
+    is persisted here. A DEALER login may self-run ONLY the primary owner
+    (their own person, is_primary) and only while no pull exists yet —
+    additional owners consent through their own secure link (0125). Team
+    initiators are unrestricted, as before."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     owner = (
@@ -4556,63 +4747,23 @@ async def owner_soft_pull(
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+    if user.role == Role.DEALER:
+        blocked = _dealer_self_pull_violation(owner.is_primary, owner.credit_pulled_at)
+        if blocked is not None:
+            raise HTTPException(blocked[0], blocked[1])
     if not body.fcra_consent:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "FCRA permissible-purpose consent is required before a credit pull",
         )
-    missing = [
-        f for f in ("dob", "street", "city", "state", "zip") if getattr(owner, f, None) in (None, "")
-    ]
-    if missing:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"The bureau needs these owner fields first: {', '.join(missing)}",
-        )
-
-    from app.services.credit_pull_core import (  # imported read-only
-        SoftPullApplicant,
-        SoftPullDenied,
-        SoftPullUnavailable,
-        run_soft_pull,
+    result = await _run_owner_soft_pull(
+        db, dealer, owner,
+        consent_recorded_by=(user.name or user.email or str(user.id)),
+        ssn=body.ssn,
+        actor=user,
     )
-
-    client = await _resolve_owner_client(db, dealer, owner)
-    try:
-        pull = await run_soft_pull(
-            db,
-            client=client,
-            applicant=SoftPullApplicant(
-                legal_first_name=owner.first_name,
-                legal_last_name=owner.last_name,
-                dob=owner.dob,
-                street=owner.street,
-                city=owner.city,
-                state=owner.state,
-                zip=owner.zip,
-                ssn=body.ssn,
-            ),
-            actor=user,
-        )
-    except SoftPullUnavailable as exc:
-        await db.rollback()
-        return SoftPullResult(ok=False, detail=str(exc))
-    except SoftPullDenied as exc:
-        await db.rollback()
-        return SoftPullResult(ok=False, detail=str(exc))
-    except Exception as exc:  # transport/validation — surfaced, never swallowed
-        await db.rollback()
-        logger.exception("dealer-os: soft pull failed for owner %s", owner_id)
-        return SoftPullResult(ok=False, detail=f"Credit pull failed: {exc}")
-
-    owner.credit_score = getattr(pull, "score", None)
-    owner.credit_tier = _credit_tier(getattr(pull, "score", None))
-    owner.credit_pulled_at = datetime.now(timezone.utc)
-    owner.credit_pull_id = pull.id
-    await log_action(
-        db, dealer.id, user, "owner.soft_pull", "owner",
-        entity_id=owner.id, after={"score": owner.credit_score, "tier": owner.credit_tier},
-    )
+    if not result.ok:
+        return result
     await db.commit()
     await db.refresh(owner)
     return SoftPullResult(ok=True, owner=OwnerRead.model_validate(owner))
@@ -4652,6 +4803,166 @@ async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
     db.add(client)
     await db.flush()
     return client
+
+
+# --- Owner credit-consent invites (0125) --------------------------------------
+# Consent for a pull must come from the person the pull is ABOUT. The primary
+# owner (the login's own person) consents in-app; every ADDITIONAL owner gets a
+# one-time secure link minted by the super admin and shared with that owner
+# directly. Only the sha256 of the token is stored — the plaintext exists
+# exactly once, in the mint response.
+
+
+def _hash_invite_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _credit_score_band(score: int | None) -> str | None:
+    """Pure: 50-point band for the public page — e.g. 712 -> "700–749".
+    The exact score never renders on an unauthenticated page."""
+    if score is None:
+        return None
+    lo = (int(score) // 50) * 50
+    return f"{lo}–{lo + 49}"
+
+
+async def _resolve_consent_owner(db: AsyncSession, token: str) -> DealerOwner:
+    """Owner row for a live consent token — 404 on unknown/consumed (a used
+    token has its hash NULLed, so it stops matching the moment it's spent)."""
+    if not token:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    owner = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.invite_token_hash == _hash_invite_token(token))
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    return owner
+
+
+@router.post(
+    "/dealers/{dealer_id}/owners/{owner_id}/credit-invite", response_model=CreditInviteResult
+)
+async def owner_credit_invite(
+    dealer_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> CreditInviteResult:
+    """Mint the one-time consent link for an owner (super-admin only). The
+    plaintext token is returned ONCE here; only its sha256 is stored.
+    Re-minting replaces the previous token — the old link dies instantly."""
+    require_super_admin(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    owner = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+    token = secrets.token_urlsafe(32)
+    owner.invite_token_hash = _hash_invite_token(token)
+    owner.invite_sent_at = datetime.now(timezone.utc)
+    owner.invite_opened_at = None  # a fresh link has not been opened yet
+    await log_action(
+        db, dealer.id, user, "owner.credit_invite", "owner",
+        entity_id=owner.id, after={"invite_sent_at": owner.invite_sent_at.isoformat()},
+    )
+    await db.commit()
+    return CreditInviteResult(token=token, path=f"/credit-consent#t={token}")
+
+
+@router.get("/public/credit-consent/{token}", response_model=PublicConsentView)
+async def public_credit_consent_view(
+    token: str, db: AsyncSession = Depends(get_db)
+) -> PublicConsentView:
+    """PUBLIC (no auth — the unguessable one-time token IS the credential).
+    Shows the owner just enough to recognize themself and the business, plus
+    which bureau-required fields we still need. First open stamps
+    invite_opened_at so the advisor can see the link landed."""
+    owner = await _resolve_consent_owner(db, token)
+    dealer = await db.get(DealerBusiness, owner.dealer_id)
+    if owner.invite_opened_at is None:
+        owner.invite_opened_at = datetime.now(timezone.utc)
+        await db.commit()
+    return PublicConsentView(
+        first_name=owner.first_name,
+        last_initial=(owner.last_name or "")[:1],
+        dealer_name=dealer.name if dealer is not None else "",
+        fields_needed=_owner_missing_pull_fields(owner),
+        completed=owner.credit_pulled_at is not None,
+    )
+
+
+@router.post("/public/credit-consent/{token}", response_model=PublicConsentResult)
+async def public_credit_consent_submit(
+    token: str, body: PublicConsentSubmit, db: AsyncSession = Depends(get_db)
+) -> PublicConsentResult:
+    """PUBLIC consent submission: the owner acknowledges FCRA permissible
+    purpose themself, fills ONLY the fields we're missing (never overwrites
+    what the advisor already has), and the SAME soft-pull gateway path runs.
+    Success consumes the token; the response is tier + a 50-point band only —
+    never the exact score, never the pull summary."""
+    # ATOMIC consume-first: two concurrent submits with the same token must
+    # never both reach the bureau. The UPDATE ... RETURNING claims the token;
+    # the loser sees zero rows and gets the dead-link 404. On gateway failure
+    # the hash is restored so the owner can retry.
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    claimed = (
+        await db.execute(
+            sa_update(DealerOwner)
+            .where(DealerOwner.invite_token_hash == token_hash)
+            .values(invite_token_hash=None)
+            .returning(DealerOwner.id)
+        )
+    ).scalar_one_or_none()
+    if claimed is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    owner = await db.get(DealerOwner, claimed)
+
+    async def _release_token() -> None:
+        owner.invite_token_hash = token_hash
+        await db.commit()
+
+    if owner.credit_pulled_at is not None:
+        await db.commit()  # keep the token consumed — the work is done
+        raise HTTPException(status.HTTP_409_CONFLICT, _ALREADY_PULLED_DETAIL)
+    if not body.fcra_consent:
+        await _release_token()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "FCRA permissible-purpose consent is required before a credit pull",
+        )
+    dealer = await db.get(DealerBusiness, owner.dealer_id)
+    if dealer is None:  # orphaned row — treat like a dead link, not a 500
+        await db.commit()
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    for f in _OWNER_PULL_REQUIRED_FIELDS:
+        value = getattr(body, f)
+        if value is not None and getattr(owner, f, None) in (None, ""):
+            setattr(owner, f, value)
+    result = await _run_owner_soft_pull(
+        db, dealer, owner,
+        consent_recorded_by=f"consent-link:{owner.first_name} {owner.last_name}",
+        actor=None,  # audit rows record the system actor; the token is the consent trail
+    )
+    if not result.ok:
+        # FIX: never surface raw gateway/bureau internals on a public page —
+        # log server-side, hand the owner a fixed, actionable message. The
+        # token is restored so they can retry once things recover.
+        logger.warning("public consent pull failed for owner %s: %s", owner.id, result.detail)
+        await _release_token()
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "We couldn't complete the credit check right now — please try again "
+            "shortly, or your advisor will follow up.",
+        )
+    await db.commit()
+    await db.refresh(owner)
+    return PublicConsentResult(
+        credit_tier=owner.credit_tier,
+        credit_score_band=_credit_score_band(owner.credit_score),
+        completed=True,
+    )
 
 
 # --- Desk admin (0120): program settings, groups, payment timing & shifts -----

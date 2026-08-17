@@ -536,6 +536,19 @@ class DealerOwner(TimestampMixin, Base):
     city: Mapped[str | None] = mapped_column(String(120))
     state: Mapped[str | None] = mapped_column(String(8))
     zip: Mapped[str | None] = mapped_column(String(12))
+    # is_primary marks the login's own person (0125): the client may self-pull
+    # this row exactly once; every other owner consents via a one-time link.
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    invite_token_hash: Mapped[str | None] = mapped_column(String(64))
+    invite_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invite_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @property
+    def has_invite(self) -> bool:
+        """Outstanding consent link? Read by OwnerRead via ORM mode so the
+        API can say "a link exists" without ever exposing the hash."""
+        return self.invite_token_hash is not None
+
     credit_score: Mapped[int | None] = mapped_column(Integer)
     credit_tier: Mapped[str | None] = mapped_column(String(16))
     credit_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
