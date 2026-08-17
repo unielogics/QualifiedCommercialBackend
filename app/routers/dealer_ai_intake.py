@@ -73,6 +73,9 @@ funding_router = APIRouter(prefix="/public/funding-review", tags=["public-fundin
 client_router = APIRouter(prefix="/buckets/client/intakes", tags=["client-bucket-intakes"])
 admin_router = APIRouter(prefix="/admin/ai-underwriter-leads", tags=["admin-ai-underwriter-leads"])
 broker_router = APIRouter(prefix="/broker/ai-underwriter-leads", tags=["broker-ai-underwriter-leads"])
+# Slim public MCA-refinance intake (mca_refi_v1) — endpoints live at the end of
+# this module, mirroring funding_router's subset.
+mca_router = APIRouter(prefix="/public/mca-refinance", tags=["public-mca-refinance"])
 log = logging.getLogger(__name__)
 
 TERMS_VERSION = "2026-05-19"
@@ -137,6 +140,8 @@ def _admin_created_welcome(variant: str | bool) -> str:
         from app.services.main_street_programs import MAIN_STREET_REQUIRED_DOCUMENTS
 
         docs = MAIN_STREET_REQUIRED_DOCUMENTS
+    elif variant == MCA_VARIANT:
+        docs = MCA_REQUIRED_DOCUMENTS
     else:
         docs = REQUIRED_DOCUMENTS
     bullets = "\n".join(f"- {doc['name']}" for doc in docs)
@@ -280,6 +285,41 @@ REAL_ESTATE_REQUIRED_DOCUMENTS = [
         "name": "Entity or vesting documents",
         "category": "Ownership",
         "description": "Upload entity, vesting, or ownership documents when available.",
+        "allow_multiple_files": True,
+    },
+]
+
+
+# The MCA-refinance intake collects exactly three things and stops. The
+# slimness IS the product — a borrower drowning in daily debits abandons long
+# checklists, and everything else can be gathered after the desk engages.
+#
+# Naming is load-bearing twice over: "bank"+"statement" in the first row keys
+# _baseline_key in bucket_ai so the >=6-months readiness engine works
+# unchanged; "mca" in the third row maps uploads to floorplan_mca_inventory in
+# _CATEGORY_CLASSIFICATIONS. The credit authorization is seeded at CREATION
+# with its signature_kind — no other public flow does this today (the admin
+# endpoint mints it on demand for other variants); seeding it is what lets the
+# borrower sign in-room without an admin touching the file first.
+MCA_REQUIRED_DOCUMENTS = [
+    {
+        "name": "Last 6 months bank statements",
+        "category": "Bank Statements",
+        "description": "Upload the last six months of the main operating business bank statements — the account your advances debit from.",
+        "allow_multiple_files": True,
+    },
+    {
+        "name": "Credit Report Authorization",
+        "category": "Compliance",
+        "description": "Authorize one soft credit check. It does not affect your score and is required to price a structured payoff.",
+        "allow_multiple_files": False,
+        "requires_signature": True,
+        "signature_kind": "credit_authorization",
+    },
+    {
+        "name": "Current MCA / advance terms",
+        "category": "Debts",
+        "description": "Your current advance agreements or payoff letters — or type the terms in with the form and skip the paperwork.",
         "allow_multiple_files": True,
     },
 ]
@@ -2693,6 +2733,8 @@ def _context_fn_for(intake: PublicUnderwritingIntake):
         return _funding_review_context
     if intake.variant == MAIN_STREET_VARIANT:
         return _main_street_context
+    if intake.variant == MCA_VARIANT:
+        return _mca_context
     return _dealer_context
 
 
@@ -8693,6 +8735,8 @@ def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
 
 DEALER_VARIANT = "dealer_gatekeeper_v1"
 MAIN_STREET_VARIANT = "main_street_v1"
+MCA_VARIANT = "mca_refi_v1"
+MCA_PUBLIC_PATH = "/mca-refinance-intake"
 
 # Admin/broker lead creation accepts short names; map them explicitly rather
 # than with a boolean. The previous `FUNDING_VARIANT if is_re else
@@ -8702,12 +8746,14 @@ _ADMIN_VARIANT_CONSTANTS: dict[str, str] = {
     "dealer": DEALER_VARIANT,
     "real_estate": FUNDING_VARIANT,
     "main_street": MAIN_STREET_VARIANT,
+    "mca_refinance": MCA_VARIANT,
 }
 
 _VARIANT_LABELS: dict[str, str] = {
     DEALER_VARIANT: "dealer capital",
     FUNDING_VARIANT: "real estate DSCR/investor",
     MAIN_STREET_VARIANT: "operating business",
+    MCA_VARIANT: "MCA refinance",
 }
 
 
@@ -9204,4 +9250,963 @@ async def book_funding_review_call(
         token=token,
         public_path=FUNDING_PUBLIC_PATH,
         assistant_message="Your call is booked. Keep uploading property, rent, and PITIA evidence here if anything is still missing before the meeting.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# MCA refinance intake (mca_refi_v1)
+# ---------------------------------------------------------------------------
+#
+# The slimmest public variant by design: the ENTIRE file is six months of bank
+# statements, a signed credit authorization, and the current advance terms.
+# Everything else — tax returns, P&L, PFS — is deliberately absent; a borrower
+# being debited daily abandons long checklists, and the desk gathers the rest
+# after it engages. Endpoints mirror funding_router's subset, plus two this
+# flow uniquely needs: a typed-in advance-terms form, and the first PUBLIC
+# token-gated soft credit pull (elsewhere the pull is admin-executed).
+
+_MCA_EMPTY_MESSAGE = {
+    Language.EN: (
+        "Welcome — let's map a way out of the daily debits. This review needs exactly three things: "
+        "your last six months of business bank statements, one signed credit authorization (a soft "
+        "check that does not affect your score), and the terms of your current advance — upload the "
+        "agreements or just type the numbers into the form. That is the whole file. Start with "
+        "whichever is easiest and I'll walk you through the rest."
+    ),
+    Language.ES: (
+        "Bienvenido — vamos a trazar la salida de los débitos diarios. Esta revisión necesita "
+        "exactamente tres cosas: sus últimos seis meses de estados de cuenta bancarios del negocio, "
+        "una autorización de crédito firmada (una consulta suave que no afecta su puntaje) y los "
+        "términos de su adelanto actual — suba los contratos o simplemente escriba los números en el "
+        "formulario. Ese es todo el expediente. Empiece por lo más fácil y yo lo guío con el resto."
+    ),
+}
+
+_MCA_WELCOME_BACK = {
+    Language.EN: (
+        "Welcome back. Your MCA refinance file is right where you left it — the checklist on this "
+        "page shows which of the three items are still open."
+    ),
+    Language.ES: (
+        "Bienvenido de nuevo. Su expediente de refinanciamiento está tal como lo dejó — la lista en "
+        "esta página muestra cuáles de los tres puntos siguen pendientes."
+    ),
+}
+
+
+def _mca_empty_message(lang: str = Language.EN) -> str:
+    return _MCA_EMPTY_MESSAGE.get(lang, _MCA_EMPTY_MESSAGE[Language.EN])
+
+
+def _mca_welcome_back(lang: str = Language.EN) -> str:
+    return _MCA_WELCOME_BACK.get(lang, _MCA_WELCOME_BACK[Language.EN])
+
+
+def _require_mca_intake(intake: PublicUnderwritingIntake) -> None:
+    if intake.variant != MCA_VARIANT:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "MCA refinance review not found")
+
+
+async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge, str]:
+    session_token = request.headers.get("x-mca-session") or request.headers.get("X-Mca-Session")
+    if not session_token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "MCA refinance session is required")
+    intake, challenge = await _load_intake_by_dealer_session(db, session_token)
+    _require_mca_intake(intake)
+    return intake, challenge, session_token
+
+
+class McaRefiStart(BaseModel):
+    full_name: str = Field(min_length=1, max_length=180)
+    email: EmailStr
+    phone: str | None = Field(default=None, max_length=48)
+    business_name: str | None = Field(default=None, max_length=180)
+    # Optional pre-seed from the marketing calculator, so the room opens
+    # already knowing what the applicant typed there.
+    remaining_payback: float | None = Field(default=None, ge=0)
+    months_remaining: float | None = Field(default=None, ge=0, le=60)
+    payment_frequency: str | None = Field(default=None, max_length=16)
+    terms_accepted: bool = False
+    privacy_accepted: bool = False
+    terms_version: str = Field(default=TERMS_VERSION, max_length=32)
+    privacy_version: str = Field(default=PRIVACY_VERSION, max_length=32)
+    preferred_language: Language = Language.EN
+
+    @field_validator("phone", "business_name", "payment_frequency", mode="before")
+    @classmethod
+    def empty_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
+class McaAdvanceRow(BaseModel):
+    funder: str = Field(min_length=1, max_length=180)
+    remaining_payback: float = Field(ge=0)
+    payment_amount: float = Field(ge=0)
+    payment_frequency: str = Field(pattern="^(daily|weekly|biweekly|monthly)$")
+    payments_remaining: int | None = Field(default=None, ge=0, le=2000)
+
+
+class McaTermsSubmission(BaseModel):
+    """Typed-in advance terms — the no-paperwork path for the third checklist
+    item. Same trusted-structured-input rationale as the debt-schedule form."""
+
+    business_name: str = Field(min_length=1, max_length=180)
+    advances: list[McaAdvanceRow] = Field(min_length=1, max_length=10)
+    acknowledgment: bool
+
+
+class PublicCreditPullRequest(BaseModel):
+    """Borrower-initiated soft pull. The SSN is optional, transient, and never
+    persisted by this API — it improves bureau hit rate and handles the
+    no_hit_provide_ssn deny path. Consent is the SIGNED authorization document
+    already on file; this endpoint refuses to run without it."""
+
+    ssn: str | None = Field(default=None)
+
+    @field_validator("ssn", mode="before")
+    @classmethod
+    def normalize_ssn(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if len(digits) != 9:
+            raise ValueError("SSN must be 9 digits")
+        return digits
+
+
+_MCA_REMITS_PER_MONTH = {"daily": 21.0, "weekly": 4.33, "biweekly": 2.17, "monthly": 1.0}
+
+# Structured facts the MCA chat may propose. Same precedence law as every
+# other detail bundle: type-validated, allowlist-dropped, never guessed.
+_MCA_DETAIL_KEYS = (
+    "funder",
+    "remaining_payback",
+    "payment_amount",
+    "payment_frequency",
+    "months_remaining",
+    "factor_rate",
+    "advance_count",
+    "requested_amount",
+)
+
+
+def _mca_details(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    state = _intake_state(intake)
+    details = state.get("mca_details")
+    return details if isinstance(details, dict) else {}
+
+
+def _merge_mca_details(intake: PublicUnderwritingIntake, proposed: Any) -> None:
+    """Validate and merge AI-proposed advance facts into
+    intake_state["mca_details"]. Any key off the allowlist or with the wrong
+    type is dropped rather than persisted."""
+    if not isinstance(proposed, dict):
+        return
+    accepted: dict[str, Any] = {}
+    for key in _MCA_DETAIL_KEYS:
+        if key not in proposed:
+            continue
+        value = proposed[key]
+        if key in ("funder",):
+            text = str(value).strip()
+            if text:
+                accepted[key] = text[:180]
+            continue
+        if key == "payment_frequency":
+            text = str(value).strip().lower()
+            if text in _MCA_REMITS_PER_MONTH:
+                accepted[key] = text
+            continue
+        if key == "advance_count":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 50:
+                accepted[key] = int(value)
+            continue
+        if key == "factor_rate":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 1.0 <= value <= 3.0:
+                accepted[key] = float(value)
+            continue
+        if key == "months_remaining":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 60:
+                accepted[key] = float(value)
+            continue
+        # remaining_payback / payment_amount / requested_amount — dollars.
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 500_000_000:
+            accepted[key] = float(value)
+    if not accepted:
+        return
+    state = _intake_state(intake)
+    merged = dict(state.get("mca_details") or {})
+    merged.update(accepted)
+    state["mca_details"] = merged
+    intake.intake_state = state
+
+
+def _mca_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    state = _intake_state(intake)
+    checklist = {
+        doc.name: doc.status for doc in (intake.bucket.requested_documents if intake.bucket else [])
+    }
+    return {
+        "review_type": MCA_VARIANT,
+        "deal_type": "MCA refinance review",
+        "documentation_level": "three-item MCA refinance file",
+        "collateral_type": "business cash flow",
+        "business_name": intake.business_name,
+        "requested_loan_amount": float(intake.requested_loan_amount) if intake.requested_loan_amount is not None else None,
+        "mca_details": _mca_details(intake) or None,
+        "credit_pull": _credit_pull_state(intake) or None,
+        "checklist_status": checklist,
+        "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
+        "baseline_document_policy": {
+            "stage": "stage_1_mca_refinance",
+            "allowed_document_categories": [
+                "last 6 months business bank statements",
+                "signed credit authorization",
+                "current MCA / advance terms (agreements, payoff letters, or the typed form)",
+            ],
+            "do_not_request_other_document_categories": True,
+        },
+    }
+
+
+async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) -> Client:
+    email = _normalize_email(str(payload.email))
+    client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
+    owner = await primary_super_admin(db)
+    lead_payload = {
+        "source": "mca_refinance",
+        "business_name": payload.business_name,
+        "remaining_payback": payload.remaining_payback,
+        "months_remaining": payload.months_remaining,
+        "payment_frequency": payload.payment_frequency,
+    }
+    if client is None:
+        client = Client(
+            name=payload.full_name.strip(),
+            email=email,
+            phone=payload.phone,
+            referral_source="mca_refinance",
+            originating_agent_id=owner.id if owner else None,
+            current_agent_id=owner.id if owner else None,
+            source_channel="mca_refinance",
+            lead_source="other",
+            lead_temperature="warm",
+            financing_support_needed="yes",
+            relationship_context="new_lead",
+            client_experience_mode="self_directed",
+            client_experience_mode_reason="mca_refinance",
+            client_experience_mode_locked_by="firm",
+            lead_intake=lead_payload,
+        )
+        db.add(client)
+        await db.flush()
+        return client
+    if not client.phone and payload.phone:
+        client.phone = payload.phone
+    if payload.full_name and (not client.name or client.name.lower() == email):
+        client.name = payload.full_name.strip()
+    if client.current_agent_id is None and owner is not None:
+        client.current_agent_id = owner.id
+    merged = dict(client.lead_intake or {})
+    merged.update({key: value for key, value in lead_payload.items() if value is not None})
+    client.lead_intake = merged
+    await db.flush()
+    return client
+
+
+async def _create_bucket_for_mca_refi(db: AsyncSession, client: Client, payload: McaRefiStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
+    owner = await primary_super_admin(db)
+    business = payload.business_name or payload.full_name
+    bucket = Bucket(
+        name=f"{business} MCA Refinance",
+        bucket_type="mca_refinance_intake",
+        client_name=business,
+        purpose="MCA refinance AI intake",
+        description="Public MCA refinance preliminary review — statements, credit authorization, advance terms.",
+        ai_context={
+            "review_type": MCA_VARIANT,
+            "screening_stage": "stage_1_mca_refinance",
+            "deal_type": "MCA refinance review",
+            "documentation_level": "three-item MCA refinance file",
+            "collateral_type": "business cash flow",
+            "client_email": client.email,
+            "stage_1_required_items": [
+                "last 6 months business bank statements",
+                "signed credit authorization",
+                "current MCA / advance terms",
+            ],
+        },
+        created_by_id=owner.id if owner else None,
+    )
+    db.add(bucket)
+    await db.flush()
+    for doc in MCA_REQUIRED_DOCUMENTS:
+        db.add(
+            BucketRequestedDocument(
+                bucket_id=bucket.id,
+                name=doc["name"],
+                category=doc["category"],
+                description=doc["description"],
+                required=True,
+                allow_multiple_files=bool(doc["allow_multiple_files"]),
+                status="requested",
+                is_custom=False,
+                requires_signature=bool(doc.get("requires_signature", False)),
+                signature_kind=doc.get("signature_kind"),
+            )
+        )
+    passcode = _generate_passcode()
+    link = BucketUploadLink(
+        bucket_id=bucket.id,
+        token=secrets.token_urlsafe(32),
+        recipient_name=payload.full_name.strip(),
+        recipient_email=client.email,
+        allow_notes=True,
+        allow_multiple_sessions=True,
+        can_use_ai_chat=True,
+        can_view_ai_tasks=True,
+        passcode_hash=_hash_passcode(passcode),
+    )
+    db.add(link)
+    await _log(
+        db,
+        bucket.id,
+        "mca_refinance_intake_created",
+        request=request,
+        actor_name=payload.full_name,
+        actor_email=client.email,
+        actor_role="public_lead",
+        target_type="bucket",
+        target_id=str(bucket.id),
+        detail="Public MCA refinance review created",
+    )
+    await db.flush()
+    return bucket, link
+
+
+@mca_router.post("/start", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def start_mca_refinance(
+    payload: McaRefiStart,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    if not payload.terms_accepted or not payload.privacy_accepted:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Terms and Privacy Policy acceptance is required.")
+    _throttle_or_429(
+        _START_LAST_BY_IP,
+        (request.client.host if request.client else "?") or "?",
+        _START_MIN_INTERVAL_SECONDS,
+        "Please wait a moment before starting another review.",
+    )
+    existing = await _latest_active_intake_by_email(db, str(payload.email), variant=MCA_VARIANT)
+    if existing is not None:
+        await _start_login_challenge(
+            db,
+            email=str(payload.email),
+            request=request,
+            reason="existing_mca_refinance_start",
+            variant=MCA_VARIANT,
+            review_label="MCA refinance review",
+            event_prefix="mca_refinance",
+            target_type="mca_refinance_intake",
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A secure MCA refinance review already exists for this email. We sent a short access code so you can continue that file.",
+        )
+    client = await _find_or_create_mca_client(db, payload)
+    bucket, link = await _create_bucket_for_mca_refi(db, client, payload, request)
+    token = _new_public_token()
+    seeded: dict[str, Any] = {}
+    if payload.remaining_payback is not None:
+        seeded["remaining_payback"] = payload.remaining_payback
+    if payload.months_remaining is not None:
+        seeded["months_remaining"] = payload.months_remaining
+    if payload.payment_frequency in _MCA_REMITS_PER_MONTH:
+        seeded["payment_frequency"] = payload.payment_frequency
+    intake = PublicUnderwritingIntake(
+        client_id=client.id,
+        bucket_id=bucket.id,
+        bucket_upload_link_id=link.id,
+        token_hash=_hash_token(token),
+        variant=MCA_VARIANT,
+        full_name=payload.full_name.strip(),
+        email=client.email or _normalize_email(str(payload.email)),
+        phone=payload.phone,
+        business_name=payload.business_name,
+        loan_purpose="mca_refinance",
+        preferred_language=payload.preferred_language,
+        intake_state={
+            "messages": [],
+            "source": "mca_refinance",
+            **({"mca_details": seeded} if seeded else {}),
+            "legal_acceptance": {
+                "terms_accepted": payload.terms_accepted,
+                "privacy_accepted": payload.privacy_accepted,
+                "terms_version": payload.terms_version or TERMS_VERSION,
+                "privacy_version": payload.privacy_version or PRIVACY_VERSION,
+                **_request_audit(request),
+            },
+        },
+    )
+    db.add(intake)
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    await _record_resume_email(
+        intake,
+        token=token,
+        request=request,
+        reason="mca_refinance_created",
+        public_path=MCA_PUBLIC_PATH,
+        review_label="MCA refinance review",
+        room_label="MCA refinance file",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH, assistant_message=_mca_empty_message(intake.preferred_language))
+
+
+@mca_router.post("/login/start", response_model=DealerLoginStartResponse)
+async def start_mca_refinance_login(
+    payload: DealerLoginStartRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLoginStartResponse:
+    login_required = await _start_login_challenge(
+        db,
+        email=str(payload.email),
+        request=request,
+        reason="mca_refinance_login_requested",
+        variant=MCA_VARIANT,
+        review_label="MCA refinance review",
+        event_prefix="mca_refinance",
+        target_type="mca_refinance_intake",
+    )
+    await db.commit()
+    return DealerLoginStartResponse(
+        login_required=login_required,
+        message=(
+            "We found an existing MCA refinance review for this email. Enter the code we sent to continue."
+            if login_required
+            else "No existing review was found. Complete the form to start a new one."
+        ),
+    )
+
+
+@mca_router.post("/login/verify", response_model=DealerIntakeResponse)
+async def verify_mca_refinance_login(
+    payload: DealerLoginVerifyRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    email_hash = _hash_token(_normalize_email(str(payload.email)))
+    challenge = (
+        await db.execute(
+            select(DealerIntakeLoginChallenge)
+            .join(PublicUnderwritingIntake, DealerIntakeLoginChallenge.intake_id == PublicUnderwritingIntake.id)
+            .where(
+                PublicUnderwritingIntake.variant == MCA_VARIANT,
+                DealerIntakeLoginChallenge.email_hash == email_hash,
+                DealerIntakeLoginChallenge.used_at.is_(None),
+                DealerIntakeLoginChallenge.revoked_at.is_(None),
+                DealerIntakeLoginChallenge.expires_at > _now(),
+            )
+            .order_by(DealerIntakeLoginChallenge.created_at.desc())
+        )
+    ).scalars().first()
+    if challenge is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    if _hash_token(payload.code.strip()) != challenge.code_hash:
+        challenge.attempt_count += 1
+        if challenge.attempt_count >= DEALER_LOGIN_MAX_ATTEMPTS:
+            challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    session_token = secrets.token_urlsafe(40)
+    public_token = _new_public_token()
+    challenge.used_at = _now()
+    challenge.session_hash = _hash_token(session_token)
+    challenge.session_expires_at = _now() + timedelta(hours=DEALER_LOGIN_SESSION_TTL_HOURS)
+    intake = await db.get(PublicUnderwritingIntake, challenge.intake_id)
+    if intake is None or intake.variant != MCA_VARIANT:
+        challenge.revoked_at = _now()
+        await db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired access code")
+    intake.token_hash = _hash_token(public_token)
+    await _log(
+        db,
+        intake.bucket_id,
+        "mca_refinance_login_verified",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="mca_refinance_intake",
+        target_id=str(intake.id),
+        detail="MCA refinance continuation login verified",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        public_path=MCA_PUBLIC_PATH,
+        assistant_message=_mca_welcome_back(intake.preferred_language),
+    )
+
+
+@mca_router.get("/session", response_model=DealerIntakeResponse)
+async def get_mca_refinance_session(request: Request, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
+    intake, _challenge, session_token = await _load_mca_intake_by_session(db, request)
+    public_token = _new_public_token()
+    intake.token_hash = _hash_token(public_token)
+    await db.commit()
+    intake = await _load_public_intake(db, public_token)
+    return await _response(
+        db,
+        intake,
+        token=public_token,
+        session_token=session_token,
+        public_path=MCA_PUBLIC_PATH,
+        assistant_message=_mca_welcome_back(intake.preferred_language),
+    )
+
+
+@mca_router.post("/logout", response_model=DealerLogoutResponse)
+async def logout_mca_refinance_session(
+    payload: DealerLogoutRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerLogoutResponse:
+    session_token = payload.session_token or request.headers.get("x-mca-session") or request.headers.get("X-Mca-Session")
+    if session_token:
+        challenge = (
+            await db.execute(
+                select(DealerIntakeLoginChallenge).where(
+                    DealerIntakeLoginChallenge.session_hash == _hash_token(session_token),
+                    DealerIntakeLoginChallenge.revoked_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if challenge is not None:
+            challenge.revoked_at = _now()
+            await db.commit()
+    return DealerLogoutResponse()
+
+
+@mca_router.get("/{token}", response_model=DealerIntakeResponse)
+async def get_mca_refinance(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH, empty_message=_mca_empty_message(intake.preferred_language))
+
+
+@mca_router.post("/{token}/chat", response_model=DealerIntakeResponse)
+async def mca_refinance_chat(
+    token: str,
+    payload: DealerChatRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    _apply_updates(intake, payload.updates)
+    _record_chat_fact(intake, payload.message)
+    intake.last_message_at = _now()
+    messages = []
+    assistant_message = None
+    if payload.message and payload.message.strip():
+        intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_mca_context(intake)}
+        chat_messages, _, _ = await create_chat_reply(
+            db,
+            bucket=intake.bucket,
+            audience="uploader",
+            message=payload.message.strip(),
+            actor_name=intake.full_name,
+            upload_link=intake.bucket_upload_link,
+            preferred_language=intake.preferred_language,
+        )
+        messages = chat_messages
+        if chat_messages:
+            assistant_message = chat_messages[-1].content
+            raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
+            proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
+            _merge_mca_details(intake, proposed_facts)
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=MCA_PUBLIC_PATH,
+        assistant_message=assistant_message,
+        messages=messages,
+    )
+
+
+@mca_router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
+async def mca_refinance_upload_init(
+    token: str,
+    payload: DealerFileUploadInit,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFileUploadInitResponse:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@mca_router.post("/{token}/files/complete", response_model=BucketFileRead)
+async def mca_refinance_upload_complete(
+    token: str,
+    payload: DealerUploadComplete,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@mca_router.post("/{token}/requested-documents/sign", response_model=BucketFileRead)
+async def mca_refinance_sign_requested_document(
+    token: str,
+    payload: DealerDocumentSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    return await _sign_requested_document(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+
+
+@mca_router.post("/{token}/requested-documents/mca-terms", response_model=BucketFileRead)
+async def submit_mca_refinance_terms(
+    token: str,
+    payload: McaTermsSubmission,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketFile:
+    """The typed-in path for the third checklist item. Renders a PDF and writes
+    a TRUSTED BucketFileAnalysis directly from the structured input (the
+    _store_drafted_form_pdf trick), so the terms flow into
+    extract_debt_schedule and the metrics pipeline identically to an analyzed
+    upload — monthly payments are normalized from each advance's remittance
+    frequency."""
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    if not payload.acknowledgment:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
+    req = next((doc for doc in intake.bucket.requested_documents if doc.category == "Debts"), None)
+    if req is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Advance terms are not requested on this intake")
+    if req.status == "uploaded":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Advance terms have already been submitted for this file")
+
+    from app.services.dealer_forms_pdf import render_debt_schedule_pdf
+
+    rows: list[tuple[str, float, float]] = []
+    debts: list[dict[str, Any]] = []
+    total_balance = 0.0
+    total_monthly = 0.0
+    for adv in payload.advances:
+        monthly = adv.payment_amount * _MCA_REMITS_PER_MONTH[adv.payment_frequency]
+        rows.append((adv.funder, adv.remaining_payback, monthly))
+        debts.append(
+            {
+                "lender": adv.funder,
+                "original_amount": None,
+                "current_balance": adv.remaining_payback,
+                "monthly_payment": round(monthly, 2),
+                "maturity_date": None,
+                "payment_amount": adv.payment_amount,
+                "payment_frequency": adv.payment_frequency,
+                "payments_remaining": adv.payments_remaining,
+            }
+        )
+        total_balance += adv.remaining_payback
+        total_monthly += monthly
+
+    key_facts: dict[str, Any] = {
+        "debts": debts,
+        "total_outstanding_balance": round(total_balance, 2),
+        "total_monthly_debt_service": round(total_monthly, 2),
+        "advance_count": len(debts),
+    }
+    pdf_bytes = render_debt_schedule_pdf(
+        business_name=payload.business_name,
+        debts=rows,
+        total_balance=key_facts["total_outstanding_balance"],
+        total_monthly=key_facts["total_monthly_debt_service"],
+    )
+    stored = await _store_drafted_form_pdf(
+        db,
+        intake,
+        req,
+        pdf_bytes,
+        request,
+        file_label="Current MCA / Advance Terms",
+        classification="debt_schedule",
+        key_facts=key_facts,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+    )
+    # Mirror the typed terms into the structured detail bundle the AI context
+    # reads, so the chat knows the terms without re-deriving them from the PDF.
+    first = payload.advances[0]
+    _merge_mca_details(
+        intake,
+        {
+            "funder": first.funder,
+            "remaining_payback": round(total_balance, 2),
+            "payment_amount": first.payment_amount,
+            "payment_frequency": first.payment_frequency,
+            "advance_count": len(debts),
+        },
+    )
+    await db.commit()
+    return stored
+
+
+# One public pull per intake, throttled per IP — this endpoint spends bureau
+# money on an unauthenticated (token-bearing) caller, so it is deliberately
+# stingier than /start.
+_MCA_PULL_LAST_BY_IP: dict[str, float] = {}
+
+
+@mca_router.post("/{token}/credit-pull", response_model=DealerIntakeResponse)
+async def mca_refinance_credit_pull(
+    token: str,
+    payload: PublicCreditPullRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """The first PUBLIC soft-pull endpoint. Consent is the signed
+    credit-authorization document on THIS intake — the endpoint refuses to run
+    without it, exactly like the admin path (run_lead_credit_pull), and the
+    result lands in the same state["credit_pull"] cross-reference. One pull
+    per intake: a second call 409s instead of re-billing the bureau."""
+    _throttle_or_429(
+        _MCA_PULL_LAST_BY_IP,
+        (request.client.host if request.client else "?") or "?",
+        30.0,
+        "Please wait a moment before requesting the credit check again.",
+    )
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    if intake.client_id is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This review has no linked client")
+    if _credit_pull_state(intake).get("fico") is not None or _credit_pull_state(intake).get("pull_id"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "The credit check has already been completed for this file.")
+
+    doc = _credit_authorization_doc(intake)
+    if doc is None or doc.status != "uploaded":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Sign the credit authorization first — the soft check cannot run without it.",
+        )
+    signature = (
+        await db.execute(
+            select(BucketDocumentSignature)
+            .where(BucketDocumentSignature.requested_document_id == doc.id)
+            .order_by(BucketDocumentSignature.created_at.desc())
+        )
+    ).scalars().first()
+    applicant_data = signature.applicant_data if signature else None
+    if not applicant_data:
+        raise HTTPException(status.HTTP_409_CONFLICT, "No applicant identity data on file for this signature")
+
+    client = await db.get(Client, intake.client_id)
+    if client is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Linked client not found")
+
+    from datetime import date as _date
+
+    from app.services import credit_pull_core
+
+    try:
+        dob = _date.fromisoformat(str(applicant_data.get("dob")))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Applicant date of birth on file is invalid") from exc
+
+    try:
+        pull = await credit_pull_core.run_soft_pull(
+            db,
+            client=client,
+            applicant=credit_pull_core.SoftPullApplicant(
+                legal_first_name=str(applicant_data.get("legal_first_name") or ""),
+                legal_last_name=str(applicant_data.get("legal_last_name") or ""),
+                dob=dob,
+                street=str(applicant_data.get("street") or ""),
+                city=str(applicant_data.get("city") or ""),
+                state=str(applicant_data.get("state") or ""),
+                zip=str(applicant_data.get("zip") or ""),
+                ssn=payload.ssn,
+            ),
+            actor=None,
+        )
+    except credit_pull_core.SoftPullDenied as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": exc.code, "message": exc.message}) from exc
+    except credit_pull_core.SoftPullValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except credit_pull_core.SoftPullRateLimited as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+    except credit_pull_core.SoftPullUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    state = _intake_state(intake)
+    state["credit_pull"] = {
+        "pull_id": str(pull.id),
+        "fico": pull.fico,
+        "pulled_at": pull.pulled_at.isoformat() if pull.pulled_at else None,
+        "expires_at": pull.expires_at.isoformat() if pull.expires_at else None,
+    }
+    intake.intake_state = state
+    await _log(
+        db,
+        intake.bucket_id,
+        "mca_refinance_credit_pull",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="mca_refinance_intake",
+        target_id=str(intake.id),
+        detail="Borrower-initiated soft credit pull completed",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=MCA_PUBLIC_PATH,
+        assistant_message="The soft credit check is done — it does not affect your score. That closes another of the three items.",
+    )
+
+
+@mca_router.post("/{token}/run-review", response_model=DealerIntakeResponse)
+async def run_mca_refinance_review(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    await _execute_intake_review(
+        db,
+        intake,
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        log_event="mca_refinance_ai_review_queued",
+        detail="Public MCA refinance screen",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH)
+
+
+@mca_router.post("/{token}/book-call", response_model=DealerIntakeResponse)
+async def book_mca_refinance_call(
+    token: str,
+    payload: DealerBookCallRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    intake = await _load_public_intake(db, token)
+    _require_mca_intake(intake)
+    if _call_booked(intake):
+        return await _response(
+            db,
+            intake,
+            token=token,
+            public_path=MCA_PUBLIC_PATH,
+            assistant_message="Your call is already booked. If any of the three items is still open, closing it before the meeting speeds everything up.",
+        )
+    starts_at = _to_utc_minute(payload.starts_at)
+    owner, booking, slots = await _dealer_call_slots(db)
+    if owner is None or booking is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
+    if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That call time is no longer available. Choose another time.")
+    who = f"{intake.full_name} <{intake.email}>"
+    description = (
+        "Booked from MCA Refinance Review.\n"
+        f"MCA refinance intake: {intake.id}\n"
+        f"Bucket: {intake.bucket_id}\n"
+        f"Business: {intake.business_name or '(not provided)'}\n"
+        f"Name: {intake.full_name}\n"
+        f"Email: {intake.email}\n"
+        f"Phone: {intake.phone or '(not provided)'}\n"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=f"MCA refinance call: {intake.business_name or intake.full_name}",
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.AUTO,
+        owner_user_id=owner.id,
+        external_ref_kind="mca_refinance_intake",
+        external_ref_id=str(intake.id),
+    )
+    db.add(ev)
+    await db.flush()
+    state = _intake_state(intake)
+    state["call_booking"] = {
+        "event_id": str(ev.id),
+        "starts_at": starts_at.isoformat(),
+        "booked_at": _now().isoformat(),
+        "host_user_id": str(owner.id),
+        "host_email": owner.email,
+    }
+    intake.intake_state = state
+    db.add(
+        Activity(
+            client_id=intake.client_id,
+            actor_id=None,
+            actor_label="public",
+            kind="calendar.mca_refinance_call_booked",
+            summary=f"MCA refinance call booked for {intake.business_name or intake.full_name}",
+            payload={
+                "event_id": str(ev.id),
+                "intake_id": str(intake.id),
+                "bucket_id": str(intake.bucket_id),
+                "host_user_id": str(owner.id),
+                "starts_at": starts_at.isoformat(),
+            },
+        )
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        "mca_refinance_call_booked",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="calendar_event",
+        target_id=str(ev.id),
+        detail=f"MCA refinance call booked for {starts_at.isoformat()}",
+    )
+    await db.commit()
+    intake = await _load_public_intake(db, token)
+    return await _response(
+        db,
+        intake,
+        token=token,
+        public_path=MCA_PUBLIC_PATH,
+        assistant_message="Your call is booked. Anything still open on the three-item checklist can be finished right here before the meeting.",
     )

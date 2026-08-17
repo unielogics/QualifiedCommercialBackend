@@ -42,9 +42,21 @@ def can_transition(from_status: str, to_status: str) -> bool:
     return to_status in SHIFT_TRANSITIONS.get(from_status, frozenset())
 
 
-def adb_impact(amount: float, from_day: int, to_day: int, month_days: int = 30) -> float:
-    """First-order ADB gain of moving a monthly payment from_day -> to_day."""
-    return round(float(amount) * (int(to_day) - int(from_day)) / month_days, 2)
+def adb_impact(
+    amount: float,
+    from_day: int,
+    to_day: int,
+    month_days: int = 30,
+    direction: str = "out",
+) -> float:
+    """First-order ADB gain of moving a monthly payment from_day -> to_day.
+
+    direction 'out' (default): paying later holds the cash longer, so a
+    later to_day is positive. direction 'in': collecting a deposit EARLIER
+    means the cash arrives sooner, so an earlier to_day is positive — the
+    sign flips (-1) so out+later and in+earlier both read as gains."""
+    sign = -1.0 if direction == "in" else 1.0
+    return round(sign * float(amount) * (int(to_day) - int(from_day)) / month_days, 2)
 
 
 def _clamp_day(day: int) -> int:
@@ -148,6 +160,8 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
     months_seen: set[tuple[int, int]] = set()
     vendor_days: dict[str, list[int]] = defaultdict(list)
     vendor_accounts: dict[str, dict] = defaultdict(lambda: defaultdict(int))
+    vendor_days_in: dict[str, list[int]] = defaultdict(list)
+    vendor_accounts_in: dict[str, dict] = defaultdict(lambda: defaultdict(int))
 
     for r in rows:
         amount = float(r.amount or 0)
@@ -159,6 +173,9 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
         key = normalize_vendor(r.description or "")
         if amount > 0:
             day_in[day] += amount
+            if key:
+                vendor_days_in[key].append(day)
+                vendor_accounts_in[key][getattr(r, "account_id", None)] += 1
         else:
             day_out[day] += -amount
             if key:
@@ -208,6 +225,34 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
             {
                 "vendor_key": v.key,
                 "label": v.sample_description,
+                "direction": "out",
+                "category": v.category,
+                "cadence": v.cadence or None,
+                "typical_day": _clamp_day(round(median(observed))),
+                "day_spread": _spread(observed),
+                "monthly_amount": round(abs(v.monthly_average), 2),
+                "account_id": account_id,
+            }
+        )
+
+    # --- recurring inflow vendors (deposit-acceleration candidates, 0121) --
+    # Same shape as the outflow rows, direction 'in'. Transfers are excluded
+    # outright — moving money between the dealer's own accounts is never a
+    # receivables change.
+    for v in vendors_rollup:
+        if v.direction != 1 or not v.is_recurring or v.category == "transfer":
+            continue
+        observed = vendor_days_in.get(v.key)
+        if not observed:
+            continue  # no inflow events inside the window
+        accounts = vendor_accounts_in.get(v.key, {})
+        account_id = max(accounts, key=accounts.get) if accounts else None
+        recurring.append(
+            {
+                "vendor_key": v.key,
+                "label": v.sample_description,
+                "direction": "in",
+                "category": v.category,
                 "cadence": v.cadence or None,
                 "typical_day": _clamp_day(round(median(observed))),
                 "day_spread": _spread(observed),

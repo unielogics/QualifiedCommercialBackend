@@ -158,6 +158,7 @@ from .schemas import (
     TargetRead,
     TaxFilingUpsert,
     TaxYearRead,
+    TimingOptimizeRead,
     TradelineRead,
     VendorAccountRead,
     VendorCategoryPatch,
@@ -192,7 +193,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import payment_timing, simulate
+from .services import payment_timing, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -2499,7 +2500,9 @@ async def simulate_dealer(
         ]
         shifts_added += round(
             sum(
-                payment_timing.adb_impact(s_.monthly_amount, s_.from_day, s_.to_day)
+                payment_timing.adb_impact(
+                    s_.monthly_amount, s_.from_day, s_.to_day, direction=s_.direction
+                )
                 for s_ in staged
             ),
             2,
@@ -4702,10 +4705,59 @@ async def dealer_payment_timing(
     )
 
 
-def _shift_estimate(monthly_amount, from_day: int, to_day: int) -> float | None:
+@router.get("/dealers/{dealer_id}/timing/optimize", response_model=TimingOptimizeRead)
+async def optimize_timing(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> TimingOptimizeRead:
+    """Deterministic draft of the best payment/deposit timing moves (0121):
+    early-month outflows pushed to just before the earliest statement cutoff,
+    tightly-clustered recurring deposits pulled earlier. Team-only, read-only
+    — persists NOTHING; each row is a candidate dos_payment_shift the desk
+    can stage explicitly. Moves already on the dealer's table (any status)
+    are never re-proposed."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
+    rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
+    window_start = date.today() - timedelta(days=_TIMING_WINDOW_DAYS)
+    windowed = sorted(
+        (r for r in rows if r.occurred_on >= window_start),
+        key=lambda r: r.occurred_on,
+        reverse=True,
+    )[:_TIMING_EVENT_CAP]
+    timing = payment_timing.analyze_timing(
+        windowed, rolled, months_window=_TIMING_WINDOW_MONTHS
+    )
+    existing = (
+        (
+            await db.execute(
+                select(DealerPaymentShift).where(DealerPaymentShift.dealer_id == dealer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    staged_keys = frozenset(
+        timing_optimizer.shift_key(s.direction, s.vendor_key, s.label) for s in existing
+    )
+    drafts = timing_optimizer.draft_optimized_shifts(
+        timing["recurring"], payment_timing.cutoff_days(rows), staged_keys=staged_keys
+    )
+    return TimingOptimizeRead(
+        shifts=drafts,
+        total_est_adb=round(sum(d["est_adb_impact"] for d in drafts), 2),
+        computed_at=datetime.now(timezone.utc),
+    )
+
+
+def _shift_estimate(
+    monthly_amount, from_day: int, to_day: int, direction: str = "out"
+) -> float | None:
     if monthly_amount is None:
         return None
-    return payment_timing.adb_impact(float(monthly_amount), from_day, to_day)
+    return payment_timing.adb_impact(
+        float(monthly_amount), from_day, to_day, direction=direction
+    )
 
 
 async def _load_shift(db: AsyncSession, dealer_id: UUID, shift_id: UUID) -> DealerPaymentShift:
@@ -4753,11 +4805,17 @@ async def create_payment_shift(
     shift = DealerPaymentShift(
         dealer_id=dealer.id,
         vendor_key=payload.vendor_key,
+        direction=payload.direction,
         label=label,
         from_day=payload.from_day,
         to_day=payload.to_day,
         monthly_amount=payload.monthly_amount,
-        est_adb_impact=_shift_estimate(payload.monthly_amount, payload.from_day, payload.to_day),
+        est_adb_impact=_shift_estimate(
+            payload.monthly_amount,
+            payload.from_day,
+            payload.to_day,
+            direction=payload.direction,
+        ),
         rationale=payload.rationale,
         created_by_user_id=user.id,
     )
@@ -4768,6 +4826,7 @@ async def create_payment_shift(
         entity_id=shift.id,
         after={
             "label": label,
+            "direction": payload.direction,
             "from_day": payload.from_day,
             "to_day": payload.to_day,
             "monthly_amount": payload.monthly_amount,
@@ -4804,13 +4863,22 @@ async def update_payment_shift(
     to_day = changes.get("to_day") or shift.to_day
     if from_day == to_day:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_day and to_day must differ")
+    # direction is fixed at creation (not patchable); a deposit ('in') row
+    # can only ever move EARLIER, whatever days the patch proposes.
+    if shift.direction == "in" and to_day >= from_day:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "direction 'in' moves a deposit EARLIER: to_day must be before from_day",
+        )
     days_changed = from_day != shift.from_day or to_day != shift.to_day
     shift.from_day = from_day
     shift.to_day = to_day
     if "rationale" in changes:
         shift.rationale = changes["rationale"]
     if days_changed:
-        shift.est_adb_impact = _shift_estimate(shift.monthly_amount, from_day, to_day)
+        shift.est_adb_impact = _shift_estimate(
+            shift.monthly_amount, from_day, to_day, direction=shift.direction
+        )
     if new_status is not None and new_status != shift.status:
         before_status = shift.status
         shift.status = new_status

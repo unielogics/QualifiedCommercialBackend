@@ -20,7 +20,9 @@ from app.services import bucket_ai as ai
 DEALER = "dealer_gatekeeper_v1"
 REAL_ESTATE = "real_estate_dscr_v1"
 MAIN_STREET = "main_street_v1"
-ALL_VARIANTS = (DEALER, REAL_ESTATE, MAIN_STREET)
+MCA = "mca_refi_v1"
+
+ALL_VARIANTS = (DEALER, REAL_ESTATE, MAIN_STREET, MCA)
 
 BUILDERS = (
     ("review", ai.build_review_system),
@@ -37,6 +39,7 @@ FINGERPRINTS = {
     DEALER: ("car dealer",),
     REAL_ESTATE: ("real estate investor / dscr underwriter", "real estate / dscr investor"),
     MAIN_STREET: ("operating business",),
+    MCA: ("merchant cash advance", "merchant-cash-advance"),
 }
 
 

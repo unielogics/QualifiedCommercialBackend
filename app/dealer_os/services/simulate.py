@@ -183,8 +183,13 @@ def daily_curve(
         b = int(getattr(sh, "to_day", 0) or 0)
         if amount <= 0 or a == b or not (1 <= a <= _CURVE_DAYS and 1 <= b <= _CURVE_DAYS):
             continue
-        lo, hi, sign = (a, b, 1.0) if b > a else (b, a, -1.0)
-        for day in range(lo, hi):
+        # Direction-aware lift (0121): an outflow paid LATER is held over
+        # from_day..to_day-1 (+); an inflow collected EARLIER arrives over
+        # to_day..from_day-1 (+). The mismatched pairs subtract.
+        direction = getattr(sh, "direction", "out") or "out"
+        moved_later = b > a
+        sign = 1.0 if (moved_later == (direction == "out")) else -1.0
+        for day in range(min(a, b), max(a, b)):
             scenario_shape[day] += sign * amount
     scenario_curve = anchored(scenario_shape, float(scenario_adb))
 

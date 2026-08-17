@@ -597,6 +597,9 @@ class DealerPaymentShift(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
     )
     vendor_key: Mapped[str | None] = mapped_column(String(120))
+    # 'out' = pay later under vendor terms; 'in' = collect earlier (real
+    # receivables change — deposits only ever move EARLIER, 0121).
+    direction: Mapped[str] = mapped_column(String(8), default="out", server_default="out")
     label: Mapped[str] = mapped_column(String(200), nullable=False)
     from_day: Mapped[int] = mapped_column(Integer, nullable=False)
     to_day: Mapped[int] = mapped_column(Integer, nullable=False)

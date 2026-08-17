@@ -163,6 +163,7 @@ for r in [
     dealer_ai_intake.client_router,
     dealer_ai_intake.admin_router,
     dealer_ai_intake.broker_router,
+    dealer_ai_intake.mca_router,
     documents.router,
     messages.router,
     notifications.router,

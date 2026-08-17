@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ORM(BaseModel):
@@ -1051,10 +1051,14 @@ class TimingBigDayRead(BaseModel):
 
 
 class TimingRecurringRead(BaseModel):
-    """A recurring/debt-like outflow vendor — a payment-shift candidate."""
+    """A recurring vendor and when in the month its money moves: outflows
+    (direction 'out' — payment-shift candidates) and, 0121, recurring
+    deposit inflows (direction 'in' — receivables-acceleration candidates)."""
 
     vendor_key: str
     label: str
+    direction: str = "out"  # "out" | "in"
+    category: str | None = None
     cadence: str | None = None
     typical_day: int
     day_spread: list[float] = []  # [p25, p75] day-of-month
@@ -1086,6 +1090,7 @@ class PaymentTimingRead(BaseModel):
 class PaymentShiftRead(ORM):
     id: UUID
     vendor_key: str | None = None
+    direction: str = "out"  # "out" pay later | "in" collect earlier (0121)
     label: str
     from_day: int
     to_day: int
@@ -1098,11 +1103,22 @@ class PaymentShiftRead(ORM):
 
 class PaymentShiftCreate(BaseModel):
     vendor_key: str | None = Field(default=None, max_length=120)
+    # 'in' = collect a recurring deposit earlier (real receivables change) —
+    # deposits only ever move EARLIER, so 'in' requires to_day < from_day.
+    direction: str = Field(default="out", pattern="^(out|in)$")
     label: str = Field(min_length=1, max_length=200)
     from_day: int = Field(ge=1, le=31)
     to_day: int = Field(ge=1, le=31)
     monthly_amount: float | None = Field(default=None, gt=0)
     rationale: str | None = None
+
+    @model_validator(mode="after")
+    def _in_moves_earlier(self) -> "PaymentShiftCreate":
+        if self.direction == "in" and self.to_day >= self.from_day:
+            raise ValueError(
+                "direction 'in' moves a deposit EARLIER: to_day must be before from_day"
+            )
+        return self
 
 
 class PaymentShiftPatch(BaseModel):
@@ -1110,6 +1126,32 @@ class PaymentShiftPatch(BaseModel):
     to_day: int | None = Field(default=None, ge=1, le=31)
     rationale: str | None = None
     status: str | None = Field(default=None, pattern="^(draft|proposed|done|dismissed)$")
+
+
+# --- Timing optimizer (0121) ---------------------------------------------------
+
+
+class TimingOptimizeShiftRead(BaseModel):
+    """One drafted move: pay an early-month vendor later under its terms, or
+    collect a recurring deposit earlier (a real receivables change)."""
+
+    vendor_key: str | None = None
+    label: str
+    direction: str  # "out" | "in"
+    from_day: int
+    to_day: int
+    monthly_amount: float
+    est_adb_impact: float
+    rationale: str
+
+
+class TimingOptimizeRead(BaseModel):
+    """GET /dealers/{id}/timing/optimize — a read-only draft, never stored;
+    each row is a candidate the team can stage as a dos_payment_shift."""
+
+    shifts: list[TimingOptimizeShiftRead] = []
+    total_est_adb: float = 0.0
+    computed_at: datetime
 
 
 # --- What-if simulator (0121) --------------------------------------------------
@@ -1124,9 +1166,20 @@ class SimulateShift(BaseModel):
     preview — e.g. a chip dragged on the Timing calendar before the team
     commits it as a dos_payment_shift row."""
 
+    # Same rule as PaymentShiftCreate: an 'in' shift accelerates a deposit,
+    # so it must move EARLIER (to_day < from_day) — 422 otherwise.
+    direction: str = Field(default="out", pattern="^(out|in)$")
     from_day: int = Field(ge=1, le=31)
     to_day: int = Field(ge=1, le=31)
     monthly_amount: float = Field(gt=0, le=1e9)
+
+    @model_validator(mode="after")
+    def _in_moves_earlier(self) -> "SimulateShift":
+        if self.direction == "in" and self.to_day >= self.from_day:
+            raise ValueError(
+                "direction 'in' moves a deposit EARLIER: to_day must be before from_day"
+            )
+        return self
 
 
 class SimulateRequest(BaseModel):
