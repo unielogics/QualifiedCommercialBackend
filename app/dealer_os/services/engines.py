@@ -11,6 +11,8 @@ transaction boundary.
 
 from __future__ import annotations
 
+import types
+from dataclasses import dataclass
 from datetime import date
 from typing import Iterable
 from uuid import UUID
@@ -19,13 +21,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import (
+    DealerAccount,
     DealerAddback,
     DealerAlert,
+    DealerDebt,
     DealerFinancialPeriod,
     DealerMetricLineage,
     DealerMetricSnapshot,
     DealerMetricTarget,
     DealerProgramSetting,
+    DealerTaxFiling,
 )
 
 # 4% lender haircut: bankable EBITDA = adjusted * 0.96
@@ -339,11 +344,35 @@ def _f(v) -> float | None:
     return float(v) if v is not None else None
 
 
-async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricSnapshot:
-    """Recompute and persist a new metric snapshot with full lineage + alerts.
+@dataclass(frozen=True)
+class MetricInputs:
+    """Everything compute_metrics needs for one dealer, loaded once.
 
-    Flushes but does NOT commit — the caller owns the transaction boundary.
-    """
+    period_rows keep .id/.period for lineage edges; periods are the plain
+    dicts the pure engine takes (most-recent-first). addback_rows carry EVERY
+    status — recompute_snapshot filters to verified, the read-only simulator
+    also wants the candidate/review pool."""
+
+    period_rows: list
+    periods: list[dict]
+    addback_rows: list
+    target_rows: list
+    targets: dict[str, float | None]
+    fallbacks: dict[str, float | None]
+
+    @property
+    def addbacks_annual_verified(self) -> float:
+        return sum(
+            float(a.annual_amount)
+            for a in self.addback_rows
+            if a.status == "verified" and a.annual_amount is not None
+        )
+
+
+async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
+    """Shared input loader for recompute_snapshot and the what-if simulator —
+    one place decides how per-account period rows collapse into months and
+    which fallbacks apply. Read-only: selects, never writes."""
     # Per-account rows mean one calendar month can span several rows. Fetch a
     # wider window, collapse to one dict per month (flow fields summed across
     # accounts, balance fields preferring the primary operating account, then
@@ -361,8 +390,6 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
         .scalars()
         .all()
     )
-    from ..models import DealerAccount
-
     primary_ids = {
         r[0]
         for r in (
@@ -390,7 +417,6 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
         rows = sorted(by_month[month], key=_rank)
         merged = rows[0]
         if len(rows) > 1:
-            import types
 
             def _sum(field):
                 vals = [float(getattr(r, field)) for r in rows if getattr(r, field) is not None]
@@ -419,16 +445,11 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
     addback_rows = (
         (
             await db.execute(
-                select(DealerAddback).where(
-                    DealerAddback.dealer_id == dealer_id, DealerAddback.status == "verified"
-                )
+                select(DealerAddback).where(DealerAddback.dealer_id == dealer_id)
             )
         )
         .scalars()
         .all()
-    )
-    addbacks_annual_verified = sum(
-        float(a.annual_amount) for a in addback_rows if a.annual_amount is not None
     )
     target_rows = (
         (
@@ -460,8 +481,6 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
     # Fallbacks for figures bank statements cannot carry. Observed values
     # always win; these only fill a gap that would otherwise leave the metric
     # permanently null.
-    from ..models import DealerDebt, DealerTaxFiling
-
     drafted_monthly = float(
         (
             await db.execute(
@@ -484,14 +503,35 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
         )
     ).scalar_one_or_none()
 
-    metrics = compute_metrics(
-        periods,
-        addbacks_annual_verified,
-        targets,
+    return MetricInputs(
+        period_rows=period_rows,
+        periods=periods,
+        addback_rows=addback_rows,
+        target_rows=target_rows,
+        targets=targets,
         fallbacks={
             "debt_schedule_monthly": drafted_monthly or None,
             "tax_ebitda_annual": _tax_ebitda(latest_filing),
         },
+    )
+
+
+async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricSnapshot:
+    """Recompute and persist a new metric snapshot with full lineage + alerts.
+
+    Flushes but does NOT commit — the caller owns the transaction boundary.
+    """
+    inputs = await load_metric_inputs(db, dealer_id)
+    period_rows = inputs.period_rows
+    # Only verified add-backs feed the persisted snapshot (and its lineage).
+    addback_rows = [a for a in inputs.addback_rows if a.status == "verified"]
+    target_rows = inputs.target_rows
+
+    metrics = compute_metrics(
+        inputs.periods,
+        inputs.addbacks_annual_verified,
+        inputs.targets,
+        fallbacks=inputs.fallbacks,
     )
 
     snapshot = DealerMetricSnapshot(
@@ -582,7 +622,7 @@ async def recompute_snapshot(db: AsyncSession, dealer_id: UUID) -> DealerMetricS
     from .paths import compute_paths, merged_settings  # local import — paths is pure, no cycle risk
 
     program_rows = (await db.execute(select(DealerProgramSetting))).scalars().all()
-    for path in compute_paths(metrics, targets, settings=merged_settings(program_rows)):
+    for path in compute_paths(metrics, inputs.targets, settings=merged_settings(program_rows)):
         readiness = float(path.get("readiness_pct") or 0.0)
         if readiness >= FUNDABILITY_READINESS_PCT:
             await _ensure_alert(

@@ -60,6 +60,77 @@ def _spread(days: Sequence[int]) -> list[float]:
     return [round(float(q[0]), 1), round(float(q[2]), 1)]
 
 
+# Median last-activity day at or past this reads as a month-end statement cut.
+_MONTH_END_CUTOFF_DAY = 28
+
+
+def cutoff_days(events: Iterable) -> list[dict]:
+    """PURE per-account statement-cutoff estimate.
+
+    Preferred signal: statement DOCUMENT boundaries — each statement's last
+    transaction day IS its cycle close, and this survives continuous
+    coverage (where the calendar-month fallback always reads ~month-end
+    because the next cycle's events fill the back half of every interior
+    month). Per account: group events by document_id, take each document's
+    max(occurred_on).day, cutoff_day = median across >= 2 documents.
+
+    Fallback (no/one document — legacy rows without provenance): per
+    (account, calendar month) max last-activity day, median across months,
+    flagged "(est.)" since it is coverage-shaped, not cycle-shaped.
+
+    basis reads "calendar month-end" at day >= 28 else "mid-cycle ~day N".
+    account_id None is the unattributed bucket — emitted only when it has
+    events. account_name is left None here; the router joins names."""
+    # Per document track the max DATE (its cycle close) — the max day-of-month
+    # would let an earlier month's day-28 line beat the true day-14 close.
+    by_acct_doc: dict[object, dict[object, object]] = defaultdict(dict)
+    last_activity: dict[object, dict[tuple[int, int], int]] = defaultdict(dict)
+    months_seen: dict[object, set] = defaultdict(set)
+    for r in events:
+        acct = getattr(r, "account_id", None)
+        day = _clamp_day(r.occurred_on.day)
+        months_seen[acct].add((r.occurred_on.year, r.occurred_on.month))
+        doc = getattr(r, "document_id", None)
+        if doc is not None:
+            prev = by_acct_doc[acct].get(doc)
+            if prev is None or r.occurred_on > prev:
+                by_acct_doc[acct][doc] = r.occurred_on
+        month = (r.occurred_on.year, r.occurred_on.month)
+        if day > last_activity[acct].get(month, 0):
+            last_activity[acct][month] = day
+
+    rows = []
+    for acct in months_seen:
+        doc_ends = [_clamp_day(d.day) for d in by_acct_doc.get(acct, {}).values()]
+        estimated = False
+        if len(doc_ends) >= 2:
+            cutoff = _clamp_day(round(median(doc_ends)))
+        else:
+            months = last_activity.get(acct) or {}
+            if not months:
+                continue
+            cutoff = _clamp_day(round(median(months.values())))
+            estimated = True
+        basis = (
+            "calendar month-end"
+            if cutoff >= _MONTH_END_CUTOFF_DAY
+            else f"mid-cycle ~day {cutoff}"
+        )
+        if estimated:
+            basis += " (est.)"
+        rows.append(
+            {
+                "account_id": acct,
+                "account_name": None,
+                "cutoff_day": cutoff,
+                "basis": basis,
+                "months_observed": len(months_seen[acct]),
+            }
+        )
+    rows.sort(key=lambda r: (r["account_id"] is None, str(r["account_id"] or "")))
+    return rows
+
+
 def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], months_window: int = 6) -> dict:
     """events: cash-event rows (occurred_on, description, amount, account_id?)
     already windowed by the caller; vendors_rollup: the full-ledger rollup.

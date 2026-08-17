@@ -1062,10 +1062,23 @@ class TimingRecurringRead(BaseModel):
     account_id: UUID | None = None
 
 
+class TimingCutoffRead(BaseModel):
+    """Estimated statement cutoff of one account: the median last-activity
+    day of the calendar month across observed months. account_id None = the
+    unattributed-events bucket (legacy rows carrying no account)."""
+
+    account_id: UUID | None = None
+    account_name: str | None = None
+    cutoff_day: int
+    basis: str  # "calendar month-end" | "mid-cycle ~day N"
+    months_observed: int
+
+
 class PaymentTimingRead(BaseModel):
     days: list[TimingDayRead] = []
     big_days: list[TimingBigDayRead] = []
     recurring: list[TimingRecurringRead] = []
+    cutoffs: list[TimingCutoffRead] = []
     window_months: int
     computed_at: datetime
 
@@ -1097,3 +1110,92 @@ class PaymentShiftPatch(BaseModel):
     to_day: int | None = Field(default=None, ge=1, le=31)
     rationale: str | None = None
     status: str | None = Field(default=None, pattern="^(draft|proposed|done|dismissed)$")
+
+
+# --- What-if simulator (0121) --------------------------------------------------
+
+# A delta past a billion dollars is a typo, not a scenario — 422, not a
+# silently absurd metric tree.
+_SIM_DELTA_LIMIT = 1_000_000_000
+
+
+class SimulateRequest(BaseModel):
+    """Levers of POST /dealers/{id}/simulate. Every field is optional; an
+    empty body is a no-op scenario that reproduces the baseline exactly."""
+
+    adb_delta: float = Field(default=0.0, ge=-_SIM_DELTA_LIMIT, le=_SIM_DELTA_LIMIT)
+    debt_service_monthly_delta: float = Field(
+        default=0.0, ge=-_SIM_DELTA_LIMIT, le=_SIM_DELTA_LIMIT
+    )
+    deposits_monthly_delta: float = Field(
+        default=0.0, ge=-_SIM_DELTA_LIMIT, le=_SIM_DELTA_LIMIT
+    )
+    ebitda_annual_delta: float = Field(default=0.0, ge=-_SIM_DELTA_LIMIT, le=_SIM_DELTA_LIMIT)
+    nsf_zero: bool = False
+    verify_all_addbacks: bool = False
+    apply_proposed_shifts: bool = False
+    statement_months: int | None = Field(default=None, ge=0, le=36)
+
+
+class SimulateApplied(BaseModel):
+    """Resolved numbers the engine actually used: the two flag-driven pools
+    reported on their own AND folded into their delta channel (adb_delta
+    includes shifts_adb_added; ebitda_annual_delta includes
+    addbacks_annual_added)."""
+
+    adb_delta: float = 0.0
+    debt_service_monthly_delta: float = 0.0
+    deposits_monthly_delta: float = 0.0
+    ebitda_annual_delta: float = 0.0
+    nsf_zero: bool = False
+    addbacks_annual_added: float = 0.0
+    shifts_adb_added: float = 0.0
+    statement_months: int = 0  # months the scenario requirements graded against
+
+
+class SimulateMetrics(BaseModel):
+    """The flat scalar block reported for baseline and scenario alike."""
+
+    score: float | None = None
+    dscr: float | None = None
+    ebitda_bankable: float | None = None
+    adb: float | None = None
+    liquidity: float | None = None
+    nsf_6mo: int = 0
+
+
+class SimulatePathRead(BaseModel):
+    path_key: str
+    label: str
+    readiness_before: float
+    readiness_after: float
+    funding_typical_before: float | None = None
+    funding_typical_after: float | None = None
+    goal_feasible_before: bool | None = None  # None: no goal, or nothing to invert
+    goal_feasible_after: bool | None = None
+
+
+class SimulateCurvePoint(BaseModel):
+    day: int
+    baseline: float
+    scenario: float
+
+
+class SimulateCurveRead(BaseModel):
+    """Intra-month daily-balance profile, baseline vs scenario — each side
+    anchored to its engine ADB so the picture and the number always agree."""
+
+    days: list[SimulateCurvePoint] = []
+    adb_baseline: float
+    adb_scenario: float
+    adb_target: float | None = None
+    cutoff_days: list[int] = []
+
+
+class SimulateRead(BaseModel):
+    applied: SimulateApplied
+    baseline: SimulateMetrics
+    scenario: SimulateMetrics
+    paths: list[SimulatePathRead] = []
+    goal: float | None = None
+    daily_curve: SimulateCurveRead | None = None

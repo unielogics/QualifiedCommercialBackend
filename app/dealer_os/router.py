@@ -145,6 +145,12 @@ from .schemas import (
     RuleRead,
     SessionCreate,
     SessionRead,
+    SimulateApplied,
+    SimulateCurveRead,
+    SimulateMetrics,
+    SimulatePathRead,
+    SimulateRead,
+    SimulateRequest,
     SnapshotRead,
     SoftPullRequest,
     SoftPullResult,
@@ -162,7 +168,7 @@ from .schemas import (
 from .services import analyst, archive, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
-from .services.engines import recompute_snapshot
+from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
 from .services.extract import _persist_plan, _route_tax_years, apply_extraction, extract_document
 from .services.forecast import compute_forecast
 from .services.normalize import (
@@ -186,7 +192,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import payment_timing
+from .services import payment_timing, simulate
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -2437,6 +2443,154 @@ async def funding_plan(
     return FundingPlanRead(goal=goal, purpose=dealer.funding_purpose, paths=paths_out)
 
 
+@router.post("/dealers/{dealer_id}/simulate", response_model=SimulateRead)
+async def simulate_dealer(
+    dealer_id: UUID,
+    payload: SimulateRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SimulateRead:
+    """Read-only what-if: rerun the metric engine + program sizing under the
+    requested levers and report baseline vs scenario side by side.
+
+    Loads the SAME inputs recompute_snapshot does (shared loader) but
+    persists nothing — no snapshot, no lineage, no alerts, no writes. The
+    baseline is recomputed from the actual periods rather than read off the
+    latest snapshot so baseline == scenario holds exactly at zero levers."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    inputs = await load_metric_inputs(db, dealer.id)
+    settings = await _global_program_settings(db)
+    deposits_avg = await _monthly_deposits_avg(db, dealer.id)
+    goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
+
+    # Resolve the flag-driven pools into their delta channels: proposed
+    # payment shifts land in ADB; verifying open add-backs lifts annual
+    # EBITDA through the add-back pool (the exact production channel).
+    addbacks_added = (
+        simulate.unverified_addbacks_annual(inputs.addback_rows)
+        if payload.verify_all_addbacks
+        else 0.0
+    )
+    shifts_added = 0.0
+    shift_rows: list[DealerPaymentShift] = []
+    if payload.apply_proposed_shifts:
+        shift_rows = (
+            (
+                await db.execute(
+                    select(DealerPaymentShift).where(
+                        DealerPaymentShift.dealer_id == dealer.id,
+                        DealerPaymentShift.status == "proposed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        shifts_added = simulate.proposed_shifts_adb(shift_rows)
+
+    adb_delta = float(payload.adb_delta) + shifts_added
+    ebitda_delta = float(payload.ebitda_annual_delta) + addbacks_added
+
+    baseline_metrics = compute_metrics(
+        inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
+    )
+    scenario_metrics = compute_metrics(
+        simulate.apply_levers(
+            inputs.periods,
+            adb_delta=adb_delta,
+            debt_service_monthly_delta=float(payload.debt_service_monthly_delta),
+            deposits_monthly_delta=float(payload.deposits_monthly_delta),
+            nsf_zero=payload.nsf_zero,
+        ),
+        inputs.addbacks_annual_verified + ebitda_delta,
+        inputs.targets,
+        fallbacks=simulate.adjusted_fallbacks(
+            inputs.fallbacks, float(payload.debt_service_monthly_delta)
+        ),
+    )
+
+    # Paths comparison: deposits injected for the deposit-multiple sizing;
+    # statement_months patches the history the SCENARIO grades against (the
+    # requirements/readiness side only — never the metric engine above).
+    scenario_deposits = deposits_avg
+    if payload.deposits_monthly_delta:
+        scenario_deposits = max(0.0, (deposits_avg or 0.0) + float(payload.deposits_monthly_delta))
+    statement_months = (
+        payload.statement_months if payload.statement_months is not None else len(inputs.periods)
+    )
+    baseline_tree = {**baseline_metrics, "deposits_monthly_avg": deposits_avg}
+    scenario_tree = {
+        **scenario_metrics,
+        "deposits_monthly_avg": scenario_deposits,
+        "periods_used": statement_months,
+    }
+
+    before = {p["key"]: p for p in compute_paths(baseline_tree, inputs.targets, settings=settings)}
+    after = {p["key"]: p for p in compute_paths(scenario_tree, inputs.targets, settings=settings)}
+
+    paths_out: list[SimulatePathRead] = []
+    for key in PATH_KEYS:
+        b, a = before[key], after[key]
+        feasible_before = feasible_after = None
+        if goal is not None:
+            req_before = requirements_for_amount(key, goal, baseline_tree, settings=settings)
+            req_after = requirements_for_amount(key, goal, scenario_tree, settings=settings)
+            feasible_before = all(r["met"] for r in req_before) if req_before else None
+            feasible_after = all(r["met"] for r in req_after) if req_after else None
+        paths_out.append(
+            SimulatePathRead(
+                path_key=key,
+                label=PATH_LABELS[key],
+                readiness_before=b["readiness_pct"],
+                readiness_after=a["readiness_pct"],
+                funding_typical_before=b["funding_typical"],
+                funding_typical_after=a["funding_typical"],
+                goal_feasible_before=feasible_before,
+                goal_feasible_after=feasible_after,
+            )
+        )
+
+    # The ADB visual: intra-month balance curve from the actual ledger,
+    # baseline vs scenario, each anchored to its engine ADB (picture ==
+    # number, always). Reuses the vendor-input ledger load + cutoff markers.
+    curve = None
+    b_adb = (baseline_metrics.get("adb") or {}).get("current")
+    s_adb = (scenario_metrics.get("adb") or {}).get("current")
+    if b_adb is not None and s_adb is not None:
+        ledger_rows, _ov, _sn = await _load_vendor_inputs(db, dealer)
+        window_start = date.today() - timedelta(days=_TIMING_WINDOW_DAYS)
+        windowed = [r for r in ledger_rows if r.occurred_on >= window_start]
+        curve_data = simulate.daily_curve(windowed, b_adb, s_adb, shift_rows)
+        if curve_data is not None:
+            curve = SimulateCurveRead(
+                **curve_data,
+                adb_target=inputs.targets.get("adb_target"),
+                cutoff_days=sorted(
+                    {c["cutoff_day"] for c in payment_timing.cutoff_days(ledger_rows)}
+                ),
+            )
+
+    return SimulateRead(
+        daily_curve=curve,
+        applied=SimulateApplied(
+            adb_delta=round(adb_delta, 2),
+            debt_service_monthly_delta=float(payload.debt_service_monthly_delta),
+            deposits_monthly_delta=float(payload.deposits_monthly_delta),
+            ebitda_annual_delta=round(ebitda_delta, 2),
+            nsf_zero=payload.nsf_zero,
+            addbacks_annual_added=addbacks_added,
+            shifts_adb_added=shifts_added,
+            statement_months=statement_months,
+        ),
+        baseline=SimulateMetrics(**simulate.summarize(baseline_metrics)),
+        scenario=SimulateMetrics(**simulate.summarize(scenario_metrics)),
+        paths=paths_out,
+        goal=goal,
+    )
+
+
 # --- Stream 5: messaging, sessions, global alerts & lender package -----------
 
 
@@ -4517,8 +4671,18 @@ async def dealer_payment_timing(
         key=lambda r: r.occurred_on,
         reverse=True,
     )[:_TIMING_EVENT_CAP]
+    # Statement cutoffs read the FULL ledger, not the 6-month window: the
+    # cutoff is a stable property of the account's statement cycle and every
+    # observed month sharpens the median.
+    cutoffs = payment_timing.cutoff_days(rows)
+    names = await _account_names(
+        db, dealer.id, [c["account_id"] for c in cutoffs if c["account_id"] is not None]
+    )
+    for c in cutoffs:
+        c["account_name"] = names.get(c["account_id"])
     return PaymentTimingRead(
-        **payment_timing.analyze_timing(windowed, rolled, months_window=_TIMING_WINDOW_MONTHS)
+        **payment_timing.analyze_timing(windowed, rolled, months_window=_TIMING_WINDOW_MONTHS),
+        cutoffs=cutoffs,
     )
 
 
