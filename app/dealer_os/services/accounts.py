@@ -78,9 +78,9 @@ def propose_role(
         if deposits > other_accounts_max_deposits:
             return (
                 "primary_operating",
-                f"Dominant deposits (${deposits:,.0f}) vs the dealer's other accounts (max ${other_accounts_max_deposits:,.0f})",
+                f"Dominant deposits (${deposits:,.0f}) vs the client's other accounts (max ${other_accounts_max_deposits:,.0f})",
             )
-    return "secondary", "No payroll/savings signal and deposits are not dominant for this dealer"
+    return "secondary", "No payroll/savings signal and deposits are not dominant for this client"
 
 
 async def _other_accounts_max_deposits(

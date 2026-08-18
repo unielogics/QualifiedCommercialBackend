@@ -384,7 +384,7 @@ async def match_bucket_by_email(
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
     if not dealer.email:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Dealer has no email on file — add one, or link a bucket manually.")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Client has no email on file — add one, or link a bucket manually.")
     from app.models.public_underwriting_intake import PublicUnderwritingIntake
 
     intake = (
@@ -708,7 +708,7 @@ async def override_target(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown metric for this dealer — propose targets first")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown metric for this client — propose targets first")
     before = {"metric_key": row.metric_key, "admin_value": row.admin_value, "status": row.status}
     row.admin_value = payload.admin_value
     row.admin_set_by_user_id = user.id
@@ -907,7 +907,7 @@ async def mark_event_recurrence(
         )
     ).scalar_one_or_none()
     if event is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this client")
 
     def _team_locked(row) -> bool:
         return (
@@ -995,7 +995,7 @@ async def patch_cash_event(
         )
     ).scalar_one_or_none()
     if event is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this client")
     before = {"category": event.category, "flags": event.flags, "categorized_by": event.categorized_by}
     if payload.category is not None:
         event.category = payload.category
@@ -1428,7 +1428,7 @@ async def upload_document(
             )
         ).scalar_one_or_none()
         if account is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this client")
     raw = await file.read()
     if not raw:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The uploaded file is empty")
@@ -1533,7 +1533,7 @@ async def document_url(
     doc = await _load_document(db, dealer.id, doc_id)
     if user.role == Role.DEALER and doc.status == "failed":
         # Parity with list_documents: failed rows are not dealer-facing.
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     key = doc.s3_key
     if not key and doc.bucket_file_id is not None:
         key = (
@@ -1771,7 +1771,7 @@ async def reextract_document(
         )
     ).scalar_one_or_none()
     if doc is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     if not doc.s3_key:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -1824,7 +1824,7 @@ async def _load_document(db: AsyncSession, dealer_id: UUID, doc_id: UUID) -> Dea
         )
     ).scalar_one_or_none()
     if doc is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     return doc
 
 
@@ -1849,7 +1849,7 @@ async def approve_dealer_document(
     if not doc.s3_key:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "The original file was not archived to S3 — ask the dealer to upload it again",
+            "The original file was not archived to S3 — ask the client to upload it again",
         )
     before_status = doc.status
     doc.error = None
@@ -1992,7 +1992,7 @@ async def bucket_file_url(
         ).scalar_one_or_none()
     if bucket_file is None:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "File not found in this dealer's linked bucket"
+            status.HTTP_404_NOT_FOUND, "File not found in this client's linked bucket"
         )
     if not bucket_file.s3_key:
         raise HTTPException(
@@ -2067,7 +2067,7 @@ async def _ingest_bucket_file_core(
         )
     ).scalar_one_or_none()
     if bucket_file is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found in this dealer's linked bucket")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found in this client's linked bucket")
 
     analysis_q = select(BucketFileAnalysis).where(
         BucketFileAnalysis.bucket_file_id == bucket_file.id,
@@ -2173,7 +2173,7 @@ async def _ingest_bucket_file_core(
     if raw is None:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            "Could not fetch the bucket file from S3 — try again or re-upload it to Dealer OS directly",
+            "Could not fetch the bucket file from S3 — try again or re-upload it to Capital OS directly",
         )
     if len(raw) > MAX_DOCUMENT_BYTES:
         raise HTTPException(
@@ -2382,7 +2382,7 @@ async def resolve_alert(
         )
     ).scalar_one_or_none()
     if alert is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Alert not found for this client")
     if alert.resolved_at is None:
         alert.resolved_at = datetime.now(timezone.utc)
     await db.commit()
@@ -2402,7 +2402,7 @@ async def _load_plan_action(db: AsyncSession, dealer_id: UUID, action_id: UUID) 
         )
     ).scalar_one_or_none()
     if action is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan action not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan action not found for this client")
     return action
 
 
@@ -2419,7 +2419,7 @@ async def _latest_snapshot_metrics(db: AsyncSession, dealer_id: UUID) -> dict:
     if snapshot is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "No metric snapshot exists for this dealer yet — import financials or "
+            "No metric snapshot exists for this client yet — import financials or "
             "POST /dealers/{id}/recompute first",
         )
     return snapshot.metrics or {}
@@ -3098,7 +3098,7 @@ async def delete_session(
         )
     ).scalar_one_or_none()
     if session is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found for this client")
     await db.delete(session)
     await db.commit()
 
@@ -3522,7 +3522,7 @@ async def patch_account(
         )
     ).scalar_one_or_none()
     if account is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this client")
     changes = payload.model_dump(exclude_unset=True)
     changes = {k: v for k, v in changes.items() if v is not None}
     if not changes:
@@ -3663,7 +3663,7 @@ async def deactivate_rule(
     ).scalar_one_or_none()
     if rule is None:
         raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "Rule not found for this dealer (global rules cannot be deactivated here)"
+            status.HTTP_404_NOT_FOUND, "Rule not found for this client (global rules cannot be deactivated here)"
         )
     if rule.active:
         rule.active = False
@@ -3776,7 +3776,7 @@ async def cash_event_feeds(
         )
     ).scalar_one_or_none()
     if event is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this client")
     snapshot = await _latest_snapshot_row(db, dealer.id)
     if snapshot is None:
         return EventFeedsRead(event_id=event.id)
@@ -3860,7 +3860,7 @@ async def patch_addback(
         )
     ).scalar_one_or_none()
     if addback is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Add-back not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Add-back not found for this client")
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         return addback
@@ -3881,7 +3881,7 @@ async def patch_addback(
                 )
             ).scalar_one_or_none()
             if doc is None:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence document not found for this dealer")
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence document not found for this client")
         addback.document_id = document_id
     await log_action(
         db, dealer.id, user, "addback.decide", "addback",
@@ -3942,7 +3942,7 @@ async def _load_doc_request(db: AsyncSession, dealer_id: UUID, req_id: UUID) -> 
         )
     ).scalar_one_or_none()
     if req is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document request not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Document request not found for this client")
     return req
 
 
@@ -3989,7 +3989,7 @@ async def create_doc_request(
             )
         ).scalar_one_or_none()
         if account is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this dealer")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found for this client")
     req = DealerDocRequest(
         dealer_id=dealer.id,
         title=payload.title.strip(),
@@ -4093,7 +4093,7 @@ async def dealer_progress(
     if not snaps:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "No metric snapshot exists for this dealer yet — import financials or "
+            "No metric snapshot exists for this client yet — import financials or "
             "POST /dealers/{id}/recompute first",
         )
     latest = snaps[0]
@@ -4542,7 +4542,7 @@ async def patch_debt(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this client")
     patch = body.model_dump(exclude_unset=True)
     before = {k: getattr(row, k) for k in patch}
     for k, v in patch.items():
@@ -4578,7 +4578,7 @@ async def delete_debt(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this client")
     if row.vendor_key:
         row.status = "dismissed"
     else:
@@ -4770,7 +4770,7 @@ async def plaid_remove(
         )
     ).scalar_one_or_none()
     if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this client")
     token = plaid_client.decrypt_token(item.encrypted_access_token)
     if token:
         try:
@@ -4919,7 +4919,7 @@ async def simulate_refinance(
     for debt_id in dict.fromkeys(payload.debt_ids):  # dedupe, order-preserving
         d = by_id.get(debt_id)
         if d is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this client")
         if d.category in refinance_svc.NEVER_REFI_CATEGORIES:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5077,7 +5077,7 @@ async def create_owner(
         if _primary_owner_conflict(body.is_primary, existing_primary is not None):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "This dealer already has a primary owner",
+                "This client already has a primary owner",
             )
     row = DealerOwner(dealer_id=dealer.id, **body.model_dump())
     db.add(row)
@@ -5088,7 +5088,7 @@ async def create_owner(
         # uq_dos_owners_one_primary — a concurrent create won the primary slot.
         await db.rollback()
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "This dealer already has a primary owner"
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "This client already has a primary owner"
         ) from None
     await db.refresh(row)
     return row
@@ -5105,7 +5105,7 @@ def _dealer_owner_patch_violation(fields: set[str] | frozenset[str]) -> str | No
     Returns a 422 detail string, or None when the patch is acceptable."""
     blocked = sorted(set(fields) - _DEALER_PATCHABLE_OWNER_FIELDS)
     if blocked:
-        return "Dealers may only update ownership_pct on an owner (not: " + ", ".join(blocked) + ")"
+        return "Clients may only update ownership_pct on an owner (not: " + ", ".join(blocked) + ")"
     return None
 
 
@@ -5127,7 +5127,7 @@ async def patch_owner(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
     patch = body.model_dump(exclude_unset=True)
     if user.role == Role.DEALER:
         violation = _dealer_owner_patch_violation(set(patch))
@@ -5156,7 +5156,7 @@ async def delete_owner(
         )
     ).scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
     await db.delete(row)
     await log_action(db, dealer.id, user, "owner.delete", "owner", entity_id=owner_id)
     await db.commit()
@@ -5369,7 +5369,7 @@ async def owner_soft_pull(
         )
     ).scalar_one_or_none()
     if owner is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
     if user.role == Role.DEALER:
         blocked = _dealer_self_pull_violation(owner.is_primary, owner.credit_pulled_at)
         if blocked is not None:
@@ -5481,7 +5481,7 @@ async def owner_credit_invite(
         )
     ).scalar_one_or_none()
     if owner is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this dealer")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
     token = secrets.token_urlsafe(32)
     owner.invite_token_hash = _hash_invite_token(token)
     owner.invite_sent_at = datetime.now(timezone.utc)
@@ -6015,7 +6015,7 @@ async def _sync_shift_plan_action(
             title=title,
             detail=detail,
             category="liquidity",
-            owner="Dealer",
+            owner="Client",
             timeline="next billing cycle",
             status="todo",
             expected_effect=(f"ADB {'+' if est >= 0 else '-'}${abs(est):,.0f}" if est else None),

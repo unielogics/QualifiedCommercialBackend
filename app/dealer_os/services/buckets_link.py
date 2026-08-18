@@ -39,14 +39,14 @@ from .extract import _parse_amount
 
 logger = logging.getLogger(__name__)
 
-_UPLOADED_BY = "Dealer OS"
+_UPLOADED_BY = "Capital OS"
 
 
 def audit_bucket_name(dealer: DealerBusiness) -> str:
     """Bucket naming convention: '{dealer} — {City}, {ST}' (location parts
     dropped when absent). Instantly identifiable in the shared bucket console."""
     loc = ", ".join(p for p in ((dealer.city or "").strip(), (dealer.state or "").strip()) if p)
-    base = (dealer.name or "Dealer").strip()
+    base = (dealer.name or "Client").strip()
     return (f"{base} — {loc}" if loc else base)[:180]
 
 

@@ -73,7 +73,7 @@ async def start_handoff(
     if not (dealer.email or "").strip():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Dealer has no email on file — add one before starting a funding file.",
+            "Client has no email on file — add one before starting a funding file.",
         )
 
     # READ-ONLY reuse of the intake creation helpers (lazy import by contract).

@@ -96,7 +96,7 @@ async def create_link_token(*, dealer_id: str, dealer_name: str) -> str:
     resp = await _post(
         "/link/token/create",
         {
-            "client_name": "Qualified Commercial — Dealer Capital OS",
+            "client_name": "Qualified Commercial — Capital OS",
             "user": {"client_user_id": dealer_id},
             "products": ["statements"],
             "statements": {

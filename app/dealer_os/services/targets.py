@@ -20,7 +20,7 @@ from .paths import merged_settings, monthly_payment_for_goal
 # metric_key -> (default value, rationale template)
 DEFAULT_RUBRIC: dict[str, tuple[float, str]] = {
     "adb_target": (500_000, "Tier 1 banking band default; refines to ~1.6× monthly fixed obligations once statements land"),
-    "adb_floor": (250_000, "Covers ~30 days of fixed obligations for a dealer at this profile"),
+    "adb_floor": (250_000, "Covers ~30 days of fixed obligations for a business at this profile"),
     "dscr_target": (1.35, "Tier 1 requirement + 0.10x cushion over the 1.25x lender floor"),
     "dscr_floor": (1.25, "Common bank underwriting floor"),
     "ebitda_target": (1_250_000, "Supports a $1M facility at 1.35x after typical lender haircut"),

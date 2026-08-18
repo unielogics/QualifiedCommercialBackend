@@ -23,7 +23,7 @@ _TEAM_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 
 def require_team(user: User) -> None:
     if user.role not in _TEAM_ROLES:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required for Dealer OS")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required for Capital OS")
 
 
 def require_super_admin(user: User) -> None:
@@ -35,14 +35,14 @@ def require_super_admin(user: User) -> None:
 def require_team_or_dealer(user: User) -> None:
     if user.role not in _TEAM_ROLES and user.role != Role.DEALER:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Team or dealer role required for Dealer OS"
+            status.HTTP_403_FORBIDDEN, "Team or client role required for Capital OS"
         )
 
 
 async def load_dealer(db: AsyncSession, dealer_id: UUID) -> DealerBusiness:
     dealer = await db.get(DealerBusiness, dealer_id)
     if dealer is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     return dealer
 
 
@@ -52,5 +52,5 @@ async def resolve_dealer_scope(db: AsyncSession, user: User, dealer_id: UUID) ->
     as a nonexistent id) so dealer ids can't be probed for existence."""
     dealer = await load_dealer(db, dealer_id)
     if user.role == Role.DEALER and dealer.dealer_user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     return dealer
