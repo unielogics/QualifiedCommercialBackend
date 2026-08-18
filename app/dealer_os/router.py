@@ -100,6 +100,13 @@ from .schemas import (
     DealerUpdate,
     DebtCreate,
     DebtDraftResult,
+    RefiDebtRead,
+    RefinanceRead,
+    RefinanceScenarioRead,
+    RefinanceSimulateRead,
+    RefinanceSimulateRequest,
+    RefiObservedRead,
+    RefiProgramRead,
     DebtPatch,
     DebtRead,
     DocRequestCreate,
@@ -207,7 +214,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import payment_timing, simulate, timing_optimizer
+from .services import payment_timing, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -1179,7 +1186,7 @@ async def upsert_period(
 # --- Stream 7: document ingestion --------------------------------------------
 
 MAX_DOCUMENT_BYTES = 15 * 1024 * 1024  # 15MB
-_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "other", "archive"}
+_DOCUMENT_KINDS = {"statement", "pl", "tax", "debt_schedule", "loan_agreement", "other", "archive"}
 
 
 async def _auto_fulfill_doc_request(
@@ -4558,6 +4565,245 @@ async def delete_debt(
         await db.delete(row)
     await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
     await db.commit()
+
+
+# --- Refinance workbench (0126) ------------------------------------------------
+
+
+def _refi_program_specs(settings: dict) -> list[dict]:
+    """DSCR-model programs with desk overrides applied — what the workbench's
+    program picker drafts terms from. Triplets are [conservative, typical,
+    aggressive]; the aggressive DSCR is the floor the scenario is graded at."""
+    out: list[dict] = []
+    for key in PATH_KEYS:
+        sizing = (settings.get(key) or {}).get("sizing") or DEFAULT_SIZING.get(key)
+        if not sizing or sizing.get("model") != "dscr":
+            continue
+        dscr = sizing["dscr"]
+        terms = sizing["term_months"]
+        out.append(
+            {
+                "path_key": key,
+                "label": PATH_LABELS[key],
+                "annual_rate_pct": round(float(sizing["annual_rate"]) * 100, 3),
+                "term_months": int(terms[1]),
+                "dscr_typical": float(dscr[1]),
+                "dscr_floor": float(dscr[2]),
+                "ceiling": float(sizing["ceiling"]),
+            }
+        )
+    return out
+
+
+async def _refi_debt_rows(db: AsyncSession, dealer) -> list[DealerDebt]:
+    return (
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.monthly_payment.desc().nullslast())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.get("/dealers/{dealer_id}/refinance", response_model=RefinanceRead)
+async def dealer_refinance(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> RefinanceRead:
+    """The refinance workbench: the debt stack with each lender's OBSERVED
+    ledger behavior (vendor-matched debits), plus the desk's DSCR programs
+    to draft replacement terms from, plus the current baseline metrics."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    debts = await _refi_debt_rows(db, dealer)
+    events, _overrides, _self_names = await _load_vendor_inputs(db, dealer)
+    observed = refinance_svc.observed_monthly(events, debts)
+
+    # per-debt debit stats for the match chips (one pass over the ledger,
+    # same containment-tolerant matcher as observed_monthly)
+    stats: dict[str, dict] = {}
+    debt_keys = [d.vendor_key for d in debts if d.vendor_key]
+    if debt_keys:
+        for row in events:
+            if float(row.amount or 0) >= 0:
+                continue
+            event_key = vendors.normalize_vendor(row.description or "")
+            for dk in debt_keys:
+                if refinance_svc.key_matches(dk, event_key):
+                    st = stats.setdefault(dk, {"count": 0, "last": None})
+                    st["count"] += 1
+                    if st["last"] is None or row.occurred_on > st["last"]:
+                        st["last"] = row.occurred_on
+                    break
+
+    inputs = await load_metric_inputs(db, dealer.id)
+    metrics = compute_metrics(
+        inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
+    )
+    summary = simulate.summarize(metrics)
+    monthly_ds = (metrics.get("dscr") or {}).get("monthly_debt_service")
+
+    rows: list[RefiDebtRead] = []
+    for d in debts:
+        by_month = observed.get(d.id) or {}
+        st = stats.get(d.vendor_key or "", {})
+        months = sorted(by_month)
+        monthly_avg = (
+            round(sum(by_month.values()) / len(by_month), 2) if by_month else None
+        )
+        rows.append(
+            RefiDebtRead(
+                **{k: getattr(d, k) for k in RefiDebtRead.model_fields if hasattr(d, k)},
+                monthly_eq=refinance_svc.monthly_equivalent(d),
+                financing_cost_monthly=refinance_svc.financing_cost_monthly(d),
+                payoff_est=refinance_svc.payoff_estimate(d),
+                refi_eligible=d.category not in refinance_svc.NEVER_REFI_CATEGORIES,
+                observed=RefiObservedRead(
+                    matched=bool(by_month),
+                    debit_count=int(st.get("count") or 0),
+                    months_observed=len(months),
+                    monthly_avg=monthly_avg,
+                    last_seen=st.get("last"),
+                    by_month={m.strftime("%Y-%m"): round(v, 2) for m, v in by_month.items()},
+                ),
+            )
+        )
+
+    settings = await _global_program_settings(db)
+    return RefinanceRead(
+        debts=rows,
+        programs=[RefiProgramRead(**spec) for spec in _refi_program_specs(settings)],
+        total_debt_service_monthly=float(monthly_ds) if monthly_ds is not None else 0.0,
+        dscr_current=summary.get("dscr"),
+        ebitda_bankable=summary.get("ebitda_bankable"),
+        adb_current=summary.get("adb"),
+    )
+
+
+@router.post("/dealers/{dealer_id}/refinance/simulate", response_model=RefinanceSimulateRead)
+async def simulate_refinance(
+    dealer_id: UUID,
+    payload: RefinanceSimulateRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RefinanceSimulateRead:
+    """Read-only refinance what-if: replay the statements WITHOUT the selected
+    lenders' observed debits (debt service falls, embedded financing cost
+    returns to EBITDA, balances stop draining), layer the replacement note's
+    payment in, and rerun the real metric engine on the adjusted months.
+    Persists nothing — same discipline as /simulate."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    debts = await _refi_debt_rows(db, dealer)
+    by_id = {d.id: d for d in debts}
+    selected: list[DealerDebt] = []
+    for debt_id in payload.debt_ids:
+        d = by_id.get(debt_id)
+        if d is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
+        if d.category in refinance_svc.NEVER_REFI_CATEGORIES:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"{d.lender} is a working line ({d.category}) — not a refinance target",
+            )
+        selected.append(d)
+
+    settings = await _global_program_settings(db)
+    specs = {spec["path_key"]: spec for spec in _refi_program_specs(settings)}
+    path_key = payload.path_key or "conventional"
+    spec = specs.get(path_key)
+    if spec is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"path_key must be a DSCR-sized program: {', '.join(sorted(specs))}",
+        )
+
+    inputs = await load_metric_inputs(db, dealer.id)
+    baseline_metrics = compute_metrics(
+        inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
+    )
+    baseline = simulate.summarize(baseline_metrics)
+
+    payoff_total = round(sum(refinance_svc.payoff_estimate(d) for d in selected), 2)
+    freed = round(sum(refinance_svc.monthly_equivalent(d) for d in selected), 2)
+    ebitda_addback_annual = round(
+        sum(refinance_svc.financing_cost_monthly(d) for d in selected) * 12, 2
+    )
+    adb_lift = round(freed * 0.5, 2)  # uniform-debit estimate, mirrored in removal_effects
+    amount = payoff_total if payload.amount is None else float(payload.amount)
+    new_pay = refinance_svc.new_loan_payment(amount, payload.annual_rate_pct, payload.term_months)
+
+    events, _overrides, _self_names = await _load_vendor_inputs(db, dealer)
+    observed = refinance_svc.observed_monthly(events, selected)
+    scenario_periods = refinance_svc.removal_effects(
+        inputs.periods, selected, observed, new_payment_monthly=new_pay
+    )
+    # Statements-only dealers carry no period EBITDA — route the financing-cost
+    # add-back through the addbacks channel there instead (never both).
+    has_period_ebitda = any(p.get("ebitda_reported") is not None for p in inputs.periods)
+    scenario_addbacks = inputs.addbacks_annual_verified + (
+        0.0 if has_period_ebitda else ebitda_addback_annual
+    )
+    scenario_metrics = compute_metrics(
+        scenario_periods,
+        scenario_addbacks,
+        inputs.targets,
+        fallbacks=simulate.adjusted_fallbacks(inputs.fallbacks, new_pay - freed),
+    )
+    scenario = simulate.summarize(scenario_metrics)
+
+    baseline_ds = (baseline_metrics.get("dscr") or {}).get("monthly_debt_service")
+    retained = max(0.0, float(baseline_ds) - freed) if baseline_ds is not None else 0.0
+    proforma_ds = round(retained + new_pay, 2)
+    ebitda_after_annual = scenario.get("ebitda_bankable")
+    max_at_floor = (
+        refinance_svc.max_principal(
+            float(ebitda_after_annual),
+            retained,
+            spec["dscr_floor"],
+            payload.annual_rate_pct,
+            payload.term_months,
+            ceiling=spec["ceiling"],
+        )
+        if ebitda_after_annual is not None
+        else 0.0
+    )
+
+    dscr_after = scenario.get("dscr")
+    if not selected:
+        verdict = "no_selection"
+    elif dscr_after is None:
+        verdict = "not_yet"
+    elif dscr_after >= spec["dscr_typical"]:
+        verdict = "feasible"
+    elif dscr_after >= spec["dscr_floor"]:
+        verdict = "conditional"
+    else:
+        verdict = "not_yet"
+
+    return RefinanceSimulateRead(
+        baseline=SimulateMetrics(**baseline),
+        scenario=SimulateMetrics(**scenario),
+        derived=RefinanceScenarioRead(
+            payoff_total=payoff_total,
+            freed_monthly=freed,
+            new_payment_monthly=new_pay,
+            retained_ds_monthly=round(retained, 2),
+            proforma_ds_monthly=proforma_ds,
+            savings_monthly=round(freed - new_pay, 2),
+            ebitda_addback_annual=ebitda_addback_annual,
+            adb_lift_estimate=adb_lift,
+            amount=round(amount, 2),
+            max_principal_at_floor=max_at_floor,
+            headroom=round(max_at_floor - amount, 2),
+            dscr_floor=spec["dscr_floor"],
+            dscr_typical=spec["dscr_typical"],
+            verdict=verdict,
+        ),
+    )
 
 
 # --- Owners, business profile & credit (0118) ---------------------------------

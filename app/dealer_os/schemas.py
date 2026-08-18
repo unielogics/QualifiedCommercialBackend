@@ -826,8 +826,17 @@ class DebtRead(BaseModel):
     vendor_key: str | None = None
     evidence: dict | None = None
     notes: str | None = None
+    # Refinance workbench (0126): contract cadence + provenance.
+    payment_amount: float | None = None
+    payment_frequency: str | None = None
+    factor_rate: float | None = None
+    payoff_amount: float | None = None
+    document_id: UUID | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+_FREQ_PATTERN = r"^(daily|weekly|biweekly|monthly)$"
 
 
 class DebtCreate(BaseModel):
@@ -839,6 +848,10 @@ class DebtCreate(BaseModel):
     term_months: int | None = None
     maturity_on: date | None = None
     notes: str | None = None
+    payment_amount: float | None = Field(default=None, ge=0)
+    payment_frequency: str | None = Field(default=None, pattern=_FREQ_PATTERN)
+    factor_rate: float | None = Field(default=None, gt=0, le=5)
+    payoff_amount: float | None = Field(default=None, ge=0)
 
 
 class DebtPatch(BaseModel):
@@ -851,6 +864,10 @@ class DebtPatch(BaseModel):
     maturity_on: date | None = None
     status: str | None = None
     notes: str | None = None
+    payment_amount: float | None = Field(default=None, ge=0)
+    payment_frequency: str | None = Field(default=None, pattern=_FREQ_PATTERN)
+    factor_rate: float | None = Field(default=None, gt=0, le=5)
+    payoff_amount: float | None = Field(default=None, ge=0)
 
 
 class DebtDraftResult(BaseModel):
@@ -859,6 +876,72 @@ class DebtDraftResult(BaseModel):
     skipped_admin: int = 0     # rows a human owns — never touched
     total_monthly: float = 0.0
     debts: list[DebtRead] = []
+
+
+# --- Refinance workbench --------------------------------------------------
+
+
+class RefiObservedRead(BaseModel):
+    """Ledger-observed payment behavior for one debt (vendor-matched)."""
+    matched: bool = False
+    debit_count: int = 0
+    months_observed: int = 0
+    monthly_avg: float | None = None
+    last_seen: date | None = None
+    by_month: dict[str, float] = {}   # "YYYY-MM" -> observed outflow total
+
+
+class RefiDebtRead(DebtRead):
+    monthly_eq: float = 0.0            # engine-facing monthly cash-out
+    financing_cost_monthly: float = 0.0
+    payoff_est: float = 0.0
+    refi_eligible: bool = True         # false for working lines (floorplan)
+    observed: RefiObservedRead = RefiObservedRead()
+
+
+class RefiProgramRead(BaseModel):
+    path_key: str
+    label: str
+    annual_rate_pct: float
+    term_months: int
+    dscr_typical: float
+    dscr_floor: float
+    ceiling: float
+
+
+class RefinanceRead(BaseModel):
+    debts: list[RefiDebtRead] = []
+    programs: list[RefiProgramRead] = []
+    total_debt_service_monthly: float = 0.0
+    dscr_current: float | None = None
+    ebitda_bankable: float | None = None
+    adb_current: float | None = None
+
+
+class RefinanceSimulateRequest(BaseModel):
+    debt_ids: list[UUID] = Field(default_factory=list, max_length=40)
+    amount: float | None = Field(default=None, ge=0, le=50_000_000)  # None -> payoff total
+    annual_rate_pct: float = Field(default=9.5, gt=0, lt=50)
+    term_months: int = Field(default=60, ge=1, le=360)
+    path_key: str | None = None       # program whose floor/ceiling grade the scenario
+
+
+class RefinanceScenarioRead(BaseModel):
+    payoff_total: float
+    freed_monthly: float               # removed debts' monthly cash-out
+    new_payment_monthly: float
+    retained_ds_monthly: float
+    proforma_ds_monthly: float
+    savings_monthly: float             # freed - new payment
+    ebitda_addback_annual: float       # financing cost returned to EBITDA
+    adb_lift_estimate: float           # uniform-debit estimate, flagged as such
+    amount: float
+    max_principal_at_floor: float
+    headroom: float                    # max - amount
+    dscr_floor: float
+    dscr_typical: float
+    verdict: str                       # feasible | conditional | not_yet | no_selection
+
 
 
 class OwnerRead(ORM):
@@ -1297,6 +1380,12 @@ class SimulateMetrics(BaseModel):
     adb: float | None = None
     liquidity: float | None = None
     nsf_6mo: int = 0
+
+
+class RefinanceSimulateRead(BaseModel):
+    baseline: SimulateMetrics
+    scenario: SimulateMetrics
+    derived: RefinanceScenarioRead
 
 
 class SimulatePathRead(BaseModel):

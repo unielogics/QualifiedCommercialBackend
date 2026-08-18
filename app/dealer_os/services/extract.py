@@ -43,11 +43,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.ai.bedrock_client import get_client, model_heavy
 from app.services.ai.usage import tracked_messages_create
 
-from ..models import DealerCashEvent, DealerDocument, DealerFinancialPeriod, DealerTaxFiling
+from ..models import DealerCashEvent, DealerDebt, DealerDocument, DealerFinancialPeriod, DealerTaxFiling
 from .accounts import match_or_create_account
 from .engines import recompute_snapshot
 from .normalize import classify_with_rules, load_active_rules, period_of, rebuild_periods
 from .recurrence import stamp_recurrence
+from .refinance import FREQUENCY_MONTHLY_MULT, key_matches
+from .vendors import normalize_vendor
 from . import storage
 
 logger = logging.getLogger(__name__)
@@ -381,6 +383,7 @@ _DOC_TYPES = {
     "profit_and_loss",
     "balance_sheet",
     "debt_schedule",
+    "loan_agreement",
     "credit_report",
     "other",
 }
@@ -446,7 +449,10 @@ def _clean_pl_months(raw: Any) -> list[dict[str, Any]]:
 
 
 def _clean_debts(raw: Any) -> list[dict[str, Any]]:
-    """[{"lender": str, "monthly_payment": float|None, "balance": float|None}]."""
+    """Per-obligation rows from debt schedules AND loan/MCA agreements (0126):
+    the legacy trio plus the contract's native cadence and pricing. A missing
+    monthly_payment is derived from payment_amount x frequency so the metric
+    engines always see a monthly figure."""
     out: list[dict[str, Any]] = []
     if not isinstance(raw, list):
         return out
@@ -456,9 +462,34 @@ def _clean_debts(raw: Any) -> list[dict[str, Any]]:
         lender = str(item.get("lender") or "").strip()[:160]
         monthly = _num(item.get("monthly_payment"))
         balance = _num(item.get("balance"))
+        payment_amount = _num(item.get("payment_amount"))
+        frequency = str(item.get("payment_frequency") or "").strip().lower() or None
+        if frequency not in FREQUENCY_MONTHLY_MULT:
+            frequency = None
+        factor = _num(item.get("factor_rate"))
+        if factor is not None and not (1.0 < factor <= 5.0):
+            factor = None
+        rate = _num(item.get("rate"))
+        term_months = _num(item.get("term_months"))
+        term_months = int(term_months) if term_months and 0 < term_months <= 600 else None
+        payoff = _num(item.get("payoff_amount"))
+        if monthly is None and payment_amount is not None and frequency:
+            monthly = round(payment_amount * FREQUENCY_MONTHLY_MULT[frequency], 2)
         if not lender and monthly is None and balance is None:
             continue
-        out.append({"lender": lender or "(unnamed lender)", "monthly_payment": monthly, "balance": balance})
+        out.append(
+            {
+                "lender": lender or "(unnamed lender)",
+                "monthly_payment": monthly,
+                "balance": balance,
+                "payment_amount": payment_amount,
+                "payment_frequency": frequency,
+                "factor_rate": factor,
+                "rate": rate,
+                "term_months": term_months,
+                "payoff_amount": payoff,
+            }
+        )
     return out
 
 
@@ -653,6 +684,86 @@ async def _route_pl_months(
     return updated
 
 
+_DEBT_CONTRACT_FIELDS = (
+    "monthly_payment",
+    "balance",
+    "payment_amount",
+    "payment_frequency",
+    "factor_rate",
+    "rate",
+    "term_months",
+    "payoff_amount",
+)
+
+
+async def _route_debt_rows(
+    db: AsyncSession,
+    dealer_id: UUID,
+    document_id: UUID | None,
+    debts: list[dict[str, Any]],
+    notes: list[str],
+) -> int:
+    """Upsert dos_debts rows from an extracted debt schedule or loan/MCA
+    agreement (0126). Match on vendor identity (normalize_vendor of the
+    lender name), falling back to a case-insensitive lender match. The
+    precedence law holds: origin='admin' rows are NEVER touched, dismissed
+    rows never resurrected; AI-drafted rows update fill-or-refresh and gain
+    document provenance."""
+    if not debts:
+        return 0
+    existing = (
+        (await db.execute(select(DealerDebt).where(DealerDebt.dealer_id == dealer_id)))
+        .scalars()
+        .all()
+    )
+    keyed = [(r.vendor_key, r) for r in existing if r.vendor_key]
+    by_name = {r.lender.strip().casefold(): r for r in existing}
+    touched = 0
+    for item in debts:
+        lender = item["lender"]
+        key = normalize_vendor(lender) or None
+        # containment-tolerant match so a contract's "Forward Financing" folds
+        # into the activity-drafted "ACH FORWARD FINANCING" row (no duplicates)
+        row = by_name.get(lender.strip().casefold())
+        if row is None and key:
+            row = next((r for k, r in keyed if key_matches(k, key)), None)
+        if row is not None:
+            if row.origin == "admin" or row.status == "dismissed":
+                continue  # a human owns it (or killed it) — extraction never wins
+            changed = False
+            for field in _DEBT_CONTRACT_FIELDS:
+                value = item.get(field)
+                if value is not None and getattr(row, field) != value:
+                    setattr(row, field, value)
+                    changed = True
+            if document_id is not None and row.document_id != document_id:
+                row.document_id = document_id
+                changed = True
+            if changed:
+                touched += 1
+        else:
+            new_row = DealerDebt(
+                dealer_id=dealer_id,
+                lender=lender[:180],
+                category="loan",
+                origin="ai_draft",
+                status="active",
+                vendor_key=key,
+                document_id=document_id,
+                evidence={"source": "document_extraction"},
+                **{f: item.get(f) for f in _DEBT_CONTRACT_FIELDS},
+            )
+            db.add(new_row)
+            if key:
+                by_key[key] = new_row
+            by_name[lender.strip().casefold()] = new_row
+            touched += 1
+    await db.flush()
+    if touched:
+        notes.append(f"Debt schedule: created/updated {touched} obligation row(s) (admin rows untouched).")
+    return touched
+
+
 async def _route_debt_schedule(
     db: AsyncSession, dealer_id: UUID, debts: list[dict[str, Any]], notes: list[str]
 ) -> int:
@@ -709,7 +820,7 @@ Read EVERY page/month — never summarize only the first month.
 
 Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 {
-  "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|debt_schedule|credit_report|other",
+  "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|debt_schedule|loan_agreement|credit_report|other",
   "months": [
     {"month": "YYYY-MM", "total_deposits": number|null, "total_withdrawals": number|null,
      "ending_balance": number|null, "average_ledger_balance": number|null,
@@ -723,7 +834,10 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
   "tax_years": [{"year": number, "revenue": number|null}],
   "business_identity": {"legal_name": "string|null", "ein": "string|null", "naics_code": "string|null"},
   "pl_months": [{"month": "YYYY-MM", "revenue": number|null, "net_income": number|null}],
-  "debts": [{"lender": "string", "monthly_payment": number|null, "balance": number|null}]
+  "debts": [{"lender": "string", "monthly_payment": number|null, "balance": number|null,
+             "payment_amount": number|null, "payment_frequency": "daily|weekly|biweekly|monthly|null",
+             "factor_rate": number|null, "rate": number|null, "term_months": number|null,
+             "payoff_amount": number|null}]
 }
 
 Rules:
@@ -733,7 +847,8 @@ Rules:
 - "tax_years" is for TAX RETURNS: one entry per tax year covered, revenue = gross receipts / total revenue as reported on the return (null when not stated). [] for other documents.
 - "business_identity" is best-effort from ANY document that states it (tax returns and statements print these): legal_name = the entity's legal name as printed; ein = employer identification number formatted XX-XXXXXXX; naics_code = the business activity code when the return shows one. Null anything not clearly printed — never guess.
 - "pl_months" is for P&L / INCOME STATEMENTS with a monthly breakdown: one entry per month with revenue and net_income when stated. If the P&L is annual/quarterly only, return [] rather than inventing a monthly split.
-- "debts" is for DEBT SCHEDULES: one entry per obligation — lender as printed, monthly_payment = the recurring MONTHLY payment (convert only when the document states the payment frequency; null when unknown), balance = current outstanding balance.
+- "debts" is for DEBT SCHEDULES and LOAN/MCA AGREEMENTS: one entry per obligation — lender/funder as printed, monthly_payment = the recurring MONTHLY payment (convert only when the document states the payment frequency; null when unknown), balance = current outstanding balance.
+- "loan_agreement" covers loan notes, merchant cash advance (MCA) agreements, and financing contracts for a SINGLE obligation. For these also fill: payment_amount = the payment in the contract's own cadence (e.g. the daily remittance), payment_frequency = that cadence, factor_rate = the MCA factor (payback / advance, e.g. 1.38) when stated, rate = the annual interest rate as a percent when stated, term_months = the stated term, payoff_amount = the stated payoff/balance when printed. Never derive factor_rate and rate from each other.
 - Every number is a bare number: no currency symbols, no commas. Withdrawals in total_withdrawals are a positive magnitude.
 - transactions[] is best-effort: include individual lines when they are legible, with deposits positive and withdrawals/debits NEGATIVE. If lines are not reliably legible, return "transactions": [].
 - Use null for any field the document does not state. Never invent numbers.
@@ -955,11 +1070,24 @@ async def extract_document(
                 )
         elif detected == "debt_schedule":
             await _route_debt_schedule(db, doc.dealer_id, debts, notes)
+            await _route_debt_rows(db, doc.dealer_id, doc.id, debts, notes)
             try:
                 await recompute_snapshot(db, doc.dealer_id)
             except Exception:
                 logger.exception(
                     "dealer-os: snapshot recompute failed after debt-schedule extract for %s",
+                    doc.dealer_id,
+                )
+        elif detected == "loan_agreement":
+            # One contract != total debt service: create/refresh the obligation
+            # row(s) only — never stamp period-level totals from a single note.
+            await _route_debt_rows(db, doc.dealer_id, doc.id, debts, notes)
+            notes.append("Loan/MCA agreement: obligation captured on the debt schedule.")
+            try:
+                await recompute_snapshot(db, doc.dealer_id)
+            except Exception:
+                logger.exception(
+                    "dealer-os: snapshot recompute failed after loan-agreement extract for %s",
                     doc.dealer_id,
                 )
         else:

@@ -509,6 +509,16 @@ class DealerDebt(TimestampMixin, Base):
     vendor_key: Mapped[str | None] = mapped_column(String(60))
     evidence: Mapped[dict | None] = mapped_column(JSONB)
     notes: Mapped[str | None] = mapped_column(Text)
+    # Refinance workbench (0126): the contract's native cadence. monthly_payment
+    # stays the monthly EQUIVALENT the engines read; payment_amount/frequency
+    # preserve what the agreement actually says ($420/day daily MCA).
+    payment_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    payment_frequency: Mapped[str | None] = mapped_column(String(12))  # daily|weekly|biweekly|monthly
+    factor_rate: Mapped[float | None] = mapped_column(Numeric(6, 3))
+    payoff_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
+    )
 
 
 class DealerOwner(TimestampMixin, Base):
