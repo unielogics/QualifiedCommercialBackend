@@ -435,7 +435,17 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         return 2
 
     by_month: dict = {}
+    seen_flow_sig: set = set()
     for row in raw_rows:
+        # Duplicate-attribution guard (user-confirmed data defect): the same
+        # statement ingested twice shows as two rows with identical
+        # deposits+withdrawals in one month under different accounts. Summing
+        # them double-counts every flow metric — keep the first.
+        sig = (row.period, row.deposits, row.withdrawals, row.ending_balance)
+        if row.account_id is not None and None not in sig[1:] and sig in seen_flow_sig:
+            continue
+        if row.account_id is not None and None not in sig[1:]:
+            seen_flow_sig.add(sig)
         by_month.setdefault(row.period, []).append(row)
     period_rows = []
     for month in sorted(by_month, reverse=True)[:6]:
