@@ -878,6 +878,41 @@ class DebtDraftResult(BaseModel):
     debts: list[DebtRead] = []
 
 
+# --- Plaid bank connections (0127, statements only) -------------------------
+
+
+class PlaidItemRead(ORM):
+    id: UUID
+    institution_name: str | None = None
+    status: str
+    error: str | None = None
+    last_pulled_at: datetime | None = None
+    next_refresh_at: datetime | None = None
+    created_at: datetime
+
+
+class PlaidStateRead(BaseModel):
+    enabled: bool = False
+    environment: str = "sandbox"
+    items: list[PlaidItemRead] = []
+
+
+class PlaidLinkTokenRead(BaseModel):
+    link_token: str
+
+
+class PlaidExchange(BaseModel):
+    public_token: str = Field(min_length=8, max_length=256)
+    institution_name: str | None = Field(default=None, max_length=160)
+
+
+class PlaidRefreshResult(BaseModel):
+    items: int = 0
+    pulled: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
 # --- Refinance workbench --------------------------------------------------
 
 

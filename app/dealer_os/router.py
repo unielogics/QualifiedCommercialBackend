@@ -44,6 +44,7 @@ from .deps import (
     resolve_dealer_scope,
 )
 from .models import (
+    DealerPlaidItem,
     DealerAccount,
     DealerAddback,
     DealerAlert,
@@ -100,6 +101,11 @@ from .schemas import (
     DealerUpdate,
     DebtCreate,
     DebtDraftResult,
+    PlaidExchange,
+    PlaidItemRead,
+    PlaidLinkTokenRead,
+    PlaidRefreshResult,
+    PlaidStateRead,
     RefiDebtRead,
     RefinanceRead,
     RefinanceScenarioRead,
@@ -214,7 +220,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import payment_timing, refinance as refinance_svc, simulate, timing_optimizer
+from .services import payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -4578,6 +4584,173 @@ async def delete_debt(
     else:
         await db.delete(row)
     await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
+    await db.commit()
+
+
+# --- Plaid bank connections (0127, statements only) ----------------------------
+
+
+async def _plaid_items(db: AsyncSession, dealer_id: UUID) -> list[DealerPlaidItem]:
+    return (
+        (
+            await db.execute(
+                select(DealerPlaidItem)
+                .where(
+                    DealerPlaidItem.dealer_id == dealer_id,
+                    DealerPlaidItem.status != "removed",
+                )
+                .order_by(DealerPlaidItem.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@router.get("/dealers/{dealer_id}/plaid", response_model=PlaidStateRead)
+async def plaid_state(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PlaidStateRead:
+    """Connection panel state. enabled=false (keys not provisioned) renders a
+    quiet disabled state — never an error."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    items = await _plaid_items(db, dealer.id)
+    return PlaidStateRead(
+        enabled=plaid_client.enabled(),
+        environment=plaid_client.environment(),
+        items=[PlaidItemRead.model_validate(i) for i in items],
+    )
+
+
+@router.post("/dealers/{dealer_id}/plaid/link-token", response_model=PlaidLinkTokenRead)
+async def plaid_link_token(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PlaidLinkTokenRead:
+    """Start a Plaid Link session — Statements product ONLY (bank statements;
+    everything else still comes through upload). The client connects their
+    own bank; team can run it alongside them."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        token = await plaid_client.create_link_token(
+            dealer_id=str(dealer.id), dealer_name=dealer.name
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    return PlaidLinkTokenRead(link_token=token)
+
+
+@router.post(
+    "/dealers/{dealer_id}/plaid/exchange",
+    response_model=PlaidItemRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def plaid_exchange(
+    dealer_id: UUID,
+    payload: PlaidExchange,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPlaidItem:
+    """Finish Link: swap the public token, store the encrypted access token,
+    and pull the first batch of statements in the background."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    existing = (
+        await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
+    ).scalar_one_or_none()
+    if existing is not None and existing.dealer_id != dealer.id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This bank connection belongs to another file")
+    if existing is not None:  # reconnect: refresh the token, revive the row
+        existing.encrypted_access_token = plaid_client.encrypt_token(access_token)
+        existing.status, existing.error = "active", None
+        item = existing
+    else:
+        item = DealerPlaidItem(
+            dealer_id=dealer.id,
+            item_id=item_id,
+            institution_name=(payload.institution_name or "")[:160] or None,
+            encrypted_access_token=plaid_client.encrypt_token(access_token),
+            status="active",
+        )
+        db.add(item)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "plaid.connect", "plaid_item", entity_id=item.id,
+        after={"institution": item.institution_name},
+    )
+    await db.commit()
+    await db.refresh(item)
+    background.add_task(_background_plaid_first_sync, item.id)
+    return item
+
+
+async def _background_plaid_first_sync(item_pk: UUID) -> None:
+    from app.db import SessionLocal
+
+    try:
+        async with SessionLocal() as db:
+            item = (
+                await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.id == item_pk))
+            ).scalar_one_or_none()
+            if item is not None:
+                await plaid_sync.sync_item(db, item)
+                await db.commit()
+    except Exception:
+        logger.exception("dealer-os plaid: first sync failed for %s", item_pk)
+
+
+@router.post("/dealers/{dealer_id}/plaid/refresh", response_model=PlaidRefreshResult)
+async def plaid_refresh(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> PlaidRefreshResult:
+    """Refresh now: pull any statements not yet ingested across the dealer's
+    connected banks. Idempotent by construction (statement-id dedupe)."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    totals = {"items": 0, "pulled": 0, "skipped": 0, "failed": 0}
+    for item in await _plaid_items(db, dealer.id):
+        if item.status == "removed":
+            continue
+        result = await plaid_sync.sync_item(db, item)
+        totals["items"] += 1
+        for k in ("pulled", "skipped", "failed"):
+            totals[k] += result.get(k, 0)
+    await db.commit()
+    return PlaidRefreshResult(**totals)
+
+
+@router.delete("/dealers/{dealer_id}/plaid/{item_pk}", status_code=status.HTTP_204_NO_CONTENT)
+async def plaid_remove(
+    dealer_id: UUID, item_pk: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> None:
+    """Disconnect a bank (team). Documents already pulled stay — they are the
+    dealer's statements; only the live connection goes."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    item = (
+        await db.execute(
+            select(DealerPlaidItem).where(
+                DealerPlaidItem.id == item_pk, DealerPlaidItem.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this dealer")
+    token = plaid_client.decrypt_token(item.encrypted_access_token)
+    if token:
+        try:
+            await plaid_client.item_remove(token)
+        except plaid_client.PlaidUnavailable:
+            pass  # best-effort — the row is retired regardless
+    item.status = "removed"
+    item.encrypted_access_token = None
+    await log_action(db, dealer.id, user, "plaid.remove", "plaid_item", entity_id=item.id)
     await db.commit()
 
 

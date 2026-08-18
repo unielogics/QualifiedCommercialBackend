@@ -931,6 +931,42 @@ def _is_xlsx(content_type: str, filename: str) -> bool:
     return "spreadsheetml" in lower or lower.endswith(".xlsx")
 
 
+async def store_document_bytes(
+    db: AsyncSession,
+    dealer_id: UUID,
+    raw: bytes,
+    filename: str,
+    content_type: str = "application/pdf",
+    *,
+    kind: str = "statement",
+    plaid_statement_id: str | None = None,
+) -> DealerDocument:
+    """Create a DealerDocument from server-held bytes (no HTTP upload).
+
+    The shared core the Plaid statement puller uses (and the shape the three
+    inline copies in router.py should eventually converge on): S3 store via
+    the standard key layout, row construction, flush. The caller runs
+    extract_document and owns the commit."""
+    from . import storage  # local import keeps module import order stable
+
+    safe = storage.safe_filename(filename)
+    key = storage.build_key(dealer_id, safe)
+    s3_key = key if storage.put_bytes(key, raw, content_type) else None
+    doc = DealerDocument(
+        dealer_id=dealer_id,
+        filename=safe[:260],
+        content_type=content_type[:120],
+        size_bytes=len(raw),
+        s3_key=s3_key,
+        kind=kind,
+        status="uploaded",
+        plaid_statement_id=plaid_statement_id,
+    )
+    db.add(doc)
+    await db.flush()
+    return doc
+
+
 async def extract_document(
     db: AsyncSession, doc: DealerDocument, raw: bytes | None = None, account_id: UUID | None = None
 ) -> dict[str, Any]:

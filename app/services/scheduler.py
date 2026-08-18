@@ -154,6 +154,21 @@ def start_scheduler() -> None:
         max_instances=1,
     )
 
+    # Dealer OS: Plaid statement auto-refresh (0127). The 30-day cadence lives
+    # in dos_plaid_items.next_refresh_at — this daily tick only syncs items
+    # that are due, so it is a no-op most days. No-ops instantly when the
+    # DEALER_OS_PLAID_* keys are not provisioned.
+    scheduler.add_job(
+        _wrap(job_dealer_os_plaid_refresh),
+        "cron",
+        hour=7,
+        minute=10,
+        id="dealer_os_plaid_refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Doc-vision scan drain (alembic 0017). Every 2 min picks up
     # Documents flagged scan_dirty=True (set by upload-complete) and
     # runs them through Claude vision. Hard-capped at 8 docs per
@@ -853,3 +868,13 @@ async def _ai_agent_send_email(
     except Exception as exc:  # noqa: BLE001
         log.warning("ai_agent send_email failed: %s", exc)
         return False, None
+
+
+async def job_dealer_os_plaid_refresh() -> None:
+    """Dealer OS (0127): pull newly available Plaid statements for items whose
+    30-day refresh is due. Thin shell — real logic in dealer_os."""
+    from app.dealer_os.services.plaid_sync import refresh_due
+
+    result = await refresh_due()
+    if result.get("items"):
+        log.info("dealer_os_plaid_refresh: synced %s item(s)", result["items"])

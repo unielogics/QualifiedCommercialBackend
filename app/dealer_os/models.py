@@ -401,6 +401,9 @@ class DealerDocument(TimestampMixin, Base):
     # declared `kind` above is never touched by classification.
     detected_kind: Mapped[str | None] = mapped_column(String(24))
     doc_meta: Mapped[dict | None] = mapped_column(JSONB)  # classifier payload summary
+    # 0127: Plaid statement identity — partial-unique per dealer, so a
+    # refresh can never ingest the same statement twice.
+    plaid_statement_id: Mapped[str | None] = mapped_column(String(64))
     # Mirror row in the dealer's linked Bucket (Phase 2). Set on push (upload
     # -> bucket) and on pull (bucket file ingested -> Dealer OS). SET NULL so
     # bucket-file deletion never destroys the extraction record.
@@ -579,6 +582,31 @@ class DealerSourceConnection(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     encrypted_tokens: Mapped[str | None] = mapped_column(Text)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerPlaidItem(TimestampMixin, Base):
+    """One connected bank via Plaid (0127). Statements product ONLY — the
+    Item pulls actual statement PDFs into the normal document pipeline;
+    Transactions/balances products are deliberately out of scope. The access
+    token is Fernet-encrypted at rest (provider_secrets key recipe).
+    next_refresh_at drives the 30-day auto-refresh; a daily scheduler tick
+    syncs whatever is due."""
+
+    __tablename__ = "dos_plaid_items"
+    __table_args__ = (Index("ix_dos_plaid_items_dealer", "dealer_id"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    item_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    institution_name: Mapped[str | None] = mapped_column(String(160))
+    encrypted_access_token: Mapped[str | None] = mapped_column(Text)
+    encryption_provider: Mapped[str] = mapped_column(String(16), default="fernet", server_default="fernet")
+    status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")  # active|error|removed
+    error: Mapped[str | None] = mapped_column(Text)
+    last_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerGroup(TimestampMixin, Base):
