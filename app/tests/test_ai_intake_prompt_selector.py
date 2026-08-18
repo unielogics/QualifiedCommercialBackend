@@ -121,11 +121,24 @@ def test_unknown_variant_gets_the_neutral_preamble_only():
             assert not leaked, f"{name} leaked {leaked} for {variant!r}"
 
 
-def test_admin_audience_override_composes_with_main_street():
-    """The internal thread override appends to whichever persona is active."""
+def test_admin_audience_gets_notes_not_the_borrower_script():
+    """The internal thread carries product KNOWLEDGE, never the borrower
+    interview script — the script kept leaking into long admin threads and
+    interviewing the operator ("what is your credit tier?")."""
     prompt = ai.build_chat_system(MAIN_STREET, audience="admin")
-    assert "operating business" in prompt
+    assert "Main Street" in prompt  # product notes present
     assert ai.ADMIN_THREAD_CHAT_RULES.split("\n")[0] in prompt
+    # the borrower pacing/screening script is structurally absent
+    assert "Stage 1 asks for" not in prompt
+    assert "Ask for one missing" not in prompt
+    for variant, marker in (
+        ("dealer_gatekeeper_v1", "Stage 1 asks for"),
+        ("mca_refi_v1", "exactly one missing item"),
+    ):
+        admin_prompt = ai.build_chat_system(variant, audience="admin")
+        assert marker not in admin_prompt, variant
+        # while the borrower-facing prompt keeps its script
+        assert marker in ai.build_chat_system(variant)
 
 
 def test_spanish_instruction_composes_with_main_street():

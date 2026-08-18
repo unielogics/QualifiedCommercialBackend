@@ -287,9 +287,27 @@ MAIN_STREET_CHAT_RULES = """- Answer like an underwriter screening an ordinary o
 # Internal-thread override, appended AFTER the product rules for the private
 # admin/broker thread only. The borrower never sees that thread, so the
 # client-facing disclosure and pacing restrictions above do not apply there.
+# Admin-thread product notes: the product knowledge an internal colleague
+# needs, WITHOUT the borrower-facing interview script (stage sequencing,
+# "ask one item at a time", document requests). The scripts kept leaking:
+# in long analytical admin threads the model would revert to the concrete
+# Stage-1 funnel and interview the OPERATOR ("what is your credit tier?").
+# For audience="admin" the borrower chat rules are structurally absent.
+_ADMIN_PRODUCT_NOTES = {
+    "dealer_gatekeeper_v1": """Product: car-dealer financing file (working capital / floorplan / MCA relief).
+Baseline evidence: last 2 years business tax returns, YTD P&L, last 6 months operating bank statements; screening facts on file: requested amount, use of funds breakdown, monthly debt obligations, credit tier. These are facts to READ from the file/context — when one is missing, say it is missing.""",
+    "real_estate_dscr_v1": """Product: real-estate / DSCR investor file.
+Baseline evidence: lease/rent roll, appraisal or value support, purchase contract or payoff statement, entity docs; key math: DSCR, LTV, PITIA, NOI (context.dscr_potential carries deterministic figures — prefer them).""",
+    "main_street_v1": """Product: operating-business (Main Street) financing file.
+Baseline evidence: 6 months bank statements, 2 years business tax returns, YTD P&L and balance sheet, business debt schedule (+ industry-conditional items). Program fit is computed deterministically and lives in context.""",
+    "mca_refi_v1": """Product: merchant-cash-advance refinance file.
+The complete file is three items: 6 months business bank statements, signed credit authorization, current advance terms (agreements/payoff letters or the terms form). Key analysis: per-advance funder, payback remaining, payment amount/frequency, factor rate, paydown percentage; pricing comes from the desk, never from this thread.""",
+}
+
+
 ADMIN_THREAD_CHAT_RULES = """This conversation is the INTERNAL underwriting thread with a Qualified Commercial operator (super admin) or partner broker — the borrower is NOT in this thread and never sees it. You are answering a colleague, NOT interviewing a borrower.
 
-CRITICAL — this thread is question-and-answer with a colleague, not the borrower intake funnel. The borrower-facing pacing rules above (Stage 1 sequencing, "ask one high-value question at a time", "give the next specific move", requesting missing items, capturing stated facts in any thread) DO NOT APPLY here and are overridden:
+CRITICAL — this thread is question-and-answer with a colleague, not the borrower intake funnel. No borrower-facing pacing or screening behavior applies in this thread — no stage sequencing, no "one question at a time" interviewing, no unsolicited "next specific move", no missing-item requests:
 - Answer exactly what the operator asked, then STOP. Do not append a "next step", a Stage 1 or missing-document request, a follow-up question, a screening offer, or any unsolicited analysis. A one-line factual lookup ("do we have a DOB?", "what's the address?") gets a one-line factual answer and nothing else.
 - Only go beyond a direct answer when the operator explicitly asks for it — e.g. "what's missing", "what's next", "screen this", "run the numbers", "give me the full picture". Then answer as fully as asked.
 - The operator is NOT the borrower and their messages are NOT borrower statements. Never ask the operator to supply use of funds, requested amount, credit score, or any other application fact, and never treat a question, hypothetical, or example they type as a fact stated by the borrower.
@@ -385,6 +403,16 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
     thread answers like a colleague underwriter (programs, pricing, DSCR math
     disclosed) instead of applying borrower-facing disclosure limits.
     """
+    if audience == "admin":
+        # INTERNAL thread: product knowledge only — the borrower interview
+        # script (stage sequencing, one-item-at-a-time requests) is
+        # structurally absent so it can never leak onto the operator.
+        notes = _ADMIN_PRODUCT_NOTES.get(review_type or "", "")
+        base = f"{CHAT_PREAMBLE}\n"
+        if notes:
+            base += f"\n{notes}\n"
+        base += f"\n{ADMIN_THREAD_CHAT_RULES}\n"
+        return base
     if review_type == "dealer_gatekeeper_v1":
         base = f"{CHAT_PREAMBLE}\n{DEALER_CHAT_RULES}\n"
     elif review_type == "real_estate_dscr_v1":
@@ -395,8 +423,6 @@ def build_chat_system(review_type: str | None, *, client_language: str | None = 
         base = f"{CHAT_PREAMBLE}\n{MCA_CHAT_RULES}\n"
     else:
         base = f"{CHAT_PREAMBLE}\n"
-    if audience == "admin":
-        base += f"\n{ADMIN_THREAD_CHAT_RULES}\n"
     if client_language == "es":
         base += (
             "\n\nThe client's preferred language is Spanish. Respond ONLY in professional, natural "
