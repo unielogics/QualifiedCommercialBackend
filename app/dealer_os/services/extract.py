@@ -755,7 +755,7 @@ async def _route_debt_rows(
             )
             db.add(new_row)
             if key:
-                by_key[key] = new_row
+                keyed.append((key, new_row))
             by_name[lender.strip().casefold()] = new_row
             touched += 1
     await db.flush()

@@ -467,6 +467,9 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
 
     periods = [
         {
+            # calendar month key — consumers that adjust per-month (the
+            # refinance replay) key on this; the metric math ignores it.
+            "period": p.period,
             "ebitda_reported": _f(p.ebitda_reported),
             "debt_service": _f(p.debt_service),
             "avg_daily_balance": _f(p.avg_daily_balance),

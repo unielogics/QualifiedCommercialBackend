@@ -921,7 +921,7 @@ class RefinanceRead(BaseModel):
 class RefinanceSimulateRequest(BaseModel):
     debt_ids: list[UUID] = Field(default_factory=list, max_length=40)
     amount: float | None = Field(default=None, ge=0, le=50_000_000)  # None -> payoff total
-    annual_rate_pct: float = Field(default=9.5, gt=0, lt=50)
+    annual_rate_pct: float = Field(default=9.5, ge=0.01, lt=50)
     term_months: int = Field(default=60, ge=1, le=360)
     path_key: str | None = None       # program whose floor/ceiling grade the scenario
 

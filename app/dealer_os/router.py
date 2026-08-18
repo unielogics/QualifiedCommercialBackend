@@ -4503,7 +4503,14 @@ async def create_debt(
 ) -> DealerDebt:
     require_team(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    row = DealerDebt(dealer_id=dealer.id, origin="admin", status="active", **body.model_dump())
+    fields = body.model_dump()
+    if fields.get("monthly_payment") is None and fields.get("payment_amount") and fields.get("payment_frequency"):
+        fields["monthly_payment"] = round(
+            float(fields["payment_amount"])
+            * refinance_svc.FREQUENCY_MONTHLY_MULT[fields["payment_frequency"]],
+            2,
+        )
+    row = DealerDebt(dealer_id=dealer.id, origin="admin", status="active", **fields)
     db.add(row)
     await log_action(db, dealer.id, user, "debts.create", "debt", after=body.model_dump(mode="json"))
     await db.commit()
@@ -4534,6 +4541,13 @@ async def patch_debt(
     before = {k: getattr(row, k) for k in patch}
     for k, v in patch.items():
         setattr(row, k, v)
+    if row.monthly_payment is None and row.payment_amount and row.payment_frequency:
+        # keep the engine-facing monthly figure in step with the cadence
+        row.monthly_payment = round(
+            float(row.payment_amount)
+            * refinance_svc.FREQUENCY_MONTHLY_MULT.get(row.payment_frequency, 1.0),
+            2,
+        )
     row.origin = "admin"
     await log_action(
         db, dealer.id, user, "debts.update", "debt",
@@ -4700,7 +4714,7 @@ async def simulate_refinance(
     debts = await _refi_debt_rows(db, dealer)
     by_id = {d.id: d for d in debts}
     selected: list[DealerDebt] = []
-    for debt_id in payload.debt_ids:
+    for debt_id in dict.fromkeys(payload.debt_ids):  # dedupe, order-preserving
         d = by_id.get(debt_id)
         if d is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this dealer")
