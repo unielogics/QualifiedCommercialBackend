@@ -878,6 +878,42 @@ class DebtDraftResult(BaseModel):
     debts: list[DebtRead] = []
 
 
+# --- MCA-style statement-only readiness --------------------------------------
+
+
+class McaCheckRead(BaseModel):
+    key: str
+    label: str
+    value: float | None = None
+    threshold: float
+    unit: str
+    passed: bool
+    detail: str
+
+
+class McaOfferRead(BaseModel):
+    advance: float = 0.0
+    advance_range: list[float] = []
+    factor_rate: float = 1.3
+    payback: float = 0.0
+    term_business_days: int = 120
+    daily_payment: float = 0.0
+    pull_pct: float | None = None
+    stretched: bool = False
+    reduced: bool = False
+
+
+class McaReadinessRead(BaseModel):
+    amr: float = 0.0
+    daily_revenue: float = 0.0
+    months_used: int = 0
+    existing_daily_pull: float = 0.0
+    checks: list[McaCheckRead] = []
+    offer: McaOfferRead | None = None
+    verdict: str = "not_yet"
+    failed_checks: list[str] = []
+
+
 # --- DSCR composition (0129) — the clickable DSCR container ------------------
 
 

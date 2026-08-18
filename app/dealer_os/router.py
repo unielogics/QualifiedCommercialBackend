@@ -115,6 +115,7 @@ from .schemas import (
     DscrNumeratorRead,
     DscrResultsRead,
     DscrSuggestionRead,
+    McaReadinessRead,
     RefiDebtRead,
     RefinanceRead,
     RefinanceScenarioRead,
@@ -229,7 +230,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -4604,6 +4605,29 @@ async def delete_debt(
     await db.commit()
 
 
+# --- MCA-style statement-only readiness -----------------------------------------
+
+
+@router.get("/dealers/{dealer_id}/mca-readiness", response_model=McaReadinessRead)
+async def mca_readiness_read(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> McaReadinessRead:
+    """The MCA-underwriter lens over the trailing statements: scrubbed AMR,
+    the four health checks, and a backed-into offer with the daily-pull
+    stress test. Desk-facing (we structure these as term loans)."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    inputs = await load_metric_inputs(db, dealer.id)
+    metrics = compute_metrics(
+        inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
+    )
+    rolled = await _vendor_rollup(db, dealer)
+    result = mca_svc.compute_mca_readiness(
+        inputs.periods, rolled, (metrics.get("adb") or {}).get("current")
+    )
+    return McaReadinessRead(**result)
+
+
 # --- DSCR composition (0129) — the clickable DSCR container --------------------
 
 
@@ -4776,6 +4800,8 @@ async def dscr_component_action(
         v = next((x for x in rolled if x.key == payload.vendor_key), None)
         if v is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "No observed vendor with that key")
+        if v.direction >= 0:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Inflow vendors can't be debt service")
         existing = (
             await db.execute(
                 select(DealerDebt).where(

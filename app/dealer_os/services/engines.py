@@ -202,6 +202,14 @@ def compute_metrics(
     # Cash-flow cross-check, fully ledger-derived: what the account actually
     # kept each month vs what it paid lenders. (net + debt) / debt — the
     # cash-based DSCR a statement lender computes by hand.
+    # DRAFT DSCR: when nothing is confirmed, the system still derives a
+    # ratio from IDENTIFIED debt-like activity (cards included) vs the
+    # inbound-derived numerator — never a blank tile, never an infinity.
+    draft_ds = (fallbacks or {}).get("debt_service_draft_monthly")
+    dscr_draft = None
+    if draft_ds and float(draft_ds) > 0 and ebitda_bankable is not None:
+        dscr_draft = round(ebitda_bankable / (float(draft_ds) * 12.0), 3)
+
     # DSCR at the funding goal: coverage of (current DS + the goal's implied
     # payment) — defined even at zero current debt.
     goal_payment = (fallbacks or {}).get("goal_monthly_payment")
@@ -310,6 +318,14 @@ def compute_metrics(
             "source": ds_source,
             "cash_flow": dscr_cash_flow,
             "at_goal": dscr_at_goal,
+            "draft": dscr_draft,
+            "draft_monthly_ds": _round2(float(draft_ds)) if draft_ds else None,
+            "display": (
+                "confirmed" if dscr is not None
+                else "draft" if dscr_draft is not None
+                else "cash_flow" if dscr_cash_flow is not None
+                else "insufficient"
+            ),
             "net_cash_flow_monthly": net_cash_flow_monthly,
             "ebitda_source": ebitda_source,
             "monthly_debt_service": _round2(monthly_ds),
@@ -560,6 +576,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
     # cards excluded for the same reason as above. Preferred over the
     # drafted schedule; statement-carried debt_service still wins overall.
     observed_ds_monthly = None
+    draft_ds_monthly = None
     observed_avg_by_debt: dict = {}
     event_rows = []
     if period_rows:
@@ -589,22 +606,50 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                 for v in rolled
                 if v.debt_like and v.category != "credit_card"
             }
-            if debt_keys:
+            # DRAFT universe: every debt-like vendor INCLUDING cards —
+            # the always-drafts-something tier. Human-excluded schedule rows
+            # (origin='admin', count_in_dscr=false) pull their vendors out.
+            draft_keys = {v.key for v in rolled if v.debt_like}
+            if debt_keys or draft_keys:
                 from .vendors import normalize_vendor
 
+                from .refinance import key_matches as _km
+
+                excluded_rows = (
+                    (
+                        await db.execute(
+                            select(DealerDebt.vendor_key).where(
+                                DealerDebt.dealer_id == dealer_id,
+                                DealerDebt.status == "active",
+                                DealerDebt.origin == "admin",
+                                DealerDebt.count_in_dscr.is_(False),
+                                DealerDebt.vendor_key.is_not(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
                 by_month: dict = {}
+                draft_by_month: dict = {}
                 for r in event_rows:
                     amt = float(r.amount or 0)
                     if amt >= 0:
                         continue
-                    if normalize_vendor(r.description or "") in debt_keys:
-                        key = date(r.period.year, r.period.month, 1)
-                        by_month[key] = by_month.get(key, 0.0) + (-amt)
+                    ev_key = normalize_vendor(r.description or "")
+                    mkey = date(r.period.year, r.period.month, 1)
+                    if ev_key in debt_keys:
+                        by_month[mkey] = by_month.get(mkey, 0.0) + (-amt)
+                    if ev_key in draft_keys and not any(_km(x, ev_key) for x in excluded_rows):
+                        draft_by_month[mkey] = draft_by_month.get(mkey, 0.0) + (-amt)
                 # Average over the covered months (months with zero debt
                 # debits count as zero — a skipped payment is information).
                 if by_month:
                     total = sum(by_month.get(m, 0.0) for m in months_covered)
                     observed_ds_monthly = round(total / max(len(months_covered), 1), 2)
+                if draft_by_month:
+                    total = sum(draft_by_month.get(m, 0.0) for m in months_covered)
+                    draft_ds_monthly = round(total / max(len(months_covered), 1), 2)
 
         # Per-schedule-row observed averages (containment-tolerant identity —
         # the same matcher the refinance workbench uses).
@@ -665,6 +710,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         targets=targets,
         fallbacks={
             "debt_service_observed_monthly": observed_ds_monthly or None,
+            "debt_service_draft_monthly": draft_ds_monthly or None,
             "debt_schedule_monthly": drafted_monthly or None,
             "goal_monthly_payment": goal_payment,
             "tax_ebitda_annual": _tax_ebitda(latest_filing),
