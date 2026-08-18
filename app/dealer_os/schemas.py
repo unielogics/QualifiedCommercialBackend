@@ -1358,5 +1358,5 @@ class PlanCommentRead(ORM):
 class RecurrenceMark(BaseModel):
     """Admin recurrence override for a cash event (optionally its vendor)."""
 
-    mark: str = Field(pattern="^(recurring|one_time|clear)$")
+    mark: str = Field(pattern="^(recurring|one_time|none|clear)$")
     apply_similar: bool = True

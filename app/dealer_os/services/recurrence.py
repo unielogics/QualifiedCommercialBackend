@@ -305,7 +305,7 @@ def apply_manual_marks(
     regardless of size thresholds. Detection never overwrites these marks;
     this function makes the live view agree with them.
     """
-    one_time_ids = {eid for eid, mark in manual.items() if mark == "one_time"}
+    one_time_ids = {eid for eid, mark in manual.items() if mark in ("one_time", "none")}
     recurring_ids = {eid for eid, mark in manual.items() if mark == "recurring"}
 
     kept_groups = []
@@ -362,6 +362,8 @@ def apply_manual_marks(
 
     kept_groups.sort(key=lambda g: -abs(g.monthly_equivalent))
     force_irregular = {
-        e.id for e in events if e.id in one_time_ids and float(e.amount or 0) < 0
+        e.id
+        for e in events
+        if manual.get(e.id) == "one_time" and float(e.amount or 0) < 0
     }
     return kept_groups, force_irregular

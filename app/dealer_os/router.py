@@ -922,6 +922,15 @@ async def mark_event_recurrence(
             flags["irregular"] = True
             flags.pop("cadence", None)
             flags.pop("recurrence_key", None)
+        elif payload.mark == "none":
+            # Ordinary payment — neither recurring nor irregular. The remove
+            # affordance on both panels lands here.
+            flags["manual_recurrence"] = "none"
+            flags["recurring"] = False
+            flags["irregular"] = False
+            flags.pop("one_time", None)
+            flags.pop("cadence", None)
+            flags.pop("recurrence_key", None)
         else:  # clear — hand the rows back to automatic detection
             flags.pop("manual_recurrence", None)
             flags.pop("one_time", None)
@@ -1043,7 +1052,7 @@ async def recurring_view(
     category_by_id = {rid: category for rid, _o, _d, _a, category, _f in rows}
     for rid, _o, _d, _a, _c, flags in rows:
         mark = (flags or {}).get("manual_recurrence") if isinstance(flags, dict) else None
-        if mark in ("recurring", "one_time"):
+        if mark in ("recurring", "one_time", "none"):
             manual[rid] = mark
     groups = recurrence.detect_groups(lite)  # already sorted by |monthly_equivalent| desc
     if manual:
@@ -1051,6 +1060,9 @@ async def recurring_view(
     else:
         force_irregular = set()
     irregular = recurrence.classify_irregular(lite, groups)
+    suppressed = {rid for rid, mark in manual.items() if mark in ("none", "recurring")}
+    if suppressed:
+        irregular = [e for e in irregular if e.id not in suppressed]
     if force_irregular:
         by_id = {e.id: e for e in lite}
         have = {e.id for e in irregular}
@@ -1063,6 +1075,7 @@ async def recurring_view(
         groups=[
             RecurringGroupRead(
                 key=g.key,
+                sample_event_id=(g.event_ids[-1] if g.event_ids else None),
                 sample_description=g.sample_description,
                 cadence=g.cadence,
                 occurrences=g.occurrences,
