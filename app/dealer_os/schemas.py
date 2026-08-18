@@ -907,10 +907,7 @@ class PlaidExchange(BaseModel):
 
 
 class PlaidRefreshResult(BaseModel):
-    items: int = 0
-    pulled: int = 0
-    skipped: int = 0
-    failed: int = 0
+    queued: int = 0   # banks queued for a background pull
 
 
 # --- Refinance workbench --------------------------------------------------

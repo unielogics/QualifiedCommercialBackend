@@ -4589,6 +4589,27 @@ async def delete_debt(
 
 # --- Plaid bank connections (0127, statements only) ----------------------------
 
+# Per-dealer cooldowns on the Plaid surfaces the CLIENT can reach — these hit
+# Plaid's API (metered) and, for refresh, spawn extraction work. In-memory is
+# fine on the single-instance deploy (same assumption the scheduler documents).
+_PLAID_LAST_CALL: dict[tuple[str, str], float] = {}
+
+
+def _plaid_cooldown(action: str, dealer_id: UUID, seconds: float) -> None:
+    import time
+
+    key = (action, str(dealer_id))
+    now = time.monotonic()
+    last = _PLAID_LAST_CALL.get(key)
+    if last is not None and now - last < seconds:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"Please wait a moment before trying again ({int(seconds - (now - last)) + 1}s)",
+        )
+    _PLAID_LAST_CALL[key] = now
+    if len(_PLAID_LAST_CALL) > 5000:  # bound the map
+        _PLAID_LAST_CALL.clear()
+
 
 async def _plaid_items(db: AsyncSession, dealer_id: UUID) -> list[DealerPlaidItem]:
     return (
@@ -4632,6 +4653,7 @@ async def plaid_link_token(
     own bank; team can run it alongside them."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    _plaid_cooldown("link", dealer.id, 10)
     try:
         token = await plaid_client.create_link_token(
             dealer_id=str(dealer.id), dealer_name=dealer.name
@@ -4657,6 +4679,7 @@ async def plaid_exchange(
     and pull the first batch of statements in the background."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    _plaid_cooldown("exchange", dealer.id, 5)
     try:
         access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
     except plaid_client.PlaidUnavailable as exc:
@@ -4669,6 +4692,7 @@ async def plaid_exchange(
     if existing is not None:  # reconnect: refresh the token, revive the row
         existing.encrypted_access_token = plaid_client.encrypt_token(access_token)
         existing.status, existing.error = "active", None
+        existing.next_refresh_at = datetime.now(timezone.utc)
         item = existing
     else:
         item = DealerPlaidItem(
@@ -4677,6 +4701,10 @@ async def plaid_exchange(
             institution_name=(payload.institution_name or "")[:160] or None,
             encrypted_access_token=plaid_client.encrypt_token(access_token),
             status="active",
+            # Safety net: the in-process background first sync is not durable
+            # (a redeploy kills it) — a due next_refresh_at means the daily
+            # scheduler sweep picks the item up regardless.
+            next_refresh_at=datetime.now(timezone.utc),
         )
         db.add(item)
     await db.flush()
@@ -4707,22 +4735,23 @@ async def _background_plaid_first_sync(item_pk: UUID) -> None:
 
 @router.post("/dealers/{dealer_id}/plaid/refresh", response_model=PlaidRefreshResult)
 async def plaid_refresh(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
 ) -> PlaidRefreshResult:
-    """Refresh now: pull any statements not yet ingested across the dealer's
-    connected banks. Idempotent by construction (statement-id dedupe)."""
+    """Refresh now: queue a pull of any statements not yet ingested across the
+    dealer's connected banks. Runs in the background (each statement PDF goes
+    through extraction — minutes, not a request); idempotent by construction
+    (statement-id dedupe), so mashing the button is harmless. Statements
+    appear in Files as they extract."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    totals = {"items": 0, "pulled": 0, "skipped": 0, "failed": 0}
-    for item in await _plaid_items(db, dealer.id):
-        if item.status == "removed":
-            continue
-        result = await plaid_sync.sync_item(db, item)
-        totals["items"] += 1
-        for k in ("pulled", "skipped", "failed"):
-            totals[k] += result.get(k, 0)
-    await db.commit()
-    return PlaidRefreshResult(**totals)
+    _plaid_cooldown("refresh", dealer.id, 60)
+    items = [i for i in await _plaid_items(db, dealer.id) if i.status != "removed"]
+    for item in items:
+        background.add_task(_background_plaid_first_sync, item.id)
+    return PlaidRefreshResult(queued=len(items))
 
 
 @router.delete("/dealers/{dealer_id}/plaid/{item_pk}", status_code=status.HTTP_204_NO_CONTENT)

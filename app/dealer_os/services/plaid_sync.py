@@ -39,38 +39,64 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days: int) -> None:
+    """Stamp the item's sync outcome in its OWN short transaction, immune to
+    whatever state the sync loop left the session in."""
+    await db.rollback()  # clear any in-flight state first
+    item = (
+        await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.id == item_pk))
+    ).scalar_one_or_none()
+    if item is None or item.status == "removed":
+        return
+    item.last_pulled_at = _now()
+    item.next_refresh_at = _now() + timedelta(days=retry_days)
+    item.status = "error" if error else "active"
+    item.error = (error or None) and error[:500]
+    await db.commit()
+
+
 async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
     """Pull any not-yet-ingested statements for one connected bank.
 
-    Returns {pulled, skipped, failed}. Updates the item's bookkeeping in
-    place: last_pulled_at, next_refresh_at (+30 days on success, +1 day on
-    error so a transient failure retries daily instead of stalling a month).
+    Each statement is COMMITTED individually — one bad PDF (or a unique-index
+    race with a concurrent sync) never discards the others' work or poisons
+    the session, and extract_document's internal failure rollback can only
+    affect the statement being processed. Returns {pulled, skipped, failed}.
+    Bookkeeping: next_refresh_at +30 days on success, +1 day on listing
+    failure so transient errors retry daily instead of stalling a month.
     """
+    if item.status == "removed":
+        return {"pulled": 0, "skipped": 0, "failed": 0}
+    item_pk = item.id
+    dealer_id = item.dealer_id
+    item_label = item.item_id[:12]
+
     token = plaid_client.decrypt_token(item.encrypted_access_token)
     if not token:
-        item.status = "error"
-        item.error = "Stored bank credentials could not be read — reconnect the bank."
-        item.next_refresh_at = _now() + timedelta(days=1)
-        await db.flush()
+        await _bookkeep(
+            db, item_pk,
+            error="Stored bank credentials could not be read — reconnect the bank.",
+            retry_days=1,
+        )
         return {"pulled": 0, "skipped": 0, "failed": 1}
 
     try:
         listing = await plaid_client.statements_list(token)
     except plaid_client.PlaidUnavailable as exc:
-        item.status = "error"
-        item.error = str(exc)[:500]
-        item.next_refresh_at = _now() + timedelta(days=1)
-        await db.flush()
+        await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
         return {"pulled": 0, "skipped": 0, "failed": 1}
 
-    if listing.get("institution_name") and not item.institution_name:
-        item.institution_name = str(listing["institution_name"])[:160]
+    institution = listing.get("institution_name")
+    if institution and not item.institution_name:
+        item.institution_name = str(institution)[:160]
+        await db.commit()
+    label = item.institution_name or "Bank"
 
     existing = set(
         (
             await db.execute(
                 select(DealerDocument.plaid_statement_id).where(
-                    DealerDocument.dealer_id == item.dealer_id,
+                    DealerDocument.dealer_id == dealer_id,
                     DealerDocument.plaid_statement_id.is_not(None),
                 )
             )
@@ -79,18 +105,26 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
         .all()
     )
 
-    pulled = skipped = failed = 0
-    for st in listing["statements"][:MAX_STATEMENTS_PER_SYNC]:
+    # Dedupe FIRST, cap the not-yet-ingested remainder — already-pulled
+    # statements must never consume cap slots or the tail past the cap
+    # would stay unreachable forever.
+    fresh = [st for st in listing["statements"] if st["statement_id"] not in existing]
+    skipped = len(listing["statements"]) - len(fresh)
+    capped = fresh[:MAX_STATEMENTS_PER_SYNC]
+    if len(fresh) > len(capped):
+        logger.info(
+            "dealer-os plaid: item %s capping sync at %d of %d new statements (rest next run)",
+            item_label, len(capped), len(fresh),
+        )
+
+    pulled = failed = 0
+    for st in capped:
         sid = st["statement_id"]
-        if sid in existing:
-            skipped += 1
-            continue
         try:
             raw = await plaid_client.statements_download(token, sid)
             if not raw:
                 failed += 1
                 continue
-            label = item.institution_name or "Bank"
             period = (
                 f"{st['year']}-{int(st['month']):02d}"
                 if st.get("year") and st.get("month")
@@ -99,7 +133,7 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
             acct = f" {st['account_name']}" if st.get("account_name") else ""
             doc = await store_document_bytes(
                 db,
-                item.dealer_id,
+                dealer_id,
                 raw,
                 f"{label}{acct} statement {period}.pdf",
                 "application/pdf",
@@ -111,22 +145,19 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
             if isinstance(doc.extracted, dict):
                 notes = list(doc.extracted.get("notes") or [])
                 doc.extracted = {**doc.extracted, "notes": ([note] + notes)[:50]}
-            existing.add(sid)
+            await db.commit()  # each statement durable on its own
             pulled += 1
         except Exception:
             logger.exception(
-                "dealer-os plaid: statement %s failed for item %s", sid[:12], item.item_id[:12]
+                "dealer-os plaid: statement %s failed for item %s", sid[:12], item_label
             )
+            await db.rollback()  # reset for the next statement
             failed += 1
 
-    item.last_pulled_at = _now()
-    item.next_refresh_at = _now() + timedelta(days=plaid_client.REFRESH_EVERY_DAYS)
-    if item.status == "error" or item.error:
-        item.status, item.error = "active", None
-    await db.flush()
+    await _bookkeep(db, item_pk, error=None, retry_days=plaid_client.REFRESH_EVERY_DAYS)
     logger.info(
         "dealer-os plaid: item %s pulled=%d skipped=%d failed=%d",
-        item.item_id[:12], pulled, skipped, failed,
+        item_label, pulled, skipped, failed,
     )
     return {"pulled": pulled, "skipped": skipped, "failed": failed}
 
@@ -145,7 +176,10 @@ async def refresh_due() -> dict:
                 await db.execute(
                     select(DealerPlaidItem.id)
                     .where(
-                        DealerPlaidItem.status == "active",
+                        # 'error' rows stay in the sweep — a transient bank
+                        # blip retries daily instead of silently ending the
+                        # 30-day auto-refresh forever. Only 'removed' is out.
+                        DealerPlaidItem.status.in_(("active", "error")),
                         DealerPlaidItem.next_refresh_at.is_not(None),
                         DealerPlaidItem.next_refresh_at <= _now(),
                     )

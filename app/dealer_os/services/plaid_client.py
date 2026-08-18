@@ -152,7 +152,13 @@ async def statements_list(access_token: str) -> dict[str, Any]:
                     "account_name": None,
                 }
             )
-    return {"institution_name": data.get("institution_name"), "statements": out}
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for st in out:
+        if st["statement_id"] not in seen:
+            seen.add(st["statement_id"])
+            deduped.append(st)
+    return {"institution_name": data.get("institution_name"), "statements": deduped}
 
 
 async def statements_download(access_token: str, statement_id: str) -> bytes:
