@@ -688,8 +688,9 @@ class AddbackPatch(BaseModel):
 
 
 class HandoffRead(BaseModel):
-    intake_id: UUID
-    url: str
+    # Both null on GET when no funding file has been started yet.
+    intake_id: UUID | None = None
+    url: str | None = None
 
 
 _DOC_KINDS_PATTERN = "^(statement|pl|tax|debt_schedule|other)$"

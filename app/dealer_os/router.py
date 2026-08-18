@@ -3909,13 +3909,14 @@ async def start_dealer_handoff(
 async def get_dealer_handoff(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> HandoffRead:
-    """The dealer's existing funding file, 404 when none was started (or the
-    intake it pointed at has since been deleted)."""
+    """The dealer's existing funding file. intake_id is null when none was
+    started (or the intake it pointed at has since been deleted) — a normal
+    state, returned as 200 so browsers don't log console errors for it."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
     intake_id = await handoff_service.find_existing_handoff(db, dealer)
     if intake_id is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No funding file has been started for this dealer")
+        return HandoffRead(intake_id=None, url=None)
     return HandoffRead(intake_id=intake_id, url=handoff_service.handoff_url(intake_id))
 
 
