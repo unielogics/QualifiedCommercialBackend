@@ -782,3 +782,85 @@ def requirements_for_amount(
         return rows
 
     return []
+
+
+# --- the fundability verdict (one decisive answer) ---------------------------
+# PROVISIONAL thresholds, same caveat as every desk constant above.
+VERDICT_FUNDABLE_PCT = 100.0     # a path with every requirement met
+VERDICT_CONDITIONAL_PCT = 75.0   # close — gaps are specific and coachable
+
+
+def fundability_verdict(paths: list[dict], goal: float | None, goal_paths: list[dict] | None = None) -> dict:
+    """Collapse the program grid into ONE answer. PURE.
+
+    verdict: "fundable" (>=1 path with 100% of requirements met and a sized
+    amount), "conditional" (>=1 path at VERDICT_CONDITIONAL_PCT+), else
+    "not_yet". best_path = the strongest program (readiness desc, then
+    typical funding desc). blocking = the unmet requirements of the best
+    path, each with its label/detail so the fix is explicit. goal_feasible
+    reflects requirements_for_amount when a goal exists.
+    """
+    if not paths:
+        return {"verdict": "not_yet", "best_path": None, "blocking": [], "goal_feasible": None}
+
+    def sort_key(p: dict):
+        return (-(p.get("readiness_pct") or 0.0), -(p.get("funding_typical") or 0.0))
+
+    ranked = sorted(paths, key=sort_key)
+    best = ranked[0]
+    readiness = float(best.get("readiness_pct") or 0.0)
+    sized = best.get("funding_typical") is not None
+    if readiness >= VERDICT_FUNDABLE_PCT and sized:
+        verdict = "fundable"
+    elif readiness >= VERDICT_CONDITIONAL_PCT:
+        verdict = "conditional"
+    else:
+        verdict = "not_yet"
+
+    blocking = [r for r in (best.get("requirements") or []) if not r.get("met")]
+
+    goal_feasible = None
+    goal_best = None
+    if goal and goal_paths:
+        feasible = [g for g in goal_paths if g.get("goal_feasible")]
+        goal_feasible = bool(feasible)
+        pool = feasible if feasible else [
+            g for g in goal_paths if g.get("requirements")
+        ]
+        if pool:
+            goal_best = min(
+                pool, key=lambda g: sum(1 for r in (g.get("requirements") or []) if not r.get("met"))
+            )
+
+    return {
+        "verdict": verdict,
+        "best_path": {
+            "key": best.get("key"),
+            "label": best.get("label"),
+            "readiness_pct": readiness,
+            "funding_min": best.get("funding_min"),
+            "funding_typical": best.get("funding_typical"),
+            "funding_max": best.get("funding_max"),
+        },
+        "blocking": [
+            {"label": r.get("label"), "detail": r.get("detail")} for r in blocking
+        ][:6],
+        "goal_feasible": goal_feasible,
+        "goal_best_path": (
+            {
+                "key": goal_best.get("path_key"),
+                "unmet": [
+                    {
+                        "label": r.get("label"),
+                        "required_value": r.get("required_value"),
+                        "current_value": r.get("current_value"),
+                        "gap": r.get("gap"),
+                    }
+                    for r in (goal_best.get("requirements") or [])
+                    if not r.get("met")
+                ][:6],
+            }
+            if goal_best is not None
+            else None
+        ),
+    }

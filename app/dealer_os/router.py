@@ -195,6 +195,7 @@ from .services.paths import (
     DEFAULT_REQUIREMENTS,
     DEFAULT_SIZING,
     PATH_KEYS,
+    fundability_verdict as paths_service_fundability,
     PATH_LABELS,
     compute_ladder,
     compute_paths,
@@ -479,6 +480,46 @@ async def create_dealer_bucket(
     await db.refresh(dealer)
     background.add_task(_background_ingest_bucket_files, dealer.id)
     return await _dealer_read(db, dealer)
+
+
+@router.get("/dealers/{dealer_id}/fundability")
+async def dealer_fundability(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """THE verdict: is this deal fundable — one answer with the receipts.
+
+    Composes the live program grid (readiness + sizing), the funding goal's
+    reverse-engineered requirements, and the strongest program's unmet
+    checklist into fundable | conditional | not_yet. 200 with verdict
+    "no_data" when no snapshot exists yet (a brand-new dealer is not a 400)."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        metrics = await _latest_snapshot_metrics(db, dealer.id)
+    except HTTPException:
+        return {"verdict": "no_data", "best_path": None, "blocking": [], "goal_feasible": None,
+                "goal": None, "goal_best_path": None}
+    targets = await _effective_targets(db, dealer.id)
+    settings = await _global_program_settings(db)
+    deposits_avg = await _monthly_deposits_avg(db, dealer.id)
+    tree = {**metrics, "deposits_monthly_avg": deposits_avg}
+    paths = compute_paths(tree, targets, settings=settings)
+    goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
+    goal_paths = None
+    if goal:
+        goal_paths = []
+        for key in PATH_KEYS:
+            reqs = requirements_for_amount(key, goal, tree, settings=settings)
+            goal_paths.append(
+                {
+                    "path_key": key,
+                    "goal_feasible": (all(r["met"] for r in reqs) if reqs else None),
+                    "requirements": reqs,
+                }
+            )
+    verdict = paths_service_fundability(paths, goal, goal_paths)
+    verdict["goal"] = goal
+    return verdict
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
