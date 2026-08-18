@@ -4635,8 +4635,8 @@ async def plaid_state(
 ) -> PlaidStateRead:
     """Connection panel state. enabled=false (keys not provisioned) renders a
     quiet disabled state — never an error."""
-    require_team_or_dealer(user)
-    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    require_team(user)  # gated off client accounts for now
+    dealer = await load_dealer(db, dealer_id)
     items = await _plaid_items(db, dealer.id)
     return PlaidStateRead(
         enabled=plaid_client.enabled(),
@@ -4652,8 +4652,8 @@ async def plaid_link_token(
     """Start a Plaid Link session — Statements product ONLY (bank statements;
     everything else still comes through upload). The client connects their
     own bank; team can run it alongside them."""
-    require_team_or_dealer(user)
-    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    require_team(user)  # gated off client accounts for now
+    dealer = await load_dealer(db, dealer_id)
     _plaid_cooldown("link", dealer.id, 10)
     try:
         token = await plaid_client.create_link_token(
@@ -4678,8 +4678,8 @@ async def plaid_exchange(
 ) -> DealerPlaidItem:
     """Finish Link: swap the public token, store the encrypted access token,
     and pull the first batch of statements in the background."""
-    require_team_or_dealer(user)
-    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    require_team(user)  # gated off client accounts for now
+    dealer = await load_dealer(db, dealer_id)
     _plaid_cooldown("exchange", dealer.id, 5)
     try:
         access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)

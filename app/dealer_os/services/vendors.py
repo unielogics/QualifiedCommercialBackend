@@ -66,6 +66,14 @@ def normalize_vendor(description: str) -> str:
                 s = s[len(prefix) + 1 :].strip()
                 changed = True
                 break
+    # Reference codes (W0940, M0871, REF A12) reduce to varying 1-2 letter
+    # orphans after digit-stripping — they split one lender into many keys
+    # and break regular-payment detection. Drop trailing short tokens, but
+    # never below one remaining token.
+    tokens = s.split(" ")
+    while len(tokens) > 1 and len(tokens[-1]) <= 2:
+        tokens.pop()
+    s = " ".join(tokens)
     return s[:_KEY_MAX_LEN].strip()
 
 
