@@ -1073,6 +1073,8 @@ class RefinanceRead(BaseModel):
     ebitda_source: str | None = None
     dscr_cash_flow: float | None = None
     net_cash_flow_monthly: float | None = None
+    dscr_draft: float | None = None
+    dscr_display: str | None = None
 
 
 class RefinanceSimulateRequest(BaseModel):

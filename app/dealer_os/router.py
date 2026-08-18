@@ -5198,6 +5198,8 @@ async def dealer_refinance(
         ebitda_source=dscr_m.get("ebitda_source"),
         dscr_cash_flow=dscr_m.get("cash_flow"),
         net_cash_flow_monthly=dscr_m.get("net_cash_flow_monthly"),
+        dscr_draft=dscr_m.get("draft"),
+        dscr_display=dscr_m.get("display"),
     )
 
 
