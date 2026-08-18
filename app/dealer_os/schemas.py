@@ -884,11 +884,17 @@ class DebtDraftResult(BaseModel):
 class PlaidItemRead(ORM):
     id: UUID
     institution_name: str | None = None
+    accounts_label: str | None = None   # "Plaid Checking ··1111 · Savings ··4444"
     status: str
     error: str | None = None
+    auto_refresh: bool = True
     last_pulled_at: datetime | None = None
     next_refresh_at: datetime | None = None
     created_at: datetime
+
+
+class PlaidItemPatch(BaseModel):
+    auto_refresh: bool
 
 
 class PlaidStateRead(BaseModel):
@@ -948,6 +954,13 @@ class RefinanceRead(BaseModel):
     dscr_current: float | None = None
     ebitda_bankable: float | None = None
     adb_current: float | None = None
+    # Provenance — where each DSCR input actually comes from (periods |
+    # observed_ledger | debt_schedule | tax_return | none) + the fully
+    # ledger-derived cash-flow cross-check.
+    dscr_source: str | None = None
+    ebitda_source: str | None = None
+    dscr_cash_flow: float | None = None
+    net_cash_flow_monthly: float | None = None
 
 
 class RefinanceSimulateRequest(BaseModel):

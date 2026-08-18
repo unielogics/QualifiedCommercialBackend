@@ -607,6 +607,10 @@ class DealerPlaidItem(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
     last_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 0128: super-admin controls — pause/resume the 30-day cycle; the
+    # connected accounts' names + last-4 for the row label.
+    auto_refresh: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    accounts_label: Mapped[str | None] = mapped_column(String(200))
 
 
 class DealerGroup(TimestampMixin, Base):

@@ -170,6 +170,15 @@ async def statements_download(access_token: str, statement_id: str) -> bytes:
     return resp.content
 
 
+async def accounts_get(access_token: str) -> list[dict[str, Any]]:
+    """-> [{name, mask}] for the row label ("Plaid Checking ··1111")."""
+    resp = await _post("/accounts/get", {"access_token": access_token})
+    out = []
+    for a in resp.json().get("accounts") or []:
+        out.append({"name": a.get("name") or a.get("official_name"), "mask": a.get("mask")})
+    return out
+
+
 async def item_remove(access_token: str) -> None:
     await _post("/item/remove", {"access_token": access_token})
 

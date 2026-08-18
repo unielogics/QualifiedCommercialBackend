@@ -89,7 +89,19 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
     institution = listing.get("institution_name")
     if institution and not item.institution_name:
         item.institution_name = str(institution)[:160]
-        await db.commit()
+    if not item.accounts_label:
+        try:
+            accts = await plaid_client.accounts_get(token)
+            parts = [
+                " ".join(x for x in (a.get("name"), "··" + a["mask"] if a.get("mask") else None) if x)
+                for a in accts
+                if a.get("name") or a.get("mask")
+            ]
+            if parts:
+                item.accounts_label = (" · ".join(parts))[:200]
+        except plaid_client.PlaidUnavailable:
+            pass  # label is cosmetic — never fail a sync over it
+    await db.commit()
     label = item.institution_name or "Bank"
 
     existing = set(
@@ -180,6 +192,7 @@ async def refresh_due() -> dict:
                         # blip retries daily instead of silently ending the
                         # 30-day auto-refresh forever. Only 'removed' is out.
                         DealerPlaidItem.status.in_(("active", "error")),
+                        DealerPlaidItem.auto_refresh.is_(True),
                         DealerPlaidItem.next_refresh_at.is_not(None),
                         DealerPlaidItem.next_refresh_at <= _now(),
                     )

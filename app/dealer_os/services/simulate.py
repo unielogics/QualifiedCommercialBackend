@@ -71,9 +71,10 @@ def adjusted_fallbacks(
     fallback is only consulted when NO period carries observed debt service,
     so shifting both can never double-count."""
     out = dict(fallbacks or {})
-    drafted = out.get("debt_schedule_monthly")
-    if debt_service_monthly_delta and drafted is not None:
-        out["debt_schedule_monthly"] = max(0.0, float(drafted) + debt_service_monthly_delta)
+    for key in ("debt_schedule_monthly", "debt_service_observed_monthly"):
+        current = out.get(key)
+        if debt_service_monthly_delta and current is not None:
+            out[key] = max(0.0, float(current) + debt_service_monthly_delta)
     return out
 
 

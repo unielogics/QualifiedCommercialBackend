@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import (
     DealerAccount,
     DealerAddback,
+    DealerCashEvent,
     DealerAlert,
     DealerDebt,
     DealerFinancialPeriod,
@@ -172,11 +173,20 @@ def compute_metrics(
     ebitda_bankable = _round2(ebitda_adjusted * BANKABLE_FACTOR) if ebitda_adjusted is not None else None
 
     # --- DSCR --------------------------------------------------------------
+    # Denominator precedence: statement-carried debt service > OBSERVED
+    # ledger debits to debt-like lenders (loans/floorplan — credit cards
+    # excluded: a card paid monthly is operating spend routed through a
+    # card, not debt service, unless an admin confirms a carried balance
+    # on the schedule) > the drafted schedule total.
     monthly_ds = _avg(p.get("debt_service") for p in periods)
     ds_source = "periods"
     if monthly_ds is None:
+        observed = fallbacks.get("debt_service_observed_monthly")
         drafted = fallbacks.get("debt_schedule_monthly")
-        if drafted is not None and float(drafted) > 0:
+        if observed is not None and float(observed) > 0:
+            monthly_ds = float(observed)
+            ds_source = "observed_ledger"
+        elif drafted is not None and float(drafted) > 0:
             monthly_ds = float(drafted)
             ds_source = "debt_schedule"
         else:
@@ -187,6 +197,18 @@ def compute_metrics(
         if ebitda_bankable is not None and annual_ds is not None and annual_ds != 0
         else None
     )
+
+    # Cash-flow cross-check, fully ledger-derived: what the account actually
+    # kept each month vs what it paid lenders. (net + debt) / debt — the
+    # cash-based DSCR a statement lender computes by hand.
+    dep_avg = _avg(p.get("deposits") for p in periods)
+    wd_avg = _avg(p.get("withdrawals") for p in periods)
+    dscr_cash_flow = None
+    net_cash_flow_monthly = None
+    if dep_avg is not None and wd_avg is not None:
+        net_cash_flow_monthly = _round2(dep_avg - wd_avg)
+        if monthly_ds is not None and monthly_ds > 0:
+            dscr_cash_flow = round((net_cash_flow_monthly + monthly_ds) / monthly_ds, 3)
 
     # --- ADB (fall back to avg ending balance when no ADB observed) --------
     adb = _avg(p.get("avg_daily_balance") for p in periods)
@@ -276,6 +298,9 @@ def compute_metrics(
         },
         "dscr": {
             "source": ds_source,
+            "cash_flow": dscr_cash_flow,
+            "net_cash_flow_monthly": net_cash_flow_monthly,
+            "ebitda_source": ebitda_source,
             "monthly_debt_service": _round2(monthly_ds),
             "current": dscr,
             "target": dscr_target,
@@ -477,6 +502,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
             "low_balance": _f(p.low_balance),
             "nsf_count": int(p.nsf_count or 0),
             "deposits": _f(p.deposits),
+            "withdrawals": _f(p.withdrawals),
         }
         for p in period_rows
     ]
@@ -484,16 +510,78 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
     # Fallbacks for figures bank statements cannot carry. Observed values
     # always win; these only fill a gap that would otherwise leave the metric
     # permanently null.
+    # AI-drafted credit-card rows are EXCLUDED: a card paid monthly is
+    # operating spend routed through a card, not debt service. An admin who
+    # confirms a carried balance (edits the row -> origin='admin') puts it
+    # back into the denominator — the precedence law as usual.
+    from sqlalchemy import and_, not_, or_
+
     drafted_monthly = float(
         (
             await db.execute(
                 select(func.coalesce(func.sum(DealerDebt.monthly_payment), 0)).where(
-                    DealerDebt.dealer_id == dealer_id, DealerDebt.status == "active"
+                    DealerDebt.dealer_id == dealer_id,
+                    DealerDebt.status == "active",
+                    not_(
+                        and_(
+                            DealerDebt.category == "credit_card",
+                            DealerDebt.origin != "admin",
+                        )
+                    ),
                 )
             )
         ).scalar_one()
         or 0
     )
+
+    # OBSERVED debt service: what the ledger actually paid to debt-like
+    # lenders (loans/floorplan) in the months the periods cover — credit
+    # cards excluded for the same reason as above. Preferred over the
+    # drafted schedule; statement-carried debt_service still wins overall.
+    observed_ds_monthly = None
+    if period_rows:
+        from .vendors import DEBT_CATEGORIES, rollup_vendors
+
+        months_covered = {r.period for r in period_rows}
+        earliest = min(months_covered)
+        event_rows = (
+            (
+                await db.execute(
+                    select(DealerCashEvent)
+                    .where(
+                        DealerCashEvent.dealer_id == dealer_id,
+                        DealerCashEvent.period >= earliest,
+                    )
+                    .order_by(DealerCashEvent.occurred_on.desc())
+                    .limit(8000)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if event_rows:
+            rolled = rollup_vendors(event_rows)
+            debt_keys = {
+                v.key
+                for v in rolled
+                if v.debt_like and v.category != "credit_card"
+            }
+            if debt_keys:
+                from .vendors import normalize_vendor
+
+                by_month: dict = {}
+                for r in event_rows:
+                    amt = float(r.amount or 0)
+                    if amt >= 0:
+                        continue
+                    if normalize_vendor(r.description or "") in debt_keys:
+                        key = date(r.period.year, r.period.month, 1)
+                        by_month[key] = by_month.get(key, 0.0) + (-amt)
+                # Average over the covered months (months with zero debt
+                # debits count as zero — a skipped payment is information).
+                if by_month:
+                    total = sum(by_month.get(m, 0.0) for m in months_covered)
+                    observed_ds_monthly = round(total / max(len(months_covered), 1), 2)
     latest_filing = (
         await db.execute(
             select(DealerTaxFiling)
@@ -513,6 +601,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         target_rows=target_rows,
         targets=targets,
         fallbacks={
+            "debt_service_observed_monthly": observed_ds_monthly or None,
             "debt_schedule_monthly": drafted_monthly or None,
             "tax_ebitda_annual": _tax_ebitda(latest_filing),
         },

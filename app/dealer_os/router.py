@@ -102,6 +102,7 @@ from .schemas import (
     DebtCreate,
     DebtDraftResult,
     PlaidExchange,
+    PlaidItemPatch,
     PlaidItemRead,
     PlaidLinkTokenRead,
     PlaidRefreshResult,
@@ -4745,13 +4746,47 @@ async def plaid_refresh(
     through extraction — minutes, not a request); idempotent by construction
     (statement-id dedupe), so mashing the button is harmless. Statements
     appear in Files as they extract."""
-    require_team_or_dealer(user)
-    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
     _plaid_cooldown("refresh", dealer.id, 60)
     items = [i for i in await _plaid_items(db, dealer.id) if i.status != "removed"]
     for item in items:
         background.add_task(_background_plaid_first_sync, item.id)
     return PlaidRefreshResult(queued=len(items))
+
+
+@router.patch("/dealers/{dealer_id}/plaid/{item_pk}", response_model=PlaidItemRead)
+async def plaid_patch(
+    dealer_id: UUID,
+    item_pk: UUID,
+    payload: PlaidItemPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPlaidItem:
+    """Super-admin: pause or resume the 30-day automatic refresh for one
+    bank. Paused items keep their connection and history; the scheduler
+    simply skips them until resumed."""
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    item = (
+        await db.execute(
+            select(DealerPlaidItem).where(
+                DealerPlaidItem.id == item_pk, DealerPlaidItem.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this client")
+    item.auto_refresh = payload.auto_refresh
+    if payload.auto_refresh and item.next_refresh_at is None:
+        item.next_refresh_at = datetime.now(timezone.utc)
+    await log_action(
+        db, dealer.id, user, "plaid.auto_refresh", "plaid_item", entity_id=item.id,
+        after={"auto_refresh": payload.auto_refresh},
+    )
+    await db.commit()
+    await db.refresh(item)
+    return item
 
 
 @router.delete("/dealers/{dealer_id}/plaid/{item_pk}", status_code=status.HTTP_204_NO_CONTENT)
@@ -4889,6 +4924,7 @@ async def dealer_refinance(
         )
 
     settings = await _global_program_settings(db)
+    dscr_m = metrics.get("dscr") or {}
     return RefinanceRead(
         debts=rows,
         programs=[RefiProgramRead(**spec) for spec in _refi_program_specs(settings)],
@@ -4896,6 +4932,10 @@ async def dealer_refinance(
         dscr_current=summary.get("dscr"),
         ebitda_bankable=summary.get("ebitda_bankable"),
         adb_current=summary.get("adb"),
+        dscr_source=dscr_m.get("source"),
+        ebitda_source=dscr_m.get("ebitda_source"),
+        dscr_cash_flow=dscr_m.get("cash_flow"),
+        net_cash_flow_monthly=dscr_m.get("net_cash_flow_monthly"),
     )
 
 
