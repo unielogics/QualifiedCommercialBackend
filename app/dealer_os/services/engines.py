@@ -486,9 +486,25 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         merged = rows[0]
         if len(rows) > 1:
 
+            legacy_rows = [r for r in rows if r.account_id is None]
+            tagged_rows = [r for r in rows if r.account_id is not None]
+
             def _sum(field):
-                vals = [float(getattr(r, field)) for r in rows if getattr(r, field) is not None]
-                return sum(vals) if vals else None
+                # A legacy (blended) statement row already contains whatever
+                # tagged rows re-attribute from it — summing both double-
+                # counts (user-confirmed defect). When both exist, take the
+                # LARGER of blended vs tagged-sum: never overstates flows.
+                def _tot(rs):
+                    vals = [float(getattr(r, field)) for r in rs if getattr(r, field) is not None]
+                    return sum(vals) if vals else None
+                if legacy_rows and tagged_rows:
+                    a, b = _tot(legacy_rows), _tot(tagged_rows)
+                    if a is None:
+                        return b
+                    if b is None:
+                        return a
+                    return max(a, b)
+                return _tot(rows)
 
             def _pref(field):
                 for r in rows:
