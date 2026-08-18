@@ -4776,7 +4776,13 @@ async def simulate_refinance(
     if not selected:
         verdict = "no_selection"
     elif dscr_after is None:
-        verdict = "not_yet"
+        # Zero pro-forma debt service means DSCR is undefined because there is
+        # nothing left to service — that's debt-free, not not-yet.
+        verdict = (
+            "feasible"
+            if ebitda_after_annual is not None and proforma_ds <= 0.01
+            else "not_yet"
+        )
     elif dscr_after >= spec["dscr_typical"]:
         verdict = "feasible"
     elif dscr_after >= spec["dscr_floor"]:
