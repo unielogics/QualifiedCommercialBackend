@@ -896,6 +896,18 @@ async def mark_event_recurrence(
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
 
+    def _team_locked(row) -> bool:
+        return (
+            row.categorized_by == "admin"
+            and isinstance(row.flags, dict)
+            and bool(row.flags.get("manual_recurrence"))
+        )
+
+    if is_dealer_actor and _team_locked(event):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This line was marked by your advisor — ask them to change it.",
+        )
     targets = [event]
     vendor_key = normalize_vendor(event.description or "")
     if payload.apply_similar and vendor_key:
@@ -907,7 +919,10 @@ async def mark_event_recurrence(
                 .limit(2000)
             )
         ).scalars().all()
-        targets += [r for r in rows if normalize_vendor(r.description or "") == vendor_key][:499]
+        similar = [r for r in rows if normalize_vendor(r.description or "") == vendor_key]
+        if is_dealer_actor:
+            similar = [r for r in similar if not _team_locked(r)]
+        targets += similar[:499]
 
     for row in targets:
         flags = dict(row.flags) if isinstance(row.flags, dict) else {}
@@ -935,7 +950,8 @@ async def mark_event_recurrence(
             flags.pop("manual_recurrence", None)
             flags.pop("one_time", None)
         row.flags = flags
-        row.categorized_by = "admin" if payload.mark != "clear" else row.categorized_by
+        if payload.mark != "clear":
+            row.categorized_by = "dealer" if is_dealer_actor else "admin"
     await log_action(
         db, dealer.id, user, "cash_event.recurrence_mark", "cash_event",
         entity_id=event.id,

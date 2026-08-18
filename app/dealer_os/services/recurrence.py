@@ -238,8 +238,10 @@ async def stamp_recurrence(db: AsyncSession, dealer_id: UUID) -> int:
             group_by_event[eid] = g
     stamped = 0
     for r in rows:
-        if r.categorized_by == "admin":
-            continue  # human correction wins — same exclusion as the rules engine
+        if r.categorized_by == "admin" or (
+            isinstance(r.flags, dict) and r.flags.get("manual_recurrence")
+        ):
+            continue  # human correction wins — team or client, never restamped
         merged = merge_recurrence_flags(r.flags, group_by_event.get(r.id), r.id in irregular_ids)
         if merged != (r.flags if isinstance(r.flags, dict) else {}):
             r.flags = merged  # reassign a fresh dict so JSONB change-tracking fires
