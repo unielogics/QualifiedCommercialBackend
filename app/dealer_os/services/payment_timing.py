@@ -115,6 +115,7 @@ def cutoff_days(events: Iterable) -> list[dict]:
     for acct in months_seen:
         doc_ends = [_clamp_day(d.day) for d in by_acct_doc.get(acct, {}).values()]
         estimated = False
+        from_range = False
         if len(doc_ends) >= 2:
             cutoff = _clamp_day(round(median(doc_ends)))
         else:
@@ -122,12 +123,22 @@ def cutoff_days(events: Iterable) -> list[dict]:
             if not months:
                 continue
             cutoff = _clamp_day(round(median(months.values())))
-            estimated = True
+            # Statement-range tier: the ledger IS the statements, so >= 2
+            # observed months whose activity runs to month-end means the
+            # statement range itself fixes the cycle at the calendar close —
+            # a derivation, not an estimate. Only a mid-cycle median (one
+            # doc, partial coverage) stays hedged.
+            if len(months) >= 2 and cutoff >= _MONTH_END_CUTOFF_DAY:
+                from_range = True
+            else:
+                estimated = True
         basis = (
             "calendar month-end"
             if cutoff >= _MONTH_END_CUTOFF_DAY
             else f"mid-cycle ~day {cutoff}"
         )
+        if from_range:
+            basis += " · from statement range"
         if estimated:
             basis += " (est.)"
         rows.append(

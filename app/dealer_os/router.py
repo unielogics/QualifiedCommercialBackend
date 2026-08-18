@@ -4755,15 +4755,15 @@ async def simulate_refinance(
     scenario_periods = refinance_svc.removal_effects(
         inputs.periods, selected, observed, new_payment_monthly=new_pay
     )
-    # Statements-only dealers carry no period EBITDA — route the financing-cost
-    # add-back through the addbacks channel there instead (never both).
+    # The financing-cost add-back applies PERIOD-LEVEL only (removal_effects
+    # raised ebitda_reported). When no period carries EBITDA the engine falls
+    # back to the tax return, and _tax_ebitda has ALREADY added interest back
+    # — stacking the add-back there double-counts it (review-confirmed).
     has_period_ebitda = any(p.get("ebitda_reported") is not None for p in inputs.periods)
-    scenario_addbacks = inputs.addbacks_annual_verified + (
-        0.0 if has_period_ebitda else ebitda_addback_annual
-    )
+    applied_addback_annual = ebitda_addback_annual if has_period_ebitda else 0.0
     scenario_metrics = compute_metrics(
         scenario_periods,
-        scenario_addbacks,
+        inputs.addbacks_annual_verified,
         inputs.targets,
         fallbacks=simulate.adjusted_fallbacks(inputs.fallbacks, new_pay - freed),
     )
@@ -4814,7 +4814,7 @@ async def simulate_refinance(
             retained_ds_monthly=round(retained, 2),
             proforma_ds_monthly=proforma_ds,
             savings_monthly=round(freed - new_pay, 2),
-            ebitda_addback_annual=ebitda_addback_annual,
+            ebitda_addback_annual=applied_addback_annual,
             adb_lift_estimate=adb_lift,
             amount=round(amount, 2),
             max_principal_at_floor=max_at_floor,
