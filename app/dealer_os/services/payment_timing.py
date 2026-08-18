@@ -143,7 +143,12 @@ def cutoff_days(events: Iterable) -> list[dict]:
     return rows
 
 
-def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], months_window: int = 6) -> dict:
+def analyze_timing(
+    events: Iterable,
+    vendors_rollup: Sequence[VendorRollup],
+    months_window: int = 6,
+    force_recurring_keys: set | None = None,
+) -> dict:
     """events: cash-event rows (occurred_on, description, amount, account_id?)
     already windowed by the caller; vendors_rollup: the full-ledger rollup.
 
