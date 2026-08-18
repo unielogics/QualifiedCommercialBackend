@@ -4621,7 +4621,7 @@ async def mca_readiness_read(
     metrics = compute_metrics(
         inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
     )
-    rolled = await _vendor_rollup(db, dealer)
+    rolled, _n = await _vendor_rollup(db, dealer)
     result = mca_svc.compute_mca_readiness(
         inputs.periods, rolled, (metrics.get("adb") or {}).get("current")
     )
