@@ -47,7 +47,13 @@ async def _verify_clerk_jwt(token: str) -> dict:
     jwks = await _get_jwks()
     if not jwks:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Clerk JWKS not configured")
-    headers = jwt.get_unverified_header(token)
+    try:
+        headers = jwt.get_unverified_header(token)
+    except Exception as exc:
+        # A non-JWT string (corrupted storage, truncation, plain garbage)
+        # raises ValueError/DecodeError BEFORE the guarded decode below —
+        # that must be a 401 so clients re-authenticate, never a 500.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Malformed bearer token") from exc
     kid = headers.get("kid")
     keys = jwks.get("keys", [])
     key_data = next((k for k in keys if k.get("kid") == kid), None)
