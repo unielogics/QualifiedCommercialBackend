@@ -113,6 +113,13 @@ class SummaryResult:
     used_stub: bool
 
 
+def _stage_label(loan) -> str:
+    """loan.stage arrives as an Enum in most paths but a bare string in some
+    (rows loaded without enum coercion) — both are crash-proof here."""
+    raw = getattr(loan.stage, "value", loan.stage)
+    return str(raw).replace("_", " ").title()
+
+
 def _format_summary_text(profile: dict[str, Any]) -> str:
     """Render the structured profile as a single paragraph for back-compat
     consumers that read loans.status_summary as a plain string."""
@@ -161,16 +168,16 @@ def _stub_profile(
 
     if flagged:
         deal_health = DealHealth.STUCK
-        status = f"{loan.stage.value.replace('_', ' ').title()}: hard block on {len(flagged)} flagged document{'s' if len(flagged) > 1 else ''}."
+        status = f"{_stage_label(loan)}: hard block on {len(flagged)} flagged document{'s' if len(flagged) > 1 else ''}."
     elif len(pending) >= 3:
         deal_health = DealHealth.AT_RISK
-        status = f"{loan.stage.value.replace('_', ' ').title()}: {len(pending)} doc requests still open."
+        status = f"{_stage_label(loan)}: {len(pending)} doc requests still open."
     elif pending:
         deal_health = DealHealth.AT_RISK
-        status = f"{loan.stage.value.replace('_', ' ').title()}: awaiting {pending[0]}."
+        status = f"{_stage_label(loan)}: awaiting {pending[0]}."
     else:
         deal_health = DealHealth.ON_TRACK
-        status = f"{loan.stage.value.replace('_', ' ').title()}: no open blockers."
+        status = f"{_stage_label(loan)}: no open blockers."
 
     if market_pulse:
         warning = market_pulse.get("warning")
