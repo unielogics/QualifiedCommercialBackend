@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import (
     DealerAccount,
+    DealerBusiness,
     DealerAddback,
     DealerCashEvent,
     DealerAlert,
@@ -201,6 +202,15 @@ def compute_metrics(
     # Cash-flow cross-check, fully ledger-derived: what the account actually
     # kept each month vs what it paid lenders. (net + debt) / debt — the
     # cash-based DSCR a statement lender computes by hand.
+    # DSCR at the funding goal: coverage of (current DS + the goal's implied
+    # payment) — defined even at zero current debt.
+    goal_payment = (fallbacks or {}).get("goal_monthly_payment")
+    dscr_at_goal = None
+    if goal_payment and ebitda_bankable is not None:
+        goal_ds_annual = ((monthly_ds or 0.0) + float(goal_payment)) * 12.0
+        if goal_ds_annual > 0:
+            dscr_at_goal = round(ebitda_bankable / goal_ds_annual, 3)
+
     dep_avg = _avg(p.get("deposits") for p in periods)
     wd_avg = _avg(p.get("withdrawals") for p in periods)
     dscr_cash_flow = None
@@ -299,6 +309,7 @@ def compute_metrics(
         "dscr": {
             "source": ds_source,
             "cash_flow": dscr_cash_flow,
+            "at_goal": dscr_at_goal,
             "net_cash_flow_monthly": net_cash_flow_monthly,
             "ebitda_source": ebitda_source,
             "monthly_debt_service": _round2(monthly_ds),
@@ -387,11 +398,17 @@ class MetricInputs:
 
     @property
     def addbacks_annual_verified(self) -> float:
-        return sum(
-            float(a.annual_amount)
-            for a in self.addback_rows
-            if a.status == "verified" and a.annual_amount is not None
-        )
+        # annual_amount wins; a monthly-only addback annualizes x12 (it used
+        # to contribute 0 — a real bug the DSCR-composition round fixed).
+        total = 0.0
+        for a in self.addback_rows:
+            if a.status != "verified":
+                continue
+            if a.annual_amount is not None:
+                total += float(a.annual_amount)
+            elif a.monthly_amount is not None:
+                total += float(a.monthly_amount) * 12.0
+        return total
 
 
 async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
@@ -520,28 +537,22 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
     # Fallbacks for figures bank statements cannot carry. Observed values
     # always win; these only fill a gap that would otherwise leave the metric
     # permanently null.
-    # AI-drafted credit-card rows are EXCLUDED: a card paid monthly is
-    # operating spend routed through a card, not debt service. An admin who
-    # confirms a carried balance (edits the row -> origin='admin') puts it
-    # back into the denominator — the precedence law as usual.
-    from sqlalchemy import and_, not_, or_
-
-    drafted_monthly = float(
+    # The debt schedule IS the DSCR denominator ledger (0129): every active
+    # row with count_in_dscr contributes. For vendor-linked rows the OBSERVED
+    # monthly debits win over the stated figure (primary source = what the
+    # statements actually show); stated monthly_payment is the fallback.
+    dscr_debt_rows = (
         (
             await db.execute(
-                select(func.coalesce(func.sum(DealerDebt.monthly_payment), 0)).where(
+                select(DealerDebt).where(
                     DealerDebt.dealer_id == dealer_id,
                     DealerDebt.status == "active",
-                    not_(
-                        and_(
-                            DealerDebt.category == "credit_card",
-                            DealerDebt.origin != "admin",
-                        )
-                    ),
+                    DealerDebt.count_in_dscr.is_(True),
                 )
             )
-        ).scalar_one()
-        or 0
+        )
+        .scalars()
+        .all()
     )
 
     # OBSERVED debt service: what the ledger actually paid to debt-like
@@ -549,6 +560,8 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
     # cards excluded for the same reason as above. Preferred over the
     # drafted schedule; statement-carried debt_service still wins overall.
     observed_ds_monthly = None
+    observed_avg_by_debt: dict = {}
+    event_rows = []
     if period_rows:
         from .vendors import DEBT_CATEGORIES, rollup_vendors
 
@@ -592,6 +605,46 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                 if by_month:
                     total = sum(by_month.get(m, 0.0) for m in months_covered)
                     observed_ds_monthly = round(total / max(len(months_covered), 1), 2)
+
+        # Per-schedule-row observed averages (containment-tolerant identity —
+        # the same matcher the refinance workbench uses).
+        if dscr_debt_rows and event_rows:
+            from .refinance import observed_monthly as _debt_observed
+
+            per_debt = _debt_observed(event_rows, dscr_debt_rows)
+            n_months = max(len(months_covered), 1)
+            for row in dscr_debt_rows:
+                by_m = per_debt.get(row.id) or {}
+                if by_m:
+                    observed_avg_by_debt[row.id] = round(
+                        sum(by_m.get(m, 0.0) for m in months_covered) / n_months, 2
+                    )
+
+    drafted_monthly = 0.0
+    for row in dscr_debt_rows:
+        observed = observed_avg_by_debt.get(row.id)
+        if observed is not None and observed > 0:
+            drafted_monthly += observed
+        elif row.monthly_payment is not None:
+            drafted_monthly += float(row.monthly_payment)
+    drafted_monthly = round(drafted_monthly, 2)
+    # DSCR-at-goal: the payment the funding goal implies at the desk's
+    # conventional terms — gives the tile a meaningful ratio even at zero
+    # current debt ("there is always a DSCR ratio").
+    goal_payment = None
+    goal_row = (
+        await db.execute(select(DealerBusiness.funding_goal).where(DealerBusiness.id == dealer_id))
+    ).scalar_one_or_none()
+    if goal_row:
+        from .paths import merged_settings, monthly_payment_for_goal
+
+        setting_rows = (
+            (await db.execute(select(DealerProgramSetting))).scalars().all()
+        )
+        goal_payment = monthly_payment_for_goal(
+            float(goal_row), settings=merged_settings(setting_rows)
+        )
+
     latest_filing = (
         await db.execute(
             select(DealerTaxFiling)
@@ -613,6 +666,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         fallbacks={
             "debt_service_observed_monthly": observed_ds_monthly or None,
             "debt_schedule_monthly": drafted_monthly or None,
+            "goal_monthly_payment": goal_payment,
             "tax_ebitda_annual": _tax_ebitda(latest_filing),
         },
     )

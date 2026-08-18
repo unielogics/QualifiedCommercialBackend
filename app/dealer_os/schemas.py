@@ -878,6 +878,82 @@ class DebtDraftResult(BaseModel):
     debts: list[DebtRead] = []
 
 
+# --- DSCR composition (0129) — the clickable DSCR container ------------------
+
+
+class DscrAddbackRead(ORM):
+    id: UUID
+    title: str
+    status: str
+    monthly_amount: float | None = None
+    annual_amount: float | None = None
+    annualized: float = 0.0            # annual ?? monthly x 12; 0 unless verified
+    document_id: UUID | None = None
+    source_event_id: UUID | None = None
+
+
+class DscrComponentRead(BaseModel):
+    debt_id: UUID
+    lender: str
+    category: str
+    origin: str
+    source: str                        # contract | drafted | manual
+    stated_monthly: float | None = None
+    observed_monthly: float | None = None
+    effective_monthly: float = 0.0     # what actually enters the denominator
+    count_in_dscr: bool = True
+    vendor_key: str | None = None
+    document_id: UUID | None = None
+
+
+class DscrSuggestionRead(BaseModel):
+    vendor_key: str
+    label: str
+    monthly_avg: float
+    months: int
+    count: int
+    category: str
+
+
+class DscrNumeratorRead(BaseModel):
+    ebitda_source: str | None = None
+    reported_ttm: float | None = None
+    addbacks: list[DscrAddbackRead] = []
+    adjusted: float | None = None
+    bankable: float | None = None
+
+
+class DscrResultsRead(BaseModel):
+    dscr_current: float | None = None
+    at_goal: float | None = None
+    cash_flow: float | None = None
+    net_cash_flow_monthly: float | None = None
+    monthly_debt_service: float | None = None
+    ds_source: str | None = None
+    funding_goal: float | None = None
+    goal_monthly_payment: float | None = None
+
+
+class DscrNetPoint(BaseModel):
+    month: str                         # YYYY-MM
+    net: float | None = None
+
+
+class DscrCompositionRead(BaseModel):
+    numerator: DscrNumeratorRead
+    components: list[DscrComponentRead] = []
+    suggestions: list[DscrSuggestionRead] = []
+    results: DscrResultsRead
+    net_series: list[DscrNetPoint] = []
+
+
+class DscrComponentAction(BaseModel):
+    action: str = Field(pattern="^(toggle|add_vendor)$")
+    debt_id: UUID | None = None
+    count_in_dscr: bool | None = None
+    vendor_key: str | None = Field(default=None, max_length=60)
+
+
 # --- Plaid bank connections (0127, statements only) -------------------------
 
 

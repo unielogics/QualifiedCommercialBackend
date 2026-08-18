@@ -107,6 +107,14 @@ from .schemas import (
     PlaidLinkTokenRead,
     PlaidRefreshResult,
     PlaidStateRead,
+    DscrAddbackRead,
+    DscrComponentAction,
+    DscrComponentRead,
+    DscrCompositionRead,
+    DscrNetPoint,
+    DscrNumeratorRead,
+    DscrResultsRead,
+    DscrSuggestionRead,
     RefiDebtRead,
     RefinanceRead,
     RefinanceScenarioRead,
@@ -1605,7 +1613,15 @@ async def document_coverage(
             months.add(f"{period.year:04d}-{period.month:02d}")
 
     has_pl = False
-    has_debt_schedule = False
+    has_debt_schedule = bool(
+        (
+            await db.execute(
+                select(func.count()).select_from(DealerDebt).where(
+                    DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active"
+                )
+            )
+        ).scalar_one()
+    )
     doc_rows = (
         await db.execute(
             select(
@@ -4586,6 +4602,226 @@ async def delete_debt(
         await db.delete(row)
     await log_action(db, dealer.id, user, "debts.delete", "debt", entity_id=debt_id)
     await db.commit()
+
+
+# --- DSCR composition (0129) — the clickable DSCR container --------------------
+
+
+def _addback_annualized(a) -> float:
+    if a.status != "verified":
+        return 0.0
+    if a.annual_amount is not None:
+        return float(a.annual_amount)
+    if a.monthly_amount is not None:
+        return round(float(a.monthly_amount) * 12.0, 2)
+    return 0.0
+
+
+@router.get("/dealers/{dealer_id}/dscr/composition", response_model=DscrCompositionRead)
+async def dscr_composition(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DscrCompositionRead:
+    """Everything the DSCR is built from, itemized: the numerator build-up
+    (EBITDA source -> add-backs -> bankable), every denominator component
+    (a debt-schedule row, observed-vs-stated monthly, include flag), and
+    observed debt-like vendors not yet on the schedule as suggestions."""
+    require_team_or_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    inputs = await load_metric_inputs(db, dealer.id)
+    metrics = compute_metrics(
+        inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
+    )
+    dscr_m = metrics.get("dscr") or {}
+    ebitda_m = metrics.get("ebitda") or {}
+
+    debts = (
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.monthly_payment.desc().nullslast())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    events, _ov, _sn = await _load_vendor_inputs(db, dealer)
+    observed = refinance_svc.observed_monthly(events, debts)
+    months_covered = {p["period"].replace(day=1) for p in inputs.periods if p.get("period")}
+    n_months = max(len(months_covered), 1)
+
+    components: list[DscrComponentRead] = []
+    for d in debts:
+        by_m = observed.get(d.id) or {}
+        obs = round(sum(by_m.get(m, 0.0) for m in months_covered) / n_months, 2) if by_m else None
+        stated = float(d.monthly_payment) if d.monthly_payment is not None else None
+        effective = obs if (obs is not None and obs > 0) else (stated or 0.0)
+        components.append(
+            DscrComponentRead(
+                debt_id=d.id,
+                lender=d.lender,
+                category=d.category,
+                origin=d.origin,
+                source="contract" if d.document_id else ("drafted" if d.origin == "ai_draft" else "manual"),
+                stated_monthly=stated,
+                observed_monthly=obs,
+                effective_monthly=round(effective, 2),
+                count_in_dscr=bool(d.count_in_dscr),
+                vendor_key=d.vendor_key,
+                document_id=d.document_id,
+            )
+        )
+
+    # Observed debt-like vendors (non-card, recurring) with no schedule row yet.
+    rolled = vendors.rollup_vendors(events)
+    covered_keys = [d.vendor_key for d in debts if d.vendor_key]
+    suggestions = [
+        DscrSuggestionRead(
+            vendor_key=v.key,
+            label=(v.sample_description or v.key)[:80],
+            monthly_avg=round(abs(v.monthly_average), 2),
+            months=v.months,
+            count=v.count,
+            category=v.category,
+        )
+        for v in rolled
+        if v.debt_like
+        and v.category != "credit_card"
+        and v.is_recurring
+        and not any(refinance_svc.key_matches(k, v.key) for k in covered_keys)
+    ]
+
+    net_series = [
+        DscrNetPoint(
+            month=p["period"].strftime("%Y-%m"),
+            net=(
+                round(float(p["deposits"]) - float(p["withdrawals"]), 2)
+                if p.get("deposits") is not None and p.get("withdrawals") is not None
+                else None
+            ),
+        )
+        for p in sorted(inputs.periods, key=lambda x: x.get("period"))
+        if p.get("period")
+    ]
+
+    return DscrCompositionRead(
+        numerator=DscrNumeratorRead(
+            ebitda_source=ebitda_m.get("source"),
+            reported_ttm=ebitda_m.get("reported_ttm"),
+            addbacks=[
+                DscrAddbackRead(
+                    id=a.id, title=a.title, status=a.status,
+                    monthly_amount=a.monthly_amount, annual_amount=a.annual_amount,
+                    annualized=_addback_annualized(a),
+                    document_id=a.document_id, source_event_id=a.source_event_id,
+                )
+                for a in inputs.addback_rows
+                if a.status != "excluded"
+            ],
+            adjusted=ebitda_m.get("adjusted"),
+            bankable=ebitda_m.get("bankable"),
+        ),
+        components=components,
+        suggestions=suggestions,
+        results=DscrResultsRead(
+            dscr_current=dscr_m.get("current"),
+            at_goal=dscr_m.get("at_goal"),
+            cash_flow=dscr_m.get("cash_flow"),
+            net_cash_flow_monthly=dscr_m.get("net_cash_flow_monthly"),
+            monthly_debt_service=dscr_m.get("monthly_debt_service"),
+            ds_source=dscr_m.get("source"),
+            funding_goal=float(dealer.funding_goal) if dealer.funding_goal is not None else None,
+            goal_monthly_payment=(inputs.fallbacks or {}).get("goal_monthly_payment"),
+        ),
+        net_series=net_series,
+    )
+
+
+@router.post("/dealers/{dealer_id}/dscr/components", response_model=DscrComponentRead)
+async def dscr_component_action(
+    dealer_id: UUID,
+    payload: DscrComponentAction,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DscrComponentRead:
+    """Add/remove DSCR denominator components — always through the debt
+    schedule (the single ledger). toggle flips count_in_dscr on a row;
+    add_vendor materializes an observed lender into a schedule row."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+
+    if payload.action == "toggle":
+        if payload.debt_id is None or payload.count_in_dscr is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "toggle needs debt_id and count_in_dscr")
+        row = (
+            await db.execute(
+                select(DealerDebt).where(DealerDebt.id == payload.debt_id, DealerDebt.dealer_id == dealer.id)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt row not found for this client")
+        before = {"count_in_dscr": row.count_in_dscr}
+        row.count_in_dscr = payload.count_in_dscr
+        row.origin = "admin"  # a human decided — re-drafts never override
+        await log_action(
+            db, dealer.id, user, "debts.dscr_toggle", "debt", entity_id=row.id,
+            before=before, after={"count_in_dscr": payload.count_in_dscr},
+        )
+    elif payload.action == "add_vendor":
+        if not payload.vendor_key:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "add_vendor needs vendor_key")
+        events, _ov, _sn = await _load_vendor_inputs(db, dealer)
+        rolled = vendors.rollup_vendors(events)
+        v = next((x for x in rolled if x.key == payload.vendor_key), None)
+        if v is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No observed vendor with that key")
+        existing = (
+            await db.execute(
+                select(DealerDebt).where(
+                    DealerDebt.dealer_id == dealer.id, DealerDebt.vendor_key == v.key
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.status, existing.count_in_dscr, existing.origin = "active", True, "admin"
+            row = existing
+        else:
+            row = DealerDebt(
+                dealer_id=dealer.id,
+                lender=(v.sample_description or v.key)[:180],
+                category=v.category if v.category in ("floorplan", "loan", "credit_card") else "loan",
+                monthly_payment=round(abs(v.monthly_average), 2),
+                origin="admin",
+                status="active",
+                count_in_dscr=True,
+                vendor_key=v.key,
+                evidence={"source": "dscr_composer", "observed_months": v.months, "observed_count": v.count},
+            )
+            db.add(row)
+        await db.flush()
+        await log_action(
+            db, dealer.id, user, "debts.create", "debt", entity_id=row.id,
+            after={"lender": row.lender, "via": "dscr_composer"},
+        )
+    else:  # unreachable given the schema pattern
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown action")
+
+    try:
+        await recompute_snapshot(db, dealer.id)
+    except Exception:
+        logger.exception("dealer-os: snapshot recompute failed after dscr component action")
+    await db.commit()
+    await db.refresh(row)
+    return DscrComponentRead(
+        debt_id=row.id, lender=row.lender, category=row.category, origin=row.origin,
+        source="contract" if row.document_id else ("drafted" if row.origin == "ai_draft" else "manual"),
+        stated_monthly=float(row.monthly_payment) if row.monthly_payment is not None else None,
+        observed_monthly=None,
+        effective_monthly=float(row.monthly_payment or 0),
+        count_in_dscr=bool(row.count_in_dscr),
+        vendor_key=row.vendor_key, document_id=row.document_id,
+    )
 
 
 # --- Plaid bank connections (0127, statements only) ----------------------------

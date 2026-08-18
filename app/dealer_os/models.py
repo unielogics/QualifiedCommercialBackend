@@ -512,6 +512,11 @@ class DealerDebt(TimestampMixin, Base):
     vendor_key: Mapped[str | None] = mapped_column(String(60))
     evidence: Mapped[dict | None] = mapped_column(JSONB)
     notes: Mapped[str | None] = mapped_column(Text)
+    # 0129: THE per-row DSCR law — this row's monthly figure counts toward
+    # the debt-service denominator iff true. Toggled from the DSCR composer,
+    # audited; drafted credit cards default false (operating spend routed
+    # through a card), everything else true.
+    count_in_dscr: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     # Refinance workbench (0126): the contract's native cadence. monthly_payment
     # stays the monthly EQUIVALENT the engines read; payment_amount/frequency
     # preserve what the agreement actually says ($420/day daily MCA).
