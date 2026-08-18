@@ -223,7 +223,8 @@ def analyze_timing(events: Iterable, vendors_rollup: Sequence[VendorRollup], mon
     # --- recurring outflow vendors (shift candidates) ----------------------
     recurring = []
     for v in vendors_rollup:  # rollup order = |total| desc, the read order
-        if v.direction != -1 or not (v.debt_like or v.is_recurring):
+        forced = bool(force_recurring_keys and v.key in force_recurring_keys)
+        if v.direction != -1 or not (v.debt_like or v.is_recurring or forced):
             continue
         observed = vendor_days.get(v.key)
         if not observed:

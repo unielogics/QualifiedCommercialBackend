@@ -289,3 +289,79 @@ def compute_freshness(covered_months: Iterable[str], today: date) -> dict[str, A
         "is_current": is_current,
         "days_since_latest": days_since_latest,
     }
+
+
+def apply_manual_marks(
+    events: list, manual: dict, groups: list
+) -> tuple[list, set]:
+    """Overlay ADMIN recurrence marks on the detected groups. PURE.
+
+    manual maps event id -> "recurring" | "one_time". One-timed events leave
+    any detected group (dropping a group below MIN_OCCURRENCES dissolves it);
+    recurring-marked events whose merchant key produced no detected group get
+    a synthesized group (cadence from intervals when they fit a band, else
+    assumed monthly). Returns (groups, force_irregular_ids) — the caller adds
+    force_irregular_ids (manually one-timed OUTFLOWS) to the irregular list
+    regardless of size thresholds. Detection never overwrites these marks;
+    this function makes the live view agree with them.
+    """
+    one_time_ids = {eid for eid, mark in manual.items() if mark == "one_time"}
+    recurring_ids = {eid for eid, mark in manual.items() if mark == "recurring"}
+
+    kept_groups = []
+    for g in groups:
+        members = [eid for eid in g.event_ids if eid not in one_time_ids]
+        if len(members) >= MIN_OCCURRENCES:
+            g.event_ids = members
+            kept_groups.append(g)
+    covered = {eid for g in kept_groups for eid in g.event_ids}
+
+    # Synthesize groups for admin-marked vendors detection didn't find.
+    by_key: dict[tuple[str, int], list] = {}
+    for e in events:
+        if e.id not in recurring_ids or e.id in covered:
+            continue
+        amount = float(e.amount or 0)
+        if amount == 0:
+            continue
+        key = normalize_desc(e.description)
+        if not key:
+            key = (e.description or "MANUAL").strip().upper()[:_KEY_MAX_LEN] or "MANUAL"
+        by_key.setdefault((key, 1 if amount > 0 else -1), []).append(e)
+
+    for (key, sign), members in by_key.items():
+        members = sorted(members, key=lambda ev: ev.occurred_on)
+        amounts = [float(m.amount) for m in members]
+        days = [m.occurred_on for m in members]
+        cadence, cadence_days = "monthly", 30
+        if len(days) >= 2:
+            gaps = [(days[i + 1] - days[i]).days for i in range(len(days) - 1)]
+            med = sorted(gaps)[len(gaps) // 2]
+            for lo, hi, name, ndays in _CADENCE_BANDS:
+                if lo <= med <= hi:
+                    cadence, cadence_days = name, ndays
+                    break
+        med_amt = sorted(amounts)[len(amounts) // 2]
+        mad = sorted(abs(a - med_amt) for a in amounts)[len(amounts) // 2]
+        kept_groups.append(
+            RecurringGroup(
+                key=key,
+                sample_description=(members[-1].description or key)[:120],
+                cadence=cadence,
+                occurrences=len(members),
+                avg_amount=round(sum(amounts) / len(amounts), 2),
+                median_amount=round(med_amt, 2),
+                amount_stable=(abs(med_amt) > 0 and mad / abs(med_amt) <= STABILITY_MAX_MAD_RATIO),
+                first_seen=days[0],
+                last_seen=days[-1],
+                next_expected_on=days[-1] + timedelta(days=cadence_days),
+                direction="inflow" if sign > 0 else "outflow",
+                event_ids=[m.id for m in members],
+            )
+        )
+
+    kept_groups.sort(key=lambda g: -abs(g.monthly_equivalent))
+    force_irregular = {
+        e.id for e in events if e.id in one_time_ids and float(e.amount or 0) < 0
+    }
+    return kept_groups, force_irregular

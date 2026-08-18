@@ -143,6 +143,7 @@ from .schemas import (
     PlanCommentCreate,
     PlanCommentRead,
     PlanRespond,
+    RecurrenceMark,
     ProgramSettingRead,
     ProgramSettingsRead,
     ProgramSettingUpdate,
@@ -870,6 +871,72 @@ async def search_cash_events(
     )
 
 
+@router.post("/dealers/{dealer_id}/cash-events/{event_id}/recurrence")
+async def mark_event_recurrence(
+    dealer_id: UUID,
+    event_id: UUID,
+    payload: RecurrenceMark,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """ADMIN recurrence override: mark a transaction (and optionally every
+    line from the same counterparty) as recurring or one-time when detection
+    lacks the history to see it. Human correction is law — marked rows get
+    categorized_by='admin', which the stamping engine skips, and the live
+    recurring view overlays these marks on top of detection."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    event = (
+        await db.execute(
+            select(DealerCashEvent).where(
+                DealerCashEvent.id == event_id, DealerCashEvent.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Cash event not found for this dealer")
+
+    targets = [event]
+    vendor_key = normalize_vendor(event.description or "")
+    if payload.apply_similar and vendor_key:
+        rows = (
+            await db.execute(
+                select(DealerCashEvent)
+                .where(DealerCashEvent.dealer_id == dealer.id, DealerCashEvent.id != event.id)
+                .order_by(DealerCashEvent.occurred_on.desc())
+                .limit(2000)
+            )
+        ).scalars().all()
+        targets += [r for r in rows if normalize_vendor(r.description or "") == vendor_key][:499]
+
+    for row in targets:
+        flags = dict(row.flags) if isinstance(row.flags, dict) else {}
+        if payload.mark == "recurring":
+            flags["manual_recurrence"] = "recurring"
+            flags["recurring"] = True
+            flags.pop("one_time", None)
+        elif payload.mark == "one_time":
+            flags["manual_recurrence"] = "one_time"
+            flags["recurring"] = False
+            flags["one_time"] = True
+            flags["irregular"] = True
+            flags.pop("cadence", None)
+            flags.pop("recurrence_key", None)
+        else:  # clear — hand the rows back to automatic detection
+            flags.pop("manual_recurrence", None)
+            flags.pop("one_time", None)
+        row.flags = flags
+        row.categorized_by = "admin" if payload.mark != "clear" else row.categorized_by
+    await log_action(
+        db, dealer.id, user, "cash_event.recurrence_mark", "cash_event",
+        entity_id=event.id,
+        after={"mark": payload.mark, "apply_similar": payload.apply_similar,
+               "updated": len(targets), "vendor_key": vendor_key or None},
+    )
+    await db.commit()
+    return {"updated": len(targets), "mark": payload.mark, "vendor_key": vendor_key or None}
+
+
 @router.patch("/dealers/{dealer_id}/cash-events/{event_id}", response_model=CashEventRead)
 async def patch_cash_event(
     dealer_id: UUID,
@@ -958,6 +1025,7 @@ async def recurring_view(
                 DealerCashEvent.description,
                 DealerCashEvent.amount,
                 DealerCashEvent.category,
+                DealerCashEvent.flags,
             )
             .where(DealerCashEvent.dealer_id == dealer.id)
             # Newest window — over-cap ledgers drop the OLDEST rows, never the
@@ -967,13 +1035,29 @@ async def recurring_view(
         )
     ).all()
     today = date.today()
+    manual = {}
     lite = [
         recurrence.EventLite(rid, occurred_on, description or "", float(amount or 0))
-        for rid, occurred_on, description, amount, _category in rows
+        for rid, occurred_on, description, amount, _category, _flags in rows
     ]
-    category_by_id = {rid: category for rid, _o, _d, _a, category in rows}
+    category_by_id = {rid: category for rid, _o, _d, _a, category, _f in rows}
+    for rid, _o, _d, _a, _c, flags in rows:
+        mark = (flags or {}).get("manual_recurrence") if isinstance(flags, dict) else None
+        if mark in ("recurring", "one_time"):
+            manual[rid] = mark
     groups = recurrence.detect_groups(lite)  # already sorted by |monthly_equivalent| desc
+    if manual:
+        groups, force_irregular = recurrence.apply_manual_marks(lite, manual, groups)
+    else:
+        force_irregular = set()
     irregular = recurrence.classify_irregular(lite, groups)
+    if force_irregular:
+        by_id = {e.id: e for e in lite}
+        have = {e.id for e in irregular}
+        irregular = list(irregular) + [
+            by_id[i] for i in force_irregular if i in by_id and i not in have
+        ]
+        irregular.sort(key=lambda e: e.occurred_on, reverse=True)
     irregular.sort(key=lambda e: e.occurred_on, reverse=True)
     return RecurringRead(
         groups=[
@@ -5254,8 +5338,16 @@ async def dealer_payment_timing(
     )
     for c in cutoffs:
         c["account_name"] = names.get(c["account_id"])
+    manual_keys = {
+        normalize_vendor(r.description or "")
+        for r in rows
+        if isinstance(r.flags, dict) and r.flags.get("manual_recurrence") == "recurring"
+    } - {""}
     return PaymentTimingRead(
-        **payment_timing.analyze_timing(windowed, rolled, months_window=_TIMING_WINDOW_MONTHS),
+        **payment_timing.analyze_timing(
+            windowed, rolled, months_window=_TIMING_WINDOW_MONTHS,
+            force_recurring_keys=manual_keys or None,
+        ),
         cutoffs=cutoffs,
     )
 
