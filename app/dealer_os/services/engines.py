@@ -182,14 +182,20 @@ def compute_metrics(
     monthly_ds = _avg(p.get("debt_service") for p in periods)
     ds_source = "periods"
     if monthly_ds is None:
-        observed = fallbacks.get("debt_service_observed_monthly")
-        drafted = fallbacks.get("debt_schedule_monthly")
-        if observed is not None and float(observed) > 0:
-            monthly_ds = float(observed)
-            ds_source = "observed_ledger"
-        elif drafted is not None and float(drafted) > 0:
-            monthly_ds = float(drafted)
-            ds_source = "debt_schedule"
+        # ONE composed denominator: the schedule (observed-wins per row,
+        # human toggles law) PLUS observed debits to lenders NOT on the
+        # schedule — the two are disjoint by construction, so an include/
+        # exclude toggle ALWAYS moves this number.
+        observed = float(fallbacks.get("debt_service_observed_monthly") or 0)
+        drafted = float(fallbacks.get("debt_schedule_monthly") or 0)
+        total = round(drafted + observed, 2)
+        if total > 0:
+            monthly_ds = total
+            ds_source = (
+                "debt_schedule" if observed <= 0
+                else "observed_ledger" if drafted <= 0
+                else "schedule+observed"
+            )
         else:
             ds_source = "none"
     annual_ds = _round2(monthly_ds * 12) if monthly_ds is not None else None

@@ -111,6 +111,7 @@ from .schemas import (
     DscrComponentAction,
     DscrComponentRead,
     DscrCompositionRead,
+    DscrImprovementRead,
     DscrNetPoint,
     DscrNumeratorRead,
     DscrResultsRead,
@@ -4749,7 +4750,44 @@ async def dscr_composition(
         if p.get("period")
     ]
 
+    # Rule-based improvement suggestions with concrete impact numbers.
+    improvements: list[DscrImprovementRead] = []
+    bankable = ebitda_m.get("bankable")
+    cur_ds = dscr_m.get("monthly_debt_service") or 0
+    def _dscr_at(ds):
+        return round(bankable / (ds * 12), 2) if bankable and ds and ds > 0 else None
+    cur = _dscr_at(cur_ds)
+    for comp_row in components:
+        if comp_row.count_in_dscr and comp_row.effective_monthly > 0 and cur_ds > comp_row.effective_monthly:
+            after = _dscr_at(cur_ds - comp_row.effective_monthly)
+            if after and cur and after > cur:
+                improvements.append(DscrImprovementRead(
+                    title=f"Review whether {comp_row.lender[:40]} is really debt service",
+                    detail=f"{comp_row.category} · ${comp_row.effective_monthly:,.0f}/mo counted — tax or trade payments are operating obligations, not debt.",
+                    impact=f"DSCR {cur}x -> {after}x if excluded",
+                ))
+    pending = [a for a in inputs.addback_rows if a.status in ("candidate", "review")]
+    if pending and bankable:
+        gain = sum(_addback_annualized(type("x", (), {"status": "verified", "annual_amount": a.annual_amount, "monthly_amount": a.monthly_amount})()) for a in pending)
+        if gain > 0 and cur_ds > 0:
+            improvements.append(DscrImprovementRead(
+                title=f"Verify {len(pending)} pending add-back(s)",
+                detail=f"${gain:,.0f}/yr of candidate add-backs are not counted until verified.",
+                impact=f"DSCR {cur}x -> {round((bankable + gain * 0.96) / (cur_ds * 12), 2)}x",
+            ))
+    if ebitda_m.get("source") == "tax_return":
+        improvements.append(DscrImprovementRead(
+            title="Upload P&L months",
+            detail="EBITDA currently comes from the last tax return — observed P&L months are what banks underwrite and usually run higher.",
+        ))
+    if dealer.funding_goal is None:
+        improvements.append(DscrImprovementRead(
+            title="Set a funding goal",
+            detail="A goal unlocks the DSCR-at-goal view and goal-aligned targets.",
+        ))
+
     return DscrCompositionRead(
+        improvements=improvements[:6],
         numerator=DscrNumeratorRead(
             ebitda_source=ebitda_m.get("source"),
             reported_ttm=ebitda_m.get("reported_ttm"),

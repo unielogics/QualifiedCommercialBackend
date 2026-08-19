@@ -978,7 +978,14 @@ class DscrNetPoint(BaseModel):
     net: float | None = None
 
 
+class DscrImprovementRead(BaseModel):
+    title: str
+    detail: str
+    impact: str | None = None    # e.g. "DSCR 0.07x -> 0.42x"
+
+
 class DscrCompositionRead(BaseModel):
+    improvements: list[DscrImprovementRead] = []
     numerator: DscrNumeratorRead
     components: list[DscrComponentRead] = []
     suggestions: list[DscrSuggestionRead] = []
