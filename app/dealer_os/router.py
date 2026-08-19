@@ -4518,7 +4518,7 @@ async def draft_debt_schedule(
         created=created,
         updated=updated,
         skipped_admin=skipped,
-        total_monthly=round(sum(float(r.monthly_payment or 0) for r in rows), 2),
+        total_monthly=round(sum(refinance_svc.monthly_equivalent(r) for r in rows), 2),
         debts=[DebtRead.model_validate(r) for r in rows],
     )
 
@@ -4688,7 +4688,11 @@ async def dscr_composition(
     for d in debts:
         by_m = observed.get(d.id) or {}
         obs = round(sum(by_m.get(m, 0.0) for m in months_covered) / n_months, 2) if by_m else None
-        stated = float(d.monthly_payment) if d.monthly_payment is not None else None
+        # Stated = the row's FULL monthly equivalent (payment_amount x cadence
+        # counts too) — the same basis the engine's drafted pool uses, so the
+        # composer's itemization always sums to the headline denominator.
+        _stated_eq = refinance_svc.monthly_equivalent(d)
+        stated = round(_stated_eq, 2) if _stated_eq > 0 else None
         effective = obs if (obs is not None and obs > 0) else (stated or 0.0)
         components.append(
             DscrComponentRead(
@@ -4899,12 +4903,13 @@ async def dscr_component_action(
         logger.exception("dealer-os: snapshot recompute failed after dscr component action")
     await db.commit()
     await db.refresh(row)
+    _row_eq = refinance_svc.monthly_equivalent(row)
     return DscrComponentRead(
         debt_id=row.id, lender=row.lender, category=row.category, origin=row.origin,
         source="contract" if row.document_id else ("drafted" if row.origin == "ai_draft" else "manual"),
-        stated_monthly=float(row.monthly_payment) if row.monthly_payment is not None else None,
+        stated_monthly=round(_row_eq, 2) if _row_eq > 0 else None,
         observed_monthly=None,
-        effective_monthly=float(row.monthly_payment or 0),
+        effective_monthly=round(_row_eq, 2),
         count_in_dscr=bool(row.count_in_dscr),
         vendor_key=row.vendor_key, document_id=row.document_id,
     )
@@ -5308,15 +5313,18 @@ async def simulate_refinance(
     baseline = simulate.summarize(baseline_metrics)
 
     payoff_total = round(sum(refinance_svc.payoff_estimate(d) for d in selected), 2)
-    freed = round(sum(refinance_svc.monthly_equivalent(d) for d in selected), 2)
     ebitda_addback_annual = round(
         sum(refinance_svc.financing_cost_monthly(d) for d in selected) * 12, 2
     )
-    adb_lift = round(freed * 0.5, 2)  # uniform-debit estimate, mirrored in removal_effects
     amount = payoff_total if payload.amount is None else float(payload.amount)
     new_pay = refinance_svc.new_loan_payment(amount, payload.annual_rate_pct, payload.term_months)
 
     events, _overrides, _self_names = await _load_vendor_inputs(db, dealer)
+    # Attribution stays vendor_key-only: a keyless row replays at its stated
+    # monthly equivalent (conservative). Name-derived identities are used for
+    # EXACT-match suppression inside the scenario engine only — containment
+    # attribution here would let a semi-generic lender name absorb a
+    # different lender's debits and overstate the what-if (review-confirmed).
     observed = refinance_svc.observed_monthly(events, selected)
     scenario_periods = refinance_svc.removal_effects(
         inputs.periods, selected, observed, new_payment_monthly=new_pay
@@ -5327,17 +5335,55 @@ async def simulate_refinance(
     # — stacking the add-back there double-counts it (review-confirmed).
     has_period_ebitda = any(p.get("ebitda_reported") is not None for p in inputs.periods)
     applied_addback_annual = ebitda_addback_annual if has_period_ebitda else 0.0
+    # Scenario denominator: RECOMPUTE the composed pool with the selected rows
+    # genuinely gone (out of the schedule tier, vendors suppressed from the
+    # observed/draft tiers), then layer the replacement note's payment in.
+    # The old approach shoved one bundled delta (new_pay - freed) into the
+    # fallbacks with a per-key zero clamp — the moment the freed sum crossed
+    # the pool size, the clamp swallowed the new payment too and the scenario
+    # DSCR went null (the "flat DSCR on the second removal" bug). Recomputing
+    # also fixes the stated-vs-observed mismatch: freed sums CONTRACT
+    # payments, while the pool counts each row at its observed-wins amount.
+    scenario_inputs = (
+        await load_metric_inputs(db, dealer.id, exclude_debt_ids={d.id for d in selected})
+        if selected
+        else inputs
+    )
+    scenario_fallbacks = dict(scenario_inputs.fallbacks)
+    if new_pay:
+        # The new note is confirmed schedule-tier debt service (and counts in
+        # the draft tier for the same reason).
+        for key in ("debt_schedule_monthly", "debt_service_draft_monthly"):
+            scenario_fallbacks[key] = round((scenario_fallbacks.get(key) or 0.0) + new_pay, 2)
     scenario_metrics = compute_metrics(
         scenario_periods,
         inputs.addbacks_annual_verified,
         inputs.targets,
-        fallbacks=simulate.adjusted_fallbacks(inputs.fallbacks, new_pay - freed),
+        fallbacks=scenario_fallbacks,
     )
     scenario = simulate.summarize(scenario_metrics)
 
-    baseline_ds = (baseline_metrics.get("dscr") or {}).get("monthly_debt_service")
-    retained = max(0.0, float(baseline_ds) - freed) if baseline_ds is not None else 0.0
+    # Retained DS falls straight out of the scenario engine (its monthly_ds
+    # already includes the new payment on every path) — never derived by
+    # subtracting stated contract sums from an observed-wins pool again.
+    scenario_ds = (scenario_metrics.get("dscr") or {}).get("monthly_debt_service")
+    retained = max(0.0, float(scenario_ds) - new_pay) if scenario_ds is not None else 0.0
     proforma_ds = round(retained + new_pay, 2)
+    # Freed cash and savings on the SAME observed-wins basis as the engine
+    # pools, so no tile can ever contradict the DSCR direction (stated
+    # contract sums used to flip the savings sign whenever observed debits
+    # diverged from the contract — review-confirmed).
+    baseline_ds = (baseline_metrics.get("dscr") or {}).get("monthly_debt_service")
+    if baseline_ds is not None:
+        freed = round(max(0.0, float(baseline_ds) - retained), 2)
+    else:
+        freed = round(sum(refinance_svc.monthly_equivalent(d) for d in selected), 2)
+    # Savings derives FROM freed so the tiles always satisfy the arithmetic a
+    # broker does in their head (savings = freed - new payment) — even in the
+    # commingled-lender edge where a kept sibling's stated contract exceeds
+    # the ledger's observed total and retained lands above baseline.
+    savings = round(freed - new_pay, 2)
+    adb_lift = round(freed * 0.5, 2)  # uniform-debit estimate, mirrored in removal_effects
     ebitda_after_annual = scenario.get("ebitda_bankable")
     max_at_floor = (
         refinance_svc.max_principal(
@@ -5353,6 +5399,12 @@ async def simulate_refinance(
     )
 
     dscr_after = scenario.get("dscr")
+    if dscr_after is None and proforma_ds > 0.01 and ebitda_after_annual is not None:
+        # Hard floor on the workbench law: while there is pro-forma debt
+        # service to cover, the DSCR-after is ALWAYS a number — derived
+        # deterministically from the same two figures the panel shows.
+        dscr_after = round(float(ebitda_after_annual) / (proforma_ds * 12.0), 3)
+        scenario["dscr"] = dscr_after
     if not selected:
         verdict = "no_selection"
     elif dscr_after is None:
@@ -5379,7 +5431,7 @@ async def simulate_refinance(
             new_payment_monthly=new_pay,
             retained_ds_monthly=round(retained, 2),
             proforma_ds_monthly=proforma_ds,
-            savings_monthly=round(freed - new_pay, 2),
+            savings_monthly=savings,
             ebitda_addback_annual=applied_addback_annual,
             adb_lift_estimate=adb_lift,
             amount=round(amount, 2),

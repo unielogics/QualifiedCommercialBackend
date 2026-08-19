@@ -67,14 +67,28 @@ def adjusted_fallbacks(
 
     A statements-only dealer has debt_service None on every period, so the
     engine reads dos_debts via fallbacks['debt_schedule_monthly'] — without
-    this, the lever would silently do nothing for exactly those dealers. The
-    fallback is only consulted when NO period carries observed debt service,
-    so shifting both can never double-count."""
+    this, the lever would silently do nothing for exactly those dealers.
+
+    Since 0129 the engine SUMS the schedule and observed tiers into one
+    composed denominator, so the delta must land on the pool exactly ONCE:
+    it applies to the schedule tier first and only the unabsorbed remainder
+    spills into the observed tier (shoving the full delta into both keys
+    double-counted every lever)."""
     out = dict(fallbacks or {})
+    delta = float(debt_service_monthly_delta or 0.0)
+    if not delta:
+        return out
     for key in ("debt_schedule_monthly", "debt_service_observed_monthly"):
         current = out.get(key)
-        if debt_service_monthly_delta and current is not None:
-            out[key] = max(0.0, float(current) + debt_service_monthly_delta)
+        if current is None or delta == 0.0:
+            continue
+        shifted = float(current) + delta
+        if shifted >= 0.0:
+            out[key] = shifted
+            delta = 0.0
+        else:
+            out[key] = 0.0
+            delta = shifted  # remaining reduction spills to the next tier
     return out
 
 

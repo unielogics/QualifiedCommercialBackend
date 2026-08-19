@@ -110,13 +110,17 @@ def key_matches(debt_key: str | None, event_key: str) -> bool:
     return len(shorter) >= _MIN_MATCH_LEN and shorter in longer
 
 
-def observed_monthly(events: Iterable, debts: list) -> dict[Any, dict[date, float]]:
+def observed_monthly(
+    events: Iterable, debts: list, key_for: Any = None
+) -> dict[Any, dict[date, float]]:
     """Per-debt observed OUTFLOW totals by calendar month, matched on the
-    debt's vendor_key via the shared vendor-identity normalizer (containment-
-    tolerant, see key_matches). Debts with no vendor_key (hand-added rows)
+    debt's ledger identity via the shared vendor-identity normalizer
+    (containment-tolerant, see key_matches). key_for overrides how a row's
+    identity is derived (default: its vendor_key). Rows with no identity
     simply get no observed data — the contract monthly equivalent covers
     them."""
-    keyed = [(d.vendor_key, d) for d in debts if getattr(d, "vendor_key", None)]
+    get_key = key_for or (lambda d: getattr(d, "vendor_key", None))
+    keyed = [(k, d) for k, d in ((get_key(d), d) for d in debts) if k]
     out: dict[Any, dict[date, float]] = {d.id: defaultdict(float) for d in debts}
     if not keyed:
         return {k: dict(v) for k, v in out.items()}

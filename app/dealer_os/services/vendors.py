@@ -77,6 +77,34 @@ def normalize_vendor(description: str) -> str:
     return s[:_KEY_MAX_LEN].strip()
 
 
+# Finance words too generic to serve as a containment identity on their own —
+# a schedule row named just "Advance" or "Capital Funding" must never become a
+# key that swallows OTHER lenders' debits through key_matches' containment.
+_GENERIC_LENDER_TOKENS: frozenset[str] = frozenset({
+    "LOAN", "LOANS", "LENDING", "LENDER", "CAPITAL", "FUNDING", "FUNDINGS",
+    "ADVANCE", "ADVANCES", "FINANCE", "FINANCING", "FINANCIAL", "CREDIT",
+    "BANK", "BANKING", "CARD", "CARDS", "PAYMENT", "PAYMENTS", "PMT",
+    "MCA", "SBA", "MERCHANT", "CASH", "MONEY", "GROUP", "SERVICES",
+    "SERVICE", "COMPANY", "PARTNERS", "SOLUTIONS", "LLC", "INC", "CORP", "THE",
+})
+
+
+def lender_identity_key(vendor_key: str | None, lender: str | None) -> str | None:
+    """A schedule row's ledger identity: its vendor_key when ledger-linked,
+    else a key derived from the human-typed lender name — but ONLY when that
+    name is specific enough to be safe under containment matching. Names made
+    entirely of generic finance words return None (no identity beats a false
+    one that silently deletes unrelated lenders from the DSCR denominator)."""
+    if vendor_key:
+        return vendor_key
+    key = normalize_vendor(lender or "")
+    if not key:
+        return None
+    if all(t in _GENERIC_LENDER_TOKENS for t in key.split(" ")):
+        return None
+    return key
+
+
 # --- Classification -----------------------------------------------------------
 #
 # Ordered: the first category whose keywords hit wins, so specific categories

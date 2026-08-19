@@ -433,10 +433,17 @@ class MetricInputs:
         return total
 
 
-async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
+async def load_metric_inputs(
+    db: AsyncSession, dealer_id: UUID, *, exclude_debt_ids: set | None = None
+) -> MetricInputs:
     """Shared input loader for recompute_snapshot and the what-if simulator —
     one place decides how per-account period rows collapse into months and
-    which fallbacks apply. Read-only: selects, never writes."""
+    which fallbacks apply. Read-only: selects, never writes.
+
+    exclude_debt_ids (refinance what-if): treat these schedule rows as GONE —
+    out of the drafted pool AND their vendors suppressed from the observed/
+    draft ledger tiers (otherwise a removed lender's debits would re-enter as
+    an "unscheduled" observed lender and the removal would never move DSCR)."""
     # Per-account rows mean one calendar month can span several rows. Fetch a
     # wider window, collapse to one dict per month (flow fields summed across
     # accounts, balance fields preferring the primary operating account, then
@@ -599,6 +606,42 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         .scalars()
         .all()
     )
+    from .vendors import lender_identity_key as _row_identity
+
+    _removed_vendor_keys: list = []   # real vendor keys — containment matching
+    _removed_exact_keys: set = set()  # name-derived — EXACT ledger-key equality only
+    if exclude_debt_ids:
+        # What-if removal: the rows leave the schedule pool here, and the
+        # removed LENDER's identity joins the suppression below so its debits
+        # can't resurface through any tier. Fetched by id — NOT from the
+        # count_in_dscr-filtered pool above — so a row a human toggled out of
+        # the DSCR still suppresses its vendor when refinanced away. A row
+        # with a real vendor_key suppresses by containment (the ledger
+        # identity space). A keyless hand-added row falls back to its typed
+        # lender name, but that name only ever suppresses an EXACT ledger-key
+        # match: under containment, a semi-generic name like "Business
+        # Funding" would swallow a different lender ("EVEREST BUSINESS
+        # FUNDING") and overstate the what-if DSCR (review-confirmed).
+        removed_rows = (
+            (
+                await db.execute(
+                    select(DealerDebt).where(
+                        DealerDebt.dealer_id == dealer_id,
+                        DealerDebt.id.in_(exclude_debt_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for _rr in removed_rows:
+            if _rr.vendor_key:
+                _removed_vendor_keys.append(_rr.vendor_key)
+            else:
+                _rk = _row_identity(None, _rr.lender)
+                if _rk:
+                    _removed_exact_keys.add(_rk)
+        dscr_debt_rows = [r for r in dscr_debt_rows if r.id not in exclude_debt_ids]
 
     # OBSERVED debt service: what the ledger actually paid to debt-like
     # lenders (loans/floorplan) in the months the periods cover — credit
@@ -674,10 +717,15 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                     .scalars()
                     .all()
                 )
+                # What-if removals suppress exactly like human exclusions.
+                excluded_rows = list(excluded_rows) + _removed_vendor_keys
                 # Vendors covered by ANY active schedule row are the
                 # schedule's jurisdiction (per-row observed-wins there) —
                 # the observed tier only carries UNSCHEDULED lenders, and
-                # human exclusions apply to both tiers.
+                # human exclusions apply to both tiers. Deliberately keyed on
+                # vendor_key ONLY: a name-derived identity here would let a
+                # semi-generic lender name hijack a different unscheduled
+                # lender's debits out of the live headline (review-confirmed).
                 scheduled_keys = [r.vendor_key for r in dscr_debt_rows if r.vendor_key]
                 by_month: dict = {}
                 draft_by_month: dict = {}
@@ -686,7 +734,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                     if amt >= 0:
                         continue
                     ev_key = normalize_vendor(r.description or "")
-                    if any(_km(x, ev_key) for x in excluded_rows):
+                    if ev_key in _removed_exact_keys or any(_km(x, ev_key) for x in excluded_rows):
                         continue
                     mkey = date(r.period.year, r.period.month, 1)
                     if ev_key in debt_keys and not any(_km(x, ev_key) for x in scheduled_keys):
@@ -705,9 +753,26 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
         # Per-schedule-row observed averages (containment-tolerant identity —
         # the same matcher the refinance workbench uses).
         if dscr_debt_rows and event_rows:
-            from .refinance import observed_monthly as _debt_observed
+            from .refinance import key_matches as _km_sib, observed_monthly as _debt_observed
+            from .vendors import normalize_vendor as _norm_sib
 
-            per_debt = _debt_observed(event_rows, dscr_debt_rows)
+            attributable = event_rows
+            if _removed_vendor_keys or _removed_exact_keys:
+                # A kept sibling row for the SAME lender must not re-absorb a
+                # removed row's debits (observed-wins would refill the pool
+                # and the removal would never move the headline) — the kept
+                # position falls back to its stated payment instead. Name-
+                # derived identities suppress on exact key equality only.
+                attributable = [
+                    r
+                    for r in event_rows
+                    if (_ek := _norm_sib(r.description or "")) not in _removed_exact_keys
+                    and not any(_km_sib(k, _ek) for k in _removed_vendor_keys)
+                ]
+            # Attribution stays vendor_key-only: a name-derived identity
+            # would pull card/operating flows (or a different lender's
+            # debits) into observed-wins on the LIVE path (review-confirmed).
+            per_debt = _debt_observed(attributable, dscr_debt_rows)
             n_months = max(len(months_covered), 1)
             for row in dscr_debt_rows:
                 by_m = per_debt.get(row.id) or {}
@@ -716,21 +781,25 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                         sum(by_m.get(m, 0.0) for m in months_covered) / n_months, 2
                     )
 
+    from .refinance import key_matches as _km_rows, monthly_equivalent as _stated_monthly
+
     drafted_monthly = 0.0
     _counted_keys: list = []
     for row in dscr_debt_rows:
-        if row.vendor_key and any(
-            __import__("app.dealer_os.services.refinance", fromlist=["key_matches"]).key_matches(k, row.vendor_key)
-            for k in _counted_keys
-        ):
+        if row.vendor_key and any(_km_rows(k, row.vendor_key) for k in _counted_keys):
             continue  # two schedule rows covering one lender count once
         if row.vendor_key:
             _counted_keys.append(row.vendor_key)
         observed = observed_avg_by_debt.get(row.id)
         if observed is not None and observed > 0:
             drafted_monthly += observed
-        elif row.monthly_payment is not None:
-            drafted_monthly += float(row.monthly_payment)
+        else:
+            # Stated fallback = the row's FULL monthly equivalent. A weekly/
+            # daily contract carrying only payment_amount used to count zero
+            # here while freed_monthly counted it (review-confirmed drift).
+            stated = _stated_monthly(row)
+            if stated > 0:
+                drafted_monthly += stated
     drafted_monthly = round(drafted_monthly, 2)
     # DSCR-at-goal: the payment the funding goal implies at the desk's
     # conventional terms — gives the tile a meaningful ratio even at zero
