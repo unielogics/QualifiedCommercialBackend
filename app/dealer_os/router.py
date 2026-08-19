@@ -4484,9 +4484,8 @@ async def draft_debt_schedule(
                     status="active",
                     vendor_key=p["vendor_key"],
                     evidence=evidence,
-                ,
-                count_in_dscr=(d.get("category") != "credit_card"),
-            )
+                    count_in_dscr=(p["category"] != "credit_card"),
+                )
             )
             created += 1
         elif row.origin == "admin" or row.status == "dismissed":
