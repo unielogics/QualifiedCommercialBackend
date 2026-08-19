@@ -832,6 +832,7 @@ class DebtRead(BaseModel):
     factor_rate: float | None = None
     payoff_amount: float | None = None
     document_id: UUID | None = None
+    count_in_dscr: bool = True
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -961,6 +962,8 @@ class DscrNumeratorRead(BaseModel):
 
 class DscrResultsRead(BaseModel):
     dscr_current: float | None = None
+    dscr_draft: float | None = None
+    display: str | None = None
     at_goal: float | None = None
     cash_flow: float | None = None
     net_cash_flow_monthly: float | None = None

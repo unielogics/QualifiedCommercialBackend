@@ -518,7 +518,14 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                 period=month,
                 deposits=_sum("deposits"),
                 withdrawals=_sum("withdrawals"),
-                nsf_count=sum(int(r.nsf_count or 0) for r in rows),
+                nsf_count=(
+                    max(
+                        sum(int(r.nsf_count or 0) for r in legacy_rows),
+                        sum(int(r.nsf_count or 0) for r in tagged_rows),
+                    )
+                    if legacy_rows and tagged_rows
+                    else sum(int(r.nsf_count or 0) for r in rows)
+                ),
                 ebitda_reported=_pref("ebitda_reported"),
                 debt_service=_pref("debt_service"),
                 avg_daily_balance=_pref("avg_daily_balance"),
@@ -597,6 +604,21 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
     event_rows = []
     if period_rows:
         from .vendors import DEBT_CATEGORIES, rollup_vendors
+        from ..models import DealerCategoryRule
+
+        rule_rows = (
+            (
+                await db.execute(
+                    select(DealerCategoryRule).where(
+                        (DealerCategoryRule.dealer_id == dealer_id)
+                        | (DealerCategoryRule.dealer_id.is_(None))
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        overrides = {r.pattern: r.category for r in rule_rows if r.active}
 
         months_covered = {r.period for r in period_rows}
         earliest = min(months_covered)
@@ -616,7 +638,7 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
             .all()
         )
         if event_rows:
-            rolled = rollup_vendors(event_rows)
+            rolled = rollup_vendors(event_rows, overrides=overrides)
             debt_keys = {
                 v.key
                 for v in rolled
@@ -646,6 +668,11 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                     .scalars()
                     .all()
                 )
+                # Vendors covered by ANY active schedule row are the
+                # schedule's jurisdiction (per-row observed-wins there) —
+                # the observed tier only carries UNSCHEDULED lenders, and
+                # human exclusions apply to both tiers.
+                scheduled_keys = [r.vendor_key for r in dscr_debt_rows if r.vendor_key]
                 by_month: dict = {}
                 draft_by_month: dict = {}
                 for r in event_rows:
@@ -653,10 +680,12 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                     if amt >= 0:
                         continue
                     ev_key = normalize_vendor(r.description or "")
+                    if any(_km(x, ev_key) for x in excluded_rows):
+                        continue
                     mkey = date(r.period.year, r.period.month, 1)
-                    if ev_key in debt_keys:
+                    if ev_key in debt_keys and not any(_km(x, ev_key) for x in scheduled_keys):
                         by_month[mkey] = by_month.get(mkey, 0.0) + (-amt)
-                    if ev_key in draft_keys and not any(_km(x, ev_key) for x in excluded_rows):
+                    if ev_key in draft_keys:
                         draft_by_month[mkey] = draft_by_month.get(mkey, 0.0) + (-amt)
                 # Average over the covered months (months with zero debt
                 # debits count as zero — a skipped payment is information).
@@ -682,7 +711,15 @@ async def load_metric_inputs(db: AsyncSession, dealer_id: UUID) -> MetricInputs:
                     )
 
     drafted_monthly = 0.0
+    _counted_keys: list = []
     for row in dscr_debt_rows:
+        if row.vendor_key and any(
+            __import__("app.dealer_os.services.refinance", fromlist=["key_matches"]).key_matches(k, row.vendor_key)
+            for k in _counted_keys
+        ):
+            continue  # two schedule rows covering one lender count once
+        if row.vendor_key:
+            _counted_keys.append(row.vendor_key)
         observed = observed_avg_by_debt.get(row.id)
         if observed is not None and observed > 0:
             drafted_monthly += observed

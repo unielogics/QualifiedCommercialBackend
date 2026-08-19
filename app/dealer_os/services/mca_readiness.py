@@ -13,9 +13,12 @@ from typing import Any, Iterable
 # --- provisional desk constants ------------------------------------------------
 ADVANCE_PCT_RANGE = (0.70, 1.20)   # of Average Monthly Revenue
 ADVANCE_PCT_TYPICAL = 0.80
+# Firm pricing: 25-40% APR converts to ~1.25-1.40x factors over the
+# standard 14-month term (user-specified).
 FACTOR_RATE = 1.30
-TERM_BUSINESS_DAYS = 120
-MAX_TERM_BUSINESS_DAYS = 180
+FACTOR_RANGE = (1.25, 1.40)
+TERM_BUSINESS_DAYS = 14 * 21       # 14-month standard term
+MAX_TERM_BUSINESS_DAYS = 14 * 21   # never stretch past 14 months — reduce instead
 BIZ_DAYS_PER_MONTH = 21
 MAX_DAILY_PULL_PCT = 0.15          # existing + new pulls vs daily revenue
 MIN_DEPOSITS_PER_MONTH = 5
@@ -32,8 +35,15 @@ def compute_mca_readiness(
     periods: list[dict],
     rolled: Iterable,
     adb_current: float | None,
+    *,
+    advance_pct: float | None = None,
+    factor_rate: float | None = None,
+    term_days: int | None = None,
 ) -> dict[str, Any]:
-    months = [p for p in periods if p.get("period")]
+    adv_pct = advance_pct if advance_pct else ADVANCE_PCT_TYPICAL
+    factor = factor_rate if factor_rate else FACTOR_RATE
+    base_term = term_days if term_days else TERM_BUSINESS_DAYS
+    months = [p for p in periods if p.get("period") and p.get("deposits") is not None]
     n = max(len(months), 1)
 
     # 1) AMR — scrubbed revenue: total deposits minus non-revenue inflows.
@@ -91,9 +101,9 @@ def compute_mca_readiness(
     # 3) Back into the offer with the daily-pull stress test.
     offer: dict[str, Any] = {}
     if amr > 0:
-        advance = round(amr * ADVANCE_PCT_TYPICAL, -2)
-        payback = round(advance * FACTOR_RATE, 2)
-        term = TERM_BUSINESS_DAYS
+        advance = round(amr * adv_pct, -2)
+        payback = round(advance * factor, 2)
+        term = base_term
         daily_payment = round(payback / term, 2)
         pull_pct = (existing_daily_pull + daily_payment) / daily_revenue if daily_revenue > 0 else 1.0
         stretched = reduced = False
@@ -101,12 +111,12 @@ def compute_mca_readiness(
             budget = daily_revenue * MAX_DAILY_PULL_PCT - existing_daily_pull
             if budget > 0:
                 needed_term = int(payback / budget) + 1
-                if needed_term <= MAX_TERM_BUSINESS_DAYS:
+                if needed_term <= max(MAX_TERM_BUSINESS_DAYS, base_term):
                     term, stretched = needed_term, True
                 else:
-                    term = MAX_TERM_BUSINESS_DAYS
+                    term = max(MAX_TERM_BUSINESS_DAYS, base_term)
                     payback = round(budget * term, 2)
-                    advance = round(payback / FACTOR_RATE, -2)
+                    advance = round(payback / factor, -2)
                     stretched = reduced = True
                 daily_payment = round(payback / term, 2)
                 pull_pct = (existing_daily_pull + daily_payment) / daily_revenue
@@ -115,7 +125,7 @@ def compute_mca_readiness(
         offer = {
             "advance": advance,
             "advance_range": [round(amr * ADVANCE_PCT_RANGE[0], -2), round(amr * ADVANCE_PCT_RANGE[1], -2)],
-            "factor_rate": FACTOR_RATE,
+            "factor_rate": factor,
             "payback": payback if advance else 0.0,
             "term_business_days": term,
             "daily_payment": daily_payment if advance else 0.0,

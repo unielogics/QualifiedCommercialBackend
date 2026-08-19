@@ -4484,7 +4484,9 @@ async def draft_debt_schedule(
                     status="active",
                     vendor_key=p["vendor_key"],
                     evidence=evidence,
-                )
+                ,
+                count_in_dscr=(d.get("category") != "credit_card"),
+            )
             )
             created += 1
         elif row.origin == "admin" or row.status == "dismissed":
@@ -4610,7 +4612,12 @@ async def delete_debt(
 
 @router.get("/dealers/{dealer_id}/mca-readiness", response_model=McaReadinessRead)
 async def mca_readiness_read(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    user: CurrentUser,
+    advance_pct: float | None = Query(default=None, gt=0.05, le=1.5),
+    factor_rate: float | None = Query(default=None, gt=1.0, le=2.0),
+    term_months: int | None = Query(default=None, ge=1, le=24),
+    db: AsyncSession = Depends(get_db),
 ) -> McaReadinessRead:
     """The MCA-underwriter lens over the trailing statements: scrubbed AMR,
     the four health checks, and a backed-into offer with the daily-pull
@@ -4623,7 +4630,9 @@ async def mca_readiness_read(
     )
     rolled, _n = await _vendor_rollup(db, dealer)
     result = mca_svc.compute_mca_readiness(
-        inputs.periods, rolled, (metrics.get("adb") or {}).get("current")
+        inputs.periods, rolled, (metrics.get("adb") or {}).get("current"),
+        advance_pct=advance_pct, factor_rate=factor_rate,
+        term_days=term_months * 21 if term_months else None,
     )
     return McaReadinessRead(**result)
 
@@ -4697,9 +4706,21 @@ async def dscr_composition(
             )
         )
 
-    # Observed debt-like vendors (non-card, recurring) with no schedule row yet.
-    rolled = vendors.rollup_vendors(events)
-    covered_keys = [d.vendor_key for d in debts if d.vendor_key]
+    # Observed debt-like vendors (non-card, recurring) with no schedule row —
+    # including DISMISSED rows (a human killed them; never resurface).
+    rolled, _n = _rollup_from_inputs(events, _ov, _sn)
+    all_row_keys = (
+        (
+            await db.execute(
+                select(DealerDebt.vendor_key).where(
+                    DealerDebt.dealer_id == dealer.id, DealerDebt.vendor_key.is_not(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    covered_keys = list(all_row_keys)
     suggestions = [
         DscrSuggestionRead(
             vendor_key=v.key,
@@ -4750,6 +4771,8 @@ async def dscr_composition(
         suggestions=suggestions,
         results=DscrResultsRead(
             dscr_current=dscr_m.get("current"),
+            dscr_draft=dscr_m.get("draft"),
+            display=dscr_m.get("display"),
             at_goal=dscr_m.get("at_goal"),
             cash_flow=dscr_m.get("cash_flow"),
             net_cash_flow_monthly=dscr_m.get("net_cash_flow_monthly"),
