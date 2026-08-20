@@ -109,6 +109,8 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    DecisionRead,
+    UnreadSummary,
     PublicPlaidResult,
     RoomPasscode,
     RoomPlaidExchange,
@@ -257,7 +259,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import client_room, consent_delivery, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, decision, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -910,6 +912,76 @@ async def dealer_fundability(
     verdict = paths_service_fundability(paths, goal, goal_paths)
     verdict["goal"] = goal
     return verdict
+
+
+@router.get("/dealers/{dealer_id}/decision", response_model=DecisionRead)
+async def dealer_decision(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DecisionRead:
+    """THE answer for this file, with the balance rule actually applied.
+
+    /fundability reads the program grid alone. That grid can say "fundable"
+    about a business whose ending balances fall every month, which is the first
+    thing a lender looks at and the first thing that gets the file declined. So
+    this composes both and lets the balance rule cap the verdict, and every
+    surface reads from here rather than deciding for itself.
+
+    Open to the owning rep: the rep is who has to tell the owner where they
+    stand, and sending them to another app to find out is how a visit ends
+    without a next step."""
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    try:
+        metrics = await _latest_snapshot_metrics(db, dealer.id)
+    except HTTPException:
+        d = decision.decide({"verdict": "no_data"}, None)
+        return DecisionRead(**asdict(d))
+
+    targets = await _effective_targets(db, dealer.id)
+    settings = await _global_program_settings(db)
+    tree = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
+    paths = compute_paths(tree, targets, settings=settings)
+
+    goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
+    goal_paths = None
+    if goal:
+        goal_paths = []
+        for key in PATH_KEYS:
+            reqs = requirements_for_amount(key, goal, tree, settings=settings)
+            goal_paths.append(
+                {
+                    "path_key": key,
+                    "goal_feasible": (all(r["met"] for r in reqs) if reqs else None),
+                    "requirements": reqs,
+                }
+            )
+    fundability = paths_service_fundability(paths, goal, goal_paths)
+
+    # Most-recent-first, which is the order assess_balance_health expects.
+    # Account-level rows are excluded: the rule is about the business, and a
+    # single account dipping while the business holds steady is not the
+    # failure the rule is describing.
+    period_rows = (
+        (
+            await db.execute(
+                select(DealerFinancialPeriod)
+                .where(
+                    DealerFinancialPeriod.dealer_id == dealer.id,
+                    DealerFinancialPeriod.account_id.is_(None),
+                )
+                .order_by(DealerFinancialPeriod.period.desc())
+                .limit(12)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    health = balance_health.assess_balance_health(
+        [{"period": r.period, "ending_balance": r.ending_balance} for r in period_rows]
+    )
+
+    return DecisionRead(**asdict(decision.decide(fundability, health)))
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
@@ -3644,6 +3716,93 @@ async def create_session(
     await db.commit()
     await db.refresh(session)
     return session
+
+
+@router.post(
+    "/dealers/{dealer_id}/sessions",
+    response_model=SessionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_session(
+    dealer_id: UUID,
+    payload: SessionCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerSession:
+    """Book a meeting on this file.
+
+    SessionCreate and the list and delete routes have existed since the
+    sessions table landed; there was never a way to create one, so the only
+    rows in it came from seeds. Open to the owning rep, because the rep is who
+    arranges the follow-up visit.
+
+    The client sees these read-only with a Join button, so a join_url that is
+    wrong is worse than one that is absent."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    session = DealerSession(
+        dealer_id=dealer.id,
+        title=payload.title.strip(),
+        kind=payload.kind,
+        starts_at=payload.starts_at,
+        join_url=(payload.join_url or None),
+        notes=payload.notes,
+        created_by_user_id=user.id,
+    )
+    db.add(session)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "session.create", "session", entity_id=session.id,
+        after={"title": session.title, "kind": session.kind,
+               "starts_at": session.starts_at.isoformat()},
+    )
+    await db.commit()
+    await db.refresh(session)
+    return session
+
+
+@router.get("/unread-summary", response_model=UnreadSummary)
+async def unread_summary(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> UnreadSummary:
+    """Unread across every file this viewer can see, for the nav badge.
+
+    One query with a group-by rather than the per-file endpoint in a loop,
+    because a rep with forty files would otherwise fire forty requests to draw
+    one number.
+
+    Scoping reuses the same rule as the file list: a rep sees their own book, a
+    dealer their own business, the team everything. It has to, or the badge
+    would count messages on files the viewer cannot open."""
+    require_team_or_dealer_or_rep(user)
+
+    visible = select(DealerBusiness.id)
+    if user.role == Role.FIELD_REP:
+        visible = visible.where(DealerBusiness.owner_user_id == user.id)
+    elif user.role == Role.DEALER:
+        visible = visible.where(DealerBusiness.dealer_user_id == user.id)
+
+    seen_at = select(
+        DealerMessageSeen.dealer_id.label("dealer_id"),
+        DealerMessageSeen.seen_at.label("seen_at"),
+    ).where(DealerMessageSeen.user_id == user.id).subquery()
+
+    q = (
+        select(DealerMessage.dealer_id, func.count().label("n"))
+        .outerjoin(seen_at, seen_at.c.dealer_id == DealerMessage.dealer_id)
+        .where(
+            DealerMessage.dealer_id.in_(visible),
+            DealerMessage.author_user_id != user.id,
+            or_(seen_at.c.seen_at.is_(None), DealerMessage.created_at > seen_at.c.seen_at),
+        )
+        .group_by(DealerMessage.dealer_id)
+    )
+    if user.role == Role.DEALER:
+        q = q.where(DealerMessage.internal.is_(False))
+
+    rows = (await db.execute(q)).all()
+    per_file = {str(dealer_id): int(n) for dealer_id, n in rows}
+    return UnreadSummary(total=sum(per_file.values()), per_file=per_file)
 
 
 @router.delete("/dealers/{dealer_id}/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -455,6 +455,30 @@ class SessionCreate(BaseModel):
     notes: str | None = None
 
 
+class DecisionRead(BaseModel):
+    """One answer per file. Every surface renders this rather than deciding for
+    itself, which is what stops a green banner sitting next to an amber note
+    that contradicts it."""
+
+    verdict: str
+    headline: str
+    blocking: list[dict] = []
+    balance_passed: bool | None = None
+    balance_reasons: list[str] = []
+    capped_by_balance: bool = False
+    best_path: dict | None = None
+    goal_feasible: bool | None = None
+    ready_for_forms: bool = False
+
+
+class UnreadSummary(BaseModel):
+    """Unread counts for the nav badge. `per_file` is keyed by dealer id as a
+    string, so the client can light up a row without a second request."""
+
+    total: int = 0
+    per_file: dict[str, int] = {}
+
+
 class GlobalAlertRead(AlertRead):
     dealer_id: UUID
     dealer_name: str
