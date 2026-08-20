@@ -112,6 +112,15 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
     return results
 
 
+# Which product each role signs in to. Roles absent from this map fall back to
+# Clerk's default (the desktop sign-up page), which is correct for the
+# operator-console roles.
+_INVITE_LANDING: dict[Role, str] = {
+    Role.FIELD_REP: "https://rep.qualifiedcommercial.com/sign-in",
+    Role.DEALER: "https://audit.qualifiedcommercial.com/sign-in",
+}
+
+
 @router.post(
     "",
     response_model=UserRead,
@@ -185,7 +194,15 @@ async def invite_user(
     await db.refresh(user)
 
     # Fire-and-forget Clerk invitation. No-op when CLERK_SECRET_KEY is unset.
-    await clerk_service.invite_user(email=body.email, name=body.name, role=body.role)
+    # Land them on the app they actually work in. Without this the invite goes
+    # to the desktop sign-up page, and a field rep or client signs in somewhere
+    # their role has no access and gets bounced with no explanation.
+    await clerk_service.invite_user(
+        email=body.email,
+        name=body.name,
+        role=body.role,
+        redirect_url=_INVITE_LANDING.get(body.role),
+    )
 
     return UserRead.model_validate(user)
 
