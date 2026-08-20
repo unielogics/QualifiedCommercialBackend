@@ -30,6 +30,11 @@ class DealerBusiness(TimestampMixin, Base):
 
     id: Mapped[uuid.UUID] = _pk()
     name: Mapped[str] = mapped_column(String(180), nullable=False)
+    # 0133: the reference a rep reads down a phone. Unique and immutable once
+    # assigned, because it goes on contracts and into the client's inbox; a
+    # file whose reference can change is a file two people can be looking at
+    # while quoting different numbers.
+    case_ref: Mapped[str | None] = mapped_column(String(24), unique=True)
     legal_name: Mapped[str | None] = mapped_column(String(180))
     ein: Mapped[str | None] = mapped_column(String(24))
     email: Mapped[str | None] = mapped_column(String(320))

@@ -120,6 +120,7 @@ class DealerUpdate(BaseModel):
 class DealerRead(ORM):
     id: UUID
     name: str
+    case_ref: str | None = None
     dealer_user_id: UUID | None = None
     bucket_name: str | None = None
     legal_name: str | None = None
@@ -148,6 +149,7 @@ class DealerRead(ORM):
 class DealerListItem(ORM):
     id: UUID
     name: str
+    case_ref: str | None = None
     city: str | None = None
     state: str | None = None
     status: str
@@ -455,6 +457,29 @@ class SessionCreate(BaseModel):
     notes: str | None = None
 
 
+class DeliveryRowRead(BaseModel):
+    """One row of the step 2 delivery log. Status is derived from the trail,
+    not stored: sent, opened and completed arrive as separate events."""
+
+    kind: str
+    request: str
+    channel: str
+    recipient: str
+    status: str
+    at: datetime
+    detail: str = ""
+    history: list[dict] = []
+
+
+class VerificationRead(BaseModel):
+    bank_linked: bool = False
+    credit_returned: bool = False
+    unlocked: bool = False
+    returned: int = 0
+    reason: str = ""
+    stage: str = "intake"
+
+
 class DecisionRead(BaseModel):
     """One answer per file. Every surface renders this rather than deciding for
     itself, which is what stops a green banner sitting next to an amber note
@@ -472,6 +497,9 @@ class DecisionRead(BaseModel):
     # The real catalogue, easiest-reachable first. Empty when the file has no
     # lending question to answer, which the catalogue decides rather than us.
     programs: list[dict] = []
+    # The gate. Steps 3-5 of the application read `unlocked` from here rather
+    # than deciding for themselves.
+    verification: VerificationRead = Field(default_factory=VerificationRead)
 
 
 class UnreadSummary(BaseModel):

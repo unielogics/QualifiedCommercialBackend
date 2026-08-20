@@ -31,10 +31,61 @@ from typing import Any
 
 from .balance_health import BalanceHealth
 
-__all__ = ["FileDecision", "decide"]
+__all__ = ["FileDecision", "Verification", "decide", "assess_verification"]
 
 # Ordered worst to best, so capping is a min() on the index.
 _RANK = ["no_data", "not_yet", "conditional", "fundable"]
+
+
+@dataclass
+class Verification:
+    """Whether this file has earned the right to be analysed.
+
+    Two authorizations, both from the applicant themselves: a read-only bank
+    connection and a soft credit inquiry. Until both return, everything past
+    step 2 would be computed from what a rep typed into a form standing in a
+    shop, and a number like that is worse than no number because it looks
+    exactly like a real one.
+
+    So this is a gate rather than a warning, and it is evaluated on the server.
+    A frontend that merely hides the locked steps is one crafted request away
+    from showing an underwriter a profile built on hearsay.
+    """
+
+    bank_linked: bool = False
+    credit_returned: bool = False
+    unlocked: bool = False
+    returned: int = 0
+    reason: str = ""
+    """Reader-facing, matching the chip in the design: '1 of 2 authorizations
+    returned' / 'Bank + credit returned'."""
+    stage: str = "intake"
+    """intake | verification | underwriting — what the case header shows."""
+
+
+def assess_verification(*, bank_linked: bool, credit_returned: bool) -> Verification:
+    """PURE. Both must return; neither alone is enough.
+
+    The bank connection is what computes the metrics, and the credit band is
+    what sizes the offer. A file with one of the two is not half-analysable,
+    it is a file waiting on the other one.
+    """
+    returned = int(bank_linked) + int(credit_returned)
+    unlocked = returned == 2
+    if unlocked:
+        reason = "Bank + credit returned"
+    elif returned == 1:
+        reason = "1 of 2 authorizations returned"
+    else:
+        reason = "Awaiting both authorizations"
+    return Verification(
+        bank_linked=bank_linked,
+        credit_returned=credit_returned,
+        unlocked=unlocked,
+        returned=returned,
+        reason=reason,
+        stage="underwriting" if unlocked else ("verification" if returned else "intake"),
+    )
 
 
 @dataclass
@@ -57,6 +108,7 @@ class FileDecision:
     """The gate for filling and signing PDFs. Deliberately strict: paperwork
     that goes out on a file that is not actually fundable wastes the owner's
     time and our credibility with the lender."""
+    verification: Verification = field(default_factory=Verification)
 
 
 def _cap(verdict: str, ceiling: str) -> str:
@@ -66,8 +118,20 @@ def _cap(verdict: str, ceiling: str) -> str:
         return verdict
 
 
-def decide(fundability: dict[str, Any], balance: BalanceHealth | None) -> FileDecision:
-    """Collapse the program grid and the balance rule into one answer. PURE."""
+def decide(
+    fundability: dict[str, Any],
+    balance: BalanceHealth | None,
+    verification: Verification | None = None,
+) -> FileDecision:
+    """Collapse the program grid, the balance rule and the verification state
+    into one answer. PURE.
+
+    Verification outranks everything. An unverified file is not "not_yet
+    fundable" on its numbers, it is a file whose numbers have not been
+    established, and saying "not fundable" about it would be a judgement we
+    have not earned.
+    """
+    ver = verification or Verification()
     verdict = str(fundability.get("verdict") or "no_data")
     blocking = list(fundability.get("blocking") or [])
     best = fundability.get("best_path")
@@ -88,7 +152,20 @@ def decide(fundability: dict[str, Any], balance: BalanceHealth | None) -> FileDe
             verdict = _cap(verdict, "not_yet")
             capped = verdict != before
 
-    if verdict == "no_data":
+    if not ver.unlocked:
+        # Nothing downstream is trustworthy yet, so do not dress it up as a
+        # verdict. Say what is outstanding, which is also the rep's next action.
+        verdict = "no_data"
+        headline = (
+            "Waiting on the bank connection and the credit authorization."
+            if ver.returned == 0
+            else (
+                "Waiting on the credit authorization."
+                if ver.bank_linked
+                else "Waiting on the bank connection."
+            )
+        )
+    elif verdict == "no_data":
         headline = "Not enough in the file yet to say. Statements are what move this."
     elif capped:
         first = reasons[0] if reasons else "the ending balances are not holding up"
@@ -121,5 +198,6 @@ def decide(fundability: dict[str, Any], balance: BalanceHealth | None) -> FileDe
         # fundable whose balances have never been checked: a client who signs a
         # package that then gets declined on the first thing a lender looks at
         # is a client who does not come back.
-        ready_for_forms=(verdict == "fundable" and balance_passed is True),
+        ready_for_forms=(ver.unlocked and verdict == "fundable" and balance_passed is True),
+        verification=ver,
     )

@@ -109,6 +109,7 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    DeliveryRowRead,
     DecisionRead,
     UnreadSummary,
     PublicPlaidResult,
@@ -259,7 +260,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, decision, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -378,6 +379,38 @@ async def _require_group(db: AsyncSession, group_id: UUID) -> DealerGroup:
     return group
 
 
+async def _next_case_ref(db: AsyncSession) -> str:
+    """QC-{year}-{5 digits}, counting within the calendar year.
+
+    Derived from the highest existing reference for the year rather than from
+    a row count, so deleting a file never causes the next one to collide with
+    a reference already printed on a contract.
+
+    The unique constraint is the real guarantee: two reps opening a file in the
+    same second would both read the same maximum, and the loser's insert fails
+    rather than duplicating. Retry once on that, which is enough for a
+    two-person race and honest about not being a distributed sequence.
+    """
+    from datetime import datetime, timezone
+
+    year = datetime.now(timezone.utc).year
+    prefix = f"QC-{year}-"
+    top = (
+        await db.execute(
+            select(func.max(DealerBusiness.case_ref)).where(
+                DealerBusiness.case_ref.like(f"{prefix}%")
+            )
+        )
+    ).scalar_one_or_none()
+    n = 0
+    if top:
+        try:
+            n = int(top.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            n = 0
+    return f"{prefix}{n + 1:05d}"
+
+
 def _client_ip(request: Request) -> str | None:
     """The consenting person's IP, as best we can see it.
 
@@ -481,11 +514,13 @@ async def _notify_client_request(
         )
     ).scalar_one_or_none()
 
+    to_email = (owner.email if owner and owner.email else None) or dealer.email
+    to_phone = (owner.phone if owner and owner.phone else None) or dealer.phone
     delivery = await consent_delivery.deliver_link_checked(
         db,
         channel=channel,
-        to_email=(owner.email if owner and owner.email else None) or dealer.email,
-        to_phone=(owner.phone if owner and owner.phone else None) or dealer.phone,
+        to_email=to_email,
+        to_phone=to_phone,
         business_name=dealer.name,
         purpose=purpose,
         path=path,
@@ -499,6 +534,10 @@ async def _notify_client_request(
             "email": delivery.email_ok,
             "sms": delivery.sms_ok,
             "purpose": purpose,
+            # Recorded so the delivery log can name who was reached without
+            # re-deriving it from the owner row, which may have changed since.
+            "recipient": to_email or to_phone or "",
+            "channel": channel,
         },
     )
     return delivery
@@ -689,7 +728,7 @@ async def create_dealer(
     # sms_consent is captured alongside the file but is not a column on it: it
     # becomes its own evidence row below.
     fields = payload.model_dump(exclude={"sms_consent"})
-    dealer = DealerBusiness(**fields, owner_user_id=user.id)
+    dealer = DealerBusiness(**fields, owner_user_id=user.id, case_ref=await _next_case_ref(db))
     db.add(dealer)
     await db.flush()
     await _record_sms_consent(db, dealer, payload.sms_consent, user, request)
@@ -914,6 +953,60 @@ async def dealer_fundability(
     return verdict
 
 
+@router.get("/dealers/{dealer_id}/delivery-log", response_model=list[DeliveryRowRead])
+async def dealer_delivery_log(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[DeliveryRowRead]:
+    """What was asked of this applicant and what came back.
+
+    A projection over the audit trail rather than a second store: every fact in
+    it is already recorded when a link is sent, opened or completed. See
+    services/delivery_log.py for why status is derived rather than stored."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = await delivery_log.build(db, dealer.id, limit=limit)
+    return [DeliveryRowRead(**asdict(r)) for r in rows]
+
+
+async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
+    """Read the two authorizations off the file.
+
+    Bank is an *active* Plaid item: a revoked or errored connection is not a
+    connection, and treating it as one would unlock a profile computed from
+    statements that stopped arriving weeks ago.
+
+    Credit is any owner with a completed pull. Files often have several
+    principals and only the guarantor is pulled, so requiring all of them would
+    gate on work nobody intends to do.
+    """
+    bank_linked = bool(
+        (
+            await db.execute(
+                select(DealerPlaidItem.id).where(
+                    DealerPlaidItem.dealer_id == dealer.id,
+                    DealerPlaidItem.status == "active",
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+    )
+    credit_returned = bool(
+        (
+            await db.execute(
+                select(DealerOwner.id).where(
+                    DealerOwner.dealer_id == dealer.id,
+                    DealerOwner.credit_pulled_at.is_not(None),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+    )
+    return decision.assess_verification(
+        bank_linked=bank_linked, credit_returned=credit_returned
+    )
+
+
 @router.get("/dealers/{dealer_id}/decision", response_model=DecisionRead)
 async def dealer_decision(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -931,11 +1024,12 @@ async def dealer_decision(
     without a next step."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    ver = await _assess_verification(db, dealer)
 
     try:
         metrics = await _latest_snapshot_metrics(db, dealer.id)
     except HTTPException:
-        d = decision.decide({"verdict": "no_data"}, None)
+        d = decision.decide({"verdict": "no_data"}, None, ver)
         return DecisionRead(**asdict(d), programs=[])
 
     targets = await _effective_targets(db, dealer.id)
@@ -998,7 +1092,7 @@ async def dealer_decision(
         dealer, tree, [{"name": f} for f in docs if f]
     )
 
-    out = decision.decide(fundability, health)
+    out = decision.decide(fundability, health, ver)
     return DecisionRead(**asdict(out), programs=[asdict(p) for p in programs])
 
 
