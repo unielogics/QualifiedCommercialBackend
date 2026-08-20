@@ -34,6 +34,62 @@ class DealerCreate(BaseModel):
     funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
     funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
+    # Consent captured in the same moment as the file. Optional, because a rep
+    # may have only an email, or the owner may decline: a file must still open.
+    sms_consent: "SmsConsentIn | None" = None
+
+
+class SmsConsentIn(BaseModel):
+    """What the form reports back about the boxes that were ticked.
+
+    Note what is NOT here: the disclosure text. The server writes the wording
+    from its own copy, so a client cannot submit a record claiming the person
+    agreed to something other than what the server can show them.
+    """
+
+    phone: str = Field(min_length=7, max_length=32)
+    transactional: bool = False
+    marketing: bool = False
+    accepted_legal: bool = False
+    method: Literal["self_web", "in_person_device", "rep_attested"] = "in_person_device"
+    consenter_name: str | None = Field(default=None, max_length=160)
+
+
+# DealerCreate refers to SmsConsentIn before it exists. `from __future__ import
+# annotations` turns that into a lazy string, which Pydantic only resolves when
+# the model is first used — and then raises "not fully defined" at request
+# time rather than at import. Resolve it here, where the failure is loud.
+DealerCreate.model_rebuild()
+
+
+class SmsConsentOut(BaseModel):
+    id: UUID
+    phone_e164: str
+    consent_kind: str
+    granted: bool
+    method: str
+    disclosure_version: str
+    consenter_name: str | None = None
+    captured_by_name: str | None = None
+    created_at: datetime
+    revoked_at: datetime | None = None
+    revoked_reason: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SmsDisclosureOut(BaseModel):
+    """The exact wording the form must render. Fetched, never hardcoded, so the
+    text on screen and the text in the proof are the same string."""
+
+    version: str
+    brand: str
+    transactional: str
+    marketing: str
+    legal: str
+    terms_url: str
+    privacy_url: str
+    support_email: str
 
 
 class DealerUpdate(BaseModel):

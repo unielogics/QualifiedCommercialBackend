@@ -787,3 +787,74 @@ class DealerRepLead(TimestampMixin, Base):
     # Append-only [{at, from, to, by, by_name}] so time-in-status is derivable
     # without a second table. Capped by the API.
     status_history: Mapped[list | None] = mapped_column(JSONB)
+
+
+# --- SMS consent (0131) -------------------------------------------------------
+
+# The exact disclosure a person agreed to, versioned. Carriers audit the
+# WORDING, not just the fact of a checkbox, so the text lives here beside the
+# record and every consent stores which version it accepted. Changing the
+# wording means a new version, never an edit in place.
+SMS_DISCLOSURE_VERSION = "2026-08-20-1"
+
+SMS_CONSENT_KINDS: tuple[str, ...] = ("transactional", "marketing")
+
+# How the consent was obtained. Carriers weigh these differently: a person
+# ticking the box themselves is the strongest, a rep recording what they were
+# told in person is acceptable when attested and logged, and anything else is
+# not consent at all.
+SMS_CONSENT_METHODS: tuple[str, ...] = (
+    "self_web",        # the person checked the box on their own device
+    "in_person_device",# the rep handed their device over and the person checked it
+    "rep_attested",    # the rep recorded verbal consent given in front of them
+)
+
+
+class DealerSmsConsent(TimestampMixin, Base):
+    """Proof that a specific phone number agreed to receive a specific kind of
+    message, under a specific disclosure.
+
+    Kept as its own row rather than a flag on the business because consent is
+    evidence: it has to survive the business record being edited, it has to be
+    revocable without losing the history, and a regulator or carrier asking
+    "show me" needs a timestamp, an IP and the exact words shown.
+
+    Modelled on the e-signature record, which solved the same problem for
+    documents.
+    """
+
+    __tablename__ = "dos_sms_consent"
+    __table_args__ = (
+        Index("ix_dos_sms_consent_dealer", "dealer_id"),
+        # Lookups on send are always "is this number cleared for this kind".
+        Index("ix_dos_sms_consent_phone_kind", "phone_e164", "consent_kind"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    # E.164. Consent belongs to a NUMBER, not a person or a business: if the
+    # number changes, the old consent does not carry over to the new one.
+    phone_e164: Mapped[str] = mapped_column(String(20), nullable=False)
+    consent_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    granted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    method: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # What they actually saw, and proof of it.
+    disclosure_version: Mapped[str] = mapped_column(String(24), nullable=False)
+    disclosure_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    disclosure_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Who was in the room, and from where.
+    captured_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    captured_by_name: Mapped[str | None] = mapped_column(String(120))
+    consenter_name: Mapped[str | None] = mapped_column(String(160))
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    user_agent: Mapped[str | None] = mapped_column(String(400))
+
+    # Revocation is a new state on the same row, so the grant is never erased.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_reason: Mapped[str | None] = mapped_column(String(120))

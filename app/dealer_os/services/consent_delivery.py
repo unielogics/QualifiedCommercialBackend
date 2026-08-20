@@ -113,6 +113,7 @@ def deliver_link(
     business_name: str,
     purpose: str,
     path: str,
+    sms_consent_ok: bool,
     rep_name: str | None = None,
 ) -> DeliveryResult:
     """Send one secure link.
@@ -121,6 +122,14 @@ def deliver_link(
     "connect your bank", "authorise a credit check", "upload your statements".
     `path` is the token-bearing path; the origin is added here so no caller has
     to know it.
+
+    `sms_consent_ok` has no default on purpose. Every caller has to say whether
+    this number has agreed to be texted, and the only honest way to answer is a
+    lookup against the consent table. A default of False would be safe but
+    would let a caller forget the question entirely and quietly lose the
+    ability to text; a default of True would be a compliance hole. Requiring it
+    makes the omission a TypeError at import-gate time instead. Use
+    `deliver_link_checked` and it is answered for you.
     """
     url = f"{AUDIT_ORIGIN}{path}"
     who = f"{rep_name} at Qualified Commercial" if rep_name else "Qualified Commercial"
@@ -131,9 +140,21 @@ def deliver_link(
             return DeliveryResult(
                 False, "sms", "That phone number does not look complete. Check it and try again."
             )
+        if not sms_consent_ok:
+            return DeliveryResult(
+                False,
+                "sms",
+                "This number has not agreed to receive texts. Ask the owner to opt in on "
+                "the file, or send it by email instead.",
+            )
         # Short by necessity, and it names the business so it does not read as
-        # a phishing text.
-        body = f"{who}: to {purpose} for {business_name}, open {url}"
+        # a phishing text. The brand and STOP are in every message because
+        # carriers require identification and an opt-out path in the message
+        # itself, not only at sign-up.
+        body = (
+            f"{who}: to {purpose} for {business_name}, open {url} "
+            f"Reply STOP to opt out."
+        )
         return _send_sms(phone, body)
 
     if channel == "email":
@@ -153,3 +174,31 @@ def deliver_link(
         return _send_email(to, f"Action needed for {business_name}", body)
 
     return DeliveryResult(False, channel, f"Unknown delivery channel: {channel!r}")
+
+
+async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
+    """`deliver_link` with the consent question answered from the database.
+
+    This is the entry point every route should use. It looks up the grant for
+    the destination number itself, so a caller cannot pass an optimistic
+    `sms_consent_ok=True` from a stale form field.
+
+    Email needs no consent check: a business that gave a rep their address to
+    receive their own funding file expects to hear from us there, and CAN-SPAM
+    governs marketing email separately through unsubscribe rather than prior
+    opt-in.
+    """
+    from . import sms_consent as sms_consent_svc
+
+    ok = False
+    if kwargs.get("channel") == "sms":
+        phone = normalize_phone(kwargs.get("to_phone"))
+        if phone:
+            grant = await sms_consent_svc.consent_for(
+                db, phone_e164=phone, kind="transactional"
+            )
+            ok = grant is not None
+
+    import asyncio
+
+    return await asyncio.to_thread(deliver_link, sms_consent_ok=ok, **kwargs)

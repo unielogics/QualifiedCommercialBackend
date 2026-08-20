@@ -14,6 +14,7 @@ import logging
 import re
 import secrets
 import zipfile
+from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
@@ -48,6 +49,7 @@ from .deps import (
 )
 from .models import (
     DealerRepLead,
+    DealerSmsConsent,
     REP_LEAD_TERMINAL,
     DealerPlaidItem,
     DealerAccount,
@@ -103,6 +105,9 @@ from .schemas import (
     CreditRead,
     CreditUpsert,
     DealerCreate,
+    SmsConsentIn,
+    SmsConsentOut,
+    SmsDisclosureOut,
     DealerInvite,
     DealerInviteResult,
     DealerListItem,
@@ -240,7 +245,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import consent_delivery, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import consent_delivery, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -359,8 +364,165 @@ async def _require_group(db: AsyncSession, group_id: UUID) -> DealerGroup:
     return group
 
 
+def _client_ip(request: Request) -> str | None:
+    """The consenting person's IP, as best we can see it.
+
+    The app sits behind Caddy, so `request.client.host` is the proxy. Caddy
+    sets X-Forwarded-For and, being the only hop we control, its LEFTMOST entry
+    is the real client. Trusting the leftmost entry is normally unsafe because
+    a client can forge the header, but here Caddy appends rather than replaces
+    and nothing else terminates TLS, so the first value is what Caddy saw.
+    """
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first[:64]
+    return request.client.host[:64] if request.client else None
+
+
+async def _record_sms_consent(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    payload: "SmsConsentIn | None",
+    user,
+    request: Request,
+) -> list[DealerSmsConsent]:
+    """Turn ticked boxes into evidence rows. One row per kind, never bundled.
+
+    Silently does nothing when nothing was agreed to, which is the normal case:
+    consent is optional and a file opens without it.
+
+    The legal checkbox is a precondition, not a row of its own. Someone who
+    ticked "text me" but not "I agree to the terms" has not given usable
+    consent, because the terms are where the SMS program is described, so we
+    record neither rather than recording something we could not defend.
+    """
+    if payload is None:
+        return []
+    if not (payload.transactional or payload.marketing):
+        return []
+    if not payload.accepted_legal:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "The Terms and Privacy Policy box has to be ticked before texts can be agreed to.",
+        )
+    phone = consent_delivery.normalize_phone(payload.phone)
+    if not phone:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That phone number does not look complete, so the opt-in cannot be recorded.",
+        )
+    kinds = [k for k, on in (("transactional", payload.transactional), ("marketing", payload.marketing)) if on]
+    rows = []
+    for kind in kinds:
+        rows.append(
+            await sms_consent_svc.record_consent(
+                db,
+                dealer_id=dealer.id,
+                phone_e164=phone,
+                kind=kind,
+                method=payload.method,
+                captured_by_user_id=user.id,
+                captured_by_name=user.name,
+                consenter_name=payload.consenter_name,
+                ip_address=_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+            )
+        )
+    await log_action(
+        db, dealer.id, user, "sms_consent.granted", "dealer",
+        entity_id=dealer.id,
+        after={"kinds": kinds, "method": payload.method, "version": sms_consent_svc.SMS_DISCLOSURE_VERSION},
+    )
+    return rows
+
+
+@router.get("/sms-disclosure", response_model=SmsDisclosureOut)
+async def get_sms_disclosure(user: CurrentUser) -> SmsDisclosureOut:
+    """The exact consent wording the form must show.
+
+    Served rather than hardcoded in the client so the words on screen and the
+    words stored as proof cannot drift apart. Editing the copy in one place
+    changes both, and bumping SMS_DISCLOSURE_VERSION marks which records saw
+    which wording."""
+    require_team_or_rep(user)
+    return SmsDisclosureOut(**asdict(sms_consent_svc.disclosure()))
+
+
+@router.get("/dealers/{dealer_id}/sms-consent", response_model=list[SmsConsentOut])
+async def list_sms_consent(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerSmsConsent]:
+    """What this file's number has agreed to, and when. The audit trail a
+    carrier complaint would be answered with."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerSmsConsent)
+                .where(DealerSmsConsent.dealer_id == dealer.id)
+                .order_by(DealerSmsConsent.created_at.desc())
+            )
+        ).scalars().all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/sms-consent",
+    response_model=list[SmsConsentOut],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_sms_consent(
+    dealer_id: UUID,
+    payload: SmsConsentIn,
+    user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerSmsConsent]:
+    """Capture consent on an existing file, for the common case where the owner
+    was not ready to opt in when the file was opened."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = await _record_sms_consent(db, dealer, payload, user, request)
+    await db.commit()
+    for r in rows:
+        await db.refresh(r)
+    return rows
+
+
+@router.delete("/dealers/{dealer_id}/sms-consent", status_code=status.HTTP_200_OK)
+async def revoke_sms_consent(
+    dealer_id: UUID,
+    user: CurrentUser,
+    phone: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Opt a number out by hand, for when someone says stop to the rep rather
+    than to the shortcode. Revokes across every file the number appears on,
+    because a person saying stop means stop."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    e164 = consent_delivery.normalize_phone(phone)
+    if not e164:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That phone number does not look complete.")
+    n = await sms_consent_svc.revoke(db, phone_e164=e164, reason="asked us to stop")
+    await log_action(
+        db, dealer.id, user, "sms_consent.revoked", "dealer",
+        entity_id=dealer.id, after={"phone": e164, "rows": n},
+    )
+    await db.commit()
+    return {"revoked": n, "phone": e164}
+
+
 @router.post("/dealers", response_model=DealerRead, status_code=status.HTTP_201_CREATED)
-async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
+async def create_dealer(
+    payload: DealerCreate,
+    user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> DealerBusiness:
     """Open a client file. Team creates anywhere in the book; a FIELD_REP
     creates into their own, and owner_user_id is what makes it theirs.
 
@@ -373,9 +535,13 @@ async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSessi
     require_team_or_rep(user)
     if payload.group_id is not None:
         await _require_group(db, payload.group_id)
-    dealer = DealerBusiness(**payload.model_dump(), owner_user_id=user.id)
+    # sms_consent is captured alongside the file but is not a column on it: it
+    # becomes its own evidence row below.
+    fields = payload.model_dump(exclude={"sms_consent"})
+    dealer = DealerBusiness(**fields, owner_user_id=user.id)
     db.add(dealer)
     await db.flush()
+    await _record_sms_consent(db, dealer, payload.sms_consent, user, request)
     # Every dealer starts with the uploads source active and a full set of
     # AI-proposed targets, so the cockpit is never empty.
     db.add(DealerSourceConnection(dealer_id=dealer.id, kind="uploads", status="active"))
@@ -6121,8 +6287,8 @@ async def owner_credit_invite(
     # Delivery is best-effort and reported honestly. The token is already
     # minted and valid, so a failed send is recoverable by reading the link
     # out; silently claiming success is not.
-    delivery = await asyncio.to_thread(
-        consent_delivery.deliver_link,
+    delivery = await consent_delivery.deliver_link_checked(
+        db,
         channel=req.channel,
         to_email=req.to_email or owner.email or dealer.email,
         to_phone=req.to_phone or owner.phone or dealer.phone,
