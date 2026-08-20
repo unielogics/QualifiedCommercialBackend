@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from datetime import date, datetime
 from uuid import UUID
 
@@ -350,7 +352,10 @@ class MessageRead(ORM):
 
 class MessageCreate(BaseModel):
     body: str = Field(min_length=1)
-    internal: bool = False
+    # Tri-state on purpose. None means "the caller did not say", which lets the
+    # server pick a safe default per role: internal for a rep, client-visible
+    # for the team's default. An explicit true/false always wins.
+    internal: bool | None = None
 
 
 class SessionRead(ORM):
@@ -1193,11 +1198,26 @@ class SoftPullResult(BaseModel):
 # the person the pull is ABOUT, never from the client on their behalf.
 
 
+class CreditInviteRequest(BaseModel):
+    """How to get the consent link to the owner.
+
+    `none` mints the link and hands it back for the rep to read out or paste
+    themselves, which is what happens when they are standing next to the
+    person and texting would be absurd."""
+
+    channel: Literal["email", "sms", "none"] = "none"
+    to_email: str | None = Field(default=None, max_length=320)
+    to_phone: str | None = Field(default=None, max_length=40)
+
+
 class CreditInviteResult(BaseModel):
     """Returned ONCE at mint time — only the sha256 of the token is stored."""
 
     token: str
     path: str  # "/credit-consent#t={token}" (fragment: token never hits server logs)
+    delivered: bool = False
+    channel: str = "none"
+    detail: str = ""
 
 
 class PublicConsentView(BaseModel):

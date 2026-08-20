@@ -7,6 +7,7 @@ ledger, plan, forecast, messaging land in Streams 2-5 on this same router.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import logging
@@ -41,6 +42,8 @@ from .deps import (
     require_super_admin,
     require_team,
     require_team_or_dealer,
+    require_team_or_dealer_or_rep,
+    require_team_or_rep,
     resolve_dealer_scope,
 )
 from .models import (
@@ -90,6 +93,7 @@ from .schemas import (
     CashEventSearchRow,
     CashImport,
     CashImportResult,
+    CreditInviteRequest,
     CreditInviteResult,
     CreditRead,
     CreditUpsert,
@@ -231,7 +235,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import consent_delivery, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -242,8 +246,10 @@ router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
 @router.get("/dealers", response_model=list[DealerListItem])
 async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[DealerListItem]:
     # Team sees the whole book; a DEALER login sees only businesses linked to it
-    # (dealer_user_id) — this is what powers the self-serve "My business" view.
-    require_team_or_dealer(user)
+    # (dealer_user_id) — this is what powers the self-serve "My business" view;
+    # a FIELD_REP sees only the files they own. This is the ONLY place a
+    # collection is role-filtered, so a missed branch here is a book-wide leak.
+    require_team_or_dealer_or_rep(user)
     # 0120: one outerjoin carries the client-file (group) name onto each row.
     stmt = (
         select(DealerBusiness, DealerGroup.name)
@@ -252,6 +258,8 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     )
     if user.role == Role.DEALER:
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
+    elif user.role == Role.FIELD_REP:
+        stmt = stmt.where(DealerBusiness.owner_user_id == user.id)
     pairs = (await db.execute(stmt)).all()
     dealers = [d for d, _ in pairs]
     group_names = {d.id: name for d, name in pairs}
@@ -348,7 +356,16 @@ async def _require_group(db: AsyncSession, group_id: UUID) -> DealerGroup:
 
 @router.post("/dealers", response_model=DealerRead, status_code=status.HTTP_201_CREATED)
 async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerBusiness:
-    require_team(user)
+    """Open a client file. Team creates anywhere in the book; a FIELD_REP
+    creates into their own, and owner_user_id is what makes it theirs.
+
+    The bucket is created here rather than lazily. For a rep working on site
+    the bucket IS the document room, so a file without one cannot receive
+    anything, and "create the file, then remember to make a bucket" is a step
+    that will be forgotten in a parking lot. ensure_bucket adopts the intake
+    bucket matched by email when the business is already in the funding
+    funnel, so this does not mint a second room for an existing client."""
+    require_team_or_rep(user)
     if payload.group_id is not None:
         await _require_group(db, payload.group_id)
     dealer = DealerBusiness(**payload.model_dump(), owner_user_id=user.id)
@@ -358,6 +375,13 @@ async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSessi
     # AI-proposed targets, so the cockpit is never empty.
     db.add(DealerSourceConnection(dealer_id=dealer.id, kind="uploads", status="active"))
     await propose_targets(db, dealer)
+    # Best-effort: a bucket failure must not cost the rep the file they just
+    # typed in front of a client. The file is still usable and
+    # POST /dealers/{id}/bucket/create recovers it.
+    try:
+        await buckets_link.ensure_bucket(db, dealer)
+    except Exception:
+        logger.exception("dealer-os: bucket creation failed for new dealer %s", dealer.id)
     await db.commit()
     await db.refresh(dealer)
     return dealer
@@ -3013,7 +3037,7 @@ async def messages_unread_count(
 async def mark_messages_seen(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -3034,9 +3058,9 @@ async def mark_messages_seen(
 async def list_messages(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerMessage]:
-    """Full thread, oldest first. Team sees internal notes; a DEALER login
-    only ever gets internal=false rows."""
-    require_team_or_dealer(user)
+    """Full thread, oldest first. Team and the owning rep see internal notes;
+    a DEALER login only ever gets internal=false rows."""
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerMessage).where(DealerMessage.dealer_id == dealer.id)
     if user.role == Role.DEALER:
@@ -3052,10 +3076,23 @@ async def list_messages(
 async def create_message(
     dealer_id: UUID, payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerMessage:
-    require_team_or_dealer(user)
+    """Post to the file's thread.
+
+    Two opposite defaults, both deliberate. A DEALER can never author an
+    internal note whatever the payload says, because the client must not be
+    able to write into the desk's private conversation. A FIELD_REP defaults
+    the other way: their messages are internal unless they explicitly ask for
+    a client-visible one, because a rep typing a candid note about a borrower
+    and having it land in front of that borrower is the failure that matters
+    most here."""
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    # A dealer can never author an internal note, whatever the payload says.
-    internal = False if user.role == Role.DEALER else payload.internal
+    if user.role == Role.DEALER:
+        internal = False
+    elif user.role == Role.FIELD_REP:
+        internal = True if payload.internal is None else payload.internal
+    else:
+        internal = False if payload.internal is None else payload.internal
     message = DealerMessage(
         dealer_id=dealer.id,
         author_user_id=user.id,
@@ -3073,7 +3110,7 @@ async def create_message(
 async def list_sessions(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerSession]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
@@ -5884,12 +5921,23 @@ async def _resolve_consent_owner(db: AsyncSession, token: str) -> DealerOwner:
     "/dealers/{dealer_id}/owners/{owner_id}/credit-invite", response_model=CreditInviteResult
 )
 async def owner_credit_invite(
-    dealer_id: UUID, owner_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    owner_id: UUID,
+    user: CurrentUser,
+    payload: CreditInviteRequest | None = None,
+    db: AsyncSession = Depends(get_db),
 ) -> CreditInviteResult:
-    """Mint the one-time consent link for an owner (super-admin only). The
-    plaintext token is returned ONCE here; only its sha256 is stored.
-    Re-minting replaces the previous token — the old link dies instantly."""
-    require_super_admin(user)
+    """Mint the one-time credit-consent link for an owner, and optionally send it.
+
+    The plaintext token is returned ONCE here; only its sha256 is stored, and
+    re-minting kills the previous link instantly.
+
+    Open to the owning field rep as well as the team. A rep sitting with a
+    business owner is exactly who needs this: consent has to come from the
+    person the pull is about, so the rep texts or emails them a link they open
+    on their own phone rather than the rep ever handling their details.
+    resolve_dealer_scope confines a rep to their own files."""
+    require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     owner = (
         await db.execute(
@@ -5907,7 +5955,32 @@ async def owner_credit_invite(
         entity_id=owner.id, after={"invite_sent_at": owner.invite_sent_at.isoformat()},
     )
     await db.commit()
-    return CreditInviteResult(token=token, path=f"/credit-consent#t={token}")
+
+    path = f"/credit-consent#t={token}"
+    req = payload or CreditInviteRequest()
+    if req.channel == "none":
+        return CreditInviteResult(token=token, path=path)
+
+    # Delivery is best-effort and reported honestly. The token is already
+    # minted and valid, so a failed send is recoverable by reading the link
+    # out; silently claiming success is not.
+    delivery = await asyncio.to_thread(
+        consent_delivery.deliver_link,
+        channel=req.channel,
+        to_email=req.to_email or owner.email or dealer.email,
+        to_phone=req.to_phone or owner.phone or dealer.phone,
+        business_name=dealer.name,
+        purpose="authorise a soft credit check",
+        path=path,
+        rep_name=user.name,
+    )
+    return CreditInviteResult(
+        token=token,
+        path=path,
+        delivered=delivery.ok,
+        channel=delivery.channel,
+        detail=delivery.detail,
+    )
 
 
 @router.get("/public/credit-consent/{token}", response_model=PublicConsentView)

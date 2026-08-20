@@ -21,6 +21,11 @@ class Role(StrEnum):
     # no book-of-business (/loans, /clients, /reports) like Role.BROKER has.
     DEALER_PARTNER = "dealer_partner"
     DEALER = "dealer"  # Dealer OS self-serve (audit.qualifiedcommercial.com)
+    # Field sales rep (rep.qualifiedcommercial.com) — visits businesses in
+    # person, creates and works the files they own. Internal, but NOT a team
+    # role: a rep is scoped to DealerBusiness.owner_user_id == their id and
+    # never sees another rep's book.
+    FIELD_REP = "field_rep"
 
 
 class Language(StrEnum):

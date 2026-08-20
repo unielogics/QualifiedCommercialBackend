@@ -716,3 +716,74 @@ class DealerMessageSeen(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# --- Field-rep pipeline (0130) ------------------------------------------------
+
+# The lifecycle of a rep-collected file, in order. Enumerated here and enforced
+# by the API rather than left as free text: the AI-underwriter side writes only
+# two of the three statuses its own admin UI filters on, which makes a filter
+# that silently returns nothing. One list, one source of truth.
+REP_LEAD_STATUSES: tuple[str, ...] = (
+    "draft",           # created on site, still being filled in
+    "info_collected",  # the rep's form is complete
+    "awaiting_docs",   # link sent, waiting on the client's bank or uploads
+    "analyzing",       # documents landed, metrics computing
+    "decision_ready",  # a verdict exists for the desk to act on
+    "forms_out",       # application PDFs sent for signature
+    "signed",          # signed, awaiting final checks
+    "complete",        # done
+    "declined",        # not proceeding
+    "stalled",         # no client response; distinct from declined, and the
+                       # one a performance report should surface loudest
+)
+
+# Statuses that end the file. Used by the performance rollup so a stalled file
+# is never counted as still-working.
+REP_LEAD_TERMINAL: frozenset[str] = frozenset({"complete", "declined", "stalled"})
+
+
+class DealerRepLead(TimestampMixin, Base):
+    """A field rep's file: the pipeline wrapper around a DealerBusiness.
+
+    The business carries the financials and gets the whole Capital OS engine.
+    This row carries who owns it and where it is in the process, which is
+    everything the engine deliberately has no opinion about.
+
+    Kept separate from DealerBusiness rather than adding status columns to it
+    because a business is durable and a lead is a moment: the same business can
+    be worked again next year, and its metrics history should not be entangled
+    with the pipeline state of a file that closed.
+    """
+
+    __tablename__ = "dos_rep_leads"
+    __table_args__ = (
+        # One open lead per business. A second attempt is a new row only once
+        # the previous one is terminal, which the API enforces.
+        Index("ix_dos_rep_leads_dealer", "dealer_id"),
+        Index("ix_dos_rep_leads_rep_status", "rep_user_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    # The owning rep. SET NULL rather than CASCADE: a rep leaving must never
+    # delete the files they collected.
+    rep_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default="draft"
+    )
+    # The desk's answer, once there is one: fundable | conditional | not_yet.
+    # Mirrors fundability_verdict rather than inventing a second vocabulary.
+    decision: Mapped[str | None] = mapped_column(String(16))
+    decision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Where the rep met them. Free text on purpose; this is a note, not a key.
+    source_note: Mapped[str | None] = mapped_column(String(240))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Append-only [{at, from, to, by, by_name}] so time-in-status is derivable
+    # without a second table. Capped by the API.
+    status_history: Mapped[list | None] = mapped_column(JSONB)

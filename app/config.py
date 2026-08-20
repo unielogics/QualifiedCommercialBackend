@@ -155,6 +155,13 @@ class Settings(BaseSettings):
     # the role needs ses:SendEmail. When ses_from_address is empty the
     # SES path no-ops silently — the re-engagement engine still runs,
     # the email rung just logs "dormant".
+    # AWS End User Messaging (SNS SMS). Dormant until the account leaves the
+    # SMS sandbox and the toll-free number finishes verification; until then
+    # sms_production stays false and every SMS path reports honestly rather
+    # than pretending to send.
+    sms_origination_number: str = ""
+    sms_production: bool = False
+
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""

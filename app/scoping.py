@@ -32,6 +32,13 @@ if TYPE_CHECKING:
     from sqlalchemy.sql import Select
 
 
+# Roles with no funding-system book of business. These must be denied
+# explicitly: the helpers below end in a bare `return stmt`, which is the
+# SUPER_ADMIN/LOAN_EXEC "see everything" case, so any role that is not named
+# here inherits full visibility by omission rather than by decision.
+_NO_FUNDING_BOOK = frozenset({Role.DEALER_PARTNER, Role.DEALER, Role.FIELD_REP})
+
+
 def scope_client_query(user, stmt: "Select") -> "Select":
     """Scope a `select(Client)` to rows the calling user may see."""
     if user.role == Role.CLIENT:
@@ -44,13 +51,14 @@ def scope_client_query(user, stmt: "Select") -> "Select":
         return stmt.where(Client.broker_id == user.broker.id)
     if user.role == Role.REGIONAL_MANAGER:
         return stmt.where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
-    if user.role == Role.DEALER_PARTNER:
-        # No book-of-business (see Role.DEALER_PARTNER's own docstring in
-        # app/enums.py) -- this role's only client-relevant surface is its
-        # own broker_router endpoints, which query PublicUnderwritingIntake
-        # directly and never go through this helper. Deny by default rather
-        # than silently falling through to the SUPER_ADMIN/LOAN_EXEC
-        # unfiltered case below.
+    if user.role in _NO_FUNDING_BOOK:
+        # No book-of-business (see each role's docstring in app/enums.py).
+        # DEALER_PARTNER works only its own broker_router endpoints, which
+        # query PublicUnderwritingIntake directly; DEALER and FIELD_REP live
+        # entirely in Capital OS, which scopes through
+        # dealer_os/deps.resolve_dealer_scope rather than this helper. Deny by
+        # default rather than silently falling through to the
+        # SUPER_ADMIN/LOAN_EXEC unfiltered case below.
         return stmt.where(sql_false())
     return stmt
 
@@ -60,7 +68,7 @@ def scope_loan_query(user, stmt: "Select") -> "Select":
 
     SUPER_ADMIN and LOAN_EXEC see everything; BROKER is restricted to
     their assigned loans; CLIENT is restricted to their own loans;
-    DEALER_PARTNER has no book-of-business and sees nothing.
+    the roles in _NO_FUNDING_BOOK have no book-of-business and see nothing.
     """
     if user.role == Role.CLIENT:
         if user.client is None:
@@ -72,7 +80,7 @@ def scope_loan_query(user, stmt: "Select") -> "Select":
         return stmt.where(Loan.broker_id == user.broker.id)
     if user.role == Role.REGIONAL_MANAGER:
         return stmt.where(Loan.broker_id.in_(regional_manager_broker_ids_subquery(user)))
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in _NO_FUNDING_BOOK:
         return stmt.where(sql_false())
     return stmt
 
