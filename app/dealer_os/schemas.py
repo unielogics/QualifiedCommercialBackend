@@ -403,6 +403,8 @@ class MessageRead(ORM):
     author_name: str | None = None
     body: str
     internal: bool
+    channel: str = "client"
+    edited_at: datetime | None = None
     created_at: datetime
 
 
@@ -412,6 +414,25 @@ class MessageCreate(BaseModel):
     # server pick a safe default per role: internal for a rep, client-visible
     # for the team's default. An explicit true/false always wins.
     internal: bool | None = None
+    # 0132: which conversation this belongs to. Wins over `internal` when both
+    # are given. Left unset, the server picks by role, which is what every
+    # existing caller relies on.
+    channel: Literal["desk", "client", "note"] | None = None
+
+
+class MessageEdit(BaseModel):
+    body: str = Field(min_length=1)
+
+
+class AIThreadMessage(ORM):
+    id: UUID
+    role: str
+    body: str
+    created_at: datetime
+
+
+class AIThreadAsk(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
 
 
 class SessionRead(ORM):

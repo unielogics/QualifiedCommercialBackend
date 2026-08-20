@@ -50,6 +50,9 @@ from .deps import (
 from .models import (
     DealerRepLead,
     DealerSmsConsent,
+    DealerAIMessage,
+    MESSAGE_CHANNELS,
+    CLIENT_VISIBLE_CHANNELS,
     REP_LEAD_TERMINAL,
     DealerPlaidItem,
     DealerAccount,
@@ -105,6 +108,9 @@ from .schemas import (
     CreditRead,
     CreditUpsert,
     DealerCreate,
+    AIThreadAsk,
+    AIThreadMessage,
+    MessageEdit,
     SmsConsentIn,
     SmsConsentOut,
     SmsDisclosureOut,
@@ -245,7 +251,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import consent_delivery, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import consent_delivery, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -3205,7 +3211,7 @@ async def messages_unread_count(
 ) -> dict:
     """Messages this viewer hasn't seen: created after their seen marker, by
     someone else; dealers never count internal notes."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     seen = (
         await db.execute(
@@ -3248,15 +3254,31 @@ async def mark_messages_seen(
 
 @router.get("/dealers/{dealer_id}/messages", response_model=list[MessageRead])
 async def list_messages(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    channel: str | None = None,
 ) -> list[DealerMessage]:
-    """Full thread, oldest first. Team and the owning rep see internal notes;
-    a DEALER login only ever gets internal=false rows."""
+    """One channel of the file's conversation, oldest first.
+
+    Omit `channel` and the desk gets everything, which is what the combined
+    view wants. A DEALER login is confined to the client channel whatever they
+    ask for."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerMessage).where(DealerMessage.dealer_id == dealer.id)
     if user.role == Role.DEALER:
-        q = q.where(DealerMessage.internal.is_(False))
+        # Belt and braces: filter on the channel allowlist AND on the legacy
+        # boolean. Either alone would be enough today; together, a row that
+        # somehow disagrees with itself stays hidden rather than leaking.
+        q = q.where(
+            DealerMessage.channel.in_(CLIENT_VISIBLE_CHANNELS),
+            DealerMessage.internal.is_(False),
+        )
+    elif channel is not None:
+        if channel not in MESSAGE_CHANNELS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown channel {channel!r}")
+        q = q.where(DealerMessage.channel == channel)
     return (
         (await db.execute(q.order_by(DealerMessage.created_at.asc()))).scalars().all()
     )
@@ -3279,23 +3301,169 @@ async def create_message(
     most here."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+
     if user.role == Role.DEALER:
-        internal = False
+        # A client writes to the client thread and nowhere else, whatever the
+        # payload claims. This is the one rule in the file that must not have
+        # an escape hatch.
+        channel = "client"
+    elif payload.channel is not None:
+        if payload.channel not in MESSAGE_CHANNELS:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"Unknown channel {payload.channel!r}"
+            )
+        channel = payload.channel
+    elif payload.internal is not None:
+        # Older callers that only know about the boolean still work.
+        channel = "desk" if payload.internal else "client"
     elif user.role == Role.FIELD_REP:
-        internal = True if payload.internal is None else payload.internal
+        # A rep typing a candid remark about a borrower and having it land in
+        # front of that borrower is the failure that matters most here, so
+        # silence defaults inward. Reaching the client is a deliberate act.
+        channel = "desk"
     else:
-        internal = False if payload.internal is None else payload.internal
+        channel = "client"
+
+    internal = channel not in CLIENT_VISIBLE_CHANNELS
     message = DealerMessage(
         dealer_id=dealer.id,
         author_user_id=user.id,
         author_name=user.name,
         body=payload.body,
         internal=internal,
+        channel=channel,
     )
     db.add(message)
     await db.commit()
     await db.refresh(message)
     return message
+
+
+@router.patch("/dealers/{dealer_id}/messages/{message_id}", response_model=MessageRead)
+async def edit_message(
+    dealer_id: UUID,
+    message_id: UUID,
+    payload: MessageEdit,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerMessage:
+    """Edit your own note.
+
+    Notes only, and only your own. A note is an annotation the desk maintains
+    ("owner travels until the 14th") and it goes stale, so editing it is the
+    point. A message in a conversation is a record of something that was said
+    to someone, and quietly rewriting one after the fact would make the whole
+    thread untrustworthy, so those are immutable."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    msg = (
+        await db.execute(
+            select(DealerMessage).where(
+                DealerMessage.id == message_id, DealerMessage.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if msg is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Message not found on this file")
+    if msg.channel != "note":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Only notes can be edited. A message someone has already read stays as it was sent.",
+        )
+    if msg.author_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only the person who wrote a note can edit it."
+        )
+    msg.body = payload.body
+    msg.edited_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+@router.get("/dealers/{dealer_id}/ai/thread", response_model=list[AIThreadMessage])
+async def list_ai_thread(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerAIMessage]:
+    """Your own AI thread on this file, oldest first.
+
+    Filtered by user_id as well as dealer_id, and there is no parameter that
+    widens it. A rep working out why coverage came out at 1.02 should not
+    appear in the underwriter's view, and the reverse matters just as much."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerAIMessage)
+                .where(
+                    DealerAIMessage.dealer_id == dealer.id,
+                    DealerAIMessage.user_id == user.id,
+                )
+                .order_by(DealerAIMessage.created_at.asc())
+            )
+        ).scalars().all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/ai/thread",
+    response_model=AIThreadMessage,
+    status_code=status.HTTP_201_CREATED,
+)
+async def ask_ai_thread(
+    dealer_id: UUID,
+    payload: AIThreadAsk,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerAIMessage:
+    """Ask a question about this file and get an answer from its actual numbers.
+
+    The question is persisted before the model runs, so a timeout leaves the
+    thread showing what was asked rather than losing it. The answer is a second
+    row; a failed call leaves the question standing and the caller can retry."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+
+    history = list(
+        (
+            await db.execute(
+                select(DealerAIMessage)
+                .where(
+                    DealerAIMessage.dealer_id == dealer.id,
+                    DealerAIMessage.user_id == user.id,
+                )
+                .order_by(DealerAIMessage.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    db.add(
+        DealerAIMessage(
+            dealer_id=dealer.id, user_id=user.id, role="user", body=payload.question
+        )
+    )
+    await db.commit()
+
+    bundle = (await _build_lender_package(db, dealer)).model_dump(mode="json")
+    try:
+        text = await file_chat.answer(db, dealer, bundle, history, payload.question)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"The analyst returned nothing usable: {exc}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("dealer-os: file chat failed for dealer %s", dealer.id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, "The analyst could not be reached. Try again."
+        ) from exc
+
+    reply = DealerAIMessage(
+        dealer_id=dealer.id, user_id=user.id, role="assistant", body=text
+    )
+    db.add(reply)
+    await db.commit()
+    await db.refresh(reply)
+    return reply
 
 
 @router.get("/dealers/{dealer_id}/sessions", response_model=list[SessionRead])

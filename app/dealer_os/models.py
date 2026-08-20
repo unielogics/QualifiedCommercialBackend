@@ -348,6 +348,13 @@ class DealerMessage(TimestampMixin, Base):
     author_name: Mapped[str | None] = mapped_column(String(120))
     body: Mapped[str] = mapped_column(Text, nullable=False)
     internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # 0132: `internal` said whether the client could see a row, which was two
+    # channels wearing one boolean. `channel` says which conversation it
+    # belongs to. `internal` is kept and kept in sync, because the dealer
+    # portal and QCDashboard both filter on it and neither should have to
+    # learn a new vocabulary to stay safe.
+    channel: Mapped[str] = mapped_column(String(12), nullable=False, server_default="client")
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerSession(TimestampMixin, Base):
@@ -858,3 +865,44 @@ class DealerSmsConsent(TimestampMixin, Base):
     # Revocation is a new state on the same row, so the grant is never erased.
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_reason: Mapped[str | None] = mapped_column(String(120))
+
+
+# --- file conversation channels (0132) ---------------------------------------
+
+# desk   the working conversation between rep, underwriter and super admin
+# client the thread the business owner sees and can reply to
+# note   short annotations pinned to the file, never a conversation
+#
+# The AI thread is deliberately NOT here. It is per-user and private, so it
+# cannot share a table whose rows are visible to everyone on the desk.
+MESSAGE_CHANNELS: tuple[str, ...] = ("desk", "client", "note")
+
+# Which channels a client login may ever read. One place, so a future channel
+# is invisible to the client until someone deliberately adds it here.
+CLIENT_VISIBLE_CHANNELS: frozenset[str] = frozenset({"client"})
+
+
+class DealerAIMessage(TimestampMixin, Base):
+    """One turn in a private, per-user AI thread about one file.
+
+    Private is the whole point. A rep asking "why did coverage come out at
+    1.02" should not surface in the underwriter's view, and an underwriter
+    stress-testing a file should not surface in the rep's. So every read and
+    write is filtered by user_id as well as dealer_id, and there is no route
+    that returns another user's turns.
+    """
+
+    __tablename__ = "dos_ai_messages"
+    __table_args__ = (
+        Index("ix_dos_ai_messages_thread", "dealer_id", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(12), nullable=False)  # user | assistant
+    body: Mapped[str] = mapped_column(Text, nullable=False)
