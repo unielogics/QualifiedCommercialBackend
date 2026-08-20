@@ -469,6 +469,9 @@ class DecisionRead(BaseModel):
     best_path: dict | None = None
     goal_feasible: bool | None = None
     ready_for_forms: bool = False
+    # The real catalogue, easiest-reachable first. Empty when the file has no
+    # lending question to answer, which the catalogue decides rather than us.
+    programs: list[dict] = []
 
 
 class UnreadSummary(BaseModel):

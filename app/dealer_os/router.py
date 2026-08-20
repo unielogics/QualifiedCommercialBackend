@@ -259,7 +259,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, decision, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, decision, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -936,7 +936,7 @@ async def dealer_decision(
         metrics = await _latest_snapshot_metrics(db, dealer.id)
     except HTTPException:
         d = decision.decide({"verdict": "no_data"}, None)
-        return DecisionRead(**asdict(d))
+        return DecisionRead(**asdict(d), programs=[])
 
     targets = await _effective_targets(db, dealer.id)
     settings = await _global_program_settings(db)
@@ -981,7 +981,25 @@ async def dealer_decision(
         [{"period": r.period, "ending_balance": r.ending_balance} for r in period_rows]
     )
 
-    return DecisionRead(**asdict(decision.decide(fundability, health)))
+    # Which real programs this file reaches, easiest first. compute_paths
+    # answers in seven generic categories; this answers in the fourteen the
+    # desk actually submits to, so a rep can name the program rather than a
+    # readiness percentage.
+    docs = (
+        (
+            await db.execute(
+                select(DealerDocument.filename).where(DealerDocument.dealer_id == dealer.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    programs = program_fit.screen(
+        dealer, tree, [{"name": f} for f in docs if f]
+    )
+
+    out = decision.decide(fundability, health)
+    return DecisionRead(**asdict(out), programs=[asdict(p) for p in programs])
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
