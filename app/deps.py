@@ -41,6 +41,64 @@ async def _get_jwks() -> dict[str, object]:
         return _jwks_cache
 
 
+# Clerk marks a session that still owes a required task — setting up two-step
+# verification, for instance — with session status "pending". The task lives in
+# the session, not the user, so a token minted for a pending session verifies
+# against JWKS perfectly well and would otherwise sail through every guard
+# below. Rejecting it here is the only place that catches a client which skips
+# the setup step, whether by an old app build or a crafted request.
+#
+# Claim shapes differ by Clerk token version, so read all of them rather than
+# betting on one:
+#   v2 tokens carry "sts" ("pending" | "active").
+#   Some carry "act"/"tasks" describing the outstanding task.
+#   "fva" (factor verification age) is [first_factor_age, second_factor_age]
+#   with -1 in the second slot when no second factor has ever been verified.
+_PENDING_STATUSES = {"pending"}
+
+
+def _session_is_pending(payload: dict) -> bool:
+    sts = payload.get("sts")
+    if isinstance(sts, str) and sts.lower() in _PENDING_STATUSES:
+        return True
+    tasks = payload.get("tasks") or payload.get("act")
+    if isinstance(tasks, list) and tasks:
+        return True
+    if isinstance(tasks, dict) and tasks.get("key"):
+        return True
+    return False
+
+
+def _second_factor_missing(payload: dict) -> bool:
+    """True only when the token positively says no second factor was verified.
+
+    Deliberately conservative: an absent `fva` means an older token format, not
+    a missing factor, and treating absence as failure would lock out everyone
+    the moment this flag is switched on.
+    """
+    fva = payload.get("fva")
+    if isinstance(fva, (list, tuple)) and len(fva) >= 2:
+        try:
+            return int(fva[1]) < 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _enforce_mfa(payload: dict) -> None:
+    # get_settings() per call, matching every other function in this module.
+    # A module-level binding would also freeze the flag at import time, which
+    # defeats the point of being able to flip it without a rebuild.
+    if not get_settings().require_mfa:
+        return
+    if _session_is_pending(payload) or _second_factor_missing(payload):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Two-step verification is required. Set it up at /account/security, "
+            "then sign in again.",
+        )
+
+
 async def _verify_clerk_jwt(token: str) -> dict:
     """Verify a Clerk-issued JWT against the project's JWKS endpoint."""
     settings = get_settings()
@@ -173,6 +231,7 @@ async def get_current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token")
     token = authorization.split(" ", 1)[1]
     payload = await _verify_clerk_jwt(token)
+    _enforce_mfa(payload)
     clerk_id = payload.get("sub")
     if not clerk_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing subject")

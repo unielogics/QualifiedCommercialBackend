@@ -23,6 +23,11 @@ class Settings(BaseSettings):
 
     # Clerk (auth)
     clerk_secret_key: str = ""
+    # When true, a Clerk session that still owes its two-step-verification
+    # setup is rejected. Ships OFF so every account can enrol without being
+    # locked out; flip it in Secrets Manager once `two_factor_enabled` is true
+    # for everyone. Reversible in one env var.
+    require_mfa: bool = False
     clerk_jwks_url: str = ""
     clerk_issuer: str = ""
 
