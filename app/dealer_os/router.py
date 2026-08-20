@@ -109,6 +109,9 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    PublicPlaidResult,
+    RoomPasscode,
+    RoomPlaidExchange,
     ClientRequestResult,
     ClientRequestSend,
     SignatureRequestSend,
@@ -5606,6 +5609,101 @@ async def plaid_exchange(
     await db.refresh(item)
     background.add_task(_background_plaid_first_sync, item.id)
     return item
+
+
+@router.post("/public/room/{token}/plaid/link-token", response_model=PlaidLinkTokenRead)
+async def public_room_link_token(
+    token: str, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
+) -> PlaidLinkTokenRead:
+    """PUBLIC. Start Plaid Link from the client's own room.
+
+    Until now Plaid was `require_team` on every route, which meant the only way
+    a business owner could get statements to us was to find, download and
+    upload twelve PDFs. That is the step files die on.
+
+    The token names the file; the caller never does. See
+    client_room.resolve_room for what that guarantees."""
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    _plaid_cooldown("link", dealer.id, 10)
+    try:
+        pt = await plaid_client.create_link_token(
+            dealer_id=str(dealer.id), dealer_name=dealer.name
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+    return PlaidLinkTokenRead(link_token=pt)
+
+
+@router.post(
+    "/public/room/{token}/plaid/exchange",
+    response_model=PublicPlaidResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_room_plaid_exchange(
+    token: str,
+    payload: RoomPlaidExchange,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> PublicPlaidResult:
+    """PUBLIC. Finish Link from the client's room.
+
+    Returns only what the owner needs to see. The authenticated version returns
+    the whole item row, which carries the encrypted access token's metadata and
+    internal status; none of that belongs in a response to an unauthenticated
+    caller, however harmless it looks."""
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    _plaid_cooldown("exchange", dealer.id, 5)
+    try:
+        access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+
+    existing = (
+        await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
+    ).scalar_one_or_none()
+    if existing is not None and existing.dealer_id != dealer.id:
+        # Same guard as the authenticated path. A bank item belongs to exactly
+        # one file, and re-pointing it would silently move somebody's
+        # transactions onto another business.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This bank connection belongs to another file"
+        )
+    if existing is not None:
+        existing.encrypted_access_token = plaid_client.encrypt_token(access_token)
+        existing.status, existing.error = "active", None
+        existing.next_refresh_at = datetime.now(timezone.utc)
+        item = existing
+    else:
+        item = DealerPlaidItem(
+            dealer_id=dealer.id,
+            item_id=item_id,
+            institution_name=(payload.institution_name or "")[:160] or None,
+            encrypted_access_token=plaid_client.encrypt_token(access_token),
+            status="active",
+            next_refresh_at=datetime.now(timezone.utc),
+        )
+        db.add(item)
+    await db.flush()
+    # No `user` to attribute this to, so the audit row records the room the
+    # owner came through. "The client did it themselves" is exactly the fact
+    # worth being able to prove later.
+    await log_action(
+        db, dealer.id, None, "plaid.connect.client", "plaid_item", entity_id=item.id,
+        after={"institution": item.institution_name, "via": "client_room", "link_id": str(link.id)},
+    )
+    await db.commit()
+    background.add_task(_background_plaid_first_sync, item.id)
+    return PublicPlaidResult(
+        connected=True,
+        institution_name=item.institution_name,
+        message="Your bank is connected. We are pulling your statements now.",
+    )
 
 
 async def _background_plaid_first_sync(item_pk: UUID) -> None:

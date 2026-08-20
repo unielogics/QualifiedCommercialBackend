@@ -803,6 +803,31 @@ class DocRequestCreate(BaseModel):
     notify: Literal["email", "sms", "none"] = "email"
 
 
+class RoomPasscode(BaseModel):
+    """The client's access code, re-sent on every call.
+
+    The room is deliberately stateless: there is no session to steal and no
+    cookie to fix, and each call is independently authorised. Matches how the
+    existing bucket upload endpoints already work."""
+
+    passcode: str = Field(min_length=1, max_length=64)
+
+
+class RoomPlaidExchange(RoomPasscode):
+    public_token: str = Field(min_length=1, max_length=512)
+    institution_name: str | None = Field(default=None, max_length=160)
+
+
+class PublicPlaidResult(BaseModel):
+    """What the business owner sees. Deliberately not the item row: an
+    unauthenticated caller has no business seeing internal status, refresh
+    scheduling or token metadata."""
+
+    connected: bool
+    institution_name: str | None = None
+    message: str
+
+
 class ClientRequestSend(BaseModel):
     """How to reach the client for a request. Email always goes unless the
     caller explicitly asks for nothing; "sms" means email AND text."""

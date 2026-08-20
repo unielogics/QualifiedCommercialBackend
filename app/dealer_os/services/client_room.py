@@ -24,8 +24,10 @@ the room a rep opens behaves exactly like the room the desk opens.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import secrets
+import time
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -39,7 +41,14 @@ from . import buckets_link
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ClientRoom", "ensure_room", "request_document", "room_url"]
+__all__ = [
+    "ClientRoom",
+    "ensure_room",
+    "request_document",
+    "room_url",
+    "resolve_room",
+    "verify_passcode",
+]
 
 # Matches the bucket admin routes exactly. Changing either without the other
 # would leave clients unable to open rooms created by the other surface.
@@ -165,3 +174,93 @@ async def request_document(
     db.add(doc)
     await db.flush()
     return doc
+
+
+# --- opening the room from the client's side ---------------------------------
+
+# Same lockout the bucket routes use, and for the same reason: a generated
+# passcode is six digits, so a leaked link URL would otherwise be brute-forced
+# by enumerating 900k codes. In-process counter, single-instance assumption,
+# matching the existing throttles.
+_ATTEMPTS: dict[str, tuple[int, float]] = {}
+_MAX_ATTEMPTS = 10
+_LOCKOUT_SECONDS = 900.0
+
+
+def _locked(key: str) -> bool:
+    entry = _ATTEMPTS.get(key)
+    if not entry:
+        return False
+    attempts, until = entry
+    if attempts < _MAX_ATTEMPTS:
+        return False
+    if time.monotonic() >= until:
+        _ATTEMPTS.pop(key, None)  # window elapsed, allow a fresh burst
+        return False
+    return True
+
+
+def verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
+    """Constant-time check with lockout. Mirrors the bucket routes exactly, so
+    a room opened from either surface behaves the same."""
+    if not passcode_hash:
+        return False
+    if _locked(passcode_hash):
+        return False
+    try:
+        scheme, raw_iterations, salt, expected = passcode_hash.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iterations = int(raw_iterations)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", passcode.encode("utf-8"), salt.encode("utf-8"), iterations
+    ).hex()
+    if hmac.compare_digest(digest, expected):
+        _ATTEMPTS.pop(passcode_hash, None)  # success resets the counter
+        return True
+    attempts = _ATTEMPTS.get(passcode_hash, (0, 0.0))[0] + 1
+    _ATTEMPTS[passcode_hash] = (attempts, time.monotonic() + _LOCKOUT_SECONDS)
+    return False
+
+
+async def resolve_room(
+    db: AsyncSession, token: str, passcode: str
+) -> tuple[BucketUploadLink, DealerBusiness]:
+    """Turn a room token and passcode into the one file it belongs to.
+
+    This is the whole security model for the unauthenticated endpoints, so it
+    is worth being explicit about what it guarantees. The caller never names a
+    dealer: the dealer is derived from the token. A token issued for file A
+    therefore cannot be used to write into file B, because there is no
+    parameter in which to say "B". Combined with the passcode and its lockout,
+    a leaked URL alone is not enough, and a leaked URL plus unlimited guessing
+    is not either.
+
+    Raises LookupError for anything that fails, so callers cannot accidentally
+    distinguish "wrong token" from "wrong code" and turn this into an oracle.
+    """
+    from datetime import datetime, timezone
+
+    link = (
+        await db.execute(select(BucketUploadLink).where(BucketUploadLink.token == token))
+    ).scalar_one_or_none()
+    if link is None or link.status != "active":
+        raise LookupError("room not found")
+    if link.expires_at is not None and link.expires_at < datetime.now(timezone.utc):
+        raise LookupError("room not found")
+    if not verify_passcode(passcode or "", link.passcode_hash):
+        raise LookupError("room not found")
+
+    dealer = (
+        await db.execute(
+            select(DealerBusiness).where(DealerBusiness.bucket_id == link.bucket_id)
+        )
+    ).scalar_one_or_none()
+    if dealer is None:
+        # A bucket with no Capital OS file behind it is an intake-only room.
+        # There is nothing to connect a bank to, and saying so plainly beats
+        # a confusing Plaid error.
+        raise LookupError("this room is not attached to a funding file")
+    return link, dealer
