@@ -166,6 +166,12 @@ class DealerListItem(ORM):
     overdue_actions: int = 0          # open plan actions past their due_on
     fundable_paths: int = 0           # unresolved fundability_* alerts
     attention_score: int = 0          # deterministic weighted sort key (services.rollups)
+    # Verification, for the portfolio's Bank and Credit chips and its filter.
+    # Batched in the list handler, never a per-row query.
+    bank_linked: bool = False
+    credit_returned: bool = False
+    verified: bool = False
+    funding_goal: float | None = None
 
 
 class TargetRead(ORM):
@@ -1845,8 +1851,29 @@ class RepFileRow(ORM):
     last_activity: datetime | None = None
 
 
+class RepFunnel(BaseModel):
+    """Where files stop.
+
+    Deliberately six stages rather than a single conversion rate: the useful
+    fact about a field team is WHERE the drop happens, and an aggregate rate
+    hides it. The gap between authorizations_sent and bank_linked is the one
+    that usually matters, because it is the only stage that depends on the
+    applicant doing something on their own.
+    """
+
+    opened: int = 0
+    authorizations_sent: int = 0
+    bank_linked: int = 0
+    credit_returned: int = 0
+    verified: int = 0
+    application_submitted: int = 0
+    contract_executed: int = 0
+
+
 class RepProduction(BaseModel):
     """What one rep has brought in over the window."""
+
+    funnel: RepFunnel = Field(default_factory=RepFunnel)
 
     rep_user_id: UUID | None = None
     rep_name: str

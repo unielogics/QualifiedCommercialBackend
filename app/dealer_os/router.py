@@ -311,6 +311,37 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
             )
         ).all()
     )
+    # Verification state per row, for the portfolio's Bank and Credit chips.
+    # Batched with the rest: the list already avoids per-dealer queries and a
+    # rep with forty files must not turn one screen into eighty round trips.
+    ids = [d.id for d, _ in pairs]
+    linked_ids: set = set()
+    pulled_ids: set = set()
+    if ids:
+        linked_ids = {
+            did
+            for (did,) in (
+                await db.execute(
+                    select(DealerPlaidItem.dealer_id)
+                    .where(DealerPlaidItem.dealer_id.in_(ids), DealerPlaidItem.status == "active")
+                    .distinct()
+                )
+            ).all()
+        }
+        pulled_ids = {
+            did
+            for (did,) in (
+                await db.execute(
+                    select(DealerOwner.dealer_id)
+                    .where(
+                        DealerOwner.dealer_id.in_(ids),
+                        DealerOwner.credit_pulled_at.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+        }
+
     # Phase 3 Wave 2 attention rollups — all batched, never per-dealer queries.
     today = date.today()
     last_month = rollups.last_calendar_month(today)
@@ -368,6 +399,9 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
         item.attention_score = rollups.attention_score(
             item.open_alerts, item.missing_statement, item.overdue_actions, item.fundable_paths
         )
+        item.bank_linked = d.id in linked_ids
+        item.credit_returned = d.id in pulled_ids
+        item.verified = item.bank_linked and item.credit_returned
         out.append(item)
     return out
 
@@ -6839,6 +6873,57 @@ async def rep_production(
         ).all()
         doc_counts = {did: int(n) for did, n in doc_rows}
 
+        # The funnel's three verification facts, one query each rather than
+        # per-file. A desk with four hundred files in the window would
+        # otherwise fire twelve hundred queries to draw six bars.
+        linked = {
+            did
+            for (did,) in (
+                await db.execute(
+                    select(DealerPlaidItem.dealer_id)
+                    .where(
+                        DealerPlaidItem.dealer_id.in_(dealer_ids),
+                        DealerPlaidItem.status == "active",
+                    )
+                    .distinct()
+                )
+            ).all()
+        }
+        pulled = {
+            did
+            for (did,) in (
+                await db.execute(
+                    select(DealerOwner.dealer_id)
+                    .where(
+                        DealerOwner.dealer_id.in_(dealer_ids),
+                        DealerOwner.credit_pulled_at.is_not(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+        }
+        # "Sent" is the audit trail, not a flag on the file: a rep who sent an
+        # authorization and got nothing back is the single biggest drop in this
+        # funnel, and it only shows if sending is counted separately from
+        # returning.
+        asked = {
+            did
+            for (did,) in (
+                await db.execute(
+                    select(DealerAuditLog.dealer_id)
+                    .where(
+                        DealerAuditLog.dealer_id.in_(dealer_ids),
+                        DealerAuditLog.action.in_(
+                            ["client_request.bank_connect", "owner.credit_invite"]
+                        ),
+                    )
+                    .distinct()
+                )
+            ).all()
+        }
+    else:
+        linked, pulled, asked = set(), set(), set()
+
     by_rep: dict[UUID | None, RepProduction] = {}
     for dealer, lead, rep in rows:
         key = dealer.owner_user_id
@@ -6852,6 +6937,24 @@ async def rep_production(
         docs = doc_counts.get(dealer.id, 0)
         score = scores.get(dealer.id)
         status_val = lead.status if lead else None
+
+        # Measured at the verification line rather than at file-open, which is
+        # the whole point of the funnel: opening a file costs a rep nothing.
+        bucket.funnel.opened += 1
+        is_linked = dealer.id in linked
+        is_pulled = dealer.id in pulled
+        if dealer.id in asked or is_linked or is_pulled:
+            bucket.funnel.authorizations_sent += 1
+        if is_linked:
+            bucket.funnel.bank_linked += 1
+        if is_pulled:
+            bucket.funnel.credit_returned += 1
+        if is_linked and is_pulled:
+            bucket.funnel.verified += 1
+        if status_val in ("forms_out", "signed", "complete"):
+            bucket.funnel.application_submitted += 1
+        if status_val in ("signed", "complete"):
+            bucket.funnel.contract_executed += 1
 
         bucket.files.append(
             RepFileRow(
@@ -6904,6 +7007,16 @@ async def rep_production(
         with_documents=sum(r.with_documents for r in reps),
         fundable=sum(r.fundable for r in reps),
     )
+    for stage in (
+        "opened",
+        "authorizations_sent",
+        "bank_linked",
+        "credit_returned",
+        "verified",
+        "application_submitted",
+        "contract_executed",
+    ):
+        setattr(totals.funnel, stage, sum(getattr(r.funnel, stage) for r in reps))
     all_scores = [f.score for r in reps for f in r.files if f.score is not None]
     totals.avg_score = round(sum(all_scores) / len(all_scores), 1) if all_scores else None
     totals.last_activity = max((r.last_activity for r in reps if r.last_activity), default=None)
