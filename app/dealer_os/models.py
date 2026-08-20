@@ -35,6 +35,20 @@ class DealerBusiness(TimestampMixin, Base):
     # file whose reference can change is a file two people can be looking at
     # while quoting different numbers.
     case_ref: Mapped[str | None] = mapped_column(String(24), unique=True)
+    # 0134: what the money is actually for, line by line.
+    #
+    # A single funding_goal answers "how much" and no lender asks only that.
+    # Every credit file wants the breakdown, and the breakdown is also what
+    # catches a request nobody has thought through: a rep and an owner who sit
+    # down and itemise it usually discover the number was either high or low.
+    #
+    # JSONB rather than a child table on purpose. These rows are a statement
+    # about one application at one moment, never queried across files, never
+    # joined, and they should version with the case rather than drift from it.
+    # A table would invite exactly the reporting that would make them look like
+    # facts rather than a plan.
+    use_of_proceeds: Mapped[list | None] = mapped_column(JSONB)
+    use_of_proceeds_note: Mapped[str | None] = mapped_column(Text)
     legal_name: Mapped[str | None] = mapped_column(String(180))
     ein: Mapped[str | None] = mapped_column(String(24))
     email: Mapped[str | None] = mapped_column(String(320))

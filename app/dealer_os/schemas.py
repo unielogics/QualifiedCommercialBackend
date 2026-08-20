@@ -19,6 +19,15 @@ class ORM(BaseModel):
 _FUNDING_PURPOSES = "^(working_capital|equipment|real_estate|refinance|floorplan|other)$"
 
 
+class UseOfProceedsRow(BaseModel):
+    """One line of the breakdown. Label and amount, nothing else: the moment
+    this grows a category enum it stops being what the owner said and starts
+    being what our dropdown allowed."""
+
+    label: str = Field(min_length=1, max_length=160)
+    amount: float = Field(ge=0, le=999_999_999_999.99)
+
+
 class DealerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
     legal_name: str | None = None
@@ -115,12 +124,16 @@ class DealerUpdate(BaseModel):
     funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
     funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
     group_id: UUID | None = None  # 0120: client file link (PATCH null detaches)
+    use_of_proceeds: list[UseOfProceedsRow] | None = None
+    use_of_proceeds_note: str | None = Field(default=None, max_length=4000)
 
 
 class DealerRead(ORM):
     id: UUID
     name: str
     case_ref: str | None = None
+    use_of_proceeds: list[UseOfProceedsRow] | None = None
+    use_of_proceeds_note: str | None = None
     dealer_user_id: UUID | None = None
     bucket_name: str | None = None
     legal_name: str | None = None
@@ -484,6 +497,7 @@ class VerificationRead(BaseModel):
     returned: int = 0
     reason: str = ""
     stage: str = "intake"
+    credit_enabled: bool = True
 
 
 class DecisionRead(BaseModel):

@@ -1152,10 +1152,18 @@ async def update_dealer(
     db: AsyncSession = Depends(get_db),
 ) -> DealerRead:
     require_team_or_dealer_or_rep(user)
+    # Scope FIRST, once, for everyone.
+    #
+    # This handler used to resolve inside the DEALER branch and fall through to
+    # an unscoped load_dealer for the team branch. That was correct while only
+    # the team could reach it, and became a hole the moment a field rep could:
+    # a rep would land in the team branch and be able to PATCH any file in the
+    # book. resolve_dealer_scope returns anything for the team, so hoisting it
+    # costs the desk nothing and closes it.
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     if user.role == Role.DEALER:
         # A client may complete the always-required business-profile fields
         # on their OWN file — nothing else.
-        dealer = await resolve_dealer_scope(db, user, dealer_id)
         changes = payload.model_dump(exclude_unset=True)
         allowed = {"legal_name", "ein", "naics_code", "entity_type", "started_on"}
         illegal = sorted(set(changes) - allowed)
@@ -1177,7 +1185,6 @@ async def update_dealer(
         r = await _dealer_read(db, dealer)
         r.notes = None
         return r
-    dealer = await load_dealer(db, dealer_id)
     changes = payload.model_dump(exclude_unset=True)
     before = {k: getattr(dealer, k) for k in changes}
     bucket_changed = (

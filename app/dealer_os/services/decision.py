@@ -61,6 +61,29 @@ class Verification:
     returned' / 'Bank + credit returned'."""
     stage: str = "intake"
     """intake | verification | underwriting — what the case header shows."""
+    credit_enabled: bool = True
+    """Whether a bureau pull can actually run.
+
+    Mirrors plaid_client.enabled(). Without it the failure lands on the
+    applicant AFTER they have entered their details and consented, as a
+    "temporarily unavailable" that is not temporary and is not their problem.
+    A rep needs to know before they send, not the applicant after they
+    comply."""
+
+
+def credit_pull_available() -> bool:
+    """True when the bureau gateway has credentials to call with.
+
+    Read at request time rather than cached: the settings come from Secrets
+    Manager through the env file, so adding the keys and restarting is all it
+    should take to switch this on."""
+    from app.config import get_settings
+
+    s = get_settings()
+    return bool(
+        (getattr(s, "isoftpull_private_key", "") or getattr(s, "isoftpull_api_key", ""))
+        and getattr(s, "isoftpull_public_key", "")
+    )
 
 
 def assess_verification(*, bank_linked: bool, credit_returned: bool) -> Verification:
@@ -85,6 +108,7 @@ def assess_verification(*, bank_linked: bool, credit_returned: bool) -> Verifica
         returned=returned,
         reason=reason,
         stage="underwriting" if unlocked else ("verification" if returned else "intake"),
+        credit_enabled=credit_pull_available(),
     )
 
 
