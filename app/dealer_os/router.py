@@ -771,7 +771,10 @@ async def dealer_fundability(
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
 async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerRead:
-    require_team_or_dealer(user)
+    """One file. resolve_dealer_scope is what confines each role: a DEALER to
+    their own business, a FIELD_REP to files they own (404, never 403, so ids
+    stay unprobeable), the team to everything."""
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     r = await _dealer_read(db, dealer)
     if user.role == Role.DEALER:
