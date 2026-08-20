@@ -884,7 +884,7 @@ async def dealer_fundability(
     reverse-engineered requirements, and the strongest program's unmet
     checklist into fundable | conditional | not_yet. 200 with verdict
     "no_data" when no snapshot exists yet (a brand-new dealer is not a 400)."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     try:
         metrics = await _latest_snapshot_metrics(db, dealer.id)
@@ -1023,7 +1023,7 @@ async def update_dealer(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRead:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     if user.role == Role.DEALER:
         # A client may complete the always-required business-profile fields
         # on their OWN file — nothing else.
@@ -1138,7 +1138,7 @@ def _target_read(t: DealerMetricTarget) -> TargetRead:
 
 @router.get("/dealers/{dealer_id}/targets", response_model=list[TargetRead])
 async def list_targets(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[TargetRead]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows = (
         await db.execute(
@@ -1253,7 +1253,7 @@ async def list_cash_events(
     limit: int = Query(default=500, ge=1, le=5000),
     db: AsyncSession = Depends(get_db),
 ) -> list[DealerCashEvent]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerCashEvent).where(DealerCashEvent.dealer_id == dealer.id)
     if period is not None:
@@ -1292,7 +1292,7 @@ async def search_cash_events(
     this is the composable read the frontend explorer codes against.
 
     Ordered occurred_on DESC, id DESC. One count query + one page query."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     filters = [DealerCashEvent.dealer_id == dealer.id]
@@ -1522,7 +1522,7 @@ async def recurring_view(
     for this response), plus large irregular one-off outflows. Groups are
     sorted by |monthly_equivalent| desc; irregular is capped at 40, newest
     first."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows = (
         await db.execute(
@@ -1606,7 +1606,7 @@ async def recurring_view(
 async def list_periods(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerFinancialPeriod]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
@@ -1872,7 +1872,7 @@ async def upload_document(
     account_id (optional form field, team only): '' = AI-detect the bank
     account from the statement; a UUID pins the document to that account and
     skips detection (admin choice wins)."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     is_dealer = user.role == Role.DEALER
     if kind not in _DOCUMENT_KINDS:
@@ -1965,7 +1965,7 @@ async def list_documents(
     extractions are an internal operational detail, not dealer-facing).
     Rejected self-uploads STAY visible to the dealer — status='rejected' with
     the reviewer's note in `error` is the dealer-facing outcome."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
     if user.role == Role.DEALER:
@@ -1997,7 +1997,7 @@ async def document_url(
     the 'open the PDF' bridge for provenance links. Key resolution: the
     document's own archive first, else the mirrored bucket file's object.
     409 when neither holds bytes; 503 when presigning is unavailable."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     doc = await _load_document(db, dealer.id, doc_id)
     if user.role == Role.DEALER and doc.status == "failed":
@@ -2055,7 +2055,7 @@ async def document_coverage(
     covered (extracted statement docs OR period rows with statement flow
     data), which tax years have a filing row, whether a P&L / debt schedule
     has landed, and how many doc requests are still open."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     months: set[str] = set()
@@ -2139,7 +2139,7 @@ async def pipeline_status(
 
     Deliberately cheap — the header polls this while work is moving. Five
     counting queries, no payload scans."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     by_status: dict[str, int] = {
@@ -2806,7 +2806,7 @@ async def dealer_health(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> HealthRead:
     """Cockpit read: latest snapshot + targets + unresolved alerts + lineage size."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     snapshot = (
         await db.execute(
@@ -2906,7 +2906,7 @@ async def _latest_snapshot_metrics(db: AsyncSession, dealer_id: UUID) -> dict:
 async def list_plan_actions(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerPlanAction]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerPlanAction).where(DealerPlanAction.dealer_id == dealer.id)
     if user.role == Role.DEALER:
@@ -3011,7 +3011,7 @@ async def respond_plan_action(
     simulation: the linked payment shift is dismissed, so its ADB lift leaves
     the optimized scenario on the next recompute. Re-responding is allowed —
     accepting again after a decline re-proposes a dismissed linked shift."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
     if not action.published:
@@ -3066,7 +3066,7 @@ async def respond_plan_action(
 async def list_plan_comments(
     dealer_id: UUID, action_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerPlanComment]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
     if user.role == Role.DEALER and not action.published:
@@ -3096,7 +3096,7 @@ async def create_plan_comment(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlanComment:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
     if user.role == Role.DEALER and not action.published:
@@ -3144,7 +3144,7 @@ async def dealer_forecast(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ForecastRead:
     """12-month baseline vs plan-adjusted projection from the latest snapshot."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     open_actions = (
@@ -3215,7 +3215,7 @@ async def dealer_paths(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> PathsRead:
     """Funding-path readiness + credit-ladder position from the latest snapshot."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     targets = await _effective_targets(db, dealer.id)
@@ -3237,7 +3237,7 @@ async def funding_plan(
     program could fund today, and — when a goal is set — the metric levels the
     goal requires (typical-case assumptions, PROVISIONAL sizing constants).
     No goal => every path carries empty requirements and null feasibility."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     metrics = await _latest_snapshot_metrics(db, dealer.id)
     targets = await _effective_targets(db, dealer.id)
@@ -3286,7 +3286,7 @@ async def simulate_dealer(
     persists nothing — no snapshot, no lineage, no alerts, no writes. The
     baseline is recomputed from the actual periods rather than read off the
     latest snapshot so baseline == scenario holds exactly at zero levers."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     inputs = await load_metric_inputs(db, dealer.id)
@@ -3722,21 +3722,6 @@ async def list_sessions(
 
 
 @router.post(
-    "/dealers/{dealer_id}/sessions", response_model=SessionRead, status_code=status.HTTP_201_CREATED
-)
-async def create_session(
-    dealer_id: UUID, payload: SessionCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
-) -> DealerSession:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
-    session = DealerSession(dealer_id=dealer.id, created_by_user_id=user.id, **payload.model_dump())
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
-    return session
-
-
-@router.post(
     "/dealers/{dealer_id}/sessions",
     response_model=SessionRead,
     status_code=status.HTTP_201_CREATED,
@@ -3749,13 +3734,15 @@ async def create_session(
 ) -> DealerSession:
     """Book a meeting on this file.
 
-    SessionCreate and the list and delete routes have existed since the
-    sessions table landed; there was never a way to create one, so the only
-    rows in it came from seeds. Open to the owning rep, because the rep is who
-    arranges the follow-up visit.
+    This replaces a team-only handler that sat on the identical path. Two
+    routes with the same method and path is not an error in FastAPI: the first
+    registered wins and the second is silently unreachable, which is how a
+    rep-enabled version shipped and 403'd every rep anyway. If you add a route
+    here, grep the path first and remember the decorator often spans two lines.
 
-    The client sees these read-only with a Join button, so a join_url that is
-    wrong is worse than one that is absent."""
+    Open to the owning rep, because the rep is who arranges the follow-up
+    visit. The client sees these read-only with a Join button, so a join_url
+    that is wrong is worse than one that is absent."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     session = DealerSession(
@@ -3874,7 +3861,7 @@ async def list_global_alerts(
 async def get_credit_profile(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> CreditRead:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -3990,7 +3977,7 @@ async def list_tax_years(
     """Filed years joined with observed deposits per calendar year (sum of the
     dealer's period deposits). Years that have observed deposits but no filing
     row still appear (filed=false, filing_id=null) so gaps are visible."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     filings = (
         await db.execute(
@@ -4063,7 +4050,7 @@ async def lender_package(
     """One-call JSON bundle powering the print-ready lender report. Sections
     that need a snapshot (forecast, paths) come back None — never 400 — so a
     brand-new dealer still renders a partial package."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return await _build_lender_package(db, dealer)
 
@@ -4225,7 +4212,7 @@ async def accept_ai_insights(
 async def list_accounts(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerAccount]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
@@ -4424,8 +4411,14 @@ async def list_audit_log(
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[DealerAuditLog]:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    """The case's own history. Open to the owning rep, because the workflow
+    puts an Audit trail tab on every case and a rep asked about a date needs
+    to answer it without calling the desk.
+
+    Scoped, not just guarded: this handler used load_dealer, so admitting a
+    role without also scoping would have exposed every client's history."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
             await db.execute(
@@ -4462,7 +4455,7 @@ async def read_lineage(
     """The latest snapshot's lineage edges (optionally one metric family),
     with cash_event refs resolved to description/amount so 'why is this number
     what it is' is answerable without extra round-trips."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     snapshot = await _latest_snapshot_row(db, dealer.id)
     if snapshot is None:
@@ -4505,7 +4498,7 @@ async def cash_event_feeds(
     """Reverse lineage for one statement line: which metrics reference it in
     the latest snapshot — directly (ref_kind='cash_event') and indirectly via
     add-backs sourced from it."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     event = (
         await db.execute(
@@ -4562,7 +4555,7 @@ async def cash_event_feeds(
 async def list_addbacks(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerAddback]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
@@ -4691,7 +4684,7 @@ async def list_doc_requests(
 ) -> list[DealerDocRequest]:
     """All document requests for the dealer, open ones first (then newest).
     Dealer-visible by design — this IS the dealer's to-do list."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return (
         (
@@ -4837,7 +4830,7 @@ async def dealer_progress(
     compares with itself, all deltas zero). Deterministic strings via the pure
     services.progress engine; actions_completed lists plan actions marked done
     between the two snapshots."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     snaps = (
         (
@@ -5033,7 +5026,7 @@ async def vendor_report(
     Grouped on vendor identity rather than a cadence band, because the old
     recurrence engine required a regular interval and therefore returned zero
     groups on a real dealer's 414 events."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rolled, analyzed = await _vendor_rollup(db, dealer)
     return VendorReportRead(
@@ -5057,7 +5050,7 @@ async def vendor_events(
     per-account attribution (count desc) and source-document provenance.
     Membership uses the SAME normalize_vendor identity the rollup groups on,
     so the drill can never disagree with the report."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
     rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
@@ -5161,7 +5154,7 @@ async def set_vendor_category(
 async def list_debts(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerDebt]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return list(
         (
@@ -5400,7 +5393,7 @@ async def dscr_composition(
     (EBITDA source -> add-backs -> bankable), every denominator component
     (a debt-schedule row, observed-vs-stated monthly, include flag), and
     observed debt-like vendors not yet on the schedule as suggestions."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
     inputs = await load_metric_inputs(db, dealer.id)
@@ -5703,9 +5696,14 @@ async def plaid_state(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> PlaidStateRead:
     """Connection panel state. enabled=false (keys not provisioned) renders a
-    quiet disabled state — never an error."""
-    require_team(user)  # gated off client accounts for now
-    dealer = await load_dealer(db, dealer_id)
+    quiet disabled state — never an error.
+
+    Open to the owning rep: step 2 of the application is a bank panel, and a
+    rep who cannot see whether the connection landed cannot do their job.
+    load_dealer swapped for resolve_dealer_scope in the same change, because
+    the guard alone would have handed a rep the entire book."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     items = await _plaid_items(db, dealer.id)
     return PlaidStateRead(
         enabled=plaid_client.enabled(),
@@ -6288,7 +6286,7 @@ async def simulate_refinance(
 async def list_owners(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerOwner]:
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     return list(
         (
@@ -6315,7 +6313,7 @@ async def create_owner(
 ) -> DealerOwner:
     # Dealers may DISCLOSE owners on their own file (the >= 20% principals a
     # lender file requires); edits/deletes stay team-only.
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     if body.is_primary:
         # 0125: at most ONE primary per dealer — is_primary marks the login's
@@ -6372,7 +6370,7 @@ async def patch_owner(
 ) -> DealerOwner:
     # 0125: DEALER logins may now PATCH, but ONLY ownership_pct — the split
     # is a disclosure fact the client owns; everything else stays team-only.
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -6424,7 +6422,7 @@ async def business_credit(
     No commercial bureau file is required to say something true about how this
     business pays — the ledger already shows every recurring obligation and
     whether it was met."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
     rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
@@ -6613,7 +6611,14 @@ async def owner_soft_pull(
     is persisted here. A DEALER login may self-run ONLY the primary owner
     (their own person, is_primary) and only while no pull exists yet —
     additional owners consent through their own secure link (0125). Team
-    initiators are unrestricted, as before."""
+    initiators are unrestricted, as before.
+
+    DELIBERATELY NOT open to a FIELD_REP. Every other read and write on a case
+    was widened for the application workflow; this one was not. The workflow's
+    credit step only ever SENDS an authorization for the applicant to complete
+    themselves, so a rep has no need to call this, and the call asserts FCRA
+    permissible-purpose consent on another person's behalf. That is a legal act
+    and it should stay with the desk."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     owner = (
@@ -7235,7 +7240,7 @@ async def dealer_payment_timing(
     """When in the month money actually moves (trailing 6 months): per-day
     in/out totals, the big outflow days with their dominant vendors, and the
     recurring/debt-like vendors that are payment-shift candidates."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     # One ledger load feeds both the full-history rollup (vendor identity,
     # cadence, debt flags) and the windowed day-of-month analysis.
@@ -7337,7 +7342,7 @@ async def list_payment_shifts(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> list[DealerPaymentShift]:
     """Team sees the whole pipeline; a DEALER login never sees drafts."""
-    require_team_or_dealer(user)
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerPaymentShift).where(DealerPaymentShift.dealer_id == dealer.id)
     if user.role == Role.DEALER:
