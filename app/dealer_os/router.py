@@ -47,6 +47,8 @@ from .deps import (
     resolve_dealer_scope,
 )
 from .models import (
+    DealerRepLead,
+    REP_LEAD_TERMINAL,
     DealerPlaidItem,
     DealerAccount,
     DealerAddback,
@@ -93,6 +95,9 @@ from .schemas import (
     CashEventSearchRow,
     CashImport,
     CashImportResult,
+    RepProductionRead,
+    RepProduction,
+    RepFileRow,
     CreditInviteRequest,
     CreditInviteResult,
     CreditRead,
@@ -382,6 +387,27 @@ async def create_dealer(payload: DealerCreate, user: CurrentUser, db: AsyncSessi
         await buckets_link.ensure_bucket(db, dealer)
     except Exception:
         logger.exception("dealer-os: bucket creation failed for new dealer %s", dealer.id)
+    # A rep's file carries a pipeline row from the moment it exists, so it shows
+    # up in production reporting immediately rather than only once it advances.
+    # Team-created files deliberately get none: they are not field work and
+    # counting them would inflate a rep's numbers with the desk's own.
+    if user.role == Role.FIELD_REP:
+        db.add(
+            DealerRepLead(
+                dealer_id=dealer.id,
+                rep_user_id=user.id,
+                status="draft",
+                status_history=[
+                    {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "from": None,
+                        "to": "draft",
+                        "by": str(user.id),
+                        "by_name": user.name,
+                    }
+                ],
+            )
+        )
     await db.commit()
     await db.refresh(dealer)
     return dealer
@@ -5879,6 +5905,137 @@ async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
     db.add(client)
     await db.flush()
     return client
+
+
+# --- Field-rep production (0130) ----------------------------------------------
+
+
+@router.get("/rep-production", response_model=RepProductionRead)
+async def rep_production(
+    user: CurrentUser,
+    days: int = 90,
+    db: AsyncSession = Depends(get_db),
+) -> RepProductionRead:
+    """What the field team has brought in, per rep.
+
+    Super-admin only. Reads ownership off DealerBusiness.owner_user_id rather
+    than the pipeline table, so files opened before the pipeline existed still
+    count — they simply carry no status.
+
+    The number that matters most here is `with_documents`, not `files_opened`.
+    A rep can open twenty files in an afternoon and none of them are production
+    until a client actually sends something, so counting files alone rewards
+    exactly the wrong behaviour.
+    """
+    require_super_admin(user)
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 730)))
+
+    rows = (
+        await db.execute(
+            select(DealerBusiness, DealerRepLead, User)
+            .outerjoin(DealerRepLead, DealerRepLead.dealer_id == DealerBusiness.id)
+            .outerjoin(User, User.id == DealerBusiness.owner_user_id)
+            .where(
+                DealerBusiness.owner_user_id.is_not(None),
+                DealerBusiness.created_at >= since,
+            )
+            .order_by(DealerBusiness.created_at.desc())
+        )
+    ).all()
+
+    dealer_ids = [d.id for d, _, _ in rows]
+    scores: dict[UUID, float | None] = {}
+    doc_counts: dict[UUID, int] = {}
+    if dealer_ids:
+        # Latest snapshot score per dealer, one query.
+        snap_rows = (
+            await db.execute(
+                select(DealerMetricSnapshot.dealer_id, DealerMetricSnapshot.score)
+                .where(DealerMetricSnapshot.dealer_id.in_(dealer_ids))
+                .order_by(DealerMetricSnapshot.dealer_id, DealerMetricSnapshot.created_at.desc())
+                .distinct(DealerMetricSnapshot.dealer_id)
+            )
+        ).all()
+        scores = {did: (float(sc) if sc is not None else None) for did, sc in snap_rows}
+        doc_rows = (
+            await db.execute(
+                select(DealerDocument.dealer_id, func.count(DealerDocument.id))
+                .where(DealerDocument.dealer_id.in_(dealer_ids))
+                .group_by(DealerDocument.dealer_id)
+            )
+        ).all()
+        doc_counts = {did: int(n) for did, n in doc_rows}
+
+    by_rep: dict[UUID | None, RepProduction] = {}
+    for dealer, lead, rep in rows:
+        key = dealer.owner_user_id
+        if key not in by_rep:
+            by_rep[key] = RepProduction(
+                rep_user_id=key,
+                rep_name=(rep.name if rep else None) or "Unassigned",
+                rep_email=rep.email if rep else None,
+            )
+        bucket = by_rep[key]
+        docs = doc_counts.get(dealer.id, 0)
+        score = scores.get(dealer.id)
+        status_val = lead.status if lead else None
+
+        bucket.files.append(
+            RepFileRow(
+                dealer_id=dealer.id,
+                name=dealer.name,
+                city=dealer.city,
+                state=dealer.state,
+                industry=dealer.industry,
+                status=status_val,
+                decision=lead.decision if lead else None,
+                score=score,
+                documents=docs,
+                created_at=dealer.created_at,
+                last_activity=dealer.updated_at,
+            )
+        )
+        bucket.files_opened += 1
+        if docs > 0:
+            bucket.with_documents += 1
+        if status_val in REP_LEAD_TERMINAL:
+            if status_val == "complete":
+                bucket.complete += 1
+            elif status_val == "declined":
+                bucket.declined += 1
+            else:
+                bucket.stalled += 1
+        else:
+            bucket.active += 1
+        if (lead.decision if lead else None) == "fundable":
+            bucket.fundable += 1
+        if bucket.last_activity is None or (
+            dealer.updated_at and dealer.updated_at > bucket.last_activity
+        ):
+            bucket.last_activity = dealer.updated_at
+
+    for bucket in by_rep.values():
+        seen = [f.score for f in bucket.files if f.score is not None]
+        bucket.avg_score = round(sum(seen) / len(seen), 1) if seen else None
+        bucket.files.sort(key=lambda f: f.created_at, reverse=True)
+
+    reps = sorted(by_rep.values(), key=lambda r: (-r.files_opened, r.rep_name))
+
+    totals = RepProduction(
+        rep_name="All reps",
+        files_opened=sum(r.files_opened for r in reps),
+        active=sum(r.active for r in reps),
+        complete=sum(r.complete for r in reps),
+        declined=sum(r.declined for r in reps),
+        stalled=sum(r.stalled for r in reps),
+        with_documents=sum(r.with_documents for r in reps),
+        fundable=sum(r.fundable for r in reps),
+    )
+    all_scores = [f.score for r in reps for f in r.files if f.score is not None]
+    totals.avg_score = round(sum(all_scores) / len(all_scores), 1) if all_scores else None
+    totals.last_activity = max((r.last_activity for r in reps if r.last_activity), default=None)
+
+    return RepProductionRead(since=since, totals=totals, reps=reps)
 
 
 # --- Owner credit-consent invites (0125) --------------------------------------

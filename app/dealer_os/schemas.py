@@ -1639,3 +1639,48 @@ class RecurrenceMark(BaseModel):
 
     mark: str = Field(pattern="^(recurring|one_time|none|clear)$")
     apply_similar: bool = True
+
+
+# --- Field-rep production (0130) ---------------------------------------------
+
+
+class RepFileRow(ORM):
+    """One file in a rep's book, as production reporting sees it."""
+
+    dealer_id: UUID
+    name: str
+    city: str | None = None
+    state: str | None = None
+    industry: str | None = None
+    status: str | None = None          # None = opened before the pipeline existed
+    decision: str | None = None
+    score: float | None = None
+    documents: int = 0
+    created_at: datetime
+    last_activity: datetime | None = None
+
+
+class RepProduction(BaseModel):
+    """What one rep has brought in over the window."""
+
+    rep_user_id: UUID | None = None
+    rep_name: str
+    rep_email: str | None = None
+    files_opened: int = 0
+    active: int = 0
+    complete: int = 0
+    declined: int = 0
+    stalled: int = 0
+    # Files with documents in. The single most useful number for a desk: a file
+    # opened and never fed is not production, and this is what separates them.
+    with_documents: int = 0
+    fundable: int = 0
+    avg_score: float | None = None
+    last_activity: datetime | None = None
+    files: list[RepFileRow] = []
+
+
+class RepProductionRead(BaseModel):
+    since: datetime | None = None
+    totals: RepProduction
+    reps: list[RepProduction] = []
