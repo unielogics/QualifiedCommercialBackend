@@ -59,6 +59,19 @@ def _event_body(ev: CalendarEvent) -> dict:
     return body
 
 
+def _meet_url(resp: dict) -> str | None:
+    """The Meet link out of a Google event resource. hangoutLink is the direct
+    field; conferenceData is the fallback for resources that only carry the
+    entry points."""
+    direct = resp.get("hangoutLink")
+    if direct:
+        return direct
+    for entry in (resp.get("conferenceData") or {}).get("entryPoints") or []:
+        if entry.get("entryPointType") == "video" and entry.get("uri"):
+            return entry["uri"]
+    return None
+
+
 def _service(creds):
     from googleapiclient.discovery import build
 
@@ -72,23 +85,40 @@ def _deterministic_google_id(ev: CalendarEvent) -> str:
     return "qc" + ev.id.hex
 
 
-async def push_event(db: AsyncSession, ev: CalendarEvent, *, deleted: bool = False) -> None:
+async def push_event(
+    db: AsyncSession,
+    ev: CalendarEvent,
+    *,
+    deleted: bool = False,
+    attendees: list[dict] | None = None,
+    want_conference: bool = False,
+    send_updates: str | None = None,
+) -> str | None:
     """Mirror one internal event to the owner's Google primary calendar.
 
     Best-effort and self-silencing: does nothing when the owner has no connected
     calendar, and never raises to the caller (logs instead) so a Google outage
     can't break the local calendar write. Local edits to a Google-origin event
-    ARE propagated back (echo-suppressed on pull by the etag guard)."""
+    ARE propagated back (echo-suppressed on pull by the etag guard).
+
+    attendees / send_updates / want_conference exist for the public booking
+    path. Putting the invitee on the event is what makes Google issue its own
+    invitation with Accept and Decline, and send_updates="all" is what actually
+    posts it; without that pair Google records the guest silently and mails
+    nobody. want_conference asks Google to mint a Meet link on insert.
+
+    Returns the Meet URL when one was created, else None. Existing callers pass
+    none of the new arguments and behave exactly as before."""
     if ev.owner_user_id is None:
-        return
+        return None
 
     try:
         creds = await google_oauth_client.credentials_for_user(db, ev.owner_user_id, CALENDAR_SCOPES)
     except (google_oauth_client.GoogleNotConnected, google_oauth_client.GoogleScopeMissing, google_oauth_client.GoogleTokenRevoked):
-        return
+        return None
     except Exception:  # noqa: BLE001
         log.exception("calendar push: credential resolution failed owner=%s", ev.owner_user_id)
-        return
+        return None
 
     cal_id = ev.google_calendar_id or "primary"
     # Use a deterministic id on the FIRST push so a concurrent/retried insert of
@@ -96,26 +126,44 @@ async def push_event(db: AsyncSession, ev: CalendarEvent, *, deleted: bool = Fal
     # already carry their real google_event_id.
     gid = ev.google_event_id or _deterministic_google_id(ev)
     body = _event_body(ev)
+    if attendees:
+        body["attendees"] = attendees
+    if want_conference and not ev.google_event_id:
+        # Only on insert. Asking again on patch replaces the existing link and
+        # invalidates the one already sitting in the invitee's invitation.
+        body["conferenceData"] = {
+            "createRequest": {
+                "requestId": _deterministic_google_id(ev),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        }
 
     def _do() -> dict | None:
         svc = _service(creds)
+        extra: dict = {}
+        if send_updates:
+            extra["sendUpdates"] = send_updates
         if deleted:
             if ev.google_event_id:
                 try:
-                    svc.events().delete(calendarId=cal_id, eventId=ev.google_event_id).execute()
+                    svc.events().delete(calendarId=cal_id, eventId=ev.google_event_id, **extra).execute()
                 except Exception:  # noqa: BLE001
                     pass
             return None
         if ev.google_event_id:
-            return svc.events().patch(calendarId=cal_id, eventId=ev.google_event_id, body=body).execute()
+            return svc.events().patch(calendarId=cal_id, eventId=ev.google_event_id, body=body, **extra).execute()
         # First push: insert with our deterministic id. If it already exists
         # (409, e.g. a racing duplicate push), patch it instead of duplicating.
         insert_body = {**body, "id": gid}
+        insert_extra = dict(extra)
+        if want_conference:
+            # Without this version flag Google drops the createRequest silently.
+            insert_extra["conferenceDataVersion"] = 1
         try:
-            return svc.events().insert(calendarId=cal_id, body=insert_body).execute()
+            return svc.events().insert(calendarId=cal_id, body=insert_body, **insert_extra).execute()
         except Exception as exc:  # noqa: BLE001
             if "409" in str(exc) or "duplicate" in str(exc).lower():
-                return svc.events().patch(calendarId=cal_id, eventId=gid, body=body).execute()
+                return svc.events().patch(calendarId=cal_id, eventId=gid, body=body, **extra).execute()
             raise
 
     try:
@@ -124,15 +172,18 @@ async def push_event(db: AsyncSession, ev: CalendarEvent, *, deleted: bool = Fal
         resp = await asyncio.to_thread(_do)
     except Exception as exc:  # noqa: BLE001
         log.warning("calendar push failed event=%s owner=%s: %s", ev.id, ev.owner_user_id, exc)
-        return
+        return None
 
-    if resp is not None:
-        ev.google_event_id = resp.get("id") or gid
-        ev.google_calendar_id = cal_id
-        ev.google_etag = resp.get("etag")
-        ev.synced_at = datetime.now(UTC)
-        ev.sync_origin = "internal"
-        await db.flush()
+    if resp is None:
+        return None
+
+    ev.google_event_id = resp.get("id") or gid
+    ev.google_calendar_id = cal_id
+    ev.google_etag = resp.get("etag")
+    ev.synced_at = datetime.now(UTC)
+    ev.sync_origin = "internal"
+    await db.flush()
+    return _meet_url(resp)
 
 
 _ALL_DAY_HOUR_UTC = 14  # ≈ 9am ET — matches calendar_emitter's default hour

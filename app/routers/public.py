@@ -20,6 +20,7 @@ best-effort per-IP throttle). No DB writes other than the Activity log.
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
 import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
@@ -34,6 +35,7 @@ from app.db import get_db
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
+from app.services import booking_notify
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
@@ -415,8 +417,12 @@ async def public_booking_create(
         )
     )
 
-    _notify_host_of_booking(user, payload, starts_at, booking)
-    await db.flush()
+    # Commit before any outbound work. The booking is real at this point; mail
+    # and Google are follow-on effects that must not be able to undo it.
+    await db.commit()
+    await db.refresh(ev)
+
+    await _deliver_booking(db, user, payload, starts_at, booking, ev)
     return PublicBookingCreateResult(ok=True, event_id=str(ev.id))
 
 
@@ -541,33 +547,60 @@ def _to_utc_minute(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
-def _notify_host_of_booking(
+async def _deliver_booking(
+    db: AsyncSession,
     user: User,
     payload: PublicBookingCreate,
     starts_at: datetime,
     booking: BookingSettings,
+    ev: CalendarEvent,
 ) -> None:
-    try:
-        from app.services.email.gmail_client import gmail_config, send_message
+    """Everything that happens after the booking row is safely committed.
 
-        cfg = gmail_config()
-        if cfg is None:
-            return
-        tz = _booking_tz(booking.timezone)
-        when = starts_at.astimezone(tz).strftime("%A, %B %d at %I:%M %p %Z")
-        host_name = user.name or user.email
-        body = (
-            f"New booking for {host_name}\n\n"
-            f"When: {when}\n"
-            f"Duration: {booking.duration_min} minutes\n"
-            f"Name: {payload.full_name}\n"
-            f"Email: {payload.email}\n"
-            f"Phone: {payload.phone or '(not provided)'}\n\n"
-            f"Notes:\n{payload.notes or '(none)'}\n"
-        )
-        send_message(cfg, to=user.email, subject=f"New booked call — {payload.full_name}", body=body)
-    except Exception:
-        log.exception("public-booking: host notification failed")
+    Ordering matters and used to be wrong: the notification fired before the
+    flush, so a later failure would have emailed a booking that did not exist.
+    It now runs after the commit, which also means a slow mail send cannot roll
+    anything back.
+
+    Google goes first, because if it mints a Meet link we want that link inside
+    both emails rather than sending a follow-up correction.
+    """
+    join_url = await booking_notify.push_to_google(
+        db,
+        ev,
+        invitee_email=payload.email,
+        invitee_name=payload.full_name,
+    )
+    if join_url:
+        try:
+            ev.description = f"{ev.description or ''}\n\nJoin: {join_url}".strip()
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            log.exception("public-booking: could not persist meet link event=%s", ev.id)
+
+    # Blocking SES calls, kept off the event loop.
+    await asyncio.to_thread(
+        booking_notify.notify_host,
+        user,
+        booking,
+        starts_at,
+        invitee_name=payload.full_name,
+        invitee_email=payload.email,
+        invitee_phone=payload.phone,
+        notes=payload.notes,
+        join_url=join_url,
+    )
+    await asyncio.to_thread(
+        booking_notify.send_invitee_invite,
+        user,
+        booking,
+        ev,
+        starts_at,
+        invitee_name=payload.full_name,
+        invitee_email=payload.email,
+        join_url=join_url,
+    )
 
 
 # ---------------------------------------------------------------------------
