@@ -510,20 +510,20 @@ async def send_bank_connect_invite(
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
 ) -> ClientRequestResult:
-    """Ask the owner to connect their bank.
+    """Email the owner their secure room so they can send bank statements.
 
-    The link opens their room, where connecting the bank and uploading
-    statements are the same two buttons they already see. Sending them
-    somewhere Plaid-only would mean a second link for the client to keep track
-    of and a dead end when the connection fails and they need to upload
-    instead."""
+    Named for what it does today, not for what it will do. Plaid is still
+    `require_team` on every route, so a client opening this room can upload and
+    nothing else; there is no unauthenticated link-token or exchange endpoint
+    yet. When those exist the room gains a Connect button and this route keeps
+    working unchanged, because the link is already the right one."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     req = payload or ClientRequestSend()
     room = await client_room.ensure_room(db, dealer)
     delivery = await _notify_client_request(
         db, dealer, user,
-        purpose="connect your bank so we can read your statements",
+        purpose="send us your recent bank statements",
         path=room.url,
         channel=req.channel,
         action="client_request.bank_connect",
