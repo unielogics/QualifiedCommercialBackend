@@ -232,7 +232,16 @@ async def get_current_user(
             adoptable = (
                 await db.execute(
                     select(_Client)
-                    .where(_Client.email == email, _Client.user_id.is_(None))
+                    # Case-insensitive for the same reason the invite bind
+                    # above is: Clerk returns whatever case the person typed,
+                    # and an agent-created Client row is stored lower-cased.
+                    # A case-sensitive compare here silently fails to adopt,
+                    # which costs the borrower their documents, credit pull and
+                    # loan history without any error being raised.
+                    .where(
+                        func.lower(_Client.email) == (email or "").lower(),
+                        _Client.user_id.is_(None),
+                    )
                     .order_by(_Client.created_at.desc())
                 )
             ).scalars().all()
