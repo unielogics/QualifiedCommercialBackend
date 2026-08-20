@@ -109,6 +109,9 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    ClientRequestResult,
+    ClientRequestSend,
+    SignatureRequestSend,
     AIThreadMessage,
     MessageEdit,
     SmsConsentIn,
@@ -251,7 +254,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import consent_delivery, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import client_room, consent_delivery, file_chat, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -442,6 +445,143 @@ async def _record_sms_consent(
         after={"kinds": kinds, "method": payload.method, "version": sms_consent_svc.SMS_DISCLOSURE_VERSION},
     )
     return rows
+
+
+async def _notify_client_request(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    user,
+    *,
+    purpose: str,
+    path: str,
+    channel: str,
+    action: str,
+) -> "consent_delivery.DeliveryResult":
+    """Tell the client that something is being asked of them.
+
+    One seam for every request type, so signature, credit and bank-connect all
+    reach the owner the same way and none of them can quietly send nothing.
+    Email always goes; a text is added on top when asked for and consented to.
+
+    Recipient comes from the owner record first and the business second. The
+    owner is the person who actually signs and authorises, and on plenty of
+    files the business email is a shared inbox nobody watches.
+    """
+    owner = (
+        await db.execute(
+            select(DealerOwner)
+            .where(DealerOwner.dealer_id == dealer.id)
+            .order_by(DealerOwner.created_at.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    delivery = await consent_delivery.deliver_link_checked(
+        db,
+        channel=channel,
+        to_email=(owner.email if owner and owner.email else None) or dealer.email,
+        to_phone=(owner.phone if owner and owner.phone else None) or dealer.phone,
+        business_name=dealer.name,
+        purpose=purpose,
+        path=path,
+        rep_name=user.name,
+    )
+    await log_action(
+        db, dealer.id, user, action, "dealer",
+        entity_id=dealer.id,
+        after={
+            "delivered": delivery.ok,
+            "email": delivery.email_ok,
+            "sms": delivery.sms_ok,
+            "purpose": purpose,
+        },
+    )
+    return delivery
+
+
+@router.post(
+    "/dealers/{dealer_id}/bank-connect-invite",
+    response_model=ClientRequestResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_bank_connect_invite(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    payload: ClientRequestSend | None = None,
+) -> ClientRequestResult:
+    """Ask the owner to connect their bank.
+
+    The link opens their room, where connecting the bank and uploading
+    statements are the same two buttons they already see. Sending them
+    somewhere Plaid-only would mean a second link for the client to keep track
+    of and a dead end when the connection fails and they need to upload
+    instead."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    req = payload or ClientRequestSend()
+    room = await client_room.ensure_room(db, dealer)
+    delivery = await _notify_client_request(
+        db, dealer, user,
+        purpose="connect your bank so we can read your statements",
+        path=room.url,
+        channel=req.channel,
+        action="client_request.bank_connect",
+    )
+    await db.commit()
+    return ClientRequestResult(
+        url=room.url,
+        passcode=room.passcode,
+        delivered=delivery.ok,
+        emailed=delivery.email_ok,
+        texted=delivery.sms_ok,
+        detail=delivery.detail,
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/signature-request",
+    response_model=ClientRequestResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_signature_request(
+    dealer_id: UUID,
+    payload: SignatureRequestSend,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientRequestResult:
+    """Ask the owner to sign something.
+
+    Adds it to the same checklist their documents are on, so there is one list
+    with everything outstanding on it rather than a separate signing inbox they
+    have to be told about separately."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    room = await client_room.ensure_room(db, dealer)
+    await client_room.request_document(
+        db, dealer,
+        name=payload.title,
+        description=payload.note,
+        category="signatures",
+        requires_signature=True,
+        signature_kind=payload.signature_kind,
+    )
+    delivery = await _notify_client_request(
+        db, dealer, user,
+        purpose=f"sign {payload.title}",
+        path=room.url,
+        channel=payload.channel,
+        action="client_request.signature",
+    )
+    await db.commit()
+    return ClientRequestResult(
+        url=room.url,
+        passcode=room.passcode,
+        delivered=delivery.ok,
+        emailed=delivery.email_ok,
+        texted=delivery.sms_ok,
+        detail=delivery.detail,
+    )
 
 
 @router.get("/sms-disclosure", response_model=SmsDisclosureOut)
@@ -4397,8 +4537,12 @@ async def list_doc_requests(
 async def create_doc_request(
     dealer_id: UUID, payload: DocRequestCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerDocRequest:
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    """Ask the client for a document, and tell them you have.
+
+    Open to the owning rep as well as the desk: a rep standing in the business
+    is exactly who knows which statement is missing."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     if payload.account_id is not None:
         account = (
             await db.execute(
@@ -4426,6 +4570,24 @@ async def create_doc_request(
         after={"title": req.title, "kind": req.kind, "due_on": req.due_on,
                "account_id": str(req.account_id) if req.account_id else None},
     )
+    # A request nobody is told about is a request that does not get answered.
+    # This used to write a row and stop, which meant the item sat in the desk's
+    # view waiting on a client who had never heard of it. Best-effort: a mail
+    # failure must not lose the request itself, and the desk can resend.
+    try:
+        await client_room.request_document(
+            db, dealer, name=req.title, description=req.note, category=req.kind,
+        )
+        room = await client_room.ensure_room(db, dealer)
+        await _notify_client_request(
+            db, dealer, user,
+            purpose=f"send us {req.title}",
+            path=room.url,
+            channel=payload.notify,
+            action="client_request.document",
+        )
+    except Exception:
+        logger.exception("dealer-os: could not notify client of doc request %s", req.id)
     await db.commit()
     await db.refresh(req)
     return req

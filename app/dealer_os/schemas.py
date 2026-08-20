@@ -797,6 +797,34 @@ class DocRequestCreate(BaseModel):
     account_id: UUID | None = None
     due_on: date | None = None
     note: str | None = None
+    # How to tell the client. "email" is the default because a request nobody
+    # hears about does not get answered; "sms" adds a text on top of the email,
+    # and "none" is for a request the desk will raise in person.
+    notify: Literal["email", "sms", "none"] = "email"
+
+
+class ClientRequestSend(BaseModel):
+    """How to reach the client for a request. Email always goes unless the
+    caller explicitly asks for nothing; "sms" means email AND text."""
+
+    channel: Literal["email", "sms", "none"] = "email"
+
+
+class SignatureRequestSend(ClientRequestSend):
+    title: str = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2000)
+    signature_kind: str | None = Field(default=None, max_length=48)
+
+
+class ClientRequestResult(BaseModel):
+    url: str
+    # Plaintext only when this call opened the room. None means the client
+    # already has their access code from an earlier link.
+    passcode: str | None = None
+    delivered: bool = False
+    emailed: bool = False
+    texted: bool = False
+    detail: str | None = None
 
 
 class DocRequestPatch(BaseModel):

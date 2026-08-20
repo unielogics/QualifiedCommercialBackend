@@ -8,7 +8,12 @@ One seam for all of them, because the difference between "send the Plaid link"
 and "send the credit-consent link" should be a URL and a sentence, not three
 separate delivery implementations that drift apart.
 
-Channels, in the order they became available:
+Email is the guaranteed channel and always goes. It needs no carrier
+registration, survives a mistyped mobile number, and leaves the client
+something they can find again next week. SMS is a nudge toward it, never a
+substitute: asking for a text sends both. That way a request is never lost
+because texting is switched off or the number was wrong.
+
   email  works today, through the SES identity verified for this domain.
   sms    built and inert until AWS End User Messaging is out of sandbox and the
          toll-free number finishes verification. It degrades to a clear, honest
@@ -30,16 +35,31 @@ from app.services.email import ses_client
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DeliveryResult", "deliver_link", "sms_available", "normalize_phone"]
+__all__ = [
+    "DeliveryResult",
+    "deliver_link",
+    "deliver_link_checked",
+    "sms_available",
+    "normalize_phone",
+]
 
 AUDIT_ORIGIN = "https://audit.qualifiedcommercial.com"
 
 
 @dataclass
 class DeliveryResult:
+    """What actually happened, per channel.
+
+    `ok` means the client was reached by SOMETHING. `email_ok` and `sms_ok`
+    say by what, because "the text failed but the email went" and "nothing
+    went" need different responses from the rep standing there.
+    """
+
     ok: bool
     channel: str
     detail: str
+    email_ok: bool = False
+    sms_ok: bool = False
 
 
 def normalize_phone(raw: str | None) -> str | None:
@@ -118,62 +138,90 @@ def deliver_link(
 ) -> DeliveryResult:
     """Send one secure link.
 
+    **Email always goes.** It is the channel that works for everyone, needs no
+    carrier registration, survives a wrong mobile number, and leaves the client
+    something they can find again a week later. A text is a nudge toward it,
+    never a replacement for it, so `channel="sms"` means "email AND text", not
+    "text instead of email". Only `channel="none"` sends nothing, for the case
+    where the rep wants the link to read out loud.
+
     `purpose` is what the client is being asked to do, in their words:
-    "connect your bank", "authorise a credit check", "upload your statements".
+    "connect your bank", "authorise a credit check", "sign the application".
     `path` is the token-bearing path; the origin is added here so no caller has
     to know it.
 
     `sms_consent_ok` has no default on purpose. Every caller has to say whether
     this number has agreed to be texted, and the only honest way to answer is a
-    lookup against the consent table. A default of False would be safe but
-    would let a caller forget the question entirely and quietly lose the
-    ability to text; a default of True would be a compliance hole. Requiring it
-    makes the omission a TypeError at import-gate time instead. Use
-    `deliver_link_checked` and it is answered for you.
+    lookup against the consent table. Requiring it makes an omission a
+    TypeError rather than a compliance hole. Use `deliver_link_checked` and it
+    is answered for you.
     """
-    url = f"{AUDIT_ORIGIN}{path}"
+    if channel == "none":
+        return DeliveryResult(True, "none", "Nothing sent. Read the link out or copy it.")
+
+    url = f"{AUDIT_ORIGIN}{path}" if path.startswith("/") else path
     who = f"{rep_name} at Qualified Commercial" if rep_name else "Qualified Commercial"
 
-    if channel == "sms":
-        phone = normalize_phone(to_phone)
-        if not phone:
-            return DeliveryResult(
-                False, "sms", "That phone number does not look complete. Check it and try again."
-            )
-        if not sms_consent_ok:
-            return DeliveryResult(
-                False,
-                "sms",
-                "This number has not agreed to receive texts. Ask the owner to opt in on "
-                "the file, or send it by email instead.",
-            )
-        # Short by necessity, and it names the business so it does not read as
-        # a phishing text. The brand and STOP are in every message because
-        # carriers require identification and an opt-out path in the message
-        # itself, not only at sign-up.
-        body = (
-            f"{who}: to {purpose} for {business_name}, open {url} "
-            f"Reply STOP to opt out."
-        )
-        return _send_sms(phone, body)
-
-    if channel == "email":
-        to = (to_email or "").strip()
-        if not to or "@" not in to:
-            return DeliveryResult(
-                False, "email", "No email address on file for this client."
-            )
+    email_res: DeliveryResult | None = None
+    to = (to_email or "").strip()
+    if to and "@" in to:
         body = (
             f"Hello,\n\n"
             f"{who} has asked you to {purpose} for {business_name}.\n\n"
             f"Open this secure link:\n{url}\n\n"
-            f"The link is single-use and personal to you. If you were not expecting\n"
-            f"this, you can ignore it and nothing will happen.\n\n"
+            f"The link is personal to you. If you were not expecting this, you can\n"
+            f"ignore it and nothing will happen.\n\n"
             f"Qualified Commercial\n"
         )
-        return _send_email(to, f"Action needed for {business_name}", body)
+        email_res = _send_email(to, f"Action needed for {business_name}", body)
 
-    return DeliveryResult(False, channel, f"Unknown delivery channel: {channel!r}")
+    sms_res: DeliveryResult | None = None
+    if channel == "sms":
+        phone = normalize_phone(to_phone)
+        if not phone:
+            sms_res = DeliveryResult(
+                False, "sms", "That phone number does not look complete."
+            )
+        elif not sms_consent_ok:
+            sms_res = DeliveryResult(
+                False,
+                "sms",
+                "This number has not agreed to receive texts, so only the email went.",
+            )
+        else:
+            # Short by necessity, and it names the business so it does not read
+            # as a phishing text. The brand and STOP are in every message
+            # because carriers require identification and an opt-out path in
+            # the message itself, not only at sign-up.
+            sms_res = _send_sms(
+                phone,
+                f"{who}: to {purpose} for {business_name}, open {url} Reply STOP to opt out.",
+            )
+
+    email_ok = bool(email_res and email_res.ok)
+    sms_ok = bool(sms_res and sms_res.ok)
+
+    if not email_res and not sms_res:
+        return DeliveryResult(
+            False, "none", "No email address or mobile number on file for this client."
+        )
+
+    if email_ok and sms_ok:
+        detail = "Emailed and texted."
+    elif email_ok and sms_res is not None:
+        detail = f"Emailed. {sms_res.detail}"
+    elif email_ok:
+        detail = "Emailed."
+    elif sms_ok:
+        detail = f"Texted, but the email failed: {email_res.detail if email_res else 'no address on file'}"
+    else:
+        parts = [r.detail for r in (email_res, sms_res) if r is not None]
+        detail = " ".join(parts) or "Could not reach this client."
+
+    channel_label = (
+        "email+sms" if email_ok and sms_ok else "email" if email_ok else "sms" if sms_ok else "none"
+    )
+    return DeliveryResult(email_ok or sms_ok, channel_label, detail, email_ok, sms_ok)
 
 
 async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
