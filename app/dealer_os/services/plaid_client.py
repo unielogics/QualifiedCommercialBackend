@@ -8,7 +8,8 @@ Settings class, per the isolation contract):
     DEALER_OS_PLAID_CLIENT_ID
     DEALER_OS_PLAID_SECRET
     DEALER_OS_PLAID_ENV           sandbox | production   (default sandbox)
-    DEALER_OS_PLAID_REDIRECT_URI  OAuth return URL       (optional, see below)
+    DEALER_OS_PLAID_REDIRECT_URI       OAuth return, team app  (optional)
+    DEALER_OS_PLAID_ROOM_REDIRECT_URI  OAuth return, client room (optional)
     DEALER_OS_PLAID_WEBHOOK_URL   Inbound webhook URL    (optional, see below)
 
 When the keys are absent every entrypoint raises PlaidUnavailable — the API
@@ -68,6 +69,31 @@ def redirect_uri() -> str:
     routing.
     """
     return _env("DEALER_OS_PLAID_REDIRECT_URI")
+
+
+def room_redirect_uri() -> str:
+    """The OAuth return URL for the PUBLIC client room.
+
+    Deliberately separate from redirect_uri(). The two paths authenticate
+    completely differently: the team app is behind a Clerk session, while the
+    client room is a public page authorised by token and passcode. Sending a
+    room user to the team app's return URL bounces them into a sign-in wall at
+    the exact moment they come back from their bank, and the connection is lost.
+
+    Plaid takes one redirect_uri per link token, so each path can carry its own.
+    Both must be registered under "Allowed redirect URIs" in the Dashboard.
+
+    Deliberately does NOT fall back to the team URI. Falling back looks
+    harmless and is the worse failure: the room user picks their bank,
+    authenticates with it, is redirected to a page that demands a login they do
+    not have, and loses the connection after doing all the work. Returning
+    nothing instead means OAuth banks are simply unavailable in the room until
+    this is configured — the user finds out before spending effort, not after.
+
+    So: unset here means no redirect_uri on room link tokens, which is exactly
+    the behaviour the room had before OAuth existed.
+    """
+    return _env("DEALER_OS_PLAID_ROOM_REDIRECT_URI")
 
 
 def webhook_url() -> str:
@@ -131,7 +157,14 @@ async def _post(path: str, payload: dict[str, Any], *, timeout: float = 30.0) ->
     return resp
 
 
-async def create_link_token(*, dealer_id: str, dealer_name: str) -> str:
+async def create_link_token(
+    *, dealer_id: str, dealer_name: str, redirect_override: str | None = None
+) -> str:
+    """A Link session for one dealer.
+
+    `redirect_override` lets the caller choose where OAuth returns to — the
+    client room needs a public page, the team app needs its authenticated one.
+    """
     today = date.today()
     resp = await _post(
         "/link/token/create",
@@ -147,7 +180,11 @@ async def create_link_token(*, dealer_id: str, dealer_name: str) -> str:
             "language": "en",
             # Only present once the URI is registered with Plaid — see
             # redirect_uri() for why sending it early is worse than omitting it.
-            **({"redirect_uri": redirect_uri()} if redirect_uri() else {}),
+            **(
+                {"redirect_uri": redirect_override or redirect_uri()}
+                if (redirect_override or redirect_uri())
+                else {}
+            ),
             **({"webhook": webhook_url()} if webhook_url() else {}),
         },
     )

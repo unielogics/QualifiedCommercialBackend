@@ -6732,7 +6732,11 @@ async def public_room_link_token(
     _plaid_cooldown("link", dealer.id, 10)
     try:
         pt = await plaid_client.create_link_token(
-            dealer_id=str(dealer.id), dealer_name=dealer.name
+            dealer_id=str(dealer.id),
+            dealer_name=dealer.name,
+            # The room is public; its OAuth return must be a public page, not
+            # the team app's authenticated one.
+            redirect_override=plaid_client.room_redirect_uri() or None,
         )
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
