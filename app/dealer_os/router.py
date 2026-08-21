@@ -35,7 +35,7 @@ from app.enums import Role
 
 # READ-ONLY reuse: bucket models are queried/appended, never altered; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
-from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument
+from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
@@ -1247,6 +1247,46 @@ async def dealer_delivery_log(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows = await delivery_log.build(db, dealer.id, limit=limit)
     return [DeliveryRowRead(**asdict(r)) for r in rows]
+
+
+async def _room_code_hash_by_token(db: AsyncSession, token: str) -> str | None:
+    """Resolve the consent token to its file's room-code hash WITHOUT touching
+    the token: the code check must run before consumption, or wrong guesses
+    would burn the owner's single-use link."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    owner = (
+        await db.execute(
+            select(DealerOwner.dealer_id).where(DealerOwner.invite_token_hash == token_hash)
+        )
+    ).scalar_one_or_none()
+    if owner is None:
+        return None
+    return await _room_code_hash(db, owner)
+
+
+async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
+    """The active room link's passcode hash for this file, or None.
+
+    None means either no room yet or a legacy link without a code — both are
+    treated as "no code required" so links minted before this gate existed
+    keep working. Every new credit invite ensures a room first, so new links
+    always carry the gate."""
+    from app.models.bucket import Bucket
+
+    row = (
+        await db.execute(
+            select(BucketUploadLink.passcode_hash)
+            .join(Bucket, Bucket.id == BucketUploadLink.bucket_id)
+            .join(DealerBusiness, DealerBusiness.bucket_id == Bucket.id)
+            .where(
+                DealerBusiness.id == dealer_id,
+                BucketUploadLink.status == "active",
+            )
+            .order_by(BucketUploadLink.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row
 
 
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
@@ -7662,6 +7702,7 @@ async def public_credit_consent_view(
         dealer_name=dealer.name if dealer is not None else "",
         fields_needed=_owner_missing_pull_fields(owner),
         completed=owner.credit_pulled_at is not None,
+        requires_code=bool(await _room_code_hash(db, owner.dealer_id)),
     )
 
 
@@ -7674,6 +7715,22 @@ async def public_credit_consent_submit(
     what the advisor already has), and the SAME soft-pull gateway path runs.
     Success consumes the token; the response is tier + a 50-point band only —
     never the exact score, never the pull summary."""
+    # The room access code gates the pull. Checked BEFORE the token is
+    # consumed, so a guesser burns lockout attempts, never the owner's link.
+    # A credit pull is the most consequential thing a leaked email link could
+    # trigger; possession of the link alone must not be enough.
+    code_hash = await _room_code_hash_by_token(db, token)
+    if code_hash is not None:
+        from .services.client_room import verify_passcode as _verify_room_code
+
+        if not _verify_room_code(body.access_code or "", code_hash):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "The access code is missing or wrong. It is the same code that opens "
+                "your document room; your representative can read it to you or issue "
+                "a new one.",
+            )
+
     # ATOMIC consume-first: two concurrent submits with the same token must
     # never both reach the bureau. The UPDATE ... RETURNING claims the token;
     # the loser sees zero rows and gets the dead-link 404. On gateway failure

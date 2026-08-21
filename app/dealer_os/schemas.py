@@ -1529,11 +1529,16 @@ class PublicConsentView(BaseModel):
     dealer_name: str
     fields_needed: list[str]  # subset of dob/street/city/state/zip still missing
     completed: bool
+    # True when the file's room carries an access code: the submit then
+    # requires it. Old links minted before rooms existed stay usable.
+    requires_code: bool = False
 
 
 class PublicConsentSubmit(BaseModel):
     """FCRA consent is a hard precondition; profile fields fill ONLY currently
     empty owner columns (never overwrite what the advisor already has)."""
+    # The room access code, when the view said one is required.
+    access_code: str | None = Field(default=None, max_length=64)
 
     fcra_consent: bool = False
     dob: date | None = None

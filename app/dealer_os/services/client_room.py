@@ -186,6 +186,24 @@ async def request_document(
     return doc
 
 
+async def rotate_passcode(db: AsyncSession, dealer: DealerBusiness) -> ClientRoom:
+    """A fresh access code for the file's room, returned in plaintext once.
+
+    The stored code is a PBKDF2 hash and can never be re-displayed, which is
+    the right storage and a wrong dead end: a rep who missed the one-time
+    display used to have a client locked out of their own room. Rotation is
+    the answer — mint a new code, invalidate the old, read the new one out.
+    One code then covers everything the room does: uploads, bank connection,
+    credit authorization, signing.
+    """
+    room = await ensure_room(db, dealer)
+    passcode = _generate_passcode()
+    room.link.passcode_hash = _hash_passcode(passcode)
+    await db.flush()
+    logger.info("dealer-os: room passcode rotated for dealer %s", dealer.id)
+    return ClientRoom(room.link, room.url, passcode)
+
+
 # --- opening the room from the client's side ---------------------------------
 
 # Same lockout the bucket routes use, and for the same reason: a generated
