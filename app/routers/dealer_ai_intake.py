@@ -62,7 +62,13 @@ from app.services.bucket_ai import CHAT_TURN_ORDER, CURRENT_FILE_ANALYSIS_VERSIO
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
-from app.services.main_street_programs import TERM_3_5_MIN_DSCR, TERM_3_5_MIN_REVENUE, TERM_10YR_MIN_DSCR
+from app.services.main_street_programs import (
+    TERM_3_5_MIN_DSCR,
+    TERM_3_5_MIN_REVENUE,
+    TERM_10YR_MIN_DSCR,
+    normalize_industry,
+    normalize_intent,
+)
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
 from app.services.payment_authorization import primary_super_admin
@@ -400,11 +406,20 @@ class AdminLeadCreate(BaseModel):
     public start schemas but with no terms/throttle and an explicit variant selector.
     The client can later log in with this email exactly like a self-serve lead."""
 
-    variant: str = Field(default="dealer")  # "dealer" | "real_estate"
+    # One of the keys in _ADMIN_VARIANT_CONSTANTS: dealer | real_estate |
+    # main_street | mca_refinance.
+    variant: str = Field(default="dealer")
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
     business_name: str | None = Field(default=None, max_length=180)
+    # Main Street: an operating business is defined by what it does and what it
+    # wants, and the program screen cannot run without both. Optional so the
+    # other three variants are unaffected; normalized (never rejected) so an
+    # unrecognized value falls back to "other"/"not_sure" rather than 422-ing a
+    # lead the operator is trying to create.
+    industry: str | None = Field(default=None, max_length=64)
+    intent: str | None = Field(default=None, max_length=64)
     # Real-estate basics (optional; mirror FundingReviewStart).
     investor_name: str | None = Field(default=None, max_length=180)
     target_property_address: str | None = Field(default=None, max_length=320)
@@ -474,11 +489,19 @@ class AdminLeadFromBucketCreate(BaseModel):
     fields (no target_property_address / requested_amount / etc.) since the
     bucket, and whatever files/requested-docs are already on it, stay as-is."""
 
-    variant: str = Field(default="dealer")  # "dealer" | "real_estate"
+    # One of the keys in _ADMIN_VARIANT_CONSTANTS.
+    variant: str = Field(default="dealer")
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
     business_name: str | None = Field(default=None, max_length=180)  # or investor name, real-estate
+    # Main Street: an operating business is defined by what it does and what it
+    # wants, and the program screen cannot run without both. Optional so the
+    # other three variants are unaffected; normalized (never rejected) so an
+    # unrecognized value falls back to "other"/"not_sure" rather than 422-ing a
+    # lead the operator is trying to create.
+    industry: str | None = Field(default=None, max_length=64)
+    intent: str | None = Field(default=None, max_length=64)
     notify_client: bool = False  # default OFF — this is an admin audit flow, not client self-service
     force_new: bool = False  # create a second lead even if one already exists for this bucket
     preferred_language: Language = Language.EN
@@ -1802,11 +1825,72 @@ def _compute_loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any
     }
 
 
+def _compute_main_street_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The operating-business screen, from the same inputs the dealer one uses.
+
+    An operating business is not a dealer file. Running the dealer screen over it
+    returns programs that do not apply — floorplan, reinsurance-backed, jumbo
+    DSCR — and a fundability verdict measured against dealer criteria. This
+    routes those files to app/services/main_street_programs.py, which screens the
+    Main Street catalogue against the lenders' actual published sheets.
+
+    Intent and industry come from the intake rather than being inferred: they are
+    what decide whether this is even a lending file. A point-of-sale enquiry has
+    no programs to screen and should not be told it failed any.
+    """
+    from app.services.main_street_programs import compute_main_street_program_fit
+
+    details = _main_street_details(intake)
+
+    # The relationship is eagerly loaded on the paths that matter, but not on
+    # every one; an unloaded relationship must degrade to "no documents yet"
+    # rather than raise inside a screen that runs on every chat turn.
+    try:
+        bucket = intake.bucket
+        docs = [
+            {"name": d.name, "status": d.status}
+            for d in (bucket.requested_documents if bucket is not None else [])
+        ]
+    except Exception:  # noqa: BLE001 - lazy-load boundary, not a logic error
+        docs = []
+
+    km = dict(_key_metrics(intake))
+    # The Main Street screen reads the requested amount from key metrics; on this
+    # path it lives on the intake row instead.
+    if km.get("requested_amount") is None and intake.requested_loan_amount is not None:
+        km["requested_amount"] = float(intake.requested_loan_amount)
+
+    return compute_main_street_program_fit(
+        intent=details.get("intent"),
+        industry=details.get("industry"),
+        key_metrics=km,
+        details=_dealer_details(intake),
+        documents=docs,
+    )
+
+
+def _program_labels_for(intake: PublicUnderwritingIntake) -> dict[str, str]:
+    """Labels matching whichever screen ran, so keys never render raw."""
+    if intake.variant == MAIN_STREET_VARIANT:
+        from app.services.main_street_programs import MAIN_STREET_PROGRAM_LABELS
+
+        return MAIN_STREET_PROGRAM_LABELS
+    return PROGRAM_LABELS
+
+
 def _apply_loan_program_fit(intake: PublicUnderwritingIntake) -> None:
     """Recomputes and writes intake_state["loan_program_fit"]. Cheap and
-    idempotent — safe to call on every dealer chat turn."""
+    idempotent — safe to call on every chat turn.
+
+    Which screen runs is decided by variant. Both write the same state key, so
+    every downstream consumer keeps working; what changes is that an operating
+    business is no longer measured against dealer programs.
+    """
     state = _intake_state(intake)
-    state["loan_program_fit"] = _compute_loan_program_fit(intake)
+    if intake.variant == MAIN_STREET_VARIANT:
+        state["loan_program_fit"] = _compute_main_street_fit(intake)
+    else:
+        state["loan_program_fit"] = _compute_loan_program_fit(intake)
     intake.intake_state = state
 
 
@@ -3046,6 +3130,126 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
     return bucket, link
 
 
+async def _create_bucket_for_main_street(
+    db: AsyncSession,
+    client: Client,
+    payload: DealerIntakeStart,
+    request: Request,
+    *,
+    intent: str,
+    industry: str,
+) -> tuple[Bucket, BucketUploadLink]:
+    """An operating-business file, with the documents its intent actually calls for.
+
+    This exists because routing a Main Street lead through
+    ``_create_bucket_for_intake`` gave it a dealer bucket: the dealer checklist,
+    the dealer AI framing ("dealer financing with real estate collateral") and
+    the dealer program screen. The welcome email was already variant-aware, so a
+    restaurant owner was emailed one document list and shown a different one.
+
+    Intent decides the package, not a fixed list. ``business_systems`` seeds no
+    documents at all — someone asking about point-of-sale software is having a
+    qualification conversation, and demanding two years of tax returns is both
+    wrong and a good way to lose them. ``documents_for`` owns that mapping; this
+    function only persists what it returns.
+    """
+    from app.services.main_street_programs import (
+        MAIN_STREET_INDUSTRIES,
+        MAIN_STREET_INTENTS,
+        documents_for,
+        intent_kind,
+    )
+
+    owner = await primary_super_admin(db)
+    kind = intent_kind(intent)
+    industry_label = MAIN_STREET_INDUSTRIES[industry]["en"]
+    intent_label = MAIN_STREET_INTENTS[intent]["en"]
+    display = payload.business_name or payload.full_name
+
+    bucket = Bucket(
+        name=f"{display} Main Street Intake",
+        bucket_type="main_street_intake",
+        client_name=display,
+        purpose="Operating business funding review",
+        description=(
+            f"Public AI intake for an operating business. Industry: {industry_label}. "
+            f"Looking for: {intent_label}."
+        ),
+        ai_context={
+            "review_type": MAIN_STREET_VARIANT,
+            "screening_stage": "stage_1_bankability",
+            "deal_type": "operating business funding review",
+            "documentation_level": "preliminary operating-business screen",
+            "collateral_type": "business cash flow",
+            "intent": intent,
+            "intent_kind": kind,
+            "industry": industry,
+            "industry_label": industry_label,
+            "client_email": client.email,
+            # A non-lending intent has no bankability bar to clear, so it gets no
+            # required-items list to be measured against.
+            "stage_1_required_items": (
+                [
+                    "last 6 months main operating bank statements",
+                    "last 2 years business tax returns (or current-year extension filing)",
+                    "current year/YTD P&L and balance sheet",
+                    "requested amount",
+                    "detailed use of funds",
+                    "years in business",
+                    "estimated credit tier/score",
+                ]
+                if kind == "lending"
+                else []
+            ),
+        },
+        created_by_id=owner.id if owner else None,
+    )
+    db.add(bucket)
+    await db.flush()
+
+    for doc in documents_for(intent, industry):
+        db.add(
+            BucketRequestedDocument(
+                bucket_id=bucket.id,
+                name=doc["name"],
+                category=doc["category"],
+                description=doc.get("description", ""),
+                required=bool(doc.get("required", True)),
+                allow_multiple_files=bool(doc.get("allow_multiple_files", False)),
+                status="requested",
+                is_custom=False,
+            )
+        )
+
+    passcode = _generate_passcode()
+    link = BucketUploadLink(
+        bucket_id=bucket.id,
+        token=secrets.token_urlsafe(32),
+        recipient_name=payload.full_name.strip(),
+        recipient_email=client.email,
+        allow_notes=True,
+        allow_multiple_sessions=True,
+        can_use_ai_chat=True,
+        can_view_ai_tasks=True,
+        passcode_hash=_hash_passcode(passcode),
+    )
+    db.add(link)
+    await _log(
+        db,
+        bucket.id,
+        "main_street_intake_created",
+        request=request,
+        actor_name=payload.full_name,
+        actor_email=client.email,
+        actor_role="public_lead",
+        target_type="bucket",
+        target_id=str(bucket.id),
+        detail=f"Main Street intake created ({industry_label} · {intent_label})",
+    )
+    await db.flush()
+    return bucket, link
+
+
 async def _create_bucket_for_funding_review(db: AsyncSession, client: Client, payload: FundingReviewStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
     owner = await primary_super_admin(db)
     investor_name = payload.investor_name or payload.full_name
@@ -3539,7 +3743,7 @@ async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingI
         # the "never disclose a program name to the borrower" rule governs the
         # chat only, per this session's existing loan_program_fit convention.
         "program_fit": _loan_program_fit(intake) if intake.variant != FUNDING_VARIANT else None,
-        "program_labels": PROGRAM_LABELS if intake.variant != FUNDING_VARIANT else None,
+        "program_labels": _program_labels_for(intake) if intake.variant != FUNDING_VARIANT else None,
         "dealer_details": _dealer_details(intake) if intake.variant != FUNDING_VARIANT else None,
     }
 
@@ -4263,7 +4467,9 @@ async def _response(
     session_token: str | None = None,
     assistant_message: str | None = None,
     messages: list[Any] | None = None,
-    public_path: str = "/dealer-ai-underwriter",
+    # None where the variant has no public client room, so no resume URL is built
+    # rather than one pointing at a different variant's intake app.
+    public_path: str | None = "/dealer-ai-underwriter",
     empty_message: str | None = None,
     include_management: bool = False,
     admin_thread: bool = False,
@@ -4343,7 +4549,7 @@ async def _response(
         intake=intake_read,
         token=token,
         session_token=session_token,
-        resume_url=_public_url(f"{public_path}?token={token}") if token else None,
+        resume_url=_public_url(f"{public_path}?token={token}") if token and public_path else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
@@ -5659,7 +5865,13 @@ async def download_admin_dealer_intelligence_pdf(
         missing_docs=missing_docs,
         result=latest_result,
         # Internal-only sections — never passed on the public/borrower exports.
-        program_fit=None if is_re else _compute_loan_program_fit(intake),
+        program_fit=(
+            None
+            if is_re
+            else _compute_main_street_fit(intake)
+            if intake.variant == MAIN_STREET_VARIANT
+            else _compute_loan_program_fit(intake)
+        ),
         dscr_potential=_compute_dscr_potential(intake) if is_re else None,
         credit=_credit_pull_state(intake) or None,
         internal=True,
@@ -6216,7 +6428,16 @@ async def create_admin_ai_lead(
             f"variant must be one of {', '.join(sorted(_ADMIN_VARIANT_CONSTANTS))}",
         )
     is_re = payload.variant == "real_estate"
+    is_ms = payload.variant == "main_street"
     variant_const = _ADMIN_VARIANT_CONSTANTS[payload.variant]
+
+    # Normalized here rather than at the edge so an unrecognized value becomes
+    # "other"/"not_sure" instead of 422-ing a lead an operator is mid-way through
+    # creating. Both are needed before the bucket exists: intent decides which
+    # documents get seeded, and seeding the wrong package is the whole bug this
+    # branch was added to fix.
+    ms_intent = normalize_intent(payload.intent) if is_ms else None
+    ms_industry = normalize_industry(payload.industry) if is_ms else None
 
     # Duplicate policy: unless force_new, surface the existing active lead so the
     # operator opens it instead of creating a duplicate bucket for the same email.
@@ -6256,6 +6477,17 @@ async def create_admin_ai_lead(
         )
         client = await _find_or_create_funding_client(db, adapter)
         bucket, link = await _create_bucket_for_funding_review(db, client, adapter, request)
+    elif is_ms:
+        adapter = DealerIntakeStart(
+            full_name=payload.full_name,
+            email=payload.email,
+            phone=payload.phone,
+            business_name=payload.business_name,
+        )
+        client = await _find_or_create_client(db, adapter)
+        bucket, link = await _create_bucket_for_main_street(
+            db, client, adapter, request, intent=ms_intent, industry=ms_industry,
+        )
     else:
         adapter = DealerIntakeStart(
             full_name=payload.full_name,
@@ -6273,9 +6505,18 @@ async def create_admin_ai_lead(
     token = _new_public_token()
     intake_state: dict[str, Any] = {
         "messages": [],
-        "source": ("funding_review" if is_re else "dealer_ai_intake"),
+        "source": (
+            "funding_review" if is_re else "main_street_intake" if is_ms else "dealer_ai_intake"
+        ),
         "admin_provenance": provenance,
     }
+    if is_ms:
+        # The key _main_street_details() reads. Without it _main_street_context
+        # falls back to "other"/"not_sure" and the program screen runs blind.
+        intake_state["main_street_details"] = {
+            "intent": ms_intent,
+            "industry": ms_industry,
+        }
     if is_re:
         intake_state["funding_review_basics"] = {
             "investor_name": payload.investor_name,
@@ -6334,7 +6575,17 @@ async def create_admin_ai_lead(
     intake = await _load_admin_dealer_lead(db, intake.id)
 
     email_note = ""
-    if payload.notify_client:
+    # Main Street has no public client room yet — dealer, real estate and MCA each
+    # have a bespoke intake app and nothing equivalent exists for operating
+    # businesses. Emailing the client the dealer room would drop them into a
+    # floorplan questionnaire, so the link is withheld and the operator is told
+    # why. The lead itself is fully workable from the dashboard.
+    if payload.notify_client and is_ms:
+        email_note = (
+            " No login link was sent: operating-business leads have no client-facing"
+            " room yet, so work this file from the dashboard."
+        )
+    elif payload.notify_client:
         if is_re:
             record = await _record_resume_email(
                 intake,
@@ -6363,7 +6614,14 @@ async def create_admin_ai_lead(
         db,
         intake,
         token=token,
-        public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
+        # None for Main Street: it has no client room yet, and the dealer room
+        # would ask an operating business floorplan and collateral questions.
+        public_path=(
+            FUNDING_PUBLIC_PATH if is_re
+            else None if is_ms
+            else MCA_PUBLIC_PATH if payload.variant == "mca_refinance"
+            else "/dealer-ai-underwriter"
+        ),
         include_management=True,
         admin_thread=True,
         thread_user=user,
@@ -6912,7 +7170,14 @@ async def create_admin_ai_lead_from_bucket(
             f"variant must be one of {', '.join(sorted(_ADMIN_VARIANT_CONSTANTS))}",
         )
     is_re = payload.variant == "real_estate"
+    is_ms = payload.variant == "main_street"
     variant_const = _ADMIN_VARIANT_CONSTANTS[payload.variant]
+    # Normalized, never rejected: an unrecognized value becomes "other"/"not_sure"
+    # rather than failing a conversion the operator is part-way through. The
+    # bucket already exists here, so unlike the create path these only steer the
+    # AI context and the program screen, not a document package.
+    ms_intent = normalize_intent(payload.intent) if is_ms else None
+    ms_industry = normalize_industry(payload.industry) if is_ms else None
 
     bucket = (
         await db.execute(
@@ -6989,6 +7254,11 @@ async def create_admin_ai_lead_from_bucket(
             "messages": [],
             "source": "bucket_conversion",
             "admin_provenance": provenance,
+            **(
+                {"main_street_details": {"intent": ms_intent, "industry": ms_industry}}
+                if is_ms
+                else {}
+            ),
         },
     )
     db.add(intake)
@@ -7016,7 +7286,17 @@ async def create_admin_ai_lead_from_bucket(
     intake = await _load_admin_dealer_lead(db, intake.id)
 
     email_note = ""
-    if payload.notify_client:
+    # Main Street has no public client room yet — dealer, real estate and MCA each
+    # have a bespoke intake app and nothing equivalent exists for operating
+    # businesses. Emailing the client the dealer room would drop them into a
+    # floorplan questionnaire, so the link is withheld and the operator is told
+    # why. The lead itself is fully workable from the dashboard.
+    if payload.notify_client and is_ms:
+        email_note = (
+            " No login link was sent: operating-business leads have no client-facing"
+            " room yet, so work this file from the dashboard."
+        )
+    elif payload.notify_client:
         if is_re:
             record = await _record_resume_email(
                 intake, token=token, request=request, reason="admin_created",
@@ -7039,7 +7319,14 @@ async def create_admin_ai_lead_from_bucket(
         db,
         intake,
         token=token,
-        public_path=(FUNDING_PUBLIC_PATH if is_re else "/dealer-ai-underwriter"),
+        # None for Main Street: it has no client room yet, and the dealer room
+        # would ask an operating business floorplan and collateral questions.
+        public_path=(
+            FUNDING_PUBLIC_PATH if is_re
+            else None if is_ms
+            else MCA_PUBLIC_PATH if payload.variant == "mca_refinance"
+            else "/dealer-ai-underwriter"
+        ),
         include_management=True,
         admin_thread=True,
         thread_user=user,
