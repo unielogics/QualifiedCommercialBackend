@@ -116,6 +116,8 @@ from .schemas import (
     RoomSignRequest,
     RoomSignResult,
     ContractDocRead,
+    ConvertToAuditRequest,
+    ConvertToAuditResult,
     RoomContractRead,
     RoomContractSignRequest,
     ContractGenerateResult,
@@ -1249,10 +1251,13 @@ async def dealer_delivery_log(
     return [DeliveryRowRead(**asdict(r)) for r in rows]
 
 
-@router.post("/dealers/{dealer_id}/convert-to-audit", response_model=DealerRead)
+@router.post("/dealers/{dealer_id}/convert-to-audit", response_model=ConvertToAuditResult)
 async def convert_to_audit(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
-) -> DealerRead:
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    payload: ConvertToAuditRequest | None = None,
+) -> ConvertToAuditResult:
     """Graduate a rep application into a full audit client.
 
     Deliberately a FLAG on the same row, never a copy. The bank connection,
@@ -1284,13 +1289,51 @@ async def convert_to_audit(
         lead.status = "complete"
         lead.status_history = history
         lead.completed_at = dealer.audit_client_since
+    # The client's Capital OS login, sent as part of the upgrade when asked.
+    # An audit client without a login is a subscription nobody can use, so the
+    # admin UI asks by default — but it stays optional, because sometimes the
+    # desk converts first and onboards the client on a call later. The invite
+    # can only ever mint Role.DEALER landing on audit., so this can never hand
+    # a client the Field Desk.
+    invite: DealerInviteResult | None = None
+    invite_error: str | None = None
+    req = payload or ConvertToAuditRequest()
+    if req.send_login_invite:
+        email = (req.login_email or "").strip() or dealer.email or ""
+        if not email:
+            owner_email = (
+                await db.execute(
+                    select(DealerOwner.email)
+                    .where(DealerOwner.dealer_id == dealer.id, DealerOwner.email.is_not(None))
+                    .order_by(DealerOwner.is_primary.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            email = owner_email or ""
+        if email:
+            try:
+                invite = await _invite_dealer_login_core(db, dealer, email, None)
+            except HTTPException as exc:
+                # The conversion itself must not fail because the email clashes
+                # with a staff account; report it and let the desk fix the email.
+                invite_error = str(exc.detail)
+        else:
+            invite_error = "No email on the file to invite. Add one and invite from the file."
+
     await log_action(
         db, dealer.id, user, "dealer.converted_to_audit", "dealer",
-        entity_id=dealer.id, after={"audit_client_since": dealer.audit_client_since.isoformat()},
+        entity_id=dealer.id,
+        after={"audit_client_since": dealer.audit_client_since.isoformat(),
+               "login_invited": bool(invite and invite.status == "invited"),
+               "login_linked": bool(invite and invite.status == "linked")},
     )
     await db.commit()
     await db.refresh(dealer)
-    return await _dealer_read(db, dealer)
+    return ConvertToAuditResult(
+        dealer=await _dealer_read(db, dealer),
+        invite=invite,
+        invite_error=invite_error,
+    )
 
 
 @router.post("/dealers/{dealer_id}/room/access-code", response_model=ClientRequestResult)
@@ -1565,17 +1608,17 @@ async def update_dealer(
     return await _dealer_read(db, dealer)
 
 
-@router.post("/dealers/{dealer_id}/invite", response_model=DealerInviteResult, status_code=status.HTTP_201_CREATED)
-async def invite_dealer_login(
-    dealer_id: UUID, payload: DealerInvite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+async def _invite_dealer_login_core(
+    db: AsyncSession, dealer: DealerBusiness, email: str, name: str | None
 ) -> DealerInviteResult:
-    """Invite (or link) the dealer's self-serve login. Creates the local User
-    row with Role.DEALER (clerk_id JIT-bound on first sign-in, same pattern as
-    the operator invite flow), links it via dealer_user_id, and best-effort
-    sends a Clerk invitation email that lands on audit.qualifiedcommercial.com."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
-    email = payload.email.strip().lower()
+    """Create-or-link the client's Capital OS login and send the Clerk invite.
+
+    The invite ALWAYS lands on audit.qualifiedcommercial.com/sign-in and the
+    account is ALWAYS Role.DEALER. That pair is what keeps a client out of the
+    Field Desk: rep.qualifiedcommercial.com walls every non-rep, non-team role
+    before a single page renders, so the only door this login opens is their
+    own audit portal. Flushes; the caller commits."""
+    email = email.strip().lower()
     existing = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
     clerk_sent = False
     if existing is not None and existing.deleted_at is None:
@@ -1588,14 +1631,14 @@ async def invite_dealer_login(
     else:
         if existing is not None:  # soft-deleted: resurrect as dealer
             existing.deleted_at = None
-            existing.name = payload.name or existing.name
+            existing.name = name or existing.name
             existing.role = Role.DEALER
             existing.clerk_id = None
             target = existing
         else:
             target = User(
                 email=email,
-                name=payload.name or f"{dealer.name} owner",
+                name=name or f"{dealer.name} owner",
                 role=Role.DEALER,
                 clerk_id=None,
             )
@@ -1610,8 +1653,23 @@ async def invite_dealer_login(
         )
         clerk_sent = sent is not None
     dealer.dealer_user_id = target.id
-    await db.commit()
+    await db.flush()
     return DealerInviteResult(status=result_status, email=email, user_id=target.id, clerk_sent=clerk_sent)
+
+
+@router.post("/dealers/{dealer_id}/invite", response_model=DealerInviteResult, status_code=status.HTTP_201_CREATED)
+async def invite_dealer_login(
+    dealer_id: UUID, payload: DealerInvite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerInviteResult:
+    """Invite (or link) the dealer's self-serve login. Creates the local User
+    row with Role.DEALER (clerk_id JIT-bound on first sign-in, same pattern as
+    the operator invite flow), links it via dealer_user_id, and best-effort
+    sends a Clerk invitation email that lands on audit.qualifiedcommercial.com."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    result = await _invite_dealer_login_core(db, dealer, payload.email, payload.name)
+    await db.commit()
+    return result
 
 
 def _target_read(t: DealerMetricTarget) -> TargetRead:

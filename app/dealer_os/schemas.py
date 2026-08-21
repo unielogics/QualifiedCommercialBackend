@@ -160,6 +160,22 @@ class DealerRead(ORM):
     group_id: UUID | None = None
 
 
+class ConvertToAuditRequest(BaseModel):
+    """Upgrade options. The invite defaults ON in the admin UI because an
+    audit client without a login is a subscription nobody can use — but it
+    stays a choice, for the desk that converts first and onboards by call."""
+
+    send_login_invite: bool = False
+    # Overrides the file's email when the login should go somewhere specific.
+    login_email: str | None = Field(default=None, max_length=320)
+
+
+class ConvertToAuditResult(BaseModel):
+    dealer: DealerRead
+    invite: DealerInviteResult | None = None
+    invite_error: str | None = None
+
+
 class DealerListItem(ORM):
     id: UUID
     name: str
@@ -789,6 +805,11 @@ class DealerInviteResult(BaseModel):
     email: str
     user_id: UUID
     clerk_sent: bool = False
+
+
+# ConvertToAuditResult (defined far above) references DealerInviteResult
+# lazily; resolve here, where the failure would be loud at import.
+ConvertToAuditResult.model_rebuild()
 
 
 class BucketSearchItem(ORM):
