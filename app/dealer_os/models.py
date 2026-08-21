@@ -35,6 +35,12 @@ class DealerBusiness(TimestampMixin, Base):
     # file whose reference can change is a file two people can be looking at
     # while quoting different numbers.
     case_ref: Mapped[str | None] = mapped_column(String(24), unique=True)
+    # 0136: when the desk graduated this file into a full audit client. The
+    # conversion is a FLAG, never a copy: rep files and audit files are the
+    # same row viewed from two apps, which is precisely why Plaid items,
+    # credit pulls, documents and consent "transfer" — there is nothing to
+    # move, and a conversion that minted a new row would strand all of it.
+    audit_client_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # 0134: what the money is actually for, line by line.
     #
     # A single funding_goal answers "how much" and no lender asks only that.

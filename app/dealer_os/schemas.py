@@ -132,6 +132,7 @@ class DealerRead(ORM):
     id: UUID
     name: str
     case_ref: str | None = None
+    audit_client_since: datetime | None = None
     use_of_proceeds: list[UseOfProceedsRow] | None = None
     use_of_proceeds_note: str | None = None
     dealer_user_id: UUID | None = None
@@ -163,6 +164,7 @@ class DealerListItem(ORM):
     id: UUID
     name: str
     case_ref: str | None = None
+    audit_client_since: datetime | None = None
     city: str | None = None
     state: str | None = None
     status: str

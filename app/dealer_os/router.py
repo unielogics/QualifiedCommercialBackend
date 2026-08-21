@@ -1249,6 +1249,50 @@ async def dealer_delivery_log(
     return [DeliveryRowRead(**asdict(r)) for r in rows]
 
 
+@router.post("/dealers/{dealer_id}/convert-to-audit", response_model=DealerRead)
+async def convert_to_audit(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerRead:
+    """Graduate a rep application into a full audit client.
+
+    Deliberately a FLAG on the same row, never a copy. The bank connection,
+    credit pull, documents, consent records and executed contracts are all
+    keyed to this dealer_id; a conversion that created a new file would strand
+    every one of them. Setting a timestamp is what makes the transfer total.
+
+    The rep keeps attribution: the pipeline row graduates to complete so the
+    file counts as a conversion in production, and owner_user_id stays so the
+    rep can still see the client they brought in."""
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    if dealer.audit_client_since is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file is already an audit client.")
+    dealer.audit_client_since = datetime.now(timezone.utc)
+    lead = (
+        await db.execute(
+            select(DealerRepLead).where(DealerRepLead.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if lead is not None and lead.status not in ("complete", "declined"):
+        history = list(lead.status_history or [])
+        history.append({
+            "at": dealer.audit_client_since.isoformat(),
+            "from": lead.status, "to": "complete",
+            "by": str(user.id), "by_name": user.name,
+            "note": "converted to audit client",
+        })
+        lead.status = "complete"
+        lead.status_history = history
+        lead.completed_at = dealer.audit_client_since
+    await log_action(
+        db, dealer.id, user, "dealer.converted_to_audit", "dealer",
+        entity_id=dealer.id, after={"audit_client_since": dealer.audit_client_since.isoformat()},
+    )
+    await db.commit()
+    await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
+
+
 @router.post("/dealers/{dealer_id}/room/access-code", response_model=ClientRequestResult)
 async def rotate_room_access_code(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
