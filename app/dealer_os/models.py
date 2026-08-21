@@ -925,3 +925,90 @@ class DealerAIMessage(TimestampMixin, Base):
     )
     role: Mapped[str] = mapped_column(String(12), nullable=False)  # user | assistant
     body: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+# --- contract package (0135) --------------------------------------------------
+
+# The lender-facing documents a case executes at step 5. Registry-driven: a
+# template is uploaded once by the desk, its fillable fields are discovered
+# from the PDF itself, and each case then instantiates documents from it. The
+# contracts are DATA, not code — next template needs an upload, not a deploy.
+CONTRACT_DOC_STATUSES: tuple[str, ...] = (
+    "draft",        # instantiated, fields still being filled
+    "ready",        # every required field filled, not yet sent
+    "out_for_signature",
+    "executed",     # signed, certificate attached
+    "void",
+)
+
+
+class ContractTemplate(TimestampMixin, Base):
+    """One blank lender document plus what we know about its fields.
+
+    `field_names` is what pypdf discovered in the PDF's AcroForm; `field_map`
+    is the desk's mapping of those names to case-record sources
+    ("business_name" -> "dealer.name"). Discovery is automatic, mapping is
+    judgement: every lender names fields differently, and guessing a mapping
+    writes the wrong value into a legal document.
+    """
+
+    __tablename__ = "dos_contract_templates"
+
+    id: Mapped[uuid.UUID] = _pk()
+    # Stable slug the UI and documents reference: "loan_app",
+    # "consulting_agreement". Immutable once documents exist against it.
+    key: Mapped[str] = mapped_column(String(48), unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(160), nullable=False)
+    s3_key: Mapped[str | None] = mapped_column(String(512))
+    page_count: Mapped[int | None] = mapped_column(Integer)
+    # True when the PDF carries a real AcroForm. False means a flat scan:
+    # filling needs the PyMuPDF coordinate overlay instead.
+    has_acroform: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    field_names: Mapped[list | None] = mapped_column(JSONB)
+    field_map: Mapped[dict | None] = mapped_column(JSONB)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    # Bumped when the underlying PDF is replaced, so an executed document can
+    # always say which revision of the paper it was signed on.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class ContractDocument(TimestampMixin, Base):
+    """One case's instance of a template: its values, state and executed copy.
+
+    Signing is evidence, so the executed record mirrors document_signature.py:
+    the hash of the exact filled document the signer saw, the signature, and
+    where the certificate lives. ESIGN/UETA compliance facts are stored per
+    signing, not assumed: the consent-to-electronic-records acknowledgement is
+    its own recorded act with its own timestamp, because "the platform's terms
+    say so" is not the same as this signer agreeing on this document.
+    """
+
+    __tablename__ = "dos_contract_documents"
+    __table_args__ = (
+        Index("ix_dos_contract_docs_dealer", "dealer_id"),
+        UniqueConstraint("dealer_id", "template_key", name="uq_dos_contract_doc"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    template_key: Mapped[str] = mapped_column(String(48), nullable=False)
+    template_revision: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
+    field_values: Mapped[dict | None] = mapped_column(JSONB)
+    filled_s3_key: Mapped[str | None] = mapped_column(String(512))
+    filled_sha256: Mapped[str | None] = mapped_column(String(64))
+    executed_s3_key: Mapped[str | None] = mapped_column(String(512))
+    executed_sha256: Mapped[str | None] = mapped_column(String(64))
+    # ESIGN §101(c): the signer's affirmative consent to do business
+    # electronically, recorded as its own act before signing.
+    esign_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    esign_consent_ip: Mapped[str | None] = mapped_column(String(64))
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    signer_name: Mapped[str | None] = mapped_column(String(160))
+    signer_ip: Mapped[str | None] = mapped_column(String(64))
+    signer_user_agent: Mapped[str | None] = mapped_column(String(400))

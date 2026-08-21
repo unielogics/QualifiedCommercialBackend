@@ -49,6 +49,7 @@ from .deps import (
 )
 from .models import (
     DealerRepLead,
+    ContractTemplate,
     DealerSmsConsent,
     DealerAIMessage,
     MESSAGE_CHANNELS,
@@ -109,6 +110,8 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    ContractTemplateMapPatch,
+    ContractTemplateRead,
     DeliveryRowRead,
     DecisionRead,
     UnreadSummary,
@@ -260,7 +263,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, contract_registry, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -660,6 +663,85 @@ async def send_signature_request(
         texted=delivery.sms_ok,
         detail=delivery.detail,
     )
+
+
+@router.get("/contract-templates", response_model=list[ContractTemplateRead])
+async def list_contract_templates(user: CurrentUser, db: AsyncSession = Depends(get_db)):
+    """The package: which lender documents exist, which have paper, which are
+    mapped. Open to reps so step 5 can draw the real state — a template holds
+    no client data at all."""
+    require_team_or_rep(user)
+    rows = (
+        (await db.execute(select(ContractTemplate).order_by(ContractTemplate.key)))
+        .scalars()
+        .all()
+    )
+    return [ContractTemplateRead.model_validate(t) for t in rows]
+
+
+@router.post(
+    "/contract-templates/{key}",
+    response_model=ContractTemplateRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_contract_template(
+    key: str,
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+) -> ContractTemplateRead:
+    """Upload (or replace) one lender document's blank PDF.
+
+    Super-admin only: this is the paper every case will execute, and replacing
+    it is a legal act, not a content edit. Field discovery runs on ingest;
+    mapping stays a separate, deliberate step."""
+    require_super_admin(user)
+    raw = await file.read()
+    if len(raw) > 25 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF larger than 25MB.")
+    try:
+        tpl = await contract_registry.ingest_template(
+            db, key=key, pdf_bytes=raw, uploaded_by=user
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await db.commit()
+    await db.refresh(tpl)
+    return ContractTemplateRead.model_validate(tpl)
+
+
+@router.patch("/contract-templates/{key}", response_model=ContractTemplateRead)
+async def map_contract_template(
+    key: str,
+    payload: ContractTemplateMapPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContractTemplateRead:
+    """Set the field mapping: discovered PDF field name -> case source path.
+
+    Only names the PDF actually declares are accepted, so a typo surfaces here
+    rather than as a silently unfilled field on a signed document."""
+    require_super_admin(user)
+    tpl = (
+        await db.execute(select(ContractTemplate).where(ContractTemplate.key == key))
+    ).scalar_one_or_none()
+    if tpl is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such template.")
+    known = set(tpl.field_names or [])
+    unknown = sorted(set(payload.field_map) - known)
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"These fields are not in the PDF: {', '.join(unknown[:8])}",
+        )
+    tpl.field_map = payload.field_map
+    # No log_action here: the audit trail is per-dealer and a template is
+    # desk-wide. The template row itself records uploader and revision.
+    await db.commit()
+    await db.refresh(tpl)
+    return ContractTemplateRead.model_validate(tpl)
 
 
 @router.get("/sms-disclosure", response_model=SmsDisclosureOut)

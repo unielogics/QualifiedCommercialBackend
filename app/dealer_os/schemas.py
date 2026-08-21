@@ -522,6 +522,24 @@ class DecisionRead(BaseModel):
     verification: VerificationRead = Field(default_factory=VerificationRead)
 
 
+class ContractTemplateRead(ORM):
+    id: UUID
+    key: str
+    title: str
+    page_count: int | None = None
+    has_acroform: bool = False
+    field_names: list | None = None
+    field_map: dict | None = None
+    revision: int = 1
+    active: bool = True
+    # Derived convenience: paper uploaded and at least one field mapped.
+    s3_key: str | None = None
+
+
+class ContractTemplateMapPatch(BaseModel):
+    field_map: dict[str, str] = Field(default_factory=dict)
+
+
 class UnreadSummary(BaseModel):
     """Unread counts for the nav badge. `per_file` is keyed by dealer id as a
     string, so the client can light up a row without a second request."""
