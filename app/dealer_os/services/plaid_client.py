@@ -7,7 +7,8 @@ Settings class, per the isolation contract):
 
     DEALER_OS_PLAID_CLIENT_ID
     DEALER_OS_PLAID_SECRET
-    DEALER_OS_PLAID_ENV        sandbox | production   (default sandbox)
+    DEALER_OS_PLAID_ENV           sandbox | production   (default sandbox)
+    DEALER_OS_PLAID_REDIRECT_URI  OAuth return URL       (optional, see below)
 
 When the keys are absent every entrypoint raises PlaidUnavailable — the API
 layer turns that into {enabled: false}, never a 500.
@@ -45,6 +46,26 @@ REFRESH_EVERY_DAYS = 30
 
 class PlaidUnavailable(Exception):
     """Keys absent or the Plaid API rejected/failed the call."""
+
+
+def redirect_uri() -> str:
+    """The OAuth return URL, or "" when OAuth is not configured yet.
+
+    Plaid requires OAuth for every integration that connects to a US, EU or UK
+    institution — which is most of the largest US banks. Without it those banks
+    simply cannot be linked, so this is not optional for production.
+
+    It is env-gated on purpose. Plaid REJECTS /link/token/create outright if the
+    redirect_uri is not already registered under "Allowed redirect URIs" in the
+    Plaid Dashboard, so sending one before that registration exists would break
+    bank linking entirely rather than improve it. Leaving this unset keeps the
+    current non-OAuth behaviour working; setting it turns OAuth on. Register the
+    URI in the Dashboard FIRST, then set this.
+
+    Must be https (localhost is allowed in Sandbox) and must not use hash
+    routing.
+    """
+    return _env("DEALER_OS_PLAID_REDIRECT_URI")
 
 
 def _env(name: str) -> str:
@@ -105,6 +126,9 @@ async def create_link_token(*, dealer_id: str, dealer_name: str) -> str:
             },
             "country_codes": ["US"],
             "language": "en",
+            # Only present once the URI is registered with Plaid — see
+            # redirect_uri() for why sending it early is worse than omitting it.
+            **({"redirect_uri": redirect_uri()} if redirect_uri() else {}),
         },
     )
     token = resp.json().get("link_token")
