@@ -116,6 +116,8 @@ from .schemas import (
     RoomSignRequest,
     RoomSignResult,
     ContractDocRead,
+    RoomContractRead,
+    RoomContractSignRequest,
     ContractGenerateResult,
     ContractTemplateMapPatch,
     ContractTemplateRead,
@@ -270,7 +272,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, contract_fill, contract_registry, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -737,6 +739,66 @@ async def generate_case_contract(
         overlay_problems=result.missing,
         sha256=result.sha256,
         download_url=presign_private_s3_object(doc.filled_s3_key, ttl_seconds=900),
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/contracts/{key}/send-signature",
+    response_model=ClientRequestResult,
+)
+async def send_contract_for_signature(
+    dealer_id: UUID,
+    key: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    payload: ClientRequestSend | None = None,
+) -> ClientRequestResult:
+    """Freeze the prepopulated agreement and put it in front of the client.
+
+    From this moment the paper cannot be regenerated: the signer and the desk
+    must be looking at the same document. The client signs in their own room,
+    on their own device — the rep's session has no signing surface at all."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    doc = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.dealer_id == dealer.id,
+                ContractDocument.template_key == key,
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None or not doc.filled_s3_key:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Generate the prepopulated agreement first.",
+        )
+    if doc.status == "executed":
+        raise HTTPException(status.HTTP_409_CONFLICT, "This document is already signed.")
+    doc.status = "out_for_signature"
+    await db.flush()
+
+    tpl = (
+        await db.execute(select(ContractTemplate).where(ContractTemplate.key == key))
+    ).scalar_one_or_none()
+    title = tpl.title if tpl else key
+    room = await client_room.ensure_room(db, dealer)
+    req = payload or ClientRequestSend()
+    delivery = await _notify_client_request(
+        db, dealer, user,
+        purpose=f"review and sign the {title}",
+        path=room.url,
+        channel=req.channel,
+        action="contract.sent_for_signature",
+    )
+    await db.commit()
+    return ClientRequestResult(
+        url=room.url,
+        passcode=room.passcode,
+        delivered=delivery.ok,
+        emailed=delivery.email_ok,
+        texted=delivery.sms_ok,
+        detail=delivery.detail,
     )
 
 
@@ -6150,11 +6212,158 @@ async def public_room_features(
                 signable=bool(text),
             )
         )
+    # Agreements out for signature (and already-executed ones, so the room can
+    # show Signed instead of silently dropping them). The FULL text rides
+    # along: what is shown in Agreement mode is extracted from the exact PDF
+    # that gets signed, never a summary.
+    contract_rows: list[RoomContractRead] = []
+    docs = (
+        (
+            await db.execute(
+                select(ContractDocument).where(
+                    ContractDocument.dealer_id == dealer.id,
+                    ContractDocument.status.in_(["out_for_signature", "executed"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if docs:
+        titles = {
+            t.key: t.title
+            for t in (
+                await db.execute(select(ContractTemplate))
+            ).scalars().all()
+        }
+        for d in docs:
+            text_full = ""
+            if d.status == "out_for_signature" and d.filled_s3_key:
+                raw_pdf = storage.get_bytes(d.filled_s3_key)
+                if raw_pdf is not None:
+                    text_full = contract_sign.agreement_text(raw_pdf)
+            contract_rows.append(
+                RoomContractRead(
+                    id=d.id,
+                    key=d.template_key,
+                    title=titles.get(d.template_key, d.template_key),
+                    status=d.status,
+                    agreement_text=text_full,
+                    commission_note=(
+                        "3% of the total funded amount"
+                        if d.template_key == "consulting_agreement"
+                        else None
+                    ),
+                )
+            )
+
     return RoomFeaturesRead(
         business_name=dealer.name,
         bank_connect_available=plaid_client.enabled(),
         plaid_environment=plaid_client.environment(),
         signable=rows,
+        contracts=contract_rows,
+    )
+
+
+@router.post(
+    "/public/room/{token}/contracts/{doc_id}/sign",
+    response_model=RoomSignResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_room_sign_contract(
+    token: str,
+    doc_id: UUID,
+    payload: RoomContractSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> RoomSignResult:
+    """PUBLIC. Execute one agreement from the client's own device.
+
+    Typed-and-adopted or drawn, the evidence is identical; a typed adoption is
+    stamped as a conformed signature (/s/ Name), the legal convention, rather
+    than a script font pretending to be handwriting. The executed artifact is
+    one PDF — agreement plus certificate page — emailed to the signer at once.
+
+    This endpoint existing ONLY behind the room token is what enforces the
+    desk's rule that a signature is never taken on the rep's device."""
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if not payload.esign_consent:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "E-SIGN consent is required.")
+
+    doc = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.id == doc_id,
+                ContractDocument.dealer_id == dealer.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such agreement on this file.")
+
+    from app.services.payment_authorization import decode_signature_data_url
+
+    sig_bytes, sig_sha, _ctype = decode_signature_data_url(payload.signature_data_url)
+
+    tpl = (
+        await db.execute(
+            select(ContractTemplate).where(ContractTemplate.key == doc.template_key)
+        )
+    ).scalar_one_or_none()
+    title = tpl.title if tpl else doc.template_key
+
+    try:
+        executed_pdf, executed_sha = await contract_sign.execute(
+            db, dealer, doc,
+            typed_name=payload.typed_name.strip(),
+            signature_png=sig_bytes,
+            signature_sha256=sig_sha,
+            ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            title=title,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+    await log_action(
+        db, dealer.id, None, "contract.executed", "contract_document",
+        entity_id=doc.id,
+        after={"template": doc.template_key, "signer": payload.typed_name.strip(),
+               "sha256": executed_sha[:16], "via": "client_room",
+               "method": "drawn" if sig_bytes else "typed"},
+    )
+    await db.commit()
+
+    # The signer's copy, immediately. Retention and delivery are compliance.
+    to = link.recipient_email or dealer.email
+    if to and "@" in to:
+        from app.services.email.ses_client import send_raw_email
+
+        try:
+            send_raw_email(
+                to_emails=[to],
+                subject=f"Your executed {title} — Qualified Commercial",
+                body_text=(
+                    f"Attached is your fully executed {title}, signed "
+                    f"{doc.signed_at:%B %d, %Y}. The final page is its certificate of "
+                    f"completion. Keep this copy for your records.\n\n"
+                    f"Qualified Commercial"
+                ),
+                attachments=[(f"{doc.template_key}-executed.pdf", executed_pdf, "application/pdf")],
+            )
+        except Exception:  # noqa: BLE001 — the signature is already sealed; mail is retryable
+            logger.exception("executed-copy email failed for contract %s", doc.id)
+
+    return RoomSignResult(
+        signed=True,
+        certificate_file_id=None,
+        message="Signed. Your executed copy, certificate included, has been emailed to you.",
     )
 
 

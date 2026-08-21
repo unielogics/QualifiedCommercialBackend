@@ -963,6 +963,27 @@ class RoomFeaturesRead(BaseModel):
     signable: list[RoomSignableRead] = []
 
 
+class RoomContractRead(BaseModel):
+    """One agreement in the client's room. Carries the FULL text for the
+    Agreement toggle: what is shown is extracted from the exact PDF that gets
+    signed, never a summary."""
+
+    id: UUID
+    key: str
+    title: str
+    status: str
+    agreement_text: str = ""
+    commission_note: str | None = None
+
+
+class RoomContractSignRequest(RoomPasscode):
+    typed_name: str = Field(min_length=2, max_length=160)
+    esign_consent: bool
+    # Absent for a typed-and-adopted signature; the stamp becomes the
+    # conformed "/s/ Name" convention instead of an image.
+    signature_data_url: str | None = Field(default=None, max_length=400_000)
+
+
 class RoomSignRequest(RoomPasscode):
     requested_document_id: UUID
     typed_name: str = Field(min_length=1, max_length=160)
