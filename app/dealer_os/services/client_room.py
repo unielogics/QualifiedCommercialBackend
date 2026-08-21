@@ -133,6 +133,7 @@ async def request_document(
     category: str | None = None,
     requires_signature: bool = False,
     signature_kind: str | None = None,
+    signature_document_text: str | None = None,
     required: bool = True,
 ) -> BucketRequestedDocument:
     """Put an item on the client's checklist. Flushes, never commits.
@@ -158,6 +159,14 @@ async def request_document(
     if existing is not None:
         if description and not existing.description:
             existing.description = description
+        # A signature request adopting a same-named plain row must UPGRADE it,
+        # or the signature requirement silently vanishes: the room would show
+        # an upload row, the client would attach any file, and the rep would
+        # see the item satisfied with nothing signed.
+        if requires_signature and not existing.requires_signature:
+            existing.requires_signature = True
+            existing.signature_kind = signature_kind
+            existing.signature_document_text = signature_document_text
         await db.flush()
         return existing
 
@@ -170,6 +179,7 @@ async def request_document(
         is_custom=True,
         requires_signature=requires_signature,
         signature_kind=signature_kind,
+        signature_document_text=signature_document_text,
     )
     db.add(doc)
     await db.flush()

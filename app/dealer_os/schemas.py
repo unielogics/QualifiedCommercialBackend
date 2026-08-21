@@ -921,6 +921,38 @@ class PublicPlaidResult(BaseModel):
     message: str
 
 
+class RoomSignableRead(BaseModel):
+    """One checklist item the client can sign, with the full text they will
+    sign. Shown, never summarised: a signature over hidden text is not one."""
+
+    id: UUID
+    name: str
+    kind: str | None = None
+    signed: bool = False
+    signable: bool = False
+    document_text: str = ""
+
+
+class RoomFeaturesRead(BaseModel):
+    business_name: str
+    bank_connect_available: bool = False
+    plaid_environment: str = ""
+    signable: list[RoomSignableRead] = []
+
+
+class RoomSignRequest(RoomPasscode):
+    requested_document_id: UUID
+    typed_name: str = Field(min_length=1, max_length=160)
+    esign_consent: bool
+    signature_data_url: str = Field(min_length=1)
+
+
+class RoomSignResult(BaseModel):
+    signed: bool
+    certificate_file_id: UUID | None = None
+    message: str
+
+
 class ClientRequestSend(BaseModel):
     """How to reach the client for a request. Email always goes unless the
     caller explicitly asks for nothing; "sms" means email AND text."""

@@ -35,7 +35,7 @@ from app.enums import Role
 
 # READ-ONLY reuse: bucket models are queried/appended, never altered; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
-from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis
+from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
@@ -110,6 +110,10 @@ from .schemas import (
     CreditUpsert,
     DealerCreate,
     AIThreadAsk,
+    RoomFeaturesRead,
+    RoomSignableRead,
+    RoomSignRequest,
+    RoomSignResult,
     ContractTemplateMapPatch,
     ContractTemplateRead,
     DeliveryRowRead,
@@ -639,13 +643,18 @@ async def send_signature_request(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     room = await client_room.ensure_room(db, dealer)
+    # The signable text IS the document. Composed from what the rep wrote so
+    # the client signs words a person chose, and refused when there are none:
+    # a signature over an empty page is not evidence of anything.
+    text = "\n\n".join(x for x in (payload.title.strip(), (payload.note or "").strip()) if x)
     await client_room.request_document(
         db, dealer,
         name=payload.title,
         description=payload.note,
         category="signatures",
         requires_signature=True,
-        signature_kind=payload.signature_kind,
+        signature_kind=payload.signature_kind or "custom",
+        signature_document_text=text,
     )
     delivery = await _notify_client_request(
         db, dealer, user,
@@ -6001,6 +6010,125 @@ async def plaid_exchange(
     await db.refresh(item)
     background.add_task(_background_plaid_first_sync, item.id)
     return item
+
+
+@router.post("/public/room/{token}/features", response_model=RoomFeaturesRead)
+async def public_room_features(
+    token: str, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
+) -> RoomFeaturesRead:
+    """PUBLIC. What this room can do beyond uploading.
+
+    The room page is generic; the capabilities are per-file. One call after the
+    passcode gate tells it whether to draw a bank-connect section and which
+    checklist items are signable, so the page never renders a button that will
+    404. The signable rows carry their full document text because the signer
+    must SEE what they sign; a sign action over hidden text is not a signature.
+    """
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    signable = (
+        (
+            await db.execute(
+                select(BucketRequestedDocument).where(
+                    BucketRequestedDocument.bucket_id == link.bucket_id,
+                    BucketRequestedDocument.requires_signature.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.services import document_signature as sig_service
+
+    rows = []
+    for r in signable:
+        text = r.signature_document_text or (
+            sig_service.credit_authorization_document_text()
+            if r.signature_kind == "credit_authorization"
+            else ""
+        )
+        rows.append(
+            RoomSignableRead(
+                id=r.id,
+                name=r.name,
+                kind=r.signature_kind,
+                signed=r.status == "uploaded",
+                document_text=text,
+                signable=bool(text),
+            )
+        )
+    return RoomFeaturesRead(
+        business_name=dealer.name,
+        bank_connect_available=plaid_client.enabled(),
+        plaid_environment=plaid_client.environment(),
+        signable=rows,
+    )
+
+
+@router.post(
+    "/public/room/{token}/sign",
+    response_model=RoomSignResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_room_sign(
+    token: str,
+    payload: RoomSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> RoomSignResult:
+    """PUBLIC. Sign one requires_signature item from the client's own room.
+
+    The signing engine is the intake flows' _sign_requested_document, imported
+    read-only rather than re-implemented: same hashes, same certificate, same
+    audit row, same email copy to the signer. Re-implementing a signature
+    pipeline is how two flows drift into producing different evidence for the
+    same legal act.
+
+    The engine needs only bucket_id and bucket_upload_link_id from its intake
+    argument, so the room's own link satisfies it via a shim. If the engine
+    ever grows a deeper dependency on the intake row, the shim fails loudly
+    with AttributeError rather than signing with wrong provenance.
+    """
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    from types import SimpleNamespace
+
+    from app.routers.dealer_ai_intake import (  # imported read-only
+        DealerDocumentSignRequest,
+        _sign_requested_document,
+    )
+
+    shim = SimpleNamespace(bucket_id=link.bucket_id, bucket_upload_link_id=link.id)
+    sign_payload = DealerDocumentSignRequest(
+        requested_document_id=payload.requested_document_id,
+        typed_name=payload.typed_name,
+        esign_consent=payload.esign_consent,
+        signature_data_url=payload.signature_data_url,
+    )
+    result_file = await _sign_requested_document(
+        db,
+        shim,  # type: ignore[arg-type] — duck-typed on the two fields the engine reads
+        sign_payload,
+        request,
+        actor_name=payload.typed_name,
+        actor_email=(link.recipient_email or dealer.email or ""),
+    )
+    await log_action(
+        db, dealer.id, None, "document.signed.client", "doc_request",
+        entity_id=payload.requested_document_id,
+        after={"signer": payload.typed_name, "via": "client_room", "file_id": str(result_file.id)},
+    )
+    await db.commit()
+    return RoomSignResult(
+        signed=True,
+        certificate_file_id=result_file.id,
+        message="Signed. A copy of the executed document has been emailed to you.",
+    )
 
 
 @router.post("/public/room/{token}/plaid/link-token", response_model=PlaidLinkTokenRead)

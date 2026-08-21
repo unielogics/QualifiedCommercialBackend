@@ -1758,7 +1758,12 @@ async def admin_upload_complete(
     file.status = "uploaded"
     if file.requested_document_id:
         req = await db.get(BucketRequestedDocument, file.requested_document_id)
-        if req:
+        # A requires_signature item is satisfied by SIGNING, which produces its
+        # certificate through the sign flow — never by an arbitrary upload.
+        # Without this check a client could attach any file and the desk would
+        # see the signature request as fulfilled with no signature, no hashes
+        # and no certificate on record.
+        if req and not req.requires_signature:
             req.status = "uploaded"
     if payload.note:
         db.add(
