@@ -62,6 +62,7 @@ from app.services.bucket_ai import CHAT_TURN_ORDER, CURRENT_FILE_ANALYSIS_VERSIO
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
+from app.services.main_street_programs import TERM_3_5_MIN_DSCR, TERM_3_5_MIN_REVENUE, TERM_10YR_MIN_DSCR
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
 from app.services.payment_authorization import primary_super_admin
@@ -1597,13 +1598,35 @@ _JUMBO_MIN_DSCR = 1.25
 # screen, not a field-completeness form. Every threshold here is a
 # provisional screening cutoff pending lending-desk sign-off, same status as
 # the reinsurance/jumbo constants above when they were first added.
+#
+# The term-band numbers are aliased from the Main Street module rather than
+# restated. They were copied here once and then drifted: when the lender's sheet
+# was reconciled, Main Street moved and this file did not, so the same business
+# could screen differently depending on which funnel it arrived through. Binding
+# to the source makes that particular drift impossible.
+#
+# The predicate *shapes* still differ — the dealer screen has no minimum-profile,
+# FICO or time-in-business gate — and unifying those means refactoring this
+# router, which is a separate job.
+_TERM_3_5_MIN_REVENUE = TERM_3_5_MIN_REVENUE
+_TERM_3_5_MIN_DSCR = TERM_3_5_MIN_DSCR
+_TERM_10YR_MIN_DSCR = TERM_10YR_MIN_DSCR
+
 _LOC_MIN_REVENUE = 100_000
-_TERM_3_5_MIN_REVENUE = 150_000
-_TERM_3_5_MIN_DSCR = 1.0
 _TERM_HYBRID_MIN_REVENUE = 200_000
 _TERM_HYBRID_MIN_DSCR = 1.1
+
+# KNOWN DIVERGENCE, deliberately not reconciled here. On the Main Street sheet
+# the 10-year band has no revenue minimum at all — what bounds it is a cap of
+# 50% of annualized sales, so revenue sizes the loan instead of gating it. That
+# rule needs a requested amount to mean anything, and applying it on this path
+# would change which programs dealer files surface, which is a desk decision
+# rather than a cleanup. Until then this keeps its own revenue proxy.
+#
+# Worth knowing when that decision gets made: the real program excludes auto,
+# RV and boat dealerships outright, so on a dealer file it is very likely the
+# honest answer is "not eligible" rather than a different threshold.
 _TERM_10YR_MIN_REVENUE = 300_000
-_TERM_10YR_MIN_DSCR = 1.15
 _MERCHANT_PROCESSING_MIN_ANNUALIZED_DEPOSITS = 120_000
 _FACTORING_MIN_REVENUE = 100_000
 _DEBT_CONSULTING_MAX_DSCR = 1.0

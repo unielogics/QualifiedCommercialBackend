@@ -44,6 +44,9 @@ __all__ = [
     "documents_for",
     "MAIN_STREET_PROGRAM_LABELS",
     "BORROWER_SUGGESTABLE_PROGRAMS",
+    "TERM_3_5_MIN_REVENUE",
+    "TERM_3_5_MIN_DSCR",
+    "TERM_10YR_MIN_DSCR",
     "compute_main_street_program_fit",
     "borrower_safe_programs",
 ]
@@ -392,8 +395,16 @@ def documents_for(intent: Any, industry: Any = None) -> list[dict[str, Any]]:
 # Minimum profile. Mirrors ELIGIBILITY_RULE in QCWeb/src/lib/programs.ts, which
 # is what the marketing site publishes. Every borrower-facing program is gated
 # on all three.
+#
+# The revenue figure is the floor to be screened at all — the lowest number any
+# single program accepts — not a house standard. EZ Term funds from $50K of
+# annual revenue, so screening everyone at $100K was declining files the lender
+# would have funded. A program that needs more than the floor states its own
+# minimum below; equipment and the SBA rows carry explicit ones for exactly that
+# reason rather than leaning on this number, because lowering a shared floor
+# silently loosens every program that was quietly relying on it.
 _MS_MIN_YEARS_IN_BUSINESS = 1.0
-_MS_MIN_ANNUAL_REVENUE = 100_000
+_MS_MIN_ANNUAL_REVENUE = 50_000
 _MS_MIN_FICO = 640
 
 # Evidence minimums, counted from per-file facts rather than model claims.
@@ -404,19 +415,55 @@ _MS_LOC_MIN_REVENUE = 100_000
 _MS_LOC_MIN_BANK_MONTHS = 3  # a line screens on deposits alone — lighter doc bar
 _MS_LOC_MAX_NSF_COUNT = 3  # six-month aggregate
 
-_MS_TERM_3_5_MIN_REVENUE = 150_000
+# ── The two term bands ──
+# Both are screened against the lender's published program sheet rather than a
+# house rule, and both ask for more than the minimum profile does: 660 FICO and
+# two filed years, where the floor is 640 and one year. A file can clear the
+# floor and still miss the program, which is the point of stating these
+# per-program instead of raising the floor for everyone.
+_MS_TERM_MIN_FICO = 660
+_MS_TERM_MIN_TIB = 2.0
+
+# EZ Term — $25K to $500K over 3-5 years, fixed, working capital or refinance.
+_MS_TERM_3_5_MIN_REVENUE = 50_000
 _MS_TERM_3_5_MIN_DSCR = 1.00
-_MS_TERM_10YR_MIN_REVENUE = 300_000
-_MS_TERM_10YR_MIN_DSCR = 1.15
-_MS_TERM_10YR_MIN_TIB = 2.0
+_MS_TERM_3_5_MIN_REQUEST = 25_000
+_MS_TERM_3_5_MAX_REQUEST = 500_000
+
+# MicroCap — $15K to $50K over 10 years, SBA-backed, working capital only.
+# It publishes no revenue minimum: what bounds the deal is the loan-to-revenue
+# cap, so revenue sizes the loan rather than gating the program. A business at
+# $60K of sales is eligible, just not for more than $30K.
+_MS_TERM_10YR_MIN_DSCR = 1.10
+_MS_TERM_10YR_MIN_REQUEST = 15_000
+_MS_TERM_10YR_MAX_REQUEST = 50_000
+_MS_TERM_10YR_LTR_CAP = 0.50
+_MS_TERM_10YR_MAX_NSF_COUNT = 2
+_MS_TERM_10YR_EXCLUDED_INDUSTRIES = frozenset(
+    {"trucking_logistics", "restaurant_food_service"}
+)
+
 _MS_HYBRID_MIN_REVENUE = 200_000
 _MS_HYBRID_MIN_DSCR = 1.10
+
+# Public because another module screens against them. The dealer path in
+# app/routers/dealer_ai_intake.py used to restate these numbers and drifted from
+# them, so the same file could screen differently depending on which funnel it
+# arrived through. Everything else above is this module's own working constant
+# and stays private; these three are the contract.
+TERM_3_5_MIN_REVENUE = _MS_TERM_3_5_MIN_REVENUE
+TERM_3_5_MIN_DSCR = _MS_TERM_3_5_MIN_DSCR
+TERM_10YR_MIN_DSCR = _MS_TERM_10YR_MIN_DSCR
 
 _MS_JUMBO_MIN_REVENUE = 5_000_000
 _MS_JUMBO_MIN_DSCR = 1.25
 _MS_JUMBO_MIN_REQUEST = 1_000_000  # below this it is a term loan, not a jumbo
 
 _MS_EQUIPMENT_MIN_CASH_FLOW = 0  # must clear zero
+# Stated rather than inherited: this program used to be gated by the shared
+# revenue floor, so when that floor dropped to $50K this number is what keeps
+# its screen where it has always been.
+_MS_EQUIPMENT_MIN_REVENUE = 100_000
 
 _MS_MERCHANT_MIN_VOLUME = 120_000  # annualized card volume
 
@@ -425,6 +472,9 @@ _MS_FACTORING_MIN_RECEIVABLES = 50_000
 
 _MS_SBA_MIN_TIB = 2.0  # SBA wants two filed years
 _MS_SBA_MIN_DSCR = 1.15
+# As with equipment above: previously inherited from the shared revenue floor,
+# now stated so the floor can drop without loosening the SBA rows.
+_MS_SBA_MIN_REVENUE = 100_000
 
 _MS_DEBT_CONSULTING_MAX_DSCR = 1.00
 
@@ -438,8 +488,12 @@ _MS_SBA_GROCERY_INDUSTRIES = frozenset({"grocery_commodities", "restaurant_food_
 MAIN_STREET_PROGRAM_LABELS: dict[str, str] = {
     # Borrower-facing, mapped 1:1 to the Main Street programs on the marketing site.
     "line_of_credit": "Lines of Credit",
-    "term_loan_3_5_year": "Term Loans",
-    "term_loan_10_year": "Term Loans",
+    # The two term bands are distinct products with their own pages, amounts and
+    # pricing, so they carry their own names. These are the public marketing
+    # names and deliberately do not name the funding partner — the lender's own
+    # brand stays out of borrower-facing copy, as it does everywhere else.
+    "term_loan_3_5_year": "EZ Term Loan",
+    "term_loan_10_year": "MicroCap Working Capital",
     "term_loan_loc_hybrid": "Hybrid Term / LOC",
     "equipment_financing": "Equipment Financing",
     "jumbo_term_loan": "Jumbo Term Loan",
@@ -473,14 +527,32 @@ BORROWER_SUGGESTABLE_PROGRAMS = frozenset(
     }
 )
 
+# Programs that compete for the same slot on a borrower's card list. Both term
+# bands can be genuinely eligible at once, but showing both asks a borrower to
+# pick a term structure before anyone has read the file, and it spends two of
+# the three available cards on one answer. First eligible wins.
+#
+# This was previously a dedupe on label text, which worked only while both bands
+# were literally called "Term Loans". Grouping by key is what makes the rename
+# to distinct product names safe.
+_MUTUALLY_EXCLUSIVE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"term_loan_3_5_year", "term_loan_10_year"}),
+)
+
 # Hand-written, never model-authored. The assistant relays these verbatim rather
 # than composing its own rationale, which removes the largest hallucination
 # surface in the whole feature. Each names the evidence, not an outcome — no
 # "you qualify", no rate, no amount.
 _WHY_TEMPLATES: dict[str, str] = {
     "line_of_credit": "Your deposit activity supports a revolving line you can draw on as needed.",
-    "term_loan_3_5_year": "Filed returns and current cash flow support a fixed monthly payment.",
-    "term_loan_10_year": "Two or more filed years and steady coverage support a longer amortization.",
+    "term_loan_3_5_year": (
+        "Your statements and stated use of funds support a fixed monthly payment "
+        "on a three-to-five year term."
+    ),
+    "term_loan_10_year": (
+        "Steady coverage and two filed years support a ten-year amortization, "
+        "which keeps the monthly payment low."
+    ),
     "term_loan_loc_hybrid": (
         "Your file supports both a fixed piece and a revolving piece, which suits a known "
         "need plus a variable one."
@@ -517,6 +589,17 @@ def _meets(value: Any, threshold: float) -> bool:
 def _clears(value: Any, threshold: float) -> bool:
     n = _num(value)
     return n is not None and n > threshold
+
+
+def _within(value: Any, low: float, high: float) -> bool:
+    """An amount inside a program's published range.
+
+    Unknown passes. A file that has not named a number yet is not disqualified
+    by one — the same call the NSF screen makes, and the reason a fresh intake
+    still sees the programs it could reach once an amount exists.
+    """
+    n = _num(value)
+    return n is None or low <= n <= high
 
 
 def _uploaded_names(documents: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -640,14 +723,26 @@ def compute_main_street_program_fit(
     if tax_years < _MS_MIN_TAX_YEARS:
         evidence_needs.append("Two years of business tax returns")
 
+    # Programs that need more revenue than the shared floor now say so out loud.
+    # While the floor sat at $100K these reasons were produced by the minimum
+    # profile; with the floor at $50K a file between the two would otherwise come
+    # back ineligible with nothing to explain it.
+    def _revenue_blocker(minimum: float) -> list[str]:
+        if _meets(revenue, minimum):
+            return []
+        return ["annual revenue below the program minimum"]
+
     line_of_credit = program(
         _meets(revenue, _MS_LOC_MIN_REVENUE)
         and bank_months >= _MS_LOC_MIN_BANK_MONTHS
         and (nsf_count is None or nsf_count <= _MS_LOC_MAX_NSF_COUNT),
         blocked=(
-            []
-            if nsf_count is None or nsf_count <= _MS_LOC_MAX_NSF_COUNT
-            else ["overdraft activity above screen"]
+            _revenue_blocker(_MS_LOC_MIN_REVENUE)
+            + (
+                []
+                if nsf_count is None or nsf_count <= _MS_LOC_MAX_NSF_COUNT
+                else ["overdraft activity above screen"]
+            )
         ),
         needs=(
             []
@@ -658,17 +753,48 @@ def compute_main_street_program_fit(
         bank_months=bank_months,
     )
 
+    # Both term bands ask for 660 and two filed years on top of the minimum
+    # profile. Reasons go in `blocked` rather than into the eligibility
+    # expression so a rep can see which line the file missed instead of a bare
+    # "no" — the same reason the line of credit reports its overdraft screen.
+    term_credit_blocked: list[str] = []
+    if not _meets(fico, _MS_TERM_MIN_FICO):
+        term_credit_blocked.append("credit score below the program minimum")
+    if not _meets(tib, _MS_TERM_MIN_TIB):
+        term_credit_blocked.append("time in business below the program minimum")
+
+    term_3_5_blocked = list(term_credit_blocked)
+    if not _within(requested, _MS_TERM_3_5_MIN_REQUEST, _MS_TERM_3_5_MAX_REQUEST):
+        term_3_5_blocked.append("requested amount outside the program range")
+
     term_loan_3_5_year = program(
         _meets(revenue, _MS_TERM_3_5_MIN_REVENUE) and _meets(dscr, _MS_TERM_3_5_MIN_DSCR),
+        blocked=_revenue_blocker(_MS_TERM_3_5_MIN_REVENUE) + term_3_5_blocked,
         needs=evidence_needs,
         revenue=revenue,
         dscr=dscr,
     )
 
+    # The 10-year band screens on coverage, not revenue: the loan-to-revenue cap
+    # below is what revenue actually controls. Its bank and sector screens are
+    # the lender's own, and stricter than the line's.
+    term_10yr_blocked = list(term_credit_blocked)
+    if not _within(requested, _MS_TERM_10YR_MIN_REQUEST, _MS_TERM_10YR_MAX_REQUEST):
+        term_10yr_blocked.append("requested amount outside the program range")
+    if (
+        requested is not None
+        and revenue is not None
+        and requested > revenue * _MS_TERM_10YR_LTR_CAP
+    ):
+        term_10yr_blocked.append("requested amount above the loan-to-revenue cap")
+    if nsf_count is not None and nsf_count > _MS_TERM_10YR_MAX_NSF_COUNT:
+        term_10yr_blocked.append("overdraft activity above screen")
+    if sector in _MS_TERM_10YR_EXCLUDED_INDUSTRIES:
+        term_10yr_blocked.append("sector not eligible")
+
     term_loan_10_year = program(
-        _meets(revenue, _MS_TERM_10YR_MIN_REVENUE)
-        and _meets(dscr, _MS_TERM_10YR_MIN_DSCR)
-        and _meets(tib, _MS_TERM_10YR_MIN_TIB),
+        _meets(dscr, _MS_TERM_10YR_MIN_DSCR),
+        blocked=term_10yr_blocked,
         needs=evidence_needs,
         revenue=revenue,
         dscr=dscr,
@@ -677,6 +803,7 @@ def compute_main_street_program_fit(
 
     term_loan_loc_hybrid = program(
         _meets(revenue, _MS_HYBRID_MIN_REVENUE) and _meets(dscr, _MS_HYBRID_MIN_DSCR),
+        blocked=_revenue_blocker(_MS_HYBRID_MIN_REVENUE),
         needs=evidence_needs,
         revenue=revenue,
         dscr=dscr,
@@ -686,6 +813,7 @@ def compute_main_street_program_fit(
         _meets(revenue, _MS_JUMBO_MIN_REVENUE)
         and _meets(dscr, _MS_JUMBO_MIN_DSCR)
         and _meets(requested, _MS_JUMBO_MIN_REQUEST),
+        blocked=_revenue_blocker(_MS_JUMBO_MIN_REVENUE),
         needs=evidence_needs,
         revenue=revenue,
         dscr=dscr,
@@ -695,8 +823,13 @@ def compute_main_street_program_fit(
     wants_equipment = bool(det.get("financing_equipment_or_vehicle")) or slug == "equipment"
     has_quote = _has(docs, "vendor quote") or _has(docs, "invoice")
     equipment_financing = program(
-        wants_equipment and _clears(cash_flow, _MS_EQUIPMENT_MIN_CASH_FLOW),
-        blocked=[] if wants_equipment else ["no equipment purchase stated"],
+        wants_equipment
+        and _clears(cash_flow, _MS_EQUIPMENT_MIN_CASH_FLOW)
+        and _meets(revenue, _MS_EQUIPMENT_MIN_REVENUE),
+        blocked=(
+            _revenue_blocker(_MS_EQUIPMENT_MIN_REVENUE)
+            + ([] if wants_equipment else ["no equipment purchase stated"])
+        ),
         needs=[] if has_quote else ["A vendor quote or invoice for the equipment"],
         cash_flow=cash_flow,
     )
@@ -705,7 +838,10 @@ def compute_main_street_program_fit(
     has_authority = _has(docs, "authority")
     transportation_finance = program(
         is_trucking and _meets(revenue, _MS_TRANSPORT_MIN_REVENUE),
-        blocked=[] if is_trucking else ["not a transportation file"],
+        blocked=(
+            _revenue_blocker(_MS_TRANSPORT_MIN_REVENUE)
+            + ([] if is_trucking else ["not a transportation file"])
+        ),
         needs=(
             []
             if has_authority
@@ -730,17 +866,32 @@ def compute_main_street_program_fit(
         sba_needs.append("Your business debt schedule")
 
     sba_core = (
-        _meets(tib, _MS_SBA_MIN_TIB) and _meets(dscr, _MS_SBA_MIN_DSCR) and sba_docs_complete
+        _meets(tib, _MS_SBA_MIN_TIB)
+        and _meets(dscr, _MS_SBA_MIN_DSCR)
+        and _meets(revenue, _MS_SBA_MIN_REVENUE)
+        and sba_docs_complete
     )
-    sba = program(sba_core, needs=sba_needs, dscr=dscr, years_in_business=tib)
+    sba = program(
+        sba_core,
+        blocked=_revenue_blocker(_MS_SBA_MIN_REVENUE),
+        needs=sba_needs,
+        dscr=dscr,
+        years_in_business=tib,
+    )
     sba_grocery = program(
         sba_core and sector in _MS_SBA_GROCERY_INDUSTRIES,
-        blocked=[] if sector in _MS_SBA_GROCERY_INDUSTRIES else ["sector not eligible"],
+        blocked=(
+            _revenue_blocker(_MS_SBA_MIN_REVENUE)
+            + ([] if sector in _MS_SBA_GROCERY_INDUSTRIES else ["sector not eligible"])
+        ),
         needs=sba_needs,
     )
     sba_made_in_america = program(
         sba_core and sector == "manufacturing",
-        blocked=[] if sector == "manufacturing" else ["sector not eligible"],
+        blocked=(
+            _revenue_blocker(_MS_SBA_MIN_REVENUE)
+            + ([] if sector == "manufacturing" else ["sector not eligible"])
+        ),
         needs=sba_needs,
     )
 
@@ -806,18 +957,19 @@ def borrower_safe_programs(
     """
     table = labels or MAIN_STREET_PROGRAM_LABELS
     out: list[dict[str, Any]] = []
-    seen_labels: set[str] = set()
+    seen_groups: set[frozenset[str]] = set()
 
     for key, row in (fit or {}).items():
         if key not in BORROWER_SUGGESTABLE_PROGRAMS or not isinstance(row, Mapping):
             continue
         if not row.get("eligible"):
             continue
+        group = next((g for g in _MUTUALLY_EXCLUSIVE_GROUPS if key in g), None)
+        if group is not None:
+            if group in seen_groups:
+                continue
+            seen_groups.add(group)
         label = table.get(key, key)
-        # The two term bands share a borrower-facing label; collapse to one card.
-        if label in seen_labels:
-            continue
-        seen_labels.add(label)
         out.append(
             {
                 "key": key,

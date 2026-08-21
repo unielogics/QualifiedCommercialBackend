@@ -384,9 +384,133 @@ def test_ineligible_programs_are_not_suggested():
 
 
 def test_the_two_term_bands_collapse_into_one_card():
-    safe = borrower_safe_programs(_fit())
-    labels = [row["label"] for row in safe]
+    """They are separate products with separate names, so the old dedupe on
+    label text would no longer catch them. The collapse is by key group now, and
+    this asserts the behaviour rather than the label coincidence that used to
+    imply it: a file eligible for both must still spend only one card on them."""
+    fit = _fit()
+    assert fit["term_loan_3_5_year"]["eligible"] is True
+    assert fit["term_loan_10_year"]["eligible"] is True
+
+    keys = [row["key"] for row in borrower_safe_programs(fit)]
+    assert keys.count("term_loan_3_5_year") + keys.count("term_loan_10_year") == 1
+
+    labels = [row["label"] for row in borrower_safe_programs(fit)]
     assert len(labels) == len(set(labels))
+
+
+def test_the_two_term_bands_are_named_separately():
+    """A shared label was what let the old collapse work; if these ever merge
+    again the test above stops proving anything."""
+    assert (
+        MAIN_STREET_PROGRAM_LABELS["term_loan_3_5_year"]
+        != MAIN_STREET_PROGRAM_LABELS["term_loan_10_year"]
+    )
+
+
+# ── program boundaries: the lender's published sheet ─────────────────────────
+
+
+@pytest.mark.parametrize("fico,eligible", [(659, False), (660, True)])
+def test_term_bands_require_660_where_the_house_floor_is_640(fico, eligible):
+    """The per-program FICO minimum must bite without dragging the shared floor
+    up with it — a 650 file still reaches a line of credit."""
+    fit = _fit(details={**STRONG_DETAILS, "estimated_credit_score": fico})
+    assert fit["term_loan_3_5_year"]["eligible"] is eligible
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+    assert fit["line_of_credit"]["eligible"] is True
+
+
+@pytest.mark.parametrize("tib,eligible", [(1.99, False), (2.0, True)])
+def test_term_bands_require_two_filed_years(tib, eligible):
+    fit = _fit(details={**STRONG_DETAILS, "years_in_business": tib})
+    assert fit["term_loan_3_5_year"]["eligible"] is eligible
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+
+
+@pytest.mark.parametrize("dscr,eligible", [(1.09, False), (1.10, True)])
+def test_ten_year_band_screens_coverage_at_one_point_one(dscr, eligible):
+    fit = _fit(key_metrics={**STRONG_METRICS, "estimated_dscr": dscr})
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+
+
+@pytest.mark.parametrize("revenue,eligible", [(49_999, False), (50_000, True)])
+def test_ez_term_funds_from_fifty_thousand_of_revenue(revenue, eligible):
+    """The old screen sat at $150K and the house floor at $100K, so a $60K file
+    saw nothing at all. Revenue this low still reaches the 3-5 year band."""
+    fit = _fit(key_metrics={**STRONG_METRICS, "ytd_annualized_revenue": revenue})
+    assert fit["term_loan_3_5_year"]["eligible"] is eligible
+
+
+def test_lowering_the_floor_did_not_loosen_the_programs_that_leaned_on_it():
+    """Equipment, transportation and the SBA rows had no revenue test of their
+    own and were gated entirely by the shared floor. At $60K they must still be
+    ineligible, and must say why."""
+    fit = _fit(
+        key_metrics={**STRONG_METRICS, "ytd_annualized_revenue": 60_000},
+        details={**STRONG_DETAILS, "financing_equipment_or_vehicle": True},
+        industry="trucking_logistics",
+    )
+    for key in ("equipment_financing", "transportation_finance", "sba", "sba_grocery"):
+        assert fit[key]["eligible"] is False, key
+        assert any("annual revenue" in b for b in fit[key]["blocked_by"]), key
+
+
+@pytest.mark.parametrize(
+    "requested,eligible",
+    [(24_999, False), (25_000, True), (500_000, True), (500_001, False)],
+)
+def test_ez_term_publishes_an_amount_band(requested, eligible):
+    fit = _fit(key_metrics={**STRONG_METRICS, "requested_amount": requested})
+    assert fit["term_loan_3_5_year"]["eligible"] is eligible
+
+
+@pytest.mark.parametrize(
+    "requested,eligible",
+    [(14_999, False), (15_000, True), (50_000, True), (50_001, False)],
+)
+def test_microcap_publishes_an_amount_band(requested, eligible):
+    fit = _fit(key_metrics={**STRONG_METRICS, "requested_amount": requested})
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+
+
+def test_an_unnamed_amount_does_not_disqualify():
+    """A fresh intake has not stated a number yet. It must still see the
+    programs it could reach, the same call the NSF screen makes."""
+    metrics = {k: v for k, v in STRONG_METRICS.items() if k != "requested_amount"}
+    fit = _fit(key_metrics=metrics)
+    assert fit["term_loan_3_5_year"]["eligible"] is True
+    assert fit["term_loan_10_year"]["eligible"] is True
+
+
+@pytest.mark.parametrize("requested,eligible", [(50_000, True), (50_001, False)])
+def test_microcap_caps_the_loan_at_half_of_revenue(requested, eligible):
+    """Revenue sizes this loan rather than gating it: at $100K of sales the cap
+    is $50K, and a dollar more is outside the program."""
+    fit = _fit(
+        key_metrics={
+            **STRONG_METRICS,
+            "ytd_annualized_revenue": 100_000,
+            "requested_amount": requested,
+        }
+    )
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+
+
+@pytest.mark.parametrize("nsf,eligible", [(2, True), (3, False)])
+def test_microcap_screens_overdrafts_tighter_than_the_line(nsf, eligible):
+    fit = _fit(key_metrics={**STRONG_METRICS, "nsf_or_overdraft_count": nsf})
+    assert fit["term_loan_10_year"]["eligible"] is eligible
+    assert fit["line_of_credit"]["eligible"] is True
+
+
+@pytest.mark.parametrize("sector", ["trucking_logistics", "restaurant_food_service"])
+def test_microcap_excludes_sectors_the_sba_sheet_excludes(sector):
+    fit = _fit(industry=sector)
+    assert fit["term_loan_10_year"]["eligible"] is False
+    assert any("sector" in b for b in fit["term_loan_10_year"]["blocked_by"])
+    # The 3-5 year band has no such restriction.
+    assert fit["term_loan_3_5_year"]["eligible"] is True
 
 
 def test_never_more_than_three_suggestions():
