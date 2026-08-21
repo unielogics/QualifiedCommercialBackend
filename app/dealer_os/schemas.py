@@ -536,6 +536,29 @@ class ContractTemplateRead(ORM):
     s3_key: str | None = None
 
 
+class ContractDocRead(ORM):
+    id: UUID
+    template_key: str
+    template_revision: int | None = None
+    status: str
+    field_values: dict | None = None
+    filled_sha256: str | None = None
+    signed_at: datetime | None = None
+    signer_name: str | None = None
+    updated_at: datetime
+
+
+class ContractGenerateResult(BaseModel):
+    status: str
+    placed: dict[str, str] = {}
+    # Case data the fill wanted and could not find — the rep's checklist.
+    missing_data: list[str] = []
+    # Overlay anchors that failed to locate — a template problem, not a rep one.
+    overlay_problems: list[str] = []
+    sha256: str
+    download_url: str | None = None
+
+
 class ContractTemplateMapPatch(BaseModel):
     field_map: dict[str, str] = Field(default_factory=dict)
 

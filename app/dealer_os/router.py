@@ -50,6 +50,7 @@ from .deps import (
 from .models import (
     DealerRepLead,
     ContractTemplate,
+    ContractDocument,
     DealerSmsConsent,
     DealerAIMessage,
     MESSAGE_CHANNELS,
@@ -114,6 +115,8 @@ from .schemas import (
     RoomSignableRead,
     RoomSignRequest,
     RoomSignResult,
+    ContractDocRead,
+    ContractGenerateResult,
     ContractTemplateMapPatch,
     ContractTemplateRead,
     DeliveryRowRead,
@@ -267,7 +270,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, contract_registry, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import balance_health, client_room, consent_delivery, contract_fill, contract_registry, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -672,6 +675,94 @@ async def send_signature_request(
         texted=delivery.sms_ok,
         detail=delivery.detail,
     )
+
+
+@router.get("/dealers/{dealer_id}/contracts", response_model=list[ContractDocRead])
+async def list_case_contracts(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ContractDocRead]:
+    """The case's copies of the package: what has been generated, what is
+    still draft, what is out for signature or executed."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = (
+        (
+            await db.execute(
+                select(ContractDocument)
+                .where(ContractDocument.dealer_id == dealer.id)
+                .order_by(ContractDocument.template_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [ContractDocRead.model_validate(r) for r in rows]
+
+
+@router.post(
+    "/dealers/{dealer_id}/contracts/{key}/generate",
+    response_model=ContractGenerateResult,
+)
+async def generate_case_contract(
+    dealer_id: UUID, key: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ContractGenerateResult:
+    """Prepopulate one agreement from what the case has collected.
+
+    Values come from steps 1-4 (client entity, principal, the 3% commission,
+    the use-of-funds sentence) and the rep on the case goes on the consultant
+    line — the rep is who signs at the bottom. Anything the case does not yet
+    know is NAMED as missing rather than defaulted: a blank on a legal
+    document must be a decision, not an accident."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        doc, result, missing = await contract_fill.generate(db, dealer, key)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await log_action(
+        db, dealer.id, user, "contract.generate", "contract_document",
+        entity_id=doc.id,
+        after={"template": key, "sha256": result.sha256[:16],
+               "placed": len(result.placed), "missing": missing},
+    )
+    await db.commit()
+    from app.services.payment_authorization import presign_private_s3_object
+
+    return ContractGenerateResult(
+        status=doc.status,
+        placed=result.placed,
+        missing_data=missing,
+        overlay_problems=result.missing,
+        sha256=result.sha256,
+        download_url=presign_private_s3_object(doc.filled_s3_key, ttl_seconds=900),
+    )
+
+
+@router.get("/dealers/{dealer_id}/contracts/{key}/url")
+async def case_contract_url(
+    dealer_id: UUID, key: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """A short-lived link to the latest filled copy, for preview."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    doc = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.dealer_id == dealer.id,
+                ContractDocument.template_key == key,
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None or not doc.filled_s3_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No generated copy yet.")
+    from app.services.payment_authorization import presign_private_s3_object
+
+    url = presign_private_s3_object(doc.filled_s3_key, ttl_seconds=900)
+    if not url:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not sign a download link.")
+    return {"url": url, "sha256": doc.filled_sha256, "status": doc.status}
 
 
 @router.get("/contract-templates", response_model=list[ContractTemplateRead])
