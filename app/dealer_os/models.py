@@ -892,6 +892,49 @@ class DealerSmsConsent(TimestampMixin, Base):
     revoked_reason: Mapped[str | None] = mapped_column(String(120))
 
 
+class DealerBankConsent(TimestampMixin, Base):
+    """Proof that a person authorised connecting a bank account (0137).
+
+    Sibling of DealerSmsConsent, not a reuse of it: SMS consent belongs to a
+    NUMBER, a bank authorisation belongs to the business whose account is being
+    connected. Same proof columns, different subject.
+
+    The row is never mutated into nothing — a withdrawal sets revoked_at so the
+    history reads "they consented, then withdrew", which is what an audit needs.
+    """
+
+    __tablename__ = "dos_bank_consent"
+    __table_args__ = (
+        # The gate asks one question per link-token request: is there a live
+        # consent for this dealer? Newest first.
+        Index("ix_dos_bank_consent_dealer", "dealer_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    granted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    method: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    # What they actually saw, and proof of it.
+    disclosure_version: Mapped[str] = mapped_column(String(24), nullable=False)
+    disclosure_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    disclosure_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Who was in the room, and from where.
+    captured_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    captured_by_name: Mapped[str | None] = mapped_column(String(120))
+    consenter_name: Mapped[str | None] = mapped_column(String(160))
+    ip_address: Mapped[str | None] = mapped_column(String(64))
+    user_agent: Mapped[str | None] = mapped_column(String(400))
+
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_reason: Mapped[str | None] = mapped_column(String(120))
+
+
 # --- file conversation channels (0132) ---------------------------------------
 
 # desk   the working conversation between rep, underwriter and super admin

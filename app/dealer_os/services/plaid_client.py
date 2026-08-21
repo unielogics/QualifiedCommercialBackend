@@ -9,6 +9,7 @@ Settings class, per the isolation contract):
     DEALER_OS_PLAID_SECRET
     DEALER_OS_PLAID_ENV           sandbox | production   (default sandbox)
     DEALER_OS_PLAID_REDIRECT_URI  OAuth return URL       (optional, see below)
+    DEALER_OS_PLAID_WEBHOOK_URL   Inbound webhook URL    (optional, see below)
 
 When the keys are absent every entrypoint raises PlaidUnavailable — the API
 layer turns that into {enabled: false}, never a 500.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import logging
 import os
 from datetime import date, timedelta
@@ -66,6 +68,23 @@ def redirect_uri() -> str:
     routing.
     """
     return _env("DEALER_OS_PLAID_REDIRECT_URI")
+
+
+def webhook_url() -> str:
+    """Where Plaid should POST item events, or "" when not configured.
+
+    Without this we only learn an Item is broken by trying to use it, which on a
+    30-day refresh cadence means up to a month of silence. Worse, the two events
+    that matter most are ones we can never discover by polling: the user
+    revoking access at my.plaid.com, and Plaid scheduling a disconnect. Our
+    privacy policy points users at those controls, so honouring them is a
+    commitment, not a nicety.
+
+    Unlike redirect_uri this needs no prior dashboard registration — it is sent
+    per link token — but it is still env-gated so it can be turned on
+    deliberately, and so a half-deployed receiver never gets traffic.
+    """
+    return _env("DEALER_OS_PLAID_WEBHOOK_URL")
 
 
 def _env(name: str) -> str:
@@ -129,6 +148,7 @@ async def create_link_token(*, dealer_id: str, dealer_name: str) -> str:
             # Only present once the URI is registered with Plaid — see
             # redirect_uri() for why sending it early is worse than omitting it.
             **({"redirect_uri": redirect_uri()} if redirect_uri() else {}),
+            **({"webhook": webhook_url()} if webhook_url() else {}),
         },
     )
     token = resp.json().get("link_token")
@@ -236,3 +256,96 @@ def decrypt_token(ciphertext: str | None) -> str | None:
         return _fernet().decrypt(ciphertext.encode()).decode()
     except (InvalidToken, Exception):  # key rotation / corruption — treat as absent
         return None
+
+
+# ── Webhook verification ────────────────────────────────────────────────────
+#
+# A webhook endpoint is unauthenticated by definition: Plaid has to be able to
+# reach it. The only identifier in the body is item_id, so without verification
+# anyone who learned an item_id could tell us a connection was revoked, or
+# trigger syncs at will. Plaid signs every webhook with an ES256 JWT in the
+# Plaid-Verification header, and that signature is what makes the endpoint safe.
+#
+# Three things are checked, and all three matter:
+#   1. the JWT signature, against a key fetched from Plaid by its key id;
+#   2. the issued-at time, so a captured webhook cannot be replayed later;
+#   3. the SHA-256 of the RAW request body against the JWT's claim, which is
+#      what stops a valid signature being reused with a swapped body.
+
+WEBHOOK_MAX_AGE_SECONDS = 300  # Plaid's own guidance
+
+_key_cache: dict[str, Any] = {}
+
+
+async def _verification_key(key_id: str) -> Any:
+    """The public KEY for a key id, cached.
+
+    Returns a key object rather than the raw JWK: the caller is verifying a
+    signature and should not have to know how Plaid packages its keys. It is
+    also the seam tests substitute, which keeps them from monkeypatching the
+    jwt module globally — `jwt.PyJWK` resolves lazily, so patching it works or
+    fails depending on import order elsewhere in the suite.
+    """
+    from jwt import PyJWK
+
+    if key_id in _key_cache:
+        return _key_cache[key_id]
+    resp = await _post("/webhook_verification_key/get", {"key_id": key_id})
+    jwk = resp.json().get("key")
+    if not isinstance(jwk, dict):
+        raise PlaidUnavailable("Plaid returned no verification key")
+    key = PyJWK.from_dict(jwk).key
+    _key_cache[key_id] = key
+    return key
+
+
+async def verify_webhook(raw_body: bytes, verification_header: str) -> bool:
+    """True only if this really came from Plaid, unmodified and recent."""
+    import time
+
+    import jwt
+
+    if not verification_header:
+        return False
+    try:
+        header = jwt.get_unverified_header(verification_header)
+    except Exception:  # noqa: BLE001 - malformed token is simply not verified
+        logger.warning("plaid webhook: unparseable verification header")
+        return False
+
+    # Algorithm is pinned. Accepting whatever the token declares is the classic
+    # JWT downgrade hole ("alg": "none", or HS256 signed with the public key).
+    if header.get("alg") != "ES256":
+        logger.warning("plaid webhook: unexpected alg %r", header.get("alg"))
+        return False
+    key_id = header.get("kid")
+    if not key_id:
+        return False
+
+    try:
+        key = await _verification_key(str(key_id))
+        claims = jwt.decode(
+            verification_header,
+            key=key,
+            algorithms=["ES256"],
+            options={"verify_aud": False},
+        )
+    except PlaidUnavailable:
+        raise
+    except Exception:  # noqa: BLE001 - any signature failure is a rejection
+        logger.warning("plaid webhook: signature did not verify")
+        return False
+
+    issued = claims.get("iat")
+    if not isinstance(issued, (int, float)) or time.time() - issued > WEBHOOK_MAX_AGE_SECONDS:
+        logger.warning("plaid webhook: stale or missing iat — possible replay")
+        return False
+
+    expected = claims.get("request_body_sha256")
+    actual = hashlib.sha256(raw_body).hexdigest()
+    # Constant-time: this is a secret comparison, not a string comparison.
+    if not isinstance(expected, str) or not hmac.compare_digest(expected, actual):
+        logger.warning("plaid webhook: body hash mismatch — body was altered")
+        return False
+
+    return True

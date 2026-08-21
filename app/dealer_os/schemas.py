@@ -983,6 +983,11 @@ class RoomFeaturesRead(BaseModel):
     business_name: str
     bank_connect_available: bool = False
     plaid_environment: str = ""
+    # The room needs the authorization wording BEFORE the connect button does
+    # anything, because the link-token endpoint refuses without a recorded
+    # consent. Shipping the gate without this would break the client room.
+    bank_consent_granted: bool = False
+    bank_consent_disclosure: str = ""
     signable: list[RoomSignableRead] = []
 
 
@@ -1346,10 +1351,40 @@ class PlaidItemPatch(BaseModel):
     auto_refresh: bool
 
 
+class BankConsentState(BaseModel):
+    """Whether this file may connect a bank, and the words it must show first."""
+
+    granted: bool = False
+    version: str | None = None
+    at: datetime | None = None
+    consenter_name: str | None = None
+    # The exact wording to render. Server-owned: the client renders it and
+    # sends back only the fact of agreement, never the text.
+    disclosure_version: str = ""
+    disclosure_text: str = ""
+
+
+class BankConsentGrant(BaseModel):
+    """What a client sends to agree. Note what is ABSENT: the disclosure text.
+
+    The server stores the wording it served. Accepting text here would let a
+    caller store a consent to wording of their own choosing, which is exactly
+    the proof this record exists to provide.
+    """
+
+    consenter_name: str | None = Field(default=None, max_length=160)
+    method: str = Field(default="self_web", max_length=24)
+
+
+class RoomBankConsentGrant(BankConsentGrant):
+    passcode: str = Field(min_length=1, max_length=64)
+
+
 class PlaidStateRead(BaseModel):
     enabled: bool = False
     environment: str = "sandbox"
     items: list[PlaidItemRead] = []
+    consent: BankConsentState = BankConsentState()
 
 
 class PlaidLinkTokenRead(BaseModel):

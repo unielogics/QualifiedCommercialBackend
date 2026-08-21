@@ -9,12 +9,25 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
-jwt_stub = ModuleType("jwt")
-jwt_stub.algorithms = SimpleNamespace(RSAAlgorithm=SimpleNamespace(from_jwk=lambda *_args, **_kwargs: None))
-jwt_stub.PyJWTError = Exception
-jwt_stub.get_unverified_header = lambda *_args, **_kwargs: {}
-jwt_stub.decode = lambda *_args, **_kwargs: {}
-sys.modules.setdefault("jwt", jwt_stub)
+# Stand in for PyJWT only when it is genuinely absent.
+#
+# This was an unconditional sys.modules.setdefault, which meant that whenever
+# this module happened to be collected before a test needing the REAL jwt, that
+# test silently received a stub carrying four functions. Whether it broke was
+# decided by collection order, which is the worst kind of test failure: it looks
+# like a bug in whatever ran second. PyJWT is a real dependency, so the stub is
+# now a fallback rather than a fixture.
+try:  # pragma: no cover - depends on what is installed
+    import jwt  # noqa: F401
+except ImportError:  # pragma: no cover
+    jwt_stub = ModuleType("jwt")
+    jwt_stub.algorithms = SimpleNamespace(
+        RSAAlgorithm=SimpleNamespace(from_jwk=lambda *_args, **_kwargs: None)
+    )
+    jwt_stub.PyJWTError = Exception
+    jwt_stub.get_unverified_header = lambda *_args, **_kwargs: {}
+    jwt_stub.decode = lambda *_args, **_kwargs: {}
+    sys.modules["jwt"] = jwt_stub
 
 activity_log_stub = ModuleType("app.services.activity_log")
 

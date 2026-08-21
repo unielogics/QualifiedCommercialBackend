@@ -1,6 +1,11 @@
 """Inbound webhooks.
 
-Currently a single receiver — the Gmail Pub/Sub push endpoint.
+Two receivers, secured differently because their senders differ:
+
+POST /webhooks/plaid
+  Plaid item + statement events. Plaid signs every webhook with an ES256 JWT,
+  so this one is verified cryptographically rather than by a URL secret — see
+  dealer_os/services/plaid_client.verify_webhook. It fails closed.
 
 POST /webhooks/gmail?token=<secret>
   A Google Cloud Pub/Sub push subscription delivers a notification
@@ -294,3 +299,56 @@ async def stripe_webhook(request: Request) -> dict[str, bool]:
 
     log.info("stripe webhook: handled event_id=%s type=%s", event_id, event_type)
     return {"received": True}
+
+
+# ── Plaid ───────────────────────────────────────────────────────────────────
+
+
+@router.post("/plaid")
+async def plaid_webhook(request: Request) -> Response:
+    """Plaid item and statement events.
+
+    Verified by signature, not by a URL secret. The body carries an item_id and
+    nothing else identifying, so an unverified endpoint would let anyone who
+    learned an item_id mark a connection revoked or trigger syncs. Plaid signs
+    with ES256 and includes a hash of the raw body, which is why the RAW bytes
+    are read here and the parsed body is only trusted afterwards.
+
+    Always 200 on a verified webhook, even for events we do not act on: a
+    non-2xx earns a retry, and retrying an event we deliberately ignore is a
+    storm with no upside. Genuine rejections (bad signature) return 403.
+    """
+    from app.dealer_os.services import plaid_client, plaid_webhook
+
+    raw = await request.body()
+    header = request.headers.get("Plaid-Verification", "")
+
+    try:
+        ok = await plaid_client.verify_webhook(raw, header)
+    except plaid_client.PlaidUnavailable:
+        # Keys unreachable — we cannot prove this is genuine, so we must not act
+        # on it. 503 asks Plaid to retry rather than dropping the event.
+        log.warning("plaid webhook: verification key unavailable")
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    if not ok:
+        log.warning("plaid webhook: rejected unverified delivery")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        log.warning("plaid webhook: verified but unparseable body")
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+    async with SessionLocal() as db:
+        outcome = await plaid_webhook.handle(db, payload)
+        await db.commit()
+
+    log.info(
+        "plaid webhook: %s/%s -> %s",
+        payload.get("webhook_type"),
+        payload.get("webhook_code"),
+        outcome,
+    )
+    return Response(status_code=status.HTTP_200_OK)

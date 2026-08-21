@@ -245,6 +245,9 @@ from .schemas import (
     VendorDetailRead,
     VendorReportRead,
     VendorRowRead,
+    BankConsentState,
+    BankConsentGrant,
+    RoomBankConsentGrant,
 )
 from .services import analyst, archive, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
@@ -274,7 +277,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -6200,6 +6203,11 @@ async def dscr_component_action(
 _PLAID_LAST_CALL: dict[tuple[str, str], float] = {}
 
 
+_NO_BANK_CONSENT = (
+    "Bank connection consent is required before an account can be linked."
+)
+
+
 def _plaid_cooldown(action: str, dealer_id: UUID, seconds: float) -> None:
     import time
 
@@ -6247,9 +6255,19 @@ async def plaid_state(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     items = await _plaid_items(db, dealer.id)
+    cs = await bank_consent.state(db, dealer.id)
+    d = bank_consent.disclosure()
     return PlaidStateRead(
         enabled=plaid_client.enabled(),
         environment=plaid_client.environment(),
+        consent=BankConsentState(
+            granted=cs.granted,
+            version=cs.version,
+            at=cs.at,
+            consenter_name=cs.consenter_name,
+            disclosure_version=d["version"],
+            disclosure_text=d["text"],
+        ),
         items=[PlaidItemRead.model_validate(i) for i in items],
     )
 
@@ -6263,6 +6281,10 @@ async def plaid_link_token(
     own bank; team can run it alongside them."""
     require_team(user)  # gated off client accounts for now
     dealer = await load_dealer(db, dealer_id)
+    # The gate sits HERE and not on exchange: consent has to precede credential
+    # entry, and by exchange the user has already typed their bank password.
+    if not await bank_consent.has_consent(db, dealer.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _NO_BANK_CONSENT)
     _plaid_cooldown("link", dealer.id, 10)
     try:
         token = await plaid_client.create_link_token(
@@ -6271,6 +6293,60 @@ async def plaid_link_token(
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
     return PlaidLinkTokenRead(link_token=token)
+
+
+@router.post("/dealers/{dealer_id}/bank-consent", response_model=BankConsentState)
+async def grant_bank_consent(
+    dealer_id: UUID,
+    payload: BankConsentGrant,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BankConsentState:
+    """Record authorisation to connect a bank account.
+
+    IP and user agent are taken from the REQUEST, never from the body — they
+    are the part of the proof a client must not be able to author.
+    """
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    try:
+        await bank_consent.record(
+            db,
+            dealer_id=dealer.id,
+            method=payload.method,
+            consenter_name=payload.consenter_name,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            captured_by_user_id=user.id,
+            captured_by_name=user.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    cs = await bank_consent.state(db, dealer.id)
+    d = bank_consent.disclosure()
+    return BankConsentState(
+        granted=cs.granted, version=cs.version, at=cs.at,
+        consenter_name=cs.consenter_name,
+        disclosure_version=d["version"], disclosure_text=d["text"],
+    )
+
+
+@router.delete("/dealers/{dealer_id}/bank-consent", response_model=BankConsentState)
+async def withdraw_bank_consent(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BankConsentState:
+    """Withdraw authorisation. The published privacy policy promises this is
+    possible, so it is a real endpoint rather than a support-inbox convention."""
+    require_team(user)
+    dealer = await load_dealer(db, dealer_id)
+    await bank_consent.revoke(db, dealer_id=dealer.id, reason="withdrawn by request")
+    await db.commit()
+    d = bank_consent.disclosure()
+    return BankConsentState(
+        granted=False, disclosure_version=d["version"], disclosure_text=d["text"]
+    )
 
 
 @router.post(
@@ -6420,10 +6496,13 @@ async def public_room_features(
                 )
             )
 
+    bank_cs = await bank_consent.state(db, dealer.id)
     return RoomFeaturesRead(
         business_name=dealer.name,
         bank_connect_available=plaid_client.enabled(),
         plaid_environment=plaid_client.environment(),
+        bank_consent_granted=bank_cs.granted,
+        bank_consent_disclosure=bank_consent.disclosure()["text"],
         signable=rows,
         contracts=contract_rows,
     )
@@ -6594,6 +6673,44 @@ async def public_room_sign(
     )
 
 
+@router.post("/public/room/{token}/bank-consent", response_model=BankConsentState)
+async def public_room_bank_consent(
+    token: str,
+    payload: RoomBankConsentGrant,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BankConsentState:
+    """PUBLIC. The client authorises the bank connection from their own room.
+
+    The room authenticates the ROOM, not a person, so consenter_name is the only
+    human identity in the record — which is why the form asks for it and why it
+    is stored verbatim.
+    """
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    try:
+        await bank_consent.record(
+            db,
+            dealer_id=dealer.id,
+            method=payload.method,
+            consenter_name=payload.consenter_name,
+            ip_address=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await db.commit()
+    cs = await bank_consent.state(db, dealer.id)
+    d = bank_consent.disclosure()
+    return BankConsentState(
+        granted=cs.granted, version=cs.version, at=cs.at,
+        consenter_name=cs.consenter_name,
+        disclosure_version=d["version"], disclosure_text=d["text"],
+    )
+
+
 @router.post("/public/room/{token}/plaid/link-token", response_model=PlaidLinkTokenRead)
 async def public_room_link_token(
     token: str, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
@@ -6610,6 +6727,8 @@ async def public_room_link_token(
         link, dealer = await client_room.resolve_room(db, token, payload.passcode)
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if not await bank_consent.has_consent(db, dealer.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _NO_BANK_CONSENT)
     _plaid_cooldown("link", dealer.id, 10)
     try:
         pt = await plaid_client.create_link_token(
