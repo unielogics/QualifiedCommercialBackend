@@ -1249,6 +1249,27 @@ async def dealer_delivery_log(
     return [DeliveryRowRead(**asdict(r)) for r in rows]
 
 
+@router.post("/dealers/{dealer_id}/room/access-code", response_model=ClientRequestResult)
+async def rotate_room_access_code(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ClientRequestResult:
+    """A fresh access code, displayed to the rep to read out.
+
+    Rotation rather than retrieval: the stored code is a hash and cannot be
+    shown again, so "show me the code" always means "make a new one". The old
+    code stops working the moment this returns, which is also the recovery
+    path when a code has leaked."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    room = await client_room.rotate_passcode(db, dealer)
+    await log_action(
+        db, dealer.id, user, "room.passcode_rotated", "dealer", entity_id=dealer.id,
+        after={"link_id": str(room.link.id)},
+    )
+    await db.commit()
+    return ClientRequestResult(url=room.url, passcode=room.passcode, delivered=False)
+
+
 async def _room_code_hash_by_token(db: AsyncSession, token: str) -> str | None:
     """Resolve the consent token to its file's room-code hash WITHOUT touching
     the token: the code check must run before consumption, or wrong guesses
@@ -7646,6 +7667,11 @@ async def owner_credit_invite(
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+    # The consent page is gated by the file's room access code — the same PIN
+    # that opens the upload room. Ensure the room (and therefore a code)
+    # exists before the link goes out, or the gate would ask for a code that
+    # was never minted.
+    await client_room.ensure_room(db, dealer)
     token = secrets.token_urlsafe(32)
     owner.invite_token_hash = _hash_invite_token(token)
     owner.invite_sent_at = datetime.now(timezone.utc)
