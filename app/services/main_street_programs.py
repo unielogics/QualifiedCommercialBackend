@@ -131,10 +131,16 @@ def intent_kind(intent: Any) -> IntentKind:
 # ══════════════════════════════════════════════════════════════════════════
 
 # CROSS-REPO CONTRACT. These nine slugs must stay identical to
-# ``VERTICALS[].industries[].slug`` in QCWeb/src/lib/programs.ts and to
-# ``MainStreetIndustry`` in QCDashboard/src/lib/intakeIndustries.ts. Nothing
-# enforces the match at build time, so an unrecognized slug normalizes to
-# ``other`` rather than being mis-routed.
+# ``VERTICALS[].industries[].slug`` in QCWeb/src/lib/programs.ts, to
+# ``MainStreetIndustry`` in QCDashboard/src/lib/intakeIndustries.ts, and to the
+# pickers in QCRep (NewApplicationForm.tsx and Step1Intake.tsx). Nothing enforces
+# the match at build time, so an unrecognized slug normalizes to ``other``
+# rather than being mis-routed.
+#
+# Worth knowing: the QCDashboard file named above did not exist for a long time
+# while this comment claimed it did, which is part of why its admin lead form
+# could not create an operating-business lead at all. If a repo is named here,
+# check it actually has the list before trusting that it matches.
 MAIN_STREET_INDUSTRIES: dict[str, dict[str, str]] = {
     "restaurant_food_service": {
         "en": "Restaurants and food service",
