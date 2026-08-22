@@ -1022,8 +1022,8 @@ def _linked_sources(row: UnifiedFileRow) -> list[UnifiedSource]:
     values = [
         ("deal", row.deal_id, "Realtor deal", "/deals/{}"),
         ("loan", row.loan_id, "Funding file", "/loans/{}"),
-        ("intake", row.intake_id, "AI intake", "/admin/ai-underwriter-leads/{}"),
-        ("bucket", row.bucket_id, "Primary document room", "/admin/buckets/{}"),
+        ("intake", row.intake_id, "AI intake", "/admin/ai-underwriter-leads?lead={}"),
+        ("bucket", row.bucket_id, "Primary document room", "/admin/buckets?bucket={}"),
         ("dealer", row.dealer_id, "Rep / dealer file", None),
     ]
     for kind, source_id, label, route in values:
@@ -1048,7 +1048,7 @@ def _linked_sources(row: UnifiedFileRow) -> list[UnifiedSource]:
                     ref=_source_ref("QC-B", bucket_id),
                     label="Linked document room",
                     relationship="supporting",
-                    route=f"/admin/buckets/{bucket_id}",
+                    route=f"/admin/buckets?bucket={bucket_id}",
                 )
             )
     return sources
@@ -1335,10 +1335,10 @@ async def link_bucket_to_intake(
             bucket_id=bucket.id,
             intake_id=intake.id,
             linked_by_user_id=user.id,
+            files=[],
         )
         db.add(link)
         await db.flush()
-        link.files = []
     link.relationship = payload.relationship
     link.note = payload.note
     link.updated_by_user_id = user.id

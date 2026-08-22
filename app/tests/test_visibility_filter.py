@@ -51,16 +51,15 @@ def test_agent_sees_everything_except_internal_only() -> None:
 
 def test_underwriter_sees_everything() -> None:
     out = filter_facts(_FACTS, "underwriter")
-    assert len(out) == 5  # all except the untagged one (no explicit visibility — defaults filtered)
-    # Wait — defaults to agent_visible for non-borrower. Underwriter sees agent_visible. Adjust.
+    assert len(out) == 6
+    assert "untagged" in {fact["field"] for fact in out}
 
 
 def test_underwriter_includes_untagged() -> None:
     """Untagged defaults to agent-internal; underwriter is allowed."""
     out = filter_facts(_FACTS, "underwriter")
     fields = {f["field"] for f in out}
-    # Default visibility is agent-internal — None marks the fact not visible
-    # to borrower. For UW it depends on whether UW gets None defaults.
+    assert "untagged" in fields
     assert "credit_score" in fields  # internal_only
 
 

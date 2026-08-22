@@ -969,6 +969,9 @@ class DealerAILeadRow(BaseModel):
     email: str
     phone: str | None = None
     business_name: str | None = None
+    referral_source: str | None = None
+    opened_by_name: str | None = None
+    opened_by_role: str | None = None
     status: str
     outcome_status: str = "submitted"
     preferred_language: str = "en"
@@ -5488,6 +5491,9 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
         email=intake.email,
         phone=intake.phone,
         business_name=intake.business_name,
+        referral_source=intake.referral_source,
+        opened_by_name=intake.broker.name if intake.broker else "House desk",
+        opened_by_role="Dealer partner" if intake.broker else "Internal",
         status=intake.status,
         outcome_status=intake.outcome_status,
         preferred_language=intake.preferred_language,
@@ -5780,6 +5786,7 @@ async def list_dealer_ai_leads(
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
             selectinload(PublicUnderwritingIntake.latest_review),
+            selectinload(PublicUnderwritingIntake.broker),
             selectinload(PublicUnderwritingIntake.delete_requested_by),
             with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
         )
@@ -6666,6 +6673,7 @@ async def list_broker_dealer_leads(
             selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes),
             selectinload(PublicUnderwritingIntake.bucket_upload_link),
             selectinload(PublicUnderwritingIntake.latest_review),
+            selectinload(PublicUnderwritingIntake.broker),
             selectinload(PublicUnderwritingIntake.delete_requested_by),
             with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
         )
