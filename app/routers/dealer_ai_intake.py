@@ -7962,6 +7962,7 @@ async def dealer_ai_lead_chat(
             message=payload.message.strip(),
             actor_name=user.name or "Super admin",
             user=user,
+            intake_id=intake.id,
         )
         if chat_messages:
             assistant_message = chat_messages[-1].content

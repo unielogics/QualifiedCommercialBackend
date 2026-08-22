@@ -2770,6 +2770,7 @@ async def create_chat_reply(
     share: BucketShare | None = None,
     vendor_access: BucketVendorAccess | None = None,
     preferred_language: str = "en",
+    intake_id: UUID | None = None,
 ) -> tuple[list[BucketAIMessage], list[BucketAIActionItem], str | None]:
     user_row = BucketAIMessage(
         bucket_id=bucket.id,
@@ -2785,7 +2786,15 @@ async def create_chat_reply(
     db.add(user_row)
     await db.flush()
 
-    context = await _chat_context(db, bucket=bucket, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access)
+    context = await _chat_context(
+        db,
+        bucket=bucket,
+        audience=audience,
+        upload_link=upload_link,
+        share=share,
+        vendor_access=vendor_access,
+        intake_id=intake_id,
+    )
     review_type = (bucket.ai_context or {}).get("review_type")
     model = model_light()
 
@@ -2833,6 +2842,7 @@ async def create_chat_reply(
                 "share_id": str(share.id) if share else None,
                 "upload_link_id": str(upload_link.id) if upload_link else None,
                 "vendor_access_id": str(vendor_access.id) if vendor_access else None,
+                "intake_id": str(intake_id) if intake_id else None,
             },
             max_tokens=3000,
             system=build_chat_system(
@@ -2911,6 +2921,7 @@ async def _chat_context(
     upload_link: BucketUploadLink | None,
     share: BucketShare | None,
     vendor_access: BucketVendorAccess | None,
+    intake_id: UUID | None = None,
 ) -> dict[str, Any]:
     base = {
         "bucket": {
@@ -2922,6 +2933,16 @@ async def _chat_context(
         "audience": audience,
     }
     if audience == "admin":
+        primary_files = [
+            file for file in bucket.files
+            if file.status == "uploaded" and file.deleted_at is None
+        ]
+        linked_files: list[BucketFile] = []
+        if intake_id is not None:
+            from app.services.operator_file_links import selected_files_for_intake
+
+            linked_files = await selected_files_for_intake(db, intake_id)
+        visible_files = list({file.id: file for file in [*primary_files, *linked_files]}.values())
         review = await latest_review(db, bucket.id)
         tasks = await visible_action_items(db, bucket.id)
         templates = (
@@ -2937,7 +2958,8 @@ async def _chat_context(
             "ai_context": bucket.ai_context or {},
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
             "document_template_library": [_template_context(template) for template in templates],
-            "files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
+            "files": [_file_context(file) for file in visible_files],
+            "linked_evidence_files": [_file_context(file) for file in linked_files],
             "notes": [_note_context(note) for note in bucket.notes],
             "latest_review": review.result if review else None,
             "action_items": [_task_context(task) for task in tasks],
