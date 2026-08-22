@@ -494,6 +494,204 @@ class SessionCreate(BaseModel):
     notes: str | None = None
 
 
+class ApplicationProfileRead(ORM):
+    id: UUID
+    dealer_id: UUID
+    landlord_mortgagee: str | None = None
+    guarantor_home_address: str | None = None
+    guarantor_dob: date | None = None
+    selected_program: str | None = None
+    term_requested_months: int | None = None
+    collateral_description: str | None = None
+    use_of_proceeds_text: str | None = None
+    updated_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApplicationProfilePatch(BaseModel):
+    landlord_mortgagee: str | None = Field(default=None, max_length=200)
+    guarantor_home_address: str | None = Field(default=None, max_length=300)
+    guarantor_dob: date | None = None
+    selected_program: str | None = Field(default=None, max_length=80)
+    term_requested_months: int | None = Field(default=None, ge=1, le=360)
+    collateral_description: str | None = Field(default=None, max_length=4000)
+    use_of_proceeds_text: str | None = Field(default=None, max_length=4000)
+
+
+class BookingAvailabilitySlot(BaseModel):
+    starts_at: datetime
+    label: str
+    date_label: str
+
+
+class BookingAvailabilityRead(BaseModel):
+    timezone: str
+    duration_min: int
+    slots: list[BookingAvailabilitySlot]
+
+
+class RepAppointmentRead(ORM):
+    id: UUID
+    dealer_id: UUID | None = None
+    owner_user_id: UUID | None = None
+    calendar_event_id: UUID | None = None
+    kind: str
+    title: str
+    starts_at: datetime
+    duration_min: int
+    timezone: str
+    invitee_name: str
+    invitee_email: str | None = None
+    invitee_phone: str | None = None
+    join_url: str | None = None
+    notes: str | None = None
+    status: str
+    booked_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RepAppointmentCreate(BaseModel):
+    kind: Literal["callback", "program_intro", "underwriting_review"] = "callback"
+    title: str | None = Field(default=None, max_length=200)
+    starts_at: datetime
+    duration_min: int | None = Field(default=None, ge=15, le=180)
+    timezone: str | None = Field(default=None, max_length=80)
+    invitee_name: str = Field(min_length=1, max_length=160)
+    invitee_email: str | None = Field(default=None, max_length=320)
+    invitee_phone: str | None = Field(default=None, max_length=32)
+    join_url: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def _needs_a_recipient(self) -> "RepAppointmentCreate":
+        if not (self.invitee_email or self.invitee_phone):
+            raise ValueError("Provide an email or phone for the invitee.")
+        return self
+
+
+class RepAppointmentPatch(BaseModel):
+    starts_at: datetime | None = None
+    status: Literal["pending", "confirmed", "cancelled", "done"] | None = None
+    join_url: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class UnderwritingReviewPreferenceRead(ORM):
+    id: UUID
+    dealer_id: UUID
+    rep_user_id: UUID | None = None
+    timezone: str
+    slots: list[dict]
+    status: str
+    submitted_at: datetime
+    selected_slot_at: datetime | None = None
+    selected_by_user_id: UUID | None = None
+    appointment_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UnderwritingReviewPreferenceCreate(BaseModel):
+    timezone: str = Field(default="America/New_York", max_length=80)
+    slots: list[datetime] = Field(min_length=3, max_length=3)
+
+
+class ContactShareRead(ORM):
+    id: UUID
+    owner_user_id: UUID | None = None
+    contact_id: UUID | None = None
+    dealer_id: UUID | None = None
+    recipient_name: str
+    recipient_email: str | None = None
+    recipient_phone_e164: str | None = None
+    channel: str
+    card_token: str
+    subject: str
+    body: str
+    email_status: str
+    sms_status: str
+    provider_refs: dict | None = None
+    created_by_user_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ContactCardRead(BaseModel):
+    recipient_name: str
+    company: str | None = None
+    rep_name: str
+    rep_email: str | None = None
+    subject: str
+    body: str
+    booking_url: str
+    application_url: str
+
+
+class ContactShareCreate(BaseModel):
+    dealer_id: UUID | None = None
+    recipient_name: str = Field(min_length=1, max_length=160)
+    company: str | None = Field(default=None, max_length=180)
+    recipient_email: str | None = Field(default=None, max_length=320)
+    recipient_phone: str | None = Field(default=None, max_length=32)
+    channel: Literal["email", "sms", "email_sms"] = "email"
+    marketing_sms_consent: bool = False
+    transactional_sms_consent: bool = False
+    consent_method: Literal["self_web", "in_person_device", "rep_attested"] = "rep_attested"
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _needs_delivery(self) -> "ContactShareCreate":
+        if not (self.recipient_email or self.recipient_phone):
+            raise ValueError("Provide an email or phone number.")
+        return self
+
+
+class RepInboxThreadRead(ORM):
+    id: UUID
+    owner_user_id: UUID | None = None
+    contact_id: UUID | None = None
+    dealer_id: UUID | None = None
+    subject: str
+    channel: str
+    source: str
+    last_message_at: datetime | None = None
+    unread_count: int
+    status: str
+    contact_name: str | None = None
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    company: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RepInboxMessageRead(ORM):
+    id: UUID
+    thread_id: UUID
+    owner_user_id: UUID | None = None
+    contact_id: UUID | None = None
+    dealer_id: UUID | None = None
+    direction: str
+    channel: str
+    subject: str | None = None
+    body: str
+    provider: str | None = None
+    provider_message_id: str | None = None
+    delivery_status: str
+    sender: str | None = None
+    recipient: str | None = None
+    read_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RepInboxMessageCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+    channel: Literal["email", "sms"] | None = None
+
+
 class DeliveryRowRead(BaseModel):
     """One row of the step 2 delivery log. Status is derived from the trail,
     not stored: sent, opened and completed arrive as separate events."""

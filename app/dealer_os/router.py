@@ -15,7 +15,7 @@ import re
 import secrets
 import zipfile
 from dataclasses import asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -29,9 +29,14 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import SessionLocal, get_db
 from app.deps import CurrentUser
+from app.config import get_settings
 from app.models.user import User
+from app.models.booking_settings import BookingSettings
+from app.models.event import CalendarEvent
+from app.services import booking_notify
+from app.services.email import ses_client
 from app.services import clerk as clerk_service
-from app.enums import Role
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 
 # READ-ONLY reuse: bucket models are queried/appended, never altered; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
@@ -49,10 +54,17 @@ from .deps import (
 )
 from .models import (
     DealerRepLead,
+    DealerApplicationProfile,
     ContractTemplate,
     ContractDocument,
     DealerSmsConsent,
     DealerAIMessage,
+    DealerRepAppointment,
+    DealerRepContact,
+    DealerRepContactShare,
+    DealerRepInboxMessage,
+    DealerRepInboxThread,
+    DealerUnderwritingReviewPreference,
     MESSAGE_CHANNELS,
     CLIENT_VISIBLE_CHANNELS,
     REP_LEAD_TERMINAL,
@@ -248,6 +260,21 @@ from .schemas import (
     BankConsentState,
     BankConsentGrant,
     RoomBankConsentGrant,
+    ApplicationProfilePatch,
+    ApplicationProfileRead,
+    BookingAvailabilityRead,
+    BookingAvailabilitySlot,
+    ContactCardRead,
+    ContactShareCreate,
+    ContactShareRead,
+    RepAppointmentCreate,
+    RepAppointmentPatch,
+    RepAppointmentRead,
+    RepInboxMessageCreate,
+    RepInboxMessageRead,
+    RepInboxThreadRead,
+    UnderwritingReviewPreferenceCreate,
+    UnderwritingReviewPreferenceRead,
 )
 from .services import analyst, archive, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
@@ -277,7 +304,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -3981,6 +4008,1008 @@ async def simulate_dealer(
         paths=paths_out,
         goal=goal,
     )
+
+
+def _to_utc_minute(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _parse_hhmm(value: str) -> int:
+    hours, minutes = [int(part) for part in value.split(":")]
+    return hours * 60 + minutes
+
+
+def _js_weekday(day: date) -> int:
+    return (day.weekday() + 1) % 7
+
+
+def _round_up_to_step(value: datetime, step_min: int) -> datetime:
+    value = value.replace(second=0, microsecond=0)
+    remainder = value.minute % step_min
+    if remainder:
+        value += timedelta(minutes=step_min - remainder)
+    return value
+
+
+def _time_label(value: datetime) -> str:
+    return value.strftime("%I:%M %p").lstrip("0")
+
+
+def _date_label(value: datetime) -> str:
+    return f"{value.strftime('%a, %b')} {value.day}"
+
+
+async def _rep_host_for(
+    db: AsyncSession, dealer: DealerBusiness | None, user: User
+) -> User:
+    if dealer and dealer.owner_user_id:
+        host = await db.get(User, dealer.owner_user_id)
+        if host is not None:
+            return host
+    return user
+
+
+async def _booking_settings_for(db: AsyncSession, host: User) -> BookingSettings:
+    row = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == host.id))
+    ).scalar_one_or_none()
+    if row is not None:
+        return row
+    return BookingSettings(
+        user_id=host.id,
+        enabled=True,
+        title=f"Book a meeting with {host.name or 'Qualified Commercial'}",
+        intro="Choose a time that works for you.",
+        duration_min=30,
+        timezone="America/New_York",
+        available_days=[1, 2, 3, 4, 5],
+        start_time="09:00",
+        end_time="17:00",
+    )
+
+
+async def _booking_slots(
+    db: AsyncSession,
+    host: User,
+    booking: BookingSettings,
+    *,
+    duration_min: int | None = None,
+) -> BookingAvailabilityRead:
+    zone = rep_workflows.tz(booking.timezone)
+    duration = duration_min or booking.duration_min or 30
+    now_local = datetime.now(zone)
+    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 15)
+    window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    busy_rows = (
+        await db.execute(
+            select(CalendarEvent)
+            .where(
+                CalendarEvent.owner_user_id == host.id,
+                CalendarEvent.status != CalendarEventStatus.CANCELLED,
+                CalendarEvent.starts_at >= now_local.astimezone(timezone.utc),
+                CalendarEvent.starts_at <= window_end_local.astimezone(timezone.utc),
+            )
+            .order_by(CalendarEvent.starts_at)
+        )
+    ).scalars().all()
+    busy = [
+        (
+            ev.starts_at.astimezone(zone),
+            ev.starts_at.astimezone(zone) + timedelta(minutes=max(15, ev.duration_min or duration)),
+        )
+        for ev in busy_rows
+    ]
+    start_min = _parse_hhmm(booking.start_time or "09:00")
+    end_min = _parse_hhmm(booking.end_time or "17:00")
+    slot_duration = timedelta(minutes=duration)
+    slots: list[BookingAvailabilitySlot] = []
+    for offset in range(15):
+        day = now_local.date() + timedelta(days=offset)
+        if _js_weekday(day) not in (booking.available_days or [1, 2, 3, 4, 5]):
+            continue
+        day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=zone)
+        day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=zone)
+        cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
+        cursor = _round_up_to_step(cursor, 15)
+        while cursor + slot_duration <= day_end:
+            slot_end = cursor + slot_duration
+            if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
+                starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                slots.append(BookingAvailabilitySlot(
+                    starts_at=starts_utc,
+                    label=_time_label(cursor),
+                    date_label=_date_label(cursor),
+                ))
+                if len(slots) >= 80:
+                    return BookingAvailabilityRead(timezone=booking.timezone, duration_min=duration, slots=slots)
+            cursor += slot_duration
+    return BookingAvailabilityRead(timezone=booking.timezone, duration_min=duration, slots=slots)
+
+
+def _appointment_title(kind: str, invitee_name: str, dealer: DealerBusiness | None) -> str:
+    labels = {
+        "callback": "Callback",
+        "program_intro": "Program intro",
+        "underwriting_review": "Underwriting review",
+    }
+    suffix = f" · {dealer.name}" if dealer else ""
+    return f"{labels.get(kind, 'Appointment')}: {invitee_name}{suffix}"
+
+
+async def _load_owned_appointment(
+    db: AsyncSession, appointment_id: UUID, user: User
+) -> DealerRepAppointment:
+    row = (
+        await db.execute(
+            select(DealerRepAppointment).where(DealerRepAppointment.id == appointment_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
+    if user.role == Role.FIELD_REP and row.owner_user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
+    require_team_or_rep(user)
+    return row
+
+
+async def _ensure_rep_contact(
+    db: AsyncSession,
+    *,
+    owner_user_id: UUID,
+    dealer_id: UUID | None,
+    full_name: str,
+    company: str | None,
+    email: str | None,
+    phone_e164: str | None,
+    source: str,
+) -> DealerRepContact:
+    q = select(DealerRepContact).where(DealerRepContact.owner_user_id == owner_user_id)
+    if email:
+        q = q.where(DealerRepContact.email == email.strip().lower())
+    elif phone_e164:
+        q = q.where(DealerRepContact.phone_e164 == phone_e164)
+    else:
+        q = q.where(DealerRepContact.full_name == full_name.strip())
+    row = (await db.execute(q.order_by(DealerRepContact.updated_at.desc()))).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        row = DealerRepContact(
+            owner_user_id=owner_user_id,
+            dealer_id=dealer_id,
+            full_name=full_name.strip(),
+            company=company,
+            email=email.strip().lower() if email else None,
+            phone_e164=phone_e164,
+            source=source,
+            last_activity_at=now,
+        )
+        db.add(row)
+        await db.flush()
+        return row
+    row.dealer_id = row.dealer_id or dealer_id
+    row.full_name = full_name.strip() or row.full_name
+    row.company = company or row.company
+    row.email = email.strip().lower() if email else row.email
+    row.phone_e164 = phone_e164 or row.phone_e164
+    row.last_activity_at = now
+    await db.flush()
+    return row
+
+
+async def _ensure_rep_thread(
+    db: AsyncSession,
+    *,
+    owner_user_id: UUID,
+    contact: DealerRepContact,
+    dealer_id: UUID | None,
+    channel: str,
+    subject: str,
+    source: str,
+) -> DealerRepInboxThread:
+    row = (
+        await db.execute(
+            select(DealerRepInboxThread)
+            .where(
+                DealerRepInboxThread.owner_user_id == owner_user_id,
+                DealerRepInboxThread.contact_id == contact.id,
+                DealerRepInboxThread.channel == channel,
+                DealerRepInboxThread.status == "open",
+            )
+            .order_by(DealerRepInboxThread.updated_at.desc())
+        )
+    ).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        row = DealerRepInboxThread(
+            owner_user_id=owner_user_id,
+            contact_id=contact.id,
+            dealer_id=dealer_id,
+            subject=subject,
+            channel=channel,
+            source=source,
+            last_message_at=now,
+        )
+        db.add(row)
+        await db.flush()
+    else:
+        row.dealer_id = row.dealer_id or dealer_id
+        row.last_message_at = now
+    return row
+
+
+async def _append_rep_inbox_message(
+    db: AsyncSession,
+    *,
+    thread: DealerRepInboxThread,
+    contact: DealerRepContact | None,
+    direction: str,
+    channel: str,
+    body: str,
+    subject: str | None = None,
+    provider: str | None = None,
+    provider_message_id: str | None = None,
+    delivery_status: str = "stored",
+    sender: str | None = None,
+    recipient: str | None = None,
+) -> DealerRepInboxMessage:
+    now = datetime.now(timezone.utc)
+    msg = DealerRepInboxMessage(
+        thread_id=thread.id,
+        owner_user_id=thread.owner_user_id,
+        contact_id=thread.contact_id,
+        dealer_id=thread.dealer_id,
+        direction=direction,
+        channel=channel,
+        subject=subject,
+        body=body,
+        provider=provider,
+        provider_message_id=provider_message_id,
+        delivery_status=delivery_status,
+        sender=sender,
+        recipient=recipient,
+        read_at=now if direction == "outbound" else None,
+    )
+    db.add(msg)
+    thread.last_message_at = now
+    if direction == "inbound":
+        thread.unread_count = int(thread.unread_count or 0) + 1
+    if contact is not None:
+        contact.last_activity_at = now
+    await db.flush()
+    return msg
+
+
+def _thread_read(thread: DealerRepInboxThread, contact: DealerRepContact | None) -> RepInboxThreadRead:
+    return RepInboxThreadRead(
+        id=thread.id,
+        owner_user_id=thread.owner_user_id,
+        contact_id=thread.contact_id,
+        dealer_id=thread.dealer_id,
+        subject=thread.subject,
+        channel=thread.channel,
+        source=thread.source,
+        last_message_at=thread.last_message_at,
+        unread_count=thread.unread_count,
+        status=thread.status,
+        contact_name=contact.full_name if contact else None,
+        contact_email=contact.email if contact else None,
+        contact_phone=contact.phone_e164 if contact else None,
+        company=contact.company if contact else None,
+        created_at=thread.created_at,
+        updated_at=thread.updated_at,
+    )
+
+
+@router.get("/dealers/{dealer_id}/application-profile", response_model=ApplicationProfileRead | None)
+async def get_application_profile(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerApplicationProfile | None:
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+
+
+@router.patch("/dealers/{dealer_id}/application-profile", response_model=ApplicationProfileRead)
+async def patch_application_profile(
+    dealer_id: UUID,
+    payload: ApplicationProfilePatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerApplicationProfile:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
+        db.add(row)
+    before = {
+        "landlord_mortgagee": row.landlord_mortgagee,
+        "guarantor_home_address": row.guarantor_home_address,
+        "guarantor_dob": row.guarantor_dob.isoformat() if row.guarantor_dob else None,
+        "selected_program": row.selected_program,
+        "term_requested_months": row.term_requested_months,
+        "collateral_description": row.collateral_description,
+        "use_of_proceeds_text": row.use_of_proceeds_text,
+    }
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(row, key, value)
+    row.updated_by_user_id = user.id
+    await db.flush()
+    lead = (
+        await db.execute(select(DealerRepLead).where(DealerRepLead.dealer_id == dealer.id))
+    ).scalar_one_or_none()
+    ver = await _assess_verification(db, dealer)
+    if lead is not None and ver.unlocked and lead.status in {"draft", "info_collected", "awaiting_docs", "analyzing"}:
+        history = list(lead.status_history or [])
+        history.append({
+            "at": datetime.now(timezone.utc).isoformat(),
+            "from": lead.status,
+            "to": "decision_ready",
+            "by": str(user.id),
+            "by_name": user.name,
+            "note": "step 4 profile saved",
+        })
+        lead.status = "decision_ready"
+        lead.status_history = history[-50:]
+        lead.submitted_at = lead.submitted_at or datetime.now(timezone.utc)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application_profile.update",
+        "application_profile",
+        entity_id=row.id,
+        before=before,
+        after=payload.model_dump(exclude_unset=True, mode="json"),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.get("/booking/availability", response_model=BookingAvailabilityRead)
+async def booking_availability(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    dealer_id: UUID | None = None,
+    duration_min: int | None = Query(default=None, ge=15, le=180),
+) -> BookingAvailabilityRead:
+    require_team_or_rep(user)
+    dealer: DealerBusiness | None = None
+    if dealer_id is not None:
+        dealer = await resolve_dealer_scope(db, user, dealer_id)
+    host = await _rep_host_for(db, dealer, user)
+    booking = await _booking_settings_for(db, host)
+    return await _booking_slots(db, host, booking, duration_min=duration_min)
+
+
+@router.get("/dealers/{dealer_id}/appointments", response_model=list[RepAppointmentRead])
+async def list_rep_appointments(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerRepAppointment]:
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerRepAppointment)
+                .where(DealerRepAppointment.dealer_id == dealer.id)
+                .order_by(DealerRepAppointment.starts_at.asc())
+            )
+        ).scalars().all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/appointments",
+    response_model=RepAppointmentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rep_appointment(
+    dealer_id: UUID,
+    payload: RepAppointmentCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepAppointment:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    host = await _rep_host_for(db, dealer, user)
+    booking = await _booking_settings_for(db, host)
+    starts_at = _to_utc_minute(payload.starts_at)
+    duration = payload.duration_min or booking.duration_min or 30
+    slots = await _booking_slots(db, host, booking, duration_min=duration)
+    if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    title = payload.title or _appointment_title(payload.kind, payload.invitee_name, dealer)
+    who = payload.invitee_name
+    if payload.invitee_email:
+        who = f"{payload.invitee_name} <{payload.invitee_email}>"
+    description = (
+        f"Rep appointment for {dealer.name}.\n"
+        f"Kind: {payload.kind}\n"
+        f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
+        f"Notes:\n{payload.notes or '(none)'}"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=title,
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=duration,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.MANUAL,
+        owner_user_id=host.id,
+        external_ref_kind="dealer_rep_appointment",
+        external_ref_id=secrets.token_urlsafe(12),
+    )
+    db.add(ev)
+    await db.flush()
+    appt = DealerRepAppointment(
+        dealer_id=dealer.id,
+        owner_user_id=host.id,
+        calendar_event_id=ev.id,
+        kind=payload.kind,
+        title=title,
+        starts_at=starts_at,
+        duration_min=duration,
+        timezone=payload.timezone or booking.timezone,
+        invitee_name=payload.invitee_name.strip(),
+        invitee_email=payload.invitee_email,
+        invitee_phone=payload.invitee_phone,
+        join_url=payload.join_url,
+        notes=payload.notes,
+        status="confirmed",
+        booked_by_user_id=user.id,
+    )
+    db.add(appt)
+    await db.flush()
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "appointment.create",
+        "appointment",
+        entity_id=appt.id,
+        after={
+            "kind": appt.kind,
+            "starts_at": appt.starts_at.isoformat(),
+            "invitee": appt.invitee_name,
+            "calendar_event_id": str(ev.id),
+        },
+    )
+    await db.commit()
+    await db.refresh(appt)
+    if payload.invitee_email:
+        join = await booking_notify.push_to_google(
+            db, ev, invitee_email=payload.invitee_email, invitee_name=payload.invitee_name
+        )
+        if join and not appt.join_url:
+            appt.join_url = join
+            ev.description = f"{description}\n\nJoin: {join}"
+            await db.commit()
+            await db.refresh(appt)
+        booking_notify.notify_host(
+            host,
+            booking,
+            starts_at,
+            invitee_name=payload.invitee_name,
+            invitee_email=payload.invitee_email,
+            invitee_phone=payload.invitee_phone,
+            notes=payload.notes,
+            join_url=appt.join_url,
+        )
+        booking_notify.send_invitee_invite(
+            host,
+            booking,
+            ev,
+            starts_at,
+            invitee_name=payload.invitee_name,
+            invitee_email=payload.invitee_email,
+            join_url=appt.join_url,
+        )
+    return appt
+
+
+@router.patch("/appointments/{appointment_id}", response_model=RepAppointmentRead)
+async def patch_rep_appointment(
+    appointment_id: UUID,
+    payload: RepAppointmentPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepAppointment:
+    appt = await _load_owned_appointment(db, appointment_id, user)
+    before = {
+        "starts_at": appt.starts_at.isoformat(),
+        "status": appt.status,
+        "join_url": appt.join_url,
+        "notes": appt.notes,
+    }
+    if payload.starts_at is not None:
+        appt.starts_at = _to_utc_minute(payload.starts_at)
+        ev = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
+        if ev is not None:
+            ev.starts_at = appt.starts_at
+    if payload.status is not None:
+        appt.status = payload.status
+        ev = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
+        if ev is not None and payload.status == "cancelled":
+            ev.status = CalendarEventStatus.CANCELLED
+        elif ev is not None and payload.status == "done":
+            ev.status = CalendarEventStatus.DONE
+    if payload.join_url is not None:
+        appt.join_url = payload.join_url or None
+    if payload.notes is not None:
+        appt.notes = payload.notes or None
+    if appt.dealer_id:
+        dealer = await resolve_dealer_scope(db, user, appt.dealer_id)
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "appointment.update",
+            "appointment",
+            entity_id=appt.id,
+            before=before,
+            after=payload.model_dump(exclude_unset=True, mode="json"),
+        )
+    await db.commit()
+    await db.refresh(appt)
+    return appt
+
+
+@router.get(
+    "/dealers/{dealer_id}/underwriting-review-preferences",
+    response_model=list[UnderwritingReviewPreferenceRead],
+)
+async def list_underwriting_review_preferences(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[DealerUnderwritingReviewPreference]:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return list(
+        (
+            await db.execute(
+                select(DealerUnderwritingReviewPreference)
+                .where(DealerUnderwritingReviewPreference.dealer_id == dealer.id)
+                .order_by(DealerUnderwritingReviewPreference.submitted_at.desc())
+            )
+        ).scalars().all()
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/underwriting-review-preferences",
+    response_model=UnderwritingReviewPreferenceRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_underwriting_review_preference(
+    dealer_id: UUID,
+    payload: UnderwritingReviewPreferenceCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerUnderwritingReviewPreference:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        slots = rep_workflows.validate_underwriting_slots(
+            payload.slots, timezone_name=payload.timezone
+        )
+    except rep_workflows.SlotValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    now = datetime.now(timezone.utc)
+    row = DealerUnderwritingReviewPreference(
+        dealer_id=dealer.id,
+        rep_user_id=user.id,
+        timezone=payload.timezone,
+        slots=slots,
+        status="pending",
+        submitted_at=now,
+    )
+    db.add(row)
+    await db.flush()
+    lead = (
+        await db.execute(select(DealerRepLead).where(DealerRepLead.dealer_id == dealer.id))
+    ).scalar_one_or_none()
+    if lead is not None and lead.status in {"decision_ready", "forms_out"}:
+        history = list(lead.status_history or [])
+        history.append({
+            "at": now.isoformat(),
+            "from": lead.status,
+            "to": "signed",
+            "by": str(user.id),
+            "by_name": user.name,
+            "note": "underwriting review times collected",
+        })
+        lead.status = "signed"
+        lead.status_history = history[-50:]
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "underwriting_review_preferences.create",
+        "underwriting_review_preference",
+        entity_id=row.id,
+        after={"timezone": row.timezone, "slots": slots},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.post("/contact-shares", response_model=ContactShareRead, status_code=status.HTTP_201_CREATED)
+async def create_contact_share(
+    payload: ContactShareCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepContactShare:
+    require_team_or_rep(user)
+    dealer: DealerBusiness | None = None
+    if payload.dealer_id is not None:
+        dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
+    phone = consent_delivery.normalize_phone(payload.recipient_phone)
+    email = payload.recipient_email.strip().lower() if payload.recipient_email else None
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=user.id,
+        dealer_id=dealer.id if dealer else None,
+        full_name=payload.recipient_name,
+        company=payload.company or (dealer.name if dealer else None),
+        email=email,
+        phone_e164=phone,
+        source="contact_share",
+    )
+    now = datetime.now(timezone.utc)
+    consent_kinds: list[str] = []
+    if phone and (payload.transactional_sms_consent or payload.marketing_sms_consent):
+        meta = {
+            "method": payload.consent_method,
+            "captured_by": str(user.id),
+            "captured_by_name": user.name,
+            "captured_at": now.isoformat(),
+            "ip": request.client.host if request.client else None,
+            "user_agent": request.headers.get("user-agent", "")[:400],
+        }
+        contact.sms_consent_meta = meta
+        if payload.transactional_sms_consent:
+            contact.sms_transactional_consented_at = now
+            consent_kinds.append("transactional")
+        if payload.marketing_sms_consent:
+            contact.sms_marketing_consented_at = now
+            consent_kinds.append("marketing")
+        if dealer is not None:
+            for kind in consent_kinds:
+                await sms_consent_svc.record_consent(
+                    db,
+                    dealer_id=dealer.id,
+                    phone_e164=phone,
+                    kind=kind,
+                    method=payload.consent_method,
+                    captured_by_user_id=user.id,
+                    captured_by_name=user.name,
+                    consenter_name=payload.recipient_name,
+                    ip_address=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                )
+    token = secrets.token_urlsafe(24)[:48]
+    base = get_settings().rep_app_url.rstrip("/")
+    card_url = f"{base}/card/{token}"
+    booking_row = (
+        await db.execute(
+            select(BookingSettings).where(
+                BookingSettings.user_id == user.id,
+                BookingSettings.enabled.is_(True),
+                BookingSettings.slug.is_not(None),
+            )
+        )
+    ).scalar_one_or_none()
+    booking_url = f"{base}/book/{booking_row.slug}" if booking_row and booking_row.slug else card_url
+    application_url = f"{base}/?new=1"
+    copy = rep_workflows.build_contact_share_copy(
+        rep_name=user.name or "Qualified Commercial",
+        rep_email=user.email,
+        rep_phone=None,
+        recipient_name=payload.recipient_name,
+        card_url=card_url,
+        booking_url=booking_url,
+        application_url=application_url,
+        notes=payload.notes,
+    )
+    share = DealerRepContactShare(
+        owner_user_id=user.id,
+        contact_id=contact.id,
+        dealer_id=dealer.id if dealer else None,
+        recipient_name=payload.recipient_name.strip(),
+        recipient_email=email,
+        recipient_phone_e164=phone,
+        channel=payload.channel,
+        card_token=token,
+        subject=copy.subject,
+        body=copy.email_body,
+        email_status="not_requested",
+        sms_status="not_requested",
+        provider_refs={},
+        created_by_user_id=user.id,
+    )
+    db.add(share)
+    await db.flush()
+
+    refs: dict[str, str] = {}
+    if payload.channel in {"email", "email_sms"}:
+        if email:
+            email_res = await asyncio.to_thread(
+                ses_client.send_email,
+                to_email=email,
+                subject=copy.subject,
+                body_text=copy.email_body,
+            )
+            share.email_status = "sent" if email_res.ok else "failed"
+            if email_res.message_id:
+                refs["email_message_id"] = email_res.message_id
+        else:
+            share.email_status = "missing_recipient"
+        thread = await _ensure_rep_thread(
+            db,
+            owner_user_id=user.id,
+            contact=contact,
+            dealer_id=dealer.id if dealer else None,
+            channel="email",
+            subject=copy.subject,
+            source="contact_share",
+        )
+        await _append_rep_inbox_message(
+            db,
+            thread=thread,
+            contact=contact,
+            direction="outbound",
+            channel="email",
+            subject=copy.subject,
+            body=copy.email_body,
+            provider="ses",
+            provider_message_id=refs.get("email_message_id"),
+            delivery_status=share.email_status,
+            sender=user.email,
+            recipient=email,
+        )
+    if payload.channel in {"sms", "email_sms"}:
+        sms_allowed = bool(
+            phone
+            and contact.sms_opted_out_at is None
+            and (contact.sms_marketing_consented_at or contact.sms_transactional_consented_at)
+        )
+        if not phone:
+            share.sms_status = "missing_recipient"
+        elif not sms_allowed:
+            share.sms_status = "blocked_no_consent"
+        else:
+            sms_res = await asyncio.to_thread(consent_delivery._send_sms, phone, copy.sms_body)  # noqa: SLF001
+            share.sms_status = "sent" if sms_res.ok else "failed"
+            if sms_res.ok:
+                refs["sms_message_id"] = sms_res.detail
+        thread = await _ensure_rep_thread(
+            db,
+            owner_user_id=user.id,
+            contact=contact,
+            dealer_id=dealer.id if dealer else None,
+            channel="sms",
+            subject=copy.subject,
+            source="contact_share",
+        )
+        await _append_rep_inbox_message(
+            db,
+            thread=thread,
+            contact=contact,
+            direction="outbound",
+            channel="sms",
+            subject=copy.subject,
+            body=copy.sms_body,
+            provider="pinpoint",
+            provider_message_id=refs.get("sms_message_id"),
+            delivery_status=share.sms_status,
+            sender=get_settings().sms_origination_number or None,
+            recipient=phone,
+        )
+    share.provider_refs = refs
+    if dealer is not None:
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "contact_share.create",
+            "contact_share",
+            entity_id=share.id,
+            after={
+                "recipient": payload.recipient_name,
+                "channel": payload.channel,
+                "email_status": share.email_status,
+                "sms_status": share.sms_status,
+            },
+        )
+    await db.commit()
+    await db.refresh(share)
+    return share
+
+
+@router.get("/contact-shares/card/{token}", response_model=ContactCardRead)
+async def read_contact_card(token: str, db: AsyncSession = Depends(get_db)) -> ContactCardRead:
+    share_row = (
+        await db.execute(
+            select(DealerRepContactShare, DealerRepContact, User)
+            .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepContactShare.contact_id)
+            .outerjoin(User, User.id == DealerRepContactShare.owner_user_id)
+            .where(DealerRepContactShare.card_token == token)
+        )
+    ).first()
+    if share_row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact card not found.")
+    share, contact, rep = share_row
+    base = get_settings().rep_app_url.rstrip("/")
+    booking_row = None
+    if share.owner_user_id:
+        booking_row = (
+            await db.execute(
+                select(BookingSettings).where(
+                    BookingSettings.user_id == share.owner_user_id,
+                    BookingSettings.enabled.is_(True),
+                    BookingSettings.slug.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+    booking_url = f"{base}/book/{booking_row.slug}" if booking_row and booking_row.slug else f"{base}/?new=1"
+    return ContactCardRead(
+        recipient_name=share.recipient_name,
+        company=contact.company if contact else None,
+        rep_name=(rep.name if rep else None) or "Qualified Commercial",
+        rep_email=rep.email if rep else None,
+        subject=share.subject,
+        body=share.body,
+        booking_url=booking_url,
+        application_url=f"{base}/?new=1",
+    )
+
+
+@router.get("/inbox/threads", response_model=list[RepInboxThreadRead])
+async def list_rep_inbox_threads(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    channel: str | None = None,
+) -> list[RepInboxThreadRead]:
+    require_team_or_rep(user)
+    q = (
+        select(DealerRepInboxThread, DealerRepContact)
+        .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+        .where(DealerRepInboxThread.owner_user_id == user.id)
+        .order_by(DealerRepInboxThread.last_message_at.desc().nullslast(), DealerRepInboxThread.created_at.desc())
+    )
+    if channel:
+        if channel not in {"email", "sms"}:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown inbox channel.")
+        q = q.where(DealerRepInboxThread.channel == channel)
+    rows = (await db.execute(q)).all()
+    return [_thread_read(thread, contact) for thread, contact in rows]
+
+
+@router.get("/inbox/threads/{thread_id}/messages", response_model=list[RepInboxMessageRead])
+async def list_rep_inbox_messages(
+    thread_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerRepInboxMessage]:
+    require_team_or_rep(user)
+    thread = (
+        await db.execute(
+            select(DealerRepInboxThread).where(
+                DealerRepInboxThread.id == thread_id,
+                DealerRepInboxThread.owner_user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if thread is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found.")
+    rows = list(
+        (
+            await db.execute(
+                select(DealerRepInboxMessage)
+                .where(DealerRepInboxMessage.thread_id == thread.id)
+                .order_by(DealerRepInboxMessage.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        if row.direction == "inbound" and row.read_at is None:
+            row.read_at = now
+    thread.unread_count = 0
+    await db.commit()
+    return rows
+
+
+@router.post(
+    "/inbox/threads/{thread_id}/messages",
+    response_model=RepInboxMessageRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rep_inbox_message(
+    thread_id: UUID,
+    payload: RepInboxMessageCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepInboxMessage:
+    require_team_or_rep(user)
+    row = (
+        await db.execute(
+            select(DealerRepInboxThread, DealerRepContact)
+            .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+            .where(DealerRepInboxThread.id == thread_id, DealerRepInboxThread.owner_user_id == user.id)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found.")
+    thread, contact = row
+    channel = payload.channel or thread.channel
+    if channel not in {"email", "sms"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown inbox channel.")
+    delivery_status = "stored"
+    provider = None
+    provider_id = None
+    recipient = None
+    sender = user.email
+    if channel == "email":
+        recipient = contact.email if contact else None
+        if not recipient:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact has no email address.")
+        res = await asyncio.to_thread(
+            ses_client.send_email,
+            to_email=recipient,
+            subject=thread.subject,
+            body_text=payload.body,
+        )
+        provider = "ses"
+        provider_id = res.message_id
+        delivery_status = "sent" if res.ok else "failed"
+    else:
+        recipient = contact.phone_e164 if contact else None
+        if not recipient:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact has no mobile number.")
+        if contact and contact.sms_opted_out_at is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact opted out of SMS.")
+        allowed = bool(contact and (contact.sms_transactional_consented_at or contact.sms_marketing_consented_at))
+        if not allowed:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact has not granted SMS consent.")
+        res = await asyncio.to_thread(consent_delivery._send_sms, recipient, payload.body)  # noqa: SLF001
+        provider = "pinpoint"
+        provider_id = res.detail if res.ok else None
+        delivery_status = "sent" if res.ok else "failed"
+        sender = get_settings().sms_origination_number or None
+    msg = await _append_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        direction="outbound",
+        channel=channel,
+        subject=thread.subject,
+        body=payload.body,
+        provider=provider,
+        provider_message_id=provider_id,
+        delivery_status=delivery_status,
+        sender=sender,
+        recipient=recipient,
+    )
+    await db.commit()
+    await db.refresh(msg)
+    return msg
 
 
 # --- Stream 5: messaging, sessions, global alerts & lender package -----------

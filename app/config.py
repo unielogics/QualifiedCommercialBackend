@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:19006,https://qualifiedcommercial.com,https://www.qualifiedcommercial.com"
     frontend_app_url: str = "https://app.qualifiedcommercial.com"
+    rep_app_url: str = "https://rep.qualifiedcommercial.com"
 
     # Clerk (auth)
     clerk_secret_key: str = ""
@@ -166,6 +167,7 @@ class Settings(BaseSettings):
     # than pretending to send.
     sms_origination_number: str = ""
     sms_production: bool = False
+    sms_webhook_token: str = ""
 
     ses_region: str = "us-east-1"
     ses_from_address: str = ""

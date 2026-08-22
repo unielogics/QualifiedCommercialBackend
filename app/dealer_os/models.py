@@ -98,6 +98,35 @@ class DealerBusiness(TimestampMixin, Base):
     naics_label: Mapped[str | None] = mapped_column(String(180))
 
 
+class DealerApplicationProfile(TimestampMixin, Base):
+    """Rep-entered fields that complete the step-4 submission package.
+
+    DealerBusiness keeps identity and verified facts. This row keeps the fields
+    a rep still has to collect after the bank and credit gate opens.
+    """
+
+    __tablename__ = "dos_application_profiles"
+    __table_args__ = (
+        UniqueConstraint("dealer_id", name="uq_dos_application_profiles_dealer"),
+        Index("ix_dos_application_profiles_dealer", "dealer_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    landlord_mortgagee: Mapped[str | None] = mapped_column(String(200))
+    guarantor_home_address: Mapped[str | None] = mapped_column(String(300))
+    guarantor_dob: Mapped[date | None] = mapped_column(Date)
+    selected_program: Mapped[str | None] = mapped_column(String(80))
+    term_requested_months: Mapped[int | None] = mapped_column(Integer)
+    collateral_description: Mapped[str | None] = mapped_column(Text)
+    use_of_proceeds_text: Mapped[str | None] = mapped_column(Text)
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
 class DealerAccount(TimestampMixin, Base):
     """One bank account of the dealer (Phase 3). Roles are AI-proposed with a
     hard precedence contract: role_set_by='ai' rows may be re-proposed, but
@@ -398,6 +427,78 @@ class DealerSession(TimestampMixin, Base):
     notes: Mapped[str | None] = mapped_column(Text)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+REP_APPOINTMENT_KINDS: tuple[str, ...] = ("callback", "program_intro", "underwriting_review")
+REP_APPOINTMENT_STATUSES: tuple[str, ...] = ("pending", "confirmed", "cancelled", "done")
+
+
+class DealerRepAppointment(TimestampMixin, Base):
+    """A booked rep appointment, mirrored to CalendarEvent when possible."""
+
+    __tablename__ = "dos_rep_appointments"
+    __table_args__ = (
+        Index("ix_dos_rep_appointments_dealer", "dealer_id", "starts_at"),
+        Index("ix_dos_rep_appointments_owner", "owner_user_id", "starts_at"),
+        Index("ix_dos_rep_appointments_event", "calendar_event_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    calendar_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("calendar_events.id", ondelete="SET NULL")
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="callback", server_default="callback")
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    duration_min: Mapped[int] = mapped_column(Integer, nullable=False, default=30, server_default="30")
+    timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York", server_default="America/New_York")
+    invitee_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    invitee_email: Mapped[str | None] = mapped_column(String(320))
+    invitee_phone: Mapped[str | None] = mapped_column(String(32))
+    join_url: Mapped[str | None] = mapped_column(String(500))
+    notes: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    booked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+UNDERWRITING_PREFERENCE_STATUSES: tuple[str, ...] = ("pending", "selected", "booked", "expired")
+
+
+class DealerUnderwritingReviewPreference(TimestampMixin, Base):
+    """Three client-friendly underwriting-review slots gathered after step 5."""
+
+    __tablename__ = "dos_underwriting_review_preferences"
+    __table_args__ = (
+        Index("ix_dos_uw_review_prefs_dealer", "dealer_id", "submitted_at"),
+        Index("ix_dos_uw_review_prefs_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    rep_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York", server_default="America/New_York")
+    slots: Mapped[list] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    selected_slot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    selected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_appointments.id", ondelete="SET NULL")
     )
 
 
@@ -890,6 +991,143 @@ class DealerSmsConsent(TimestampMixin, Base):
     # Revocation is a new state on the same row, so the grant is never erased.
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_reason: Mapped[str | None] = mapped_column(String(120))
+
+
+REP_INBOX_CHANNELS: tuple[str, ...] = ("email", "sms")
+REP_INBOX_DIRECTIONS: tuple[str, ...] = ("inbound", "outbound")
+
+
+class DealerRepContact(TimestampMixin, Base):
+    """A person a rep is working, with or without a dealer file yet."""
+
+    __tablename__ = "dos_rep_contacts"
+    __table_args__ = (
+        Index("ix_dos_rep_contacts_owner", "owner_user_id", "last_activity_at"),
+        Index("ix_dos_rep_contacts_email", "owner_user_id", "email"),
+        Index("ix_dos_rep_contacts_phone", "owner_user_id", "phone_e164"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    full_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    company: Mapped[str | None] = mapped_column(String(180))
+    email: Mapped[str | None] = mapped_column(String(320))
+    phone_e164: Mapped[str | None] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual", server_default="manual")
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sms_transactional_consented_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sms_marketing_consented_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sms_consent_meta: Mapped[dict | None] = mapped_column(JSONB)
+    sms_opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerRepContactShare(TimestampMixin, Base):
+    """A business-card/program intro sent by a rep."""
+
+    __tablename__ = "dos_rep_contact_shares"
+    __table_args__ = (
+        Index("ix_dos_rep_contact_shares_owner", "owner_user_id", "created_at"),
+        Index("ix_dos_rep_contact_shares_contact", "contact_id"),
+        Index("ix_dos_rep_contact_shares_token", "card_token", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="SET NULL")
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    recipient_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    recipient_phone_e164: Mapped[str | None] = mapped_column(String(20))
+    channel: Mapped[str] = mapped_column(String(24), nullable=False, default="email", server_default="email")
+    card_token: Mapped[str] = mapped_column(String(48), nullable=False)
+    subject: Mapped[str] = mapped_column(String(180), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    email_status: Mapped[str] = mapped_column(String(24), nullable=False, default="not_requested", server_default="not_requested")
+    sms_status: Mapped[str] = mapped_column(String(24), nullable=False, default="not_requested", server_default="not_requested")
+    provider_refs: Mapped[dict | None] = mapped_column(JSONB)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class DealerRepInboxThread(TimestampMixin, Base):
+    """Owner-scoped email/SMS conversation for reps."""
+
+    __tablename__ = "dos_rep_inbox_threads"
+    __table_args__ = (
+        Index("ix_dos_rep_inbox_threads_owner", "owner_user_id", "last_message_at"),
+        Index("ix_dos_rep_inbox_threads_contact", "contact_id"),
+        Index("ix_dos_rep_inbox_threads_dealer", "dealer_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="SET NULL")
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False, default="email", server_default="email")
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual", server_default="manual")
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unread_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", server_default="open")
+
+
+class DealerRepInboxMessage(TimestampMixin, Base):
+    """One inbound or outbound message in a rep inbox thread."""
+
+    __tablename__ = "dos_rep_inbox_messages"
+    __table_args__ = (
+        Index("ix_dos_rep_inbox_messages_thread", "thread_id", "created_at"),
+        Index("ix_dos_rep_inbox_messages_owner", "owner_user_id", "created_at"),
+        Index(
+            "uq_dos_rep_inbox_provider_message",
+            "provider",
+            "provider_message_id",
+            unique=True,
+            postgresql_where=text("provider_message_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    thread_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_inbox_threads.id", ondelete="CASCADE"), nullable=False
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="SET NULL")
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    direction: Mapped[str] = mapped_column(String(12), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject: Mapped[str | None] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32))
+    provider_message_id: Mapped[str | None] = mapped_column(String(160))
+    delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="stored", server_default="stored")
+    sender: Mapped[str | None] = mapped_column(String(320))
+    recipient: Mapped[str | None] = mapped_column(String(320))
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerBankConsent(TimestampMixin, Base):

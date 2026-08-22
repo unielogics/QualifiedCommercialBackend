@@ -39,11 +39,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.dealer_os.models import DealerRepContact, DealerRepInboxMessage, DealerRepInboxThread
+from app.dealer_os.services import consent_delivery, rep_workflows, sms_consent as sms_consent_svc
 from app.models.billing import BillableExpense, ChargeAttempt, ClientPaymentMethod, PaymentAuthorization
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+
+
+def _first_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _sms_payload(raw: dict) -> dict:
+    if isinstance(raw.get("Message"), str):
+        try:
+            nested = json.loads(raw["Message"])
+            if isinstance(nested, dict):
+                return nested
+        except json.JSONDecodeError:
+            return raw
+    if isinstance(raw.get("message"), dict):
+        return raw["message"]
+    return raw
 
 
 async def _triggered_poll() -> None:
@@ -90,6 +112,135 @@ async def gmail_push(
 
     # Ack Pub/Sub immediately; the poll runs after the response is sent.
     background.add_task(_triggered_poll)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/aws-sms")
+async def aws_sms_inbound(request: Request, token: str = "") -> Response:
+    """AWS End User Messaging inbound receiver for rep inbox SMS.
+
+    The provider shape can arrive directly or wrapped by SNS. We accept the
+    common field names, dedupe by provider message id, and route by the sender's
+    E.164 phone number to the latest rep contact that has that number.
+    """
+    settings = get_settings()
+    expected = settings.sms_webhook_token
+    if not expected or token != expected:
+        log.warning("aws sms webhook: rejected push (bad/missing token)")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+    try:
+        raw = await request.json()
+    except Exception:  # noqa: BLE001
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    payload = _sms_payload(raw if isinstance(raw, dict) else {})
+    provider_id = _first_str(
+        payload.get("messageId"),
+        payload.get("MessageId"),
+        payload.get("message_id"),
+        payload.get("smsMessageId"),
+    )
+    from_phone = consent_delivery.normalize_phone(
+        _first_str(
+            payload.get("originationNumber"),
+            payload.get("from"),
+            payload.get("sourcePhoneNumber"),
+            payload.get("sender"),
+        )
+    )
+    to_phone = consent_delivery.normalize_phone(
+        _first_str(
+            payload.get("destinationNumber"),
+            payload.get("to"),
+            payload.get("destinationPhoneNumber"),
+        )
+    )
+    body = _first_str(payload.get("messageBody"), payload.get("body"), payload.get("text"), payload.get("message"))
+    if not from_phone or not body:
+        log.warning("aws sms webhook: missing sender/body keys=%s", sorted(payload.keys()))
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    async with SessionLocal() as db:
+        if provider_id:
+            duplicate = (
+                await db.execute(
+                    select(DealerRepInboxMessage.id).where(
+                        DealerRepInboxMessage.provider == "pinpoint",
+                        DealerRepInboxMessage.provider_message_id == provider_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if duplicate is not None:
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        contacts = list(
+            (
+                await db.execute(
+                    select(DealerRepContact)
+                    .where(DealerRepContact.phone_e164 == from_phone)
+                    .order_by(DealerRepContact.last_activity_at.desc().nullslast(), DealerRepContact.updated_at.desc())
+                )
+            ).scalars().all()
+        )
+        if rep_workflows.is_stop_message(body):
+            await sms_consent_svc.revoke(db, phone_e164=from_phone, reason="STOP")
+            now = datetime.now(timezone.utc)
+            for contact in contacts:
+                contact.sms_opted_out_at = now
+                contact.last_activity_at = now
+            await db.commit()
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        contact = contacts[0] if contacts else None
+        if contact is None or contact.owner_user_id is None:
+            log.warning("aws sms webhook: no rep contact for sender=%s", from_phone)
+            return Response(status_code=status.HTTP_202_ACCEPTED)
+
+        now = datetime.now(timezone.utc)
+        thread = (
+            await db.execute(
+                select(DealerRepInboxThread)
+                .where(
+                    DealerRepInboxThread.owner_user_id == contact.owner_user_id,
+                    DealerRepInboxThread.contact_id == contact.id,
+                    DealerRepInboxThread.channel == "sms",
+                    DealerRepInboxThread.status == "open",
+                )
+                .order_by(DealerRepInboxThread.updated_at.desc())
+            )
+        ).scalar_one_or_none()
+        if thread is None:
+            thread = DealerRepInboxThread(
+                owner_user_id=contact.owner_user_id,
+                contact_id=contact.id,
+                dealer_id=contact.dealer_id,
+                subject=f"SMS with {contact.full_name}",
+                channel="sms",
+                source="inbound_sms",
+                last_message_at=now,
+                unread_count=0,
+            )
+            db.add(thread)
+            await db.flush()
+        msg = DealerRepInboxMessage(
+            thread_id=thread.id,
+            owner_user_id=thread.owner_user_id,
+            contact_id=contact.id,
+            dealer_id=thread.dealer_id,
+            direction="inbound",
+            channel="sms",
+            subject=thread.subject,
+            body=body,
+            provider="pinpoint",
+            provider_message_id=provider_id,
+            delivery_status="received",
+            sender=from_phone,
+            recipient=to_phone,
+        )
+        db.add(msg)
+        thread.last_message_at = now
+        thread.unread_count = int(thread.unread_count or 0) + 1
+        contact.last_activity_at = now
+        await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
