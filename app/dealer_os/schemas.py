@@ -559,6 +559,7 @@ class RepAppointmentCreate(BaseModel):
     duration_min: int | None = Field(default=None, ge=15, le=180)
     timezone: str | None = Field(default=None, max_length=80)
     invitee_name: str = Field(min_length=1, max_length=160)
+    company: str | None = Field(default=None, max_length=180)
     invitee_email: str | None = Field(default=None, max_length=320)
     invitee_phone: str | None = Field(default=None, max_length=32)
     join_url: str | None = Field(default=None, max_length=500)
@@ -572,6 +573,7 @@ class RepAppointmentCreate(BaseModel):
 
 
 class RepAppointmentPatch(BaseModel):
+    dealer_id: UUID | None = None
     starts_at: datetime | None = None
     status: Literal["pending", "confirmed", "cancelled", "done"] | None = None
     join_url: str | None = Field(default=None, max_length=500)
@@ -749,6 +751,9 @@ class DeliveryRowRead(BaseModel):
 
 class VerificationRead(BaseModel):
     bank_linked: bool = False
+    bank_source: Literal["plaid", "upload", "none"] = "none"
+    statement_months: list[str] = []
+    missing_statement_months: list[str] = []
     credit_returned: bool = False
     unlocked: bool = False
     returned: int = 0
@@ -1286,6 +1291,23 @@ class ClientRequestResult(BaseModel):
     emailed: bool = False
     texted: bool = False
     detail: str | None = None
+
+
+class BankUploadRequestResult(ClientRequestResult):
+    bucket_id: UUID | None = None
+    upload_link_id: UUID | None = None
+    requested_document_id: UUID | None = None
+
+
+class BankEvidenceRead(BaseModel):
+    bank_linked: bool = False
+    bank_source: Literal["plaid", "upload", "none"] = "none"
+    statement_months: list[str] = []
+    missing_statement_months: list[str] = []
+    statement_target: int = 6
+    bucket_id: UUID | None = None
+    upload_url: str | None = None
+    passcode: str | None = None
 
 
 class DocRequestPatch(BaseModel):
@@ -2261,6 +2283,31 @@ class RepFileRow(ORM):
     last_activity: datetime | None = None
 
 
+class RepCategoryMetric(BaseModel):
+    industry: str
+    opened: int = 0
+    approved_or_fundable: int = 0
+
+
+class RepAmountMetric(BaseModel):
+    average_requested: float | None = None
+    average_approved: float | None = None
+    approved_amount_source: str = "none"
+    approved_amount_source_counts: dict[str, int] = {}
+
+
+class RepProductionInsights(BaseModel):
+    underwriting_ready: int = 0
+    approved_or_fundable: int = 0
+    underwriting_ready_ratio: float | None = None
+    approved_or_fundable_ratio: float | None = None
+    document_ratio: float | None = None
+    contract_execution_ratio: float | None = None
+    amount_metrics: RepAmountMetric = Field(default_factory=RepAmountMetric)
+    top_new_app_industries: list[RepCategoryMetric] = []
+    top_approved_industries: list[RepCategoryMetric] = []
+
+
 class RepFunnel(BaseModel):
     """Where files stop.
 
@@ -2299,6 +2346,7 @@ class RepProduction(BaseModel):
     fundable: int = 0
     avg_score: float | None = None
     last_activity: datetime | None = None
+    insights: RepProductionInsights = Field(default_factory=RepProductionInsights)
     files: list[RepFileRow] = []
 
 

@@ -116,6 +116,9 @@ from .schemas import (
     CashImportResult,
     RepProductionRead,
     RepProduction,
+    RepProductionInsights,
+    RepAmountMetric,
+    RepCategoryMetric,
     RepFileRow,
     CreditInviteRequest,
     CreditInviteResult,
@@ -143,6 +146,8 @@ from .schemas import (
     RoomPlaidExchange,
     ClientRequestResult,
     ClientRequestSend,
+    BankEvidenceRead,
+    BankUploadRequestResult,
     SignatureRequestSend,
     AIThreadMessage,
     MessageEdit,
@@ -280,7 +285,7 @@ from .schemas import (
     UnderwritingReviewPreferenceCreate,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, archive, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -649,7 +654,7 @@ async def send_bank_connect_invite(
     room = await client_room.ensure_room(db, dealer)
     delivery = await _notify_client_request(
         db, dealer, user,
-        purpose="send us your recent bank statements",
+        purpose="connect your business bank account with Plaid",
         path=room.url,
         channel=req.channel,
         action="client_request.bank_connect",
@@ -662,6 +667,91 @@ async def send_bank_connect_invite(
         emailed=delivery.email_ok,
         texted=delivery.sms_ok,
         detail=delivery.detail,
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/bank-upload-request",
+    response_model=BankUploadRequestResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_bank_upload_request(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    payload: ClientRequestSend | None = None,
+) -> BankUploadRequestResult:
+    """Ask the owner to upload statements instead of connecting Plaid."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    req = payload or ClientRequestSend()
+    requested = await client_room.request_document(
+        db,
+        dealer,
+        name="Last 6 months business bank statements",
+        description=(
+            "Upload the six most recent completed months of business bank statements. "
+            "PDF statements are preferred."
+        ),
+        category="financials",
+        required=True,
+    )
+    room = await client_room.ensure_room(db, dealer)
+    delivery = await _notify_client_request(
+        db,
+        dealer,
+        user,
+        purpose="upload the last 6 months of business bank statements",
+        path=room.url,
+        channel=req.channel,
+        action="client_request.bank_upload",
+    )
+    await db.commit()
+    return BankUploadRequestResult(
+        url=room.url,
+        passcode=room.passcode,
+        delivered=delivery.ok,
+        emailed=delivery.email_ok,
+        texted=delivery.sms_ok,
+        detail=delivery.detail,
+        bucket_id=dealer.bucket_id,
+        upload_link_id=room.link.id,
+        requested_document_id=requested.id,
+    )
+
+
+@router.get("/dealers/{dealer_id}/bank-evidence", response_model=BankEvidenceRead)
+async def bank_evidence(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BankEvidenceRead:
+    """Current bank evidence source and statement-month coverage for Step 2."""
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    ver = await _assess_verification(db, dealer)
+    room_url: str | None = None
+    passcode: str | None = None
+    if dealer.bucket_id is not None:
+        link = (
+            await db.execute(
+                select(BucketUploadLink)
+                .where(
+                    BucketUploadLink.bucket_id == dealer.bucket_id,
+                    BucketUploadLink.status == "active",
+                )
+                .order_by(BucketUploadLink.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if link is not None:
+            room_url = client_room.room_url(link.token)
+    return BankEvidenceRead(
+        bank_linked=ver.bank_linked,
+        bank_source=ver.bank_source if ver.bank_source in {"plaid", "upload"} else "none",
+        statement_months=ver.statement_months,
+        missing_statement_months=ver.missing_statement_months,
+        bucket_id=dealer.bucket_id,
+        upload_url=room_url,
+        passcode=passcode,
     )
 
 
@@ -1431,6 +1521,49 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
     return row
 
 
+async def _statement_month_coverage(
+    db: AsyncSession, dealer_id: UUID
+) -> tuple[list[str], list[str]]:
+    """Statement months covered by extracted uploads or financial periods."""
+    months: set[str] = set()
+    period_rows = (
+        await db.execute(
+            select(
+                DealerFinancialPeriod.period,
+                DealerFinancialPeriod.deposits,
+                DealerFinancialPeriod.withdrawals,
+            ).where(DealerFinancialPeriod.dealer_id == dealer_id)
+        )
+    ).all()
+    for period, deposits, withdrawals in period_rows:
+        if deposits is not None or withdrawals is not None:
+            months.add(f"{period.year:04d}-{period.month:02d}")
+
+    doc_rows = (
+        await db.execute(
+            select(
+                DealerDocument.kind,
+                DealerDocument.detected_kind,
+                DealerDocument.extracted,
+            ).where(
+                DealerDocument.dealer_id == dealer_id,
+                DealerDocument.status == "extracted",
+            )
+        )
+    ).all()
+    for kind, detected_kind, extracted in doc_rows:
+        effective = detected_kind or _KIND_TO_DETECTED.get(kind)
+        if effective != "bank_statement":
+            continue
+        for m in (extracted or {}).get("months") or []:
+            key = str(m.get("month") or "") if isinstance(m, dict) else ""
+            if _COVERAGE_MONTH_RE.match(key):
+                months.add(key)
+
+    freshness = recurrence.compute_freshness(months, date.today())
+    return sorted(months), list(freshness.get("missing_months") or [])
+
+
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     """Read the two authorizations off the file.
 
@@ -1442,7 +1575,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     principals and only the guarantor is pulled, so requiring all of them would
     gate on work nobody intends to do.
     """
-    bank_linked = bool(
+    plaid_linked = bool(
         (
             await db.execute(
                 select(DealerPlaidItem.id).where(
@@ -1452,6 +1585,10 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
             )
         ).scalar_one_or_none()
     )
+    statement_months, missing_statement_months = await _statement_month_coverage(db, dealer.id)
+    upload_linked = len(statement_months) >= 6 and not missing_statement_months
+    bank_linked = plaid_linked or upload_linked
+    bank_source = "plaid" if plaid_linked else ("upload" if upload_linked else "none")
     credit_returned = bool(
         (
             await db.execute(
@@ -1463,7 +1600,11 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         ).scalar_one_or_none()
     )
     return decision.assess_verification(
-        bank_linked=bank_linked, credit_returned=credit_returned
+        bank_linked=bank_linked,
+        bank_source=bank_source,
+        statement_months=statement_months,
+        missing_statement_months=missing_statement_months,
+        credit_returned=credit_returned,
     )
 
 
@@ -3271,58 +3412,9 @@ async def _ingest_bucket_file_core(
     return doc
 
 
-MAX_AUTO_INGEST = 60
-
-
 async def _background_ingest_bucket_files(dealer_id: UUID) -> None:
-    """Auto-ingest every not-yet-ingested file in the dealer's linked bucket.
-    Ingestion is not optional — linking a bucket IS the instruction to pull
-    its data into the metrics pipeline. Own session per file so one failure
-    never poisons the rest; cached analyses map with zero model calls."""
-    try:
-        async with SessionLocal() as db:
-            dealer = await db.get(DealerBusiness, dealer_id)
-            if dealer is None or dealer.bucket_id is None:
-                return
-            ingested = set(
-                (
-                    await db.execute(
-                        select(DealerDocument.bucket_file_id).where(
-                            DealerDocument.dealer_id == dealer_id,
-                            DealerDocument.bucket_file_id.is_not(None),
-                        )
-                    )
-                ).scalars().all()
-            )
-            file_ids = [
-                fid
-                for fid in (
-                    await db.execute(
-                        select(BucketFile.id)
-                        .where(
-                            BucketFile.bucket_id == dealer.bucket_id,
-                            BucketFile.deleted_at.is_(None),
-                        )
-                        .order_by(BucketFile.created_at.asc())
-                    )
-                ).scalars().all()
-                if fid not in ingested
-            ][:MAX_AUTO_INGEST]
-        for fid in file_ids:
-            async with SessionLocal() as db:
-                try:
-                    dealer = await db.get(DealerBusiness, dealer_id)
-                    if dealer is None:
-                        return
-                    await _ingest_bucket_file_core(db, dealer, fid)
-                    await db.commit()
-                except Exception:
-                    logger.exception(
-                        "dealer-os: auto-ingest failed for bucket file %s (dealer %s)",
-                        fid, dealer_id,
-                    )
-    except Exception:
-        logger.exception("dealer-os: auto-ingest sweep failed for dealer %s", dealer_id)
+    """Compatibility wrapper for older background-task call sites."""
+    await bucket_ingest.auto_ingest_dealer_bucket_files(dealer_id)
 
 
 @router.post("/dealers/{dealer_id}/bucket-files/ingest-all")
@@ -4467,6 +4559,7 @@ async def create_standalone_rep_appointment(
     description = (
         "Standalone rep appointment.\n"
         f"Kind: {payload.kind}\n"
+        f"Company: {payload.company or '(not provided)'}\n"
         f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
         f"Notes:\n{payload.notes or '(none)'}"
     )
@@ -4514,7 +4607,7 @@ async def create_standalone_rep_appointment(
         owner_user_id=user.id,
         dealer_id=None,
         full_name=payload.invitee_name,
-        company=None,
+        company=payload.company,
         email=payload.invitee_email.strip().lower() if payload.invitee_email else None,
         phone_e164=phone,
         source="appointment",
@@ -4618,6 +4711,7 @@ async def create_rep_appointment(
     description = (
         f"Rep appointment for {dealer.name}.\n"
         f"Kind: {payload.kind}\n"
+        f"Company: {payload.company or dealer.name or '(not provided)'}\n"
         f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
         f"Notes:\n{payload.notes or '(none)'}"
     )
@@ -4712,11 +4806,30 @@ async def patch_rep_appointment(
 ) -> DealerRepAppointment:
     appt = await _load_owned_appointment(db, appointment_id, user)
     before = {
+        "dealer_id": str(appt.dealer_id) if appt.dealer_id else None,
         "starts_at": appt.starts_at.isoformat(),
         "status": appt.status,
         "join_url": appt.join_url,
         "notes": appt.notes,
     }
+    if "dealer_id" in payload.model_fields_set and payload.dealer_id is not None:
+        dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
+        if appt.dealer_id != dealer.id:
+            appt.dealer_id = dealer.id
+            if appt.calendar_event_id:
+                ev = await db.get(CalendarEvent, appt.calendar_event_id)
+                if ev is not None and "Rep appointment for" not in (ev.description or ""):
+                    ev.description = f"Linked file: {dealer.name}\n\n{ev.description or ''}".strip()
+            await log_action(
+                db,
+                dealer.id,
+                user,
+                "appointment.link_file",
+                "appointment",
+                entity_id=appt.id,
+                before=before,
+                after={"dealer_id": str(dealer.id)},
+            )
     if payload.starts_at is not None:
         appt.starts_at = _to_utc_minute(payload.starts_at)
         ev = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
@@ -9049,6 +9162,7 @@ async def rep_production(
     dealer_ids = [d.id for d, _, _ in rows]
     scores: dict[UUID, float | None] = {}
     doc_counts: dict[UUID, int] = {}
+    statement_months: dict[UUID, set[str]] = {}
     if dealer_ids:
         # Latest snapshot score per dealer, one query.
         snap_rows = (
@@ -9068,6 +9182,40 @@ async def rep_production(
             )
         ).all()
         doc_counts = {did: int(n) for did, n in doc_rows}
+        period_rows = (
+            await db.execute(
+                select(
+                    DealerFinancialPeriod.dealer_id,
+                    DealerFinancialPeriod.period,
+                    DealerFinancialPeriod.deposits,
+                    DealerFinancialPeriod.withdrawals,
+                ).where(DealerFinancialPeriod.dealer_id.in_(dealer_ids))
+            )
+        ).all()
+        for did, period, deposits, withdrawals in period_rows:
+            if deposits is not None or withdrawals is not None:
+                statement_months.setdefault(did, set()).add(f"{period.year:04d}-{period.month:02d}")
+        extracted_doc_rows = (
+            await db.execute(
+                select(
+                    DealerDocument.dealer_id,
+                    DealerDocument.kind,
+                    DealerDocument.detected_kind,
+                    DealerDocument.extracted,
+                ).where(
+                    DealerDocument.dealer_id.in_(dealer_ids),
+                    DealerDocument.status == "extracted",
+                )
+            )
+        ).all()
+        for did, kind, detected_kind, extracted in extracted_doc_rows:
+            effective = detected_kind or _KIND_TO_DETECTED.get(kind)
+            if effective != "bank_statement":
+                continue
+            for m in (extracted or {}).get("months") or []:
+                key = str(m.get("month") or "") if isinstance(m, dict) else ""
+                if _COVERAGE_MONTH_RE.match(key):
+                    statement_months.setdefault(did, set()).add(key)
 
         # The funnel's three verification facts, one query each rather than
         # per-file. A desk with four hundred files in the window would
@@ -9085,6 +9233,13 @@ async def rep_production(
                 )
             ).all()
         }
+        uploaded_bank = {
+            did
+            for did, months in statement_months.items()
+            if len(months) >= 6
+            and not recurrence.compute_freshness(months, date.today()).get("missing_months")
+        }
+        linked |= uploaded_bank
         pulled = {
             did
             for (did,) in (
@@ -9110,7 +9265,11 @@ async def rep_production(
                     .where(
                         DealerAuditLog.dealer_id.in_(dealer_ids),
                         DealerAuditLog.action.in_(
-                            ["client_request.bank_connect", "owner.credit_invite"]
+                            [
+                                "client_request.bank_connect",
+                                "client_request.bank_upload",
+                                "owner.credit_invite",
+                            ]
                         ),
                     )
                     .distinct()
@@ -9121,6 +9280,11 @@ async def rep_production(
         linked, pulled, asked = set(), set(), set()
 
     by_rep: dict[UUID | None, RepProduction] = {}
+    requested_amounts: dict[UUID | None, list[float]] = {}
+    approved_amounts: dict[UUID | None, list[float]] = {}
+    approved_counts: dict[UUID | None, int] = {}
+    approved_amount_sources: dict[UUID | None, dict[str, int]] = {}
+    industry_totals: dict[UUID | None, dict[str, dict[str, int]]] = {}
     for dealer, lead, rep in rows:
         key = dealer.owner_user_id
         if key not in by_rep:
@@ -9130,9 +9294,36 @@ async def rep_production(
                 rep_email=rep.email if rep else None,
             )
         bucket = by_rep[key]
+        requested_amounts.setdefault(key, [])
+        approved_amounts.setdefault(key, [])
+        approved_counts.setdefault(key, 0)
+        approved_amount_sources.setdefault(key, {})
+        industry_totals.setdefault(key, {})
         docs = doc_counts.get(dealer.id, 0)
         score = scores.get(dealer.id)
         status_val = lead.status if lead else None
+        decision_val = lead.decision if lead else None
+        is_approved_or_fundable = decision_val == "fundable" or status_val == "complete"
+        if dealer.funding_goal is not None:
+            try:
+                goal_amount = float(dealer.funding_goal)
+            except (TypeError, ValueError):
+                goal_amount = None
+            if goal_amount is not None and goal_amount > 0:
+                requested_amounts[key].append(goal_amount)
+                if is_approved_or_fundable:
+                    approved_amounts[key].append(goal_amount)
+                    approved_amount_sources[key]["dealer_funding_goal"] = (
+                        approved_amount_sources[key].get("dealer_funding_goal", 0) + 1
+                    )
+        industry = (dealer.industry or "Uncategorized").strip() or "Uncategorized"
+        industry_bucket = industry_totals[key].setdefault(
+            industry, {"opened": 0, "approved_or_fundable": 0}
+        )
+        industry_bucket["opened"] += 1
+        if is_approved_or_fundable:
+            approved_counts[key] += 1
+            industry_bucket["approved_or_fundable"] += 1
 
         # Measured at the verification line rather than at file-open, which is
         # the whole point of the funnel: opening a file costs a rep nothing.
@@ -9160,7 +9351,7 @@ async def rep_production(
                 state=dealer.state,
                 industry=dealer.industry,
                 status=status_val,
-                decision=lead.decision if lead else None,
+                decision=decision_val,
                 score=score,
                 documents=docs,
                 created_at=dealer.created_at,
@@ -9179,7 +9370,7 @@ async def rep_production(
                 bucket.stalled += 1
         else:
             bucket.active += 1
-        if (lead.decision if lead else None) == "fundable":
+        if decision_val == "fundable":
             bucket.fundable += 1
         if bucket.last_activity is None or (
             dealer.updated_at and dealer.updated_at > bucket.last_activity
@@ -9190,6 +9381,67 @@ async def rep_production(
         seen = [f.score for f in bucket.files if f.score is not None]
         bucket.avg_score = round(sum(seen) / len(seen), 1) if seen else None
         bucket.files.sort(key=lambda f: f.created_at, reverse=True)
+        key = bucket.rep_user_id
+        requested = requested_amounts.get(key, [])
+        approved = approved_amounts.get(key, [])
+        approved_or_fundable = approved_counts.get(key, 0)
+        sources = approved_amount_sources.get(key, {})
+        industries = industry_totals.get(key, {})
+        source_label = "none"
+        if sources:
+            source_label = "mixed" if len(sources) > 1 else next(iter(sources))
+        bucket.insights = RepProductionInsights(
+            underwriting_ready=bucket.funnel.verified,
+            approved_or_fundable=approved_or_fundable,
+            underwriting_ready_ratio=(
+                round(bucket.funnel.verified / bucket.files_opened * 100, 1)
+                if bucket.files_opened
+                else None
+            ),
+            approved_or_fundable_ratio=(
+                round(approved_or_fundable / bucket.files_opened * 100, 1)
+                if bucket.files_opened
+                else None
+            ),
+            document_ratio=(
+                round(bucket.with_documents / bucket.files_opened * 100, 1)
+                if bucket.files_opened
+                else None
+            ),
+            contract_execution_ratio=(
+                round(bucket.funnel.contract_executed / bucket.files_opened * 100, 1)
+                if bucket.files_opened
+                else None
+            ),
+            amount_metrics=RepAmountMetric(
+                average_requested=round(sum(requested) / len(requested), 2) if requested else None,
+                average_approved=round(sum(approved) / len(approved), 2) if approved else None,
+                approved_amount_source=source_label,
+                approved_amount_source_counts=sources,
+            ),
+            top_new_app_industries=[
+                RepCategoryMetric(
+                    industry=name,
+                    opened=counts["opened"],
+                    approved_or_fundable=counts["approved_or_fundable"],
+                )
+                for name, counts in sorted(
+                    industries.items(), key=lambda item: (-item[1]["opened"], item[0])
+                )[:6]
+            ],
+            top_approved_industries=[
+                RepCategoryMetric(
+                    industry=name,
+                    opened=counts["opened"],
+                    approved_or_fundable=counts["approved_or_fundable"],
+                )
+                for name, counts in sorted(
+                    industries.items(),
+                    key=lambda item: (-item[1]["approved_or_fundable"], -item[1]["opened"], item[0]),
+                )
+                if counts["approved_or_fundable"] > 0
+            ][:6],
+        )
 
     reps = sorted(by_rep.values(), key=lambda r: (-r.files_opened, r.rep_name))
 
@@ -9216,6 +9468,77 @@ async def rep_production(
     all_scores = [f.score for r in reps for f in r.files if f.score is not None]
     totals.avg_score = round(sum(all_scores) / len(all_scores), 1) if all_scores else None
     totals.last_activity = max((r.last_activity for r in reps if r.last_activity), default=None)
+    all_requested = [amount for values in requested_amounts.values() for amount in values]
+    all_approved = [amount for values in approved_amounts.values() for amount in values]
+    all_sources: dict[str, int] = {}
+    for source_counts in approved_amount_sources.values():
+        for source, count in source_counts.items():
+            all_sources[source] = all_sources.get(source, 0) + count
+    total_industries: dict[str, dict[str, int]] = {}
+    for per_rep in industry_totals.values():
+        for name, counts in per_rep.items():
+            target = total_industries.setdefault(name, {"opened": 0, "approved_or_fundable": 0})
+            target["opened"] += counts["opened"]
+            target["approved_or_fundable"] += counts["approved_or_fundable"]
+    total_approved_or_fundable = sum(approved_counts.values())
+    totals.insights = RepProductionInsights(
+        underwriting_ready=totals.funnel.verified,
+        approved_or_fundable=total_approved_or_fundable,
+        underwriting_ready_ratio=(
+            round(totals.funnel.verified / totals.files_opened * 100, 1)
+            if totals.files_opened
+            else None
+        ),
+        approved_or_fundable_ratio=(
+            round(total_approved_or_fundable / totals.files_opened * 100, 1)
+            if totals.files_opened
+            else None
+        ),
+        document_ratio=(
+            round(totals.with_documents / totals.files_opened * 100, 1)
+            if totals.files_opened
+            else None
+        ),
+        contract_execution_ratio=(
+            round(totals.funnel.contract_executed / totals.files_opened * 100, 1)
+            if totals.files_opened
+            else None
+        ),
+        amount_metrics=RepAmountMetric(
+            average_requested=round(sum(all_requested) / len(all_requested), 2)
+            if all_requested
+            else None,
+            average_approved=round(sum(all_approved) / len(all_approved), 2)
+            if all_approved
+            else None,
+            approved_amount_source=(
+                "mixed" if len(all_sources) > 1 else (next(iter(all_sources)) if all_sources else "none")
+            ),
+            approved_amount_source_counts=all_sources,
+        ),
+        top_new_app_industries=[
+            RepCategoryMetric(
+                industry=name,
+                opened=counts["opened"],
+                approved_or_fundable=counts["approved_or_fundable"],
+            )
+            for name, counts in sorted(
+                total_industries.items(), key=lambda item: (-item[1]["opened"], item[0])
+            )[:6]
+        ],
+        top_approved_industries=[
+            RepCategoryMetric(
+                industry=name,
+                opened=counts["opened"],
+                approved_or_fundable=counts["approved_or_fundable"],
+            )
+            for name, counts in sorted(
+                total_industries.items(),
+                key=lambda item: (-item[1]["approved_or_fundable"], -item[1]["opened"], item[0]),
+            )
+            if counts["approved_or_fundable"] > 0
+        ][:6],
+    )
 
     return RepProductionRead(since=since, totals=totals, reps=reps)
 

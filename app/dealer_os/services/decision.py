@@ -53,6 +53,10 @@ class Verification:
     """
 
     bank_linked: bool = False
+    bank_source: str = "none"
+    """plaid | upload | none — why the bank side of the gate is satisfied."""
+    statement_months: list[str] = field(default_factory=list)
+    missing_statement_months: list[str] = field(default_factory=list)
     credit_returned: bool = False
     unlocked: bool = False
     returned: int = 0
@@ -86,7 +90,14 @@ def credit_pull_available() -> bool:
     )
 
 
-def assess_verification(*, bank_linked: bool, credit_returned: bool) -> Verification:
+def assess_verification(
+    *,
+    bank_linked: bool,
+    credit_returned: bool,
+    bank_source: str | None = None,
+    statement_months: list[str] | None = None,
+    missing_statement_months: list[str] | None = None,
+) -> Verification:
     """PURE. Both must return; neither alone is enough.
 
     The bank connection is what computes the metrics, and the credit band is
@@ -103,6 +114,9 @@ def assess_verification(*, bank_linked: bool, credit_returned: bool) -> Verifica
         reason = "Awaiting both authorizations"
     return Verification(
         bank_linked=bank_linked,
+        bank_source=bank_source or ("plaid" if bank_linked else "none"),
+        statement_months=list(statement_months or []),
+        missing_statement_months=list(missing_statement_months or []),
         credit_returned=credit_returned,
         unlocked=unlocked,
         returned=returned,

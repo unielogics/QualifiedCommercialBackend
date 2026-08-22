@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 import boto3
 from botocore.config import Config
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
@@ -21,6 +21,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 from app.config import get_settings
 from app.db import get_db
 from app.deps import require_role
+from app.dealer_os.services.bucket_ingest import auto_ingest_bucket_files_for_bucket
 from app.enums import Role
 from app.models.bucket import (
     Bucket,
@@ -1743,6 +1744,7 @@ async def admin_upload_init(
 async def admin_upload_complete(
     bucket_id: UUID,
     payload: BucketUploadComplete,
+    background: BackgroundTasks,
     request: Request,
     user: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
@@ -1803,6 +1805,7 @@ async def admin_upload_complete(
         logging.getLogger(__name__).exception("enqueue file analysis failed bucket=%s file=%s", bucket_id, file.id)
     await db.commit()
     await db.refresh(file)
+    background.add_task(auto_ingest_bucket_files_for_bucket, bucket_id)
     return file
 
 
@@ -2318,6 +2321,7 @@ async def request_upload_init(
 async def request_upload_complete(
     token: str,
     payload: BucketUploadComplete,
+    background: BackgroundTasks,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> BucketFile:
@@ -2356,6 +2360,7 @@ async def request_upload_complete(
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", link.bucket_id, file.id)
     await db.commit()
     await db.refresh(file)
+    background.add_task(auto_ingest_bucket_files_for_bucket, link.bucket_id)
     return file
 
 

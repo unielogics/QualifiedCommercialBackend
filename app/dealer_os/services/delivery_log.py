@@ -34,6 +34,7 @@ __all__ = ["DeliveryRow", "build"]
 # else in the audit trail is desk activity, not something asked of the client.
 _REQUESTS: dict[str, tuple[str, str]] = {
     "client_request.bank_connect": ("Bank connection", "bank"),
+    "client_request.bank_upload": ("Statement upload", "bank"),
     "client_request.document": ("Document request", "document"),
     "client_request.signature": ("Signature request", "signature"),
     "owner.credit_invite": ("Credit authorization", "credit"),
