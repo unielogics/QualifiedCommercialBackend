@@ -477,6 +477,24 @@ class LanguageUpdate(BaseModel):
     preferred_language: Language
 
 
+class AdminLeadContactUpdate(BaseModel):
+    """Editable operator-facing identity and request fields for one intake."""
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=180)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=48)
+    business_name: str | None = Field(default=None, max_length=180)
+    loan_purpose: str | None = Field(default=None, max_length=255)
+    requested_loan_amount: float | None = Field(default=None, ge=0)
+    estimated_credit_score: int | None = Field(default=None, ge=300, le=850)
+    referral_source: str | None = Field(default=None, max_length=180)
+
+    @field_validator("phone", "business_name", "loan_purpose", "referral_source", mode="before")
+    @classmethod
+    def blank_to_none(cls, value: object) -> object:
+        return None if value == "" else value
+
+
 class DealerLeadNoteCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
 
@@ -917,6 +935,7 @@ class DealerIntakeRead(ORMModel):
     id: UUID
     client_id: UUID | None
     bucket_id: UUID
+    bucket_name: str | None = None
     bucket_upload_link_id: UUID | None
     latest_review_id: UUID | None
     variant: str
@@ -4539,6 +4558,7 @@ async def _response(
         else []
     )
     intake_read = DealerIntakeRead.model_validate(intake)
+    intake_read.bucket_name = intake.bucket.name
     # Redact internal-only data from the public/uploader payload. The dealer
     # sees only whitelisted intake_state keys and a sanitized review result.
     intake_read.intake_state = _client_safe_intake_state(intake.intake_state)
@@ -6410,6 +6430,44 @@ async def update_lead_language(
     await _log(
         db, intake.bucket_id, "dealer_ai_lead_language_changed", request=request, user=user,
         target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.preferred_language,
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake.id)
+    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
+
+
+@admin_router.patch("/{intake_id}/contact", response_model=DealerIntakeResponse)
+async def update_lead_contact(
+    intake_id: UUID,
+    payload: AdminLeadContactUpdate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Admin-only correction of the person, entity, and request summary.
+
+    These fields belong to the intake. The linked Client record is not changed
+    because one client can own multiple files with different entity contacts.
+    """
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    values = payload.model_dump(exclude_unset=True)
+    if "full_name" in values and values["full_name"] is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Principal name is required")
+    if "email" in values and values["email"] is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Email is required")
+    for field, value in values.items():
+        setattr(intake, field, str(value) if field == "email" and value is not None else value)
+    changed = ", ".join(sorted(values)) or "No fields changed"
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_lead_contact_updated",
+        request=request,
+        user=user,
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"Updated fields: {changed}",
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
