@@ -4608,6 +4608,31 @@ async def booking_availability(
     return await _booking_slots(db, host, booking, duration_min=duration_min)
 
 
+@router.get("/appointments", response_model=list[RepAppointmentRead])
+async def list_all_rep_appointments(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    starts_from: datetime | None = Query(default=None, alias="from"),
+    starts_to: datetime | None = Query(default=None, alias="to"),
+    limit: int = Query(default=250, ge=1, le=500),
+) -> list[DealerRepAppointment]:
+    require_team_or_rep(user)
+    q = select(DealerRepAppointment)
+    if user.role == Role.FIELD_REP:
+        q = q.where(DealerRepAppointment.owner_user_id == user.id)
+    if starts_from is not None:
+        q = q.where(DealerRepAppointment.starts_at >= _to_utc_minute(starts_from))
+    if starts_to is not None:
+        q = q.where(DealerRepAppointment.starts_at <= _to_utc_minute(starts_to))
+    return list(
+        (
+            await db.execute(
+                q.order_by(DealerRepAppointment.starts_at.asc()).limit(limit)
+            )
+        ).scalars().all()
+    )
+
+
 @router.post("/appointments", response_model=RepAppointmentRead, status_code=status.HTTP_201_CREATED)
 async def create_standalone_rep_appointment(
     payload: RepAppointmentCreate,
