@@ -2289,6 +2289,15 @@ class RepCategoryMetric(BaseModel):
     approved_or_fundable: int = 0
 
 
+class RepLocationMetric(BaseModel):
+    location: str
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    opened: int = 0
+    approved_or_fundable: int = 0
+
+
 class RepAmountMetric(BaseModel):
     average_requested: float | None = None
     average_approved: float | None = None
@@ -2306,6 +2315,10 @@ class RepProductionInsights(BaseModel):
     amount_metrics: RepAmountMetric = Field(default_factory=RepAmountMetric)
     top_new_app_industries: list[RepCategoryMetric] = []
     top_approved_industries: list[RepCategoryMetric] = []
+    top_new_app_towns: list[RepLocationMetric] = []
+    top_approved_towns: list[RepLocationMetric] = []
+    top_new_app_zip_codes: list[RepLocationMetric] = []
+    top_approved_zip_codes: list[RepLocationMetric] = []
 
 
 class RepFunnel(BaseModel):

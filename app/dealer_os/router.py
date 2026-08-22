@@ -119,6 +119,7 @@ from .schemas import (
     RepProductionInsights,
     RepAmountMetric,
     RepCategoryMetric,
+    RepLocationMetric,
     RepFileRow,
     CreditInviteRequest,
     CreditInviteResult,
@@ -4352,16 +4353,24 @@ async def _ensure_rep_thread(
     channel: str,
     subject: str,
     source: str,
+    dealer_scoped: bool = False,
 ) -> DealerRepInboxThread:
+    filters = [
+        DealerRepInboxThread.owner_user_id == owner_user_id,
+        DealerRepInboxThread.contact_id == contact.id,
+        DealerRepInboxThread.channel == channel,
+        DealerRepInboxThread.status == "open",
+    ]
+    if dealer_scoped:
+        filters.append(
+            DealerRepInboxThread.dealer_id == dealer_id
+            if dealer_id is not None
+            else DealerRepInboxThread.dealer_id.is_(None)
+        )
     row = (
         await db.execute(
             select(DealerRepInboxThread)
-            .where(
-                DealerRepInboxThread.owner_user_id == owner_user_id,
-                DealerRepInboxThread.contact_id == contact.id,
-                DealerRepInboxThread.channel == channel,
-                DealerRepInboxThread.status == "open",
-            )
+            .where(*filters)
             .order_by(DealerRepInboxThread.updated_at.desc())
         )
     ).scalar_one_or_none()
@@ -4444,6 +4453,67 @@ def _thread_read(thread: DealerRepInboxThread, contact: DealerRepContact | None)
         company=contact.company if contact else None,
         created_at=thread.created_at,
         updated_at=thread.updated_at,
+    )
+
+
+async def _mirror_file_message_to_rep_inbox(
+    db: AsyncSession,
+    *,
+    dealer: DealerBusiness,
+    user: User,
+    message: DealerMessage,
+) -> None:
+    """Mirror client-facing file messages into the rep inbox.
+
+    Desk notes stay only on the file. The inbox is the controlled outreach
+    surface, so it should show the same client conversation history and unread
+    client replies without making private underwriting notes look sendable.
+    """
+    if message.channel not in CLIENT_VISIBLE_CHANNELS:
+        return
+    owner_user_id = dealer.owner_user_id
+    if owner_user_id is None:
+        if user.role == Role.DEALER:
+            return
+        owner_user_id = user.id
+
+    phone = consent_delivery.normalize_phone(dealer.phone)
+    email = dealer.email.strip().lower() if dealer.email else None
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=owner_user_id,
+        dealer_id=dealer.id,
+        full_name=dealer.name or "Business owner",
+        company=dealer.name,
+        email=email,
+        phone_e164=phone,
+        source="file_message",
+    )
+    thread_channel = "email" if email else "sms"
+    thread = await _ensure_rep_thread(
+        db,
+        owner_user_id=owner_user_id,
+        contact=contact,
+        dealer_id=dealer.id,
+        channel=thread_channel,
+        subject=f"File messages: {dealer.name}",
+        source="file_message",
+        dealer_scoped=True,
+    )
+    direction = "inbound" if user.role == Role.DEALER else "outbound"
+    await _append_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        direction=direction,
+        channel=thread_channel,
+        subject=thread.subject,
+        body=message.body,
+        provider="file_message",
+        provider_message_id=str(message.id),
+        delivery_status="stored",
+        sender=user.email,
+        recipient=email or phone,
     )
 
 
@@ -5065,6 +5135,7 @@ async def create_contact_share(
             channel="email",
             subject=copy.subject,
             source="contact_share",
+            dealer_scoped=dealer is not None,
         )
         await _append_rep_inbox_message(
             db,
@@ -5103,6 +5174,7 @@ async def create_contact_share(
             channel="sms",
             subject=copy.subject,
             source="contact_share",
+            dealer_scoped=dealer is not None,
         )
         await _append_rep_inbox_message(
             db,
@@ -5296,6 +5368,7 @@ async def create_rep_inbox_thread(
             channel=channel,
             subject=payload.subject,
             source="manual",
+            dealer_scoped=dealer is not None,
         )
         provider = None
         provider_id = None
@@ -5339,6 +5412,16 @@ async def create_rep_inbox_thread(
         result_messages.append(msg)
 
     if dealer is not None:
+        db.add(
+            DealerMessage(
+                dealer_id=dealer.id,
+                author_user_id=user.id,
+                author_name=user.name,
+                body=payload.body,
+                internal=False,
+                channel="client",
+            )
+        )
         await log_action(
             db,
             dealer.id,
@@ -5484,6 +5567,18 @@ async def create_rep_inbox_message(
         sender=sender,
         recipient=recipient,
     )
+    if thread.dealer_id is not None:
+        dealer = await resolve_dealer_scope(db, user, thread.dealer_id)
+        db.add(
+            DealerMessage(
+                dealer_id=dealer.id,
+                author_user_id=user.id,
+                author_name=user.name,
+                body=payload.body,
+                internal=False,
+                channel="client",
+            )
+        )
     await db.commit()
     await db.refresh(msg)
     return msg
@@ -5621,6 +5716,8 @@ async def create_message(
         channel=channel,
     )
     db.add(message)
+    await db.flush()
+    await _mirror_file_message_to_rep_inbox(db, dealer=dealer, user=user, message=message)
     await db.commit()
     await db.refresh(message)
     return message
@@ -9126,6 +9223,47 @@ async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
 # --- Field-rep production (0130) ----------------------------------------------
 
 
+def _town_key(dealer: DealerBusiness) -> str:
+    city = (dealer.city or "").strip()
+    state = (dealer.state or "").strip()
+    label = ", ".join(part for part in (city, state) if part)
+    return label or "Unknown town"
+
+
+def _location_rows(
+    rows: dict[str, dict[str, object]],
+    *,
+    approved_only: bool = False,
+    limit: int = 6,
+) -> list[RepLocationMetric]:
+    ordered = sorted(
+        rows.items(),
+        key=lambda item: (
+            -int(item[1].get("approved_or_fundable" if approved_only else "opened") or 0),
+            -int(item[1].get("opened") or 0),
+            item[0],
+        ),
+    )
+    out: list[RepLocationMetric] = []
+    for label, counts in ordered:
+        approved = int(counts.get("approved_or_fundable") or 0)
+        if approved_only and approved <= 0:
+            continue
+        out.append(
+            RepLocationMetric(
+                location=label,
+                city=counts.get("city") if isinstance(counts.get("city"), str) else None,
+                state=counts.get("state") if isinstance(counts.get("state"), str) else None,
+                zip=counts.get("zip") if isinstance(counts.get("zip"), str) else None,
+                opened=int(counts.get("opened") or 0),
+                approved_or_fundable=approved,
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 @router.get("/rep-production", response_model=RepProductionRead)
 async def rep_production(
     user: CurrentUser,
@@ -9285,6 +9423,8 @@ async def rep_production(
     approved_counts: dict[UUID | None, int] = {}
     approved_amount_sources: dict[UUID | None, dict[str, int]] = {}
     industry_totals: dict[UUID | None, dict[str, dict[str, int]]] = {}
+    town_totals: dict[UUID | None, dict[str, dict[str, object]]] = {}
+    zip_totals: dict[UUID | None, dict[str, dict[str, object]]] = {}
     for dealer, lead, rep in rows:
         key = dealer.owner_user_id
         if key not in by_rep:
@@ -9299,6 +9439,8 @@ async def rep_production(
         approved_counts.setdefault(key, 0)
         approved_amount_sources.setdefault(key, {})
         industry_totals.setdefault(key, {})
+        town_totals.setdefault(key, {})
+        zip_totals.setdefault(key, {})
         docs = doc_counts.get(dealer.id, 0)
         score = scores.get(dealer.id)
         status_val = lead.status if lead else None
@@ -9324,6 +9466,36 @@ async def rep_production(
         if is_approved_or_fundable:
             approved_counts[key] += 1
             industry_bucket["approved_or_fundable"] += 1
+
+        town_label = _town_key(dealer)
+        town_bucket = town_totals[key].setdefault(
+            town_label,
+            {
+                "opened": 0,
+                "approved_or_fundable": 0,
+                "city": dealer.city,
+                "state": dealer.state,
+                "zip": None,
+            },
+        )
+        town_bucket["opened"] = int(town_bucket["opened"]) + 1
+        if is_approved_or_fundable:
+            town_bucket["approved_or_fundable"] = int(town_bucket["approved_or_fundable"]) + 1
+
+        zip_label = (dealer.zip or "").strip() or "Unknown ZIP"
+        zip_bucket = zip_totals[key].setdefault(
+            zip_label,
+            {
+                "opened": 0,
+                "approved_or_fundable": 0,
+                "city": None,
+                "state": dealer.state,
+                "zip": (dealer.zip or "").strip() or None,
+            },
+        )
+        zip_bucket["opened"] = int(zip_bucket["opened"]) + 1
+        if is_approved_or_fundable:
+            zip_bucket["approved_or_fundable"] = int(zip_bucket["approved_or_fundable"]) + 1
 
         # Measured at the verification line rather than at file-open, which is
         # the whole point of the funnel: opening a file costs a rep nothing.
@@ -9387,6 +9559,8 @@ async def rep_production(
         approved_or_fundable = approved_counts.get(key, 0)
         sources = approved_amount_sources.get(key, {})
         industries = industry_totals.get(key, {})
+        towns = town_totals.get(key, {})
+        zips = zip_totals.get(key, {})
         source_label = "none"
         if sources:
             source_label = "mixed" if len(sources) > 1 else next(iter(sources))
@@ -9441,6 +9615,10 @@ async def rep_production(
                 )
                 if counts["approved_or_fundable"] > 0
             ][:6],
+            top_new_app_towns=_location_rows(towns),
+            top_approved_towns=_location_rows(towns, approved_only=True),
+            top_new_app_zip_codes=_location_rows(zips),
+            top_approved_zip_codes=_location_rows(zips, approved_only=True),
         )
 
     reps = sorted(by_rep.values(), key=lambda r: (-r.files_opened, r.rep_name))
@@ -9480,6 +9658,40 @@ async def rep_production(
             target = total_industries.setdefault(name, {"opened": 0, "approved_or_fundable": 0})
             target["opened"] += counts["opened"]
             target["approved_or_fundable"] += counts["approved_or_fundable"]
+    total_towns: dict[str, dict[str, object]] = {}
+    for per_rep in town_totals.values():
+        for label, counts in per_rep.items():
+            target = total_towns.setdefault(
+                label,
+                {
+                    "opened": 0,
+                    "approved_or_fundable": 0,
+                    "city": counts.get("city"),
+                    "state": counts.get("state"),
+                    "zip": None,
+                },
+            )
+            target["opened"] = int(target["opened"]) + int(counts.get("opened") or 0)
+            target["approved_or_fundable"] = int(target["approved_or_fundable"]) + int(
+                counts.get("approved_or_fundable") or 0
+            )
+    total_zips: dict[str, dict[str, object]] = {}
+    for per_rep in zip_totals.values():
+        for label, counts in per_rep.items():
+            target = total_zips.setdefault(
+                label,
+                {
+                    "opened": 0,
+                    "approved_or_fundable": 0,
+                    "city": None,
+                    "state": counts.get("state"),
+                    "zip": counts.get("zip"),
+                },
+            )
+            target["opened"] = int(target["opened"]) + int(counts.get("opened") or 0)
+            target["approved_or_fundable"] = int(target["approved_or_fundable"]) + int(
+                counts.get("approved_or_fundable") or 0
+            )
     total_approved_or_fundable = sum(approved_counts.values())
     totals.insights = RepProductionInsights(
         underwriting_ready=totals.funnel.verified,
@@ -9538,6 +9750,10 @@ async def rep_production(
             )
             if counts["approved_or_fundable"] > 0
         ][:6],
+        top_new_app_towns=_location_rows(total_towns),
+        top_approved_towns=_location_rows(total_towns, approved_only=True),
+        top_new_app_zip_codes=_location_rows(total_zips),
+        top_approved_zip_codes=_location_rows(total_zips, approved_only=True),
     )
 
     return RepProductionRead(since=since, totals=totals, reps=reps)
