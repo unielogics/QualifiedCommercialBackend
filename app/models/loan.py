@@ -157,6 +157,16 @@ class Loan(TimestampMixin, Base):
     """The Deal this loan was promoted from. NULL for legacy /
     operator-created loans that didn't go through the agent flow."""
 
+    source_intake_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+    """The public AI intake promoted into this funding file. Explicit
+    lineage only; identity fields are never used to infer this link."""
+
     baseline_profile_snapshot: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True,
     )

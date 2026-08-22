@@ -13,7 +13,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
 
-
 UnifiedVertical = Literal["real_estate", "main_street", "dealer", "mca"]
 UnifiedOrigin = Literal["console", "agent", "rep", "dealer", "ai_intake"]
 UnifiedSourceKind = Literal["deal", "loan", "intake", "bucket", "dealer"]
@@ -34,6 +33,73 @@ class UnifiedDocumentProgress(BaseModel):
     signatures_uploaded: int = 0
     signatures_total: int = 0
     bucket_progress_label: str = "No room"
+
+
+class UnifiedGate(BaseModel):
+    key: str
+    label: str
+    state: Literal["locked", "ready", "passed"]
+    ready: bool
+    blockers: list[str] = Field(default_factory=list)
+
+
+class UnifiedDocumentRequirement(BaseModel):
+    key: str
+    label: str
+    kind: Literal["document", "signature"] = "document"
+    required: bool = True
+    status: Literal["missing", "requested", "received", "complete"] = "missing"
+
+
+class UnifiedDocumentPack(BaseModel):
+    vertical: UnifiedVertical
+    documents: list[UnifiedDocumentRequirement] = Field(default_factory=list)
+    signatures: list[UnifiedDocumentRequirement] = Field(default_factory=list)
+
+
+class UnifiedSource(BaseModel):
+    kind: UnifiedSourceKind
+    id: UUID
+    ref: str
+    label: str
+    relationship: str
+    route: str | None = None
+
+
+class UnifiedParticipant(BaseModel):
+    name: str
+    role: str
+    email: str | None = None
+    phone: str | None = None
+
+
+class UnifiedProfile(BaseModel):
+    shape: Literal["person", "business", "person_and_business"]
+    person: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    business: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class UnifiedActivity(BaseModel):
+    id: UUID
+    source: Literal["funding", "client", "bucket", "intake", "dealer"]
+    action: str
+    actor_name: str | None = None
+    actor_role: str | None = None
+    detail: str | None = None
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class UnifiedActionDefinition(BaseModel):
+    key: str
+    label: str
+    method: Literal["POST", "PATCH", "DELETE"]
+    path: str
+    tone: Literal["default", "danger"] = "default"
+    effects: list[str] = Field(default_factory=list)
+    reversible: bool
+    external: bool = False
+    confirmation_label: str
 
 
 class UnifiedFileRow(BaseModel):
@@ -85,7 +151,11 @@ class UnifiedFileRow(BaseModel):
     @computed_field
     @property
     def business_name(self) -> str | None:
-        if self.title and self.title != self.principal and self.source_kind in {"intake", "loan", "dealer"}:
+        if (
+            self.title
+            and self.title != self.principal
+            and self.source_kind in {"intake", "loan", "dealer"}
+        ):
             return self.title
         return None
 
@@ -112,7 +182,9 @@ class UnifiedFileRow(BaseModel):
         if self.working_stage is not None:
             return self.working_stage
         key = self.normalized_stage.lower().replace(" ", "_")
-        return UnifiedStage(key=key, label=self.normalized_stage, index=1, total=1, family="working")
+        return UnifiedStage(
+            key=key, label=self.normalized_stage, index=1, total=1, family="working"
+        )
 
     @computed_field
     @property
@@ -182,6 +254,15 @@ class UnifiedAuditItem(BaseModel):
 class UnifiedFileDetail(BaseModel):
     file: UnifiedFileRow
     audit: list[UnifiedAuditItem] = Field(default_factory=list)
+    ladder: list[UnifiedStage] = Field(default_factory=list)
+    gate: UnifiedGate
+    blockers: list[str] = Field(default_factory=list)
+    document_pack: UnifiedDocumentPack
+    linked_sources: list[UnifiedSource] = Field(default_factory=list)
+    participants: list[UnifiedParticipant] = Field(default_factory=list)
+    profile: UnifiedProfile
+    activities: list[UnifiedActivity] = Field(default_factory=list)
+    actions: list[UnifiedActionDefinition] = Field(default_factory=list)
 
 
 class BucketIntakeLinkRequest(BaseModel):
@@ -194,10 +275,56 @@ class BucketIntakeLinkRequest(BaseModel):
 
 class BucketIntakeLinkResult(BaseModel):
     ok: bool = True
+    link_id: UUID
     bucket_id: UUID
     intake_id: UUID
     relationship: Literal["primary", "supporting", "source"] = "primary"
     linked_file_ids: list[UUID]
     audit_ids: list[UUID] = Field(default_factory=list)
     audit_action: str
-    bucket_context: dict
+    review_id: UUID | None = None
+    status: Literal["active", "unlinked"] = "active"
+
+
+class BucketIntakeLinkRead(BaseModel):
+    link_id: UUID
+    bucket_id: UUID
+    intake_id: UUID
+    relationship: Literal["primary", "supporting", "source"]
+    linked_file_ids: list[UUID] = Field(default_factory=list)
+    note: str | None = None
+    status: Literal["active", "unlinked"]
+    created_at: datetime
+    updated_at: datetime
+
+
+class BucketIntakeLinkUpdate(BaseModel):
+    relationship: Literal["primary", "supporting", "source"] | None = None
+    file_ids: list[UUID] | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+
+class BucketIntakeLinkOption(BaseModel):
+    id: UUID
+    label: str
+    subtitle: str | None = None
+    file_count: int = 0
+    linked: bool = False
+
+
+class BucketIntakeLinkOptions(BaseModel):
+    buckets: list[BucketIntakeLinkOption] = Field(default_factory=list)
+    intakes: list[BucketIntakeLinkOption] = Field(default_factory=list)
+
+
+class IntakePromotionRequest(BaseModel):
+    funding_file_kind: str | None = Field(default=None, max_length=32)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class IntakePromotionResult(BaseModel):
+    intake_id: UUID
+    loan_id: UUID
+    client_id: UUID
+    created: bool
+    audit_id: UUID

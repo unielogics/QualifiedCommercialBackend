@@ -107,6 +107,7 @@ from app.models.fix_flip_scenario import FixFlipScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
+from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
 from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
 from app.models.provider_secret import ProviderSecret  # noqa: F401

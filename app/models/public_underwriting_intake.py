@@ -33,6 +33,13 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     latest_review_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_ai_reviews.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    promoted_loan_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("loans.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
     # Set only when a dealer partner (Role.DEALER_PARTNER) created this lead
     # via /broker/ai-underwriter-leads — NULL for public-site self-serve leads
     # and admin-created leads (both are house/admin-attributed).

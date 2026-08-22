@@ -15,14 +15,16 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import false as sql_false, or_, select
+from sqlalchemy import false as sql_false
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import get_db
-from app.dealer_os.models import DealerBusiness, DealerRepLead
+from app.dealer_os.models import DealerAuditLog, DealerBusiness, DealerRepLead
 from app.deps import CurrentUser
-from app.enums import Role
+from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
+from app.models.activity import Activity
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
@@ -33,19 +35,39 @@ from app.models.bucket import (
 from app.models.client import Client
 from app.models.deal import Deal
 from app.models.loan import Loan
+from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
-from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.schemas.operator_file import (
+    BucketIntakeLinkOption,
+    BucketIntakeLinkOptions,
+    BucketIntakeLinkRead,
     BucketIntakeLinkRequest,
     BucketIntakeLinkResult,
+    BucketIntakeLinkUpdate,
+    IntakePromotionRequest,
+    IntakePromotionResult,
+    UnifiedActionDefinition,
+    UnifiedActivity,
     UnifiedAuditItem,
+    UnifiedDocumentPack,
     UnifiedDocumentProgress,
+    UnifiedDocumentRequirement,
     UnifiedFileDetail,
     UnifiedFilePage,
     UnifiedFileRow,
+    UnifiedGate,
+    UnifiedParticipant,
+    UnifiedProfile,
     UnifiedRollup,
+    UnifiedSource,
     UnifiedStage,
+)
+from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
+from app.services.activity_log import log_activity
+from app.services.operator_file_links import (
+    active_links_for_sources,
+    queue_link_change_review,
 )
 
 router = APIRouter(prefix="/operator-files", tags=["operator-files"])
@@ -89,6 +111,52 @@ FUNDING_LADDER = [
     ("closing", "Closing"),
     ("funded", "Funded"),
 ]
+
+DOCUMENT_PACKS: dict[str, tuple[list[str], list[str]]] = {
+    "real_estate": (
+        [
+            "Government ID",
+            "Entity documents",
+            "Purchase contract",
+            "Property insurance",
+            "Bank statements",
+        ],
+        ["Credit authorization", "Borrower certification"],
+    ),
+    "main_street": (
+        [
+            "Government ID",
+            "Business formation",
+            "Bank statements",
+            "Profit and loss",
+            "Business tax returns",
+            "Debt schedule",
+        ],
+        ["Credit authorization", "Business application", "Owner certification"],
+    ),
+    "dealer": (
+        [
+            "Government ID",
+            "Dealer license",
+            "Bank statements",
+            "Inventory report",
+            "Business tax returns",
+            "Debt schedule",
+        ],
+        ["Credit authorization", "Dealer application", "Owner certification"],
+    ),
+    "mca": (
+        [
+            "Government ID",
+            "MCA statements",
+            "Bank statements",
+            "Merchant processing",
+            "Payoff letters",
+            "Business tax returns",
+        ],
+        ["Credit authorization", "Debt payoff authorization", "Owner certification"],
+    ),
+}
 
 CLIENT_STAGE_TO_WORKING = {
     "lead": "lead",
@@ -249,27 +317,6 @@ def _bucket_vertical(bucket: Bucket, intake: PublicUnderwritingIntake | None = N
     return "real_estate"
 
 
-def _bucket_links(bucket: Bucket | None) -> tuple[list[UUID], list[UUID]]:
-    if bucket is None:
-        return [], []
-    links = (bucket.ai_context or {}).get("unified_links")
-    if not isinstance(links, dict):
-        return [], []
-    bucket_ids: list[UUID] = []
-    intake_ids: list[UUID] = []
-    for value in links.get("bucket_ids") or []:
-        try:
-            bucket_ids.append(UUID(str(value)))
-        except (TypeError, ValueError):
-            pass
-    for value in links.get("intake_ids") or []:
-        try:
-            intake_ids.append(UUID(str(value)))
-        except (TypeError, ValueError):
-            pass
-    return bucket_ids, intake_ids
-
-
 def _document_progress(bucket: Bucket | None) -> UnifiedDocumentProgress:
     if bucket is None:
         return UnifiedDocumentProgress()
@@ -307,11 +354,13 @@ def _program_tags_for_intake(intake: PublicUnderwritingIntake) -> list[str]:
 
 
 def _program_tags_for_loan(loan: Loan) -> list[str]:
-    return _dedupe([
-        _titleize(str(loan.type) if loan.type else None),
-        _titleize(str(loan.purpose) if loan.purpose else None),
-        _titleize(loan.funding_file_kind),
-    ])
+    return _dedupe(
+        [
+            _titleize(str(loan.type) if loan.type else None),
+            _titleize(str(loan.purpose) if loan.purpose else None),
+            _titleize(loan.funding_file_kind),
+        ]
+    )
 
 
 def _dedupe(values: list[str | None]) -> list[str]:
@@ -350,21 +399,35 @@ async def _bucket_map(db: AsyncSession, bucket_ids: set[UUID]) -> dict[UUID, Buc
     if not bucket_ids:
         return {}
     rows = (
-        await db.execute(
-            _with_bucket_relationships(select(Bucket).where(Bucket.id.in_(bucket_ids), Bucket.archived_at.is_(None)))
+        (
+            await db.execute(
+                _with_bucket_relationships(
+                    select(Bucket).where(Bucket.id.in_(bucket_ids), Bucket.archived_at.is_(None))
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return {row.id: row for row in rows}
 
 
-async def _intake_by_bucket_map(db: AsyncSession, bucket_ids: set[UUID]) -> dict[UUID, PublicUnderwritingIntake]:
+async def _intake_by_bucket_map(
+    db: AsyncSession, bucket_ids: set[UUID]
+) -> dict[UUID, PublicUnderwritingIntake]:
     if not bucket_ids:
         return {}
     rows = (
-        await db.execute(
-            select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.bucket_id.in_(bucket_ids))
+        (
+            await db.execute(
+                select(PublicUnderwritingIntake).where(
+                    PublicUnderwritingIntake.bucket_id.in_(bucket_ids)
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return {row.bucket_id: row for row in rows}
 
 
@@ -413,8 +476,12 @@ async def _deal_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
                 origin="agent",
                 origin_label=ORIGIN_LABELS["agent"],
                 source_label="Realtor / mobile pipeline",
-                amount=_money(getattr(loan, "amount", None) or deal.target_price or deal.list_price),
-                amount_label=_money_label(getattr(loan, "amount", None) or deal.target_price or deal.list_price),
+                amount=_money(
+                    getattr(loan, "amount", None) or deal.target_price or deal.list_price
+                ),
+                amount_label=_money_label(
+                    getattr(loan, "amount", None) or deal.target_price or deal.list_price
+                ),
                 working_stage=working,
                 funding_stage=funding,
                 normalized_stage=normalized,
@@ -435,7 +502,7 @@ async def _loan_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     stmt = (
         select(Loan, Client)
         .join(Client, Client.id == Loan.client_id)
-        .where(Loan.source_deal_id.is_(None))
+        .where(Loan.source_deal_id.is_(None), Loan.source_intake_id.is_(None))
         .order_by(Loan.updated_at.desc())
     )
     stmt = scope_loan_query(user, stmt)
@@ -445,7 +512,9 @@ async def _loan_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
         vertical = _loan_vertical(loan)
         funding = _funding_stage(str(loan.stage))
         normalized = funding.label if funding else "Prequalified"
-        health, health_tone = _health(normalized, str(loan.deal_health) if loan.deal_health else None)
+        health, health_tone = _health(
+            normalized, str(loan.deal_health) if loan.deal_health else None
+        )
         origin = "agent" if loan.source_deal_id else "console"
         rows.append(
             UnifiedFileRow(
@@ -498,9 +567,9 @@ def _scope_intake_stmt(user: User, stmt):
             )
         )
     if user.role == Role.REGIONAL_MANAGER:
-        return stmt.join(Client, Client.id == PublicUnderwritingIntake.client_id, isouter=True).where(
-            Client.broker_id.in_(regional_manager_broker_ids_subquery(user))
-        )
+        return stmt.join(
+            Client, Client.id == PublicUnderwritingIntake.client_id, isouter=True
+        ).where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     if user.role == Role.DEALER_PARTNER:
         return stmt.where(PublicUnderwritingIntake.broker_id == user.id)
     return stmt.where(sql_false())
@@ -520,19 +589,29 @@ async def _intake_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
         .order_by(PublicUnderwritingIntake.updated_at.desc())
     )
     stmt = _scope_intake_stmt(user, stmt)
+    pairs = list((await db.execute(stmt)).all())
+    loan_ids = {
+        intake.promoted_loan_id
+        for intake, _bucket, _client, _partner in pairs
+        if intake.promoted_loan_id
+    }
+    loan_stmt = select(Loan).where(Loan.id.in_(loan_ids)) if loan_ids else None
+    visible_loans = (
+        list((await db.execute(scope_loan_query(user, loan_stmt))).scalars().all())
+        if loan_stmt is not None
+        else []
+    )
+    loan_map = {loan.id: loan for loan in visible_loans}
     rows: list[UnifiedFileRow] = []
-    for intake, bucket, client, partner in list((await db.execute(stmt)).all()):
+    for intake, bucket, client, partner in pairs:
         vertical = _variant_vertical(intake.variant)
         origin = "dealer" if intake.broker_id else "ai_intake"
         working_key = INTAKE_STATUS_TO_WORKING.get(intake.status, "applicant_intake")
         working = _working_stage(vertical, working_key)
-        normalized = working.label
+        loan = loan_map.get(intake.promoted_loan_id)
+        funding = _funding_stage(str(loan.stage)) if loan else None
+        normalized = funding.label if funding else working.label
         health, health_tone = _health(normalized, intake.outcome_status)
-        linked_bucket_ids, linked_intake_ids = _bucket_links(bucket)
-        if intake.id not in linked_intake_ids:
-            linked_intake_ids.append(intake.id)
-        if bucket.id not in linked_bucket_ids:
-            linked_bucket_ids.append(bucket.id)
         title = intake.business_name or intake.full_name
         rows.append(
             UnifiedFileRow(
@@ -548,6 +627,7 @@ async def _intake_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
                 client_name=client.name if client else intake.full_name,
                 intake_id=intake.id,
                 bucket_id=bucket.id,
+                loan_id=loan.id if loan else None,
                 vertical=vertical,  # type: ignore[arg-type]
                 vertical_label=VERTICAL_LABELS[vertical],
                 origin=origin,  # type: ignore[arg-type]
@@ -556,17 +636,24 @@ async def _intake_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
                 amount=_money(intake.requested_loan_amount),
                 amount_label=_money_label(intake.requested_loan_amount),
                 working_stage=working,
+                funding_stage=funding,
                 normalized_stage=normalized,
                 stage_tone=_stage_tone(normalized, health),
                 health=health,
                 health_tone=health_tone,  # type: ignore[arg-type]
                 document_progress=_document_progress(bucket),
-                program_tags=_program_tags_for_intake(intake),
+                program_tags=_dedupe(
+                    [
+                        *_program_tags_for_intake(intake),
+                        *(_program_tags_for_loan(loan) if loan else []),
+                    ]
+                ),
                 owner_name=partner.name if partner else None,
                 dealer_name=partner.name if intake.broker_id and partner else None,
-                linked_bucket_ids=linked_bucket_ids,
-                linked_intake_ids=linked_intake_ids,
-                updated_at=intake.updated_at,
+                linked_bucket_ids=[bucket.id],
+                linked_intake_ids=[intake.id],
+                promoted_loan_id=intake.promoted_loan_id,
+                updated_at=max(intake.updated_at, loan.updated_at) if loan else intake.updated_at,
             )
         )
     return rows
@@ -591,10 +678,9 @@ async def _bucket_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
         if bucket.id in intake_by_bucket:
             continue
         vertical = _bucket_vertical(bucket)
-        linked_bucket_ids, linked_intake_ids = _bucket_links(bucket)
-        if bucket.id not in linked_bucket_ids:
-            linked_bucket_ids.append(bucket.id)
-        working = _working_stage(vertical, "applicant_intake" if vertical != "real_estate" else "lead")
+        working = _working_stage(
+            vertical, "applicant_intake" if vertical != "real_estate" else "lead"
+        )
         health, health_tone = _health(bucket.status)
         rows.append(
             UnifiedFileRow(
@@ -619,8 +705,7 @@ async def _bucket_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
                 health_tone=health_tone,  # type: ignore[arg-type]
                 document_progress=_document_progress(bucket),
                 program_tags=[_titleize(bucket.bucket_type)],
-                linked_bucket_ids=linked_bucket_ids,
-                linked_intake_ids=linked_intake_ids,
+                linked_bucket_ids=[bucket.id],
                 updated_at=bucket.updated_at,
             )
         )
@@ -647,15 +732,14 @@ async def _dealer_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     for dealer, rep, owner in pairs:
         vertical = _dealer_vertical(dealer)
         bucket = buckets.get(dealer.bucket_id)
-        working_key = REP_STATUS_TO_WORKING.get(rep.status if rep else dealer.status, "applicant_intake")
+        working_key = REP_STATUS_TO_WORKING.get(
+            rep.status if rep else dealer.status, "applicant_intake"
+        )
         working = _working_stage(vertical, working_key)
         normalized = working.label
         health, health_tone = _health(normalized, rep.status if rep else dealer.status)
-        linked_bucket_ids, linked_intake_ids = _bucket_links(bucket)
-        if bucket and bucket.id not in linked_bucket_ids:
-            linked_bucket_ids.append(bucket.id)
-        if dealer.handoff_intake_id and dealer.handoff_intake_id not in linked_intake_ids:
-            linked_intake_ids.append(dealer.handoff_intake_id)
+        linked_bucket_ids = [bucket.id] if bucket else []
+        linked_intake_ids = [dealer.handoff_intake_id] if dealer.handoff_intake_id else []
         rows.append(
             UnifiedFileRow(
                 id=f"dealer:{dealer.id}",
@@ -694,6 +778,70 @@ async def _dealer_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     return rows
 
 
+def _merge_explicit_lineage(root: UnifiedFileRow, linked: UnifiedFileRow) -> None:
+    """Fold an explicitly linked physical source into its logical root."""
+
+    if linked.loan_id and not root.loan_id:
+        root.loan_id = linked.loan_id
+    if linked.funding_stage:
+        root.funding_stage = linked.funding_stage
+        root.normalized_stage = linked.funding_stage.label
+        root.stage_tone = linked.stage_tone
+    if linked.client_id and not root.client_id:
+        root.client_id = linked.client_id
+    if linked.client_name and not root.client_name:
+        root.client_name = linked.client_name
+    if linked.amount is not None and root.amount is None:
+        root.amount = linked.amount
+        root.amount_label = linked.amount_label
+    root.program_tags = _dedupe([*root.program_tags, *linked.program_tags])
+    root.linked_bucket_ids = list(
+        dict.fromkeys([*root.linked_bucket_ids, *linked.linked_bucket_ids])
+    )
+    root.linked_intake_ids = list(
+        dict.fromkeys([*root.linked_intake_ids, *linked.linked_intake_ids])
+    )
+    linked_total = linked.document_progress.docs_total + linked.document_progress.signatures_total
+    root_total = root.document_progress.docs_total + root.document_progress.signatures_total
+    if linked_total > root_total:
+        root.document_progress = linked.document_progress
+    root.updated_at = max(root.updated_at, linked.updated_at)
+
+
+def _collapse_logical_rows(rows: list[UnifiedFileRow]) -> list[UnifiedFileRow]:
+    """Collapse only durable lineage; names and email addresses are ignored."""
+
+    intake_roots = {row.source_id: row for row in rows if row.source_kind == "intake"}
+    suppressed: set[str] = set()
+    for dealer in [row for row in rows if row.source_kind == "dealer"]:
+        if dealer.intake_id and dealer.intake_id in intake_roots:
+            intake = intake_roots[dealer.intake_id]
+            _merge_explicit_lineage(dealer, intake)
+            suppressed.add(intake.id)
+    return [row for row in rows if row.id not in suppressed]
+
+
+async def _decorate_durable_links(rows: list[UnifiedFileRow], user: User, db: AsyncSession) -> None:
+    visible_bucket_ids = {bucket_id for row in rows for bucket_id in row.linked_bucket_ids}
+    visible_intake_ids = {intake_id for row in rows for intake_id in row.linked_intake_ids}
+    links = await active_links_for_sources(
+        db, bucket_ids=visible_bucket_ids, intake_ids=visible_intake_ids
+    )
+    for link in links:
+        # Supporting links never widen a scoped user's book. Both endpoints
+        # must already be represented by a visible source before IDs are added.
+        if user.role not in INTERNAL_ROLES and not (
+            link.bucket_id in visible_bucket_ids and link.intake_id in visible_intake_ids
+        ):
+            continue
+        for row in rows:
+            if link.bucket_id in row.linked_bucket_ids or link.intake_id in row.linked_intake_ids:
+                if link.bucket_id not in row.linked_bucket_ids:
+                    row.linked_bucket_ids.append(link.bucket_id)
+                if link.intake_id not in row.linked_intake_ids:
+                    row.linked_intake_ids.append(link.intake_id)
+
+
 async def _all_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     rows: list[UnifiedFileRow] = []
     rows.extend(await _deal_rows(user, db))
@@ -701,6 +849,8 @@ async def _all_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     rows.extend(await _intake_rows(user, db))
     rows.extend(await _bucket_rows(user, db))
     rows.extend(await _dealer_rows(user, db))
+    await _decorate_durable_links(rows, user, db)
+    rows = _collapse_logical_rows(rows)
     rows.sort(key=lambda row: row.updated_at, reverse=True)
     return rows
 
@@ -722,7 +872,8 @@ def _apply_filters(
         filtered = [
             row
             for row in filtered
-            if needle in " ".join(
+            if needle
+            in " ".join(
                 [
                     row.ref,
                     row.title,
@@ -747,7 +898,13 @@ def _rollup(rows: list[UnifiedFileRow]) -> UnifiedRollup:
         by_origin=dict(by_origin),
         by_stage=dict(by_stage),
         needs_attention=len([row for row in rows if row.health_tone in {"bad", "warn"}]),
-        promoted=len([row for row in rows if row.funding_stage is not None or row.promoted_loan_id is not None]),
+        promoted=len(
+            [
+                row
+                for row in rows
+                if row.funding_stage is not None or row.promoted_loan_id is not None
+            ]
+        ),
     )
 
 
@@ -770,6 +927,293 @@ async def list_operator_files(
     )
 
 
+def _row_matches_source(row: UnifiedFileRow, source_kind: str, source_id: UUID) -> bool:
+    source_ids = {
+        "deal": row.deal_id,
+        "loan": row.loan_id,
+        "intake": row.intake_id,
+        "bucket": row.bucket_id,
+        "dealer": row.dealer_id,
+    }
+    return (row.source_kind == source_kind and row.source_id == source_id) or source_ids.get(
+        source_kind
+    ) == source_id
+
+
+def _ladder_for(row: UnifiedFileRow) -> list[UnifiedStage]:
+    working = REAL_ESTATE_LADDER if row.vertical == "real_estate" else APPLICATION_LADDER
+    return [
+        *[_stage(working, key, "working") for key, _label in working],
+        *[_stage(FUNDING_LADDER, key, "funding") for key, _label in FUNDING_LADDER],
+    ]
+
+
+def _blockers_for(row: UnifiedFileRow) -> list[str]:
+    progress = row.document_progress
+    blockers: list[str] = []
+    missing_docs = max(0, progress.docs_total - progress.docs_uploaded)
+    missing_signatures = max(0, progress.signatures_total - progress.signatures_uploaded)
+    if missing_docs:
+        blockers.append(f"{missing_docs} required document(s) outstanding")
+    if missing_signatures:
+        blockers.append(f"{missing_signatures} required signature(s) outstanding")
+    if row.health_tone == "bad":
+        blockers.append("File has an unresolved attention flag")
+    return blockers
+
+
+def _gate_for(row: UnifiedFileRow, blockers: list[str]) -> UnifiedGate:
+    passed = row.funding_stage is not None
+    ready = passed or (
+        not blockers
+        and row.working_stage is not None
+        and row.working_stage.index == row.working_stage.total
+    )
+    state = "passed" if passed else "ready" if ready else "locked"
+    return UnifiedGate(
+        key="funding_handoff",
+        label="Ready for lending",
+        state=state,
+        ready=ready,
+        blockers=[] if passed else blockers,
+    )
+
+
+def _requirement_status(name: str, bucket: Bucket | None) -> str:
+    if bucket is None:
+        return "missing"
+    match = next(
+        (doc for doc in bucket.requested_documents if doc.name.casefold() == name.casefold()),
+        None,
+    )
+    if match is None:
+        return "missing"
+    if match.status == "uploaded":
+        return "complete"
+    return "requested"
+
+
+def _document_pack_for(row: UnifiedFileRow, bucket: Bucket | None) -> UnifiedDocumentPack:
+    documents, signatures = DOCUMENT_PACKS[row.vertical]
+    return UnifiedDocumentPack(
+        vertical=row.vertical,
+        documents=[
+            UnifiedDocumentRequirement(
+                key=name.lower().replace(" ", "_"),
+                label=name,
+                status=_requirement_status(name, bucket),  # type: ignore[arg-type]
+            )
+            for name in documents
+        ],
+        signatures=[
+            UnifiedDocumentRequirement(
+                key=name.lower().replace(" ", "_"),
+                label=name,
+                kind="signature",
+                status=_requirement_status(name, bucket),  # type: ignore[arg-type]
+            )
+            for name in signatures
+        ],
+    )
+
+
+def _linked_sources(row: UnifiedFileRow) -> list[UnifiedSource]:
+    sources: list[UnifiedSource] = []
+    values = [
+        ("deal", row.deal_id, "Realtor deal", "/deals/{}"),
+        ("loan", row.loan_id, "Funding file", "/loans/{}"),
+        ("intake", row.intake_id, "AI intake", "/admin/ai-underwriter-leads/{}"),
+        ("bucket", row.bucket_id, "Primary document room", "/admin/buckets/{}"),
+        ("dealer", row.dealer_id, "Rep / dealer file", None),
+    ]
+    for kind, source_id, label, route in values:
+        if source_id is None:
+            continue
+        sources.append(
+            UnifiedSource(
+                kind=kind,  # type: ignore[arg-type]
+                id=source_id,
+                ref=_source_ref(f"QC-{kind[0].upper()}", source_id),
+                label=label,
+                relationship="canonical" if kind == row.source_kind else "lineage",
+                route=route.format(source_id) if route else None,
+            )
+        )
+    for bucket_id in row.linked_bucket_ids:
+        if bucket_id != row.bucket_id:
+            sources.append(
+                UnifiedSource(
+                    kind="bucket",
+                    id=bucket_id,
+                    ref=_source_ref("QC-B", bucket_id),
+                    label="Linked document room",
+                    relationship="supporting",
+                    route=f"/admin/buckets/{bucket_id}",
+                )
+            )
+    return sources
+
+
+def _actions_for(row: UnifiedFileRow, user: User) -> list[UnifiedActionDefinition]:
+    actions: list[UnifiedActionDefinition] = []
+    if row.deal_id and row.client_id and not row.loan_id and user.role in OPERATOR_ROLES:
+        actions.append(
+            UnifiedActionDefinition(
+                key="promote_deal",
+                label="Send to funding",
+                method="POST",
+                path=f"/clients/{row.client_id}/deals/{row.deal_id}/mark-ready-for-lending",
+                effects=[
+                    "Creates the canonical funding file",
+                    "Preserves the realtor deal lineage",
+                ],
+                reversible=False,
+                confirmation_label="Send to funding",
+            )
+        )
+    if row.intake_id and not row.loan_id and user.role in INTERNAL_ROLES:
+        actions.append(
+            UnifiedActionDefinition(
+                key="promote_intake",
+                label="Create funding file",
+                method="POST",
+                path=f"/operator-files/intakes/{row.intake_id}/promote",
+                effects=[
+                    "Creates the canonical funding file",
+                    "Preserves the AI intake and evidence lineage",
+                ],
+                reversible=False,
+                confirmation_label="Create funding file",
+            )
+        )
+    if row.loan_id and user.role in OPERATOR_ROLES:
+        actions.append(
+            UnifiedActionDefinition(
+                key="change_funding_stage",
+                label="Update stage",
+                method="POST",
+                path=f"/loans/{row.loan_id}/stage",
+                effects=["Updates the shared funding ladder", "Writes a funding activity entry"],
+                reversible=True,
+                confirmation_label="Update stage",
+            )
+        )
+    if (row.bucket_id or row.intake_id) and user.role in INTERNAL_ROLES:
+        actions.append(
+            UnifiedActionDefinition(
+                key="manage_bucket_intake_link",
+                label="Manage linked evidence",
+                method="POST",
+                path="/operator-files/bucket-intake-links",
+                effects=[
+                    "Changes which selected files Elara may review",
+                    "Queues a fresh intake review",
+                ],
+                reversible=True,
+                confirmation_label="Confirm link",
+            )
+        )
+    return actions
+
+
+async def _activities_for(row: UnifiedFileRow, db: AsyncSession) -> list[UnifiedActivity]:
+    activities: list[UnifiedActivity] = []
+    predicates = []
+    if row.loan_id:
+        predicates.append(Activity.loan_id == row.loan_id)
+    if row.client_id:
+        predicates.append(Activity.client_id == row.client_id)
+    if predicates:
+        loan_rows = list(
+            (
+                await db.execute(
+                    select(Activity)
+                    .where(or_(*predicates))
+                    .order_by(Activity.occurred_at.desc())
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        actor_ids = {item.actor_id for item in loan_rows if item.actor_id}
+        actors = {
+            actor.id: actor
+            for actor in (
+                (await db.execute(select(User).where(User.id.in_(actor_ids)))).scalars().all()
+                if actor_ids
+                else []
+            )
+        }
+        for item in loan_rows:
+            actor = actors.get(item.actor_id)
+            activities.append(
+                UnifiedActivity(
+                    id=item.id,
+                    source="funding" if item.loan_id else "client",
+                    action=item.kind,
+                    actor_name=actor.name if actor else item.actor_label,
+                    actor_role=item.actor_label,
+                    detail=item.summary,
+                    metadata=item.payload or {},
+                    created_at=item.occurred_at,
+                )
+            )
+    if row.linked_bucket_ids:
+        bucket_logs = list(
+            (
+                await db.execute(
+                    select(BucketActivityLog)
+                    .where(BucketActivityLog.bucket_id.in_(row.linked_bucket_ids))
+                    .order_by(BucketActivityLog.created_at.desc())
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        activities.extend(
+            UnifiedActivity(
+                id=log.id,
+                source="intake" if row.intake_id else "bucket",
+                action=log.action,
+                actor_name=log.actor_name,
+                actor_role=log.actor_role,
+                detail=log.detail,
+                metadata={"target_type": log.target_type, "target_id": log.target_id},
+                created_at=log.created_at,
+            )
+            for log in bucket_logs
+        )
+    if row.dealer_id:
+        dealer_logs = list(
+            (
+                await db.execute(
+                    select(DealerAuditLog)
+                    .where(DealerAuditLog.dealer_id == row.dealer_id)
+                    .order_by(DealerAuditLog.created_at.desc())
+                    .limit(100)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        activities.extend(
+            UnifiedActivity(
+                id=log.id,
+                source="dealer",
+                action=log.action,
+                actor_name=log.actor_name,
+                detail=log.entity_kind,
+                metadata={"before": log.before, "after": log.after},
+                created_at=log.created_at,
+            )
+            for log in dealer_logs
+        )
+    activities.sort(key=lambda item: item.created_at, reverse=True)
+    return activities[:150]
+
+
 @router.get("/{source_kind}/{source_id}", response_model=UnifiedFileDetail)
 async def get_operator_file(
     source_kind: str,
@@ -778,31 +1222,78 @@ async def get_operator_file(
     db: AsyncSession = Depends(get_db),
 ) -> UnifiedFileDetail:
     rows = await _all_rows(user, db)
-    row = next((item for item in rows if item.source_kind == source_kind and item.source_id == source_id), None)
+    row = next((item for item in rows if _row_matches_source(item, source_kind, source_id)), None)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unified file not found")
-    audit: list[UnifiedAuditItem] = []
-    if row.bucket_id is not None:
-        logs = (
+    bucket = (
+        (
             await db.execute(
-                select(BucketActivityLog)
-                .where(BucketActivityLog.bucket_id == row.bucket_id)
-                .order_by(BucketActivityLog.created_at.desc())
-                .limit(50)
+                _with_bucket_relationships(select(Bucket).where(Bucket.id == row.bucket_id))
             )
-        ).scalars().all()
-        audit = [
-            UnifiedAuditItem(
-                id=log.id,
-                action=log.action,
-                actor_name=log.actor_name,
-                actor_role=log.actor_role,
-                detail=log.detail,
-                created_at=log.created_at,
+        ).scalar_one_or_none()
+        if row.bucket_id
+        else None
+    )
+    intake = await db.get(PublicUnderwritingIntake, row.intake_id) if row.intake_id else None
+    client = await db.get(Client, row.client_id) if row.client_id else None
+    activities = await _activities_for(row, db)
+    audit = [
+        UnifiedAuditItem(
+            id=item.id,
+            action=item.action,
+            actor_name=item.actor_name,
+            actor_role=item.actor_role,
+            detail=item.detail,
+            created_at=item.created_at,
+        )
+        for item in activities[:50]
+    ]
+    participants = []
+    if row.principal:
+        participants.append(
+            UnifiedParticipant(
+                name=row.principal,
+                role="Applicant",
+                email=intake.email if intake else client.email if client else None,
+                phone=row.phone,
             )
-            for log in logs
-        ]
-    return UnifiedFileDetail(file=row, audit=audit)
+        )
+    if row.owner_name:
+        participants.append(UnifiedParticipant(name=row.owner_name, role="Owner / rep"))
+    blockers = _blockers_for(row)
+    return UnifiedFileDetail(
+        file=row,
+        audit=audit,
+        ladder=_ladder_for(row),
+        gate=_gate_for(row, blockers),
+        blockers=blockers,
+        document_pack=_document_pack_for(row, bucket),
+        linked_sources=_linked_sources(row),
+        participants=participants,
+        profile=UnifiedProfile(
+            shape="person_and_business" if row.business_name else "person",
+            person={
+                "name": row.principal,
+                "email": intake.email if intake else client.email if client else None,
+                "phone": row.phone,
+                "credit_score": intake.estimated_credit_score
+                if intake
+                else client.fico
+                if client
+                else None,
+            },
+            business={
+                "name": row.business_name,
+                "requested_amount": row.amount,
+                "purpose": row.subtitle,
+                "vertical": row.vertical_label,
+            }
+            if row.business_name
+            else {},
+        ),
+        activities=activities,
+        actions=_actions_for(row, user),
+    )
 
 
 def _client_ip(request: Request) -> str | None:
@@ -827,104 +1318,474 @@ async def link_bucket_to_intake(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> BucketIntakeLinkResult:
+    bucket, intake = await _load_link_sources(payload.bucket_id, payload.intake_id, user, db)
+    selected_file_ids = _validated_file_ids(bucket, payload.file_ids)
+    link = (
+        await db.execute(
+            select(BucketIntakeLink)
+            .where(
+                BucketIntakeLink.bucket_id == bucket.id,
+                BucketIntakeLink.intake_id == intake.id,
+            )
+            .options(selectinload(BucketIntakeLink.files))
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        link = BucketIntakeLink(
+            bucket_id=bucket.id,
+            intake_id=intake.id,
+            linked_by_user_id=user.id,
+        )
+        db.add(link)
+        await db.flush()
+        link.files = []
+    link.relationship = payload.relationship
+    link.note = payload.note
+    link.updated_by_user_id = user.id
+    link.unlinked_at = None
+    link.unlinked_by_user_id = None
+    _reconcile_link_files(link, selected_file_ids, user.id)
+    review = await queue_link_change_review(db, intake=intake, requested_by_user_id=user.id)
+    audit_ids = _write_link_audits(
+        db,
+        bucket=bucket,
+        intake=intake,
+        user=user,
+        request=request,
+        action="bucket_intake_linked",
+        detail=payload.note
+        or f"Linked {len(selected_file_ids)} selected file(s) as {payload.relationship}",
+    )
+    await db.flush()
+    return _link_result(link, audit_ids, review.id, "bucket_intake_linked")
+
+
+@router.get("/bucket-intake-links", response_model=list[BucketIntakeLinkRead])
+async def list_bucket_intake_links(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    bucket_id: UUID | None = Query(None),
+    intake_id: UUID | None = Query(None),
+    include_unlinked: bool = Query(False),
+) -> list[BucketIntakeLinkRead]:
+    _require_internal(user)
+    stmt = select(BucketIntakeLink).options(selectinload(BucketIntakeLink.files))
+    if bucket_id:
+        stmt = stmt.where(BucketIntakeLink.bucket_id == bucket_id)
+    if intake_id:
+        stmt = stmt.where(BucketIntakeLink.intake_id == intake_id)
+    if not include_unlinked:
+        stmt = stmt.where(BucketIntakeLink.unlinked_at.is_(None))
+    links = list(
+        (await db.execute(stmt.order_by(BucketIntakeLink.updated_at.desc()))).scalars().all()
+    )
+    return [
+        BucketIntakeLinkRead(
+            link_id=link.id,
+            bucket_id=link.bucket_id,
+            intake_id=link.intake_id,
+            relationship=link.relationship,  # type: ignore[arg-type]
+            linked_file_ids=_selected_file_ids(link),
+            note=link.note,
+            status="unlinked" if link.unlinked_at else "active",
+            created_at=link.created_at,
+            updated_at=link.updated_at,
+        )
+        for link in links
+    ]
+
+
+@router.patch("/bucket-intake-links/{link_id}", response_model=BucketIntakeLinkResult)
+async def update_bucket_intake_link(
+    link_id: UUID,
+    payload: BucketIntakeLinkUpdate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketIntakeLinkResult:
+    _require_internal(user)
+    link = await _load_link(link_id, db)
+    bucket, intake = await _load_link_sources(link.bucket_id, link.intake_id, user, db)
+    if payload.relationship is not None:
+        link.relationship = payload.relationship
+    if payload.note is not None:
+        link.note = payload.note
+    if payload.file_ids is not None:
+        _reconcile_link_files(link, _validated_file_ids(bucket, payload.file_ids), user.id)
+    link.updated_by_user_id = user.id
+    link.unlinked_at = None
+    link.unlinked_by_user_id = None
+    review = await queue_link_change_review(db, intake=intake, requested_by_user_id=user.id)
+    selected = _selected_file_ids(link)
+    audit_ids = _write_link_audits(
+        db,
+        bucket=bucket,
+        intake=intake,
+        user=user,
+        request=request,
+        action="bucket_intake_link_updated",
+        detail=payload.note or f"Updated relationship with {len(selected)} selected file(s)",
+    )
+    await db.flush()
+    return _link_result(link, audit_ids, review.id, "bucket_intake_link_updated")
+
+
+@router.delete("/bucket-intake-links/{link_id}", response_model=BucketIntakeLinkResult)
+async def unlink_bucket_from_intake(
+    link_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketIntakeLinkResult:
+    _require_internal(user)
+    link = await _load_link(link_id, db)
+    bucket, intake = await _load_link_sources(link.bucket_id, link.intake_id, user, db)
+    now = datetime.now(UTC)
+    link.unlinked_at = now
+    link.unlinked_by_user_id = user.id
+    link.updated_by_user_id = user.id
+    for file_ref in link.files:
+        if file_ref.removed_at is None:
+            file_ref.removed_at = now
+            file_ref.removed_by_user_id = user.id
+    review = await queue_link_change_review(db, intake=intake, requested_by_user_id=user.id)
+    audit_ids = _write_link_audits(
+        db,
+        bucket=bucket,
+        intake=intake,
+        user=user,
+        request=request,
+        action="bucket_intake_unlinked",
+        detail="Removed linked evidence access; source files were not deleted",
+    )
+    await db.flush()
+    return _link_result(
+        link, audit_ids, review.id, "bucket_intake_unlinked", link_status="unlinked"
+    )
+
+
+@router.get("/link-options", response_model=BucketIntakeLinkOptions)
+async def bucket_intake_link_options(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BucketIntakeLinkOptions:
+    _require_internal(user)
+    buckets = list(
+        (
+            await db.execute(
+                _with_bucket_relationships(
+                    select(Bucket)
+                    .where(Bucket.archived_at.is_(None))
+                    .order_by(Bucket.updated_at.desc())
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    intakes = list(
+        (
+            await db.execute(
+                select(PublicUnderwritingIntake).order_by(
+                    PublicUnderwritingIntake.updated_at.desc()
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    active_pairs = {
+        (link.bucket_id, link.intake_id)
+        for link in (
+            await db.execute(select(BucketIntakeLink).where(BucketIntakeLink.unlinked_at.is_(None)))
+        )
+        .scalars()
+        .all()
+    }
+    linked_bucket_ids = {bucket_id for bucket_id, _intake_id in active_pairs}
+    linked_intake_ids = {intake_id for _bucket_id, intake_id in active_pairs}
+    return BucketIntakeLinkOptions(
+        buckets=[
+            BucketIntakeLinkOption(
+                id=bucket.id,
+                label=bucket.name,
+                subtitle=bucket.client_name or bucket.purpose,
+                file_count=len([file for file in bucket.files if file.deleted_at is None]),
+                linked=bucket.id in linked_bucket_ids,
+            )
+            for bucket in buckets
+        ],
+        intakes=[
+            BucketIntakeLinkOption(
+                id=intake.id,
+                label=intake.business_name or intake.full_name,
+                subtitle=f"{_titleize(_variant_vertical(intake.variant))} · {intake.email}",
+                linked=intake.id in linked_intake_ids,
+            )
+            for intake in intakes
+        ],
+    )
+
+
+@router.post("/intakes/{intake_id}/promote", response_model=IntakePromotionResult)
+async def promote_intake_to_funding(
+    intake_id: UUID,
+    payload: IntakePromotionRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> IntakePromotionResult:
+    _require_internal(user)
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found")
+    if intake.promoted_loan_id:
+        existing = await db.get(Loan, intake.promoted_loan_id)
+        if existing:
+            existing_audit = await log_activity(
+                db,
+                loan_id=existing.id,
+                actor_id=user.id,
+                actor_label=_role_value(user),
+                kind="intake.promotion_reopened",
+                summary="Opened the existing funding file from its AI intake",
+                mark_dirty=False,
+            )
+            return IntakePromotionResult(
+                intake_id=intake.id,
+                loan_id=existing.id,
+                client_id=existing.client_id,
+                created=False,
+                audit_id=existing_audit.id,
+            )
+
+    client = await db.get(Client, intake.client_id) if intake.client_id else None
+    if client is None:
+        client = Client(
+            name=intake.full_name,
+            email=intake.email,
+            phone=intake.phone,
+            referral_source=intake.referral_source,
+            source_channel="ai_intake",
+            client_experience_mode="guided",
+            client_experience_mode_reason="ai_intake_promoted",
+            client_experience_mode_locked_by="firm",
+        )
+        db.add(client)
+        await db.flush()
+        intake.client_id = client.id
+
+    state = intake.intake_state or {}
+    vertical = _variant_vertical(intake.variant)
+    address = str(
+        state.get("property_address")
+        or state.get("business_address")
+        or client.address
+        or "Address pending"
+    )
+    funding_kind = (
+        payload.funding_file_kind
+        or {
+            "real_estate": "dscr_purchase",
+            "main_street": "business",
+            "dealer": "dealer",
+            "mca": "mca_refinance",
+        }[vertical]
+    )
+    loan = Loan(
+        id=uuid4(),
+        deal_id=f"I-{str(intake.id)[:8].upper()}",
+        client_id=client.id,
+        address=address,
+        property_type=PropertyType.COMMERCIAL,
+        type=LoanType.DSCR if vertical == "real_estate" else LoanType.BRIDGE,
+        purpose=LoanPurpose.PURCHASE if vertical == "real_estate" else LoanPurpose.CASH_OUT_REFI,
+        stage=LoanStage.PREQUALIFIED,
+        amount=float(intake.requested_loan_amount or 0),
+        source_intake_id=intake.id,
+        funding_file_kind=funding_kind,
+        entity_name=intake.business_name,
+        baseline_profile_snapshot={
+            "source": "public_underwriting_intake",
+            "intake_id": str(intake.id),
+            "variant": intake.variant,
+            "intake_state": state,
+            "result_snapshot": intake.result_snapshot,
+        },
+        handoff_summary=payload.notes
+        or f"Promoted from AI intake for {intake.business_name or intake.full_name}.",
+        source_attribution="website",
+        assigned_owner_id=user.id,
+    )
+    db.add(loan)
+    await db.flush()
+    intake.promoted_loan_id = loan.id
+    audit = await log_activity(
+        db,
+        loan_id=loan.id,
+        actor_id=user.id,
+        actor_label=_role_value(user),
+        kind="intake.promoted_to_funding",
+        summary=f"AI intake promoted to funding file {loan.deal_id}",
+        payload={"intake_id": str(intake.id), "vertical": vertical},
+    )
+    _write_link_audits(
+        db,
+        bucket=await db.get(Bucket, intake.bucket_id),
+        intake=intake,
+        user=user,
+        request=request,
+        action="intake_promoted_to_funding",
+        detail=f"Created funding file {loan.deal_id}",
+    )
+    await db.flush()
+    return IntakePromotionResult(
+        intake_id=intake.id,
+        loan_id=loan.id,
+        client_id=client.id,
+        created=True,
+        audit_id=audit.id,
+    )
+
+
+def _require_internal(user: User) -> None:
     if user.role not in INTERNAL_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+
+
+async def _load_link_sources(
+    bucket_id: UUID,
+    intake_id: UUID,
+    user: User,
+    db: AsyncSession,
+) -> tuple[Bucket, PublicUnderwritingIntake]:
+    _require_internal(user)
     bucket = (
         await db.execute(
             _with_bucket_relationships(
-                select(Bucket).where(Bucket.id == payload.bucket_id, Bucket.archived_at.is_(None))
+                select(Bucket).where(Bucket.id == bucket_id, Bucket.archived_at.is_(None))
             )
         )
     ).scalar_one_or_none()
     if bucket is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket not found")
-    intake = await db.get(PublicUnderwritingIntake, payload.intake_id)
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
     if intake is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found")
+    return bucket, intake
 
-    active_file_ids = {file.id for file in bucket.files if file.deleted_at is None}
-    selected_file_ids = [file_id for file_id in payload.file_ids if file_id in active_file_ids]
 
-    ctx = dict(bucket.ai_context or {})
-    links = dict(ctx.get("unified_links") or {})
-    intake_ids = [str(value) for value in links.get("intake_ids") or []]
-    bucket_ids = [str(value) for value in links.get("bucket_ids") or []]
-    if str(intake.id) not in intake_ids:
-        intake_ids.append(str(intake.id))
-    if str(bucket.id) not in bucket_ids:
-        bucket_ids.append(str(bucket.id))
-    linked_files_by_intake = dict(links.get("file_ids_by_intake") or {})
-    current_files = [str(value) for value in linked_files_by_intake.get(str(intake.id)) or []]
-    for file_id in selected_file_ids:
-        if str(file_id) not in current_files:
-            current_files.append(str(file_id))
-    linked_files_by_intake[str(intake.id)] = current_files
-    links.update(
-        {
-            "bucket_ids": bucket_ids,
-            "intake_ids": intake_ids,
-            "primary_intake_id": str(intake.id),
-            "relationship_by_intake": {
-                **dict(links.get("relationship_by_intake") or {}),
-                str(intake.id): payload.relationship,
-            },
-            "file_ids_by_intake": linked_files_by_intake,
-            "updated_at": datetime.now(UTC).isoformat(),
-            "updated_by_user_id": str(user.id),
-        }
-    )
-    if payload.note:
-        links["note"] = payload.note
-    ctx["unified_links"] = links
-    bucket.ai_context = ctx
-    audit_ids: list[UUID] = []
+async def _load_link(link_id: UUID, db: AsyncSession) -> BucketIntakeLink:
+    link = (
+        await db.execute(
+            select(BucketIntakeLink)
+            .where(BucketIntakeLink.id == link_id)
+            .options(selectinload(BucketIntakeLink.files))
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bucket/intake link not found")
+    return link
 
-    bucket_audit_id = uuid4()
-    audit_ids.append(bucket_audit_id)
-    db.add(
-        BucketActivityLog(
-            id=bucket_audit_id,
-            bucket_id=bucket.id,
-            actor_user_id=user.id,
-            actor_name=user.name,
-            actor_email=user.email,
-            actor_role=_role_value(user),
-            action="unified_bucket_intake_linked",
-            target_type="public_underwriting_intake",
-            target_id=str(intake.id),
-            detail=payload.note or f"Linked {len(selected_file_ids)} file(s) to unified AI intake as {payload.relationship}",
-            ip_address=_client_ip(request),
-            user_agent=_user_agent(request),
-            created_at=datetime.now(UTC),
+
+def _validated_file_ids(bucket: Bucket, file_ids: list[UUID]) -> list[UUID]:
+    active_file_ids = {
+        file.id for file in bucket.files if file.deleted_at is None and file.status == "uploaded"
+    }
+    requested = list(dict.fromkeys(file_ids))
+    invalid = [file_id for file_id in requested if file_id not in active_file_ids]
+    if invalid:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{len(invalid)} selected file(s) are not active files in this bucket",
+        )
+    return requested
+
+
+def _reconcile_link_files(
+    link: BucketIntakeLink, selected_file_ids: list[UUID], actor_id: UUID
+) -> None:
+    now = datetime.now(UTC)
+    selected = set(selected_file_ids)
+    existing = {file_ref.bucket_file_id: file_ref for file_ref in link.files}
+    for file_id in selected:
+        file_ref = existing.get(file_id)
+        if file_ref is None:
+            link.files.append(
+                BucketIntakeLinkFile(
+                    bucket_file_id=file_id,
+                    selected_by_user_id=actor_id,
+                )
+            )
+        else:
+            file_ref.removed_at = None
+            file_ref.removed_by_user_id = None
+            file_ref.selected_by_user_id = actor_id
+    for file_id, file_ref in existing.items():
+        if file_id not in selected and file_ref.removed_at is None:
+            file_ref.removed_at = now
+            file_ref.removed_by_user_id = actor_id
+
+
+def _selected_file_ids(link: BucketIntakeLink) -> list[UUID]:
+    return [file_ref.bucket_file_id for file_ref in link.files if file_ref.removed_at is None]
+
+
+def _write_link_audits(
+    db: AsyncSession,
+    *,
+    bucket: Bucket | None,
+    intake: PublicUnderwritingIntake,
+    user: User,
+    request: Request,
+    action: str,
+    detail: str,
+) -> list[UUID]:
+    bucket_ids = list(
+        dict.fromkeys(
+            [value for value in [bucket.id if bucket else None, intake.bucket_id] if value]
         )
     )
-    if intake.bucket_id != bucket.id:
-        intake_audit_id = uuid4()
-        audit_ids.append(intake_audit_id)
+    audit_ids: list[UUID] = []
+    for bucket_id in bucket_ids:
+        audit_id = uuid4()
+        audit_ids.append(audit_id)
         db.add(
             BucketActivityLog(
-                id=intake_audit_id,
-                bucket_id=intake.bucket_id,
+                id=audit_id,
+                bucket_id=bucket_id,
                 actor_user_id=user.id,
                 actor_name=user.name,
                 actor_email=user.email,
                 actor_role=_role_value(user),
-                action="unified_intake_linked_to_bucket",
-                target_type="bucket",
-                target_id=str(bucket.id),
-                detail=payload.note or f"Linked from unified Operator Console drawer as {payload.relationship}",
+                action=action,
+                target_type="public_underwriting_intake",
+                target_id=str(intake.id),
+                detail=detail,
                 ip_address=_client_ip(request),
                 user_agent=_user_agent(request),
                 created_at=datetime.now(UTC),
             )
         )
-    await db.flush()
+    return audit_ids
+
+
+def _link_result(
+    link: BucketIntakeLink,
+    audit_ids: list[UUID],
+    review_id: UUID,
+    action: str,
+    *,
+    link_status: str = "active",
+) -> BucketIntakeLinkResult:
     return BucketIntakeLinkResult(
-        bucket_id=bucket.id,
-        intake_id=intake.id,
-        relationship=payload.relationship,
-        linked_file_ids=selected_file_ids,
+        link_id=link.id,
+        bucket_id=link.bucket_id,
+        intake_id=link.intake_id,
+        relationship=link.relationship,  # type: ignore[arg-type]
+        linked_file_ids=_selected_file_ids(link),
         audit_ids=audit_ids,
-        audit_action="unified_bucket_intake_linked",
-        bucket_context=ctx,
+        audit_action=action,
+        review_id=review_id,
+        status=link_status,  # type: ignore[arg-type]
     )

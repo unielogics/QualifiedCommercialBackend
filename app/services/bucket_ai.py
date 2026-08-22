@@ -2216,6 +2216,23 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     await db.flush()
 
     files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    # An intake may explicitly grant Elara access to selected files from
+    # supporting buckets. These are references only; ownership and S3 objects
+    # remain with their original bucket. Reviews on ordinary buckets are
+    # unchanged.
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+    from app.services.operator_file_links import selected_files_for_intake
+
+    intake = (
+        await db.execute(
+            select(PublicUnderwritingIntake).where(
+                PublicUnderwritingIntake.bucket_id == bucket.id
+            )
+        )
+    ).scalar_one_or_none()
+    if intake is not None:
+        linked_files = await selected_files_for_intake(db, intake.id)
+        files = list({file.id: file for file in [*files, *linked_files]}.values())
     extracted_zip_parent_ids = {
         file.parent_zip_file_id
         for file in files
