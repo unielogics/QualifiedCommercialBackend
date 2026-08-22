@@ -618,6 +618,17 @@ class ContactShareRead(ORM):
     updated_at: datetime
 
 
+class ProgramPdfAttachmentRead(BaseModel):
+    key: str
+    title: str
+    description: str
+    filename: str
+
+
+class ContactCardProgramPdfRead(ProgramPdfAttachmentRead):
+    download_url: str
+
+
 class ContactCardRead(BaseModel):
     recipient_name: str
     company: str | None = None
@@ -627,6 +638,7 @@ class ContactCardRead(BaseModel):
     body: str
     booking_url: str
     application_url: str
+    program_pdfs: list[ContactCardProgramPdfRead] = Field(default_factory=list)
 
 
 class ContactShareCreate(BaseModel):
@@ -639,12 +651,36 @@ class ContactShareCreate(BaseModel):
     marketing_sms_consent: bool = False
     transactional_sms_consent: bool = False
     consent_method: Literal["self_web", "in_person_device", "rep_attested"] = "rep_attested"
+    program_pdf_keys: list[str] = Field(default_factory=list, max_length=5)
     notes: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def _needs_delivery(self) -> "ContactShareCreate":
         if not (self.recipient_email or self.recipient_phone):
             raise ValueError("Provide an email or phone number.")
+        return self
+
+
+class RepInboxThreadCreate(BaseModel):
+    dealer_id: UUID | None = None
+    recipient_name: str = Field(min_length=1, max_length=160)
+    company: str | None = Field(default=None, max_length=180)
+    recipient_email: str | None = Field(default=None, max_length=320)
+    recipient_phone: str | None = Field(default=None, max_length=32)
+    channels: list[Literal["email", "sms"]] = Field(min_length=1, max_length=2)
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=4000)
+    marketing_sms_consent: bool = False
+    transactional_sms_consent: bool = False
+    consent_method: Literal["self_web", "in_person_device", "rep_attested"] = "rep_attested"
+
+    @model_validator(mode="after")
+    def _validate_channels(self) -> "RepInboxThreadCreate":
+        channels = set(self.channels)
+        if "email" in channels and not self.recipient_email:
+            raise ValueError("Provide an email address or turn off email.")
+        if "sms" in channels and not self.recipient_phone:
+            raise ValueError("Provide a mobile number or turn off SMS.")
         return self
 
 
@@ -685,6 +721,11 @@ class RepInboxMessageRead(ORM):
     read_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RepInboxComposeResult(BaseModel):
+    threads: list[RepInboxThreadRead]
+    messages: list[RepInboxMessageRead]
 
 
 class RepInboxMessageCreate(BaseModel):

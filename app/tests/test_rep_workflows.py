@@ -3,10 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+from pydantic import ValidationError
 
+from app.dealer_os.schemas import RepInboxThreadCreate
 from app.dealer_os.services.rep_workflows import (
     SlotValidationError,
     is_stop_message,
+    program_pdf_options,
+    render_program_pdf,
+    selected_program_pdfs,
     validate_underwriting_slots,
 )
 
@@ -51,3 +56,37 @@ def test_underwriting_slots_reject_duplicates() -> None:
 @pytest.mark.parametrize("body", ["STOP", " stop ", "Unsubscribe", "quit"])
 def test_stop_messages_are_detected(body: str) -> None:
     assert is_stop_message(body) is True
+
+
+def test_program_pdf_allowlist_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="Unknown program PDF"):
+        selected_program_pdfs(["missing"])
+
+
+def test_program_pdf_options_render_valid_pdf_bytes() -> None:
+    options = program_pdf_options()
+    assert options
+    pdf = selected_program_pdfs([options[0]["key"]])[0]
+    rendered = render_program_pdf(pdf)
+    assert rendered.startswith(b"%PDF-")
+    assert pdf.filename.endswith(".pdf")
+
+
+def test_inbox_compose_requires_contact_for_selected_channels() -> None:
+    with pytest.raises(ValidationError, match="mobile"):
+        RepInboxThreadCreate(
+            recipient_name="Jane Client",
+            channels=["sms"],
+            subject="Qualified Commercial",
+            body="Hello",
+        )
+
+    payload = RepInboxThreadCreate(
+        recipient_name="Jane Client",
+        recipient_email="jane@example.com",
+        recipient_phone="5551234567",
+        channels=["email", "sms"],
+        subject="Qualified Commercial",
+        body="Hello",
+    )
+    assert payload.channels == ["email", "sms"]

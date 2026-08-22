@@ -265,13 +265,17 @@ from .schemas import (
     BookingAvailabilityRead,
     BookingAvailabilitySlot,
     ContactCardRead,
+    ContactCardProgramPdfRead,
     ContactShareCreate,
     ContactShareRead,
+    ProgramPdfAttachmentRead,
     RepAppointmentCreate,
     RepAppointmentPatch,
     RepAppointmentRead,
+    RepInboxComposeResult,
     RepInboxMessageCreate,
     RepInboxMessageRead,
+    RepInboxThreadCreate,
     RepInboxThreadRead,
     UnderwritingReviewPreferenceCreate,
     UnderwritingReviewPreferenceRead,
@@ -4198,6 +4202,55 @@ async def _ensure_rep_contact(
     return row
 
 
+async def _capture_rep_contact_sms_consent(
+    db: AsyncSession,
+    *,
+    request: Request,
+    user: User,
+    contact: DealerRepContact,
+    dealer: DealerBusiness | None,
+    phone_e164: str | None,
+    recipient_name: str,
+    transactional: bool,
+    marketing: bool,
+    method: str,
+) -> list[str]:
+    if not phone_e164 or not (transactional or marketing):
+        return []
+    now = datetime.now(timezone.utc)
+    meta = {
+        "method": method,
+        "captured_by": str(user.id),
+        "captured_by_name": user.name,
+        "captured_at": now.isoformat(),
+        "ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent", "")[:400],
+    }
+    contact.sms_consent_meta = meta
+    consent_kinds: list[str] = []
+    if transactional:
+        contact.sms_transactional_consented_at = now
+        consent_kinds.append("transactional")
+    if marketing:
+        contact.sms_marketing_consented_at = now
+        consent_kinds.append("marketing")
+    if dealer is not None:
+        for kind in consent_kinds:
+            await sms_consent_svc.record_consent(
+                db,
+                dealer_id=dealer.id,
+                phone_e164=phone_e164,
+                kind=kind,
+                method=method,
+                captured_by_user_id=user.id,
+                captured_by_name=user.name,
+                consenter_name=recipient_name,
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+            )
+    return consent_kinds
+
+
 async def _ensure_rep_thread(
     db: AsyncSession,
     *,
@@ -4391,6 +4444,134 @@ async def booking_availability(
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
     return await _booking_slots(db, host, booking, duration_min=duration_min)
+
+
+@router.post("/appointments", response_model=RepAppointmentRead, status_code=status.HTTP_201_CREATED)
+async def create_standalone_rep_appointment(
+    payload: RepAppointmentCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepAppointment:
+    require_team_or_rep(user)
+    host = user
+    booking = await _booking_settings_for(db, host)
+    starts_at = _to_utc_minute(payload.starts_at)
+    duration = payload.duration_min or booking.duration_min or 30
+    slots = await _booking_slots(db, host, booking, duration_min=duration)
+    if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    title = payload.title or _appointment_title(payload.kind, payload.invitee_name, None)
+    who = payload.invitee_name
+    if payload.invitee_email:
+        who = f"{payload.invitee_name} <{payload.invitee_email}>"
+    description = (
+        "Standalone rep appointment.\n"
+        f"Kind: {payload.kind}\n"
+        f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
+        f"Notes:\n{payload.notes or '(none)'}"
+    )
+    ev = CalendarEvent(
+        loan_id=None,
+        kind=CalendarEventKind.CALL,
+        title=title,
+        description=description,
+        who=who[:160],
+        starts_at=starts_at,
+        duration_min=duration,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.MANUAL,
+        owner_user_id=host.id,
+        external_ref_kind="dealer_rep_appointment",
+        external_ref_id=secrets.token_urlsafe(12),
+    )
+    db.add(ev)
+    await db.flush()
+    appt = DealerRepAppointment(
+        dealer_id=None,
+        owner_user_id=host.id,
+        calendar_event_id=ev.id,
+        kind=payload.kind,
+        title=title,
+        starts_at=starts_at,
+        duration_min=duration,
+        timezone=payload.timezone or booking.timezone,
+        invitee_name=payload.invitee_name.strip(),
+        invitee_email=payload.invitee_email,
+        invitee_phone=payload.invitee_phone,
+        join_url=payload.join_url,
+        notes=payload.notes,
+        status="confirmed",
+        booked_by_user_id=user.id,
+    )
+    db.add(appt)
+    await db.flush()
+
+    phone = consent_delivery.normalize_phone(payload.invitee_phone)
+    if not payload.invitee_email and not phone:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Provide a valid email or mobile number.")
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=user.id,
+        dealer_id=None,
+        full_name=payload.invitee_name,
+        company=None,
+        email=payload.invitee_email.strip().lower() if payload.invitee_email else None,
+        phone_e164=phone,
+        source="appointment",
+    )
+    thread = await _ensure_rep_thread(
+        db,
+        owner_user_id=user.id,
+        contact=contact,
+        dealer_id=None,
+        channel="email" if payload.invitee_email else "sms",
+        subject=title,
+        source="appointment",
+    )
+    await _append_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        direction="outbound",
+        channel=thread.channel,
+        subject=title,
+        body=f"Appointment booked for {payload.invitee_name}: {starts_at.isoformat()}",
+        provider="calendar",
+        delivery_status="stored",
+        sender=user.email if thread.channel == "email" else get_settings().sms_origination_number or None,
+        recipient=payload.invitee_email or phone,
+    )
+    await db.commit()
+    await db.refresh(appt)
+    if payload.invitee_email:
+        join = await booking_notify.push_to_google(
+            db, ev, invitee_email=payload.invitee_email, invitee_name=payload.invitee_name
+        )
+        if join and not appt.join_url:
+            appt.join_url = join
+            ev.description = f"{description}\n\nJoin: {join}"
+            await db.commit()
+            await db.refresh(appt)
+        booking_notify.notify_host(
+            host,
+            booking,
+            starts_at,
+            invitee_name=payload.invitee_name,
+            invitee_email=payload.invitee_email,
+            invitee_phone=payload.invitee_phone,
+            notes=payload.notes,
+            join_url=appt.join_url,
+        )
+        booking_notify.send_invitee_invite(
+            host,
+            booking,
+            ev,
+            starts_at,
+            invitee_name=payload.invitee_name,
+            invitee_email=payload.invitee_email,
+            join_url=appt.join_url,
+        )
+    return appt
 
 
 @router.get("/dealers/{dealer_id}/appointments", response_model=list[RepAppointmentRead])
@@ -4648,6 +4829,12 @@ async def create_underwriting_review_preference(
     return row
 
 
+@router.get("/contact-shares/program-pdfs", response_model=list[ProgramPdfAttachmentRead])
+async def list_contact_share_program_pdfs(user: CurrentUser) -> list[dict[str, str]]:
+    require_team_or_rep(user)
+    return rep_workflows.program_pdf_options()
+
+
 @router.post("/contact-shares", response_model=ContactShareRead, status_code=status.HTTP_201_CREATED)
 async def create_contact_share(
     payload: ContactShareCreate,
@@ -4661,6 +4848,10 @@ async def create_contact_share(
         dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
     phone = consent_delivery.normalize_phone(payload.recipient_phone)
     email = payload.recipient_email.strip().lower() if payload.recipient_email else None
+    try:
+        selected_pdfs = rep_workflows.selected_program_pdfs(payload.program_pdf_keys)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     contact = await _ensure_rep_contact(
         db,
         owner_user_id=user.id,
@@ -4671,38 +4862,18 @@ async def create_contact_share(
         phone_e164=phone,
         source="contact_share",
     )
-    now = datetime.now(timezone.utc)
-    consent_kinds: list[str] = []
-    if phone and (payload.transactional_sms_consent or payload.marketing_sms_consent):
-        meta = {
-            "method": payload.consent_method,
-            "captured_by": str(user.id),
-            "captured_by_name": user.name,
-            "captured_at": now.isoformat(),
-            "ip": request.client.host if request.client else None,
-            "user_agent": request.headers.get("user-agent", "")[:400],
-        }
-        contact.sms_consent_meta = meta
-        if payload.transactional_sms_consent:
-            contact.sms_transactional_consented_at = now
-            consent_kinds.append("transactional")
-        if payload.marketing_sms_consent:
-            contact.sms_marketing_consented_at = now
-            consent_kinds.append("marketing")
-        if dealer is not None:
-            for kind in consent_kinds:
-                await sms_consent_svc.record_consent(
-                    db,
-                    dealer_id=dealer.id,
-                    phone_e164=phone,
-                    kind=kind,
-                    method=payload.consent_method,
-                    captured_by_user_id=user.id,
-                    captured_by_name=user.name,
-                    consenter_name=payload.recipient_name,
-                    ip_address=request.client.host if request.client else None,
-                    user_agent=request.headers.get("user-agent"),
-                )
+    await _capture_rep_contact_sms_consent(
+        db,
+        request=request,
+        user=user,
+        contact=contact,
+        dealer=dealer,
+        phone_e164=phone,
+        recipient_name=payload.recipient_name,
+        transactional=payload.transactional_sms_consent,
+        marketing=payload.marketing_sms_consent,
+        method=payload.consent_method,
+    )
     token = secrets.token_urlsafe(24)[:48]
     base = get_settings().rep_app_url.rstrip("/")
     card_url = f"{base}/card/{token}"
@@ -4740,21 +4911,34 @@ async def create_contact_share(
         body=copy.email_body,
         email_status="not_requested",
         sms_status="not_requested",
-        provider_refs={},
+        provider_refs={"program_pdf_keys": [pdf.key for pdf in selected_pdfs]},
         created_by_user_id=user.id,
     )
     db.add(share)
     await db.flush()
 
-    refs: dict[str, str] = {}
+    refs: dict[str, object] = {"program_pdf_keys": [pdf.key for pdf in selected_pdfs]}
     if payload.channel in {"email", "email_sms"}:
         if email:
-            email_res = await asyncio.to_thread(
-                ses_client.send_email,
-                to_email=email,
-                subject=copy.subject,
-                body_text=copy.email_body,
-            )
+            attachments = [
+                (pdf.filename, rep_workflows.render_program_pdf(pdf), "application/pdf")
+                for pdf in selected_pdfs
+            ]
+            if attachments:
+                email_res = await asyncio.to_thread(
+                    ses_client.send_raw_email,
+                    to_emails=[email],
+                    subject=copy.subject,
+                    body_text=copy.email_body,
+                    attachments=attachments,
+                )
+            else:
+                email_res = await asyncio.to_thread(
+                    ses_client.send_email,
+                    to_email=email,
+                    subject=copy.subject,
+                    body_text=copy.email_body,
+                )
             share.email_status = "sent" if email_res.ok else "failed"
             if email_res.message_id:
                 refs["email_message_id"] = email_res.message_id
@@ -4778,7 +4962,7 @@ async def create_contact_share(
             subject=copy.subject,
             body=copy.email_body,
             provider="ses",
-            provider_message_id=refs.get("email_message_id"),
+            provider_message_id=refs.get("email_message_id") if isinstance(refs.get("email_message_id"), str) else None,
             delivery_status=share.email_status,
             sender=user.email,
             recipient=email,
@@ -4843,7 +5027,11 @@ async def create_contact_share(
 
 
 @router.get("/contact-shares/card/{token}", response_model=ContactCardRead)
-async def read_contact_card(token: str, db: AsyncSession = Depends(get_db)) -> ContactCardRead:
+async def read_contact_card(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ContactCardRead:
     share_row = (
         await db.execute(
             select(DealerRepContactShare, DealerRepContact, User)
@@ -4868,6 +5056,31 @@ async def read_contact_card(token: str, db: AsyncSession = Depends(get_db)) -> C
             )
         ).scalar_one_or_none()
     booking_url = f"{base}/book/{booking_row.slug}" if booking_row and booking_row.slug else f"{base}/?new=1"
+    refs = share.provider_refs or {}
+    pdf_keys = refs.get("program_pdf_keys") if isinstance(refs, dict) else None
+    program_pdfs: list[ContactCardProgramPdfRead] = []
+    if isinstance(pdf_keys, list):
+        selected = []
+        for raw_key in pdf_keys:
+            pdf = rep_workflows.program_pdf(str(raw_key))
+            if pdf is not None:
+                selected.append(pdf)
+        for pdf in selected:
+            program_pdfs.append(
+                ContactCardProgramPdfRead(
+                    key=pdf.key,
+                    title=pdf.title,
+                    description=pdf.description,
+                    filename=pdf.filename,
+                    download_url=str(
+                        request.url_for(
+                            "read_contact_card_program_pdf",
+                            token=token,
+                            key=pdf.key,
+                        )
+                    ),
+                )
+            )
     return ContactCardRead(
         recipient_name=share.recipient_name,
         company=contact.company if contact else None,
@@ -4877,7 +5090,158 @@ async def read_contact_card(token: str, db: AsyncSession = Depends(get_db)) -> C
         body=share.body,
         booking_url=booking_url,
         application_url=f"{base}/?new=1",
+        program_pdfs=program_pdfs,
     )
+
+
+@router.get("/contact-shares/card/{token}/program-pdfs/{key}")
+async def read_contact_card_program_pdf(
+    token: str,
+    key: str,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    share = (
+        await db.execute(
+            select(DealerRepContactShare).where(DealerRepContactShare.card_token == token)
+        )
+    ).scalar_one_or_none()
+    if share is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact card not found.")
+    refs = share.provider_refs or {}
+    pdf_keys = refs.get("program_pdf_keys") if isinstance(refs, dict) else None
+    if not isinstance(pdf_keys, list) or key not in {str(value) for value in pdf_keys}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Program PDF not found.")
+    pdf = rep_workflows.program_pdf(key)
+    if pdf is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Program PDF not found.")
+    return StreamingResponse(
+        io.BytesIO(rep_workflows.render_program_pdf(pdf)),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{pdf.filename}"'},
+    )
+
+
+@router.post(
+    "/inbox/threads",
+    response_model=RepInboxComposeResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rep_inbox_thread(
+    payload: RepInboxThreadCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepInboxComposeResult:
+    require_team_or_rep(user)
+    dealer: DealerBusiness | None = None
+    if payload.dealer_id is not None:
+        dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
+    phone = consent_delivery.normalize_phone(payload.recipient_phone)
+    email = payload.recipient_email.strip().lower() if payload.recipient_email else None
+    channels = list(dict.fromkeys(payload.channels))
+    if "sms" in channels and not phone:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Provide a valid mobile number for SMS.")
+
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=user.id,
+        dealer_id=dealer.id if dealer else None,
+        full_name=payload.recipient_name,
+        company=payload.company or (dealer.name if dealer else None),
+        email=email,
+        phone_e164=phone,
+        source="manual",
+    )
+    await _capture_rep_contact_sms_consent(
+        db,
+        request=request,
+        user=user,
+        contact=contact,
+        dealer=dealer,
+        phone_e164=phone,
+        recipient_name=payload.recipient_name,
+        transactional=payload.transactional_sms_consent,
+        marketing=payload.marketing_sms_consent,
+        method=payload.consent_method,
+    )
+
+    if "sms" in channels:
+        if contact.sms_opted_out_at is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact opted out of SMS.")
+        allowed = bool(contact.sms_transactional_consented_at or contact.sms_marketing_consented_at)
+        if not allowed:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This contact has not granted SMS consent.")
+
+    result_threads: list[RepInboxThreadRead] = []
+    result_messages: list[DealerRepInboxMessage] = []
+    for channel in channels:
+        thread = await _ensure_rep_thread(
+            db,
+            owner_user_id=user.id,
+            contact=contact,
+            dealer_id=dealer.id if dealer else None,
+            channel=channel,
+            subject=payload.subject,
+            source="manual",
+        )
+        provider = None
+        provider_id = None
+        delivery_status = "stored"
+        sender = user.email
+        recipient = email
+        if channel == "email":
+            if not email:
+                raise HTTPException(status.HTTP_409_CONFLICT, "This contact has no email address.")
+            res = await asyncio.to_thread(
+                ses_client.send_email,
+                to_email=email,
+                subject=payload.subject,
+                body_text=payload.body,
+            )
+            provider = "ses"
+            provider_id = res.message_id
+            delivery_status = "sent" if res.ok else "failed"
+        else:
+            recipient = phone
+            sender = get_settings().sms_origination_number or None
+            res = await asyncio.to_thread(consent_delivery._send_sms, phone, payload.body)  # noqa: SLF001
+            provider = "pinpoint"
+            provider_id = res.detail if res.ok else None
+            delivery_status = "sent" if res.ok else "failed"
+        msg = await _append_rep_inbox_message(
+            db,
+            thread=thread,
+            contact=contact,
+            direction="outbound",
+            channel=channel,
+            subject=payload.subject,
+            body=payload.body,
+            provider=provider,
+            provider_message_id=provider_id,
+            delivery_status=delivery_status,
+            sender=sender,
+            recipient=recipient,
+        )
+        result_threads.append(_thread_read(thread, contact))
+        result_messages.append(msg)
+
+    if dealer is not None:
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "inbox.thread.create",
+            "inbox_thread",
+            after={
+                "recipient": payload.recipient_name,
+                "channels": channels,
+                "subject": payload.subject,
+            },
+        )
+    await db.commit()
+    for msg in result_messages:
+        await db.refresh(msg)
+    return RepInboxComposeResult(threads=result_threads, messages=result_messages)
 
 
 @router.get("/inbox/threads", response_model=list[RepInboxThreadRead])
