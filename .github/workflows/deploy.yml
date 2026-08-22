@@ -70,7 +70,7 @@ jobs:
             ]}' \
             --query Command.CommandId --output text)
           echo "Command ID: $CMD_ID"
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$CMD_ID" \
               --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
@@ -80,7 +80,7 @@ jobs:
               Success) exit 0 ;;
               Failed|Cancelled|TimedOut) exit 1 ;;
             esac
-            sleep 3
+            sleep 5
           done
           echo "Timed out waiting for SSM command"
           exit 1
