@@ -1,7 +1,7 @@
 """operator file lineage and durable bucket-intake links
 
-Revision ID: 0138_operator_file_lineage
-Revises: 0137_dos_bank_consent
+Revision ID: 0139_operator_file_lineage
+Revises: 0138_dos_rep_workflows
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from alembic import op
 
-revision = "0138_operator_file_lineage"
-down_revision = "0137_dos_bank_consent"
+revision = "0139_operator_file_lineage"
+down_revision = "0138_dos_rep_workflows"
 branch_labels = None
 depends_on = None
 
