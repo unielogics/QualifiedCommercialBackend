@@ -49,14 +49,21 @@ resource "aws_iam_role_policy" "github_deploy" {
         Effect = "Allow"
         Action = [
           "ssm:SendCommand",
-          "ssm:GetCommandInvocation",
-          "ssm:ListCommandInvocations",
           "ssm:DescribeInstanceInformation"
         ]
         Resource = [
           "arn:aws:ssm:*:*:document/AWS-RunShellScript",
           "arn:aws:ec2:*:*:instance/${var.existing_ec2_instance_id}"
         ]
+      },
+      {
+        Sid    = "SsmReadCommandStatus"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetCommandInvocation",
+          "ssm:ListCommandInvocations"
+        ]
+        Resource = "*"
       },
       {
         Sid      = "SsmReadInstanceState"
