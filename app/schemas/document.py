@@ -33,6 +33,46 @@ class DocumentRead(ORMModel):
     due_date: date | None = None
 
 
+class VaultTotals(BaseModel):
+    borrowers: int
+    loan_files: int
+    documents: int
+    need_attention: int
+
+
+class VaultLoanSummary(BaseModel):
+    loan_id: UUID
+    deal_id: str
+    borrower_id: UUID
+    borrower_name: str
+    entity_name: str | None = None
+    address: str
+    city: str | None = None
+    state: str | None = None
+    stage: str
+    documents: int
+    requested: int
+    pending_review: int
+    verified: int
+    flagged: int
+    updated_at: datetime
+
+
+class VaultLoanPage(BaseModel):
+    items: list[VaultLoanSummary]
+    totals: VaultTotals
+    total: int
+    limit: int
+    offset: int
+
+
+class VaultDocumentPage(BaseModel):
+    items: list[DocumentRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class DocumentPatch(BaseModel):
     """Partial update from the loan detail's Workflow tab.
     Fields are independently optional; missing keys leave the column

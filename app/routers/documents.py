@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from typing import Literal
 from uuid import UUID, uuid4
 
 log = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -16,6 +17,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import DocStatus, Role
 from app.models.activity import Activity
+from app.models.client import Client
 from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
 from app.models.loan import Loan
@@ -28,6 +30,10 @@ from app.schemas.document import (
     DocumentUploadComplete,
     DocumentUploadInit,
     DocumentUploadInitResponse,
+    VaultDocumentPage,
+    VaultLoanPage,
+    VaultLoanSummary,
+    VaultTotals,
 )
 from app.services import calendar_emitter
 from app.services.activity_log import mark_loan_dirty
@@ -65,6 +71,226 @@ async def list_documents(
     stmt = scope_loan_query(user, stmt)
     rows = (await db.execute(stmt)).scalars().all()
     return [DocumentRead.model_validate(r) for r in rows]
+
+
+_VAULT_ROLES = {
+    Role.CLIENT,
+    Role.BROKER,
+    Role.REGIONAL_MANAGER,
+    Role.SUPER_ADMIN,
+    Role.LOAN_EXEC,
+}
+
+
+def _vault_loan_scope(user, search: str | None = None):
+    active_document = exists(
+        select(Document.id).where(
+            Document.loan_id == Loan.id,
+            Document.status != DocStatus.SKIPPED,
+        )
+    )
+    stmt = (
+        select(
+            Loan.id.label("loan_id"),
+            Loan.client_id.label("borrower_id"),
+        )
+        .join(Client, Client.id == Loan.client_id)
+        .where(active_document)
+    )
+    if search and search.strip():
+        pattern = f"%{search.strip()}%"
+        document_match = exists(
+            select(Document.id).where(
+                Document.loan_id == Loan.id,
+                Document.status != DocStatus.SKIPPED,
+                Document.name.ilike(pattern),
+            )
+        )
+        stmt = stmt.where(
+            or_(
+                Client.name.ilike(pattern),
+                Loan.deal_id.ilike(pattern),
+                Loan.entity_name.ilike(pattern),
+                Loan.address.ilike(pattern),
+                Loan.city.ilike(pattern),
+                document_match,
+            )
+        )
+    return scope_loan_query(user, stmt)
+
+
+def _vault_document_count(*statuses: DocStatus):
+    filters = [
+        Document.loan_id == Loan.id,
+        Document.status != DocStatus.SKIPPED,
+    ]
+    if statuses:
+        filters.append(Document.status.in_(statuses))
+    return (
+        select(func.count(Document.id))
+        .where(*filters)
+        .correlate(Loan)
+        .scalar_subquery()
+    )
+
+
+@router.get("/vault", response_model=VaultLoanPage)
+async def list_vault_loan_files(
+    search: str | None = None,
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    user: CurrentUser = None,
+    db: AsyncSession = Depends(get_db),
+) -> VaultLoanPage:
+    """Bounded Vault index: one folder per scoped loan, grouped by borrower in UI."""
+    if user.role not in _VAULT_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+
+    filtered_scope = _vault_loan_scope(user, search)
+    total = (
+        await db.execute(
+            select(func.count()).select_from(filtered_scope.order_by(None).subquery())
+        )
+    ).scalar_one()
+
+    page_scope = (
+        filtered_scope
+        .order_by(Loan.updated_at.desc(), Loan.id.asc())
+        .offset(offset)
+        .limit(limit)
+        .subquery()
+    )
+    document_count = _vault_document_count()
+    requested_count = _vault_document_count(DocStatus.REQUESTED)
+    pending_review_count = _vault_document_count(DocStatus.PENDING, DocStatus.RECEIVED)
+    verified_count = _vault_document_count(DocStatus.VERIFIED)
+    flagged_count = _vault_document_count(DocStatus.FLAGGED)
+    rows = (
+        await db.execute(
+            select(
+                Loan.id.label("loan_id"),
+                Loan.deal_id,
+                Loan.client_id.label("borrower_id"),
+                Client.name.label("borrower_name"),
+                Loan.entity_name,
+                Loan.address,
+                Loan.city,
+                Loan.state,
+                Loan.stage,
+                document_count.label("documents"),
+                requested_count.label("requested"),
+                pending_review_count.label("pending_review"),
+                verified_count.label("verified"),
+                flagged_count.label("flagged"),
+                Loan.updated_at,
+            )
+            .join(page_scope, page_scope.c.loan_id == Loan.id)
+            .join(Client, Client.id == Loan.client_id)
+            .order_by(Loan.updated_at.desc(), Loan.id.asc())
+        )
+    ).mappings().all()
+
+    visible_scope = _vault_loan_scope(user).subquery()
+    stats = (
+        await db.execute(
+            select(
+                func.count(func.distinct(visible_scope.c.borrower_id)).label("borrowers"),
+                func.count(func.distinct(visible_scope.c.loan_id)).label("loan_files"),
+                func.count(Document.id).label("documents"),
+                func.count(Document.id)
+                .filter(Document.status.in_((DocStatus.REQUESTED, DocStatus.FLAGGED)))
+                .label("need_attention"),
+            )
+            .select_from(visible_scope)
+            .join(Document, Document.loan_id == visible_scope.c.loan_id)
+            .where(Document.status != DocStatus.SKIPPED)
+        )
+    ).mappings().one()
+
+    items = []
+    for row in rows:
+        values = dict(row)
+        stage_value = values["stage"]
+        values["stage"] = stage_value.value if hasattr(stage_value, "value") else str(stage_value)
+        items.append(VaultLoanSummary(**values))
+
+    return VaultLoanPage(
+        items=items,
+        totals=VaultTotals(**dict(stats)),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/vault/{loan_id}", response_model=VaultDocumentPage)
+async def list_vault_loan_documents(
+    loan_id: UUID,
+    section: Literal["all", "attention", "requested", "experience", "active_asset"] = "all",
+    search: str | None = None,
+    limit: int = Query(default=25, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    user: CurrentUser = None,
+    db: AsyncSession = Depends(get_db),
+) -> VaultDocumentPage:
+    """Return one scoped loan folder at a time; never stream the firm-wide Vault."""
+    if user.role not in _VAULT_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    if not await _can_access_loan(user, loan_id, db):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Loan not found")
+
+    filters = [
+        Document.loan_id == loan_id,
+        Document.status != DocStatus.SKIPPED,
+    ]
+    if section == "attention":
+        filters.append(Document.status.in_((DocStatus.REQUESTED, DocStatus.FLAGGED)))
+    elif section == "requested":
+        filters.append(Document.status == DocStatus.REQUESTED)
+    elif section == "experience":
+        filters.extend(
+            (
+                Document.status != DocStatus.REQUESTED,
+                or_(Document.category.is_(None), Document.category != "active_asset"),
+            )
+        )
+    elif section == "active_asset":
+        filters.extend(
+            (
+                Document.status != DocStatus.REQUESTED,
+                Document.category == "active_asset",
+            )
+        )
+    if search and search.strip():
+        pattern = f"%{search.strip()}%"
+        filters.append(
+            or_(
+                Document.name.ilike(pattern),
+                Document.category.ilike(pattern),
+                Document.checklist_key.ilike(pattern),
+            )
+        )
+
+    total = (
+        await db.execute(
+            select(func.count(Document.id)).where(*filters)
+        )
+    ).scalar_one()
+    documents = (
+        await db.execute(
+            select(Document)
+            .where(*filters)
+            .order_by(Document.updated_at.desc(), Document.id.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).scalars().all()
+    return VaultDocumentPage(
+        items=[DocumentRead.model_validate(document) for document in documents],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 class DocAnalysisItem(BaseModel):
