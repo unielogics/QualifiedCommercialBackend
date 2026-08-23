@@ -8007,6 +8007,7 @@ async def plaid_exchange(
     and pull the first batch of statements in the background."""
     require_team(user)  # gated off client accounts for now
     dealer = await load_dealer(db, dealer_id)
+    await _lock_dealer_related_writes(db, dealer.id)
     _plaid_cooldown("exchange", dealer.id, 5)
     try:
         access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
@@ -8418,6 +8419,7 @@ async def public_room_plaid_exchange(
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
+    await _lock_dealer_related_writes(db, dealer.id)
     existing = (
         await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
     ).scalar_one_or_none()
@@ -8467,6 +8469,15 @@ async def public_room_plaid_exchange(
     )
 
 
+async def _lock_dealer_related_writes(db: AsyncSession, dealer_id: UUID) -> None:
+    """Serialize owner and bank-list mutations whose limits span multiple rows."""
+    await db.execute(
+        select(DealerBusiness.id)
+        .where(DealerBusiness.id == dealer_id)
+        .with_for_update()
+    )
+
+
 @router.post(
     "/public/room/{token}/plaid/{item_pk}/primary",
     response_model=PublicPlaidItemRead,
@@ -8482,6 +8493,7 @@ async def public_room_set_primary_bank(
         link, dealer = await client_room.resolve_room(db, token, payload.passcode)
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    await _lock_dealer_related_writes(db, dealer.id)
     item = (
         await db.execute(
             select(DealerPlaidItem).where(
@@ -8563,6 +8575,7 @@ async def plaid_patch(
     """Update one bank; scoped reps may select the main operating bank."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _lock_dealer_related_writes(db, dealer.id)
     item = (
         await db.execute(
             select(DealerPlaidItem).where(
@@ -8609,6 +8622,7 @@ async def plaid_remove(
     dealer's statements; only the live connection goes."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
+    await _lock_dealer_related_writes(db, dealer.id)
     item = (
         await db.execute(
             select(DealerPlaidItem).where(
@@ -9109,6 +9123,7 @@ async def create_owner(
     # lender file requires); edits/deletes stay team-only.
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _lock_dealer_related_writes(db, dealer.id)
     owner_count = int(
         (
             await db.execute(
@@ -9183,6 +9198,7 @@ async def patch_owner(
     # is a disclosure fact the client owns; everything else stays team-only.
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _lock_dealer_related_writes(db, dealer.id)
     row = (
         await db.execute(
             select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
@@ -10182,6 +10198,20 @@ async def owner_credit_invite(
         path=path,
         rep_name=user.name,
     )
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "owner.credit_invite_delivery",
+        "owner",
+        entity_id=owner.id,
+        after={
+            "delivered": delivery.ok,
+            "channel": delivery.channel,
+            "recipient": owner.email,
+        },
+    )
+    await db.commit()
     return CreditInviteResult(
         token=token,
         path=path,

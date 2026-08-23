@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import DealerDocument, DealerPlaidItem
 from . import plaid_client
+from .audit import log_action
 from .extract import extract_document, store_document_bytes
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,15 @@ async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days:
     item.next_refresh_at = _now() + timedelta(days=retry_days)
     item.status = "error" if error else "active"
     item.error = (error or None) and error[:500]
+    await log_action(
+        db,
+        item.dealer_id,
+        None,
+        "plaid.sync",
+        "plaid_item",
+        entity_id=item.id,
+        after={"status": item.status, "error": item.error, "retry_days": retry_days},
+    )
     await db.commit()
 
 
