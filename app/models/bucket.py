@@ -4,8 +4,21 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -170,6 +183,11 @@ class BucketFile(TimestampMixin, Base):
     upload_link_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_upload_links.id", ondelete="SET NULL"), nullable=True
     )
+    application_plaid_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_plaid_items.id", ondelete="SET NULL"), nullable=True
+    )
+    plaid_statement_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    statement_period: Mapped[str | None] = mapped_column(String(7), nullable=True)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     s3_key: Mapped[str] = mapped_column(String(700), nullable=False)
     content_type: Mapped[str] = mapped_column(String(160), nullable=False, default="application/octet-stream")
@@ -406,6 +424,7 @@ class BucketNote(TimestampMixin, Base):
     author_name: Mapped[str] = mapped_column(String(180), nullable=False)
     author_role: Mapped[str] = mapped_column(String(40), nullable=False)
     visibility: Mapped[str] = mapped_column(String(24), nullable=False, default="admin", server_default="admin")
+    channel: Mapped[str] = mapped_column(String(16), nullable=False, default="partner", server_default="partner")
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     bucket: Mapped[Bucket] = relationship(back_populates="notes")

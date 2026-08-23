@@ -168,6 +168,16 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        _wrap(job_application_plaid_refresh),
+        "cron",
+        hour=7,
+        minute=15,
+        id="application_plaid_refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
 
     # Doc-vision scan drain (alembic 0017). Every 2 min picks up
     # Documents flagged scan_dirty=True (set by upload-complete) and
@@ -878,3 +888,11 @@ async def job_dealer_os_plaid_refresh() -> None:
     result = await refresh_due()
     if result.get("items"):
         log.info("dealer_os_plaid_refresh: synced %s item(s)", result["items"])
+
+
+async def job_application_plaid_refresh() -> None:
+    from app.services.application_plaid_sync import refresh_due
+
+    result = await refresh_due()
+    if result["items"]:
+        log.info("application_plaid_refresh: synced %s item(s)", result["items"])

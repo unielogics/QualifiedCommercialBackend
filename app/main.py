@@ -13,16 +13,19 @@ from app.db import SessionLocal
 from app.dealer_os import router as dealer_os_router
 from app.routers import (
     admin as admin_router,
+)
+from app.routers import (
     agent_tasks,
     agents,
     agreements,
     ai,
     ai_agents,
     ai_feedback,
-    ai_voice,
     ai_preview,
     ai_tasks,
+    ai_voice,
     analysis,
+    application_profiles,
     auth,
     billing,
     brokers,
@@ -30,18 +33,18 @@ from app.routers import (
     calendar,
     clients,
     closing_costs,
+    communications,
     contracts,
     credit,
     deal_chat,
-    dealer_ai_intake,
-    fix_flip,
     deal_secretary,
+    dealer_ai_intake,
     deals,
     devices,
     documents,
     email_drafts,
+    fix_flip,
     fred,
-    google as google_router,
     inbox,
     intake,
     legal,
@@ -49,24 +52,35 @@ from app.routers import (
     lenders,
     lending_admin,
     loan_participants,
-    me,
     loan_summary,
     loan_workspace,
     loans,
+    me,
     messages,
     meta,
     notifications,
     operator_files,
-    pipeline as pipeline_router,
     prequal,
-    public as public_router,
     rates,
     regional_managers,
     reports,
-    webhooks as webhooks_router,
     search,
-    settings as settings_router,
     users,
+)
+from app.routers import (
+    google as google_router,
+)
+from app.routers import (
+    pipeline as pipeline_router,
+)
+from app.routers import (
+    public as public_router,
+)
+from app.routers import (
+    settings as settings_router,
+)
+from app.routers import (
+    webhooks as webhooks_router,
 )
 
 settings = get_settings()
@@ -152,6 +166,7 @@ for r in [
     loan_workspace.router,
     loan_workspace.public_router,  # /public/hud/{token} — no auth
     clients.router,
+    communications.router,
     deals.router,
     deal_chat.router,
     agent_tasks.router,
@@ -176,6 +191,7 @@ for r in [
     ai_feedback.router,
     ai_preview.router,
     analysis.router,
+    application_profiles.router,
     analysis.property_router,
     calendar.router,
     billing.router,
