@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +26,7 @@ from app.config import get_settings as get_app_config
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
+from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
 from app.models.broker import Broker
 from app.schemas.booking_settings import (
@@ -142,6 +143,22 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
     )
 
 
+def _booking_public_url(row: BookingSettings) -> str | None:
+    settings = get_app_config()
+    base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
+    if not base or "localhost" in base or "127.0.0.1" in base or base.startswith("http://"):
+        if settings.app_env.lower() == "production":
+            base = "https://app.qualifiedcommercial.com"
+    return f"{base}/book/{row.slug}" if (row.enabled and row.slug and base) else None
+
+
+def _booking_invite_body(body: str, booking_url: str) -> str:
+    cleaned = body.strip()
+    if booking_url in cleaned:
+        return cleaned
+    return f"{cleaned}\n\nChoose a time that works for you:\n{booking_url}"
+
+
 @router.get("/booking-settings", response_model=UserBookingSettingsRead)
 async def get_booking_settings(
     user: CurrentUser,
@@ -168,13 +185,83 @@ async def get_booking_link(
     A slug always exists (auto-created); url is null when booking is disabled."""
     row = await _get_or_create_booking_settings(db, user)
     await db.commit()
-    settings = get_app_config()
-    base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
-    if not base or "localhost" in base or "127.0.0.1" in base or base.startswith("http://"):
-        if settings.app_env.lower() == "production":
-            base = "https://app.qualifiedcommercial.com"
-    url = f"{base}/book/{row.slug}" if (row.enabled and row.slug and base) else None
-    return BookingLinkRead(enabled=bool(row.enabled), slug=row.slug, url=url)
+    return BookingLinkRead(enabled=bool(row.enabled), slug=row.slug, url=_booking_public_url(row))
+
+
+class BookingInviteShareRequest(BaseModel):
+    to_emails: list[EmailStr] = Field(min_length=1, max_length=10)
+    subject: str = Field(min_length=1, max_length=512)
+    body: str = Field(min_length=1, max_length=12_000)
+
+
+class BookingInviteShareResponse(BaseModel):
+    ok: bool
+    detail: str | None = None
+    message_id: str | None = None
+    booking_url: str
+
+
+@router.post("/booking-link/share", response_model=BookingInviteShareResponse)
+async def share_booking_link(
+    payload: BookingInviteShareRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingInviteShareResponse:
+    """Email the current user's public booking page through the normal user-mail path."""
+    if user.role == Role.CLIENT:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Client accounts cannot send booking invites")
+
+    row = await _get_or_create_booking_settings(db, user)
+    booking_url = _booking_public_url(row)
+    if booking_url is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Enable your public booking page before sharing an invite",
+        )
+
+    recipients = list(dict.fromkeys(str(email).lower() for email in payload.to_emails))
+    body = _booking_invite_body(payload.body, booking_url)
+
+    from app.services.email.user_mailer import send_as_user
+
+    result = await send_as_user(
+        db,
+        user.id,
+        to_emails=recipients,
+        subject=payload.subject.strip(),
+        body_text=body,
+    )
+    db.add(
+        Activity(
+            actor_id=user.id,
+            actor_label=user.email,
+            kind="calendar.booking_invite_sent" if result.ok else "calendar.booking_invite_failed",
+            summary=(
+                f"Booking invite sent to {', '.join(recipients)}"
+                if result.ok
+                else f"Booking invite failed for {', '.join(recipients)}"
+            ),
+            payload={
+                "booking_url": booking_url,
+                "recipients": recipients,
+                "provider_message_id": result.message_id,
+                "provider_detail": result.detail,
+            },
+        )
+    )
+    await db.commit()
+
+    if not result.ok:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            result.detail or "The booking invite could not be delivered",
+        )
+    return BookingInviteShareResponse(
+        ok=True,
+        detail=result.detail,
+        message_id=result.message_id,
+        booking_url=booking_url,
+    )
 
 
 @router.put("/booking-settings", response_model=UserBookingSettingsRead)
