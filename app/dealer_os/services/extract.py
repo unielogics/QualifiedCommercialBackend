@@ -940,6 +940,7 @@ async def store_document_bytes(
     *,
     kind: str = "statement",
     plaid_statement_id: str | None = None,
+    plaid_item_id: UUID | None = None,
 ) -> DealerDocument:
     """Create a DealerDocument from server-held bytes (no HTTP upload).
 
@@ -961,6 +962,7 @@ async def store_document_bytes(
         kind=kind,
         status="uploaded",
         plaid_statement_id=plaid_statement_id,
+        plaid_item_id=plaid_item_id,
     )
     db.add(doc)
     await db.flush()

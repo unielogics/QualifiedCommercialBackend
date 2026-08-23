@@ -123,6 +123,9 @@ from .schemas import (
     RepFileRow,
     CreditInviteRequest,
     CreditInviteResult,
+    BulkCreditInviteRequest,
+    BulkCreditInviteResult,
+    OwnerCreditInviteResult,
     CreditRead,
     CreditUpsert,
     DealerCreate,
@@ -143,6 +146,7 @@ from .schemas import (
     DecisionRead,
     UnreadSummary,
     PublicPlaidResult,
+    PublicPlaidItemRead,
     RoomPasscode,
     RoomPlaidExchange,
     ClientRequestResult,
@@ -1572,9 +1576,9 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     connection, and treating it as one would unlock a profile computed from
     statements that stopped arriving weeks ago.
 
-    Credit is any owner with a completed pull. Files often have several
-    principals and only the guarantor is pulled, so requiring all of them would
-    gate on work nobody intends to do.
+    Credit is complete only when ownership totals 100% and every disclosed
+    owner at 20% or more has completed their own pull. Each pull remains tied
+    to its owner row and consent link.
     """
     plaid_linked = bool(
         (
@@ -1582,6 +1586,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
                 select(DealerPlaidItem.id).where(
                     DealerPlaidItem.dealer_id == dealer.id,
                     DealerPlaidItem.status == "active",
+                    DealerPlaidItem.is_primary_operating.is_(True),
                 ).limit(1)
             )
         ).scalar_one_or_none()
@@ -1590,15 +1595,12 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     upload_linked = len(statement_months) >= 6 and not missing_statement_months
     bank_linked = plaid_linked or upload_linked
     bank_source = "plaid" if plaid_linked else ("upload" if upload_linked else "none")
+    owner_state = await _owner_requirement_state(db, dealer.id)
     credit_returned = bool(
-        (
-            await db.execute(
-                select(DealerOwner.id).where(
-                    DealerOwner.dealer_id == dealer.id,
-                    DealerOwner.credit_pulled_at.is_not(None),
-                ).limit(1)
-            )
-        ).scalar_one_or_none()
+        owner_state["ownership_complete"]
+        and owner_state["required"]
+        and not owner_state["missing_email"]
+        and len(owner_state["completed"]) == len(owner_state["required"])
     )
     return decision.assess_verification(
         bank_linked=bank_linked,
@@ -1606,6 +1608,11 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         statement_months=statement_months,
         missing_statement_months=missing_statement_months,
         credit_returned=credit_returned,
+        ownership_total=owner_state["ownership_total"],
+        ownership_complete=owner_state["ownership_complete"],
+        required_credit_owner_count=len(owner_state["required"]),
+        completed_credit_owner_count=len(owner_state["completed"]),
+        pending_credit_owner_ids=[owner.id for owner in owner_state["pending"]],
     )
 
 
@@ -7883,6 +7890,7 @@ async def plaid_state(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     items = await _plaid_items(db, dealer.id)
+    months = await _plaid_statement_months_by_item(db, dealer.id)
     cs = await bank_consent.state(db, dealer.id)
     d = bank_consent.disclosure()
     return PlaidStateRead(
@@ -7896,7 +7904,13 @@ async def plaid_state(
             disclosure_version=d["version"],
             disclosure_text=d["text"],
         ),
-        items=[PlaidItemRead.model_validate(i) for i in items],
+        items=[
+            PlaidItemRead(
+                **PlaidItemRead.model_validate(item).model_dump(exclude={"statement_months"}),
+                statement_months=months.get(item.id, []),
+            )
+            for item in items
+        ],
     )
 
 
@@ -8022,9 +8036,14 @@ async def plaid_exchange(
         )
         db.add(item)
     await db.flush()
+    if payload.is_primary_operating is True or not await _has_primary_operating_bank(db, dealer.id):
+        await _make_primary_operating_bank(db, dealer.id, item)
     await log_action(
         db, dealer.id, user, "plaid.connect", "plaid_item", entity_id=item.id,
-        after={"institution": item.institution_name},
+        after={
+            "institution": item.institution_name,
+            "is_primary_operating": item.is_primary_operating,
+        },
     )
     await db.commit()
     await db.refresh(item)
@@ -8131,6 +8150,7 @@ async def public_room_features(
         plaid_environment=plaid_client.environment(),
         bank_consent_granted=bank_cs.granted,
         bank_consent_disclosure=bank_consent.disclosure()["text"],
+        bank_connections=await _safe_plaid_items(db, dealer.id),
         signable=rows,
         contracts=contract_rows,
     )
@@ -8424,12 +8444,19 @@ async def public_room_plaid_exchange(
         )
         db.add(item)
     await db.flush()
+    if payload.is_primary_operating is True or not await _has_primary_operating_bank(db, dealer.id):
+        await _make_primary_operating_bank(db, dealer.id, item)
     # No `user` to attribute this to, so the audit row records the room the
     # owner came through. "The client did it themselves" is exactly the fact
     # worth being able to prove later.
     await log_action(
         db, dealer.id, None, "plaid.connect.client", "plaid_item", entity_id=item.id,
-        after={"institution": item.institution_name, "via": "client_room", "link_id": str(link.id)},
+        after={
+            "institution": item.institution_name,
+            "via": "client_room",
+            "link_id": str(link.id),
+            "is_primary_operating": item.is_primary_operating,
+        },
     )
     await db.commit()
     background.add_task(_background_plaid_first_sync, item.id)
@@ -8437,6 +8464,55 @@ async def public_room_plaid_exchange(
         connected=True,
         institution_name=item.institution_name,
         message="Your bank is connected. We are pulling your statements now.",
+    )
+
+
+@router.post(
+    "/public/room/{token}/plaid/{item_pk}/primary",
+    response_model=PublicPlaidItemRead,
+)
+async def public_room_set_primary_bank(
+    token: str,
+    item_pk: UUID,
+    payload: RoomPasscode,
+    db: AsyncSession = Depends(get_db),
+) -> PublicPlaidItemRead:
+    """Let the client identify the operating bank without exposing secrets."""
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    item = (
+        await db.execute(
+            select(DealerPlaidItem).where(
+                DealerPlaidItem.id == item_pk,
+                DealerPlaidItem.dealer_id == dealer.id,
+                DealerPlaidItem.status != "removed",
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
+    await _make_primary_operating_bank(db, dealer.id, item)
+    await log_action(
+        db,
+        dealer.id,
+        None,
+        "plaid.primary.client",
+        "plaid_item",
+        entity_id=item.id,
+        after={"via": "client_room", "link_id": str(link.id)},
+    )
+    await db.commit()
+    months = await _plaid_statement_months_by_item(db, dealer.id)
+    return PublicPlaidItemRead(
+        id=item.id,
+        institution_name=item.institution_name,
+        accounts_label=item.accounts_label,
+        status=item.status,
+        is_primary_operating=True,
+        last_pulled_at=item.last_pulled_at,
+        statement_months=months.get(item.id, []),
     )
 
 
@@ -8484,11 +8560,9 @@ async def plaid_patch(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlaidItem:
-    """Super-admin: pause or resume the 30-day automatic refresh for one
-    bank. Paused items keep their connection and history; the scheduler
-    simply skips them until resumed."""
-    require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    """Update one bank; scoped reps may select the main operating bank."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     item = (
         await db.execute(
             select(DealerPlaidItem).where(
@@ -8498,13 +8572,30 @@ async def plaid_patch(
     ).scalar_one_or_none()
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this client")
-    item.auto_refresh = payload.auto_refresh
-    if payload.auto_refresh and item.next_refresh_at is None:
-        item.next_refresh_at = datetime.now(timezone.utc)
-    await log_action(
-        db, dealer.id, user, "plaid.auto_refresh", "plaid_item", entity_id=item.id,
-        after={"auto_refresh": payload.auto_refresh},
-    )
+    if payload.auto_refresh is not None:
+        if user.role != Role.SUPER_ADMIN:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only a super admin may change automatic bank refresh",
+            )
+        item.auto_refresh = payload.auto_refresh
+        if payload.auto_refresh and item.next_refresh_at is None:
+            item.next_refresh_at = datetime.now(timezone.utc)
+        await log_action(
+            db, dealer.id, user, "plaid.auto_refresh", "plaid_item", entity_id=item.id,
+            after={"auto_refresh": payload.auto_refresh},
+        )
+    if payload.is_primary_operating is True:
+        await _make_primary_operating_bank(db, dealer.id, item)
+        await log_action(
+            db, dealer.id, user, "plaid.primary", "plaid_item", entity_id=item.id,
+            after={"is_primary_operating": True},
+        )
+    elif payload.is_primary_operating is False and item.is_primary_operating:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select another main operating bank instead of clearing the current one",
+        )
     await db.commit()
     await db.refresh(item)
     return item
@@ -8535,6 +8626,19 @@ async def plaid_remove(
             pass  # best-effort — the row is retired regardless
     item.status = "removed"
     item.encrypted_access_token = None
+    was_primary = item.is_primary_operating
+    item.is_primary_operating = False
+    if was_primary:
+        replacement = next(
+            (
+                candidate
+                for candidate in await _plaid_items(db, dealer.id)
+                if candidate.id != item.id and candidate.status != "removed"
+            ),
+            None,
+        )
+        if replacement is not None:
+            await _make_primary_operating_bank(db, dealer.id, replacement)
     await log_action(db, dealer.id, user, "plaid.remove", "plaid_item", entity_id=item.id)
     await db.commit()
 
@@ -8840,6 +8944,137 @@ async def simulate_refinance(
 
 # --- Owners, business profile & credit (0118) ---------------------------------
 
+_MAX_OWNERS_PER_FILE = 5
+_CREDIT_OWNER_THRESHOLD = 20.0
+
+
+def _normalized_owner_email(value: str | None) -> str | None:
+    clean = (value or "").strip().lower()
+    return clean or None
+
+
+async def _assert_owner_email_unique(
+    db: AsyncSession,
+    dealer_id: UUID,
+    email: str | None,
+    *,
+    exclude_owner_id: UUID | None = None,
+) -> None:
+    normalized = _normalized_owner_email(email)
+    if normalized is None:
+        return
+    stmt = select(DealerOwner.id).where(
+        DealerOwner.dealer_id == dealer_id,
+        func.lower(DealerOwner.email) == normalized,
+    )
+    if exclude_owner_id is not None:
+        stmt = stmt.where(DealerOwner.id != exclude_owner_id)
+    if (await db.execute(stmt.limit(1))).scalar_one_or_none() is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Each owner must use a different email address",
+        )
+
+
+async def _make_primary_operating_bank(
+    db: AsyncSession, dealer_id: UUID, item: DealerPlaidItem
+) -> None:
+    """Select exactly one primary bank without exposing token-bearing rows."""
+    await db.execute(
+        sa_update(DealerPlaidItem)
+        .where(
+            DealerPlaidItem.dealer_id == dealer_id,
+            DealerPlaidItem.id != item.id,
+            DealerPlaidItem.is_primary_operating.is_(True),
+        )
+        .values(is_primary_operating=False)
+    )
+    item.is_primary_operating = True
+
+
+async def _has_primary_operating_bank(db: AsyncSession, dealer_id: UUID) -> bool:
+    return (
+        await db.execute(
+            select(DealerPlaidItem.id)
+            .where(
+                DealerPlaidItem.dealer_id == dealer_id,
+                DealerPlaidItem.status != "removed",
+                DealerPlaidItem.is_primary_operating.is_(True),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+
+
+async def _plaid_statement_months_by_item(
+    db: AsyncSession, dealer_id: UUID
+) -> dict[UUID, list[str]]:
+    rows = (
+        await db.execute(
+            select(DealerDocument.plaid_item_id, DealerDocument.extracted).where(
+                DealerDocument.dealer_id == dealer_id,
+                DealerDocument.plaid_item_id.is_not(None),
+            )
+        )
+    ).all()
+    coverage: dict[UUID, set[str]] = {}
+    for item_id, extracted in rows:
+        if item_id is None or not isinstance(extracted, dict):
+            continue
+        for month in extracted.get("months") or []:
+            if isinstance(month, str) and re.fullmatch(r"\d{4}-\d{2}", month):
+                coverage.setdefault(item_id, set()).add(month)
+    return {item_id: sorted(months) for item_id, months in coverage.items()}
+
+
+async def _safe_plaid_items(
+    db: AsyncSession, dealer_id: UUID
+) -> list[PublicPlaidItemRead]:
+    months = await _plaid_statement_months_by_item(db, dealer_id)
+    return [
+        PublicPlaidItemRead(
+            id=item.id,
+            institution_name=item.institution_name,
+            accounts_label=item.accounts_label,
+            status=item.status,
+            is_primary_operating=item.is_primary_operating,
+            last_pulled_at=item.last_pulled_at,
+            statement_months=months.get(item.id, []),
+        )
+        for item in await _plaid_items(db, dealer_id)
+    ]
+
+
+async def _owner_requirement_state(db: AsyncSession, dealer_id: UUID) -> dict:
+    owners = list(
+        (
+            await db.execute(
+                select(DealerOwner)
+                .where(DealerOwner.dealer_id == dealer_id)
+                .order_by(DealerOwner.ownership_pct.desc().nullslast(), DealerOwner.last_name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    total = round(sum(float(owner.ownership_pct or 0) for owner in owners), 2)
+    ownership_complete = bool(owners) and abs(total - 100.0) < 0.005
+    required = [
+        owner for owner in owners if float(owner.ownership_pct or 0) >= _CREDIT_OWNER_THRESHOLD
+    ]
+    completed = [owner for owner in required if owner.credit_pulled_at is not None]
+    missing_email = [owner for owner in required if not _normalized_owner_email(owner.email)]
+    pending = [owner for owner in required if owner.credit_pulled_at is None]
+    return {
+        "owners": owners,
+        "ownership_total": total,
+        "ownership_complete": ownership_complete,
+        "required": required,
+        "completed": completed,
+        "missing_email": missing_email,
+        "pending": pending,
+    }
+
 
 @router.get("/dealers/{dealer_id}/owners", response_model=list[OwnerRead])
 async def list_owners(
@@ -8874,6 +9109,21 @@ async def create_owner(
     # lender file requires); edits/deletes stay team-only.
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    owner_count = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(DealerOwner).where(
+                    DealerOwner.dealer_id == dealer.id
+                )
+            )
+        ).scalar_one()
+    )
+    if owner_count >= _MAX_OWNERS_PER_FILE:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A file may contain at most five owners",
+        )
+    await _assert_owner_email_unique(db, dealer.id, body.email)
     if body.is_primary:
         # 0125: at most ONE primary per dealer — is_primary marks the login's
         # own person, and there is only one of those.
@@ -8889,7 +9139,9 @@ async def create_owner(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "This client already has a primary owner",
             )
-    row = DealerOwner(dealer_id=dealer.id, **body.model_dump())
+    values = body.model_dump()
+    values["email"] = _normalized_owner_email(body.email)
+    row = DealerOwner(dealer_id=dealer.id, **values)
     db.add(row)
     await log_action(db, dealer.id, user, "owner.create", "owner", after=body.model_dump(mode="json"))
     try:
@@ -8943,12 +9195,28 @@ async def patch_owner(
         violation = _dealer_owner_patch_violation(set(patch))
         if violation is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, violation)
+    if "email" in patch:
+        patch["email"] = _normalized_owner_email(patch["email"])
+        await _assert_owner_email_unique(
+            db, dealer.id, patch["email"], exclude_owner_id=row.id
+        )
+    before_required = row.credit_required
     for k, v in patch.items():
         setattr(row, k, v)
     await log_action(
         db, dealer.id, user, "owner.update", "owner",
         entity_id=row.id, after=jsonable_encoder(patch),
     )
+    if before_required != row.credit_required:
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "owner.credit_threshold_changed",
+            "owner",
+            entity_id=row.id,
+            after={"credit_required": row.credit_required, "ownership_pct": float(row.ownership_pct or 0)},
+        )
     await db.commit()
     await db.refresh(row)
     return row
@@ -8967,6 +9235,11 @@ async def delete_owner(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+    if row.invite_sent_at is not None or row.credit_pulled_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This owner has credit authorization history and cannot be deleted",
+        )
     await db.delete(row)
     await log_action(db, dealer.id, user, "owner.delete", "owner", entity_id=owner_id)
     await db.commit()
@@ -9187,6 +9460,17 @@ async def owner_soft_pull(
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    if not owner_state["ownership_complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Ownership must total 100.00% before a credit pull can run",
+        )
+    if not owner.credit_required:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Credit is not required for an owner below 20% ownership",
+        )
     if user.role == Role.DEALER:
         blocked = _dealer_self_pull_violation(owner.is_primary, owner.credit_pulled_at)
         if blocked is not None:
@@ -9849,6 +10133,22 @@ async def owner_credit_invite(
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    if not owner_state["ownership_complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
+        )
+    if not owner.credit_required:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Credit authorization is required only for owners with 20% or more ownership",
+        )
+    if not _normalized_owner_email(owner.email):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This owner needs an email before a credit authorization can be sent",
+        )
     # The consent page is gated by the file's room access code — the same PIN
     # that opens the upload room. Ensure the room (and therefore a code)
     # exists before the link goes out, or the gate would ask for a code that
@@ -9875,8 +10175,8 @@ async def owner_credit_invite(
     delivery = await consent_delivery.deliver_link_checked(
         db,
         channel=req.channel,
-        to_email=req.to_email or owner.email or dealer.email,
-        to_phone=req.to_phone or owner.phone or dealer.phone,
+        to_email=owner.email,
+        to_phone=owner.phone,
         business_name=dealer.name,
         purpose="authorise a soft credit check",
         path=path,
@@ -9889,6 +10189,64 @@ async def owner_credit_invite(
         channel=delivery.channel,
         detail=delivery.detail,
     )
+
+
+@router.post(
+    "/dealers/{dealer_id}/owners/credit-invites",
+    response_model=BulkCreditInviteResult,
+)
+async def bulk_owner_credit_invites(
+    dealer_id: UUID,
+    payload: BulkCreditInviteRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BulkCreditInviteResult:
+    """Send one isolated consent link to every required owner still pending."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    if not owner_state["ownership_complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
+        )
+    if owner_state["missing_email"]:
+        names = ", ".join(owner.full_name for owner in owner_state["missing_email"])
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Add an email for every required owner before sending: {names}",
+        )
+
+    results: list[OwnerCreditInviteResult] = []
+    for owner in owner_state["pending"]:
+        try:
+            sent = await owner_credit_invite(
+                dealer_id,
+                owner.id,
+                user,
+                CreditInviteRequest(channel=payload.channel),
+                db,
+            )
+            results.append(
+                OwnerCreditInviteResult(
+                    owner_id=owner.id,
+                    owner_name=owner.full_name,
+                    token=sent.token,
+                    path=sent.path,
+                    delivered=sent.delivered,
+                    channel=sent.channel,
+                    detail=sent.detail,
+                )
+            )
+        except HTTPException as exc:
+            results.append(
+                OwnerCreditInviteResult(
+                    owner_id=owner.id,
+                    owner_name=owner.full_name,
+                    detail=str(exc.detail),
+                )
+            )
+    return BulkCreditInviteResult(items=results)
 
 
 @router.get("/public/credit-consent/{token}", response_model=PublicConsentView)
@@ -9973,6 +10331,19 @@ async def public_credit_consent_submit(
     if dealer is None:  # orphaned row — treat like a dead link, not a 500
         await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This consent link is no longer valid")
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    if not owner_state["ownership_complete"]:
+        await _release_token()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The ownership schedule is being updated. Ask your representative before continuing.",
+        )
+    if not owner.credit_required:
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This owner no longer requires a credit authorization for this file.",
+        )
     for f in _OWNER_PULL_REQUIRED_FIELDS:
         value = getattr(body, f)
         if value is not None and getattr(owner, f, None) in (None, ""):

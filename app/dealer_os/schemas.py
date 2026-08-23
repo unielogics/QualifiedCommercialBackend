@@ -760,6 +760,11 @@ class VerificationRead(BaseModel):
     reason: str = ""
     stage: str = "intake"
     credit_enabled: bool = True
+    ownership_total: float = 0.0
+    ownership_complete: bool = False
+    required_credit_owner_count: int = 0
+    completed_credit_owner_count: int = 0
+    pending_credit_owner_ids: list[UUID] = Field(default_factory=list)
 
 
 class DecisionRead(BaseModel):
@@ -1199,6 +1204,7 @@ class RoomPasscode(BaseModel):
 class RoomPlaidExchange(RoomPasscode):
     public_token: str = Field(min_length=1, max_length=512)
     institution_name: str | None = Field(default=None, max_length=160)
+    is_primary_operating: bool | None = None
 
 
 class PublicPlaidResult(BaseModel):
@@ -1209,6 +1215,16 @@ class PublicPlaidResult(BaseModel):
     connected: bool
     institution_name: str | None = None
     message: str
+
+
+class PublicPlaidItemRead(BaseModel):
+    id: UUID
+    institution_name: str | None = None
+    accounts_label: str | None = None
+    status: str
+    is_primary_operating: bool = False
+    last_pulled_at: datetime | None = None
+    statement_months: list[str] = Field(default_factory=list)
 
 
 class RoomSignableRead(BaseModel):
@@ -1232,6 +1248,7 @@ class RoomFeaturesRead(BaseModel):
     # consent. Shipping the gate without this would break the client room.
     bank_consent_granted: bool = False
     bank_consent_disclosure: str = ""
+    bank_connections: list[PublicPlaidItemRead] = Field(default_factory=list)
     signable: list[RoomSignableRead] = []
 
 
@@ -1302,7 +1319,7 @@ class BankUploadRequestResult(ClientRequestResult):
 class BankEvidenceRead(BaseModel):
     bank_linked: bool = False
     bank_source: Literal["plaid", "upload", "none"] = "none"
-    statement_months: list[str] = []
+    statement_months: list[str] = Field(default_factory=list)
     missing_statement_months: list[str] = []
     statement_target: int = 6
     bucket_id: UUID | None = None
@@ -1606,10 +1623,13 @@ class PlaidItemRead(ORM):
     last_pulled_at: datetime | None = None
     next_refresh_at: datetime | None = None
     created_at: datetime
+    is_primary_operating: bool = False
+    statement_months: list[str] = []
 
 
 class PlaidItemPatch(BaseModel):
-    auto_refresh: bool
+    auto_refresh: bool | None = None
+    is_primary_operating: bool | None = None
 
 
 class BankConsentState(BaseModel):
@@ -1655,6 +1675,7 @@ class PlaidLinkTokenRead(BaseModel):
 class PlaidExchange(BaseModel):
     public_token: str = Field(min_length=8, max_length=256)
     institution_name: str | None = Field(default=None, max_length=160)
+    is_primary_operating: bool | None = None
 
 
 class PlaidRefreshResult(BaseModel):
@@ -1740,6 +1761,7 @@ class OwnerRead(ORM):
     id: UUID
     first_name: str
     last_name: str
+    full_name: str
     email: str | None = None
     phone: str | None = None
     ownership_pct: float | None = None
@@ -1761,6 +1783,8 @@ class OwnerRead(ORM):
     credit_pulled_at: datetime | None = None
     credit_summary: dict | None = None
     notes: str | None = None
+    credit_required: bool = False
+    credit_complete: bool = False
 
 
 class OwnerCreate(BaseModel):
@@ -1768,7 +1792,7 @@ class OwnerCreate(BaseModel):
     last_name: str = Field(min_length=1, max_length=80)
     email: str | None = None
     phone: str | None = None
-    ownership_pct: float | None = None
+    ownership_pct: float | None = Field(default=None, ge=0, le=100)
     is_guarantor: bool = True
     dob: date | None = None
     street: str | None = None
@@ -1786,7 +1810,7 @@ class OwnerPatch(BaseModel):
     last_name: str | None = Field(default=None, min_length=1, max_length=80)
     email: str | None = None
     phone: str | None = None
-    ownership_pct: float | None = None
+    ownership_pct: float | None = Field(default=None, ge=0, le=100)
     is_guarantor: bool | None = None
     dob: date | None = None
     street: str | None = None
@@ -1836,6 +1860,24 @@ class CreditInviteResult(BaseModel):
     delivered: bool = False
     channel: str = "none"
     detail: str = ""
+
+
+class BulkCreditInviteRequest(BaseModel):
+    channel: Literal["email", "none"] = "email"
+
+
+class OwnerCreditInviteResult(BaseModel):
+    owner_id: UUID
+    owner_name: str
+    token: str | None = None
+    path: str | None = None
+    delivered: bool = False
+    channel: str = "none"
+    detail: str = ""
+
+
+class BulkCreditInviteResult(BaseModel):
+    items: list[OwnerCreditInviteResult] = Field(default_factory=list)
 
 
 class PublicConsentView(BaseModel):

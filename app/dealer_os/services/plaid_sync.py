@@ -151,6 +151,7 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
                 "application/pdf",
                 kind="statement",
                 plaid_statement_id=sid,
+                plaid_item_id=item_pk,
             )
             await extract_document(db, doc, raw)
             note = f"Pulled from Plaid · {label} · statement period {period}"

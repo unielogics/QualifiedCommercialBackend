@@ -73,6 +73,11 @@ class Verification:
     "temporarily unavailable" that is not temporary and is not their problem.
     A rep needs to know before they send, not the applicant after they
     comply."""
+    ownership_total: float = 0.0
+    ownership_complete: bool = False
+    required_credit_owner_count: int = 0
+    completed_credit_owner_count: int = 0
+    pending_credit_owner_ids: list = field(default_factory=list)
 
 
 def credit_pull_available() -> bool:
@@ -97,6 +102,11 @@ def assess_verification(
     bank_source: str | None = None,
     statement_months: list[str] | None = None,
     missing_statement_months: list[str] | None = None,
+    ownership_total: float = 0.0,
+    ownership_complete: bool = False,
+    required_credit_owner_count: int = 0,
+    completed_credit_owner_count: int = 0,
+    pending_credit_owner_ids: list | None = None,
 ) -> Verification:
     """PURE. Both must return; neither alone is enough.
 
@@ -106,8 +116,14 @@ def assess_verification(
     """
     returned = int(bank_linked) + int(credit_returned)
     unlocked = returned == 2
-    if unlocked:
-        reason = "Bank + credit returned"
+    if not ownership_complete:
+        reason = f"Ownership totals {ownership_total:.2f}% · complete 100% in step 1"
+    elif required_credit_owner_count and completed_credit_owner_count < required_credit_owner_count:
+        reason = (
+            f"{completed_credit_owner_count} of {required_credit_owner_count} required owners completed"
+        )
+    elif unlocked:
+        reason = "Bank + all required owner credit returned"
     elif returned == 1:
         reason = "1 of 2 authorizations returned"
     else:
@@ -123,6 +139,11 @@ def assess_verification(
         reason=reason,
         stage="underwriting" if unlocked else ("verification" if returned else "intake"),
         credit_enabled=credit_pull_available(),
+        ownership_total=ownership_total,
+        ownership_complete=ownership_complete,
+        required_credit_owner_count=required_credit_owner_count,
+        completed_credit_owner_count=completed_credit_owner_count,
+        pending_credit_owner_ids=list(pending_credit_owner_ids or []),
     )
 
 
