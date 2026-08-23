@@ -762,6 +762,8 @@ class VerificationRead(BaseModel):
     credit_enabled: bool = True
     ownership_total: float = 0.0
     ownership_complete: bool = False
+    owner_contact_complete: bool = False
+    missing_credit_contact_owner_ids: list[UUID] = Field(default_factory=list)
     required_credit_owner_count: int = 0
     completed_credit_owner_count: int = 0
     pending_credit_owner_ids: list[UUID] = Field(default_factory=list)
@@ -1785,6 +1787,7 @@ class OwnerRead(ORM):
     notes: str | None = None
     credit_required: bool = False
     credit_complete: bool = False
+    credit_contact_complete: bool = False
 
 
 class OwnerCreate(BaseModel):
@@ -1863,7 +1866,7 @@ class CreditInviteResult(BaseModel):
 
 
 class BulkCreditInviteRequest(BaseModel):
-    channel: Literal["email", "none"] = "email"
+    channel: Literal["email", "sms", "none"] = "email"
 
 
 class OwnerCreditInviteResult(BaseModel):

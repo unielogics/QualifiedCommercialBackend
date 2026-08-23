@@ -1598,8 +1598,8 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     owner_state = await _owner_requirement_state(db, dealer.id)
     credit_returned = bool(
         owner_state["ownership_complete"]
+        and owner_state["contact_complete"]
         and owner_state["required"]
-        and not owner_state["missing_email"]
         and len(owner_state["completed"]) == len(owner_state["required"])
     )
     return decision.assess_verification(
@@ -1610,6 +1610,8 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         credit_returned=credit_returned,
         ownership_total=owner_state["ownership_total"],
         ownership_complete=owner_state["ownership_complete"],
+        owner_contact_complete=owner_state["contact_complete"],
+        missing_credit_contact_owner_ids=[owner.id for owner in owner_state["missing_contact"]],
         required_credit_owner_count=len(owner_state["required"]),
         completed_credit_owner_count=len(owner_state["completed"]),
         pending_credit_owner_ids=[owner.id for owner in owner_state["pending"]],
@@ -9078,6 +9080,11 @@ async def _owner_requirement_state(db: AsyncSession, dealer_id: UUID) -> dict:
     ]
     completed = [owner for owner in required if owner.credit_pulled_at is not None]
     missing_email = [owner for owner in required if not _normalized_owner_email(owner.email)]
+    missing_phone = [owner for owner in required if not consent_delivery.normalize_phone(owner.phone)]
+    missing_contact = [
+        owner for owner in required
+        if owner in missing_email or owner in missing_phone
+    ]
     pending = [owner for owner in required if owner.credit_pulled_at is None]
     return {
         "owners": owners,
@@ -9086,6 +9093,9 @@ async def _owner_requirement_state(db: AsyncSession, dealer_id: UUID) -> dict:
         "required": required,
         "completed": completed,
         "missing_email": missing_email,
+        "missing_phone": missing_phone,
+        "missing_contact": missing_contact,
+        "contact_complete": not missing_contact,
         "pending": pending,
     }
 
@@ -9101,7 +9111,7 @@ async def list_owners(
             await db.execute(
                 select(DealerOwner)
                 .where(DealerOwner.dealer_id == dealer.id)
-                .order_by(DealerOwner.ownership_pct.desc().nullslast(), DealerOwner.last_name)
+                .order_by(DealerOwner.created_at.asc(), DealerOwner.id.asc())
             )
         )
         .scalars()
@@ -10165,6 +10175,11 @@ async def owner_credit_invite(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "This owner needs an email before a credit authorization can be sent",
         )
+    if not consent_delivery.normalize_phone(owner.phone):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This owner needs a valid personal phone before a credit authorization can be sent",
+        )
     # The consent page is gated by the file's room access code — the same PIN
     # that opens the upload room. Ensure the room (and therefore a code)
     # exists before the link goes out, or the gate would ask for a code that
@@ -10240,11 +10255,11 @@ async def bulk_owner_credit_invites(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
         )
-    if owner_state["missing_email"]:
-        names = ", ".join(owner.full_name for owner in owner_state["missing_email"])
+    if owner_state["missing_contact"]:
+        names = ", ".join(owner.full_name for owner in owner_state["missing_contact"])
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Add an email for every required owner before sending: {names}",
+            f"Add a valid personal email and phone for every required owner before sending: {names}",
         )
 
     results: list[OwnerCreditInviteResult] = []

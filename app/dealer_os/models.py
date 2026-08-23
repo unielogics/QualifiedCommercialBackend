@@ -718,6 +718,10 @@ class DealerOwner(TimestampMixin, Base):
     def credit_complete(self) -> bool:
         return self.credit_pulled_at is not None
 
+    @property
+    def credit_contact_complete(self) -> bool:
+        return bool((self.email or "").strip() and (self.phone or "").strip())
+
     credit_score: Mapped[int | None] = mapped_column(Integer)
     credit_tier: Mapped[str | None] = mapped_column(String(16))
     credit_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
