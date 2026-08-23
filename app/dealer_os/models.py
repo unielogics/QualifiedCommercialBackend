@@ -537,6 +537,12 @@ class DealerDocument(TimestampMixin, Base):
     # 0127: Plaid statement identity — partial-unique per dealer, so a
     # refresh can never ingest the same statement twice.
     plaid_statement_id: Mapped[str | None] = mapped_column(String(64))
+    # The Plaid institution that supplied this statement. Older rows remain
+    # null because statement ids alone cannot be safely reverse-mapped after
+    # ingestion; new rows keep exact institution lineage.
+    plaid_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_plaid_items.id", ondelete="SET NULL")
+    )
     # Mirror row in the dealer's linked Bucket (Phase 2). Set on push (upload
     # -> bucket) and on pull (bucket file ingested -> Dealer OS). SET NULL so
     # bucket-file deletion never destroys the extraction record.
@@ -700,6 +706,18 @@ class DealerOwner(TimestampMixin, Base):
         API can say "a link exists" without ever exposing the hash."""
         return self.invite_token_hash is not None
 
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}".strip()
+
+    @property
+    def credit_required(self) -> bool:
+        return float(self.ownership_pct or 0) >= 20.0
+
+    @property
+    def credit_complete(self) -> bool:
+        return self.credit_pulled_at is not None
+
     credit_score: Mapped[int | None] = mapped_column(Integer)
     credit_tier: Mapped[str | None] = mapped_column(String(16))
     credit_pulled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -749,6 +767,9 @@ class DealerPlaidItem(TimestampMixin, Base):
     # connected accounts' names + last-4 for the row label.
     auto_refresh: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     accounts_label: Mapped[str | None] = mapped_column(String(200))
+    is_primary_operating: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
 
 
 class DealerGroup(TimestampMixin, Base):
