@@ -177,8 +177,9 @@ def upgrade() -> None:
             id, dealer_id, primary_bucket_id, vertical, funding_category,
             entity_type, industry, naics_code, naics_label, backfill_needs_review
         )
-        SELECT gen_random_uuid(), d.id, d.bucket_id, 'dealer', d.funding_purpose,
-               d.entity_type, d.industry, d.naics_code, d.naics_label, false
+        SELECT gen_random_uuid(), d.id, d.bucket_id, 'dealer', left(d.funding_purpose, 64),
+               left(d.entity_type, 32), left(d.industry, 80),
+               left(d.naics_code, 8), left(d.naics_label, 180), false
           FROM dos_dealers d
         """
     )
@@ -212,8 +213,8 @@ def upgrade() -> None:
                    WHEN i.variant ILIKE '%dealer%' THEN 'dealer'
                    ELSE 'main_street'
                END,
-               i.loan_purpose,
-               i.intake_state #>> '{main_street_details,industry}',
+               left(i.loan_purpose, 64),
+               left(i.intake_state #>> '{main_street_details,industry}', 80),
                true
           FROM public_underwriting_intakes i
          WHERE NOT EXISTS (
@@ -226,7 +227,7 @@ def upgrade() -> None:
         INSERT INTO application_profiles (
             id, client_id, deal_id, vertical, funding_category, backfill_needs_review
         )
-        SELECT gen_random_uuid(), d.client_id, d.id, 'real_estate', d.deal_type, true
+        SELECT gen_random_uuid(), d.client_id, d.id, 'real_estate', left(d.deal_type, 64), true
           FROM deals d
         """
     )
@@ -269,7 +270,7 @@ def upgrade() -> None:
         )
         SELECT gen_random_uuid(), l.client_id, l.id,
                CASE WHEN lower(CAST(l.type AS text)) LIKE '%mca%' THEN 'mca' ELSE 'real_estate' END,
-               CAST(l.purpose AS text), CAST(l.entity_type AS text), true
+               left(CAST(l.purpose AS text), 64), left(CAST(l.entity_type AS text), 32), true
           FROM loans l
          WHERE NOT EXISTS (
              SELECT 1 FROM application_profiles p WHERE p.loan_id = l.id
@@ -283,13 +284,13 @@ def upgrade() -> None:
             ownership_pct, is_primary, is_guarantor, backfill_needs_review
         )
         SELECT gen_random_uuid(), p.id,
-               split_part(trim(COALESCE(i.full_name, c.name, 'Unknown Owner')), ' ', 1),
-               COALESCE(
+               left(split_part(trim(COALESCE(i.full_name, c.name, 'Unknown Owner')), ' ', 1), 80),
+               left(COALESCE(
                    NULLIF(trim(substr(trim(COALESCE(i.full_name, c.name, 'Unknown Owner')),
                        strpos(trim(COALESCE(i.full_name, c.name, 'Unknown Owner')), ' ') + 1)), ''),
                    'Unknown'
-               ),
-               COALESCE(i.email, c.email), COALESCE(i.phone, c.phone),
+               ), 80),
+               left(COALESCE(i.email, c.email), 320), left(COALESCE(i.phone, c.phone), 48),
                100.00, true, true, true
           FROM application_profiles p
           LEFT JOIN public_underwriting_intakes i ON i.id = p.intake_id
