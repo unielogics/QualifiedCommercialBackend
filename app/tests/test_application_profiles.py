@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.enums import Role
 from app.models.application_profile import ApplicationOwner, ApplicationPlaidItem
+from app.routers.application_profiles import _require_profile_bank_client
 from app.routers.communications import _intake_allowed_channels
 from app.schemas.application_profile import FileOwnerPatch
 
@@ -54,3 +56,17 @@ def test_model_metadata_contains_partial_uniqueness_contracts() -> None:
 )
 def test_intake_channels_remain_role_confined(role: Role, channels: set[str]) -> None:
     assert _intake_allowed_channels(SimpleNamespace(role=role)) == channels
+
+
+def test_application_bank_actions_are_client_owned() -> None:
+    application = SimpleNamespace(dealer_id=None)
+    dealer = SimpleNamespace(dealer_id="dealer-id")
+
+    _require_profile_bank_client(dealer, SimpleNamespace(role=Role.DEALER))
+
+    for role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP):
+        _require_profile_bank_client(application, SimpleNamespace(role=role))
+
+        with pytest.raises(HTTPException) as dealer_error:
+            _require_profile_bank_client(dealer, SimpleNamespace(role=role))
+        assert dealer_error.value.status_code == 403

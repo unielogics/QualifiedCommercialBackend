@@ -1,20 +1,34 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
-from app.dealer_os.router import _assert_owner_email_unique, _normalized_owner_email
 from app.dealer_os.models import DealerOwner
+from app.dealer_os.router import (
+    _assert_owner_email_unique,
+    _normalized_owner_email,
+    grant_bank_consent,
+    plaid_exchange,
+    plaid_link_token,
+    plaid_patch,
+    plaid_remove,
+)
 from app.dealer_os.schemas import (
+    BankConsentGrant,
     BulkCreditInviteResult,
+    PlaidExchange,
+    PlaidItemPatch,
     PublicPlaidItemRead,
     RoomFeaturesRead,
     VerificationRead,
 )
 from app.dealer_os.services.decision import assess_verification
+from app.enums import Role
 
 
 class _ScalarResult:
@@ -123,9 +137,69 @@ def test_new_list_defaults_are_isolated() -> None:
             accounts_label=None,
             status="active",
             is_primary_operating=True,
-            last_pulled_at=datetime.now(timezone.utc),
+            last_pulled_at=datetime.now(UTC),
             statement_months=[],
         )
     )
     assert second_room.bank_connections == []
     assert BulkCreditInviteResult().items == []
+
+
+def _user(role: Role):
+    return SimpleNamespace(id=uuid4(), role=role, name="Test User")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP])
+async def test_non_clients_cannot_start_authenticated_plaid(role: Role) -> None:
+    user = _user(role)
+    dealer_id = uuid4()
+
+    with pytest.raises(HTTPException) as link_error:
+        await plaid_link_token(dealer_id, user, None)
+    assert link_error.value.status_code == 403
+
+    with pytest.raises(HTTPException) as consent_error:
+        await grant_bank_consent(
+            dealer_id,
+            BankConsentGrant(consenter_name="Client Owner"),
+            SimpleNamespace(client=None, headers={}),
+            user,
+            None,
+        )
+    assert consent_error.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exchange_error:
+        await plaid_exchange(
+            dealer_id,
+            PlaidExchange(public_token="public-token"),
+            SimpleNamespace(add_task=lambda *args: None),
+            user,
+            None,
+        )
+    assert exchange_error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_staff_cannot_choose_primary_and_only_super_admin_can_disconnect() -> None:
+    dealer_id = uuid4()
+    item_id = uuid4()
+
+    with pytest.raises(HTTPException) as primary_error:
+        await plaid_patch(
+            dealer_id,
+            item_id,
+            PlaidItemPatch(is_primary_operating=True),
+            _user(Role.LOAN_EXEC),
+            None,
+        )
+    assert primary_error.value.status_code == 403
+
+    with pytest.raises(HTTPException) as disconnect_error:
+        await plaid_remove(dealer_id, item_id, _user(Role.LOAN_EXEC), None)
+    assert disconnect_error.value.status_code == 403
+
+
+def test_bank_consent_requires_client_identity() -> None:
+    with pytest.raises(ValidationError):
+        BankConsentGrant(consenter_name="")

@@ -42,6 +42,14 @@ def require_super_admin(user: User) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
 
 
+def require_dealer(user: User) -> None:
+    """Client-owned actions that staff must never perform on the client's behalf."""
+    if user.role != Role.DEALER:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Client role required for this action"
+        )
+
+
 def require_team_or_dealer(user: User) -> None:
     if user.role not in _TEAM_ROLES and user.role != Role.DEALER:
         raise HTTPException(

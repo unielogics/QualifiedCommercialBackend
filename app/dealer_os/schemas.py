@@ -1655,7 +1655,7 @@ class BankConsentGrant(BaseModel):
     the proof this record exists to provide.
     """
 
-    consenter_name: str | None = Field(default=None, max_length=160)
+    consenter_name: str = Field(min_length=2, max_length=160)
     method: str = Field(default="self_web", max_length=24)
 
 

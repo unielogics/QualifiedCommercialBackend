@@ -29,6 +29,7 @@ from app.models.application_profile import (
 from app.models.bucket import BucketFile
 from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.user import User
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
     ApplicationBankConsentGrant,
@@ -77,6 +78,15 @@ def _credit_tier(score: int | None) -> str | None:
     if score >= 660:
         return "Tier 2"
     return "Tier 3"
+
+
+def _require_profile_bank_client(profile: ApplicationProfile, user: User) -> None:
+    """Dealer OS bank actions belong to the authenticated Audit client."""
+    if profile.dealer_id and user.role != Role.DEALER:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "The client must complete this bank action from their own account or secure link",
+        )
 
 
 async def _owner_for_profile(
@@ -494,13 +504,13 @@ async def grant_application_bank_consent(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
+    _require_profile_bank_client(profile, user)
     disclosure = dealer_bank_consent.disclosure()
     if profile.dealer_id:
-        method_map = {"electronic": "self_web", "verbal": "rep_attested", "written": "in_person_device"}
         await dealer_bank_consent.record(
             db,
             dealer_id=profile.dealer_id,
-            method=method_map[payload.method],
+            method="self_web",
             consenter_name=payload.consenter_name,
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -522,7 +532,8 @@ async def grant_application_bank_consent(
                 user_agent=(request.headers.get("user-agent") or "")[:400] or None,
             )
         )
-    await profiles.log_profile_action(db, profile, user, "bank.consent", "Recorded bank statement access authorization")
+    consent_action = "bank.consent.client" if profile.dealer_id else "bank.consent"
+    await profiles.log_profile_action(db, profile, user, consent_action, "Recorded bank statement access authorization")
     await db.commit()
     return await get_application_banks(profile_id, user, db)
 
@@ -532,6 +543,7 @@ async def create_application_plaid_link_token(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationPlaidLinkTokenRead:
     profile = await profiles.load_profile(db, profile_id, user)
+    _require_profile_bank_client(profile, user)
     consent = await dealer_bank_consent.has_consent(db, profile.dealer_id) if profile.dealer_id else await _application_consent_granted(db, profile.id)
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Record bank access authorization before opening Plaid")
@@ -558,6 +570,7 @@ async def exchange_application_plaid_token(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     profile = await profiles.load_profile(db, profile_id, user)
+    _require_profile_bank_client(profile, user)
     consent = await dealer_bank_consent.has_consent(db, profile.dealer_id) if profile.dealer_id else await _application_consent_granted(db, profile.id)
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bank access authorization is required")
@@ -590,7 +603,8 @@ async def exchange_application_plaid_token(
     current = await profiles.bank_rows(db, profile)
     if payload.is_primary_operating or not any(row.is_primary_operating for row in current):
         await _make_primary(db, profile, item)
-    await profiles.log_profile_action(db, profile, user, "plaid.connect", f"Connected {payload.institution_name or 'business bank'}", target_type="plaid_item", target_id=item.id)
+    connect_action = "plaid.connect.client" if profile.dealer_id else "plaid.connect"
+    await profiles.log_profile_action(db, profile, user, connect_action, f"Connected {payload.institution_name or 'business bank'}", target_type="plaid_item", target_id=item.id)
     await db.commit()
     await db.refresh(item)
     if profile.dealer_id:
@@ -621,20 +635,27 @@ async def update_application_bank(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     profile = await profiles.load_profile(db, profile_id, user)
+    if payload.is_primary_operating is not None:
+        _require_profile_bank_client(profile, user)
+    if payload.auto_refresh is not None and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may change automatic refresh")
     model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
     predicate = DealerPlaidItem.dealer_id == profile.dealer_id if profile.dealer_id else ApplicationPlaidItem.profile_id == profile.id
     item = (await db.execute(select(model).where(model.id == item_id, predicate))).scalar_one_or_none()
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
     if payload.auto_refresh is not None:
-        if user.role != Role.SUPER_ADMIN:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may change automatic refresh")
         item.auto_refresh = payload.auto_refresh
     if payload.is_primary_operating is True:
         await _make_primary(db, profile, item)
     elif payload.is_primary_operating is False and item.is_primary_operating:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Select another primary operating bank first")
-    await profiles.log_profile_action(db, profile, user, "plaid.update", "Updated bank connection controls", target_type="plaid_item", target_id=item.id)
+    action = (
+        "plaid.primary.client"
+        if profile.dealer_id and payload.is_primary_operating is not None
+        else "plaid.update"
+    )
+    await profiles.log_profile_action(db, profile, user, action, "Updated bank connection controls", target_type="plaid_item", target_id=item.id)
     await db.commit()
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
@@ -646,6 +667,8 @@ async def refresh_application_bank(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationPlaidRefreshRead:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may retry statement synchronization")
     profile = await profiles.load_profile(db, profile_id, user)
     if profile.dealer_id:
         item = await db.get(DealerPlaidItem, item_id)
@@ -658,6 +681,7 @@ async def refresh_application_bank(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
         from app.services.application_plaid_sync import sync_item
     result = await sync_item(db, item)
+    await profiles.log_profile_action(db, profile, user, "plaid.refresh.recovery", "Retried statement synchronization", target_type="plaid_item", target_id=item.id)
     await db.commit()
     return ApplicationPlaidRefreshRead(**result)
 
@@ -669,6 +693,8 @@ async def disconnect_application_bank(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may disconnect a bank")
     profile = await profiles.load_profile(db, profile_id, user)
     model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
     predicate = DealerPlaidItem.dealer_id == profile.dealer_id if profile.dealer_id else ApplicationPlaidItem.profile_id == profile.id
@@ -689,7 +715,7 @@ async def disconnect_application_bank(
         replacement = (await db.execute(select(model).where(predicate, model.id != item.id, model.status != "removed").order_by(model.created_at.asc()).limit(1))).scalar_one_or_none()
         if replacement:
             await _make_primary(db, profile, replacement)
-    await profiles.log_profile_action(db, profile, user, "plaid.disconnect", "Disconnected bank; previously collected statements were retained", target_type="plaid_item", target_id=item.id)
+    await profiles.log_profile_action(db, profile, user, "plaid.disconnect.recovery", "Disconnected bank; previously collected statements were retained", target_type="plaid_item", target_id=item.id)
     await db.commit()
 
 

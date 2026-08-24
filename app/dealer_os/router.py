@@ -45,6 +45,7 @@ from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
     load_dealer,
+    require_dealer,
     require_super_admin,
     require_team,
     require_team_or_dealer,
@@ -646,13 +647,7 @@ async def send_bank_connect_invite(
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
 ) -> ClientRequestResult:
-    """Email the owner their secure room so they can send bank statements.
-
-    Named for what it does today, not for what it will do. Plaid is still
-    `require_team` on every route, so a client opening this room can upload and
-    nothing else; there is no unauthenticated link-token or exchange endpoint
-    yet. When those exist the room gains a Connect button and this route keeps
-    working unchanged, because the link is already the right one."""
+    """Send the owner their secure room to authorize and connect business banks."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     req = payload or ClientRequestSend()
@@ -7882,14 +7877,12 @@ async def _plaid_items(db: AsyncSession, dealer_id: UUID) -> list[DealerPlaidIte
 async def plaid_state(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> PlaidStateRead:
-    """Connection panel state. enabled=false (keys not provisioned) renders a
-    quiet disabled state — never an error.
+    """Business-bank state for the client, team, or owning rep.
 
-    Open to the owning rep: step 2 of the application is a bank panel, and a
-    rep who cannot see whether the connection landed cannot do their job.
-    load_dealer swapped for resolve_dealer_scope in the same change, because
-    the guard alone would have handed a rep the entire book."""
-    require_team_or_rep(user)
+    This read contains status only. Consent and credential entry are separate
+    client-owned mutations below.
+    """
+    require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     items = await _plaid_items(db, dealer.id)
     months = await _plaid_statement_months_by_item(db, dealer.id)
@@ -7920,11 +7913,9 @@ async def plaid_state(
 async def plaid_link_token(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> PlaidLinkTokenRead:
-    """Start a Plaid Link session — Statements product ONLY (bank statements;
-    everything else still comes through upload). The client connects their
-    own bank; team can run it alongside them."""
-    require_team(user)  # gated off client accounts for now
-    dealer = await load_dealer(db, dealer_id)
+    """Start Plaid Link from the owning client's authenticated account."""
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     # The gate sits HERE and not on exchange: consent has to precede credential
     # entry, and by exchange the user has already typed their bank password.
     if not await bank_consent.has_consent(db, dealer.id):
@@ -7952,13 +7943,13 @@ async def grant_bank_consent(
     IP and user agent are taken from the REQUEST, never from the body — they
     are the part of the proof a client must not be able to author.
     """
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     try:
         await bank_consent.record(
             db,
             dealer_id=dealer.id,
-            method=payload.method,
+            method="self_web",
             consenter_name=payload.consenter_name,
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
@@ -7967,6 +7958,15 @@ async def grant_bank_consent(
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.consent.client",
+        "dealer",
+        entity_id=dealer.id,
+        after={"via": "authenticated_client", "consenter_name": payload.consenter_name},
+    )
     await db.commit()
     cs = await bank_consent.state(db, dealer.id)
     d = bank_consent.disclosure()
@@ -7983,9 +7983,18 @@ async def withdraw_bank_consent(
 ) -> BankConsentState:
     """Withdraw authorisation. The published privacy policy promises this is
     possible, so it is a real endpoint rather than a support-inbox convention."""
-    require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     await bank_consent.revoke(db, dealer_id=dealer.id, reason="withdrawn by request")
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.consent.withdrawn.client",
+        "dealer",
+        entity_id=dealer.id,
+        after={"via": "authenticated_client"},
+    )
     await db.commit()
     d = bank_consent.disclosure()
     return BankConsentState(
@@ -8007,8 +8016,8 @@ async def plaid_exchange(
 ) -> DealerPlaidItem:
     """Finish Link: swap the public token, store the encrypted access token,
     and pull the first batch of statements in the background."""
-    require_team(user)  # gated off client accounts for now
-    dealer = await load_dealer(db, dealer_id)
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     await _lock_dealer_related_writes(db, dealer.id)
     _plaid_cooldown("exchange", dealer.id, 5)
     try:
@@ -8042,10 +8051,11 @@ async def plaid_exchange(
     if payload.is_primary_operating is True or not await _has_primary_operating_bank(db, dealer.id):
         await _make_primary_operating_bank(db, dealer.id, item)
     await log_action(
-        db, dealer.id, user, "plaid.connect", "plaid_item", entity_id=item.id,
+        db, dealer.id, user, "plaid.connect.client", "plaid_item", entity_id=item.id,
         after={
             "institution": item.institution_name,
             "is_primary_operating": item.is_primary_operating,
+            "via": "authenticated_client",
         },
     )
     await db.commit()
@@ -8345,13 +8355,26 @@ async def public_room_bank_consent(
         await bank_consent.record(
             db,
             dealer_id=dealer.id,
-            method=payload.method,
+            method="self_web",
             consenter_name=payload.consenter_name,
             ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        None,
+        "plaid.consent.client",
+        "dealer",
+        entity_id=dealer.id,
+        after={
+            "via": "client_room",
+            "link_id": str(_link.id),
+            "consenter_name": payload.consenter_name,
+        },
+    )
     await db.commit()
     cs = await bank_consent.state(db, dealer.id)
     d = bank_consent.disclosure()
@@ -8563,6 +8586,16 @@ async def plaid_refresh(
     items = [i for i in await _plaid_items(db, dealer.id) if i.status != "removed"]
     for item in items:
         background.add_task(_background_plaid_first_sync, item.id)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.refresh.recovery",
+        "dealer",
+        entity_id=dealer.id,
+        after={"queued": len(items)},
+    )
+    await db.commit()
     return PlaidRefreshResult(queued=len(items))
 
 
@@ -8574,8 +8607,18 @@ async def plaid_patch(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlaidItem:
-    """Update one bank; scoped reps may select the main operating bank."""
-    require_team_or_rep(user)
+    """Client primary-bank choice or super-admin refresh recovery settings."""
+    require_team_or_dealer(user)
+    if payload.is_primary_operating is not None and user.role != Role.DEALER:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the client may select the main operating bank",
+        )
+    if payload.auto_refresh is not None and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a super admin may change automatic bank refresh",
+        )
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     await _lock_dealer_related_writes(db, dealer.id)
     item = (
@@ -8588,11 +8631,6 @@ async def plaid_patch(
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this client")
     if payload.auto_refresh is not None:
-        if user.role != Role.SUPER_ADMIN:
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Only a super admin may change automatic bank refresh",
-            )
         item.auto_refresh = payload.auto_refresh
         if payload.auto_refresh and item.next_refresh_at is None:
             item.next_refresh_at = datetime.now(timezone.utc)
@@ -8603,8 +8641,8 @@ async def plaid_patch(
     if payload.is_primary_operating is True:
         await _make_primary_operating_bank(db, dealer.id, item)
         await log_action(
-            db, dealer.id, user, "plaid.primary", "plaid_item", entity_id=item.id,
-            after={"is_primary_operating": True},
+            db, dealer.id, user, "plaid.primary.client", "plaid_item", entity_id=item.id,
+            after={"is_primary_operating": True, "via": "authenticated_client"},
         )
     elif payload.is_primary_operating is False and item.is_primary_operating:
         raise HTTPException(
@@ -8620,9 +8658,9 @@ async def plaid_patch(
 async def plaid_remove(
     dealer_id: UUID, item_pk: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
-    """Disconnect a bank (team). Documents already pulled stay — they are the
+    """Disconnect a bank (super-admin recovery). Documents already pulled stay — they are the
     dealer's statements; only the live connection goes."""
-    require_team(user)
+    require_super_admin(user)
     dealer = await load_dealer(db, dealer_id)
     await _lock_dealer_related_writes(db, dealer.id)
     item = (
@@ -8655,7 +8693,15 @@ async def plaid_remove(
         )
         if replacement is not None:
             await _make_primary_operating_bank(db, dealer.id, replacement)
-    await log_action(db, dealer.id, user, "plaid.remove", "plaid_item", entity_id=item.id)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.disconnect.recovery",
+        "plaid_item",
+        entity_id=item.id,
+        after={"retained_statement_evidence": True},
+    )
     await db.commit()
 
 

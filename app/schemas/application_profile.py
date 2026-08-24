@@ -175,8 +175,8 @@ class ApplicationBankState(BaseModel):
 
 class ApplicationBankConsentGrant(BaseModel):
     granted: bool = True
-    method: Literal["written", "verbal", "electronic"] = "electronic"
-    consenter_name: str = Field(min_length=1, max_length=160)
+    method: Literal["electronic"] = "electronic"
+    consenter_name: str = Field(min_length=2, max_length=160)
 
 
 class ApplicationPlaidLinkTokenRead(BaseModel):
