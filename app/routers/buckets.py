@@ -1,3 +1,6 @@
+# FastAPI dependency injection intentionally uses callable defaults.
+# ruff: noqa: B008
+
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +10,7 @@ import logging
 import re
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import boto3
@@ -20,8 +23,8 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import get_settings
 from app.db import get_db
-from app.deps import require_role
 from app.dealer_os.services.bucket_ingest import auto_ingest_bucket_files_for_bucket
+from app.deps import require_role
 from app.enums import Role
 from app.models.bucket import (
     Bucket,
@@ -55,9 +58,9 @@ from app.schemas.bucket import (
     BucketAISummaryRead,
     BucketCreate,
     BucketDetail,
-    BucketFileRead,
     BucketFileAnnotationCreate,
     BucketFileAnnotationRead,
+    BucketFileRead,
     BucketFileReviewRead,
     BucketFileUploadInit,
     BucketFileUploadInitResponse,
@@ -72,13 +75,15 @@ from app.schemas.bucket import (
     BucketRequestAccessRead,
     BucketRequestAccessRequest,
     BucketRequestBucketRead,
-    BucketRequestInfoRead,
-    BucketRequestUploadedFileRead,
     BucketRequestedDocumentCreate,
     BucketRequestedDocumentRead,
+    BucketRequestInfoRead,
+    BucketRequestUploadedFileRead,
     BucketShareAccessRead,
     BucketShareAccessRequest,
     BucketShareCreate,
+    BucketSharedDownloadCreate,
+    BucketSharedNoteCreate,
     BucketShareEmailRequest,
     BucketShareEmailResponse,
     BucketShareFileRead,
@@ -86,8 +91,6 @@ from app.schemas.bucket import (
     BucketSharePasscodeResetRead,
     BucketSharePatch,
     BucketShareRead,
-    BucketSharedNoteCreate,
-    BucketSharedDownloadCreate,
     BucketTemplateRead,
     BucketUploadComplete,
     BucketUploadLinkCreate,
@@ -105,7 +108,6 @@ from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
     create_chat_reply,
     latest_review,
-    log_bucket_ai_activity,
     share_visible_summary,
     upload_link_visible_summary,
     vendor_visible_summary,
@@ -117,7 +119,7 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _public_url(path: str) -> str:

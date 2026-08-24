@@ -16,8 +16,8 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_db
 from app.config import get_settings
+from app.db import get_db
 from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
 from app.dealer_os.services import consent_delivery, plaid_client
@@ -39,6 +39,7 @@ from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadL
 from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.routers.buckets import _hash_passcode, _verify_passcode
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
     ApplicationBankConsentGrant,
@@ -58,9 +59,9 @@ from app.schemas.application_profile import (
     ApplicationRoomPlaidExchange,
     ApplicationRoomPlaidUpdate,
     ApplicationRoomPrimaryBank,
+    ApplicationRoomSignable,
     ApplicationRoomSignRequest,
     ApplicationRoomSignResult,
-    ApplicationRoomSignable,
     ApplicationRoomState,
     ClassificationConfirm,
     ClassificationPatch,
@@ -101,7 +102,6 @@ from app.schemas.application_profile import (
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import plaid_lifecycle
-from app.routers.buckets import _hash_passcode, _verify_passcode
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 

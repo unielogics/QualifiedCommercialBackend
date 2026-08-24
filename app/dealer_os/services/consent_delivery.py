@@ -101,6 +101,7 @@ def _send_sms(to_phone: str, body: str) -> DeliveryResult:
         )
     try:
         import boto3
+
         from app.config import get_settings
 
         s = get_settings()

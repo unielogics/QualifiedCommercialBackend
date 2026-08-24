@@ -29,6 +29,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import UTC
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -269,14 +270,14 @@ async def resolve_room(
     Raises LookupError for anything that fails, so callers cannot accidentally
     distinguish "wrong token" from "wrong code" and turn this into an oracle.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     link = (
         await db.execute(select(BucketUploadLink).where(BucketUploadLink.token == token))
     ).scalar_one_or_none()
     if link is None or link.status != "active":
         raise LookupError("room not found")
-    if link.expires_at is not None and link.expires_at < datetime.now(timezone.utc):
+    if link.expires_at is not None and link.expires_at < datetime.now(UTC):
         raise LookupError("room not found")
     if not verify_passcode(passcode or "", link.passcode_hash):
         raise LookupError("room not found")

@@ -1,7 +1,10 @@
+# FastAPI dependency injection intentionally uses callable defaults.
+# ruff: noqa: B008
+
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -10,8 +13,8 @@ import re
 import secrets
 import time
 import zipfile
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -23,18 +26,41 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.config import get_settings
 from app.db import get_db
+from app.dealer_os.services import consent_delivery
 from app.deps import CurrentUser
-from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, ContractType, Language, Role
+from app.enums import (
+    CalendarEventKind,
+    CalendarEventSource,
+    CalendarEventStatus,
+    ContractType,
+    Language,
+    Role,
+)
 from app.models.activity import Activity
 from app.models.application_profile import ApplicationRoomDelivery
 from app.models.booking_settings import BookingSettings
-from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketDocumentSignature, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
+from app.models.bucket import (
+    Bucket,
+    BucketAIMessage,
+    BucketAIReview,
+    BucketDocumentSignature,
+    BucketFile,
+    BucketFileAnalysis,
+    BucketNote,
+    BucketRequestedDocument,
+    BucketShare,
+    BucketUploadLink,
+    BucketVendorAccess,
+)
 from app.models.client import Client
-from app.models.event import CalendarEvent
 from app.models.dealer_intake_login import DealerIntakeLoginChallenge
-from app.models.public_underwriting_intake import PublicUnderwritingIntake, PublicUnderwritingIntakeArtifact, PublicUnderwritingIntakeEmailSend
+from app.models.event import CalendarEvent
+from app.models.public_underwriting_intake import (
+    PublicUnderwritingIntake,
+    PublicUnderwritingIntakeArtifact,
+    PublicUnderwritingIntakeEmailSend,
+)
 from app.models.user import User
-from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.routers.buckets import (
     _bucket_storage_config,
     _client_ip,
@@ -49,21 +75,30 @@ from app.routers.buckets import (
     _upload_url,
     _vendor_user_from_payload,
 )
+from app.routers.public import _available_booking_slots, _to_utc_minute
 from app.schemas.bucket import (
     BucketAIMessageRead,
     BucketAIReviewRead,
     BucketFileRead,
     BucketFileUploadInitResponse,
     BucketNoteRead,
-    BucketRequestUploadedFileRead,
     BucketRequestedDocumentRead,
+    BucketRequestUploadedFileRead,
 )
 from app.schemas.common import ORMModel
-from app.services.bucket_ai import CHAT_TURN_ORDER, CURRENT_FILE_ANALYSIS_VERSION, create_chat_reply, latest_review, run_bucket_ai_review, upload_link_visible_summary
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
+from app.services.bucket_ai import (
+    CHAT_TURN_ORDER,
+    CURRENT_FILE_ANALYSIS_VERSION,
+    create_chat_reply,
+    latest_review,
+    run_bucket_ai_review,
+    upload_link_visible_summary,
+)
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
-from app.dealer_os.services import consent_delivery
+from app.services.email.ses_client import send_email, send_raw_email
+from app.services.email.user_mailer import send_as_user
 from app.services.main_street_programs import (
     TERM_3_5_MIN_DSCR,
     TERM_3_5_MIN_REVENUE,
@@ -71,11 +106,8 @@ from app.services.main_street_programs import (
     normalize_industry,
     normalize_intent,
 )
-from app.services.email.ses_client import send_email, send_raw_email
-from app.services.email.user_mailer import send_as_user
 from app.services.payment_authorization import primary_super_admin
 from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
-
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
@@ -1033,7 +1065,7 @@ class DealerAILeadListResponse(BaseModel):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _hash_token(token: str) -> str:
@@ -5075,7 +5107,6 @@ def _send_signed_document_copy_email(*, to_email: str, typed_name: str, document
     contract types) — same pattern as app/routers/contracts.py's
     _send_signed_copy_email, kept separate since this path's certificate PDF
     is rendered by document_signature.py, not contract_templates.py."""
-    from app.services.email.ses_client import send_raw_email
 
     subject = f"Signed: {document_title}"
     body_text = (
@@ -6835,7 +6866,7 @@ async def _build_channel_inbox(
     threaded = [i for i in intakes if any(n.visibility == "admin" for n in i.bucket.notes)]
     unread = await _channel_unread_by_intake(db, user=user, intakes=threaded)
     items = [_inbox_item(i, unread.get(i.id, 0)) for i in threaded]
-    items.sort(key=lambda it: it.last_message_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    items.sort(key=lambda it: it.last_message_at or datetime.min.replace(tzinfo=UTC), reverse=True)
     return DealerLeadInboxResponse(items=items, total_unread=sum(it.unread_count for it in items))
 
 
@@ -7349,7 +7380,10 @@ async def create_admin_ai_lead_from_bucket(
     # Reuse the bucket's existing active upload link (if any) rather than minting a
     # new one — bucket_upload_link_id is nullable, so a bucket with no client-facing
     # link at all (e.g. a purely admin-populated audit bucket) is fine too.
-    link = next((l for l in bucket.upload_links if l.status == "active"), None)
+    link = next(
+        (upload_link for upload_link in bucket.upload_links if upload_link.status == "active"),
+        None,
+    )
 
     token = _new_public_token()
     intake = PublicUnderwritingIntake(
@@ -8323,7 +8357,10 @@ async def dealer_ai_lead_ingest_from_drive(
         await db.rollback()
         _cleanup_put_objects()
         log.exception("drive ingest: batch failed intake=%s — rolled back + cleaned %d object(s)", intake_id, len(put_keys))
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Drive import failed; no files were imported.")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Drive import failed; no files were imported.",
+        ) from None
     return DriveIngestResponse(ingested=ingested, skipped=skipped, items=items)
 
 
@@ -8401,7 +8438,7 @@ async def build_package_zip_bytes(
     label = _safe_filename(intake.business_name or intake.full_name or "lead")
     files = sorted(_active_files(intake.bucket), key=lambda f: f.file_name.lower())
     manifest_lines = [
-        f"Qualified Commercial — Underwriting Package",
+        "Qualified Commercial — Underwriting Package",
         f"Borrower/entity: {intake.business_name or intake.full_name or '-'}",
         f"Contact: {intake.full_name or '-'} <{intake.email or '-'}>",
         f"Generated: {_now().strftime('%b %d, %Y %I:%M %p UTC')}",
