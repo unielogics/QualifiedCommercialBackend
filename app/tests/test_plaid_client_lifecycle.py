@@ -18,7 +18,7 @@ def _plaid_environment(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_initial_link_uses_file_client_name_and_selected_products(monkeypatch):
+async def test_initial_link_uses_company_name_and_selected_products(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -27,18 +27,18 @@ async def test_initial_link_uses_file_client_name_and_selected_products(monkeypa
 
     monkeypatch.setattr(plaid_client, "_post", fake_post)
     token = await plaid_client.create_link_token(
-        dealer_id="file-1", dealer_name="Borrower LLC"
+        dealer_id="file-1", dealer_name="Northstar Holdings LLC"
     )
 
     assert token == "link-production"
     assert captured["path"] == "/link/token/create"
-    assert captured["payload"]["client_name"] == "Borrower LLC"
+    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
     assert captured["payload"]["products"] == ["assets", "statements"]
     assert captured["payload"]["webhook"] == "https://api.example.test/plaid"
 
 
 @pytest.mark.asyncio
-async def test_initial_link_trims_long_file_client_name_before_plaid_fallback(monkeypatch):
+async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -48,10 +48,10 @@ async def test_initial_link_trims_long_file_client_name_before_plaid_fallback(mo
     monkeypatch.setattr(plaid_client, "_post", fake_post)
     await plaid_client.create_link_token(
         dealer_id="file-1",
-        dealer_name="Very Long Borrower Operating Company LLC",
+        dealer_name="Very Long Operating Company LLC",
     )
 
-    assert captured["payload"]["client_name"] == "Very Long Borrower Operating"
+    assert captured["payload"]["client_name"] == "Very Long Operating Company"
     assert len(captured["payload"]["client_name"]) <= 30
 
 
@@ -67,14 +67,14 @@ async def test_update_link_can_request_new_account_selection(monkeypatch):
     token = await plaid_client.create_update_link_token(
         access_token="access-production",
         client_user_id="file-1",
-        display_name="Borrower LLC",
+        display_name="Northstar Holdings LLC",
         account_selection_enabled=True,
     )
 
     assert token == "update-production"
     assert captured["path"] == "/link/token/create"
     assert captured["payload"]["access_token"] == "access-production"
-    assert captured["payload"]["client_name"] == "Borrower LLC"
+    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
     assert captured["payload"]["update"] == {"account_selection_enabled": True}
 
 

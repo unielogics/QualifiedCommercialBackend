@@ -8202,7 +8202,7 @@ async def plaid_link_token(
     _plaid_cooldown("link", dealer.id, 10)
     try:
         token = await plaid_client.create_link_token(
-            dealer_id=str(dealer.id), dealer_name=dealer.name
+            dealer_id=str(dealer.id), dealer_name=dealer.legal_name or dealer.name
         )
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
@@ -8229,7 +8229,7 @@ async def plaid_update_link_token(
         token = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(dealer.id),
-            display_name=dealer.name,
+            display_name=dealer.legal_name or dealer.name,
             account_selection_enabled=(
                 payload.account_selection_enabled
                 or item.update_mode_account_selection
@@ -8759,7 +8759,7 @@ async def public_room_link_token(
     try:
         pt = await plaid_client.create_link_token(
             dealer_id=str(dealer.id),
-            dealer_name=dealer.name,
+            dealer_name=dealer.legal_name or dealer.name,
             # The room is public; its OAuth return must be a public page, not
             # the team app's authenticated one.
             redirect_override=plaid_client.room_redirect_uri() or None,
@@ -8790,7 +8790,7 @@ async def public_room_update_link_token(
         link_token = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(dealer.id),
-            display_name=dealer.name,
+            display_name=dealer.legal_name or dealer.name,
             redirect_override=plaid_client.room_redirect_uri() or None,
             account_selection_enabled=(
                 payload.account_selection_enabled

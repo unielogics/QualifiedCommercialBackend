@@ -207,7 +207,7 @@ async def _post(path: str, payload: dict[str, Any], *, timeout: float = 30.0) ->
 async def create_link_token(
     *, dealer_id: str, dealer_name: str, redirect_override: str | None = None
 ) -> str:
-    """A Link session for one dealer.
+    """A Link session for one business file.
 
     `redirect_override` lets the caller choose where OAuth returns to — the
     client room needs a public page, the team app needs its authenticated one.

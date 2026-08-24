@@ -337,13 +337,9 @@ async def _profile_plaid_display_name(db: AsyncSession, profile: ApplicationProf
             return dealer.legal_name or dealer.name
     if profile.intake_id:
         intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
-        if intake:
-            return intake.business_name or intake.full_name
-    if profile.client_id:
-        client = await db.get(Client, profile.client_id)
-        if client:
-            return client.name
-    return "Application"
+        if intake and intake.business_name:
+            return intake.business_name
+    return "Business bank account"
 
 
 def _hash_token(token: str) -> str:
