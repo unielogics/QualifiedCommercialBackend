@@ -66,6 +66,7 @@ from .models import (
     DealerAIMessage,
     DealerRepAppointment,
     DealerRepContact,
+    DealerRepContactAssignment,
     DealerRepContactShare,
     DealerRepInboxMessage,
     DealerRepInboxThread,
@@ -491,6 +492,7 @@ async def dealer_portfolio(
     bank: str = Query(default="all", pattern="^(all|linked|awaiting)$"),
     credit: str = Query(default="all", pattern="^(all|returned|awaiting)$"),
     archive: str = Query(default="active", pattern="^(active|archived|all)$"),
+    lifecycle: str = Query(default="active", pattern="^(active|draft|all)$"),
     sort_by: str = Query(default="updated_at", pattern="^(created_at|updated_at)$"),
     sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=10, ge=1, le=10),
@@ -533,6 +535,8 @@ async def dealer_portfolio(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
     else:
         filters.append(DealerBusiness.archived_at.is_(None))
+    if lifecycle != "all":
+        filters.append(DealerBusiness.application_lifecycle == lifecycle)
 
     needle = q.strip().lower()
     if needle:
@@ -4613,12 +4617,20 @@ async def _ensure_rep_thread(
     source: str,
     dealer_scoped: bool = False,
 ) -> DealerRepInboxThread:
+    subject_key = None
+    if channel == "email":
+        subject_key = subject.strip().lower()
+        while re.match(r"^(re|fw|fwd)\s*:", subject_key):
+            subject_key = re.sub(r"^(re|fw|fwd)\s*:\s*", "", subject_key)
+        subject_key = " ".join(subject_key.split())[:200]
     filters = [
         DealerRepInboxThread.owner_user_id == owner_user_id,
         DealerRepInboxThread.contact_id == contact.id,
         DealerRepInboxThread.channel == channel,
         DealerRepInboxThread.status == "open",
     ]
+    if channel == "email":
+        filters.append(DealerRepInboxThread.subject_key == subject_key)
     if dealer_scoped:
         filters.append(
             DealerRepInboxThread.dealer_id == dealer_id
@@ -4639,6 +4651,7 @@ async def _ensure_rep_thread(
             contact_id=contact.id,
             dealer_id=dealer_id,
             subject=subject,
+            subject_key=subject_key,
             channel=channel,
             source=source,
             last_message_at=now,
@@ -5730,10 +5743,21 @@ async def list_rep_inbox_threads(
     channel: str | None = None,
 ) -> list[RepInboxThreadRead]:
     require_team_or_rep(user)
+    access_filter = (
+        or_(
+            DealerRepInboxThread.owner_user_id == user.id,
+            exists(select(DealerRepContactAssignment.id).where(
+                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
+                DealerRepContactAssignment.user_id == user.id,
+            )),
+        )
+        if user.role == Role.FIELD_REP
+        else True
+    )
     q = (
         select(DealerRepInboxThread, DealerRepContact)
         .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-        .where(DealerRepInboxThread.owner_user_id == user.id)
+        .where(access_filter)
         .order_by(DealerRepInboxThread.last_message_at.desc().nullslast(), DealerRepInboxThread.created_at.desc())
     )
     if channel:
@@ -5751,11 +5775,20 @@ async def list_rep_inbox_messages(
     db: AsyncSession = Depends(get_db),
 ) -> list[DealerRepInboxMessage]:
     require_team_or_rep(user)
+    access_filter = (
+        or_(
+            DealerRepInboxThread.owner_user_id == user.id,
+            exists(select(DealerRepContactAssignment.id).where(
+                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
+                DealerRepContactAssignment.user_id == user.id,
+            )),
+        ) if user.role == Role.FIELD_REP else True
+    )
     thread = (
         await db.execute(
             select(DealerRepInboxThread).where(
                 DealerRepInboxThread.id == thread_id,
-                DealerRepInboxThread.owner_user_id == user.id,
+                access_filter,
             )
         )
     ).scalar_one_or_none()
@@ -5791,11 +5824,20 @@ async def create_rep_inbox_message(
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepInboxMessage:
     require_team_or_rep(user)
+    access_filter = (
+        or_(
+            DealerRepInboxThread.owner_user_id == user.id,
+            exists(select(DealerRepContactAssignment.id).where(
+                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
+                DealerRepContactAssignment.user_id == user.id,
+            )),
+        ) if user.role == Role.FIELD_REP else True
+    )
     row = (
         await db.execute(
             select(DealerRepInboxThread, DealerRepContact)
             .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-            .where(DealerRepInboxThread.id == thread_id, DealerRepInboxThread.owner_user_id == user.id)
+            .where(DealerRepInboxThread.id == thread_id, access_filter)
         )
     ).first()
     if row is None:
@@ -5851,7 +5893,9 @@ async def create_rep_inbox_message(
         recipient=recipient,
     )
     if thread.dealer_id is not None:
-        dealer = await resolve_dealer_scope(db, user, thread.dealer_id)
+        # Thread access was already checked above. Assigned reps may reply to a
+        # shared contact even when they do not own the linked application.
+        dealer = await load_dealer(db, thread.dealer_id)
         db.add(
             DealerMessage(
                 dealer_id=dealer.id,

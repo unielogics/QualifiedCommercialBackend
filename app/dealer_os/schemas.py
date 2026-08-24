@@ -160,6 +160,8 @@ class DealerRead(ORM):
     naics_code: str | None = None
     naics_label: str | None = None
     funding_goal: float | None = None
+    client_requested_amount: float | None = None
+    application_lifecycle: str = "active"
     funding_purpose: str | None = None
     group_id: UUID | None = None
 
@@ -210,6 +212,8 @@ class DealerListItem(ORM):
     credit_returned: bool = False
     verified: bool = False
     funding_goal: float | None = None
+    client_requested_amount: float | None = None
+    application_lifecycle: str = "active"
 
 
 class PortfolioOwnerSummary(BaseModel):

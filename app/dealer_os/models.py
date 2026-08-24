@@ -85,6 +85,10 @@ class DealerBusiness(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealer_groups.id", ondelete="SET NULL")
     )
     funding_goal: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    client_requested_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    application_lifecycle: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
@@ -1054,6 +1058,30 @@ REP_INBOX_CHANNELS: tuple[str, ...] = ("email", "sms")
 REP_INBOX_DIRECTIONS: tuple[str, ...] = ("inbound", "outbound")
 
 
+class DealerRepCompany(TimestampMixin, Base):
+    """A CRM company that may have many people and funding files."""
+
+    __tablename__ = "dos_rep_companies"
+    __table_args__ = (
+        Index("ix_dos_rep_companies_owner", "owner_user_id", "updated_at"),
+        Index("ix_dos_rep_companies_name", "owner_user_id", "name"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    industry: Mapped[str | None] = mapped_column(String(80))
+    address: Mapped[str | None] = mapped_column(String(240))
+    city: Mapped[str | None] = mapped_column(String(120))
+    state: Mapped[str | None] = mapped_column(String(8))
+    zip: Mapped[str | None] = mapped_column(String(12))
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+
+
 class DealerRepContact(TimestampMixin, Base):
     """A person a rep is working, with or without a dealer file yet."""
 
@@ -1071,6 +1099,9 @@ class DealerRepContact(TimestampMixin, Base):
     dealer_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
     )
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_companies.id", ondelete="SET NULL")
+    )
     full_name: Mapped[str] = mapped_column(String(160), nullable=False)
     company: Mapped[str | None] = mapped_column(String(180))
     email: Mapped[str | None] = mapped_column(String(320))
@@ -1081,6 +1112,123 @@ class DealerRepContact(TimestampMixin, Base):
     sms_marketing_consented_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sms_consent_meta: Mapped[dict | None] = mapped_column(JSONB)
     sms_opted_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerRepContactAssignment(TimestampMixin, Base):
+    __tablename__ = "dos_rep_contact_assignments"
+    __table_args__ = (
+        UniqueConstraint("contact_id", "user_id", name="uq_dos_rep_contact_assignment"),
+        Index("ix_dos_rep_contact_assignments_user", "user_id", "contact_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    assigned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class DealerApplicationContact(TimestampMixin, Base):
+    __tablename__ = "dos_application_contacts"
+    __table_args__ = (
+        UniqueConstraint("dealer_id", "contact_id", name="uq_dos_application_contact"),
+        Index("ix_dos_application_contacts_contact", "contact_id", "dealer_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="CASCADE"), nullable=False
+    )
+    relationship: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="owner", server_default="owner"
+    )
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+
+class DealerProductCatalog(TimestampMixin, Base):
+    __tablename__ = "dos_product_catalog"
+    __table_args__ = (
+        UniqueConstraint("program_key", "version", name="uq_dos_product_catalog_version"),
+        Index("ix_dos_product_catalog_active", "active", "category", "sort_order"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    program_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    category: Mapped[str] = mapped_column(String(48), nullable=False)
+    copy: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    pricing: Mapped[dict | None] = mapped_column(JSONB)
+    eligibility: Mapped[dict | None] = mapped_column(JSONB)
+    disclosures: Mapped[dict | None] = mapped_column(JSONB)
+    amount_min: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    amount_max: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    term_min_months: Mapped[int | None] = mapped_column(Integer)
+    term_max_months: Mapped[int | None] = mapped_column(Integer)
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class DealerProductFinderSession(TimestampMixin, Base):
+    __tablename__ = "dos_product_finder_sessions"
+    __table_args__ = (
+        Index("ix_dos_product_finder_owner", "owner_user_id", "updated_at"),
+        Index("ix_dos_product_finder_contact", "contact_id", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_companies.id", ondelete="CASCADE"), nullable=False
+    )
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="CASCADE"), nullable=False
+    )
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    locale: Mapped[str] = mapped_column(String(2), nullable=False, default="en", server_default="en")
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="screening", server_default="screening"
+    )
+    answers: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    current_result: Mapped[dict | None] = mapped_column(JSONB)
+    client_requested_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    recommended_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    funding_goal_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerProductScreeningSnapshot(TimestampMixin, Base):
+    __tablename__ = "dos_product_screening_snapshots"
+    __table_args__ = (Index("ix_dos_product_screening_session", "session_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_product_finder_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="self_reported", server_default="self_reported"
+    )
+    inputs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    result: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
 
 
 class DealerRepContactShare(TimestampMixin, Base):
@@ -1139,6 +1287,7 @@ class DealerRepInboxThread(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
     )
     subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    subject_key: Mapped[str | None] = mapped_column(String(200))
     channel: Mapped[str] = mapped_column(String(16), nullable=False, default="email", server_default="email")
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual", server_default="manual")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1185,6 +1334,47 @@ class DealerRepInboxMessage(TimestampMixin, Base):
     sender: Mapped[str | None] = mapped_column(String(320))
     recipient: Mapped[str | None] = mapped_column(String(320))
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerProductPresentation(TimestampMixin, Base):
+    """A product, comparison, or catalog shown or delivered to a contact."""
+
+    __tablename__ = "dos_product_presentations"
+    __table_args__ = (
+        Index("ix_dos_product_presentations_contact", "contact_id", "created_at"),
+        Index("ix_dos_product_presentations_owner", "owner_user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_companies.id", ondelete="SET NULL")
+    )
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="CASCADE"), nullable=False
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_product_finder_sessions.id", ondelete="SET NULL")
+    )
+    program_keys: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    locale: Mapped[str] = mapped_column(String(2), nullable=False, default="en", server_default="en")
+    channel: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="in_person", server_default="in_person"
+    )
+    delivery_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="presented", server_default="presented"
+    )
+    contact_share_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contact_shares.id", ondelete="SET NULL")
+    )
+    inbox_thread_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_inbox_threads.id", ondelete="SET NULL")
+    )
 
 
 class DealerBankConsent(TimestampMixin, Base):
