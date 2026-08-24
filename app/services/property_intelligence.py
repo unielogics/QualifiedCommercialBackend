@@ -67,7 +67,13 @@ async def log_provider_usage(
 
 async def google_autocomplete(db: AsyncSession, input_text: str, session_token: str | None) -> list[dict[str, Any]]:
     settings = await runtime_settings(db)
-    if not settings.google_server_api_key:
+    # Field Desk uses the authenticated backend proxy. Prefer the restricted
+    # server key, but installations that already configured the web Places key
+    # should not silently lose autocomplete while the server key is being
+    # rolled out. The browser key is already public by design and remains
+    # protected by its Google API restrictions.
+    api_key = settings.google_server_api_key or settings.google_maps_browser_key
+    if not api_key:
         return []
     body: dict[str, Any] = {
         "input": input_text,
@@ -80,7 +86,7 @@ async def google_autocomplete(db: AsyncSession, input_text: str, session_token: 
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 f"{GOOGLE_PLACES_BASE}/places:autocomplete",
-                headers={"X-Goog-Api-Key": settings.google_server_api_key},
+                headers={"X-Goog-Api-Key": api_key},
                 json=body,
             )
         resp.raise_for_status()
@@ -134,7 +140,8 @@ async def google_resolve(
     session_token: str | None,
 ) -> tuple[AddressParts, dict[str, Any] | None]:
     settings = await runtime_settings(db)
-    if not settings.google_server_api_key:
+    api_key = settings.google_server_api_key or settings.google_maps_browser_key
+    if not api_key:
         return AddressParts(full=address), None
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -144,7 +151,7 @@ async def google_resolve(
                     f"{GOOGLE_PLACES_BASE}/places/{normalized_place_id}",
                     params={"sessionToken": session_token} if session_token else None,
                     headers={
-                        "X-Goog-Api-Key": settings.google_server_api_key,
+                        "X-Goog-Api-Key": api_key,
                         "X-Goog-FieldMask": "id,formattedAddress,location,addressComponents,displayName",
                     },
                 )
@@ -157,7 +164,7 @@ async def google_resolve(
                 parts.longitude = loc.get("longitude")
                 return parts, data
             if address:
-                resp = await client.get(GOOGLE_GEOCODE_BASE, params={"address": address, "key": settings.google_server_api_key})
+                resp = await client.get(GOOGLE_GEOCODE_BASE, params={"address": address, "key": api_key})
                 resp.raise_for_status()
                 data = resp.json()
                 first = (data.get("results") or [None])[0]

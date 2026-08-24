@@ -148,7 +148,7 @@ async def provider_settings_status(db: AsyncSession, *, include_secret_values: b
     runtime = await runtime_settings(db)
     return {
         "rentcast_configured": bool(runtime.rentcast_api_key),
-        "google_server_configured": bool(runtime.google_server_api_key),
+        "google_server_configured": bool(runtime.google_server_api_key or runtime.google_maps_browser_key),
         "google_maps_browser_key_configured": bool(runtime.google_maps_browser_key),
         "google_maps_ios_key_configured": bool(runtime.google_maps_ios_key),
         "google_maps_android_key_configured": bool(runtime.google_maps_android_key),
