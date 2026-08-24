@@ -80,6 +80,9 @@ class Verification:
     required_credit_owner_count: int = 0
     completed_credit_owner_count: int = 0
     pending_credit_owner_ids: list = field(default_factory=list)
+    pre_screen_complete: bool = False
+    pre_screen_blockers: list[str] = field(default_factory=list)
+    preliminary_program_fit: dict | None = None
 
 
 def credit_pull_available() -> bool:
@@ -111,19 +114,24 @@ def assess_verification(
     required_credit_owner_count: int = 0,
     completed_credit_owner_count: int = 0,
     pending_credit_owner_ids: list | None = None,
+    pre_screen_complete: bool = False,
+    pre_screen_blockers: list[str] | None = None,
+    preliminary_program_fit: dict | None = None,
 ) -> Verification:
-    """PURE. Both must return; neither alone is enough.
+    """PURE. Bank and credit must return after the Step 1 screen is complete.
 
     The bank connection is what computes the metrics, and the credit band is
     what sizes the offer. A file with one of the two is not half-analysable,
     it is a file waiting on the other one.
     """
     returned = int(bank_linked) + int(credit_returned)
-    unlocked = returned == 2
+    unlocked = returned == 2 and pre_screen_complete
     if not ownership_complete:
         reason = f"Ownership totals {ownership_total:.2f}% · complete 100% in step 1"
     elif not owner_contact_complete:
         reason = "Add personal email and phone for every 20%+ owner in step 1"
+    elif not pre_screen_complete:
+        reason = "Complete the Step 1 eligibility checkpoint before verification"
     elif required_credit_owner_count and completed_credit_owner_count < required_credit_owner_count:
         reason = (
             f"{completed_credit_owner_count} of {required_credit_owner_count} required owners completed"
@@ -152,6 +160,9 @@ def assess_verification(
         required_credit_owner_count=required_credit_owner_count,
         completed_credit_owner_count=completed_credit_owner_count,
         pending_credit_owner_ids=list(pending_credit_owner_ids or []),
+        pre_screen_complete=pre_screen_complete,
+        pre_screen_blockers=list(pre_screen_blockers or []),
+        preliminary_program_fit=preliminary_program_fit,
     )
 
 

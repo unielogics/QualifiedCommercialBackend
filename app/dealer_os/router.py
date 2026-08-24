@@ -80,6 +80,7 @@ from .models import (
     DealerAlert,
     DealerAuditLog,
     DealerBusiness,
+    DealerApplicationPreScreen,
     DealerCashEvent,
     DealerCategoryRule,
     DealerCreditProfile,
@@ -110,6 +111,8 @@ from .schemas import (
     AIInsightsAccept,
     AIInsightsRead,
     AlertRead,
+    ApplicationPreScreenPatch,
+    ApplicationPreScreenRead,
     AuditRead,
     BucketFileItem,
     BucketSearchItem,
@@ -304,7 +307,7 @@ from .schemas import (
     UnderwritingReviewPreferenceCreate,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, application_prescreen, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -1848,6 +1851,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     bank_linked = plaid_linked or upload_linked
     bank_source = "plaid" if plaid_linked else ("upload" if upload_linked else "none")
     owner_state = await _owner_requirement_state(db, dealer.id)
+    pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
     credit_returned = bool(
         owner_state["ownership_complete"]
         and owner_state["contact_complete"]
@@ -1867,6 +1871,9 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         required_credit_owner_count=len(owner_state["required"]),
         completed_credit_owner_count=len(owner_state["completed"]),
         pending_credit_owner_ids=[owner.id for owner in owner_state["pending"]],
+        pre_screen_complete=pre_screen["complete"],
+        pre_screen_blockers=pre_screen["blockers"],
+        preliminary_program_fit=pre_screen["routing_result"],
     )
 
 
@@ -9802,6 +9809,169 @@ async def _owner_requirement_state(db: AsyncSession, dealer_id: UUID) -> dict:
     }
 
 
+async def _application_pre_screen_state(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    owner_state: dict | None = None,
+) -> dict:
+    owner_state = owner_state or await _owner_requirement_state(db, dealer.id)
+    row = (
+        await db.execute(
+            select(DealerApplicationPreScreen).where(
+                DealerApplicationPreScreen.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    file_answers = dict(row.file_answers or {}) if row else {}
+    owner_answers = dict(row.owner_answers or {}) if row else {}
+    required_ids = [str(owner.id) for owner in owner_state["required"]]
+    completed_ids = [
+        owner_id
+        for owner_id in required_ids
+        if application_prescreen.owner_answer_complete(owner_answers.get(owner_id))
+    ]
+    incomplete_ids = [owner_id for owner_id in required_ids if owner_id not in completed_ids]
+    blockers: list[str] = []
+    if not isinstance(file_answers.get("refinance_debt"), bool):
+        blockers.append("Confirm whether any proceeds will refinance debt.")
+    if incomplete_ids:
+        blockers.append(f"Complete eligibility for {len(incomplete_ids)} required owner(s).")
+    complete = not blockers and bool(required_ids)
+    verified_scores = {
+        str(owner.id): owner.credit_score for owner in owner_state["required"]
+    }
+    result = application_prescreen.screen_application(
+        requested_amount=float(dealer.funding_goal or dealer.client_requested_amount or 0),
+        refinance_debt=bool(file_answers.get("refinance_debt")),
+        required_owner_ids=required_ids,
+        owner_answers=owner_answers,
+        verified_credit_by_owner=verified_scores,
+    ) if complete else None
+    return {
+        "row": row,
+        "rules_version": row.rules_version if row else application_prescreen.RULES_VERSION,
+        "file_answers": file_answers,
+        "owner_answers": owner_answers,
+        "required_owner_ids": required_ids,
+        "completed_owner_ids": completed_ids,
+        "incomplete_owner_ids": incomplete_ids,
+        "complete": complete,
+        "blockers": blockers,
+        "routing_result": result,
+        "completed_at": row.completed_at if row else None,
+    }
+
+
+def _pre_screen_read(state: dict) -> ApplicationPreScreenRead:
+    return ApplicationPreScreenRead(
+        rules_version=state["rules_version"],
+        file_answers=state["file_answers"],
+        owner_answers=state["owner_answers"],
+        required_owner_ids=[UUID(value) for value in state["required_owner_ids"]],
+        completed_owner_ids=[UUID(value) for value in state["completed_owner_ids"]],
+        incomplete_owner_ids=[UUID(value) for value in state["incomplete_owner_ids"]],
+        complete=state["complete"],
+        blockers=state["blockers"],
+        routing_result=state["routing_result"],
+        completed_at=state["completed_at"],
+    )
+
+
+@router.get(
+    "/dealers/{dealer_id}/pre-screen",
+    response_model=ApplicationPreScreenRead,
+)
+async def get_application_pre_screen(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ApplicationPreScreenRead:
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return _pre_screen_read(await _application_pre_screen_state(db, dealer))
+
+
+@router.patch(
+    "/dealers/{dealer_id}/pre-screen",
+    response_model=ApplicationPreScreenRead,
+)
+async def patch_application_pre_screen(
+    dealer_id: UUID,
+    body: ApplicationPreScreenPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationPreScreenRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    row = (
+        await db.execute(
+            select(DealerApplicationPreScreen).where(
+                DealerApplicationPreScreen.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DealerApplicationPreScreen(
+            dealer_id=dealer.id,
+            rules_version=application_prescreen.RULES_VERSION,
+            file_answers={},
+            owner_answers={},
+        )
+        db.add(row)
+        await db.flush()
+
+    file_answers = dict(row.file_answers or {})
+    owner_answers = dict(row.owner_answers or {})
+    if body.refinance_debt is not None:
+        file_answers["refinance_debt"] = body.refinance_debt
+    if body.owner_id is not None:
+        owner = next((item for item in owner_state["owners"] if item.id == body.owner_id), None)
+        if owner is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+        incoming = dict(body.owner_answers or {})
+        unknown = set(incoming) - set(application_prescreen.REQUIRED_OWNER_FIELDS)
+        if unknown:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Unsupported eligibility fields: {', '.join(sorted(unknown))}",
+            )
+        current = dict(owner_answers.get(str(owner.id)) or {})
+        current.update(incoming)
+        if "bankruptcy_timing" in current and current["bankruptcy_timing"] not in application_prescreen.BANKRUPTCY_VALUES:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid bankruptcy timing")
+        if "felony_timing" in current and current["felony_timing"] not in application_prescreen.FELONY_VALUES:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid felony timing")
+        owner_answers[str(owner.id)] = current
+
+    row.file_answers = file_answers
+    row.owner_answers = owner_answers
+    await db.flush()
+    state = await _application_pre_screen_state(db, dealer, owner_state)
+    row.routing_result = state["routing_result"]
+    if state["complete"]:
+        row.completed_at = row.completed_at or datetime.now(timezone.utc)
+        row.completed_by_user_id = user.id
+        state["completed_at"] = row.completed_at
+    else:
+        row.completed_at = None
+        row.completed_by_user_id = None
+        state["completed_at"] = None
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.pre_screen_updated",
+        "application_pre_screen",
+        entity_id=row.id,
+        after={
+            "complete": state["complete"],
+            "required_owner_ids": state["required_owner_ids"],
+            "rules_version": row.rules_version,
+        },
+    )
+    await db.commit()
+    return _pre_screen_read(state)
+
+
 @router.get("/dealers/{dealer_id}/owners", response_model=list[OwnerRead])
 async def list_owners(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -10205,6 +10375,12 @@ async def owner_soft_pull(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Ownership must total 100.00% before a credit pull can run",
+        )
+    pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
+    if not pre_screen["complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Complete the Step 1 eligibility checkpoint before a credit pull can run",
         )
     if not owner.credit_required:
         raise HTTPException(
@@ -10880,6 +11056,12 @@ async def owner_credit_invite(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
         )
+    pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
+    if not pre_screen["complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Complete the Step 1 eligibility checkpoint before sending credit authorizations",
+        )
     if not owner.credit_required:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -10970,6 +11152,12 @@ async def bulk_owner_credit_invites(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
+        )
+    pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
+    if not pre_screen["complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Complete the Step 1 eligibility checkpoint before sending credit authorizations",
         )
     if owner_state["missing_contact"]:
         names = ", ".join(owner.full_name for owner in owner_state["missing_contact"])

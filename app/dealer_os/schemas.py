@@ -809,6 +809,28 @@ class VerificationRead(BaseModel):
     required_credit_owner_count: int = 0
     completed_credit_owner_count: int = 0
     pending_credit_owner_ids: list[UUID] = Field(default_factory=list)
+    pre_screen_complete: bool = False
+    pre_screen_blockers: list[str] = Field(default_factory=list)
+    preliminary_program_fit: dict | None = None
+
+
+class ApplicationPreScreenPatch(BaseModel):
+    refinance_debt: bool | None = None
+    owner_id: UUID | None = None
+    owner_answers: dict | None = None
+
+
+class ApplicationPreScreenRead(BaseModel):
+    rules_version: str
+    file_answers: dict = Field(default_factory=dict)
+    owner_answers: dict = Field(default_factory=dict)
+    required_owner_ids: list[UUID] = Field(default_factory=list)
+    completed_owner_ids: list[UUID] = Field(default_factory=list)
+    incomplete_owner_ids: list[UUID] = Field(default_factory=list)
+    complete: bool = False
+    blockers: list[str] = Field(default_factory=list)
+    routing_result: dict | None = None
+    completed_at: datetime | None = None
 
 
 class DecisionRead(BaseModel):

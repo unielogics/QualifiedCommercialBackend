@@ -133,9 +133,24 @@ def test_verification_requires_complete_ownership_and_all_required_credit() -> N
         owner_contact_complete=True,
         required_credit_owner_count=2,
         completed_credit_owner_count=2,
+        pre_screen_complete=True,
     )
     assert complete.unlocked is True
     assert complete.stage == "underwriting"
+
+    missing_screen = assess_verification(
+        bank_linked=True,
+        credit_returned=True,
+        ownership_total=100,
+        ownership_complete=True,
+        owner_contact_complete=True,
+        required_credit_owner_count=2,
+        completed_credit_owner_count=2,
+        pre_screen_complete=False,
+    )
+    assert missing_screen.unlocked is False
+    assert missing_screen.stage == "verification"
+    assert "eligibility checkpoint" in missing_screen.reason
 
 
 def test_verification_blocks_missing_required_owner_contact() -> None:

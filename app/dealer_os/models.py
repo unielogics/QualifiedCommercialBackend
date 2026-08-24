@@ -1369,12 +1369,70 @@ class DealerProductPresentation(TimestampMixin, Base):
     delivery_status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="presented", server_default="presented"
     )
+    catalog_versions: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    pdf_sha256: Mapped[str | None] = mapped_column(String(64))
     contact_share_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_rep_contact_shares.id", ondelete="SET NULL")
     )
     inbox_thread_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_rep_inbox_threads.id", ondelete="SET NULL")
     )
+
+
+class DealerApplicationPreScreen(TimestampMixin, Base):
+    """Auditable Step 1.5 eligibility answers and deterministic result.
+
+    Owner answers stay keyed by owner id so changing an ownership percentage
+    can change who is currently required without deleting what was previously
+    disclosed. The result is a snapshot of the rule version named here; later
+    verified evidence may create a recalculation while this self-report stays
+    available to the desk.
+    """
+
+    __tablename__ = "dos_application_pre_screens"
+    __table_args__ = (
+        UniqueConstraint("dealer_id", name="uq_dos_application_pre_screen_dealer"),
+        Index("ix_dos_application_pre_screen_updated", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    rules_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="quidity_step1_v1", server_default="quidity_step1_v1"
+    )
+    file_answers: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    owner_answers: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    routing_result: Mapped[dict | None] = mapped_column(JSONB)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class DealerProductPresentationArtifact(TimestampMixin, Base):
+    """Immutable presentation PDF plus a revocable public download token."""
+
+    __tablename__ = "dos_product_presentation_artifacts"
+    __table_args__ = (
+        UniqueConstraint("presentation_id", name="uq_dos_product_presentation_artifact"),
+        Index("ix_dos_product_presentation_token", "token_hash", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    presentation_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_product_presentations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    s3_key: Mapped[str] = mapped_column(String(720), nullable=False)
+    filename: Mapped[str] = mapped_column(String(200), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    download_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_downloaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerBankConsent(TimestampMixin, Base):

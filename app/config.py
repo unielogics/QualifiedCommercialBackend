@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://localhost:8081,http://localhost:19006,https://qualifiedcommercial.com,https://www.qualifiedcommercial.com"
     frontend_app_url: str = "https://app.qualifiedcommercial.com"
     rep_app_url: str = "https://rep.qualifiedcommercial.com"
+    public_api_url: str = "https://api.qualifiedcommercial.com"
 
     # Clerk (auth)
     clerk_secret_key: str = ""
