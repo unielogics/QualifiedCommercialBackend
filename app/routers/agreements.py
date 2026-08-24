@@ -40,6 +40,7 @@ from app.models.billing import PaymentAuthorization
 from app.models.bucket import Bucket, BucketDocumentSignature, BucketRequestedDocument
 from app.models.client import Client
 from app.models.contract_agreement import ContractAgreement
+from app.models.agreement_counterparty import AgreementCounterparty
 from app.models.deal_registration import DealRegistration
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.referral_partner_company import ReferralPartnerCompany
@@ -64,7 +65,7 @@ class AgreementRow(BaseModel):
     party_name: str | None
     party_email: str | None
     party_company: str | None
-    party_kind: str  # "user" | "company" | "lead" | "client" | "unknown"
+    party_kind: str  # "user" | "company" | "counterparty" | "lead" | "client" | "unknown"
     # Only set when party_kind == "company" -- the ReferralPartnerCompany's
     # own id, distinct from `id` (the ContractAgreement row's id) above.
     # Lets the frontend target "Issue Deal Registration" at this specific
@@ -100,6 +101,9 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
 
     user_ids = {a.subject_id for a in agreements if a.subject_type == ContractSubjectType.USER}
     company_ids = {a.subject_id for a in agreements if a.subject_type == ContractSubjectType.COMPANY}
+    counterparty_ids = {
+        a.subject_id for a in agreements if a.subject_type == ContractSubjectType.COUNTERPARTY
+    }
 
     users_by_id: dict[UUID, User] = {}
     if user_ids:
@@ -113,6 +117,16 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
             c.id: c
             for c in (
                 await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.id.in_(company_ids)))
+            ).scalars().all()
+        }
+    counterparties_by_id: dict[UUID, AgreementCounterparty] = {}
+    if counterparty_ids:
+        counterparties_by_id = {
+            c.id: c
+            for c in (
+                await db.execute(
+                    select(AgreementCounterparty).where(AgreementCounterparty.id.in_(counterparty_ids))
+                )
             ).scalars().all()
         }
 
@@ -144,6 +158,13 @@ async def _rows_from_contract_agreements(db: AsyncSession) -> list[AgreementRow]
             party_kind = "company"
             company_id = a.subject_id
             detail_url = "/settings?section=team"
+        elif a.subject_type == ContractSubjectType.COUNTERPARTY:
+            counterparty = counterparties_by_id.get(a.subject_id)
+            if counterparty is not None:
+                party_name = str((a.field_values or {}).get("counterparty_signer_name") or "") or None
+                party_email = counterparty.signer_email
+                party_company = counterparty.legal_name
+            party_kind = "counterparty"
 
         try:
             contract_title = tpl.CONTRACT_TITLES[ContractType(a.contract_type)]

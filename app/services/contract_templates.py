@@ -30,6 +30,7 @@ from typing import Any
 
 from app.enums import ContractType
 from app.services.contract_templates_data import CONTRACT_RAW_DATA
+from app.services.mutual_nda_template_data import MUTUAL_NDA_TEMPLATE_DATA
 from app.services.payment_authorization import (  # noqa: F401 re-exported for callers
     client_ip,
     decode_signature_data_url,
@@ -65,6 +66,7 @@ _DATA_KEY_BY_CONTRACT_TYPE: dict[ContractType, str] = {
     ContractType.SBA_ENGAGEMENT: "sba_engagement",
     ContractType.CLIENT_ENGAGEMENT: "client_engagement",
     ContractType.CONSULTING_ADDENDUM: "consulting_addendum",
+    ContractType.MUTUAL_NDA_NON_CIRCUMVENTION: "mutual_nda_non_circumvention",
 }
 
 # One version string per contract type, bumped whenever the underlying
@@ -77,6 +79,7 @@ CONTRACT_DOCUMENT_VERSIONS: dict[ContractType, str] = {
     ContractType.SBA_ENGAGEMENT: "2026-08-05-1",
     ContractType.CLIENT_ENGAGEMENT: "2026-08-05-1",
     ContractType.CONSULTING_ADDENDUM: "2026-08-05-1",
+    ContractType.MUTUAL_NDA_NON_CIRCUMVENTION: "2026-08-24-1",
 }
 
 # Short code used inside the human-readable contract number, e.g.
@@ -88,6 +91,7 @@ CONTRACT_TYPE_CODE: dict[ContractType, str] = {
     ContractType.SBA_ENGAGEMENT: "SBA",
     ContractType.CLIENT_ENGAGEMENT: "CEA",
     ContractType.CONSULTING_ADDENDUM: "CFA",
+    ContractType.MUTUAL_NDA_NON_CIRCUMVENTION: "MNCA",
 }
 
 CONTRACT_TITLES: dict[ContractType, str] = {
@@ -96,6 +100,7 @@ CONTRACT_TITLES: dict[ContractType, str] = {
     ContractType.SBA_ENGAGEMENT: "SBA Advisory and Packaging Engagement Agreement",
     ContractType.CLIENT_ENGAGEMENT: "Capital Advisory and Placement Engagement Agreement",
     ContractType.CONSULTING_ADDENDUM: "Consulting and Fee Schedule Addendum",
+    ContractType.MUTUAL_NDA_NON_CIRCUMVENTION: "Mutual Nondisclosure & Non-Circumvention Agreement",
 }
 
 
@@ -189,7 +194,11 @@ def _section_from_raw(s: dict) -> ContractSection:
 
 def get_template_spec(contract_type: ContractType) -> ContractTemplateSpec:
     key = _DATA_KEY_BY_CONTRACT_TYPE[contract_type]
-    raw = CONTRACT_RAW_DATA[key]
+    raw = (
+        MUTUAL_NDA_TEMPLATE_DATA
+        if contract_type == ContractType.MUTUAL_NDA_NON_CIRCUMVENTION
+        else CONTRACT_RAW_DATA[key]
+    )
     fields = {name: _field_from_raw(name, info) for name, info in raw["field_schema"].items()}
     return ContractTemplateSpec(
         contract_type=contract_type,

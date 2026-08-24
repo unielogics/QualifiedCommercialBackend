@@ -28,19 +28,22 @@ client signs it through the mechanism that already exists, unchanged).
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ContractSubjectType, ContractType, Role
 from app.models.contract_agreement import ContractAgreement
+from app.models.agreement_counterparty import AgreementCounterparty
+from app.models.public_contract_sign_session import PublicContractSignSession
 from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
 from app.services import contract_templates as tpl
@@ -138,6 +141,24 @@ class ContractAgreementRead(BaseModel):
     esign_consent: bool
     signed_at: datetime | None
     certificate_download_url: str | None = None
+    email_delivery_status: str | None = None
+
+
+class PublicContractSessionRequest(BaseModel):
+    honeypot: str = Field(default="", max_length=200)
+
+
+class PublicContractSessionRead(BaseModel):
+    token: str
+    expires_at: datetime
+
+
+class MutualNdaSignRequest(ContractSignRequest):
+    signer_email: EmailStr
+    signature_data_url: str = Field(min_length=1, max_length=2_000_000)
+    public_session_token: str = Field(min_length=32, max_length=256)
+    honeypot: str = Field(default="", max_length=200)
+    no_preexisting_relationships: bool = False
 
 
 async def _latest_agreement(
@@ -211,7 +232,7 @@ class ContractPreview(BaseModel):
 # exposed here -- PLATFORM_ACCESS is signed from inside the app (its preview
 # already comes from the authenticated /status endpoint) and the 3
 # client-facing types never reach this router at all (see module docstring).
-_PUBLIC_PREVIEWABLE = _COMPANY_SCOPED
+_PUBLIC_PREVIEWABLE = _COMPANY_SCOPED | {ContractType.MUTUAL_NDA_NON_CIRCUMVENTION}
 
 
 @router.get("/{contract_type}/preview", response_model=ContractPreview)
@@ -241,6 +262,61 @@ async def contract_render(contract_type: ContractType, payload: ContractRenderRe
         document=_document_read(contract_type, payload.field_values),
         fields=_fields_read(contract_type),
     )
+
+
+_PUBLIC_SESSION_TTL = timedelta(minutes=20)
+_PUBLIC_SESSION_RATE_WINDOW = timedelta(minutes=15)
+_PUBLIC_SESSION_RATE_LIMIT = 5
+_PUBLIC_SESSION_MAX_ATTEMPTS = 5
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _ip_hash(request: Request) -> str:
+    ip = tpl.client_ip(request) or "unknown"
+    return hashlib.sha256(f"public-contract:{ip}".encode("utf-8")).hexdigest()
+
+
+@router.post(
+    "/mutual-nda-non-circumvention/public-session",
+    response_model=PublicContractSessionRead,
+    status_code=201,
+)
+async def create_mutual_nda_public_session(
+    payload: PublicContractSessionRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> PublicContractSessionRead:
+    if payload.honeypot:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unable to create signing session")
+
+    now = datetime.now(timezone.utc)
+    ip_hash = _ip_hash(request)
+    recent_count = (
+        await db.execute(
+            select(func.count(PublicContractSignSession.id)).where(
+                PublicContractSignSession.ip_hash == ip_hash,
+                PublicContractSignSession.created_at >= now - _PUBLIC_SESSION_RATE_WINDOW,
+            )
+        )
+    ).scalar_one()
+    if recent_count >= _PUBLIC_SESSION_RATE_LIMIT:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Please wait before starting another signing session")
+
+    raw_token = secrets.token_urlsafe(48)
+    expires_at = now + _PUBLIC_SESSION_TTL
+    session = PublicContractSignSession(
+        contract_type=ContractType.MUTUAL_NDA_NON_CIRCUMVENTION,
+        token_hash=_token_hash(raw_token),
+        ip_hash=ip_hash,
+        expires_at=expires_at,
+        user_agent=(request.headers.get("user-agent") or "")[:512] or None,
+    )
+    db.add(session)
+    await db.commit()
+    return PublicContractSessionRead(token=raw_token, expires_at=expires_at)
 
 
 async def _next_contract_number(db: AsyncSession, contract_type: ContractType) -> str:
@@ -348,6 +424,205 @@ async def sign_referral_protection(
     )
 
 
+def _normalize_identity(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+async def _fail_public_session(
+    db: AsyncSession,
+    session: PublicContractSignSession,
+    detail: str,
+    *,
+    status_code: int = status.HTTP_400_BAD_REQUEST,
+) -> None:
+    session.attempt_count += 1
+    if session.attempt_count >= _PUBLIC_SESSION_MAX_ATTEMPTS:
+        session.revoked_at = datetime.now(timezone.utc)
+    await db.commit()
+    raise HTTPException(status_code, detail)
+
+
+async def _find_or_create_counterparty(
+    db: AsyncSession,
+    *,
+    legal_name: str,
+    entity_type: str,
+    state_of_formation: str,
+    principal_address: str,
+    signer_email: str,
+) -> AgreementCounterparty:
+    normalized_name = _normalize_identity(legal_name)
+    normalized_state = _normalize_identity(state_of_formation)
+    counterparty = (
+        await db.execute(
+            select(AgreementCounterparty).where(
+                AgreementCounterparty.normalized_legal_name == normalized_name,
+                AgreementCounterparty.normalized_state_of_formation == normalized_state,
+            )
+        )
+    ).scalar_one_or_none()
+    if counterparty is None:
+        counterparty = AgreementCounterparty(
+            legal_name=legal_name,
+            normalized_legal_name=normalized_name,
+            entity_type=entity_type,
+            state_of_formation=state_of_formation,
+            normalized_state_of_formation=normalized_state,
+            principal_business_address=principal_address,
+            signer_email=signer_email,
+        )
+        db.add(counterparty)
+        await db.flush()
+    else:
+        counterparty.legal_name = legal_name
+        counterparty.entity_type = entity_type
+        counterparty.state_of_formation = state_of_formation
+        counterparty.principal_business_address = principal_address
+        counterparty.signer_email = signer_email
+    return counterparty
+
+
+def _agreement_read(agreement: ContractAgreement) -> ContractAgreementRead:
+    return ContractAgreementRead(
+        id=agreement.id,
+        contract_type=agreement.contract_type,
+        contract_number=agreement.contract_number,
+        subject_type=agreement.subject_type,
+        subject_id=agreement.subject_id,
+        typed_name=agreement.typed_name,
+        esign_consent=agreement.esign_consent,
+        signed_at=agreement.signed_at,
+        certificate_download_url=tpl.presign_private_s3_object(agreement.certificate_s3_key),
+        email_delivery_status=agreement.email_delivery_status,
+    )
+
+
+@router.post(
+    "/mutual-nda-non-circumvention/sign",
+    response_model=ContractAgreementRead,
+    status_code=201,
+)
+async def sign_mutual_nda_non_circumvention(
+    payload: MutualNdaSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ContractAgreementRead:
+    if payload.honeypot:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unable to sign agreement")
+
+    now = datetime.now(timezone.utc)
+    session = (
+        await db.execute(
+            select(PublicContractSignSession)
+            .where(PublicContractSignSession.token_hash == _token_hash(payload.public_session_token))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if session is None or session.contract_type != ContractType.MUTUAL_NDA_NON_CIRCUMVENTION:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Signing session is invalid")
+    if session.revoked_at is not None or session.attempt_count >= _PUBLIC_SESSION_MAX_ATTEMPTS:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Signing session is no longer valid")
+    if session.used_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Signing session has already been used")
+    if session.expires_at <= now:
+        await _fail_public_session(db, session, "Signing session has expired", status_code=status.HTTP_410_GONE)
+    if session.ip_hash != _ip_hash(request):
+        await _fail_public_session(db, session, "Signing session is invalid", status_code=status.HTTP_401_UNAUTHORIZED)
+
+    required_fields = (
+        "effective_date",
+        "counterparty_legal_name",
+        "counterparty_entity_type",
+        "counterparty_state_of_formation",
+        "counterparty_principal_address",
+        "counterparty_signer_name",
+        "counterparty_signer_title",
+        "counterparty_signer_email",
+    )
+    clean: dict[str, Any] = {}
+    maximum_lengths = {
+        "effective_date": 10,
+        "counterparty_legal_name": 255,
+        "counterparty_entity_type": 80,
+        "counterparty_state_of_formation": 80,
+        "counterparty_principal_address": 512,
+        "counterparty_signer_name": 160,
+        "counterparty_signer_title": 160,
+        "counterparty_signer_email": 320,
+    }
+    for field_name in required_fields:
+        value = str(payload.field_values.get(field_name) or "").strip()
+        if not value:
+            await _fail_public_session(db, session, f"{field_name.replace('_', ' ').title()} is required")
+        if len(value) > maximum_lengths[field_name]:
+            await _fail_public_session(db, session, f"{field_name.replace('_', ' ').title()} is too long")
+        clean[field_name] = value
+
+    if _normalize_identity(clean["counterparty_signer_name"]) != _normalize_identity(payload.typed_name):
+        await _fail_public_session(db, session, "Typed legal name must match the signer name")
+    if clean["counterparty_signer_email"].casefold() != str(payload.signer_email).casefold():
+        await _fail_public_session(db, session, "Signer email does not match the agreement")
+
+    submitted_rows = payload.field_values.get("preexisting_relationship_rows") or []
+    if not isinstance(submitted_rows, list):
+        await _fail_public_session(db, session, "Exhibit A relationships are invalid")
+    if len(submitted_rows) > 25:
+        await _fail_public_session(db, session, "Exhibit A supports up to 25 relationships")
+    clean_rows: list[dict[str, str]] = []
+    for row in submitted_rows:
+        if not isinstance(row, dict):
+            await _fail_public_session(db, session, "Exhibit A relationships are invalid")
+        clean_row = {
+            key: str(row.get(key) or "").strip()
+            for key in ("name", "category", "description", "start_date")
+        }
+        if any(clean_row.values()) and not all(clean_row.values()):
+            await _fail_public_session(db, session, "Complete every field in each Exhibit A row")
+        if any(len(value) > 500 for value in clean_row.values()):
+            await _fail_public_session(db, session, "An Exhibit A value is too long")
+        if all(clean_row.values()):
+            clean_rows.append(clean_row)
+
+    if payload.no_preexisting_relationships and clean_rows:
+        await _fail_public_session(db, session, "Choose either disclosed relationships or no relationships")
+    if not payload.no_preexisting_relationships and not clean_rows:
+        await _fail_public_session(db, session, "Complete Exhibit A or confirm there are no relationships")
+
+    clean.update(
+        {
+            "counterparty_signature_date": clean["effective_date"],
+            "qc_signatory_name": "Jonathan Franco",
+            "qc_signature_date": clean["effective_date"],
+            "preexisting_relationship_declaration": (
+                "No pre-existing relationships to disclose."
+                if payload.no_preexisting_relationships
+                else "The following pre-existing relationships are disclosed before execution of this Agreement."
+            ),
+            "preexisting_relationship_rows": clean_rows,
+        }
+    )
+    signed_payload = payload.model_copy(update={"field_values": clean})
+    counterparty = await _find_or_create_counterparty(
+        db,
+        legal_name=clean["counterparty_legal_name"],
+        entity_type=clean["counterparty_entity_type"],
+        state_of_formation=clean["counterparty_state_of_formation"],
+        principal_address=clean["counterparty_principal_address"],
+        signer_email=str(payload.signer_email),
+    )
+    session.used_at = now
+    agreement = await _sign(
+        db,
+        request,
+        contract_type=ContractType.MUTUAL_NDA_NON_CIRCUMVENTION,
+        subject_type=ContractSubjectType.COUNTERPARTY,
+        subject_id=counterparty.id,
+        payload=signed_payload,
+        notify_email=str(payload.signer_email),
+    )
+    return _agreement_read(agreement)
+
+
 async def _sign(
     db: AsyncSession,
     request: Request,
@@ -413,18 +688,25 @@ async def _sign(
     await db.refresh(agreement)
 
     if notify_email:
-        _send_signed_copy_email(
+        delivery = _send_signed_copy_email(
             to_email=notify_email,
             title=rendered.title,
             contract_number=contract_number,
             typed_name=agreement.typed_name,
             pdf_bytes=pdf_bytes,
         )
+        agreement.email_delivery_status = "sent" if delivery.ok else "failed"
+        agreement.email_delivery_message_id = delivery.message_id
+        agreement.email_delivery_error = None if delivery.ok else delivery.detail[:1000]
+    else:
+        agreement.email_delivery_status = "not_requested"
+    await db.commit()
+    await db.refresh(agreement)
 
     return agreement
 
 
-def _send_signed_copy_email(*, to_email: str, title: str, contract_number: str, typed_name: str, pdf_bytes: bytes) -> None:
+def _send_signed_copy_email(*, to_email: str, title: str, contract_number: str, typed_name: str, pdf_bytes: bytes):
     """E-SIGN-compliant delivery of the signer's own copy: the certificate
     PDF attached directly to the confirmation email (not just a download
     link, which could expire or be inaccessible), plus the paper-copy and
@@ -440,7 +722,7 @@ def _send_signed_copy_email(*, to_email: str, title: str, contract_number: str, 
         "to electronic records prospectively, by contacting support@qualifiedcommercial.com.\n\n"
         "Qualified Commercial LLC"
     )
-    send_raw_email(
+    return send_raw_email(
         to_emails=[to_email],
         subject=subject,
         body_text=body_text,
