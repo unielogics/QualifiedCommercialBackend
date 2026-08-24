@@ -2508,6 +2508,7 @@ class RepProduction(BaseModel):
 
 
 class RepProductionRead(BaseModel):
+    scope: Literal["own", "firm"] = "firm"
     since: datetime | None = None
     totals: RepProduction
     reps: list[RepProduction] = []

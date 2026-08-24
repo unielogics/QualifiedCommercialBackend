@@ -10489,35 +10489,48 @@ def _location_rows(
     return out
 
 
+def _rep_production_access_scope(user: User) -> tuple[str, UUID | None]:
+    """Resolve reporting scope before any production rows are queried."""
+    require_team_or_rep(user)
+    if user.role == Role.FIELD_REP:
+        return "own", user.id
+    return "firm", None
+
+
 @router.get("/rep-production", response_model=RepProductionRead)
 async def rep_production(
     user: CurrentUser,
     days: int = 90,
     db: AsyncSession = Depends(get_db),
 ) -> RepProductionRead:
-    """What the field team has brought in, per rep.
+    """What the field team has brought in, scoped to the viewer.
 
-    Super-admin only. Reads ownership off DealerBusiness.owner_user_id rather
-    than the pipeline table, so files opened before the pipeline existed still
-    count — they simply carry no status.
+    Field reps see only files they own. Loan executives and super admins see
+    firm-wide production. Ownership is read from DealerBusiness.owner_user_id
+    rather than the pipeline table, so files opened before the pipeline existed
+    still count — they simply carry no status.
 
     The number that matters most here is `with_documents`, not `files_opened`.
     A rep can open twenty files in an afternoon and none of them are production
     until a client actually sends something, so counting files alone rewards
     exactly the wrong behaviour.
     """
-    require_super_admin(user)
+    scope, owner_user_id = _rep_production_access_scope(user)
     since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 730)))
+
+    production_filters = [
+        DealerBusiness.owner_user_id.is_not(None),
+        DealerBusiness.created_at >= since,
+    ]
+    if owner_user_id is not None:
+        production_filters.append(DealerBusiness.owner_user_id == owner_user_id)
 
     rows = (
         await db.execute(
             select(DealerBusiness, DealerRepLead, User)
             .outerjoin(DealerRepLead, DealerRepLead.dealer_id == DealerBusiness.id)
             .outerjoin(User, User.id == DealerBusiness.owner_user_id)
-            .where(
-                DealerBusiness.owner_user_id.is_not(None),
-                DealerBusiness.created_at >= since,
-            )
+            .where(*production_filters)
             .order_by(DealerBusiness.created_at.desc())
         )
     ).all()
@@ -10982,7 +10995,7 @@ async def rep_production(
         top_approved_zip_codes=_location_rows(total_zips, approved_only=True),
     )
 
-    return RepProductionRead(since=since, totals=totals, reps=reps)
+    return RepProductionRead(scope=scope, since=since, totals=totals, reps=reps)
 
 
 # --- Owner credit-consent invites (0125) --------------------------------------
