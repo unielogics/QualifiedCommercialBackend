@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app.db import SessionLocal, get_db
+from app.db import get_db
 from app.deps import CurrentUser
 from app.config import get_settings
 from app.models.user import User
@@ -2089,6 +2089,7 @@ async def mark_event_recurrence(
     categorized_by='admin', which the stamping engine skips, and the live
     recurring view overlays these marks on top of detection."""
     require_team(user)
+    is_dealer_actor = user.role == Role.DEALER
     dealer = await load_dealer(db, dealer_id)
     event = (
         await db.execute(
@@ -2113,7 +2114,7 @@ async def mark_event_recurrence(
             "This line was marked by your advisor — ask them to change it.",
         )
     targets = [event]
-    vendor_key = normalize_vendor(event.description or "")
+    vendor_key = vendors.normalize_vendor(event.description or "")
     if payload.apply_similar and vendor_key:
         rows = (
             await db.execute(
@@ -2123,7 +2124,7 @@ async def mark_event_recurrence(
                 .limit(2000)
             )
         ).scalars().all()
-        similar = [r for r in rows if normalize_vendor(r.description or "") == vendor_key]
+        similar = [r for r in rows if vendors.normalize_vendor(r.description or "") == vendor_key]
         if is_dealer_actor:
             similar = [r for r in similar if not _team_locked(r)]
         targets += similar[:499]
@@ -7926,7 +7927,7 @@ async def plaid_link_token(
             dealer_id=str(dealer.id), dealer_name=dealer.name
         )
     except plaid_client.PlaidUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return PlaidLinkTokenRead(link_token=token)
 
 
@@ -8023,7 +8024,7 @@ async def plaid_exchange(
     try:
         access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
     except plaid_client.PlaidUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     existing = (
         await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
     ).scalar_one_or_none()
@@ -8413,7 +8414,7 @@ async def public_room_link_token(
             redirect_override=plaid_client.room_redirect_uri() or None,
         )
     except plaid_client.PlaidUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return PlaidLinkTokenRead(link_token=pt)
 
 
@@ -8442,7 +8443,7 @@ async def public_room_plaid_exchange(
     try:
         access_token, item_id = await plaid_client.exchange_public_token(payload.public_token)
     except plaid_client.PlaidUnavailable as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
     await _lock_dealer_related_writes(db, dealer.id)
     existing = (
@@ -10713,7 +10714,7 @@ async def dealer_payment_timing(
     for c in cutoffs:
         c["account_name"] = names.get(c["account_id"])
     manual_keys = {
-        normalize_vendor(r.description or "")
+        vendors.normalize_vendor(r.description or "")
         for r in rows
         if isinstance(r.flags, dict) and r.flags.get("manual_recurrence") == "recurring"
     } - {""}
