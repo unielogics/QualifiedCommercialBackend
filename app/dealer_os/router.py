@@ -33,9 +33,11 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.config import get_settings
 from app.models.user import User
+from app.models.application_profile import PlaidAssetReport
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.services import booking_notify
+from app.services import plaid_lifecycle
 from app.services.email import ses_client
 from app.services import clerk as clerk_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
@@ -152,6 +154,7 @@ from .schemas import (
     PublicPlaidItemRead,
     RoomPasscode,
     RoomPlaidExchange,
+    RoomPlaidUpdateLink,
     ClientRequestResult,
     ClientRequestSend,
     BankEvidenceRead,
@@ -173,11 +176,14 @@ from .schemas import (
     DebtCreate,
     DebtDraftResult,
     PlaidExchange,
+    PlaidAssetReportCreate,
+    PlaidAssetReportRead,
     PlaidItemPatch,
     PlaidItemRead,
     PlaidLinkTokenRead,
     PlaidRefreshResult,
     PlaidStateRead,
+    PlaidUpdateLinkRequest,
     DscrAddbackRead,
     DscrComponentAction,
     DscrComponentRead,
@@ -389,7 +395,11 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
             for (did,) in (
                 await db.execute(
                     select(DealerPlaidItem.dealer_id)
-                    .where(DealerPlaidItem.dealer_id.in_(ids), DealerPlaidItem.status == "active")
+                    .where(
+                        DealerPlaidItem.dealer_id.in_(ids),
+                        DealerPlaidItem.status == "active",
+                        DealerPlaidItem.environment == plaid_client.environment(),
+                    )
                     .distinct()
                 )
             ).all()
@@ -492,6 +502,7 @@ async def dealer_portfolio(
         select(DealerPlaidItem.id).where(
             DealerPlaidItem.dealer_id == DealerBusiness.id,
             DealerPlaidItem.status == "active",
+            DealerPlaidItem.environment == plaid_client.environment(),
         )
     )
     required_credit_owner = exists(
@@ -590,7 +601,11 @@ async def dealer_portfolio(
         for row in (
             await db.execute(
                 select(DealerPlaidItem.dealer_id)
-                .where(DealerPlaidItem.dealer_id.in_(ids), DealerPlaidItem.status == "active")
+                .where(
+                    DealerPlaidItem.dealer_id.in_(ids),
+                    DealerPlaidItem.status == "active",
+                    DealerPlaidItem.environment == plaid_client.environment(),
+                )
                 .distinct()
             )
         ).all()
@@ -1818,6 +1833,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
                 select(DealerPlaidItem.id).where(
                     DealerPlaidItem.dealer_id == dealer.id,
                     DealerPlaidItem.status == "active",
+                    DealerPlaidItem.environment == plaid_client.environment(),
                     DealerPlaidItem.is_primary_operating.is_(True),
                 ).limit(1)
             )
@@ -8102,6 +8118,7 @@ async def _plaid_items(db: AsyncSession, dealer_id: UUID) -> list[DealerPlaidIte
                 .where(
                     DealerPlaidItem.dealer_id == dealer_id,
                     DealerPlaidItem.status != "removed",
+                    DealerPlaidItem.environment == plaid_client.environment(),
                 )
                 .order_by(DealerPlaidItem.created_at)
             )
@@ -8109,6 +8126,24 @@ async def _plaid_items(db: AsyncSession, dealer_id: UUID) -> list[DealerPlaidIte
         .scalars()
         .all()
     )
+
+
+async def _dealer_plaid_item(
+    db: AsyncSession, dealer_id: UUID, item_pk: UUID
+) -> DealerPlaidItem:
+    item = (
+        await db.execute(
+            select(DealerPlaidItem).where(
+                DealerPlaidItem.id == item_pk,
+                DealerPlaidItem.dealer_id == dealer_id,
+                DealerPlaidItem.status != "removed",
+                DealerPlaidItem.environment == plaid_client.environment(),
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
+    return item
 
 
 @router.get("/dealers/{dealer_id}/plaid", response_model=PlaidStateRead)
@@ -8125,12 +8160,13 @@ async def plaid_state(
     items = await _plaid_items(db, dealer.id)
     months = await _plaid_statement_months_by_item(db, dealer.id)
     cs = await bank_consent.state(db, dealer.id)
+    current_consent = await bank_consent.has_consent(db, dealer.id)
     d = bank_consent.disclosure()
     return PlaidStateRead(
         enabled=plaid_client.enabled(),
         environment=plaid_client.environment(),
         consent=BankConsentState(
-            granted=cs.granted,
+            granted=current_consent,
             version=cs.version,
             at=cs.at,
             consenter_name=cs.consenter_name,
@@ -8143,6 +8179,11 @@ async def plaid_state(
                 statement_months=months.get(item.id, []),
             )
             for item in items
+        ],
+        assets_enabled=plaid_client.assets_enabled(),
+        asset_reports=[
+            PlaidAssetReportRead.model_validate(report)
+            for report in await plaid_lifecycle.owner_asset_reports(db, dealer_id=dealer.id)
         ],
     )
 
@@ -8166,6 +8207,68 @@ async def plaid_link_token(
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     return PlaidLinkTokenRead(link_token=token)
+
+
+@router.post(
+    "/dealers/{dealer_id}/plaid/{item_pk}/update-link-token",
+    response_model=PlaidLinkTokenRead,
+)
+async def plaid_update_link_token(
+    dealer_id: UUID,
+    item_pk: UUID,
+    payload: PlaidUpdateLinkRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PlaidLinkTokenRead:
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if not await bank_consent.has_consent(db, dealer.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _NO_BANK_CONSENT)
+    item = await _dealer_plaid_item(db, dealer.id, item_pk)
+    try:
+        token = await plaid_client.create_update_link_token(
+            access_token=plaid_lifecycle.decrypted_access_token(item),
+            client_user_id=str(dealer.id),
+            account_selection_enabled=(
+                payload.account_selection_enabled
+                or item.update_mode_account_selection
+            ),
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return PlaidLinkTokenRead(link_token=token)
+
+
+@router.post(
+    "/dealers/{dealer_id}/plaid/{item_pk}/update-complete",
+    response_model=PlaidItemRead,
+)
+async def plaid_update_complete(
+    dealer_id: UUID,
+    item_pk: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerPlaidItem:
+    require_dealer(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    item = await _dealer_plaid_item(db, dealer.id, item_pk)
+    try:
+        await plaid_lifecycle.complete_update(item)
+    except plaid_client.PlaidUnavailable as exc:
+        await db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.update_mode.completed.client",
+        "plaid_item",
+        entity_id=item.id,
+        after={"via": "authenticated_client"},
+    )
+    await db.commit()
+    await db.refresh(item)
+    return item
 
 
 @router.post("/dealers/{dealer_id}/bank-consent", response_model=BankConsentState)
@@ -8223,6 +8326,12 @@ async def withdraw_bank_consent(
     possible, so it is a real endpoint rather than a support-inbox convention."""
     require_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        disconnected = await plaid_lifecycle.purge_owner_connections(
+            db, dealer_id=dealer.id
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     await bank_consent.revoke(db, dealer_id=dealer.id, reason="withdrawn by request")
     await log_action(
         db,
@@ -8231,7 +8340,7 @@ async def withdraw_bank_consent(
         "plaid.consent.withdrawn.client",
         "dealer",
         entity_id=dealer.id,
-        after={"via": "authenticated_client"},
+        after={"via": "authenticated_client", "disconnected_items": disconnected},
     )
     await db.commit()
     d = bank_consent.disclosure()
@@ -8269,7 +8378,10 @@ async def plaid_exchange(
         raise HTTPException(status.HTTP_409_CONFLICT, "This bank connection belongs to another file")
     if existing is not None:  # reconnect: refresh the token, revive the row
         existing.encrypted_access_token = plaid_client.encrypt_token(access_token)
+        existing.environment = plaid_client.environment()
         existing.status, existing.error = "active", None
+        existing.update_mode_reason = None
+        existing.update_mode_account_selection = False
         existing.next_refresh_at = datetime.now(timezone.utc)
         item = existing
     else:
@@ -8278,6 +8390,7 @@ async def plaid_exchange(
             item_id=item_id,
             institution_name=(payload.institution_name or "")[:160] or None,
             encrypted_access_token=plaid_client.encrypt_token(access_token),
+            environment=plaid_client.environment(),
             status="active",
             # Safety net: the in-process background first sync is not durable
             # (a redeploy kills it) — a due next_refresh_at means the daily
@@ -8394,14 +8507,14 @@ async def public_room_features(
                 )
             )
 
-    bank_cs = await bank_consent.state(db, dealer.id)
     return RoomFeaturesRead(
         business_name=dealer.name,
         bank_connect_available=plaid_client.enabled(),
         plaid_environment=plaid_client.environment(),
-        bank_consent_granted=bank_cs.granted,
+        bank_consent_granted=await bank_consent.has_consent(db, dealer.id),
         bank_consent_disclosure=bank_consent.disclosure()["text"],
         bank_connections=await _safe_plaid_items(db, dealer.id),
+        plaid_assets_enabled=plaid_client.assets_enabled(),
         signable=rows,
         contracts=contract_rows,
     )
@@ -8656,6 +8769,110 @@ async def public_room_link_token(
 
 
 @router.post(
+    "/public/room/{token}/plaid/{item_pk}/update-link-token",
+    response_model=PlaidLinkTokenRead,
+)
+async def public_room_update_link_token(
+    token: str,
+    item_pk: UUID,
+    payload: RoomPlaidUpdateLink,
+    db: AsyncSession = Depends(get_db),
+) -> PlaidLinkTokenRead:
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if not await bank_consent.has_consent(db, dealer.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _NO_BANK_CONSENT)
+    item = await _dealer_plaid_item(db, dealer.id, item_pk)
+    try:
+        link_token = await plaid_client.create_update_link_token(
+            access_token=plaid_lifecycle.decrypted_access_token(item),
+            client_user_id=str(dealer.id),
+            redirect_override=plaid_client.room_redirect_uri() or None,
+            account_selection_enabled=(
+                payload.account_selection_enabled
+                or item.update_mode_account_selection
+            ),
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return PlaidLinkTokenRead(link_token=link_token)
+
+
+@router.post(
+    "/public/room/{token}/plaid/{item_pk}/update-complete",
+    response_model=PublicPlaidItemRead,
+)
+async def public_room_update_complete(
+    token: str,
+    item_pk: UUID,
+    payload: RoomPasscode,
+    db: AsyncSession = Depends(get_db),
+) -> PublicPlaidItemRead:
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    item = await _dealer_plaid_item(db, dealer.id, item_pk)
+    try:
+        await plaid_lifecycle.complete_update(item)
+    except plaid_client.PlaidUnavailable as exc:
+        await db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        None,
+        "plaid.update_mode.completed.client",
+        "plaid_item",
+        entity_id=item.id,
+        after={"via": "client_room", "link_id": str(link.id)},
+    )
+    await db.commit()
+    return next(row for row in await _safe_plaid_items(db, dealer.id) if row.id == item.id)
+
+
+@router.delete(
+    "/public/room/{token}/plaid/{item_pk}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def public_room_disconnect_bank(
+    token: str,
+    item_pk: UUID,
+    payload: RoomPasscode,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    item = await _dealer_plaid_item(db, dealer.id, item_pk)
+    was_primary = item.is_primary_operating
+    try:
+        await plaid_lifecycle.disconnect_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    if was_primary:
+        replacement = next(
+            (candidate for candidate in await _plaid_items(db, dealer.id) if candidate.id != item.id),
+            None,
+        )
+        if replacement:
+            await _make_primary_operating_bank(db, dealer.id, replacement)
+    await log_action(
+        db,
+        dealer.id,
+        None,
+        "plaid.disconnect.client",
+        "plaid_item",
+        entity_id=item.id,
+        after={"via": "client_room", "link_id": str(link.id)},
+    )
+    await db.commit()
+
+
+@router.post(
     "/public/room/{token}/plaid/exchange",
     response_model=PublicPlaidResult,
     status_code=status.HTTP_201_CREATED,
@@ -8695,7 +8912,10 @@ async def public_room_plaid_exchange(
         )
     if existing is not None:
         existing.encrypted_access_token = plaid_client.encrypt_token(access_token)
+        existing.environment = plaid_client.environment()
         existing.status, existing.error = "active", None
+        existing.update_mode_reason = None
+        existing.update_mode_account_selection = False
         existing.next_refresh_at = datetime.now(timezone.utc)
         item = existing
     else:
@@ -8704,6 +8924,7 @@ async def public_room_plaid_exchange(
             item_id=item_id,
             institution_name=(payload.institution_name or "")[:160] or None,
             encrypted_access_token=plaid_client.encrypt_token(access_token),
+            environment=plaid_client.environment(),
             status="active",
             next_refresh_at=datetime.now(timezone.utc),
         )
@@ -8763,6 +8984,7 @@ async def public_room_set_primary_bank(
                 DealerPlaidItem.id == item_pk,
                 DealerPlaidItem.dealer_id == dealer.id,
                 DealerPlaidItem.status != "removed",
+                DealerPlaidItem.environment == plaid_client.environment(),
             )
         )
     ).scalar_one_or_none()
@@ -8896,10 +9118,18 @@ async def plaid_patch(
 async def plaid_remove(
     dealer_id: UUID, item_pk: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
-    """Disconnect a bank (super-admin recovery). Documents already pulled stay — they are the
-    dealer's statements; only the live connection goes."""
-    require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    """Disconnect at the owning client's request or as super-admin recovery."""
+    if user.role == Role.DEALER:
+        dealer = await resolve_dealer_scope(db, user, dealer_id)
+        action = "plaid.disconnect.client"
+    elif user.role == Role.SUPER_ADMIN:
+        dealer = await load_dealer(db, dealer_id)
+        action = "plaid.disconnect.recovery"
+    else:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the client or a super admin may disconnect a bank",
+        )
     await _lock_dealer_related_writes(db, dealer.id)
     item = (
         await db.execute(
@@ -8910,16 +9140,11 @@ async def plaid_remove(
     ).scalar_one_or_none()
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found for this client")
-    token = plaid_client.decrypt_token(item.encrypted_access_token)
-    if token:
-        try:
-            await plaid_client.item_remove(token)
-        except plaid_client.PlaidUnavailable:
-            pass  # best-effort — the row is retired regardless
-    item.status = "removed"
-    item.encrypted_access_token = None
     was_primary = item.is_primary_operating
-    item.is_primary_operating = False
+    try:
+        await plaid_lifecycle.disconnect_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     if was_primary:
         replacement = next(
             (
@@ -8935,10 +9160,153 @@ async def plaid_remove(
         db,
         dealer.id,
         user,
-        "plaid.disconnect.recovery",
+        action,
         "plaid_item",
         entity_id=item.id,
-        after={"retained_statement_evidence": True},
+        after={
+            "retained_statement_evidence": True,
+            "via": "authenticated_client" if user.role == Role.DEALER else "super_admin",
+        },
+    )
+    await db.commit()
+
+
+@router.delete(
+    "/dealers/{dealer_id}/plaid",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def purge_dealer_plaid_on_offboarding(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Remove every Plaid Item and Asset Report when the file is offboarded."""
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    try:
+        removed = await plaid_lifecycle.purge_owner_connections(
+            db, dealer_id=dealer.id
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.offboarding_purge",
+        "dealer",
+        entity_id=dealer.id,
+        after={"removed_items": removed},
+    )
+    await db.commit()
+
+
+async def _dealer_asset_report(
+    db: AsyncSession, dealer_id: UUID, report_id: UUID
+) -> PlaidAssetReport:
+    report = (
+        await db.execute(
+            select(PlaidAssetReport).where(
+                PlaidAssetReport.id == report_id,
+                PlaidAssetReport.dealer_id == dealer_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Asset Report not found")
+    return report
+
+
+@router.post(
+    "/dealers/{dealer_id}/plaid/asset-reports",
+    response_model=PlaidAssetReportRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_dealer_asset_report(
+    dealer_id: UUID,
+    payload: PlaidAssetReportCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PlaidAssetReport:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if not await bank_consent.has_consent(db, dealer.id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The client must accept the current bank disclosure first",
+        )
+    try:
+        report = await plaid_lifecycle.create_asset_report(
+            db,
+            items=await _plaid_items(db, dealer.id),
+            dealer_id=dealer.id,
+            days_requested=payload.days_requested,
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.asset_report.requested",
+        "plaid_asset_report",
+        entity_id=report.id,
+        after={"days_requested": report.days_requested},
+    )
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+@router.get("/dealers/{dealer_id}/plaid/asset-reports/{report_id}/pdf")
+async def download_dealer_asset_report(
+    dealer_id: UUID,
+    report_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    report = await _dealer_asset_report(db, dealer.id, report_id)
+    report_token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
+    if report.status != "ready" or not report_token:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Asset Report is not ready")
+    try:
+        content = await plaid_client.asset_report_pdf(report_token)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="asset-report-{report.id}.pdf"'},
+    )
+
+
+@router.delete(
+    "/dealers/{dealer_id}/plaid/asset-reports/{report_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_dealer_asset_report(
+    dealer_id: UUID,
+    report_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    report = await _dealer_asset_report(db, dealer.id, report_id)
+    try:
+        await plaid_lifecycle.remove_asset_report(report)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "plaid.asset_report.removed",
+        "plaid_asset_report",
+        entity_id=report.id,
+        after={"reason": "no_longer_needed"},
     )
     await db.commit()
 
@@ -9299,6 +9667,7 @@ async def _has_primary_operating_bank(db: AsyncSession, dealer_id: UUID) -> bool
             .where(
                 DealerPlaidItem.dealer_id == dealer_id,
                 DealerPlaidItem.status != "removed",
+                DealerPlaidItem.environment == plaid_client.environment(),
                 DealerPlaidItem.is_primary_operating.is_(True),
             )
             .limit(1)
@@ -9337,6 +9706,9 @@ async def _safe_plaid_items(
             institution_name=item.institution_name,
             accounts_label=item.accounts_label,
             status=item.status,
+            environment=item.environment,
+            update_mode_reason=item.update_mode_reason,
+            update_mode_account_selection=item.update_mode_account_selection,
             is_primary_operating=item.is_primary_operating,
             last_pulled_at=item.last_pulled_at,
             statement_months=months.get(item.id, []),
@@ -9997,6 +10369,7 @@ async def rep_production(
                     .where(
                         DealerPlaidItem.dealer_id.in_(dealer_ids),
                         DealerPlaidItem.status == "active",
+                        DealerPlaidItem.environment == plaid_client.environment(),
                     )
                     .distinct()
                 )
@@ -10519,6 +10892,8 @@ async def owner_credit_invite(
             "recipient": owner.email,
         },
     )
+
+
     owner.credit_workflow_status = "sent" if delivery.ok else "delivery_failed"
     owner.credit_delivery_detail = (delivery.detail or "")[:240] or None
     await db.commit()

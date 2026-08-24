@@ -25,9 +25,8 @@ trimmed as legalese:
   retrieving their data
 - credentials are stated to go to Plaid and not to us, which is the single fact
   a borrower most wants to know when a screen asks for their bank login
-- the connection is stated to be read-only and statements-only, which is true
-  of the Statements product and would stop being true if Auth or Transfer were
-  ever added — if that happens, this wording must change first
+- the connection is stated to be read-only and limited to underwriting data;
+  it may retrieve statements and create an Asset Report, but cannot move funds
 - scope and duration are disclosed: twenty-four months back, refreshing about
   every thirty days, until disconnected
 - Plaid's own policy is linked, and named as governing Plaid's use
@@ -43,7 +42,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,7 +61,7 @@ __all__ = [
 
 # Bump on ANY wording change. Separate from SMS_DISCLOSURE_VERSION — they are
 # different disclosures and sharing a counter would misdate one of them.
-BANK_DISCLOSURE_VERSION = "2026-08-21"
+BANK_DISCLOSURE_VERSION = "2026-08-24-assets-v1"
 
 # How the consent was taken. `rep_attested` exists because a rep sometimes sits
 # with a client; it is recorded honestly rather than disguised as self-service.
@@ -70,14 +69,17 @@ BANK_CONSENT_METHODS = ("self_web", "in_person_device", "rep_attested")
 
 _DISCLOSURE = (
     "I authorize Qualified Commercial LLC to use Plaid, Inc. to retrieve my "
-    "business bank statements from my financial institution.\n\n"
+    "business bank information from my financial institution for financing "
+    "and underwriting.\n\n"
     "I understand that I will enter my bank login directly into Plaid's own "
     "window, and that Qualified Commercial does not receive or store those "
     "credentials.\n\n"
-    "I understand this connection is read-only and limited to statements: it "
-    "cannot move funds, initiate payments, or create charges.\n\n"
+    "I understand this connection is read-only. It may retrieve business bank "
+    "statements, account identity and balance information, and transaction "
+    "history, and may be used to create a Plaid Asset Report for underwriting. "
+    "It cannot move funds, initiate payments, or create charges.\n\n"
     "I understand that up to 24 months of statements will be retrieved, and "
-    "that the connection will check for new statements about every 30 days "
+    "that the connection may check for new underwriting information about every 30 days "
     "until it is disconnected.\n\n"
     "I understand that Plaid's use of the information it collects is governed "
     "by Plaid's End User Privacy Policy at "
@@ -97,7 +99,7 @@ class ConsentState:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def disclosure() -> dict[str, str]:
@@ -133,14 +135,9 @@ async def state(db: AsyncSession, dealer_id: uuid.UUID) -> ConsentState:
 
 
 async def has_consent(db: AsyncSession, dealer_id: uuid.UUID) -> bool:
-    """The gate. A live, un-revoked grant, or nothing.
-
-    Deliberately does NOT require the current disclosure version. Re-consent on
-    every wording tweak would be theatre — but a MATERIAL change (new products,
-    a different processor) should bump the version AND clear old grants, which
-    is a decision for whoever makes that change, not an automatic rule here.
-    """
-    return (await state(db, dealer_id)).granted
+    """The gate requires a live grant to the current product disclosure."""
+    current = await state(db, dealer_id)
+    return current.granted and current.version == BANK_DISCLOSURE_VERSION
 
 
 async def record(

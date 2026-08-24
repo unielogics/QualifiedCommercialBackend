@@ -17,6 +17,7 @@ from app.dealer_os.models import (
     DealerOwner,
     DealerPlaidItem,
 )
+from app.dealer_os.services import plaid_client
 from app.enums import Role
 from app.models.activity import Activity
 from app.models.application_profile import (
@@ -729,6 +730,7 @@ async def bank_rows(
                     select(DealerPlaidItem).where(
                         DealerPlaidItem.dealer_id == profile.dealer_id,
                         DealerPlaidItem.status != "removed",
+                        DealerPlaidItem.environment == plaid_client.environment(),
                     ).order_by(DealerPlaidItem.created_at.asc())
                 )
             ).scalars().all()
@@ -755,7 +757,10 @@ async def bank_rows(
                 institution_name=item.institution_name,
                 accounts_label=item.accounts_label,
                 status=item.status,
+                environment=item.environment,
                 error=item.error,
+                update_mode_reason=item.update_mode_reason,
+                update_mode_account_selection=item.update_mode_account_selection,
                 auto_refresh=item.auto_refresh,
                 is_primary_operating=item.is_primary_operating,
                 last_pulled_at=item.last_pulled_at,
@@ -771,6 +776,7 @@ async def bank_rows(
                 select(ApplicationPlaidItem).where(
                     ApplicationPlaidItem.profile_id == profile.id,
                     ApplicationPlaidItem.status != "removed",
+                    ApplicationPlaidItem.environment == plaid_client.environment(),
                 ).order_by(ApplicationPlaidItem.created_at.asc())
             )
         ).scalars().all()
@@ -796,7 +802,10 @@ async def bank_rows(
             institution_name=item.institution_name,
             accounts_label=item.accounts_label,
             status=item.status,
+            environment=item.environment,
             error=item.error,
+            update_mode_reason=item.update_mode_reason,
+            update_mode_account_selection=item.update_mode_account_selection,
             auto_refresh=item.auto_refresh,
             is_primary_operating=item.is_primary_operating,
             last_pulled_at=item.last_pulled_at,

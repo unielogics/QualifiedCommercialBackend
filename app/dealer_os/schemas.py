@@ -1247,6 +1247,10 @@ class RoomPlaidExchange(RoomPasscode):
     is_primary_operating: bool | None = None
 
 
+class RoomPlaidUpdateLink(RoomPasscode):
+    account_selection_enabled: bool = False
+
+
 class PublicPlaidResult(BaseModel):
     """What the business owner sees. Deliberately not the item row: an
     unauthenticated caller has no business seeing internal status, refresh
@@ -1262,6 +1266,9 @@ class PublicPlaidItemRead(BaseModel):
     institution_name: str | None = None
     accounts_label: str | None = None
     status: str
+    environment: str = "sandbox"
+    update_mode_reason: str | None = None
+    update_mode_account_selection: bool = False
     is_primary_operating: bool = False
     last_pulled_at: datetime | None = None
     statement_months: list[str] = Field(default_factory=list)
@@ -1289,6 +1296,7 @@ class RoomFeaturesRead(BaseModel):
     bank_consent_granted: bool = False
     bank_consent_disclosure: str = ""
     bank_connections: list[PublicPlaidItemRead] = Field(default_factory=list)
+    plaid_assets_enabled: bool = False
     signable: list[RoomSignableRead] = []
 
 
@@ -1658,7 +1666,10 @@ class PlaidItemRead(ORM):
     institution_name: str | None = None
     accounts_label: str | None = None   # "Plaid Checking ··1111 · Savings ··4444"
     status: str
+    environment: str = "sandbox"
     error: str | None = None
+    update_mode_reason: str | None = None
+    update_mode_account_selection: bool = False
     auto_refresh: bool = True
     last_pulled_at: datetime | None = None
     next_refresh_at: datetime | None = None
@@ -1706,10 +1717,30 @@ class PlaidStateRead(BaseModel):
     environment: str = "sandbox"
     items: list[PlaidItemRead] = []
     consent: BankConsentState = BankConsentState()
+    assets_enabled: bool = False
+    asset_reports: list["PlaidAssetReportRead"] = []
 
 
 class PlaidLinkTokenRead(BaseModel):
     link_token: str
+
+
+class PlaidUpdateLinkRequest(BaseModel):
+    account_selection_enabled: bool = False
+
+
+class PlaidAssetReportRead(ORM):
+    id: UUID
+    status: str
+    environment: str
+    days_requested: int
+    error: str | None = None
+    ready_at: datetime | None = None
+    created_at: datetime
+
+
+class PlaidAssetReportCreate(BaseModel):
+    days_requested: int = Field(default=60, ge=0, le=731)
 
 
 class PlaidExchange(BaseModel):

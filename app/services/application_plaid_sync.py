@@ -58,7 +58,7 @@ async def _put_pdf(key: str, raw: bytes) -> None:
 
 
 async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, int]:
-    if item.status == "removed":
+    if item.status == "removed" or item.environment != plaid_client.environment():
         return {"pulled": 0, "skipped": 0, "failed": 0}
     profile = await db.get(ApplicationProfile, item.profile_id)
     if profile is None or profile.primary_bucket_id is None:
@@ -194,6 +194,7 @@ async def refresh_due() -> dict[str, int]:
                 await db.execute(
                     select(ApplicationPlaidItem.id).where(
                         ApplicationPlaidItem.status.in_(("active", "error")),
+                        ApplicationPlaidItem.environment == plaid_client.environment(),
                         ApplicationPlaidItem.auto_refresh.is_(True),
                         ApplicationPlaidItem.next_refresh_at.is_not(None),
                         ApplicationPlaidItem.next_refresh_at <= _now(),

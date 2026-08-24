@@ -39,6 +39,7 @@ from app.models.application_profile import (  # noqa: F401
     ApplicationTaxonomyEntry,
     ApplicationVerificationInvitation,
     FundingCategory,
+    PlaidAssetReport,
 )
 from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401

@@ -11,8 +11,22 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -755,12 +769,12 @@ class DealerSourceConnection(TimestampMixin, Base):
 
 
 class DealerPlaidItem(TimestampMixin, Base):
-    """One connected bank via Plaid (0127). Statements product ONLY — the
-    Item pulls actual statement PDFs into the normal document pipeline;
-    Transactions/balances products are deliberately out of scope. The access
-    token is Fernet-encrypted at rest (provider_secrets key recipe).
-    next_refresh_at drives the 30-day auto-refresh; a daily scheduler tick
-    syncs whatever is due."""
+    """One connected bank via Plaid.
+
+    Statements are imported into the document pipeline and the same Item may
+    be used for an explicitly requested Asset Report. Access tokens are
+    Fernet-encrypted at rest and isolated by Plaid environment.
+    """
 
     __tablename__ = "dos_plaid_items"
     __table_args__ = (Index("ix_dos_plaid_items_dealer", "dealer_id"),)
@@ -770,6 +784,9 @@ class DealerPlaidItem(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
     )
     item_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    environment: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sandbox", server_default="sandbox"
+    )
     institution_name: Mapped[str | None] = mapped_column(String(160))
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
     encryption_provider: Mapped[str] = mapped_column(String(16), default="fernet", server_default="fernet")
@@ -784,6 +801,11 @@ class DealerPlaidItem(TimestampMixin, Base):
     is_primary_operating: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
+    update_mode_reason: Mapped[str | None] = mapped_column(String(32))
+    update_mode_account_selection: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    last_webhook_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerGroup(TimestampMixin, Base):

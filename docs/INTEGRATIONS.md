@@ -13,7 +13,7 @@ Status of each external service.
 | GitHub Actions deploy | ⏳ awaiting 3 settings | Need `AWS_DEPLOY_ROLE_ARN` secret + `AWS_REGION` + `EC2_INSTANCE_ID` variables on QualifiedCommercialBackend repo. |
 | AWS S3 (documents) | ⏳ awaiting bucket create | EC2 instance role already has `s3:*` on `qc-documents-*`. Just needs the bucket. |
 | iSoftpull (credit) | ⛔ production credentials missing | `ISOFTPULL_PUBLIC_KEY`, `ISOFTPULL_PRIVATE_KEY`, `ISOFTPULL_API_URL=https://app.isoftpull.com/api/v2`. Real bureau pulls only; the UI reports provider unavailable when keys are absent. |
-| Plaid (business banking) | ⚠️ sandbox configured | Production requires the production secret, `DEALER_OS_PLAID_ENV=production`, Statements access, registered OAuth redirects, and the signed HTTPS webhook. Invalid environments fail closed. |
+| Plaid (business banking) | Production-capable; dashboard approval required | Uses Statements and Assets, update mode, signed webhooks, encrypted environment-scoped tokens, explicit Item/Asset Report removal, and the branded Link client name. Production activation still requires published Data Transparency Messaging, product access, production keys, and registered OAuth redirects. |
 | RentCast (property) | ⏳ awaiting key | `RENTCAST_API_KEY`. SmartIntake autofill (sqft, taxes, comps). |
 | EAS (mobile) | ⏳ awaiting Expo login | `unielogics/QCMobile`. Apple/Google accounts needed for store distribution. |
 | Gmail Pub/Sub | 🛑 deferred | Local fake inbox covers the air-gap logic until prod. |

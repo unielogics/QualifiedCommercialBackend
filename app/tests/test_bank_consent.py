@@ -1,7 +1,11 @@
 """The gate must be closed by default and must precede credential entry."""
 from __future__ import annotations
+
 import uuid
+from datetime import UTC
+
 import pytest
+
 from app.dealer_os.services import bank_consent
 
 
@@ -23,10 +27,24 @@ async def test_no_consent_means_no_bank_connection():
 
 @pytest.mark.asyncio
 async def test_a_revoked_consent_does_not_count():
+    from datetime import datetime
     from types import SimpleNamespace
-    from datetime import datetime, timezone
-    row = SimpleNamespace(granted=True, revoked_at=datetime.now(timezone.utc),
+    row = SimpleNamespace(granted=True, revoked_at=datetime.now(UTC),
                           disclosure_version="v", created_at=None, consenter_name="x")
+    assert await bank_consent.has_consent(_DB(row), uuid.uuid4()) is False
+
+
+@pytest.mark.asyncio
+async def test_assets_require_consent_to_the_current_disclosure():
+    from types import SimpleNamespace
+
+    row = SimpleNamespace(
+        granted=True,
+        revoked_at=None,
+        disclosure_version="statements-only-v1",
+        created_at=None,
+        consenter_name="Client",
+    )
     assert await bank_consent.has_consent(_DB(row), uuid.uuid4()) is False
 
 

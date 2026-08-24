@@ -18,7 +18,7 @@ the sweep).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ MAX_STATEMENTS_PER_SYNC = 60
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days: int) -> None:
@@ -75,7 +75,7 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
     Bookkeeping: next_refresh_at +30 days on success, +1 day on listing
     failure so transient errors retry daily instead of stalling a month.
     """
-    if item.status == "removed":
+    if item.status == "removed" or item.environment != plaid_client.environment():
         return {"pulled": 0, "skipped": 0, "failed": 0}
     item_pk = item.id
     dealer_id = item.dealer_id
@@ -203,6 +203,7 @@ async def refresh_due() -> dict:
                         # blip retries daily instead of silently ending the
                         # 30-day auto-refresh forever. Only 'removed' is out.
                         DealerPlaidItem.status.in_(("active", "error")),
+                        DealerPlaidItem.environment == plaid_client.environment(),
                         DealerPlaidItem.auto_refresh.is_(True),
                         DealerPlaidItem.next_refresh_at.is_not(None),
                         DealerPlaidItem.next_refresh_at <= _now(),

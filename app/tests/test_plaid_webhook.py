@@ -128,6 +128,14 @@ class _FakeDB:
         return SimpleNamespace(scalar_one_or_none=lambda: item)
 
 
+class _AssetDB:
+    def __init__(self, report):
+        self.report = report
+
+    async def execute(self, _stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: self.report)
+
+
 def _item(**over):
     fields = {
         "item_id": "itm_1",
@@ -228,6 +236,59 @@ async def test_item_error_stops_the_scheduler_retrying_what_only_a_user_can_fix(
     assert item.status == "error"
     assert item.next_refresh_at is None
     assert "login required" in item.error
+    assert item.update_mode_reason == "item_login_required"
+
+
+@pytest.mark.asyncio
+async def test_new_accounts_available_requests_account_selection_update_mode():
+    item = _item()
+    out = await plaid_webhook.handle(
+        _FakeDB(item),
+        {
+            "webhook_type": "ITEM",
+            "webhook_code": "NEW_ACCOUNTS_AVAILABLE",
+            "item_id": "itm_1",
+        },
+    )
+    assert out == "new accounts available"
+    assert item.update_mode_reason == "new_accounts_available"
+    assert item.update_mode_account_selection is True
+
+
+@pytest.mark.asyncio
+async def test_login_repaired_dismisses_update_mode_prompt():
+    item = _item(
+        status="error",
+        error="Reconnect",
+        update_mode_reason="item_login_required",
+        update_mode_account_selection=True,
+    )
+    out = await plaid_webhook.handle(
+        _FakeDB(item),
+        {"webhook_type": "ITEM", "webhook_code": "LOGIN_REPAIRED", "item_id": "itm_1"},
+    )
+    assert out == "login repaired"
+    assert item.status == "active"
+    assert item.update_mode_reason is None
+    assert item.update_mode_account_selection is False
+
+
+@pytest.mark.asyncio
+async def test_asset_report_ready_webhook_marks_report_downloadable():
+    report = SimpleNamespace(status="pending", error="waiting", ready_at=None)
+    out = await plaid_webhook.handle(
+        _AssetDB(report),
+        {
+            "webhook_type": "ASSETS",
+            "webhook_code": "PRODUCT_READY",
+            "asset_report_id": "asset-report-1",
+            "environment": "production",
+        },
+    )
+    assert out == "asset report ready"
+    assert report.status == "ready"
+    assert report.error is None
+    assert report.ready_at is not None
 
 
 @pytest.mark.asyncio

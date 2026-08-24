@@ -172,13 +172,28 @@ class ApplicationBankConnectionRead(BaseModel):
     institution_name: str | None = None
     accounts_label: str | None = None
     status: str
+    environment: str = "sandbox"
     error: str | None = None
+    update_mode_reason: str | None = None
+    update_mode_account_selection: bool = False
     auto_refresh: bool = True
     is_primary_operating: bool = False
     last_pulled_at: datetime | None = None
     next_refresh_at: datetime | None = None
     statement_months: list[str] = Field(default_factory=list)
     source: Literal["application", "dealer"] = "application"
+
+
+class PlaidAssetReportRead(BaseModel):
+    id: UUID
+    status: str
+    environment: str
+    days_requested: int
+    error: str | None = None
+    ready_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class ApplicationBankState(BaseModel):
@@ -191,6 +206,8 @@ class ApplicationBankState(BaseModel):
     manual_override: bool = False
     manual_override_reason: str | None = None
     manual_statement_months: list[str] = Field(default_factory=list)
+    assets_enabled: bool = False
+    asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
 
 
 class ManualBankOverrideRequest(BaseModel):
@@ -205,6 +222,14 @@ class ApplicationBankConsentGrant(BaseModel):
 
 class ApplicationPlaidLinkTokenRead(BaseModel):
     link_token: str
+
+
+class ApplicationPlaidUpdateLinkRequest(BaseModel):
+    account_selection_enabled: bool = False
+
+
+class PlaidAssetReportCreate(BaseModel):
+    days_requested: int = Field(default=60, ge=0, le=731)
 
 
 class ApplicationPlaidExchange(BaseModel):
@@ -360,6 +385,8 @@ class PublicBankVerificationRead(BaseModel):
     consent_granted: bool = False
     items: list[ApplicationBankConnectionRead] = Field(default_factory=list)
     manual_statement_months: list[str] = Field(default_factory=list)
+    assets_enabled: bool = False
+    asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
     statement_upload_enabled: bool = False
     expires_at: datetime
 

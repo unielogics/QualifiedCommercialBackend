@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import sqlalchemy as sa
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +31,7 @@ from app.models.application_profile import (
     ApplicationTaxonomyEntry,
     ApplicationVerificationInvitation,
     FundingCategory,
+    PlaidAssetReport,
 )
 from app.models.bucket import BucketFile
 from app.models.client import Client
@@ -47,6 +48,7 @@ from app.schemas.application_profile import (
     ApplicationPlaidItemPatch,
     ApplicationPlaidLinkTokenRead,
     ApplicationPlaidRefreshRead,
+    ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
     ClassificationConfirm,
@@ -64,6 +66,8 @@ from app.schemas.application_profile import (
     FundingCategoryCreate,
     FundingCategoryRead,
     ManualBankOverrideRequest,
+    PlaidAssetReportCreate,
+    PlaidAssetReportRead,
     PublicBankVerificationRead,
     PublicFileOwnerConsentRead,
     PublicFileOwnerConsentResult,
@@ -80,6 +84,7 @@ from app.schemas.application_profile import (
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
+from app.services import plaid_lifecycle
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 
@@ -877,6 +882,8 @@ async def _application_consent_granted(db: AsyncSession, profile_id: UUID) -> bo
                 ApplicationBankConsent.profile_id == profile_id,
                 ApplicationBankConsent.granted.is_(True),
                 ApplicationBankConsent.revoked_at.is_(None),
+                ApplicationBankConsent.disclosure_version
+                == dealer_bank_consent.BANK_DISCLOSURE_VERSION,
             ).order_by(ApplicationBankConsent.created_at.desc()).limit(1)
         )
     ).scalar_one_or_none()
@@ -918,6 +925,11 @@ async def public_bank_verification(
         consent_granted=await _application_consent_granted(db, profile.id),
         items=await profiles.bank_rows(db, profile),
         manual_statement_months=await profiles.manual_statement_months(db, profile),
+        assets_enabled=plaid_client.assets_enabled(),
+        asset_reports=[
+            PlaidAssetReportRead.model_validate(row)
+            for row in await plaid_lifecycle.owner_asset_reports(db, profile_id=profile.id)
+        ],
         statement_upload_enabled=bool(intake and intake.bucket_upload_link_id),
         expires_at=invitation.expires_at,
     )
@@ -957,6 +969,99 @@ async def public_bank_verification_link_token(
         redirect_override=plaid_client.room_redirect_uri() or None,
     )
     return ApplicationPlaidLinkTokenRead(link_token=value)
+
+
+@router.post(
+    "/public/bank-verification/{token}/banks/{item_id}/update-link-token",
+    response_model=ApplicationPlaidLinkTokenRead,
+)
+async def public_bank_verification_update_link_token(
+    token: str,
+    item_id: UUID,
+    payload: ApplicationPlaidUpdateLinkRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationPlaidLinkTokenRead:
+    _invitation, profile = await _public_bank_invitation(db, token)
+    if not await _application_consent_granted(db, profile.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
+    item = await _profile_plaid_item(db, profile, item_id)
+    account_selection = payload.account_selection_enabled or item.update_mode_account_selection
+    try:
+        value = await plaid_client.create_update_link_token(
+            access_token=plaid_lifecycle.decrypted_access_token(item),
+            client_user_id=str(profile.id),
+            redirect_override=plaid_client.room_redirect_uri() or None,
+            account_selection_enabled=account_selection,
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return ApplicationPlaidLinkTokenRead(link_token=value)
+
+
+@router.post(
+    "/public/bank-verification/{token}/banks/{item_id}/update-complete",
+    response_model=ApplicationBankConnectionRead,
+)
+async def public_bank_verification_update_complete(
+    token: str,
+    item_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankConnectionRead:
+    invitation, profile = await _public_bank_invitation(db, token)
+    item = await _profile_plaid_item(db, profile, item_id)
+    try:
+        await plaid_lifecycle.complete_update(item)
+    except plaid_client.PlaidUnavailable as exc:
+        await db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.update_mode.completed.secure_room",
+        "Client repaired the business bank connection",
+        target_type="plaid_item",
+        target_id=item.id,
+        metadata={"invitation_id": str(invitation.id)},
+    )
+    await db.commit()
+    return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
+
+
+@router.delete(
+    "/public/bank-verification/{token}/banks/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def public_bank_verification_disconnect(
+    token: str,
+    item_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    invitation, profile = await _public_bank_invitation(db, token)
+    item = await _profile_plaid_item(db, profile, item_id)
+    was_primary = item.is_primary_operating
+    try:
+        await plaid_lifecycle.disconnect_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    if was_primary:
+        replacement = next(
+            (candidate for candidate in await _profile_plaid_items(db, profile) if candidate.id != item.id),
+            None,
+        )
+        if replacement:
+            await _make_primary(db, profile, replacement)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.disconnect.secure_room",
+        "Client disconnected the bank; retained evidence remains on the file",
+        target_type="plaid_item",
+        target_id=item.id,
+        metadata={"invitation_id": str(invitation.id)},
+    )
+    await db.commit()
 
 
 _BANK_UPLOAD_EXTENSIONS = {
@@ -1077,8 +1182,11 @@ async def public_bank_verification_exchange(
         db.add(item)
     item.institution_name = payload.institution_name
     item.encrypted_access_token = plaid_client.encrypt_token(access_token)
+    item.environment = plaid_client.environment()
     item.status = "active"
     item.error = None
+    item.update_mode_reason = None
+    item.update_mode_account_selection = False
     item.next_refresh_at = datetime.now(UTC)
     await db.flush()
     current = await profiles.bank_rows(db, profile)
@@ -1102,11 +1210,7 @@ async def public_bank_verification_primary(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     _invitation, profile = await _public_bank_invitation(db, token)
-    item = (await db.execute(select(ApplicationPlaidItem).where(
-        ApplicationPlaidItem.id == item_id, ApplicationPlaidItem.profile_id == profile.id,
-    ))).scalar_one_or_none()
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
+    item = await _profile_plaid_item(db, profile, item_id)
     if payload.is_primary_operating is not True:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The secure room may only select the primary operating bank")
     await _make_primary(db, profile, item)
@@ -1136,6 +1240,15 @@ async def get_application_banks(
         manual_override=bool(profile.bank_verification_override_at),
         manual_override_reason=profile.bank_verification_override_reason,
         manual_statement_months=manual_months,
+        assets_enabled=plaid_client.assets_enabled(),
+        asset_reports=[
+            PlaidAssetReportRead.model_validate(row)
+            for row in await plaid_lifecycle.owner_asset_reports(
+                db,
+                dealer_id=profile.dealer_id,
+                profile_id=None if profile.dealer_id else profile.id,
+            )
+        ],
     )
 
 
@@ -1222,11 +1335,116 @@ async def create_application_plaid_link_token(
     return ApplicationPlaidLinkTokenRead(link_token=token)
 
 
+@router.post(
+    "/{profile_id}/banks/{item_id}/update-link-token",
+    response_model=ApplicationPlaidLinkTokenRead,
+)
+async def create_application_plaid_update_link_token(
+    profile_id: UUID,
+    item_id: UUID,
+    payload: ApplicationPlaidUpdateLinkRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationPlaidLinkTokenRead:
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_profile_bank_client(profile, user)
+    consent = (
+        await dealer_bank_consent.has_consent(db, profile.dealer_id)
+        if profile.dealer_id
+        else await _application_consent_granted(db, profile.id)
+    )
+    if not consent:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
+    item = await _profile_plaid_item(db, profile, item_id)
+    account_selection = payload.account_selection_enabled or item.update_mode_account_selection
+    try:
+        token = await plaid_client.create_update_link_token(
+            access_token=plaid_lifecycle.decrypted_access_token(item),
+            client_user_id=str(profile.id),
+            account_selection_enabled=account_selection,
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return ApplicationPlaidLinkTokenRead(link_token=token)
+
+
+@router.post(
+    "/{profile_id}/banks/{item_id}/update-complete",
+    response_model=ApplicationBankConnectionRead,
+)
+async def complete_application_plaid_update(
+    profile_id: UUID,
+    item_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankConnectionRead:
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_profile_bank_client(profile, user)
+    item = await _profile_plaid_item(db, profile, item_id)
+    try:
+        await plaid_lifecycle.complete_update(item)
+    except plaid_client.PlaidUnavailable as exc:
+        await db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "plaid.update_mode.completed.client",
+        "Client repaired the business bank connection",
+        target_type="plaid_item",
+        target_id=item.id,
+    )
+    await db.commit()
+    return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
+
+
 async def _make_primary(db: AsyncSession, profile: ApplicationProfile, item) -> None:
     model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
     predicate = DealerPlaidItem.dealer_id == profile.dealer_id if profile.dealer_id else ApplicationPlaidItem.profile_id == profile.id
     await db.execute(sa_update(model).where(predicate, model.id != item.id).values(is_primary_operating=False))
     item.is_primary_operating = True
+
+
+async def _profile_plaid_item(
+    db: AsyncSession, profile: ApplicationProfile, item_id: UUID
+) -> DealerPlaidItem | ApplicationPlaidItem:
+    model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
+    predicate = (
+        DealerPlaidItem.dealer_id == profile.dealer_id
+        if profile.dealer_id
+        else ApplicationPlaidItem.profile_id == profile.id
+    )
+    item = (
+        await db.execute(select(model).where(model.id == item_id, predicate))
+    ).scalar_one_or_none()
+    if item is None or item.status == "removed":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
+    return item
+
+
+async def _profile_plaid_items(
+    db: AsyncSession, profile: ApplicationProfile
+) -> list[DealerPlaidItem | ApplicationPlaidItem]:
+    model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
+    predicate = (
+        DealerPlaidItem.dealer_id == profile.dealer_id
+        if profile.dealer_id
+        else ApplicationPlaidItem.profile_id == profile.id
+    )
+    return list(
+        (
+            await db.execute(
+                select(model).where(
+                    predicate,
+                    model.status != "removed",
+                    model.environment == plaid_client.environment(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 @router.post("/{profile_id}/banks/exchange", response_model=ApplicationBankConnectionRead, status_code=status.HTTP_201_CREATED)
@@ -1255,14 +1473,18 @@ async def exchange_application_plaid_token(
     if existing:
         item = existing
         item.encrypted_access_token = plaid_client.encrypt_token(access_token)
+        item.environment = plaid_client.environment()
         item.status = "active"
         item.error = None
+        item.update_mode_reason = None
+        item.update_mode_account_selection = False
     else:
         item = model(
             **({"dealer_id": profile.dealer_id} if profile.dealer_id else {"profile_id": profile.id}),
             item_id=plaid_item_id,
             institution_name=payload.institution_name,
             encrypted_access_token=plaid_client.encrypt_token(access_token),
+            environment=plaid_client.environment(),
             status="active",
             next_refresh_at=datetime.now(UTC),
         )
@@ -1307,11 +1529,7 @@ async def update_application_bank(
         _require_profile_bank_client(profile, user)
     if payload.auto_refresh is not None and user.role != Role.SUPER_ADMIN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may change automatic refresh")
-    model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
-    predicate = DealerPlaidItem.dealer_id == profile.dealer_id if profile.dealer_id else ApplicationPlaidItem.profile_id == profile.id
-    item = (await db.execute(select(model).where(model.id == item_id, predicate))).scalar_one_or_none()
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
+    item = await _profile_plaid_item(db, profile, item_id)
     if payload.auto_refresh is not None:
         item.auto_refresh = payload.auto_refresh
     if payload.is_primary_operating is True:
@@ -1338,15 +1556,10 @@ async def refresh_application_bank(
     if user.role != Role.SUPER_ADMIN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may retry statement synchronization")
     profile = await profiles.load_profile(db, profile_id, user)
+    item = await _profile_plaid_item(db, profile, item_id)
     if profile.dealer_id:
-        item = await db.get(DealerPlaidItem, item_id)
-        if item is None or item.dealer_id != profile.dealer_id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
         from app.dealer_os.services.plaid_sync import sync_item
     else:
-        item = await db.get(ApplicationPlaidItem, item_id)
-        if item is None or item.profile_id != profile.id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
         from app.services.application_plaid_sync import sync_item
     result = await sync_item(db, item)
     await profiles.log_profile_action(db, profile, user, "plaid.refresh.recovery", "Retried statement synchronization", target_type="plaid_item", target_id=item.id)
@@ -1361,29 +1574,179 @@ async def disconnect_application_bank(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    if user.role != Role.SUPER_ADMIN:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may disconnect a bank")
     profile = await profiles.load_profile(db, profile_id, user)
-    model = DealerPlaidItem if profile.dealer_id else ApplicationPlaidItem
-    predicate = DealerPlaidItem.dealer_id == profile.dealer_id if profile.dealer_id else ApplicationPlaidItem.profile_id == profile.id
-    item = (await db.execute(select(model).where(model.id == item_id, predicate))).scalar_one_or_none()
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank connection not found")
-    token = plaid_client.decrypt_token(item.encrypted_access_token)
-    if token:
-        try:
-            await plaid_client.item_remove(token)
-        except plaid_client.PlaidUnavailable:
-            pass
+    if user.role != Role.SUPER_ADMIN:
+        _require_profile_bank_client(profile, user)
+    item = await _profile_plaid_item(db, profile, item_id)
     was_primary = item.is_primary_operating
-    item.status = "removed"
-    item.encrypted_access_token = None
-    item.is_primary_operating = False
+    try:
+        await plaid_lifecycle.disconnect_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     if was_primary:
-        replacement = (await db.execute(select(model).where(predicate, model.id != item.id, model.status != "removed").order_by(model.created_at.asc()).limit(1))).scalar_one_or_none()
+        replacement = next(
+            (candidate for candidate in await _profile_plaid_items(db, profile) if candidate.id != item.id),
+            None,
+        )
         if replacement:
             await _make_primary(db, profile, replacement)
-    await profiles.log_profile_action(db, profile, user, "plaid.disconnect.recovery", "Disconnected bank; previously collected statements were retained", target_type="plaid_item", target_id=item.id)
+    action = (
+        "plaid.disconnect.recovery"
+        if user.role == Role.SUPER_ADMIN
+        else "plaid.disconnect.client"
+    )
+    await profiles.log_profile_action(db, profile, user, action, "Disconnected bank; previously collected statements were retained", target_type="plaid_item", target_id=item.id)
+    await db.commit()
+
+
+def _require_asset_report_staff(user: User) -> None:
+    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped underwriting staff may manage Asset Reports")
+
+
+async def _profile_asset_report(
+    db: AsyncSession, profile: ApplicationProfile, report_id: UUID
+) -> PlaidAssetReport:
+    predicate = (
+        PlaidAssetReport.dealer_id == profile.dealer_id
+        if profile.dealer_id
+        else PlaidAssetReport.profile_id == profile.id
+    )
+    report = (
+        await db.execute(
+            select(PlaidAssetReport).where(PlaidAssetReport.id == report_id, predicate)
+        )
+    ).scalar_one_or_none()
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Asset Report not found")
+    return report
+
+
+@router.post(
+    "/{profile_id}/asset-reports",
+    response_model=PlaidAssetReportRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_application_asset_report(
+    profile_id: UUID,
+    payload: PlaidAssetReportCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PlaidAssetReport:
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_asset_report_staff(user)
+    consent = (
+        await dealer_bank_consent.has_consent(db, profile.dealer_id)
+        if profile.dealer_id
+        else await _application_consent_granted(db, profile.id)
+    )
+    if not consent:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The client must accept the current bank disclosure first")
+    try:
+        report = await plaid_lifecycle.create_asset_report(
+            db,
+            items=await _profile_plaid_items(db, profile),
+            dealer_id=profile.dealer_id,
+            profile_id=None if profile.dealer_id else profile.id,
+            days_requested=payload.days_requested,
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "plaid.asset_report.requested",
+        "Requested a lender-ready Plaid Asset Report",
+        target_type="plaid_asset_report",
+        target_id=report.id,
+        metadata={"days_requested": report.days_requested},
+    )
+    await db.commit()
+    await db.refresh(report)
+    return report
+
+
+@router.get("/{profile_id}/asset-reports/{report_id}/pdf")
+async def download_application_asset_report(
+    profile_id: UUID,
+    report_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_asset_report_staff(user)
+    report = await _profile_asset_report(db, profile, report_id)
+    if report.status != "ready" or not report.encrypted_asset_report_token:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Asset Report is not ready")
+    try:
+        content = await plaid_client.asset_report_pdf(
+            plaid_client.decrypt_token(report.encrypted_asset_report_token) or ""
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="asset-report-{report.id}.pdf"'},
+    )
+
+
+@router.delete(
+    "/{profile_id}/asset-reports/{report_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_application_asset_report(
+    profile_id: UUID,
+    report_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may remove an Asset Report")
+    profile = await profiles.load_profile(db, profile_id, user)
+    report = await _profile_asset_report(db, profile, report_id)
+    try:
+        await plaid_lifecycle.remove_asset_report(report)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "plaid.asset_report.removed",
+        "Removed a Plaid Asset Report because it was no longer needed",
+        target_type="plaid_asset_report",
+        target_id=report.id,
+    )
+    await db.commit()
+
+
+@router.delete("/{profile_id}/banks", status_code=status.HTTP_204_NO_CONTENT)
+async def purge_application_banks_on_offboarding(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may purge bank connections")
+    profile = await profiles.load_profile(db, profile_id, user)
+    try:
+        removed = await plaid_lifecycle.purge_owner_connections(
+            db,
+            dealer_id=profile.dealer_id,
+            profile_id=None if profile.dealer_id else profile.id,
+        )
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "plaid.offboarding_purge",
+        "Removed all live Plaid Items and Asset Reports during offboarding",
+        metadata={"removed_items": removed},
+    )
     await db.commit()
 
 

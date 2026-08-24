@@ -1,4 +1,4 @@
-"""Thin Plaid API client — Statements product ONLY.
+"""Thin Plaid API client for Statements, Assets, and Item lifecycle calls.
 
 Deliberately not the plaid-python SDK: four JSON POSTs don't justify a
 dependency, and the raw API keeps the failure surface visible. Config comes
@@ -8,6 +8,8 @@ Settings class, per the isolation contract):
     DEALER_OS_PLAID_CLIENT_ID
     DEALER_OS_PLAID_SECRET
     DEALER_OS_PLAID_ENV           sandbox | production   (default sandbox)
+    DEALER_OS_PLAID_PRODUCTS      statements,assets      (default statements)
+    DEALER_OS_PLAID_CLIENT_NAME   Link display name
     DEALER_OS_PLAID_REDIRECT_URI       OAuth return, team app  (optional)
     DEALER_OS_PLAID_ROOM_REDIRECT_URI  OAuth return, client room (optional)
     DEALER_OS_PLAID_WEBHOOK_URL   Inbound webhook URL    (optional, see below)
@@ -45,6 +47,8 @@ STATEMENT_LOOKBACK_DAYS = 730
 
 # The auto-refresh cadence the user asked for.
 REFRESH_EVERY_DAYS = 30
+DEFAULT_CLIENT_NAME = "Qualified Commercial - Capital OS"
+_SUPPORTED_PRODUCTS = {"assets", "statements"}
 
 
 class PlaidUnavailable(Exception):
@@ -121,6 +125,30 @@ def enabled() -> bool:
     return bool(_env("DEALER_OS_PLAID_CLIENT_ID") and _env("DEALER_OS_PLAID_SECRET"))
 
 
+def client_name() -> str:
+    return _env("DEALER_OS_PLAID_CLIENT_NAME") or DEFAULT_CLIENT_NAME
+
+
+def products() -> list[str]:
+    configured = {
+        value.strip().lower()
+        for value in (_env("DEALER_OS_PLAID_PRODUCTS") or "statements").split(",")
+        if value.strip()
+    }
+    invalid = configured - _SUPPORTED_PRODUCTS
+    if invalid:
+        raise PlaidUnavailable(
+            "Unsupported DEALER_OS_PLAID_PRODUCTS value(s): " + ", ".join(sorted(invalid))
+        )
+    if not configured:
+        raise PlaidUnavailable("DEALER_OS_PLAID_PRODUCTS must include at least one product")
+    return sorted(configured)
+
+
+def assets_enabled() -> bool:
+    return "assets" in products()
+
+
 def environment() -> str:
     env = _env("DEALER_OS_PLAID_ENV").lower() or "sandbox"
     if env not in _HOSTS:
@@ -170,16 +198,25 @@ async def create_link_token(
     client room needs a public page, the team app needs its authenticated one.
     """
     today = date.today()
+    configured_products = products()
     resp = await _post(
         "/link/token/create",
         {
-            "client_name": "Qualified Commercial — Capital OS",
+            "client_name": client_name(),
             "user": {"client_user_id": dealer_id},
-            "products": ["statements"],
-            "statements": {
-                "start_date": (today - timedelta(days=STATEMENT_LOOKBACK_DAYS)).isoformat(),
-                "end_date": today.isoformat(),
-            },
+            "products": configured_products,
+            **(
+                {
+                    "statements": {
+                        "start_date": (
+                            today - timedelta(days=STATEMENT_LOOKBACK_DAYS)
+                        ).isoformat(),
+                        "end_date": today.isoformat(),
+                    }
+                }
+                if "statements" in configured_products
+                else {}
+            ),
             "country_codes": ["US"],
             "language": "en",
             # Only present once the URI is registered with Plaid — see
@@ -195,6 +232,43 @@ async def create_link_token(
     token = resp.json().get("link_token")
     if not token:
         raise PlaidUnavailable("Plaid returned no link token")
+    return token
+
+
+async def create_update_link_token(
+    *,
+    access_token: str,
+    client_user_id: str,
+    redirect_override: str | None = None,
+    account_selection_enabled: bool = False,
+    add_products: list[str] | None = None,
+) -> str:
+    requested_products = [value for value in (add_products or []) if value in _SUPPORTED_PRODUCTS]
+    payload: dict[str, Any] = {
+        "client_name": client_name(),
+        "user": {"client_user_id": client_user_id},
+        "access_token": access_token,
+        "country_codes": ["US"],
+        "language": "en",
+        "update": {"account_selection_enabled": account_selection_enabled},
+        **(
+            {"redirect_uri": redirect_override or redirect_uri()}
+            if (redirect_override or redirect_uri())
+            else {}
+        ),
+    }
+    if requested_products:
+        payload["products"] = requested_products
+        if "statements" in requested_products:
+            today = date.today()
+            payload["statements"] = {
+                "start_date": (today - timedelta(days=STATEMENT_LOOKBACK_DAYS)).isoformat(),
+                "end_date": today.isoformat(),
+            }
+    resp = await _post("/link/token/create", payload)
+    token = resp.json().get("link_token")
+    if not token:
+        raise PlaidUnavailable("Plaid returned no update-mode link token")
     return token
 
 
@@ -264,8 +338,54 @@ async def accounts_get(access_token: str) -> list[dict[str, Any]]:
     return out
 
 
+async def item_get(access_token: str) -> dict[str, Any]:
+    resp = await _post("/item/get", {"access_token": access_token})
+    return resp.json()
+
+
 async def item_remove(access_token: str) -> None:
     await _post("/item/remove", {"access_token": access_token})
+
+
+async def asset_report_create(
+    access_tokens: list[str], *, client_report_id: str, days_requested: int = 60
+) -> tuple[str, str]:
+    if not assets_enabled():
+        raise PlaidUnavailable("Plaid Assets is not enabled for this deployment")
+    resp = await _post(
+        "/asset_report/create",
+        {
+            "access_tokens": access_tokens,
+            "days_requested": max(0, min(days_requested, 731)),
+            "options": {
+                "client_report_id": client_report_id[:100],
+                **({"webhook": webhook_url()} if webhook_url() else {}),
+                "require_all_items": False,
+            },
+        },
+    )
+    data = resp.json()
+    report_id = data.get("asset_report_id")
+    report_token = data.get("asset_report_token")
+    if not report_id or not report_token:
+        raise PlaidUnavailable("Plaid returned an incomplete Asset Report response")
+    return str(report_id), str(report_token)
+
+
+async def asset_report_get(asset_report_token: str) -> dict[str, Any]:
+    resp = await _post("/asset_report/get", {"asset_report_token": asset_report_token})
+    return resp.json()
+
+
+async def asset_report_pdf(asset_report_token: str) -> bytes:
+    resp = await _post(
+        "/asset_report/pdf/get", {"asset_report_token": asset_report_token}, timeout=90.0
+    )
+    return resp.content
+
+
+async def asset_report_remove(asset_report_token: str) -> None:
+    await _post("/asset_report/remove", {"asset_report_token": asset_report_token})
 
 
 # --- token encryption at rest -------------------------------------------------

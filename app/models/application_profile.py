@@ -332,6 +332,9 @@ class ApplicationPlaidItem(TimestampMixin, Base):
         nullable=False,
     )
     item_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    environment: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sandbox", server_default="sandbox"
+    )
     institution_name: Mapped[str | None] = mapped_column(String(160))
     accounts_label: Mapped[str | None] = mapped_column(String(200))
     encrypted_access_token: Mapped[str | None] = mapped_column(Text)
@@ -350,6 +353,45 @@ class ApplicationPlaidItem(TimestampMixin, Base):
     is_primary_operating: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    update_mode_reason: Mapped[str | None] = mapped_column(String(32))
+    update_mode_account_selection: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    last_webhook_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PlaidAssetReport(TimestampMixin, Base):
+    __tablename__ = "plaid_asset_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "(profile_id IS NOT NULL)::int + (dealer_id IS NOT NULL)::int = 1",
+            name="ck_plaid_asset_report_one_owner",
+        ),
+        Index("ix_plaid_asset_reports_profile", "profile_id"),
+        Index("ix_plaid_asset_reports_dealer", "dealer_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_profiles.id", ondelete="CASCADE"),
+    )
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE")
+    )
+    asset_report_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    encrypted_asset_report_token: Mapped[str | None] = mapped_column(Text)
+    environment: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    days_requested: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    source_item_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ApplicationBankConsent(TimestampMixin, Base):

@@ -30,7 +30,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.application_profile import ApplicationPlaidItem
+from app.models.application_profile import ApplicationPlaidItem, PlaidAssetReport
 
 from ..models import DealerPlaidItem
 
@@ -44,16 +44,24 @@ def _now() -> datetime:
 
 
 async def _item(
-    db: AsyncSession, item_id: str
+    db: AsyncSession, item_id: str, environment: str
 ) -> DealerPlaidItem | ApplicationPlaidItem | None:
     dealer_item = (
-        await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
+        await db.execute(
+            select(DealerPlaidItem).where(
+                DealerPlaidItem.item_id == item_id,
+                DealerPlaidItem.environment == environment,
+            )
+        )
     ).scalar_one_or_none()
     if dealer_item is not None:
         return dealer_item
     return (
         await db.execute(
-            select(ApplicationPlaidItem).where(ApplicationPlaidItem.item_id == item_id)
+            select(ApplicationPlaidItem).where(
+                ApplicationPlaidItem.item_id == item_id,
+                ApplicationPlaidItem.environment == environment,
+            )
         )
     ).scalar_one_or_none()
 
@@ -67,20 +75,55 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
     wtype = str(payload.get("webhook_type") or "")
     code = str(payload.get("webhook_code") or "")
     item_id = str(payload.get("item_id") or "")
+    environment = str(payload.get("environment") or "sandbox")
+
+    if wtype == "ASSETS":
+        report_id = str(payload.get("asset_report_id") or "")
+        if not report_id:
+            return "ignored: no asset_report_id"
+        report = (
+            await db.execute(
+                select(PlaidAssetReport).where(
+                    PlaidAssetReport.asset_report_id == report_id,
+                    PlaidAssetReport.environment == environment,
+                )
+            )
+        ).scalar_one_or_none()
+        if report is None:
+            return "ignored: unknown asset report"
+        if code == "PRODUCT_READY":
+            report.status = "ready"
+            report.error = None
+            report.ready_at = _now()
+            return "asset report ready"
+        if code == "ERROR":
+            error = payload.get("error") or {}
+            report.status = "error"
+            report.error = str(
+                error.get("display_message")
+                or error.get("error_message")
+                or error.get("error_code")
+                or "Asset Report generation failed"
+            )
+            return "asset report error recorded"
+        return f"unhandled: {wtype}/{code}"
 
     if not item_id:
         return "ignored: no item_id"
 
-    item = await _item(db, item_id)
+    item = await _item(db, item_id, environment)
     if item is None:
         # Not ours, or already hard-deleted. Not an error — Plaid has no way to
         # know which items we still track.
         return "ignored: unknown item"
+    item.last_webhook_at = _now()
 
     # ── The connection is gone, by the user's own choice ──
     if code == "USER_PERMISSION_REVOKED":
         item.status = "revoked"
         item.error = "The bank connection was revoked by the account holder."
+        item.update_mode_reason = "user_permission_revoked"
+        item.update_mode_account_selection = False
         item.auto_refresh = False
         item.next_refresh_at = None
         # The token cannot be used after revocation, and keeping bank
@@ -95,6 +138,8 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         # reconcile the account/statement view on the next scheduler pass.
         account_id = str(payload.get("account_id") or "")
         item.error = "Access to one linked bank account was revoked by the account holder."
+        item.update_mode_reason = "user_account_revoked"
+        item.update_mode_account_selection = True
         if item.status != "revoked" and item.auto_refresh:
             item.next_refresh_at = _now()
         logger.info(
@@ -107,8 +152,11 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
     # ── The connection is broken and needs the user to repair it ──
     if wtype == "ITEM" and code == "ERROR":
         err = payload.get("error") or {}
+        error_code = str(err.get("error_code") or "")
         item.status = "error"
         item.error = str(err.get("error_message") or err.get("error_code") or "Connection error")
+        item.update_mode_reason = error_code.lower()[:32] or "item_error"
+        item.update_mode_account_selection = False
         # Stop the scheduler retrying a connection only the user can fix.
         item.next_refresh_at = None
         return "error recorded"
@@ -118,6 +166,8 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         # a stale warning in front of the user.
         item.status = "active"
         item.error = None
+        item.update_mode_reason = None
+        item.update_mode_account_selection = False
         if item.auto_refresh and item.next_refresh_at is None:
             item.next_refresh_at = _now()
         return "login repaired"
@@ -129,11 +179,15 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
             "This bank connection needs to be renewed"
             + (f" before {when}." if when else ".")
         )
+        item.update_mode_reason = code.lower()
+        item.update_mode_account_selection = False
         return "pending disconnect flagged"
 
     if code == "NEW_ACCOUNTS_AVAILABLE":
         # Informational: we pull statements for the accounts already shared, and
         # adding accounts is the user's decision to make in update mode.
+        item.update_mode_reason = "new_accounts_available"
+        item.update_mode_account_selection = True
         return "new accounts available"
 
     if code == "WEBHOOK_UPDATE_ACKNOWLEDGED":
