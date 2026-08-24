@@ -106,7 +106,7 @@ async def resolve_dealer_scope(db: AsyncSession, user: User, dealer_id: UUID) ->
         if dealer.dealer_user_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     elif user.role == Role.FIELD_REP:
-        if dealer.owner_user_id != user.id:
+        if dealer.owner_user_id != user.id or dealer.archived_at is not None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     elif user.role not in _TEAM_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "No access to this client")

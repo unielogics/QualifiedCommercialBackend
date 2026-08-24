@@ -12,7 +12,8 @@ Status of each external service.
 | AWS Amplify (desktop hosting) | ⏳ awaiting console click | `unielogics/QCDashboard` → `app.qualifiedcommercial.com`. See `DEPLOY.md`. |
 | GitHub Actions deploy | ⏳ awaiting 3 settings | Need `AWS_DEPLOY_ROLE_ARN` secret + `AWS_REGION` + `EC2_INSTANCE_ID` variables on QualifiedCommercialBackend repo. |
 | AWS S3 (documents) | ⏳ awaiting bucket create | EC2 instance role already has `s3:*` on `qc-documents-*`. Just needs the bucket. |
-| iSoftpull (credit) | ✅ demo wired | `ISOFTPULL_PUBLIC_KEY`, `ISOFTPULL_PRIVATE_KEY`, `ISOFTPULL_API_URL`. Real bureau pulls — no synthetic fallback. POST /credit/pull returns 503 if keys are absent. |
+| iSoftpull (credit) | ⛔ production credentials missing | `ISOFTPULL_PUBLIC_KEY`, `ISOFTPULL_PRIVATE_KEY`, `ISOFTPULL_API_URL=https://app.isoftpull.com/api/v2`. Real bureau pulls only; the UI reports provider unavailable when keys are absent. |
+| Plaid (business banking) | ⚠️ sandbox configured | Production requires the production secret, `DEALER_OS_PLAID_ENV=production`, Statements access, registered OAuth redirects, and the signed HTTPS webhook. Invalid environments fail closed. |
 | RentCast (property) | ⏳ awaiting key | `RENTCAST_API_KEY`. SmartIntake autofill (sqft, taxes, comps). |
 | EAS (mobile) | ⏳ awaiting Expo login | `unielogics/QCMobile`. Apple/Google accounts needed for store distribution. |
 | Gmail Pub/Sub | 🛑 deferred | Local fake inbox covers the air-gap logic until prod. |
@@ -25,9 +26,10 @@ Status of each external service.
 In rough order:
 1. **GitHub PAT** (or you click in Settings) — to set the 3 deploy settings on the backend repo
 2. **AWS Console access** for Amplify — to connect QCDashboard via the Amplify GitHub App and add env vars
-3. **iSoftpull production credentials** — currently using demo keys; swap for production tier before shipping
-4. **RentCast API key** — when SmartIntake autofill is needed
-5. **Apple Developer + Google Play accounts** — for mobile store distribution
+3. **iSoftpull production credentials** — store the public/private pair in `qcbackend/prod`; production pulls remain disabled until present
+4. **Plaid production credentials and Statements approval** — the current `qcbackend/prod` configuration remains sandbox and must not be relabeled as production
+5. **RentCast API key** — when SmartIntake autofill is needed
+6. **Apple Developer + Google Play accounts** — for mobile store distribution
 
 ## What's live in production right now
 

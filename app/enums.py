@@ -612,7 +612,7 @@ class AIAgentLeadStatus(StrEnum):
 
 
 class ContractType(StrEnum):
-    """The 5 real, attorney-drafted contract templates the platform can
+    """The versioned contract templates the platform can
     dynamically fill and e-sign. See app/services/contract_templates.py for
     the actual document bodies. PLATFORM_ACCESS is individual-scoped (a
     dealer-partner user); REFERRAL_PROTECTION is company-scoped (a
@@ -623,6 +623,7 @@ class ContractType(StrEnum):
     SBA_ENGAGEMENT = "sba_engagement"
     CLIENT_ENGAGEMENT = "client_engagement"
     CONSULTING_ADDENDUM = "consulting_addendum"
+    MUTUAL_NDA_NON_CIRCUMVENTION = "mutual_nda_non_circumvention"
 
 
 class ContractSubjectType(StrEnum):
@@ -632,6 +633,7 @@ class ContractSubjectType(StrEnum):
     company with no single FK column that fits both."""
     USER = "user"
     COMPANY = "company"
+    COUNTERPARTY = "counterparty"
 
 
 class LoanProgram(StrEnum):

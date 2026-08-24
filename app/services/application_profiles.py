@@ -20,11 +20,13 @@ from app.dealer_os.models import (
 from app.enums import Role
 from app.models.activity import Activity
 from app.models.application_profile import (
+    ApplicationExtractedFact,
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationTaxonomyEntry,
 )
-from app.models.bucket import Bucket, BucketActivityLog, BucketFile
+from app.models.bucket import Bucket, BucketActivityLog, BucketFile, BucketFileAnalysis
 from app.models.client import Client
 from app.models.deal import Deal
 from app.models.loan import Loan
@@ -33,15 +35,19 @@ from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
+    ApplicationDraftAnalysisStatus,
     ApplicationEvidenceRead,
+    ApplicationIntelligenceRead,
     ApplicationProfileRead,
     EvidenceFileRead,
     EvidenceSourceRead,
     FileOwnerRead,
     FileOwnerRequirementState,
+    IntelligenceMetric,
     UnifiedAuditEvent,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services.underwriting_intelligence import calculate_dscr
 
 MAX_OWNERS = 5
 CREDIT_THRESHOLD = Decimal("20.00")
@@ -62,6 +68,77 @@ def normalized_phone(value: str | None) -> str | None:
     return normalize_phone(value)
 
 
+async def capture_extracted_profile_facts(
+    db: AsyncSession, *, file: BucketFile, analysis: BucketFileAnalysis
+) -> None:
+    profile = (
+        await db.execute(select(ApplicationProfile).where(
+            ApplicationProfile.primary_bucket_id == file.bucket_id
+        ).limit(1))
+    ).scalar_one_or_none()
+    if profile is None:
+        return
+    payload = analysis.analysis or {}
+    facts = payload.get("profile_facts") if isinstance(payload.get("profile_facts"), dict) else {}
+    for field_key, raw in facts.items():
+        if not isinstance(raw, dict):
+            raw = {"value": raw}
+        value = raw.get("value")
+        if value in (None, ""):
+            continue
+        normalized = " ".join(str(value).casefold().split())
+        existing = (
+            await db.execute(select(ApplicationExtractedFact.id).where(
+                ApplicationExtractedFact.profile_id == profile.id,
+                ApplicationExtractedFact.source_analysis_id == analysis.id,
+                ApplicationExtractedFact.field_key == field_key,
+                ApplicationExtractedFact.normalized_value == normalized,
+            ).limit(1))
+        ).scalar_one_or_none()
+        if existing:
+            continue
+        confidence = raw.get("confidence")
+        try:
+            confidence_value = max(0.0, min(float(confidence), 1.0)) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence_value = None
+        db.add(ApplicationExtractedFact(
+            profile_id=profile.id, field_key=str(field_key)[:64], value={"value": value},
+            normalized_value=normalized, confidence=confidence_value,
+            source_file_id=file.id, source_analysis_id=analysis.id,
+        ))
+        if field_key in {"entity_type", "naics_code", "naics_label"} and not getattr(profile, field_key, None):
+            setattr(profile, field_key, str(value))
+    code = str((facts.get("naics_code") or {}).get("value") or "").strip()
+    if re.fullmatch(r"\d{6}", code):
+        entry = (
+            await db.execute(select(ApplicationTaxonomyEntry).where(
+                ApplicationTaxonomyEntry.level == 6,
+                ApplicationTaxonomyEntry.code == code,
+                ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
+            ).limit(1))
+        ).scalar_one_or_none()
+        if entry:
+            subindustry = await db.get(ApplicationTaxonomyEntry, entry.parent_id)
+            industry = await db.get(ApplicationTaxonomyEntry, subindustry.parent_id) if subindustry else None
+            profile.activity_entry_id = profile.activity_entry_id or entry.id
+            profile.subindustry_entry_id = profile.subindustry_entry_id or (subindustry.id if subindustry else None)
+            profile.industry_entry_id = profile.industry_entry_id or (industry.id if industry else None)
+            profile.naics_label = profile.naics_label or entry.label
+            profile.subindustry = profile.subindustry or (subindustry.label if subindustry else None)
+            profile.industry = profile.industry or (industry.label if industry else None)
+            profile.classification_provenance = {
+                "source": "document_extraction", "source_file_id": str(file.id),
+                "source_analysis_id": str(analysis.id), "status": "suggested",
+            }
+    key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), dict) else {}
+    period = str(key_facts.get("statement_period") or "")
+    month_match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", period)
+    if analysis.classification == "bank_statement" and month_match and not file.statement_period:
+        file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
+    await db.flush()
+
+
 def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
     return ApplicationProfileRead(
         id=profile.id,
@@ -75,13 +152,24 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         funding_category=profile.funding_category,
         entity_type=profile.entity_type,
         industry=profile.industry,
+        subindustry=profile.subindustry,
         naics_code=profile.naics_code,
         naics_label=profile.naics_label,
         custom_industry=profile.custom_industry,
+        industry_entry_id=profile.industry_entry_id,
+        subindustry_entry_id=profile.subindustry_entry_id,
+        activity_entry_id=profile.activity_entry_id,
+        taxonomy_version=profile.taxonomy_version,
+        classification_provenance=profile.classification_provenance,
         classification_revision=profile.classification_revision,
         classification_state=profile.classification_state,
         classified_at=profile.classified_at,
         backfill_needs_review=profile.backfill_needs_review,
+        is_draft=profile.is_draft,
+        draft_finalized_at=profile.draft_finalized_at,
+        extraction_reviewed_at=profile.extraction_reviewed_at,
+        bank_verification_override_at=profile.bank_verification_override_at,
+        bank_verification_override_reason=profile.bank_verification_override_reason,
         owner_storage="dealer" if profile.dealer_id else "application",
     )
 
@@ -435,18 +523,24 @@ async def verification_state(
     pending = [owner for owner in required if not owner.credit_complete]
     banks = await bank_rows(db, profile)
     months = sorted({month for bank in banks for month in bank.statement_months})
-    blockers: list[str] = []
+    manual_months = await manual_statement_months(db, profile)
+    ownership_blockers: list[str] = []
     if not owners:
-        blockers.append("Add at least one owner")
+        ownership_blockers.append("Add at least one owner")
     if not ownership_complete:
-        blockers.append(f"Ownership must total 100.00% (currently {total:.2f}%)")
+        ownership_blockers.append(f"Ownership must total 100.00% (currently {total:.2f}%)")
     if missing_contact:
-        blockers.append("Every 20%+ owner needs a personal email and valid phone")
+        ownership_blockers.append("Every 20%+ owner needs a personal email and valid phone")
     ready_step_2 = ownership_complete and not missing_contact
-    if not banks:
-        blockers.append("Connect at least one business bank")
+    credit_blockers: list[str] = []
     if pending:
-        blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
+        credit_blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
+    banking_blockers: list[str] = []
+    banking_complete = bool(banks) or bool(profile.bank_verification_override_at and manual_months)
+    if not banking_complete:
+        banking_blockers.append("Connect an LLC business bank or approve uploaded statement evidence")
+    evidence = await evidence_state(db, profile)
+    blockers = ownership_blockers + credit_blockers + banking_blockers + evidence.blockers
     return FileOwnerRequirementState(
         ownership_total=total,
         ownership_complete=ownership_complete,
@@ -458,11 +552,170 @@ async def verification_state(
         missing_credit_contact_owner_ids=[owner.id for owner in missing_contact],
         bank_linked=bool(banks),
         bank_connection_count=len(banks),
-        bank_statement_months=len(months),
-        credit_returned=bool(required) and not pending,
+        bank_statement_months=len(set(months) | set(manual_months)),
+        credit_returned=not pending,
+        owner_credit_complete=ready_step_2 and not pending,
+        business_banking_complete=banking_complete,
+        evidence_complete=evidence.review_file_count > 0 and not evidence.blockers,
         ready_for_step_2=ready_step_2,
-        unlocked=ready_step_2 and bool(banks) and not pending,
+        unlocked=ready_step_2 and banking_complete and not pending and evidence.review_file_count > 0,
+        ownership_blockers=ownership_blockers,
+        credit_blockers=credit_blockers,
+        banking_blockers=banking_blockers,
         blockers=blockers,
+    )
+
+
+async def manual_statement_months(db: AsyncSession, profile: ApplicationProfile) -> list[str]:
+    if profile.primary_bucket_id is None:
+        return []
+    rows = list(
+        (
+            await db.execute(
+                select(BucketFile.statement_period, BucketFileAnalysis.analysis)
+                .outerjoin(
+                    BucketFileAnalysis,
+                    (BucketFileAnalysis.bucket_file_id == BucketFile.id)
+                    & (BucketFileAnalysis.status == "completed"),
+                )
+                .where(
+                    BucketFile.bucket_id == profile.primary_bucket_id,
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.application_plaid_item_id.is_(None),
+                )
+            )
+        ).all()
+    )
+    months: set[str] = set()
+    for statement_period, analysis in rows:
+        if statement_period:
+            months.add(str(statement_period))
+        months.update(_statement_months_from_analysis(analysis))
+    return sorted(months)
+
+
+async def draft_analysis_status(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ApplicationDraftAnalysisStatus:
+    if profile.primary_bucket_id is None:
+        return ApplicationDraftAnalysisStatus(profile_id=profile.id, can_finalize=True)
+    from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
+
+    file_ids = list(
+        (
+            await db.execute(
+                select(BucketFile.id).where(
+                    BucketFile.bucket_id == profile.primary_bucket_id,
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    )
+    analysis_rows = list(
+        (
+            await db.execute(
+                select(BucketFileAnalysis.bucket_file_id, BucketFileAnalysis.status)
+                .join(BucketFile, BucketFile.id == BucketFileAnalysis.bucket_file_id)
+                .where(
+                    BucketFileAnalysis.bucket_file_id.in_(file_ids) if file_ids else False,
+                    BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+                    BucketFileAnalysis.content_hash == BucketFile.content_hash,
+                )
+            )
+        ).all()
+    )
+    latest_status = {file_id: str(status_value) for file_id, status_value in analysis_rows}
+    analyzed = sum(value in {"completed", "skipped"} for value in latest_status.values())
+    failed = sum(value == "failed" for value in latest_status.values())
+    processing = max(0, len(file_ids) - analyzed - failed)
+    fact_rows = list(
+        (
+            await db.execute(
+                select(ApplicationExtractedFact.status, func.count())
+                .where(ApplicationExtractedFact.profile_id == profile.id)
+                .group_by(ApplicationExtractedFact.status)
+            )
+        ).all()
+    )
+    fact_counts = {str(status_value): int(count) for status_value, count in fact_rows}
+    suggested = fact_counts.get("suggested", 0)
+    reviewed = fact_counts.get("accepted", 0) + fact_counts.get("rejected", 0)
+    return ApplicationDraftAnalysisStatus(
+        profile_id=profile.id,
+        uploaded_file_count=len(file_ids),
+        analyzed_file_count=analyzed,
+        processing_file_count=processing,
+        failed_file_count=failed,
+        suggested_fact_count=suggested,
+        reviewed_fact_count=reviewed,
+        can_finalize=processing == 0 and failed == 0 and suggested == 0,
+    )
+
+
+def _statement_months_from_analysis(analysis: dict | None) -> set[str]:
+    """Return every explicit statement month without inferring missing periods."""
+    if not isinstance(analysis, dict):
+        return set()
+    key_facts = analysis.get("key_facts")
+    if not isinstance(key_facts, dict):
+        return set()
+    values: list[object] = [key_facts.get("statement_period")]
+    for row in key_facts.get("months") or []:
+        if isinstance(row, dict):
+            values.extend(
+                row.get(key)
+                for key in ("month", "statement_period", "period", "start_date")
+            )
+        else:
+            values.append(row)
+    result: set[str] = set()
+    for value in values:
+        match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", str(value or ""))
+        if match:
+            result.add(f"{match.group(1)}-{match.group(2)}")
+    return result
+
+
+def _metric_number(data: dict, *keys: str) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            return float(str(value).replace("$", "").replace(",", "").replace("x", "").strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def intelligence_state(db: AsyncSession, profile: ApplicationProfile) -> ApplicationIntelligenceRead:
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    snapshot = dict(intake.result_snapshot or {}) if intake else {}
+    key_metrics = snapshot.get("key_metrics") if isinstance(snapshot.get("key_metrics"), dict) else {}
+    requested = float(intake.requested_loan_amount) if intake and intake.requested_loan_amount is not None else None
+    ebitda = _metric_number(key_metrics, "bankable_ebitda", "annual_ebitda", "tax_net_income")
+    annual_debt = _metric_number(key_metrics, "annual_debt_service")
+    if annual_debt is None:
+        monthly_debt = _metric_number(key_metrics, "monthly_debt_service", "debt_service_monthly")
+        annual_debt = monthly_debt * 12 if monthly_debt is not None else None
+    deterministic_dscr = calculate_dscr(ebitda, annual_debt)
+    dscr = deterministic_dscr if deterministic_dscr is not None else _metric_number(key_metrics, "estimated_dscr", "dscr")
+    has_assets = bool(intake and intake.asset_rows)
+    is_real_estate = profile.vertical == "real_estate" or has_assets
+    revenue = _metric_number(key_metrics, "annualized_revenue", "annual_revenue", "gross_revenue")
+    ltv = _metric_number(key_metrics, "ltv", "estimated_ltv") if is_real_estate else None
+    metrics = [
+        IntelligenceMetric(key="requested", label="Requested", value=requested, unit="USD", status="ready" if requested is not None else "needs_evidence", source="intake", action=None if requested is not None else "edit_profile"),
+        IntelligenceMetric(key="revenue", label="Annualized revenue", value=revenue, unit="USD", status="ready" if revenue is not None else "needs_evidence", source="latest_review", action=None if revenue is not None else "request_bank_or_tax_evidence"),
+        IntelligenceMetric(key="dscr", label="DSCR", value=dscr, unit="x", status="ready" if dscr is not None else "needs_evidence", source="deterministic: bankable EBITDA / annual debt service" if deterministic_dscr is not None else "latest AI review", action=None if dscr is not None else "request_debt_schedule", confidence=1.0 if deterministic_dscr is not None else 0.65 if dscr is not None else None),
+        IntelligenceMetric(key="ltv", label="LTV", applicable=is_real_estate, value=ltv, unit="%", status=("ready" if ltv is not None else "needs_evidence") if is_real_estate else "not_applicable", source="collateral evidence" if is_real_estate else None, action="request_property_evidence" if is_real_estate and ltv is None else None),
+    ]
+    return ApplicationIntelligenceRead(
+        profile_id=profile.id,
+        metrics=metrics,
+        dscr_inputs={"bankable_ebitda": ebitda, "annual_debt_service": annual_debt, "target": 1.25, "floor": 1.1},
     )
 
 

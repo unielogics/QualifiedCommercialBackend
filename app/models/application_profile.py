@@ -67,9 +67,23 @@ class ApplicationProfile(TimestampMixin, Base):
     funding_category: Mapped[str | None] = mapped_column(String(64))
     entity_type: Mapped[str | None] = mapped_column(String(32))
     industry: Mapped[str | None] = mapped_column(String(80))
+    subindustry: Mapped[str | None] = mapped_column(String(120))
     naics_code: Mapped[str | None] = mapped_column(String(8))
     naics_label: Mapped[str | None] = mapped_column(String(180))
     custom_industry: Mapped[str | None] = mapped_column(String(180))
+    industry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    subindustry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    activity_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    taxonomy_version: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="2022", server_default="2022"
+    )
+    classification_provenance: Mapped[dict | None] = mapped_column(JSONB)
     classification_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
@@ -81,6 +95,130 @@ class ApplicationProfile(TimestampMixin, Base):
     backfill_needs_review: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    is_draft: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    draft_finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    extraction_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bank_verification_override_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bank_verification_override_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    bank_verification_override_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class FundingCategory(TimestampMixin, Base):
+    __tablename__ = "application_funding_categories"
+    __table_args__ = (
+        UniqueConstraint("vertical", "slug", name="uq_application_funding_category_slug"),
+        Index("ix_application_funding_categories_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vertical: Mapped[str] = mapped_column(String(32), nullable=False)
+    slug: Mapped[str] = mapped_column(String(80), nullable=False)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    requirements: Mapped[dict | None] = mapped_column(JSONB)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class ApplicationTaxonomyEntry(TimestampMixin, Base):
+    __tablename__ = "application_taxonomy_entries"
+    __table_args__ = (
+        Index("ix_application_taxonomy_level_status", "level", "status"),
+        Index("ix_application_taxonomy_parent", "parent_id"),
+        Index("ix_application_taxonomy_normalized", "normalized_label"),
+        Index(
+            "uq_application_taxonomy_active_code",
+            "taxonomy_version", "level", "code",
+            unique=True,
+            postgresql_where=text("code IS NOT NULL AND status IN ('official', 'approved')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    code: Mapped[str | None] = mapped_column(String(8))
+    label: Mapped[str] = mapped_column(String(180), nullable=False)
+    normalized_label: Mapped[str] = mapped_column(String(180), nullable=False)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="custom", server_default="custom")
+    taxonomy_version: Mapped[str] = mapped_column(String(24), nullable=False, default="2022", server_default="2022")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
+    aliases: Mapped[list | None] = mapped_column(JSONB)
+    originating_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="SET NULL")
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    canonical_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    review_note: Mapped[str | None] = mapped_column(Text)
+
+
+class ApplicationExtractedFact(TimestampMixin, Base):
+    __tablename__ = "application_extracted_facts"
+    __table_args__ = (
+        Index("ix_application_extracted_facts_profile_status", "profile_id", "status"),
+        Index("ix_application_extracted_facts_source", "source_file_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    field_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    normalized_value: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    source_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
+    )
+    source_analysis_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_file_analyses.id", ondelete="SET NULL")
+    )
+    extraction_method: Mapped[str] = mapped_column(String(32), nullable=False, default="document_ai", server_default="document_ai")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="suggested", server_default="suggested")
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ApplicationVerificationInvitation(TimestampMixin, Base):
+    __tablename__ = "application_verification_invitations"
+    __table_args__ = (
+        Index("ix_application_verification_invitations_profile", "profile_id"),
+        Index("ix_application_verification_invitations_expires", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    recipient_phone: Mapped[str | None] = mapped_column(String(48))
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False, default="business_banking", server_default="business_banking")
+    delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="created", server_default="created")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ApplicationOwner(TimestampMixin, Base):

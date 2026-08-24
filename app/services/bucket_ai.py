@@ -38,13 +38,13 @@ from app.models.bucket import (
 )
 from app.models.user import User
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
+from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 
 # The user and assistant rows of one chat turn are flushed together and share
 # a single created_at, so timestamp-only ordering can render an answer above
 # its question. Tiebreak chronologically: user first, assistant second. Use
 # .asc() on ascending queries and .desc() on descending-then-reversed ones.
 CHAT_TURN_ORDER = case((BucketAIMessage.role == "user", 0), else_=1)
-from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 # to hit and get the new prompt on first analysis. The only cost of leaving it
 # is that the number no longer uniquely identifies the prompt text. Bump it if
 # and when existing files genuinely need reclassifying under the new tokens.
-CURRENT_FILE_ANALYSIS_VERSION = 2
+CURRENT_FILE_ANALYSIS_VERSION = 3
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_REVIEW_ATTACHMENTS = 8
@@ -448,10 +448,23 @@ Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
   "baseline_categories_supported": ["which baseline package categories this file satisfies, if any"],
   "red_flags": ["underwriter concerns visible in THIS file: mismatched names/dates/amounts, NSF/overdraft, stale dates, tampering, illegible sections"],
   "limitations": ["what this file does NOT establish / what is unreadable"],
-  "key_facts": {"note": "structured facts you can extract: names, entities, dates, amounts, revenue, deposits, DSCR/LTV/rent/PITIA inputs, property address, balances. Use null when not present. Never invent numbers."}
+  "key_facts": {"note": "structured facts you can extract: names, entities, dates, amounts, revenue, deposits, DSCR/LTV/rent/PITIA inputs, property address, balances. Use null when not present. Never invent numbers."},
+  "profile_facts": {
+    "legal_entity_name": {"value": "string|null", "confidence": 0.0},
+    "entity_type": {"value": "string|null", "confidence": 0.0},
+    "principal_name": {"value": "string|null", "confidence": 0.0},
+    "email": {"value": "string|null", "confidence": 0.0},
+    "phone": {"value": "string|null", "confidence": 0.0},
+    "naics_code": {"value": "six printed digits|null", "confidence": 0.0},
+    "naics_label": {"value": "printed business activity or principal product/service|null", "confidence": 0.0},
+    "business_activity": {"value": "string|null", "confidence": 0.0},
+    "tax_form": {"value": "string|null", "confidence": 0.0},
+    "tax_year": {"value": "string|null", "confidence": 0.0}
+  }
 }
 
 Analyze only the single document provided. Do not speculate about other files. Keep summary under 320 characters and each list <= 6 items.
+For profile_facts, copy only values visibly printed in the document. IRS Schedule K business-activity codes are six digits. Never infer or invent a NAICS label from the code; the application validates it against the official catalogue.
 
 If this document is a BANK STATEMENT (or contains multiple statement periods), populate key_facts with the exact fields needed to judge deposit consistency: bank, account_holder, account_last4, statement_period (e.g. "2026-01-01 to 2026-01-31"), beginning_balance, ending_balance, total_deposits_and_credits, total_withdrawals_and_debits, number_of_deposits, number_of_checks, average_ledger_balance, low_daily_balance, nsf_or_overdraft_count, returned_check_count, and negative_balance_dates. If the file covers MORE THAN ONE month, add a "months" array with one object per month carrying these same fields, so month-over-month deposit consistency can be confirmed. Read every page/month; never summarize only the first month.
 
@@ -2181,11 +2194,15 @@ async def analyze_bucket_file(
             "red_flags": parsed.get("red_flags") or [],
             "limitations": parsed.get("limitations") or [],
             "key_facts": parsed.get("key_facts") if isinstance(parsed.get("key_facts"), dict) else {},
+            "profile_facts": parsed.get("profile_facts") if isinstance(parsed.get("profile_facts"), dict) else {},
         }
         row.input_tokens = input_tokens
         row.output_tokens = output_tokens
         row.error = None
         row.analyzed_at = _now()
+        from app.services.application_profiles import capture_extracted_profile_facts
+
+        await capture_extracted_profile_facts(db, file=file, analysis=row)
     except Exception as exc:  # noqa: BLE001
         log.exception("analyze_bucket_file failed file=%s", file.id)
         row.status = "failed"

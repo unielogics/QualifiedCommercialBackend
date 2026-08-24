@@ -20,6 +20,8 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.underwriting_intelligence import calculate_dscr
+
 from ..models import (
     DealerAccount,
     DealerBusiness,
@@ -199,11 +201,7 @@ def compute_metrics(
         else:
             ds_source = "none"
     annual_ds = _round2(monthly_ds * 12) if monthly_ds is not None else None
-    dscr = (
-        round(ebitda_bankable / annual_ds, 3)
-        if ebitda_bankable is not None and annual_ds is not None and annual_ds != 0
-        else None
-    )
+    dscr = calculate_dscr(ebitda_bankable, annual_ds)
 
     # Cash-flow cross-check, fully ledger-derived: what the account actually
     # kept each month vs what it paid lenders. (net + debt) / debt — the
@@ -701,7 +699,6 @@ async def load_metric_inputs(
                 from .vendors import normalize_vendor
 
                 from .refinance import key_matches as _km
-
                 excluded_rows = (
                     (
                         await db.execute(

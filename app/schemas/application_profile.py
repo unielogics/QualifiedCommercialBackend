@@ -27,13 +27,24 @@ class ApplicationProfileRead(BaseModel):
     funding_category: str | None = None
     entity_type: str | None = None
     industry: str | None = None
+    subindustry: str | None = None
     naics_code: str | None = None
     naics_label: str | None = None
     custom_industry: str | None = None
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
+    taxonomy_version: str = "2022"
+    classification_provenance: dict | None = None
     classification_revision: int
     classification_state: dict | None = None
     classified_at: datetime | None = None
     backfill_needs_review: bool = False
+    is_draft: bool = False
+    draft_finalized_at: datetime | None = None
+    extraction_reviewed_at: datetime | None = None
+    bank_verification_override_at: datetime | None = None
+    bank_verification_override_reason: str | None = None
     owner_storage: Literal["application", "dealer"]
 
 
@@ -127,8 +138,14 @@ class FileOwnerRequirementState(BaseModel):
     bank_connection_count: int = 0
     bank_statement_months: int = 0
     credit_returned: bool = False
+    owner_credit_complete: bool = False
+    business_banking_complete: bool = False
+    evidence_complete: bool = False
     ready_for_step_2: bool = False
     unlocked: bool = False
+    ownership_blockers: list[str] = Field(default_factory=list)
+    credit_blockers: list[str] = Field(default_factory=list)
+    banking_blockers: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
 
 
@@ -171,6 +188,13 @@ class ApplicationBankState(BaseModel):
     disclosure_version: str
     disclosure_text: str
     items: list[ApplicationBankConnectionRead] = Field(default_factory=list)
+    manual_override: bool = False
+    manual_override_reason: str | None = None
+    manual_statement_months: list[str] = Field(default_factory=list)
+
+
+class ManualBankOverrideRequest(BaseModel):
+    reason: str = Field(min_length=8, max_length=1000)
 
 
 class ApplicationBankConsentGrant(BaseModel):
@@ -205,9 +229,170 @@ class ClassificationPatch(BaseModel):
     funding_category: str | None = Field(default=None, max_length=64)
     entity_type: str | None = Field(default=None, max_length=32)
     industry: str | None = Field(default=None, max_length=80)
+    subindustry: str | None = Field(default=None, max_length=120)
     naics_code: str | None = Field(default=None, max_length=8)
     naics_label: str | None = Field(default=None, max_length=180)
     custom_industry: str | None = Field(default=None, max_length=180)
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
+
+    @field_validator("naics_code")
+    @classmethod
+    def validate_naics(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if value and (not value.isdigit() or len(value) != 6):
+            raise ValueError("NAICS/PBA activity codes must contain exactly six digits")
+        return value or None
+
+
+class TaxonomyEntryRead(BaseModel):
+    id: UUID
+    level: Literal[2, 3, 6]
+    code: str | None = None
+    label: str
+    parent_id: UUID | None = None
+    source: str
+    taxonomy_version: str
+    status: str
+    aliases: list[str] = Field(default_factory=list)
+    originating_profile_id: UUID | None = None
+    canonical_entry_id: UUID | None = None
+
+
+class TaxonomySearchRead(BaseModel):
+    items: list[TaxonomyEntryRead] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+
+
+class TaxonomyContributionCreate(BaseModel):
+    level: Literal[2, 3, 6]
+    label: str = Field(min_length=2, max_length=180)
+    code: str | None = Field(default=None, max_length=6)
+    parent_id: UUID | None = None
+
+    @field_validator("code")
+    @classmethod
+    def contribution_code(cls, value: str | None, info) -> str | None:
+        value = (value or "").strip()
+        if info.data.get("level") == 6 and (len(value) != 6 or not value.isdigit()):
+            raise ValueError("A custom activity requires a six-digit code")
+        return value or None
+
+
+class TaxonomyReviewRequest(BaseModel):
+    action: Literal["approve", "edit", "reject", "merge", "map"]
+    canonical_entry_id: UUID | None = None
+    label: str | None = Field(default=None, min_length=2, max_length=180)
+    code: str | None = Field(default=None, max_length=8)
+    note: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("code")
+    @classmethod
+    def normalize_review_code(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if value and not value.isdigit():
+            raise ValueError("Classification codes must contain digits only")
+        return value or None
+
+
+class FundingCategoryRead(BaseModel):
+    id: UUID
+    vertical: str
+    slug: str
+    label: str
+    status: str
+    is_system: bool = False
+
+
+class FundingCategoryCreate(BaseModel):
+    vertical: ApplicationVertical
+    label: str = Field(min_length=2, max_length=120)
+
+
+class ExtractedFactRead(BaseModel):
+    id: UUID
+    field_key: str
+    value: dict
+    normalized_value: str | None = None
+    confidence: float | None = None
+    source_file_id: UUID | None = None
+    status: str
+    extraction_method: str
+    created_at: datetime
+
+
+class ExtractedFactReview(BaseModel):
+    action: Literal["accept", "reject"]
+
+
+class ApplicationDraftAnalysisStatus(BaseModel):
+    profile_id: UUID
+    uploaded_file_count: int = 0
+    analyzed_file_count: int = 0
+    processing_file_count: int = 0
+    failed_file_count: int = 0
+    suggested_fact_count: int = 0
+    reviewed_fact_count: int = 0
+    can_finalize: bool = False
+
+
+class VerificationInvitationCreate(BaseModel):
+    channel: Literal["email", "sms", "none"] = "email"
+    recipient_email: EmailStr | None = None
+    recipient_phone: str | None = Field(default=None, max_length=48)
+
+
+class VerificationInvitationRead(BaseModel):
+    id: UUID
+    path: str
+    token: str | None = None
+    delivery_status: str
+    expires_at: datetime
+
+
+class PublicBankVerificationRead(BaseModel):
+    business_name: str
+    disclosure_version: str
+    disclosure_text: str
+    consent_granted: bool = False
+    items: list[ApplicationBankConnectionRead] = Field(default_factory=list)
+    manual_statement_months: list[str] = Field(default_factory=list)
+    statement_upload_enabled: bool = False
+    expires_at: datetime
+
+
+class SecureBankFileUploadInit(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(default="application/octet-stream", max_length=160)
+    size_bytes: int = Field(gt=0, le=100 * 1024 * 1024)
+    requested_document_id: UUID | None = None
+
+
+class SecureBankFileUploadComplete(BaseModel):
+    file_id: UUID
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class IntelligenceMetric(BaseModel):
+    key: str
+    label: str
+    applicable: bool = True
+    value: float | str | None = None
+    unit: str | None = None
+    status: Literal["ready", "needs_evidence", "not_applicable"]
+    confidence: float | None = None
+    period: str | None = None
+    source: str | None = None
+    action: str | None = None
+
+
+class ApplicationIntelligenceRead(BaseModel):
+    profile_id: UUID
+    metrics: list[IntelligenceMetric] = Field(default_factory=list)
+    dscr_inputs: dict = Field(default_factory=dict)
 
 
 class ClassificationPreview(BaseModel):

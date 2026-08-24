@@ -9,6 +9,8 @@ from app.models.application_profile import ApplicationOwner, ApplicationPlaidIte
 from app.routers.application_profiles import _require_profile_bank_client
 from app.routers.communications import _intake_allowed_channels
 from app.schemas.application_profile import FileOwnerPatch
+from app.services.application_profiles import _statement_months_from_analysis
+from app.services.underwriting_intelligence import calculate_dscr
 
 
 def test_owner_credit_threshold_is_inclusive_and_requires_personal_contacts() -> None:
@@ -63,10 +65,34 @@ def test_application_bank_actions_are_client_owned() -> None:
     dealer = SimpleNamespace(dealer_id="dealer-id")
 
     _require_profile_bank_client(dealer, SimpleNamespace(role=Role.DEALER))
+    _require_profile_bank_client(application, SimpleNamespace(role=Role.CLIENT))
 
     for role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP):
-        _require_profile_bank_client(application, SimpleNamespace(role=role))
+        with pytest.raises(HTTPException) as application_error:
+            _require_profile_bank_client(application, SimpleNamespace(role=role))
+        assert application_error.value.status_code == 403
 
         with pytest.raises(HTTPException) as dealer_error:
             _require_profile_bank_client(dealer, SimpleNamespace(role=role))
         assert dealer_error.value.status_code == 403
+
+
+def test_manual_statement_coverage_uses_every_explicit_month() -> None:
+    assert _statement_months_from_analysis(
+        {
+            "key_facts": {
+                "statement_period": "2026-01-01 to 2026-01-31",
+                "months": [
+                    {"month": "2026-02"},
+                    {"statement_period": "2026/03/01 through 2026/03/31"},
+                    {"period": "not stated"},
+                ],
+            }
+        }
+    ) == {"2026-01", "2026-02", "2026-03"}
+
+
+def test_shared_dscr_engine_requires_deterministic_inputs() -> None:
+    assert calculate_dscr(240_000, 200_000) == 1.2
+    assert calculate_dscr(None, 200_000) is None
+    assert calculate_dscr(240_000, 0) is None

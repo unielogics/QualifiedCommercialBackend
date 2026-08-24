@@ -24,11 +24,13 @@ error to Plaid earns a retry storm for an event we were never going to act on.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.application_profile import ApplicationPlaidItem
 
 from ..models import DealerPlaidItem
 
@@ -38,12 +40,21 @@ __all__ = ["handle"]
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
-async def _item(db: AsyncSession, item_id: str) -> DealerPlaidItem | None:
-    return (
+async def _item(
+    db: AsyncSession, item_id: str
+) -> DealerPlaidItem | ApplicationPlaidItem | None:
+    dealer_item = (
         await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.item_id == item_id))
+    ).scalar_one_or_none()
+    if dealer_item is not None:
+        return dealer_item
+    return (
+        await db.execute(
+            select(ApplicationPlaidItem).where(ApplicationPlaidItem.item_id == item_id)
+        )
     ).scalar_one_or_none()
 
 
@@ -67,7 +78,7 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         return "ignored: unknown item"
 
     # ── The connection is gone, by the user's own choice ──
-    if code in {"USER_PERMISSION_REVOKED", "USER_ACCOUNT_REVOKED"}:
+    if code == "USER_PERMISSION_REVOKED":
         item.status = "revoked"
         item.error = "The bank connection was revoked by the account holder."
         item.auto_refresh = False
@@ -77,6 +88,21 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         item.encrypted_access_token = None
         logger.info("plaid webhook: item %s revoked by user", item_id)
         return "revoked"
+
+    if code == "USER_ACCOUNT_REVOKED":
+        # This event applies to one account, not the entire Item. Keep the token
+        # so the remaining authorized business accounts continue to work, then
+        # reconcile the account/statement view on the next scheduler pass.
+        account_id = str(payload.get("account_id") or "")
+        item.error = "Access to one linked bank account was revoked by the account holder."
+        if item.status != "revoked" and item.auto_refresh:
+            item.next_refresh_at = _now()
+        logger.info(
+            "plaid webhook: account %s revoked on item %s",
+            account_id or "unknown",
+            item_id,
+        )
+        return "account revocation flagged"
 
     # ── The connection is broken and needs the user to repair it ──
     if wtype == "ITEM" and code == "ERROR":
@@ -109,6 +135,9 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         # Informational: we pull statements for the accounts already shared, and
         # adding accounts is the user's decision to make in update mode.
         return "new accounts available"
+
+    if code == "WEBHOOK_UPDATE_ACKNOWLEDGED":
+        return "webhook acknowledged"
 
     # ── Statements finished extracting ──
     if wtype == "STATEMENTS" and code == "STATEMENTS_REFRESH_COMPLETE":

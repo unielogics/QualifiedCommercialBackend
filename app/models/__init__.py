@@ -32,15 +32,21 @@ from app.models.ai_usage_event import AIUsageEvent  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.application_profile import (  # noqa: F401
     ApplicationBankConsent,
+    ApplicationExtractedFact,
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationTaxonomyEntry,
+    ApplicationVerificationInvitation,
+    FundingCategory,
 )
 from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401
 from app.models.booking_settings import BookingSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
 from app.models.contract_agreement import ContractAgreement  # noqa: F401
+from app.models.agreement_counterparty import AgreementCounterparty  # noqa: F401
+from app.models.public_contract_sign_session import PublicContractSignSession  # noqa: F401
 from app.models.deal_registration import DealRegistration  # noqa: F401
 from app.models.dealer_lead_channel_seen import DealerLeadChannelSeen  # noqa: F401
 from app.models.referral_partner_company import ReferralPartnerCompany  # noqa: F401
