@@ -21,12 +21,14 @@ from app.dealer_os.router import (
 from app.dealer_os.schemas import (
     BankConsentGrant,
     BulkCreditInviteResult,
+    DealerCreate,
     PlaidExchange,
     PlaidItemPatch,
     PublicPlaidItemRead,
     RoomFeaturesRead,
     VerificationRead,
 )
+from app.dealer_os.services import plaid_client
 from app.dealer_os.services.decision import assess_verification
 from app.enums import Role
 
@@ -53,6 +55,39 @@ def test_owner_email_normalization_is_stable() -> None:
     assert _normalized_owner_email(" Owner@Example.COM ") == "owner@example.com"
     assert _normalized_owner_email("   ") is None
     assert _normalized_owner_email(None) is None
+
+
+def test_new_application_requires_request_but_not_ein_address_or_trading_since() -> None:
+    payload = DealerCreate(
+        name="Optional Fields LLC",
+        entity_type="Limited liability company",
+        funding_goal=250_000,
+        funding_purpose="working_capital",
+        use_of_proceeds_note="Purchase equipment and retain operating liquidity.",
+    )
+
+    assert payload.ein is None
+    assert payload.address is None
+
+
+@pytest.mark.parametrize("field", ["funding_goal", "funding_purpose", "use_of_proceeds_note"])
+def test_new_application_rejects_missing_required_request_fields(field: str) -> None:
+    data = {
+        "name": "Incomplete LLC",
+        "entity_type": "Limited liability company",
+        "funding_goal": 250_000,
+        "funding_purpose": "working_capital",
+        "use_of_proceeds_note": "Working capital for payroll and inventory.",
+    }
+    data.pop(field)
+    with pytest.raises(ValidationError):
+        DealerCreate.model_validate(data)
+
+
+def test_plaid_invalid_environment_never_falls_back_to_sandbox(monkeypatch) -> None:
+    monkeypatch.setenv("DEALER_OS_PLAID_ENV", "prodution")
+    with pytest.raises(plaid_client.PlaidUnavailable):
+        plaid_client.environment()
 
 
 def test_credit_requirement_uses_inclusive_twenty_percent_threshold() -> None:

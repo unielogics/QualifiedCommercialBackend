@@ -101,11 +101,11 @@ async def run_soft_pull(
     db.add(pull)
     await db.flush()
 
-    if not private_key:
+    if not private_key or not public_key:
         pull.status = CreditPullStatus.REVOKED
         pull.notes = "iSoftPull credentials not configured"
         await db.flush()
-        log.error("Credit pull attempted but ISOFTPULL_PRIVATE_KEY is not configured")
+        log.error("Credit pull attempted but the iSoftPull public/private key pair is incomplete")
         raise SoftPullUnavailable("Credit pull service is temporarily unavailable. Please contact support.")
 
     try:

@@ -11,17 +11,19 @@ import asyncio
 import hashlib
 import io
 import logging
+import os
 import re
 import secrets
 import zipfile
 from dataclasses import asdict
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, or_
+from sqlalchemy import and_, exists, func, not_, select, or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -162,7 +164,10 @@ from .schemas import (
     SmsDisclosureOut,
     DealerInvite,
     DealerInviteResult,
+    DealerIntegrationStatus,
     DealerListItem,
+    DealerPortfolioItem,
+    DealerPortfolioPage,
     DealerRead,
     DealerUpdate,
     DebtCreate,
@@ -218,6 +223,7 @@ from .schemas import (
     OwnerCreate,
     OwnerPatch,
     OwnerRead,
+    PortfolioOwnerSummary,
     PathFundingRead,
     PathsRead,
     PaymentShiftCreate,
@@ -338,6 +344,7 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     stmt = (
         select(DealerBusiness, DealerGroup.name)
         .outerjoin(DealerGroup, DealerBusiness.group_id == DealerGroup.id)
+        .where(DealerBusiness.archived_at.is_(None))
         .order_by(DealerBusiness.created_at.desc())
     )
     if user.role == Role.DEALER:
@@ -463,6 +470,236 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
         item.verified = item.bank_linked and item.credit_returned
         out.append(item)
     return out
+
+
+@router.get("/portfolio", response_model=DealerPortfolioPage)
+async def dealer_portfolio(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str = Query(default="", max_length=160),
+    stage: str = Query(default="all", pattern="^(all|awaiting|verified|contract)$"),
+    bank: str = Query(default="all", pattern="^(all|linked|awaiting)$"),
+    credit: str = Query(default="all", pattern="^(all|returned|awaiting)$"),
+    archive: str = Query(default="active", pattern="^(active|archived|all)$"),
+    sort_by: str = Query(default="updated_at", pattern="^(created_at|updated_at)$"),
+    sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
+    limit: int = Query(default=10, ge=1, le=10),
+    offset: int = Query(default=0, ge=0),
+) -> DealerPortfolioPage:
+    """Rep portfolio with filtering and pagination applied before rows leave Postgres."""
+    require_team_or_rep(user)
+    bank_linked = exists(
+        select(DealerPlaidItem.id).where(
+            DealerPlaidItem.dealer_id == DealerBusiness.id,
+            DealerPlaidItem.status == "active",
+        )
+    )
+    required_credit_owner = exists(
+        select(DealerOwner.id).where(
+            DealerOwner.dealer_id == DealerBusiness.id,
+            DealerOwner.ownership_pct >= Decimal("20.00"),
+        )
+    )
+    pending_credit_owner = exists(
+        select(DealerOwner.id).where(
+            DealerOwner.dealer_id == DealerBusiness.id,
+            DealerOwner.ownership_pct >= Decimal("20.00"),
+            DealerOwner.credit_pulled_at.is_(None),
+        )
+    )
+    credit_returned = and_(required_credit_owner, not_(pending_credit_owner))
+    filters = []
+    if user.role == Role.FIELD_REP:
+        filters.extend(
+            [DealerBusiness.owner_user_id == user.id, DealerBusiness.archived_at.is_(None)]
+        )
+    elif archive == "archived":
+        if user.role != Role.SUPER_ADMIN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+        filters.append(DealerBusiness.archived_at.is_not(None))
+    elif archive == "all":
+        if user.role != Role.SUPER_ADMIN:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    else:
+        filters.append(DealerBusiness.archived_at.is_(None))
+
+    needle = q.strip().lower()
+    if needle:
+        like = f"%{needle}%"
+        owner_match = exists(
+            select(DealerOwner.id).where(
+                DealerOwner.dealer_id == DealerBusiness.id,
+                or_(
+                    func.lower(func.concat(DealerOwner.first_name, " ", DealerOwner.last_name)).like(like),
+                    func.lower(func.coalesce(DealerOwner.email, "")).like(like),
+                ),
+            )
+        )
+        filters.append(
+            or_(
+                func.lower(DealerBusiness.name).like(like),
+                func.lower(func.coalesce(DealerBusiness.address, "")).like(like),
+                func.lower(func.coalesce(DealerBusiness.city, "")).like(like),
+                func.lower(func.coalesce(DealerBusiness.state, "")).like(like),
+                owner_match,
+            )
+        )
+    if stage == "awaiting":
+        filters.append(not_(and_(bank_linked, credit_returned)))
+    elif stage == "verified":
+        filters.extend([bank_linked, credit_returned])
+    elif stage == "contract":
+        filters.append(DealerBusiness.status == "complete")
+    if bank == "linked":
+        filters.append(bank_linked)
+    elif bank == "awaiting":
+        filters.append(not_(bank_linked))
+    if credit == "returned":
+        filters.append(credit_returned)
+    elif credit == "awaiting":
+        filters.append(not_(credit_returned))
+
+    total = int(
+        (await db.execute(select(func.count()).select_from(DealerBusiness).where(*filters))).scalar_one()
+    )
+    order_col = DealerBusiness.created_at if sort_by == "created_at" else DealerBusiness.updated_at
+    order = order_col.asc() if sort_dir == "asc" else order_col.desc()
+    dealers = (
+        await db.execute(
+            select(DealerBusiness).where(*filters).order_by(order, DealerBusiness.id).limit(limit).offset(offset)
+        )
+    ).scalars().all()
+    ids = [row.id for row in dealers]
+    owner_rows = (
+        await db.execute(
+            select(DealerOwner).where(DealerOwner.dealer_id.in_(ids)).order_by(DealerOwner.created_at)
+        )
+    ).scalars().all() if ids else []
+    owners_by_dealer: dict[UUID, list[PortfolioOwnerSummary]] = {dealer_id: [] for dealer_id in ids}
+    for owner in owner_rows:
+        owners_by_dealer[owner.dealer_id].append(
+            PortfolioOwnerSummary(
+                id=owner.id,
+                name=owner.full_name,
+                email=owner.email,
+                ownership_pct=float(owner.ownership_pct) if owner.ownership_pct is not None else None,
+            )
+        )
+    linked_ids = {
+        row[0]
+        for row in (
+            await db.execute(
+                select(DealerPlaidItem.dealer_id)
+                .where(DealerPlaidItem.dealer_id.in_(ids), DealerPlaidItem.status == "active")
+                .distinct()
+            )
+        ).all()
+    } if ids else set()
+    returned_ids: set[UUID] = set()
+    if ids:
+        required_status = (
+            await db.execute(
+                select(
+                    DealerOwner.dealer_id,
+                    func.count(DealerOwner.id),
+                    func.count(DealerOwner.credit_pulled_at),
+                )
+                .where(
+                    DealerOwner.dealer_id.in_(ids),
+                    DealerOwner.ownership_pct >= Decimal("20.00"),
+                )
+                .group_by(DealerOwner.dealer_id)
+            )
+        ).all()
+        returned_ids = {
+            dealer_id
+            for dealer_id, required_count, completed_count in required_status
+            if required_count > 0 and completed_count == required_count
+        }
+    items: list[DealerPortfolioItem] = []
+    for dealer in dealers:
+        item = DealerPortfolioItem.model_validate(dealer)
+        item.owners = owners_by_dealer.get(dealer.id, [])
+        item.bank_linked = dealer.id in linked_ids
+        item.credit_returned = dealer.id in returned_ids
+        item.verified = item.bank_linked and item.credit_returned
+        items.append(item)
+    return DealerPortfolioPage(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.post("/dealers/{dealer_id}/archive", response_model=DealerRead)
+async def archive_dealer(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if dealer.archived_at is None:
+        dealer.archived_at = datetime.now(timezone.utc)
+        dealer.archived_by_user_id = user.id
+        await log_action(
+            db, dealer.id, user, "dealer.archived", "dealer", entity_id=dealer.id,
+            after={"archived_at": dealer.archived_at.isoformat()},
+        )
+        await db.commit()
+        await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
+
+
+@router.post("/dealers/{dealer_id}/restore", response_model=DealerRead)
+async def restore_dealer(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRead:
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    if dealer.archived_at is not None:
+        before = {"archived_at": dealer.archived_at.isoformat()}
+        dealer.archived_at = None
+        dealer.archived_by_user_id = None
+        await log_action(
+            db, dealer.id, user, "dealer.restored", "dealer", entity_id=dealer.id,
+            before=before, after={"archived_at": None},
+        )
+        await db.commit()
+        await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
+
+
+@router.get("/integrations/status", response_model=DealerIntegrationStatus)
+async def dealer_integration_status(user: CurrentUser) -> DealerIntegrationStatus:
+    """Credential-presence diagnostics only; secrets and bureau payloads never leave the server."""
+    require_super_admin(user)
+    settings = get_settings()
+    private_key = settings.isoftpull_private_key or settings.isoftpull_api_key
+    isoftpull_ready = bool(private_key and settings.isoftpull_public_key)
+    plaid_ready = plaid_client.enabled()
+    try:
+        plaid_env = plaid_client.environment()
+        plaid_env_error = None
+    except plaid_client.PlaidUnavailable as exc:
+        plaid_env = "invalid"
+        plaid_env_error = str(exc)
+    return DealerIntegrationStatus(
+        isoftpull={
+            "configured": isoftpull_ready,
+            "environment": "production",
+            "endpoint": settings.isoftpull_api_url,
+            "detail": "Ready" if isoftpull_ready else "Public/private credentials are not configured",
+        },
+        plaid={
+            "configured": plaid_ready,
+            "environment": plaid_env,
+            "endpoint": os.getenv("DEALER_OS_PLAID_WEBHOOK_URL") or None,
+            "detail": plaid_env_error or (
+                "Ready for production"
+                if plaid_ready and plaid_env == "production"
+                else "Configured outside production" if plaid_ready else "Client ID/secret are not configured"
+            ),
+        },
+    )
 
 
 async def _require_group(db: AsyncSession, group_id: UUID) -> DealerGroup:
@@ -9455,6 +9692,16 @@ async def _run_owner_soft_pull(
     )
 
     owner_pk = owner.id  # captured pre-rollback: expired instances can't lazy-load async
+    async def _record_provider_failure(status_value: str, category: str, detail: str) -> SoftPullResult:
+        await db.rollback()
+        current = await db.get(DealerOwner, owner_pk)
+        if current is not None:
+            current.credit_workflow_status = status_value
+            current.credit_provider_error_category = category[:48]
+            current.credit_delivery_detail = detail[:240]
+            await db.commit()
+        return SoftPullResult(ok=False, detail=detail)
+
     client = await _resolve_owner_client(db, dealer, owner)
     try:
         pull = await run_soft_pull(
@@ -9473,20 +9720,22 @@ async def _run_owner_soft_pull(
             actor=actor,
         )
     except SoftPullUnavailable as exc:
-        await db.rollback()
-        return SoftPullResult(ok=False, detail=str(exc))
+        return await _record_provider_failure("provider_unavailable", "provider_unavailable", str(exc))
     except SoftPullDenied as exc:
-        await db.rollback()
-        return SoftPullResult(ok=False, detail=str(exc))
+        return await _record_provider_failure("declined", getattr(exc, "code", "bureau_denied"), str(exc))
     except Exception as exc:  # transport/validation — surfaced, never swallowed
-        await db.rollback()
         logger.exception("dealer-os: soft pull failed for owner %s", owner_pk)
-        return SoftPullResult(ok=False, detail=f"Credit pull failed: {exc}")
+        return await _record_provider_failure("failed", type(exc).__name__, f"Credit pull failed: {exc}")
 
     owner.credit_score = getattr(pull, "score", None)
     owner.credit_tier = _credit_tier(getattr(pull, "score", None))
     owner.credit_pulled_at = datetime.now(timezone.utc)
     owner.credit_pull_id = pull.id
+    owner.credit_workflow_status = "completed"
+    owner.credit_provider_error_category = None
+    owner.credit_delivery_detail = None
+    provider_id = re.search(r"(?:^|;)\s*isoftpull_id=([^;]+)", pull.notes or "")
+    owner.credit_provider_request_id = provider_id.group(1).strip()[:120] if provider_id else None
     await log_action(
         db, dealer.id, actor, "owner.soft_pull", "owner",
         entity_id=owner.id,
@@ -10227,15 +10476,12 @@ async def owner_credit_invite(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "This owner needs a valid personal phone before a credit authorization can be sent",
         )
-    # The consent page is gated by the file's room access code — the same PIN
-    # that opens the upload room. Ensure the room (and therefore a code)
-    # exists before the link goes out, or the gate would ask for a code that
-    # was never minted.
-    await client_room.ensure_room(db, dealer)
     token = secrets.token_urlsafe(32)
     owner.invite_token_hash = _hash_invite_token(token)
     owner.invite_sent_at = datetime.now(timezone.utc)
     owner.invite_opened_at = None  # a fresh link has not been opened yet
+    owner.credit_workflow_status = "link_created"
+    owner.credit_delivery_detail = None
     await log_action(
         db, dealer.id, user, "owner.credit_invite", "owner",
         entity_id=owner.id, after={"invite_sent_at": owner.invite_sent_at.isoformat()},
@@ -10273,6 +10519,8 @@ async def owner_credit_invite(
             "recipient": owner.email,
         },
     )
+    owner.credit_workflow_status = "sent" if delivery.ok else "delivery_failed"
+    owner.credit_delivery_detail = (delivery.detail or "")[:240] or None
     await db.commit()
     return CreditInviteResult(
         token=token,
@@ -10353,6 +10601,7 @@ async def public_credit_consent_view(
     dealer = await db.get(DealerBusiness, owner.dealer_id)
     if owner.invite_opened_at is None:
         owner.invite_opened_at = datetime.now(timezone.utc)
+        owner.credit_workflow_status = "opened"
         await db.commit()
     return PublicConsentView(
         first_name=owner.first_name,
@@ -10360,7 +10609,10 @@ async def public_credit_consent_view(
         dealer_name=dealer.name if dealer is not None else "",
         fields_needed=_owner_missing_pull_fields(owner),
         completed=owner.credit_pulled_at is not None,
-        requires_code=bool(await _room_code_hash(db, owner.dealer_id)),
+        # The short-lived, high-entropy, one-time owner token is the consent
+        # credential. A separate document-room passcode is unrelated and made
+        # emailed owner links impossible to complete independently.
+        requires_code=False,
     )
 
 
@@ -10373,22 +10625,6 @@ async def public_credit_consent_submit(
     what the advisor already has), and the SAME soft-pull gateway path runs.
     Success consumes the token; the response is tier + a 50-point band only —
     never the exact score, never the pull summary."""
-    # The room access code gates the pull. Checked BEFORE the token is
-    # consumed, so a guesser burns lockout attempts, never the owner's link.
-    # A credit pull is the most consequential thing a leaked email link could
-    # trigger; possession of the link alone must not be enough.
-    code_hash = await _room_code_hash_by_token(db, token)
-    if code_hash is not None:
-        from .services.client_room import verify_passcode as _verify_room_code
-
-        if not _verify_room_code(body.access_code or "", code_hash):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "The access code is missing or wrong. It is the same code that opens "
-                "your document room; your representative can read it to you or issue "
-                "a new one.",
-            )
-
     # ATOMIC consume-first: two concurrent submits with the same token must
     # never both reach the bureau. The UPDATE ... RETURNING claims the token;
     # the loser sees zero rows and gets the dead-link 404. On gateway failure
@@ -10414,6 +10650,8 @@ async def public_credit_consent_submit(
         await db.commit()  # keep the token consumed — the work is done
         raise HTTPException(status.HTTP_409_CONFLICT, _ALREADY_PULLED_DETAIL)
     if not body.fcra_consent:
+        owner.credit_workflow_status = "declined"
+        owner.credit_provider_error_category = "consent_declined"
         await _release_token()
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,

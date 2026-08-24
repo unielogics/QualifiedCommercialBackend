@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     isoftpull_public_key: str = ""
     isoftpull_private_key: str = ""
     isoftpull_api_key: str = ""  # legacy / fallback for private_key
-    isoftpull_api_url: str = "https://api.isoftpull.com/v1"
+    isoftpull_api_url: str = "https://app.isoftpull.com/api/v2"
     isoftpull_timeout_seconds: float = 15.0
     isoftpull_max_retries: int = 2
     # Server-side dashboard login — bridge until Full Feed is enabled.

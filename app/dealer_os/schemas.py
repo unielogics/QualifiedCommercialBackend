@@ -30,6 +30,7 @@ class UseOfProceedsRow(BaseModel):
 
 class DealerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=180)
+    entity_type: str = Field(min_length=1, max_length=32)
     legal_name: str | None = None
     ein: str | None = None
     email: str | None = None
@@ -40,8 +41,9 @@ class DealerCreate(BaseModel):
     zip: str | None = None
     industry: str = "auto_dealer"
     notes: str | None = None
-    funding_goal: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
-    funding_purpose: str | None = Field(default=None, pattern=_FUNDING_PURPOSES)
+    funding_goal: float = Field(gt=0, le=999_999_999_999.99)
+    funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
+    use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
     # Consent captured in the same moment as the file. Optional, because a rep
     # may have only an email, or the owner may decline: a file must still open.
@@ -151,6 +153,8 @@ class DealerRead(ORM):
     bucket_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
+    archived_by_user_id: UUID | None = None
     started_on: date | None = None
     entity_type: str | None = None
     naics_code: str | None = None
@@ -185,6 +189,9 @@ class DealerListItem(ORM):
     state: str | None = None
     status: str
     created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    archived_by_user_id: UUID | None = None
     # 0120: client-file grouping (group_name filled by the router's outerjoin)
     group_id: UUID | None = None
     group_name: str | None = None
@@ -203,6 +210,37 @@ class DealerListItem(ORM):
     credit_returned: bool = False
     verified: bool = False
     funding_goal: float | None = None
+
+
+class PortfolioOwnerSummary(BaseModel):
+    id: UUID
+    name: str
+    email: str | None = None
+    ownership_pct: float | None = None
+
+
+class DealerPortfolioItem(DealerListItem):
+    address: str | None = None
+    owners: list[PortfolioOwnerSummary] = Field(default_factory=list)
+
+
+class DealerPortfolioPage(BaseModel):
+    items: list[DealerPortfolioItem] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+
+
+class IntegrationProviderStatus(BaseModel):
+    configured: bool
+    environment: str
+    endpoint: str | None = None
+    detail: str
+
+
+class DealerIntegrationStatus(BaseModel):
+    isoftpull: IntegrationProviderStatus
+    plaid: IntegrationProviderStatus
 
 
 class TargetRead(ORM):
@@ -1779,6 +1817,10 @@ class OwnerRead(ORM):
     is_primary: bool = False
     invite_sent_at: datetime | None = None
     invite_opened_at: datetime | None = None
+    credit_workflow_status: str | None = None
+    credit_delivery_detail: str | None = None
+    credit_provider_request_id: str | None = None
+    credit_provider_error_category: str | None = None
     has_invite: bool = False
     credit_score: int | None = None
     credit_tier: str | None = None
@@ -1893,15 +1935,15 @@ class PublicConsentView(BaseModel):
     dealer_name: str
     fields_needed: list[str]  # subset of dob/street/city/state/zip still missing
     completed: bool
-    # True when the file's room carries an access code: the submit then
-    # requires it. Old links minted before rooms existed stay usable.
+    # Kept for older clients; owner consent links no longer depend on the
+    # unrelated document-room passcode.
     requires_code: bool = False
 
 
 class PublicConsentSubmit(BaseModel):
     """FCRA consent is a hard precondition; profile fields fill ONLY currently
     empty owner columns (never overwrite what the advisor already has)."""
-    # The room access code, when the view said one is required.
+    # Backward-compatible no-op for older clients.
     access_code: str | None = Field(default=None, max_length=64)
 
     fcra_consent: bool = False

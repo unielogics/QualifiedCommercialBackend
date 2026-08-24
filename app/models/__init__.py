@@ -32,9 +32,13 @@ from app.models.ai_usage_event import AIUsageEvent  # noqa: F401
 from app.models.app_settings import AppSettings  # noqa: F401
 from app.models.application_profile import (  # noqa: F401
     ApplicationBankConsent,
+    ApplicationExtractedFact,
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationTaxonomyEntry,
+    ApplicationVerificationInvitation,
+    FundingCategory,
 )
 from app.models.admin_activity import AdminActivitySeen, AdminDigestState  # noqa: F401
 from app.models.analysis_run import AnalysisRun  # noqa: F401

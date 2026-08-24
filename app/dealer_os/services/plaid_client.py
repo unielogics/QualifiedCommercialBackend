@@ -123,7 +123,11 @@ def enabled() -> bool:
 
 def environment() -> str:
     env = _env("DEALER_OS_PLAID_ENV").lower() or "sandbox"
-    return env if env in _HOSTS else "sandbox"
+    if env not in _HOSTS:
+        raise PlaidUnavailable(
+            "DEALER_OS_PLAID_ENV must be sandbox or production; refusing to fall back"
+        )
+    return env
 
 
 def _base() -> str:

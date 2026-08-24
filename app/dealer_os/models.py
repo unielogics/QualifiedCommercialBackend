@@ -74,6 +74,12 @@ class DealerBusiness(TimestampMixin, Base):
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
+    # Rep-facing deletion is an archive tombstone. The file and every related
+    # credit, bank, document, message, and audit row remain intact.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
     owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -699,6 +705,10 @@ class DealerOwner(TimestampMixin, Base):
     invite_token_hash: Mapped[str | None] = mapped_column(String(64))
     invite_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     invite_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credit_workflow_status: Mapped[str | None] = mapped_column(String(32))
+    credit_delivery_detail: Mapped[str | None] = mapped_column(String(240))
+    credit_provider_request_id: Mapped[str | None] = mapped_column(String(120))
+    credit_provider_error_category: Mapped[str | None] = mapped_column(String(48))
 
     @property
     def has_invite(self) -> bool:
