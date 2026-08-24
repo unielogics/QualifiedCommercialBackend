@@ -387,26 +387,54 @@ def render_contract_certificate_pdf(
     qc_name_default = qc_name_default.default if qc_name_default else None
     qc_signature_datauri_value = qc_signature_datauri() if qc_name_default else None
 
-    def signature_section_para_html(text: str) -> str:
-        m = _BY_LINE_RE.match(text)
-        if not m:
-            return para_html(text)
-        by_name = m.group(1).strip()
-        if qc_signature_datauri_value and by_name == qc_name_default:
-            return (
-                '<div class="signature-block">'
-                f'<img class="contract-sig" src="{qc_signature_datauri_value}" alt="Qualified Commercial signature"/>'
-                f'<div>{html.escape(text)}</div>'
-                '</div>'
-            )
-        if signer_signature_datauri and " ".join(by_name.casefold().split()) == " ".join(typed_name.casefold().split()):
-            return (
-                '<div class="signature-block">'
-                f'<img class="contract-sig" src="{signer_signature_datauri}" alt="Counterparty signature"/>'
-                f'<div>{html.escape(text)}</div>'
-                '</div>'
-            )
-        return para_html(text)
+    def signature_section_html(sec: ContractSection) -> str:
+        # Signature sections place Qualified Commercial first and the
+        # counterparty second. Track which slot has been rendered so a
+        # counterparty who is also named Jonathan Franco does not receive the
+        # company's standing signature a second time.
+        qc_signature_rendered = False
+        signer_signature_rendered = False
+        paragraphs: list[str] = []
+        normalized_qc_name = " ".join((qc_name_default or "").casefold().split())
+        normalized_signer_name = " ".join(typed_name.casefold().split())
+
+        for text in sec.paragraphs:
+            m = _BY_LINE_RE.match(text)
+            if not m:
+                paragraphs.append(para_html(text))
+                continue
+
+            by_name = m.group(1).strip()
+            normalized_by_name = " ".join(by_name.casefold().split())
+            if (
+                qc_signature_datauri_value
+                and not qc_signature_rendered
+                and normalized_by_name == normalized_qc_name
+            ):
+                qc_signature_rendered = True
+                paragraphs.append(
+                    '<div class="signature-block">'
+                    f'<img class="contract-sig" src="{qc_signature_datauri_value}" alt="Qualified Commercial signature"/>'
+                    f'<div>{html.escape(text)}</div>'
+                    '</div>'
+                )
+                continue
+            if (
+                signer_signature_datauri
+                and not signer_signature_rendered
+                and normalized_by_name == normalized_signer_name
+            ):
+                signer_signature_rendered = True
+                paragraphs.append(
+                    '<div class="signature-block">'
+                    f'<img class="contract-sig" src="{signer_signature_datauri}" alt="Counterparty signature"/>'
+                    f'<div>{html.escape(text)}</div>'
+                    '</div>'
+                )
+                continue
+            paragraphs.append(para_html(text))
+
+        return "".join(paragraphs)
 
     def table_html(sec: ContractSection) -> str:
         if not sec.rows:
@@ -425,9 +453,10 @@ def render_contract_certificate_pdf(
     preamble_html = "".join(para_html(p) for p in rendered.preamble)
     sections_html = "".join(
         f'<h2>{html.escape(sec.heading)}</h2>'
-        + "".join(
-            (signature_section_para_html if sec.heading in _SIGNATURE_SECTION_HEADINGS else para_html)(p)
-            for p in sec.paragraphs
+        + (
+            signature_section_html(sec)
+            if sec.heading in _SIGNATURE_SECTION_HEADINGS
+            else "".join(para_html(p) for p in sec.paragraphs)
         )
         + table_html(sec)
         for sec in rendered.sections

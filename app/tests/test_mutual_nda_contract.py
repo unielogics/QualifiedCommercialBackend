@@ -120,3 +120,42 @@ def test_signed_pdf_contains_signature_evidence_and_visible_signature_images(
     assert "By: Jane Doe" in certificate_html
     assert "By: Jonathan Franco" in certificate_html
     assert certificate_html.count('class="contract-sig"') == 2
+
+
+def test_signed_pdf_keeps_counterparty_drawing_when_signer_matches_qc_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _values()
+    values["counterparty_signer_name"] = "Jonathan Franco"
+    rendered = render_contract_document(ContractType.MUTUAL_NDA_NON_CIRCUMVENTION, values)
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    signature_datauri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    captured: dict[str, str] = {}
+
+    class FakeHTML:
+        def __init__(self, *, string: str):
+            captured["html"] = string
+
+        def write_pdf(self) -> bytes:
+            return b"%PDF-test"
+
+    monkeypatch.setitem(sys.modules, "weasyprint", types.SimpleNamespace(HTML=FakeHTML))
+
+    render_contract_certificate_pdf(
+        rendered=rendered,
+        contract_type=ContractType.MUTUAL_NDA_NON_CIRCUMVENTION,
+        contract_number="QC-NDA-2026-000002",
+        typed_name="Jonathan Franco",
+        document_hash=contract_document_hash(rendered),
+        ip_address="198.51.100.10",
+        user_agent="Agreement test",
+        signed_at=datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc),
+        signer_signature_datauri=signature_datauri,
+        signature_hash="b" * 64,
+    )
+
+    certificate_html = captured["html"]
+    assert certificate_html.count('alt="Qualified Commercial signature"') == 1
+    assert certificate_html.count('alt="Counterparty signature"') == 1
