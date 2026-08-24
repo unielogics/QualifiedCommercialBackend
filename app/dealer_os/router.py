@@ -11227,7 +11227,10 @@ async def public_credit_consent_view(
         await db.commit()
     return PublicConsentView(
         first_name=owner.first_name,
+        last_name=owner.last_name,
         last_initial=(owner.last_name or "")[:1],
+        email=owner.email or "",
+        phone=owner.phone or "",
         dealer_name=dealer.name if dealer is not None else "",
         fields_needed=_owner_missing_pull_fields(owner),
         completed=owner.credit_pulled_at is not None,
@@ -11296,6 +11299,30 @@ async def public_credit_consent_submit(
             status.HTTP_409_CONFLICT,
             "This owner no longer requires a credit authorization for this file.",
         )
+    first_name = body.first_name.strip()
+    last_name = body.last_name.strip()
+    email = _normalized_owner_email(str(body.email))
+    phone = consent_delivery.normalize_phone(body.phone)
+    if not first_name or not last_name or email is None or phone is None:
+        await _release_token()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Confirm your first name, last name, personal email, and valid phone number",
+        )
+    try:
+        await _assert_owner_email_unique(
+            db,
+            dealer.id,
+            email,
+            exclude_owner_id=owner.id,
+        )
+    except HTTPException:
+        await _release_token()
+        raise
+    owner.first_name = first_name
+    owner.last_name = last_name
+    owner.email = email
+    owner.phone = phone
     for f in _OWNER_PULL_REQUIRED_FIELDS:
         value = getattr(body, f)
         if value is not None and getattr(owner, f, None) in (None, ""):

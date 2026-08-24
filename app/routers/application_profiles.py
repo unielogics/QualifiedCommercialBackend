@@ -1153,7 +1153,10 @@ async def public_application_credit_consent(
     fields_needed = [field for field in ("dob", "street", "city", "state", "zip") if not getattr(owner, field)]
     return PublicFileOwnerConsentRead(
         first_name=owner.first_name,
+        last_name=owner.last_name,
         last_initial=(owner.last_name or "")[:1],
+        email=owner.email or "",
+        phone=owner.phone or "",
         business_name=_business_label(profile, intake, client),
         fields_needed=fields_needed,
         completed=owner.credit_complete,
@@ -1193,6 +1196,25 @@ async def submit_public_application_credit_consent(
     if not state.ownership_complete or not owner.credit_required:
         await release()
         raise HTTPException(status.HTTP_409_CONFLICT, "The ownership schedule changed; contact your representative")
+    first_name = payload.first_name.strip()
+    last_name = payload.last_name.strip()
+    email = profiles.normalized_email(str(payload.email))
+    phone = profiles.normalized_phone(payload.phone)
+    if not first_name or not last_name or email is None or phone is None:
+        await release()
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Confirm your first name, last name, personal email, and valid phone number",
+        )
+    try:
+        await _assert_unique_email(db, profile, email, exclude_id=owner.id)
+    except HTTPException:
+        await release()
+        raise
+    owner.first_name = first_name
+    owner.last_name = last_name
+    owner.email = email
+    owner.phone = phone
     for field in ("dob", "street", "city", "state", "zip"):
         value = getattr(payload, field)
         if value is not None and not getattr(owner, field):

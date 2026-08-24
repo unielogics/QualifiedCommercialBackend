@@ -25,9 +25,11 @@ from app.dealer_os.schemas import (
     PlaidExchange,
     PlaidItemPatch,
     PublicPlaidItemRead,
+    PublicConsentSubmit,
     RoomFeaturesRead,
     VerificationRead,
 )
+from app.schemas.application_profile import PublicFileOwnerConsentSubmit
 from app.dealer_os.services import plaid_client
 from app.dealer_os.services.decision import assess_verification
 from app.enums import Role
@@ -96,6 +98,33 @@ def test_credit_requirement_uses_inclusive_twenty_percent_threshold() -> None:
 
     assert below.credit_required is False
     assert exact.credit_required is True
+
+
+@pytest.mark.parametrize("schema", [PublicConsentSubmit, PublicFileOwnerConsentSubmit])
+def test_public_owner_consent_requires_confirmed_contact(schema) -> None:
+    payload = schema.model_validate(
+        {
+            "fcra_consent": True,
+            "first_name": "Jonathan",
+            "last_name": "Franco",
+            "email": "jonathan@example.com",
+            "phone": "(551) 404-9732",
+            "dob": "1995-05-09",
+        }
+    )
+    assert payload.first_name == "Jonathan"
+    assert str(payload.email) == "jonathan@example.com"
+
+    with pytest.raises(ValidationError):
+        schema.model_validate(
+            {
+                "fcra_consent": True,
+                "first_name": "Jonathan",
+                "last_name": "Franco",
+                "email": "not-an-email",
+                "phone": "(551) 404-9732",
+            }
+        )
 
 
 @pytest.mark.asyncio

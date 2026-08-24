@@ -7,7 +7,7 @@ from typing import Literal
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class ORM(BaseModel):
@@ -1988,7 +1988,10 @@ class PublicConsentView(BaseModel):
     Never scores, summaries, or other owners."""
 
     first_name: str
+    last_name: str
     last_initial: str
+    email: str
+    phone: str
     dealer_name: str
     fields_needed: list[str]  # subset of dob/street/city/state/zip still missing
     completed: bool
@@ -1998,12 +2001,16 @@ class PublicConsentView(BaseModel):
 
 
 class PublicConsentSubmit(BaseModel):
-    """FCRA consent is a hard precondition; profile fields fill ONLY currently
-    empty owner columns (never overwrite what the advisor already has)."""
+    """FCRA consent is a hard precondition. The owner confirms or corrects
+    their identity/contact fields; bureau-only profile fields fill empty data."""
     # Backward-compatible no-op for older clients.
     access_code: str | None = Field(default=None, max_length=64)
 
     fcra_consent: bool = False
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    email: EmailStr
+    phone: str = Field(min_length=8, max_length=48)
     dob: date | None = None
     street: str | None = Field(default=None, max_length=240)
     city: str | None = Field(default=None, max_length=120)

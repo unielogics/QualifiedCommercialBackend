@@ -583,7 +583,10 @@ class UnifiedAuditEvent(BaseModel):
 
 class PublicFileOwnerConsentRead(BaseModel):
     first_name: str
+    last_name: str
     last_initial: str
+    email: str
+    phone: str
     business_name: str
     fields_needed: list[str] = Field(default_factory=list)
     completed: bool = False
@@ -591,6 +594,10 @@ class PublicFileOwnerConsentRead(BaseModel):
 
 class PublicFileOwnerConsentSubmit(BaseModel):
     fcra_consent: bool = False
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    email: EmailStr
+    phone: str = Field(min_length=8, max_length=48)
     dob: date | None = None
     street: str | None = Field(default=None, max_length=240)
     city: str | None = Field(default=None, max_length=120)
