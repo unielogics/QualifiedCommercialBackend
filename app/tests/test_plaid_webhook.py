@@ -116,13 +116,15 @@ async def test_the_algorithm_is_pinned_to_es256():
 
 
 class _FakeDB:
-    """Just enough of a session to return one item for a select()."""
+    """Just enough of a session to resolve Dealer and application items."""
 
-    def __init__(self, item):
-        self._item = item
+    def __init__(self, item, application_item=None):
+        self._items = [item, application_item]
+        self._calls = 0
 
     async def execute(self, _stmt):
-        item = self._item
+        item = self._items[min(self._calls, len(self._items) - 1)]
+        self._calls += 1
         return SimpleNamespace(scalar_one_or_none=lambda: item)
 
 
@@ -153,6 +155,42 @@ async def test_revocation_stops_everything_and_drops_the_token():
     assert item.auto_refresh is False
     assert item.next_refresh_at is None
     assert item.encrypted_access_token is None
+
+
+@pytest.mark.asyncio
+async def test_application_profile_items_receive_the_same_webhook_handling():
+    item = _item(error="stale warning")
+    out = await plaid_webhook.handle(
+        _FakeDB(None, application_item=item),
+        {
+            "webhook_type": "STATEMENTS",
+            "webhook_code": "STATEMENTS_REFRESH_COMPLETE",
+            "item_id": "itm_1",
+            "result": "SUCCESS",
+        },
+    )
+    assert out == "sync queued"
+    assert item.next_refresh_at is not None
+    assert item.error is None
+
+
+@pytest.mark.asyncio
+async def test_account_revocation_preserves_the_remaining_item_connection():
+    item = _item()
+    out = await plaid_webhook.handle(
+        _FakeDB(item),
+        {
+            "webhook_type": "ITEM",
+            "webhook_code": "USER_ACCOUNT_REVOKED",
+            "item_id": "itm_1",
+            "account_id": "acct_revoked",
+        },
+    )
+    assert out == "account revocation flagged"
+    assert item.status == "active"
+    assert item.encrypted_access_token == "cipher"
+    assert item.next_refresh_at is not None
+    assert "one linked bank account" in item.error
 
 
 @pytest.mark.asyncio
