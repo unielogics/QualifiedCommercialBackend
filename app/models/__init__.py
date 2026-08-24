@@ -36,6 +36,7 @@ from app.models.application_profile import (  # noqa: F401
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationRoomDelivery,
     ApplicationTaxonomyEntry,
     ApplicationVerificationInvitation,
     FundingCategory,

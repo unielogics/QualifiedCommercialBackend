@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.config import get_settings
 from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
 from app.dealer_os.services import consent_delivery, plaid_client
@@ -28,12 +29,13 @@ from app.models.application_profile import (
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationRoomDelivery,
     ApplicationTaxonomyEntry,
     ApplicationVerificationInvitation,
     FundingCategory,
     PlaidAssetReport,
 )
-from app.models.bucket import BucketFile
+from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
@@ -51,6 +53,15 @@ from app.schemas.application_profile import (
     ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
+    ApplicationRoomAccess,
+    ApplicationRoomConsentGrant,
+    ApplicationRoomPlaidExchange,
+    ApplicationRoomPlaidUpdate,
+    ApplicationRoomPrimaryBank,
+    ApplicationRoomSignRequest,
+    ApplicationRoomSignResult,
+    ApplicationRoomSignable,
+    ApplicationRoomState,
     ClassificationConfirm,
     ClassificationPatch,
     ClassificationPreview,
@@ -72,6 +83,11 @@ from app.schemas.application_profile import (
     PublicFileOwnerConsentRead,
     PublicFileOwnerConsentResult,
     PublicFileOwnerConsentSubmit,
+    RoomDeliveryReceipt,
+    RoomPinRotateRequest,
+    RoomReminderCreate,
+    RoomRequestCreate,
+    RoomRequestResult,
     SecureBankFileUploadComplete,
     SecureBankFileUploadInit,
     TaxonomyContributionCreate,
@@ -85,6 +101,7 @@ from app.schemas.application_profile import (
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import plaid_lifecycle
+from app.routers.buckets import _hash_passcode, _verify_passcode
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 
@@ -426,6 +443,355 @@ async def get_application_profile(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationProfileRead:
     return profiles.profile_read(await profiles.load_profile(db, profile_id, user))
+
+
+def _masked_recipient(channel: str, email: str | None, phone: str | None) -> str | None:
+    if channel == "email" and email and "@" in email:
+        local, domain = email.split("@", 1)
+        return f"{local[:2]}***@{domain}"
+    if channel == "sms" and phone:
+        digits = "".join(value for value in phone if value.isdigit())
+        return f"***-***-{digits[-4:]}" if len(digits) >= 4 else "***"
+    return None
+
+
+def _room_delivery_read(row: ApplicationRoomDelivery) -> RoomDeliveryReceipt:
+    provider = row.provider_result if isinstance(row.provider_result, dict) else {}
+    return RoomDeliveryReceipt(
+        id=row.id,
+        action_kind=row.action_kind,
+        channel=row.channel,
+        recipient_masked=_masked_recipient(
+            row.channel, row.recipient_email, row.recipient_phone
+        ),
+        status=row.status,
+        detail=row.detail,
+        provider_accepted=bool(provider.get("accepted")),
+        created_at=row.created_at,
+    )
+
+
+async def _profile_room_link(
+    db: AsyncSession, profile: ApplicationProfile
+) -> BucketUploadLink:
+    if profile.primary_bucket_id is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no application room")
+    link = (
+        await db.execute(
+            select(BucketUploadLink)
+            .where(
+                BucketUploadLink.bucket_id == profile.primary_bucket_id,
+                BucketUploadLink.status == "active",
+            )
+            .order_by(BucketUploadLink.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no active application room")
+    return link
+
+
+def _room_url(link: BucketUploadLink, *, query: str | None = None) -> str:
+    base = f"{get_settings().frontend_app_url.rstrip('/')}/buckets/request/{link.token}"
+    return f"{base}?{query}" if query else base
+
+
+async def _persist_room_delivery(
+    db: AsyncSession,
+    *,
+    profile: ApplicationProfile,
+    requested_document_id: UUID | None,
+    action_kind: str,
+    channel: str,
+    recipient_email: str | None,
+    recipient_phone: str | None,
+    status_value: str,
+    detail: str,
+    accepted: bool,
+    user: User,
+) -> ApplicationRoomDelivery:
+    row = ApplicationRoomDelivery(
+        profile_id=profile.id,
+        bucket_id=profile.primary_bucket_id,
+        requested_document_id=requested_document_id,
+        action_kind=action_kind,
+        channel=channel,
+        recipient_email=recipient_email,
+        recipient_phone=recipient_phone,
+        status=status_value,
+        detail=detail,
+        provider_result={"accepted": accepted},
+        created_by_user_id=user.id,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def _deliver_room_request(
+    db: AsyncSession,
+    *,
+    profile: ApplicationProfile,
+    user: User,
+    link: BucketUploadLink,
+    action_kind: str,
+    purpose: str,
+    query: str,
+    email: str | None,
+    phone: str | None,
+    send_email: bool,
+    send_sms: bool,
+    requested_document_id: UUID | None = None,
+) -> list[ApplicationRoomDelivery]:
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    business_name = _business_label(profile, intake, client)
+    path = f"/buckets/request/{link.token}?{query}"
+    rows: list[ApplicationRoomDelivery] = []
+    if send_email:
+        delivery = await consent_delivery.deliver_link_checked(
+            db,
+            channel="email",
+            to_email=email,
+            to_phone=None,
+            business_name=business_name,
+            purpose=purpose,
+            path=path,
+            rep_name=user.name,
+            origin=get_settings().frontend_app_url,
+        )
+        rows.append(
+            await _persist_room_delivery(
+                db,
+                profile=profile,
+                requested_document_id=requested_document_id,
+                action_kind=action_kind,
+                channel="email",
+                recipient_email=email,
+                recipient_phone=None,
+                status_value="sent" if delivery.email_ok else "failed",
+                detail=delivery.detail,
+                accepted=delivery.email_ok,
+                user=user,
+            )
+        )
+    if send_sms:
+        delivery = await consent_delivery.deliver_link_checked(
+            db,
+            channel="sms",
+            to_email=None,
+            to_phone=phone,
+            business_name=business_name,
+            purpose=purpose,
+            path=path,
+            rep_name=user.name,
+            origin=get_settings().frontend_app_url,
+        )
+        rows.append(
+            await _persist_room_delivery(
+                db,
+                profile=profile,
+                requested_document_id=requested_document_id,
+                action_kind=action_kind,
+                channel="sms",
+                recipient_email=None,
+                recipient_phone=phone,
+                status_value="sent" if delivery.sms_ok else "failed",
+                detail=delivery.detail,
+                accepted=delivery.sms_ok,
+                user=user,
+            )
+        )
+    if not send_email and not send_sms:
+        rows.append(
+            await _persist_room_delivery(
+                db,
+                profile=profile,
+                requested_document_id=requested_document_id,
+                action_kind=action_kind,
+                channel="none",
+                recipient_email=email,
+                recipient_phone=phone,
+                status_value="created",
+                detail="Created without sending",
+                accepted=False,
+                user=user,
+            )
+        )
+    return rows
+
+
+def _delivery_overall(rows: list[ApplicationRoomDelivery]) -> str:
+    attempted = [row for row in rows if row.channel != "none"]
+    if not attempted:
+        return "created"
+    sent = sum(row.status == "sent" for row in attempted)
+    if sent == len(attempted):
+        return "success"
+    if sent:
+        return "partial"
+    return "failed"
+
+
+@router.get("/{profile_id}/room/deliveries", response_model=list[RoomDeliveryReceipt])
+async def list_application_room_deliveries(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[RoomDeliveryReceipt]:
+    profile = await profiles.load_profile(db, profile_id, user)
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationRoomDelivery)
+                .where(
+                    or_(
+                        ApplicationRoomDelivery.profile_id == profile.id,
+                        ApplicationRoomDelivery.bucket_id == profile.primary_bucket_id,
+                    )
+                )
+                .order_by(ApplicationRoomDelivery.created_at.desc())
+                .limit(100)
+            )
+        ).scalars().all()
+    )
+    return [_room_delivery_read(row) for row in rows]
+
+
+@router.post("/{profile_id}/room/pin/rotate", response_model=RoomRequestResult)
+async def rotate_application_room_pin(
+    profile_id: UUID,
+    payload: RoomPinRotateRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomRequestResult:
+    profile = await profiles.load_profile(db, profile_id, user)
+    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may rotate the room PIN")
+    link = await _profile_room_link(db, profile)
+    link.passcode_hash = _hash_passcode(payload.secure_room_pin)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "room.pin_rotated",
+        "Rotated the secure application-room PIN",
+        target_type="upload_link",
+        target_id=link.id,
+    )
+    await db.commit()
+    return RoomRequestResult(room_url=_room_url(link), overall_status="created")
+
+
+@router.post("/{profile_id}/room/requests", response_model=RoomRequestResult)
+async def create_application_room_request(
+    profile_id: UUID,
+    payload: RoomRequestCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomRequestResult:
+    profile = await profiles.load_profile(db, profile_id, user)
+    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may create room requests")
+    link = await _profile_room_link(db, profile)
+    requested = BucketRequestedDocument(
+        bucket_id=profile.primary_bucket_id,
+        name=payload.name.strip(),
+        category=(payload.category or "Other").strip(),
+        description=(payload.instructions or "").strip() or None,
+        required=True,
+        allow_multiple_files=payload.allow_multiple_files,
+        status="requested",
+        is_custom=True,
+    )
+    db.add(requested)
+    await db.flush()
+    email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
+    phone = profiles.normalized_phone(payload.recipient_phone)
+    rows = await _deliver_room_request(
+        db,
+        profile=profile,
+        user=user,
+        link=link,
+        action_kind="document_request",
+        purpose=f"provide {requested.name}",
+        query=f"tab=todo&request={requested.id}",
+        email=email,
+        phone=phone,
+        send_email=payload.email_room_link,
+        send_sms=payload.sms_reminder,
+        requested_document_id=requested.id,
+    )
+    overall = _delivery_overall(rows)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "room.document_requested",
+        f"Requested {requested.name}; delivery {overall}",
+        target_type="requested_document",
+        target_id=requested.id,
+        metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},
+    )
+    await db.commit()
+    return RoomRequestResult(
+        requested_document_id=requested.id,
+        room_url=_room_url(link, query=f"tab=todo&request={requested.id}"),
+        overall_status=overall,
+        deliveries=[_room_delivery_read(row) for row in rows],
+    )
+
+
+@router.post("/{profile_id}/room/reminders", response_model=RoomRequestResult)
+async def send_application_room_reminder(
+    profile_id: UUID,
+    payload: RoomReminderCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomRequestResult:
+    profile = await profiles.load_profile(db, profile_id, user)
+    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may send room reminders")
+    link = await _profile_room_link(db, profile)
+    query = "tab=banking" if payload.purpose == "business_banking" else "tab=todo"
+    purpose = (
+        "connect or upload business bank statements"
+        if payload.purpose == "business_banking"
+        else "complete the requested application items"
+    )
+    email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
+    phone = profiles.normalized_phone(payload.recipient_phone)
+    rows = await _deliver_room_request(
+        db,
+        profile=profile,
+        user=user,
+        link=link,
+        action_kind=f"{payload.purpose}_reminder",
+        purpose=purpose,
+        query=query,
+        email=email,
+        phone=phone,
+        send_email=payload.email_room_link,
+        send_sms=payload.sms_reminder,
+    )
+    overall = _delivery_overall(rows)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "room.reminder_sent",
+        f"Sent {payload.purpose.replace('_', ' ')} reminder; delivery {overall}",
+        target_type="upload_link",
+        target_id=link.id,
+        metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},
+    )
+    await db.commit()
+    return RoomRequestResult(
+        room_url=_room_url(link, query=query),
+        overall_status=overall,
+        deliveries=[_room_delivery_read(row) for row in rows],
+    )
 
 
 @router.get("/{profile_id}/extracted-facts", response_model=list[ExtractedFactRead])
@@ -918,6 +1284,425 @@ async def _public_bank_invitation(
     if profile is None or profile.dealer_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "This bank verification link is not valid")
     return invitation, profile
+
+
+async def _public_application_room(
+    db: AsyncSession,
+    token: str,
+    passcode: str,
+    request: Request,
+) -> tuple[BucketUploadLink, ApplicationProfile]:
+    link = (
+        await db.execute(
+            select(BucketUploadLink).where(
+                BucketUploadLink.token == token,
+                BucketUploadLink.status == "active",
+            )
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application room not found")
+    if not _verify_passcode(
+        passcode,
+        link.passcode_hash,
+        attempt_scope=_client_ip(request) or "unknown",
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid room PIN")
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(
+                ApplicationProfile.primary_bucket_id == link.bucket_id
+            )
+        )
+    ).scalar_one_or_none()
+    # Dealer rooms retain their existing Dealer OS contract and endpoints.
+    if profile is None or profile.dealer_id is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application banking is not enabled for this room")
+    return link, profile
+
+
+async def _application_bank_state(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ApplicationBankState:
+    disclosure = dealer_bank_consent.disclosure()
+    return ApplicationBankState(
+        enabled=plaid_client.enabled(),
+        environment=plaid_client.environment(),
+        consent_granted=await _application_consent_granted(db, profile.id),
+        disclosure_version=disclosure["version"],
+        disclosure_text=disclosure["text"],
+        items=await profiles.bank_rows(db, profile),
+        manual_override=profile.bank_verification_override_at is not None,
+        manual_override_reason=profile.bank_verification_override_reason,
+        manual_statement_months=await profiles.manual_statement_months(db, profile),
+        assets_enabled=plaid_client.assets_enabled(),
+        asset_reports=[
+            PlaidAssetReportRead.model_validate(row)
+            for row in await plaid_lifecycle.owner_asset_reports(db, profile_id=profile.id)
+        ],
+    )
+
+
+async def _application_room_signables(
+    db: AsyncSession, bucket_id: UUID
+) -> list[ApplicationRoomSignable]:
+    rows = list(
+        (
+            await db.execute(
+                select(BucketRequestedDocument).where(
+                    BucketRequestedDocument.bucket_id == bucket_id,
+                    BucketRequestedDocument.requires_signature.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from app.services import document_signature as sig_service
+
+    return [
+        ApplicationRoomSignable(
+            id=row.id,
+            name=row.name,
+            kind=row.signature_kind,
+            signed=row.status == "uploaded",
+            document_text=(
+                row.signature_document_text
+                or (
+                    sig_service.credit_authorization_document_text()
+                    if row.signature_kind == "credit_authorization"
+                    else ""
+                )
+            ),
+            signable=bool(
+                row.signature_document_text
+                or row.signature_kind == "credit_authorization"
+            ),
+        )
+        for row in rows
+    ]
+
+
+@router.post("/public/room/{token}/state", response_model=ApplicationRoomState)
+async def public_application_room_state(
+    token: str,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationRoomState:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    return ApplicationRoomState(
+        profile_id=profile.id,
+        business_name=_business_label(profile, intake, client),
+        room_url=_room_url(link),
+        capabilities=["documents", "business_banking", "agreements"],
+        banking=await _application_bank_state(db, profile),
+        signable=await _application_room_signables(db, link.bucket_id),
+    )
+
+
+@router.post("/public/room/{token}/bank-consent", response_model=ApplicationRoomState)
+async def public_application_room_consent(
+    token: str,
+    payload: ApplicationRoomConsentGrant,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationRoomState:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    disclosure = dealer_bank_consent.disclosure()
+    db.add(
+        ApplicationBankConsent(
+            profile_id=profile.id,
+            granted=payload.granted,
+            method="secure_room",
+            disclosure_version=disclosure["version"],
+            disclosure_hash=disclosure["hash"],
+            disclosure_text=disclosure["text"],
+            consenter_name=payload.consenter_name,
+            ip_address=_client_ip(request),
+            user_agent=(request.headers.get("user-agent") or "")[:400] or None,
+        )
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "bank.consent.application_room",
+        "Client authorized LLC banking from the application room",
+        target_type="upload_link",
+        target_id=link.id,
+    )
+    await db.commit()
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    return ApplicationRoomState(
+        profile_id=profile.id,
+        business_name=_business_label(profile, intake, client),
+        room_url=_room_url(link),
+        capabilities=["documents", "business_banking", "agreements"],
+        banking=await _application_bank_state(db, profile),
+        signable=await _application_room_signables(db, link.bucket_id),
+    )
+
+
+@router.post(
+    "/public/room/{token}/sign",
+    response_model=ApplicationRoomSignResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_application_room_sign(
+    token: str,
+    payload: ApplicationRoomSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationRoomSignResult:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+
+    from types import SimpleNamespace
+
+    from app.routers.dealer_ai_intake import (
+        DealerDocumentSignRequest,
+        _sign_requested_document,
+    )
+
+    result_file = await _sign_requested_document(
+        db,
+        SimpleNamespace(bucket_id=link.bucket_id, bucket_upload_link_id=link.id),
+        DealerDocumentSignRequest(
+            requested_document_id=payload.requested_document_id,
+            typed_name=payload.typed_name,
+            esign_consent=payload.esign_consent,
+            signature_data_url=payload.signature_data_url,
+            applicant_legal_first_name=payload.applicant_legal_first_name,
+            applicant_legal_last_name=payload.applicant_legal_last_name,
+            applicant_dob=payload.applicant_dob,
+            applicant_street=payload.applicant_street,
+            applicant_city=payload.applicant_city,
+            applicant_state=payload.applicant_state,
+            applicant_zip=payload.applicant_zip,
+        ),
+        request,
+        actor_name=payload.typed_name,
+        actor_email=(
+            link.recipient_email
+            or (intake.email if intake else None)
+            or (client.email if client else None)
+            or ""
+        ),
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "document.signed.application_room",
+        "Client signed an application-room document",
+        target_type="requested_document",
+        target_id=payload.requested_document_id,
+        metadata={"signer": payload.typed_name, "file_id": str(result_file.id)},
+    )
+    await db.commit()
+    return ApplicationRoomSignResult(
+        signed=True,
+        certificate_file_id=result_file.id,
+        message="Signed. A copy of the executed document has been emailed to you.",
+    )
+
+
+@router.post("/public/room/{token}/plaid/link-token", response_model=ApplicationPlaidLinkTokenRead)
+async def public_application_room_link_token(
+    token: str,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationPlaidLinkTokenRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    if not await _application_consent_granted(db, profile.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the bank disclosure before continuing")
+    value = await plaid_client.create_link_token(
+        dealer_id=str(profile.id),
+        dealer_name=await _profile_plaid_display_name(db, profile),
+        redirect_override=plaid_client.room_redirect_uri() or None,
+    )
+    return ApplicationPlaidLinkTokenRead(link_token=value)
+
+
+@router.post("/public/room/{token}/plaid/exchange", response_model=ApplicationBankConnectionRead)
+async def public_application_room_exchange(
+    token: str,
+    payload: ApplicationRoomPlaidExchange,
+    request: Request,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankConnectionRead:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    if not await _application_consent_granted(db, profile.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bank authorization is required")
+    try:
+        access_token, plaid_item_id = await plaid_client.exchange_public_token(payload.public_token)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    existing = (
+        await db.execute(
+            select(ApplicationPlaidItem).where(ApplicationPlaidItem.item_id == plaid_item_id)
+        )
+    ).scalar_one_or_none()
+    if existing and existing.profile_id != profile.id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This bank connection belongs to another file")
+    item = existing or ApplicationPlaidItem(profile_id=profile.id, item_id=plaid_item_id)
+    if existing is None:
+        db.add(item)
+    item.institution_name = payload.institution_name
+    item.encrypted_access_token = plaid_client.encrypt_token(access_token)
+    item.environment = plaid_client.environment()
+    item.status = "active"
+    item.error = None
+    item.update_mode_reason = None
+    item.update_mode_account_selection = False
+    item.next_refresh_at = datetime.now(UTC)
+    await db.flush()
+    current = await profiles.bank_rows(db, profile)
+    if payload.is_primary_operating or not any(row.is_primary_operating for row in current):
+        await _make_primary(db, profile, item)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.connect.application_room",
+        f"Client connected {payload.institution_name or 'business bank'}",
+        target_type="plaid_item",
+        target_id=item.id,
+        metadata={"upload_link_id": str(link.id)},
+    )
+    await db.commit()
+    from app.services.application_plaid_sync import sync_item_background
+
+    background.add_task(sync_item_background, item.id)
+    return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
+
+
+@router.post(
+    "/public/room/{token}/plaid/{item_id}/update-link-token",
+    response_model=ApplicationPlaidLinkTokenRead,
+)
+async def public_application_room_update_link_token(
+    token: str,
+    item_id: UUID,
+    payload: ApplicationRoomPlaidUpdate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationPlaidLinkTokenRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    if not await _application_consent_granted(db, profile.id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
+    item = await _profile_plaid_item(db, profile, item_id)
+    value = await plaid_client.create_update_link_token(
+        access_token=plaid_lifecycle.decrypted_access_token(item),
+        client_user_id=str(profile.id),
+        display_name=await _profile_plaid_display_name(db, profile),
+        redirect_override=plaid_client.room_redirect_uri() or None,
+        account_selection_enabled=(
+            payload.account_selection_enabled or item.update_mode_account_selection
+        ),
+    )
+    return ApplicationPlaidLinkTokenRead(link_token=value)
+
+
+@router.post(
+    "/public/room/{token}/plaid/{item_id}/update-complete",
+    response_model=ApplicationBankConnectionRead,
+)
+async def public_application_room_update_complete(
+    token: str,
+    item_id: UUID,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankConnectionRead:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    item = await _profile_plaid_item(db, profile, item_id)
+    try:
+        await plaid_lifecycle.complete_update(item)
+    except plaid_client.PlaidUnavailable as exc:
+        await db.commit()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.update_mode.completed.application_room",
+        "Client repaired the business bank connection",
+        target_type="plaid_item",
+        target_id=item.id,
+        metadata={"upload_link_id": str(link.id)},
+    )
+    await db.commit()
+    return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
+
+
+@router.patch(
+    "/public/room/{token}/plaid/{item_id}/primary",
+    response_model=ApplicationBankConnectionRead,
+)
+async def public_application_room_primary_bank(
+    token: str,
+    item_id: UUID,
+    payload: ApplicationRoomPrimaryBank,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankConnectionRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    item = await _profile_plaid_item(db, profile, item_id)
+    await _make_primary(db, profile, item)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.primary.application_room",
+        "Client selected the primary operating bank",
+        target_type="plaid_item",
+        target_id=item.id,
+    )
+    await db.commit()
+    return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
+
+
+@router.delete("/public/room/{token}/plaid/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def public_application_room_disconnect(
+    token: str,
+    item_id: UUID,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    item = await _profile_plaid_item(db, profile, item_id)
+    was_primary = item.is_primary_operating
+    try:
+        await plaid_lifecycle.disconnect_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    if was_primary:
+        replacement = next(
+            (candidate for candidate in await _profile_plaid_items(db, profile) if candidate.id != item.id),
+            None,
+        )
+        if replacement:
+            await _make_primary(db, profile, replacement)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.disconnect.application_room",
+        "Client disconnected the bank; retained evidence remains on the file",
+        target_type="plaid_item",
+        target_id=item.id,
+        metadata={"upload_link_id": str(link.id)},
+    )
+    await db.commit()
 
 
 @router.get("/public/bank-verification/{token}", response_model=PublicBankVerificationRead)

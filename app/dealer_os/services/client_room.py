@@ -64,7 +64,7 @@ def _hash_passcode(passcode: str) -> str:
 
 
 def _generate_passcode() -> str:
-    return f"QC-{secrets.randbelow(900000) + 100000}"
+    return f"{secrets.randbelow(900000) + 100000}"
 
 
 def room_url(token: str) -> str:

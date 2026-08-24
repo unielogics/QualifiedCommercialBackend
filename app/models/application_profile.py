@@ -221,6 +221,48 @@ class ApplicationVerificationInvitation(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ApplicationRoomDelivery(TimestampMixin, Base):
+    """Persistent result of a secure-room request or reminder delivery.
+
+    Room tokens and PINs are intentionally absent. The row records only the
+    destination, provider outcome, and the business record that caused it.
+    """
+
+    __tablename__ = "application_room_deliveries"
+    __table_args__ = (
+        Index("ix_application_room_deliveries_profile", "profile_id", "created_at"),
+        Index("ix_application_room_deliveries_bucket", "bucket_id", "created_at"),
+        Index("ix_application_room_deliveries_request", "requested_document_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_profiles.id", ondelete="SET NULL"),
+    )
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("bucket_requested_documents.id", ondelete="SET NULL"),
+    )
+    action_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    recipient_phone: Mapped[str | None] = mapped_column(String(48))
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="created", server_default="created"
+    )
+    detail: Mapped[str | None] = mapped_column(Text)
+    provider_result: Mapped[dict | None] = mapped_column(JSONB)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
 class ApplicationOwner(TimestampMixin, Base):
     """An owner on a non-Dealer application profile.
 

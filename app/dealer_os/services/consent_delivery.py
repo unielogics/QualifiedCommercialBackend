@@ -135,6 +135,7 @@ def deliver_link(
     path: str,
     sms_consent_ok: bool,
     rep_name: str | None = None,
+    origin: str = AUDIT_ORIGIN,
 ) -> DeliveryResult:
     """Send one secure link.
 
@@ -159,7 +160,7 @@ def deliver_link(
     if channel == "none":
         return DeliveryResult(True, "none", "Nothing sent. Read the link out or copy it.")
 
-    url = f"{AUDIT_ORIGIN}{path}" if path.startswith("/") else path
+    url = f"{origin.rstrip('/')}{path}" if path.startswith("/") else path
     who = f"{rep_name} at Qualified Commercial" if rep_name else "Qualified Commercial"
 
     email_res: DeliveryResult | None = None

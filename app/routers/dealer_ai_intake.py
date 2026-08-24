@@ -26,6 +26,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, ContractType, Language, Role
 from app.models.activity import Activity
+from app.models.application_profile import ApplicationRoomDelivery
 from app.models.booking_settings import BookingSettings
 from app.models.bucket import Bucket, BucketAIMessage, BucketAIReview, BucketDocumentSignature, BucketFile, BucketFileAnalysis, BucketNote, BucketRequestedDocument, BucketShare, BucketUploadLink, BucketVendorAccess
 from app.models.client import Client
@@ -62,6 +63,7 @@ from app.services.bucket_ai import CHAT_TURN_ORDER, CURRENT_FILE_ANALYSIS_VERSIO
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
+from app.dealer_os.services import consent_delivery
 from app.services.main_street_programs import (
     TERM_3_5_MIN_DSCR,
     TERM_3_5_MIN_REVENUE,
@@ -434,6 +436,7 @@ class AdminLeadCreate(BaseModel):
     # Optionally assign the file to a dealer partner at creation, so the team's
     # first message on it reaches that partner's channel. Must be a dealer_partner.
     broker_user_id: UUID | None = None
+    secure_room_pin: str = Field(pattern=r"^\d{6}$")
 
     @field_validator("variant", mode="before")
     @classmethod
@@ -976,6 +979,9 @@ class DealerIntakeResponse(BaseModel):
     # admin_thread=True audience (admin cockpit + broker portal) — never sent
     # to the public/uploader client-facing response.
     notes: list[BucketNoteRead] = []
+    secure_room_pin: str | None = None
+    room_delivery_status: str | None = None
+    room_delivery_detail: str | None = None
 
 
 class DealerAILeadRow(BaseModel):
@@ -3078,7 +3084,14 @@ async def _find_or_create_funding_client(db: AsyncSession, payload: FundingRevie
     return client
 
 
-async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: DealerIntakeStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
+async def _create_bucket_for_intake(
+    db: AsyncSession,
+    client: Client,
+    payload: DealerIntakeStart,
+    request: Request,
+    *,
+    room_pin: str | None = None,
+) -> tuple[Bucket, BucketUploadLink]:
     owner = await primary_super_admin(db)
     bucket = Bucket(
         name=f"{payload.business_name or payload.full_name} Dealer AI Intake",
@@ -3123,7 +3136,7 @@ async def _create_bucket_for_intake(db: AsyncSession, client: Client, payload: D
                 is_custom=False,
             )
         )
-    passcode = _generate_passcode()
+    passcode = room_pin or _generate_passcode()
     link = BucketUploadLink(
         bucket_id=bucket.id,
         token=secrets.token_urlsafe(32),
@@ -3160,6 +3173,7 @@ async def _create_bucket_for_main_street(
     *,
     intent: str,
     industry: str,
+    room_pin: str | None = None,
 ) -> tuple[Bucket, BucketUploadLink]:
     """An operating-business file, with the documents its intent actually calls for.
 
@@ -3243,7 +3257,7 @@ async def _create_bucket_for_main_street(
             )
         )
 
-    passcode = _generate_passcode()
+    passcode = room_pin or _generate_passcode()
     link = BucketUploadLink(
         bucket_id=bucket.id,
         token=secrets.token_urlsafe(32),
@@ -3272,7 +3286,14 @@ async def _create_bucket_for_main_street(
     return bucket, link
 
 
-async def _create_bucket_for_funding_review(db: AsyncSession, client: Client, payload: FundingReviewStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
+async def _create_bucket_for_funding_review(
+    db: AsyncSession,
+    client: Client,
+    payload: FundingReviewStart,
+    request: Request,
+    *,
+    room_pin: str | None = None,
+) -> tuple[Bucket, BucketUploadLink]:
     owner = await primary_super_admin(db)
     investor_name = payload.investor_name or payload.full_name
     bucket = Bucket(
@@ -3322,7 +3343,7 @@ async def _create_bucket_for_funding_review(db: AsyncSession, client: Client, pa
                 is_custom=False,
             )
         )
-    passcode = _generate_passcode()
+    passcode = room_pin or _generate_passcode()
     link = BucketUploadLink(
         bucket_id=bucket.id,
         token=secrets.token_urlsafe(32),
@@ -4497,6 +4518,9 @@ async def _response(
     admin_thread: bool = False,
     thread_user: User | None = None,
     prequalification_widget: dict[str, Any] | None = None,
+    secure_room_pin: str | None = None,
+    room_delivery_status: str | None = None,
+    room_delivery_detail: str | None = None,
 ) -> DealerIntakeResponse:
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
@@ -4584,6 +4608,9 @@ async def _response(
         artifacts=[_artifact_read(artifact) for artifact in artifacts],
         email_sends=[_email_send_read(row) for row in email_sends],
         notes=[BucketNoteRead.model_validate(n) for n in notes],
+        secure_room_pin=secure_room_pin,
+        room_delivery_status=room_delivery_status,
+        room_delivery_detail=room_delivery_detail,
     )
 
 
@@ -6541,7 +6568,9 @@ async def create_admin_ai_lead(
             estimated_credit_tier=payload.estimated_credit_tier,
         )
         client = await _find_or_create_funding_client(db, adapter)
-        bucket, link = await _create_bucket_for_funding_review(db, client, adapter, request)
+        bucket, link = await _create_bucket_for_funding_review(
+            db, client, adapter, request, room_pin=payload.secure_room_pin
+        )
     elif is_ms:
         adapter = DealerIntakeStart(
             full_name=payload.full_name,
@@ -6551,7 +6580,13 @@ async def create_admin_ai_lead(
         )
         client = await _find_or_create_client(db, adapter)
         bucket, link = await _create_bucket_for_main_street(
-            db, client, adapter, request, intent=ms_intent, industry=ms_industry,
+            db,
+            client,
+            adapter,
+            request,
+            intent=ms_intent,
+            industry=ms_industry,
+            room_pin=payload.secure_room_pin,
         )
     else:
         adapter = DealerIntakeStart(
@@ -6561,7 +6596,9 @@ async def create_admin_ai_lead(
             business_name=payload.business_name,
         )
         client = await _find_or_create_client(db, adapter)
-        bucket, link = await _create_bucket_for_intake(db, client, adapter, request)
+        bucket, link = await _create_bucket_for_intake(
+            db, client, adapter, request, room_pin=payload.secure_room_pin
+        )
 
     # CRM traceability: mark that this client/lead originated from an admin action.
     if isinstance(client.lead_intake, dict):
@@ -6640,39 +6677,46 @@ async def create_admin_ai_lead(
     intake = await _load_admin_dealer_lead(db, intake.id)
 
     email_note = ""
-    # Main Street has no public client room yet — dealer, real estate and MCA each
-    # have a bespoke intake app and nothing equivalent exists for operating
-    # businesses. Emailing the client the dealer room would drop them into a
-    # floorplan questionnaire, so the link is withheld and the operator is told
-    # why. The lead itself is fully workable from the dashboard.
-    if payload.notify_client and is_ms:
-        email_note = (
-            " No login link was sent: operating-business leads have no client-facing"
-            " room yet, so work this file from the dashboard."
+    delivery_status = "created"
+    delivery_detail = "Room created without sending"
+    if payload.notify_client:
+        room_path = f"/buckets/request/{link.token}"
+        delivery = await consent_delivery.deliver_link_checked(
+            db,
+            channel="email",
+            to_email=intake.email,
+            to_phone=intake.phone,
+            business_name=intake.business_name or intake.full_name,
+            purpose="open the secure application room",
+            path=room_path,
+            rep_name=user.name,
+            origin=get_settings().frontend_app_url,
         )
-    elif payload.notify_client:
-        if is_re:
-            record = await _record_resume_email(
-                intake,
-                token=token,
-                request=request,
-                reason="admin_created",
-                public_path=FUNDING_PUBLIC_PATH,
-                review_label="real estate funding review",
-                room_label="real estate funding review file",
-                db=db,
-                sender_user_id=user.id,
+        delivery_status = "sent" if delivery.ok else "failed"
+        delivery_detail = delivery.detail
+        db.add(
+            ApplicationRoomDelivery(
+                bucket_id=bucket.id,
+                action_kind="room_created",
+                channel="email",
+                recipient_email=intake.email,
+                recipient_phone=intake.phone,
+                status=delivery_status,
+                detail=delivery.detail,
+                provider_result={
+                    "accepted": delivery.ok,
+                    "email_ok": delivery.email_ok,
+                    "sms_ok": delivery.sms_ok,
+                },
+                created_by_user_id=user.id,
             )
-        else:
-            record = await _record_resume_email(
-                intake, token=token, request=request, reason="admin_created", db=db, sender_user_id=user.id,
-            )
+        )
         await db.commit()
         intake = await _load_admin_dealer_lead(db, intake.id)
         email_note = (
-            " A secure login link was emailed to the client."
-            if record.get("ok")
-            else " Email delivery is unavailable; share the resume link manually."
+            " The secure room link was emailed to the client; share the PIN separately."
+            if delivery.ok
+            else " Room email delivery failed; copy the room link and share the PIN separately."
         )
 
     return await _response(
@@ -6691,6 +6735,9 @@ async def create_admin_ai_lead(
         admin_thread=True,
         thread_user=user,
         assistant_message=welcome_text + email_note,
+        secure_room_pin=payload.secure_room_pin,
+        room_delivery_status=delivery_status,
+        room_delivery_detail=delivery_detail,
     )
 
 

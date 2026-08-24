@@ -189,11 +189,17 @@ def _passcode_locked(key: str) -> bool:
     return True
 
 
-def _verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
+def _verify_passcode(
+    passcode: str,
+    passcode_hash: str | None,
+    *,
+    attempt_scope: str | None = None,
+) -> bool:
     if not passcode_hash:
         return False
     # Deny (and skip the expensive PBKDF2) while the target is locked out.
-    if _passcode_locked(passcode_hash):
+    attempt_key = f"{passcode_hash}:{attempt_scope}" if attempt_scope else passcode_hash
+    if _passcode_locked(attempt_key):
         return False
     try:
         scheme, raw_iterations, salt, expected = passcode_hash.split("$", 3)
@@ -204,15 +210,15 @@ def _verify_passcode(passcode: str, passcode_hash: str | None) -> bool:
         return False
     digest = hashlib.pbkdf2_hmac("sha256", passcode.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
     if hmac.compare_digest(digest, expected):
-        _PASSCODE_ATTEMPTS.pop(passcode_hash, None)  # success resets the counter
+        _PASSCODE_ATTEMPTS.pop(attempt_key, None)  # success resets the counter
         return True
-    attempts = _PASSCODE_ATTEMPTS.get(passcode_hash, (0, 0.0))[0] + 1
-    _PASSCODE_ATTEMPTS[passcode_hash] = (attempts, time.monotonic() + _PASSCODE_LOCKOUT_SECONDS)
+    attempts = _PASSCODE_ATTEMPTS.get(attempt_key, (0, 0.0))[0] + 1
+    _PASSCODE_ATTEMPTS[attempt_key] = (attempts, time.monotonic() + _PASSCODE_LOCKOUT_SECONDS)
     return False
 
 
 def _generate_passcode() -> str:
-    return f"QC-{secrets.randbelow(900000) + 100000}"
+    return f"{secrets.randbelow(900000) + 100000}"
 
 
 def _require_upload_passcode(link: BucketUploadLink) -> None:
@@ -2210,7 +2216,7 @@ async def request_link_access(
 ) -> BucketRequestAccessRead:
     link = await _load_upload_link_or_404(db, token)
     _require_upload_passcode(link)
-    if not _verify_passcode(payload.passcode, link.passcode_hash):
+    if not _verify_passcode(payload.passcode, link.passcode_hash, attempt_scope=_client_ip(request) or "unknown"):
         await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
@@ -2244,7 +2250,7 @@ async def request_upload_init(
 ) -> BucketFileUploadInitResponse:
     link = await _load_upload_link_or_404(db, token)
     _require_upload_passcode(link)
-    if not _verify_passcode(payload.passcode or "", link.passcode_hash):
+    if not _verify_passcode(payload.passcode or "", link.passcode_hash, attempt_scope=_client_ip(request) or "unknown"):
         await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=payload.uploader_name or link.recipient_name, actor_email=str(payload.uploader_email) if payload.uploader_email else link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id), detail=payload.file_name)
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")

@@ -378,6 +378,108 @@ class VerificationInvitationRead(BaseModel):
     expires_at: datetime
 
 
+class RoomPinRotateRequest(BaseModel):
+    secure_room_pin: str = Field(pattern=r"^\d{6}$")
+
+
+class RoomDeliveryReceipt(BaseModel):
+    id: UUID
+    action_kind: str
+    channel: str
+    recipient_masked: str | None = None
+    status: str
+    detail: str | None = None
+    provider_accepted: bool = False
+    created_at: datetime
+
+
+class RoomRequestCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=180)
+    category: str | None = Field(default=None, max_length=100)
+    instructions: str | None = Field(default=None, max_length=2000)
+    allow_multiple_files: bool = False
+    recipient_email: EmailStr | None = None
+    recipient_phone: str | None = Field(default=None, max_length=48)
+    email_room_link: bool = True
+    sms_reminder: bool = False
+
+
+class RoomReminderCreate(BaseModel):
+    purpose: Literal["documents", "business_banking", "room"] = "room"
+    recipient_email: EmailStr | None = None
+    recipient_phone: str | None = Field(default=None, max_length=48)
+    email_room_link: bool = True
+    sms_reminder: bool = False
+
+
+class RoomRequestResult(BaseModel):
+    requested_document_id: UUID | None = None
+    room_url: str
+    overall_status: Literal["created", "success", "partial", "failed"]
+    deliveries: list[RoomDeliveryReceipt] = Field(default_factory=list)
+
+
+class ApplicationRoomAccess(BaseModel):
+    passcode: str = Field(min_length=6, max_length=16)
+
+
+class ApplicationRoomConsentGrant(ApplicationRoomAccess):
+    granted: bool = True
+    consenter_name: str = Field(min_length=2, max_length=160)
+
+
+class ApplicationRoomPlaidExchange(ApplicationRoomAccess):
+    public_token: str = Field(min_length=1)
+    institution_name: str | None = Field(default=None, max_length=160)
+    is_primary_operating: bool | None = None
+
+
+class ApplicationRoomPlaidUpdate(ApplicationRoomAccess):
+    account_selection_enabled: bool = False
+
+
+class ApplicationRoomPrimaryBank(ApplicationRoomAccess):
+    is_primary_operating: Literal[True] = True
+
+
+class ApplicationRoomSignable(BaseModel):
+    id: UUID
+    name: str
+    kind: str | None = None
+    signed: bool = False
+    signable: bool = False
+    document_text: str = ""
+
+
+class ApplicationRoomSignRequest(ApplicationRoomAccess):
+    requested_document_id: UUID
+    typed_name: str = Field(min_length=1, max_length=160)
+    esign_consent: bool
+    signature_data_url: str = Field(min_length=1)
+    applicant_legal_first_name: str | None = Field(default=None, max_length=120)
+    applicant_legal_last_name: str | None = Field(default=None, max_length=120)
+    applicant_dob: str | None = Field(default=None, max_length=32)
+    applicant_street: str | None = Field(default=None, max_length=240)
+    applicant_city: str | None = Field(default=None, max_length=120)
+    applicant_state: str | None = Field(default=None, max_length=2)
+    applicant_zip: str | None = Field(default=None, max_length=10)
+
+
+class ApplicationRoomSignResult(BaseModel):
+    signed: bool
+    certificate_file_id: UUID | None = None
+    message: str
+
+
+class ApplicationRoomState(BaseModel):
+    profile_id: UUID
+    business_name: str
+    room_url: str
+    capabilities: list[str] = Field(default_factory=list)
+    banking: ApplicationBankState
+    signable: list[ApplicationRoomSignable] = Field(default_factory=list)
+
+
 class PublicBankVerificationRead(BaseModel):
     business_name: str
     disclosure_version: str
