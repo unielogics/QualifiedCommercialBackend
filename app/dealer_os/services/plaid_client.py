@@ -48,6 +48,7 @@ STATEMENT_LOOKBACK_DAYS = 730
 # The auto-refresh cadence the user asked for.
 REFRESH_EVERY_DAYS = 30
 DEFAULT_CLIENT_NAME = "Qualified Commercial - Capital OS"
+PLAID_CLIENT_NAME_MAX_LENGTH = 30
 _SUPPORTED_PRODUCTS = {"assets", "statements"}
 
 
@@ -129,6 +130,20 @@ def client_name() -> str:
     return _env("DEALER_OS_PLAID_CLIENT_NAME") or DEFAULT_CLIENT_NAME
 
 
+def link_client_name(display_name: str | None = None) -> str:
+    """Plaid Link display name, capped before Plaid falls back to "This Application"."""
+    value = " ".join((display_name or "").split()).strip()
+    if not value:
+        value = client_name()
+    if len(value) <= PLAID_CLIENT_NAME_MAX_LENGTH:
+        return value
+    clipped = value[:PLAID_CLIENT_NAME_MAX_LENGTH].rstrip()
+    last_space = clipped.rfind(" ")
+    if last_space >= 12:
+        clipped = clipped[:last_space].rstrip()
+    return clipped or client_name()[:PLAID_CLIENT_NAME_MAX_LENGTH]
+
+
 def products() -> list[str]:
     configured = {
         value.strip().lower()
@@ -202,7 +217,7 @@ async def create_link_token(
     resp = await _post(
         "/link/token/create",
         {
-            "client_name": client_name(),
+            "client_name": link_client_name(dealer_name),
             "user": {"client_user_id": dealer_id},
             "products": configured_products,
             **(
@@ -239,13 +254,14 @@ async def create_update_link_token(
     *,
     access_token: str,
     client_user_id: str,
+    display_name: str | None = None,
     redirect_override: str | None = None,
     account_selection_enabled: bool = False,
     add_products: list[str] | None = None,
 ) -> str:
     requested_products = [value for value in (add_products or []) if value in _SUPPORTED_PRODUCTS]
     payload: dict[str, Any] = {
-        "client_name": client_name(),
+        "client_name": link_client_name(display_name),
         "user": {"client_user_id": client_user_id},
         "access_token": access_token,
         "country_codes": ["US"],

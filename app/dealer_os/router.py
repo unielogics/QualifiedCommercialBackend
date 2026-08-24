@@ -8229,6 +8229,7 @@ async def plaid_update_link_token(
         token = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(dealer.id),
+            display_name=dealer.name,
             account_selection_enabled=(
                 payload.account_selection_enabled
                 or item.update_mode_account_selection
@@ -8789,6 +8790,7 @@ async def public_room_update_link_token(
         link_token = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(dealer.id),
+            display_name=dealer.name,
             redirect_override=plaid_client.room_redirect_uri() or None,
             account_selection_enabled=(
                 payload.account_selection_enabled

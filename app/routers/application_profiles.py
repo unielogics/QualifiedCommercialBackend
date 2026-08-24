@@ -330,6 +330,22 @@ def _client_ip(request: Request) -> str | None:
     return (forwarded.split(",", 1)[0].strip() if forwarded else request.client.host if request.client else None)
 
 
+async def _profile_plaid_display_name(db: AsyncSession, profile: ApplicationProfile) -> str:
+    if profile.dealer_id:
+        dealer = await db.get(DealerBusiness, profile.dealer_id)
+        if dealer:
+            return dealer.legal_name or dealer.name
+    if profile.intake_id:
+        intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+        if intake:
+            return intake.business_name or intake.full_name
+    if profile.client_id:
+        client = await db.get(Client, profile.client_id)
+        if client:
+            return client.name
+    return "Application"
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -962,10 +978,9 @@ async def public_bank_verification_link_token(
     _invitation, profile = await _public_bank_invitation(db, token)
     if not await _application_consent_granted(db, profile.id):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the bank disclosure before continuing")
-    client = await db.get(Client, profile.client_id) if profile.client_id else None
     value = await plaid_client.create_link_token(
         dealer_id=str(profile.id),
-        dealer_name=client.name if client else "Qualified Commercial application",
+        dealer_name=await _profile_plaid_display_name(db, profile),
         redirect_override=plaid_client.room_redirect_uri() or None,
     )
     return ApplicationPlaidLinkTokenRead(link_token=value)
@@ -990,6 +1005,7 @@ async def public_bank_verification_update_link_token(
         value = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(profile.id),
+            display_name=await _profile_plaid_display_name(db, profile),
             redirect_override=plaid_client.room_redirect_uri() or None,
             account_selection_enabled=account_selection,
         )
@@ -1328,9 +1344,8 @@ async def create_application_plaid_link_token(
     consent = await dealer_bank_consent.has_consent(db, profile.dealer_id) if profile.dealer_id else await _application_consent_granted(db, profile.id)
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Record bank access authorization before opening Plaid")
-    client = await db.get(Client, profile.client_id) if profile.client_id else None
     token = await plaid_client.create_link_token(
-        dealer_id=str(profile.id), dealer_name=client.name if client else "Qualified Commercial application"
+        dealer_id=str(profile.id), dealer_name=await _profile_plaid_display_name(db, profile)
     )
     return ApplicationPlaidLinkTokenRead(link_token=token)
 
@@ -1361,6 +1376,7 @@ async def create_application_plaid_update_link_token(
         token = await plaid_client.create_update_link_token(
             access_token=plaid_lifecycle.decrypted_access_token(item),
             client_user_id=str(profile.id),
+            display_name=await _profile_plaid_display_name(db, profile),
             account_selection_enabled=account_selection,
         )
     except plaid_client.PlaidUnavailable as exc:
