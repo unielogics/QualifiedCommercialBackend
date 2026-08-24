@@ -348,6 +348,8 @@ def render_contract_certificate_pdf(
     ip_address: str | None,
     user_agent: str | None,
     signed_at: datetime | None,
+    signer_signature_datauri: str | None = None,
+    signature_hash: str | None = None,
     extra_rows: list[tuple[str, str]] | None = None,
 ) -> bytes:
     """Render the full signed contract (every section) plus an evidentiary
@@ -363,6 +365,7 @@ def render_contract_certificate_pdf(
         ("Signer", typed_name),
         ("Document version", rendered.document_version),
         ("Document SHA-256", document_hash),
+        ("Signature SHA-256", signature_hash or ""),
         ("Signed at", ts.isoformat()),
         ("IP address", ip_address or ""),
         ("User agent", user_agent or ""),
@@ -382,12 +385,27 @@ def render_contract_certificate_pdf(
     # "By: <their name>" line on the same section is never affected.
     qc_name_default = get_template_spec(contract_type).fields.get("qc_signatory_name")
     qc_name_default = qc_name_default.default if qc_name_default else None
-    signature_datauri = qc_signature_datauri() if qc_name_default else None
+    qc_signature_datauri_value = qc_signature_datauri() if qc_name_default else None
 
     def signature_section_para_html(text: str) -> str:
         m = _BY_LINE_RE.match(text)
-        if m and signature_datauri and m.group(1).strip() == qc_name_default:
-            return f'<p><img class="qc-sig" src="{signature_datauri}" alt="Qualified Commercial signature"/></p>'
+        if not m:
+            return para_html(text)
+        by_name = m.group(1).strip()
+        if qc_signature_datauri_value and by_name == qc_name_default:
+            return (
+                '<div class="signature-block">'
+                f'<img class="contract-sig" src="{qc_signature_datauri_value}" alt="Qualified Commercial signature"/>'
+                f'<div>{html.escape(text)}</div>'
+                '</div>'
+            )
+        if signer_signature_datauri and " ".join(by_name.casefold().split()) == " ".join(typed_name.casefold().split()):
+            return (
+                '<div class="signature-block">'
+                f'<img class="contract-sig" src="{signer_signature_datauri}" alt="Counterparty signature"/>'
+                f'<div>{html.escape(text)}</div>'
+                '</div>'
+            )
         return para_html(text)
 
     def table_html(sec: ContractSection) -> str:
@@ -437,7 +455,8 @@ def render_contract_certificate_pdf(
           th, td {{ border: 1px solid #d1d5db; padding: 7px 9px; vertical-align: top; font-size: 10.5px; }}
           .doc-table th {{ width: auto; }}
           .doc-table {{ font-size: 10px; }}
-          .qc-sig {{ height: 34px; margin: 2px 0; }}
+          .signature-block {{ margin: 10px 0 14px; page-break-inside: avoid; }}
+          .contract-sig {{ display: block; max-width: 260px; height: 46px; object-fit: contain; object-position: left center; margin: 0 0 4px; }}
         </style>
       </head>
       <body>

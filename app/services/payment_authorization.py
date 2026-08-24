@@ -4,6 +4,7 @@ import base64
 import hashlib
 import html
 import logging
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -189,16 +190,25 @@ def put_private_s3_object(*, key: str, body: bytes, content_type: str) -> None:
     )
 
 
-def presign_private_s3_object(key: str | None, *, ttl_seconds: int = 900) -> str | None:
+def presign_private_s3_object(
+    key: str | None,
+    *,
+    ttl_seconds: int = 900,
+    download_filename: str | None = None,
+) -> str | None:
     if not key:
         return None
     settings = get_settings()
     if not settings.s3_bucket:
         return None
     try:
+        params = {"Bucket": settings.s3_bucket, "Key": key}
+        if download_filename:
+            safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", download_filename).strip("._") or "document.pdf"
+            params["ResponseContentDisposition"] = f'attachment; filename="{safe_filename}"'
         return boto3.client("s3", region_name=settings.aws_region).generate_presigned_url(
             "get_object",
-            Params={"Bucket": settings.s3_bucket, "Key": key},
+            Params=params,
             ExpiresIn=ttl_seconds,
         )
     except Exception as exc:  # noqa: BLE001

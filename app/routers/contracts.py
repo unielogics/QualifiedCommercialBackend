@@ -27,6 +27,7 @@ client signs it through the mechanism that already exists, unchanged).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -264,7 +265,7 @@ async def contract_render(contract_type: ContractType, payload: ContractRenderRe
     )
 
 
-_PUBLIC_SESSION_TTL = timedelta(minutes=20)
+_PUBLIC_SESSION_TTL = timedelta(minutes=60)
 _PUBLIC_SESSION_RATE_WINDOW = timedelta(minutes=15)
 _PUBLIC_SESSION_RATE_LIMIT = 5
 _PUBLIC_SESSION_MAX_ATTEMPTS = 5
@@ -492,7 +493,10 @@ def _agreement_read(agreement: ContractAgreement) -> ContractAgreementRead:
         typed_name=agreement.typed_name,
         esign_consent=agreement.esign_consent,
         signed_at=agreement.signed_at,
-        certificate_download_url=tpl.presign_private_s3_object(agreement.certificate_s3_key),
+        certificate_download_url=tpl.presign_private_s3_object(
+            agreement.certificate_s3_key,
+            download_filename=f"{agreement.contract_number}.pdf",
+        ),
         email_delivery_status=agreement.email_delivery_status,
     )
 
@@ -520,14 +524,16 @@ async def sign_mutual_nda_non_circumvention(
     ).scalar_one_or_none()
     if session is None or session.contract_type != ContractType.MUTUAL_NDA_NON_CIRCUMVENTION:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Signing session is invalid")
+    if session.used_at is not None and session.agreement_id is not None:
+        existing_agreement = await db.get(ContractAgreement, session.agreement_id)
+        if existing_agreement is not None:
+            return _agreement_read(existing_agreement)
     if session.revoked_at is not None or session.attempt_count >= _PUBLIC_SESSION_MAX_ATTEMPTS:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Signing session is no longer valid")
     if session.used_at is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Signing session has already been used")
     if session.expires_at <= now:
         await _fail_public_session(db, session, "Signing session has expired", status_code=status.HTTP_410_GONE)
-    if session.ip_hash != _ip_hash(request):
-        await _fail_public_session(db, session, "Signing session is invalid", status_code=status.HTTP_401_UNAUTHORIZED)
 
     required_fields = (
         "effective_date",
@@ -610,7 +616,6 @@ async def sign_mutual_nda_non_circumvention(
         principal_address=clean["counterparty_principal_address"],
         signer_email=str(payload.signer_email),
     )
-    session.used_at = now
     agreement = await _sign(
         db,
         request,
@@ -619,6 +624,7 @@ async def sign_mutual_nda_non_circumvention(
         subject_id=counterparty.id,
         payload=signed_payload,
         notify_email=str(payload.signer_email),
+        public_session=session,
     )
     return _agreement_read(agreement)
 
@@ -632,6 +638,7 @@ async def _sign(
     subject_id: UUID,
     payload: ContractSignRequest,
     notify_email: str | None = None,
+    public_session: PublicContractSignSession | None = None,
 ) -> ContractAgreement:
     if not payload.esign_consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "E-SIGN consent is required")
@@ -678,26 +685,41 @@ async def _sign(
         ip_address=agreement.ip_address,
         user_agent=agreement.user_agent,
         signed_at=now,
+        signer_signature_datauri=(
+            f"data:{sig_content_type};base64,{base64.b64encode(sig_bytes).decode('ascii')}"
+        ),
+        signature_hash=sig_hash,
     )
     cert_key = f"contracts/{contract_type}/{agreement.id}/certificate.pdf"
     tpl.put_private_s3_object(key=cert_key, body=pdf_bytes, content_type="application/pdf")
     agreement.certificate_s3_key = cert_key
     agreement.certificate_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
+    # Consume the one-time session in the same transaction that persists the
+    # executed agreement. A PDF/S3 failure therefore leaves the session usable,
+    # while a lost HTTP response can safely retrieve this exact agreement.
+    if public_session is not None:
+        public_session.used_at = now
+        public_session.agreement_id = agreement.id
+
     await db.commit()
     await db.refresh(agreement)
 
     if notify_email:
-        delivery = _send_signed_copy_email(
-            to_email=notify_email,
-            title=rendered.title,
-            contract_number=contract_number,
-            typed_name=agreement.typed_name,
-            pdf_bytes=pdf_bytes,
-        )
-        agreement.email_delivery_status = "sent" if delivery.ok else "failed"
-        agreement.email_delivery_message_id = delivery.message_id
-        agreement.email_delivery_error = None if delivery.ok else delivery.detail[:1000]
+        try:
+            delivery = _send_signed_copy_email(
+                to_email=notify_email,
+                title=rendered.title,
+                contract_number=contract_number,
+                typed_name=agreement.typed_name,
+                pdf_bytes=pdf_bytes,
+            )
+            agreement.email_delivery_status = "sent" if delivery.ok else "failed"
+            agreement.email_delivery_message_id = delivery.message_id
+            agreement.email_delivery_error = None if delivery.ok else delivery.detail[:1000]
+        except Exception as exc:  # noqa: BLE001 - delivery cannot invalidate execution
+            agreement.email_delivery_status = "failed"
+            agreement.email_delivery_error = f"Signed-copy email delivery failed: {exc}"[:1000]
     else:
         agreement.email_delivery_status = "not_requested"
     await db.commit()
@@ -746,7 +768,10 @@ async def contract_certificate(
     if agreement is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No signed agreement found for this subject")
     return {
-        "download_url": tpl.presign_private_s3_object(agreement.certificate_s3_key),
+        "download_url": tpl.presign_private_s3_object(
+            agreement.certificate_s3_key,
+            download_filename=f"{agreement.contract_number}.pdf",
+        ),
         "signed_at": agreement.signed_at.isoformat() if agreement.signed_at else None,
         "contract_number": agreement.contract_number,
     }
