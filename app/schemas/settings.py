@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
-
 
 # --- Section: doc checklists ---------------------------------------------
 
@@ -118,6 +117,7 @@ class PropertyIntelligenceSettings(BaseModel):
     """
     ai_report_enabled: bool = True
     cache_ttl_hours: int = Field(default=24, ge=1, le=720)
+    address_provider: Literal["google", "geoapify"] = "google"
 
 
 # --- Section: referrals --------------------------------------------------

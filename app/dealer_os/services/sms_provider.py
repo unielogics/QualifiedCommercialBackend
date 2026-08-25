@@ -1,0 +1,211 @@
+"""Explicit transactional SMS provider adapter.
+
+AWS End User Messaging and Twilio remain independently configurable. The
+selected provider never falls back silently: a provider outage or incomplete
+configuration is reported against the provider the operator chose.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+import httpx
+
+from app.config import Settings, get_settings
+
+log = logging.getLogger(__name__)
+TWILIO_API_BASE = "https://api.twilio.com/2010-04-01"
+
+
+@dataclass(frozen=True)
+class SmsSendResult:
+    ok: bool
+    provider: str
+    detail: str
+    message_id: str | None = None
+    sender: str | None = None
+    status: str = "failed"
+
+
+def selected_provider(settings: Settings | None = None) -> str:
+    value = str((settings or get_settings()).sms_provider or "aws").strip().lower()
+    return value if value in {"aws", "twilio"} else "invalid"
+
+
+def _twilio_auth(settings: Settings) -> tuple[str, str] | None:
+    if settings.twilio_api_key_sid and settings.twilio_api_key_secret:
+        return settings.twilio_api_key_sid, settings.twilio_api_key_secret
+    if settings.twilio_account_sid and settings.twilio_auth_token:
+        return settings.twilio_account_sid, settings.twilio_auth_token
+    return None
+
+
+def provider_sender(settings: Settings | None = None) -> str | None:
+    settings = settings or get_settings()
+    if selected_provider(settings) == "twilio":
+        return settings.twilio_messaging_service_sid or settings.twilio_from_number or None
+    return settings.sms_origination_number or None
+
+
+def provider_readiness(settings: Settings | None = None) -> dict[str, object]:
+    settings = settings or get_settings()
+    provider = selected_provider(settings)
+    if provider == "twilio":
+        configured = bool(
+            settings.twilio_account_sid
+            and _twilio_auth(settings)
+            and (settings.twilio_messaging_service_sid or settings.twilio_from_number)
+            and settings.twilio_auth_token
+        )
+        detail = (
+            "Ready"
+            if configured and settings.sms_production
+            else "Configured but SMS_PRODUCTION is disabled"
+            if configured
+            else "Twilio account, API credentials, auth token, and sender are required"
+        )
+        return {
+            "provider": provider,
+            "configured": configured,
+            "production": bool(settings.sms_production),
+            "sender": provider_sender(settings),
+            "detail": detail,
+        }
+    if provider == "aws":
+        configured = bool(settings.sms_origination_number)
+        detail = (
+            "Ready"
+            if configured and settings.sms_production
+            else "Configured but SMS_PRODUCTION is disabled"
+            if configured
+            else "AWS origination identity is not configured"
+        )
+        return {
+            "provider": provider,
+            "configured": configured,
+            "production": bool(settings.sms_production),
+            "sender": provider_sender(settings),
+            "detail": detail,
+        }
+    return {
+        "provider": provider,
+        "configured": False,
+        "production": False,
+        "sender": None,
+        "detail": "SMS_PROVIDER must be aws or twilio",
+    }
+
+
+def sms_available(settings: Settings | None = None) -> bool:
+    status = provider_readiness(settings)
+    return bool(status["configured"] and status["production"])
+
+
+def _safe_failure(provider: str, exc: Exception) -> SmsSendResult:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    category = f"http_{status_code}" if status_code else type(exc).__name__
+    log.warning("%s SMS send failed category=%s", provider, category)
+    return SmsSendResult(
+        ok=False,
+        provider=provider,
+        detail=f"{provider.title()} SMS send failed ({category}).",
+        sender=provider_sender(),
+    )
+
+
+def _send_aws(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
+    try:
+        import boto3
+
+        client = boto3.client("pinpoint-sms-voice-v2", region_name=settings.aws_region or "us-east-1")
+        response = client.send_text_message(
+            DestinationPhoneNumber=to_phone,
+            OriginationIdentity=settings.sms_origination_number,
+            MessageBody=body,
+            MessageType="TRANSACTIONAL",
+        )
+        message_id = response.get("MessageId")
+        return SmsSendResult(
+            ok=True,
+            provider="aws",
+            detail="Sent through AWS End User Messaging.",
+            message_id=message_id,
+            sender=settings.sms_origination_number,
+            status="accepted",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _safe_failure("aws", exc)
+
+
+def _send_twilio(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
+    auth = _twilio_auth(settings)
+    if auth is None:
+        return SmsSendResult(False, "twilio", "Twilio API credentials are incomplete.")
+    payload = {"To": to_phone, "Body": body}
+    if settings.twilio_messaging_service_sid:
+        payload["MessagingServiceSid"] = settings.twilio_messaging_service_sid
+    else:
+        payload["From"] = settings.twilio_from_number
+    if settings.public_api_url:
+        payload["StatusCallback"] = (
+            f"{settings.public_api_url.rstrip('/')}/api/v1/webhooks/twilio/sms/status"
+        )
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            response = client.post(
+                f"{TWILIO_API_BASE}/Accounts/{settings.twilio_account_sid}/Messages.json",
+                data=payload,
+                auth=auth,
+            )
+        response.raise_for_status()
+        data = response.json()
+        return SmsSendResult(
+            ok=True,
+            provider="twilio",
+            detail="Accepted by Twilio.",
+            message_id=data.get("sid"),
+            sender=settings.twilio_messaging_service_sid or data.get("from") or settings.twilio_from_number,
+            status=str(data.get("status") or "accepted"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _safe_failure("twilio", exc)
+
+
+def send_sms(to_phone: str, body: str) -> SmsSendResult:
+    settings = get_settings()
+    readiness = provider_readiness(settings)
+    provider = str(readiness["provider"])
+    if not sms_available(settings):
+        return SmsSendResult(
+            ok=False,
+            provider=provider,
+            detail=str(readiness["detail"]),
+            sender=provider_sender(settings),
+        )
+    if provider == "twilio":
+        return _send_twilio(to_phone, body, settings)
+    if provider == "aws":
+        return _send_aws(to_phone, body, settings)
+    return SmsSendResult(False, provider, "SMS provider selection is invalid.")
+
+
+def validate_twilio_signature(
+    *,
+    url: str,
+    form: Mapping[str, str],
+    signature: str,
+    auth_token: str,
+) -> bool:
+    """Validate Twilio's HMAC-SHA1 webhook signature without SDK coupling."""
+    if not signature or not auth_token:
+        return False
+    payload = url + "".join(f"{key}{form[key]}" for key in sorted(form))
+    expected = base64.b64encode(
+        hmac.new(auth_token.encode(), payload.encode(), hashlib.sha1).digest()  # noqa: S324
+    ).decode()
+    return hmac.compare_digest(expected, signature)

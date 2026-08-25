@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.provider_secret import ProviderSecret
 
-
 SECRET_KEYS = {
     "rentcast_api_key",
     "google_server_api_key",
@@ -20,6 +19,7 @@ SECRET_KEYS = {
     "google_maps_ios_key",
     "google_maps_android_key",
     "google_maps_mobile_key",
+    "geoapify_api_key",
 }
 
 
@@ -31,6 +31,8 @@ class ProviderRuntimeSettings:
     google_maps_ios_key: str | None
     google_maps_android_key: str | None
     google_maps_mobile_key: str | None
+    geoapify_api_key: str | None
+    address_provider: str
     property_analysis_ai_enabled: bool
     property_intelligence_cache_ttl_hours: int
 
@@ -139,6 +141,8 @@ async def runtime_settings(db: AsyncSession) -> ProviderRuntimeSettings:
         google_maps_ios_key=await get_secret(db, "google_maps_ios_key") or None,
         google_maps_android_key=await get_secret(db, "google_maps_android_key") or None,
         google_maps_mobile_key=await get_secret(db, "google_maps_mobile_key") or None,
+        geoapify_api_key=await get_secret(db, "geoapify_api_key") or None,
+        address_provider=pi.address_provider,
         property_analysis_ai_enabled=pi.ai_report_enabled,
         property_intelligence_cache_ttl_hours=pi.cache_ttl_hours,
     )
@@ -149,6 +153,13 @@ async def provider_settings_status(db: AsyncSession, *, include_secret_values: b
     return {
         "rentcast_configured": bool(runtime.rentcast_api_key),
         "google_server_configured": bool(runtime.google_server_api_key or runtime.google_maps_browser_key),
+        "geoapify_configured": bool(runtime.geoapify_api_key),
+        "address_provider": runtime.address_provider,
+        "address_provider_ready": bool(
+            runtime.geoapify_api_key
+            if runtime.address_provider == "geoapify"
+            else runtime.google_server_api_key or runtime.google_maps_browser_key
+        ),
         "google_maps_browser_key_configured": bool(runtime.google_maps_browser_key),
         "google_maps_ios_key_configured": bool(runtime.google_maps_ios_key),
         "google_maps_android_key_configured": bool(runtime.google_maps_android_key),
@@ -159,6 +170,7 @@ async def provider_settings_status(db: AsyncSession, *, include_secret_values: b
         "google_maps_ios_key": runtime.google_maps_ios_key if include_secret_values else None,
         "google_maps_android_key": runtime.google_maps_android_key if include_secret_values else None,
         "google_maps_mobile_key": runtime.google_maps_mobile_key if include_secret_values else None,
+        "geoapify_api_key": runtime.geoapify_api_key if include_secret_values else None,
         "property_analysis_ai_enabled": runtime.property_analysis_ai_enabled,
         "property_intelligence_cache_ttl_hours": runtime.property_intelligence_cache_ttl_hours,
     }

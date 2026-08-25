@@ -40,8 +40,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db import SessionLocal
 from app.dealer_os.models import DealerRepContact, DealerRepInboxMessage, DealerRepInboxThread
-from app.dealer_os.services import consent_delivery, rep_workflows, sms_consent as sms_consent_svc
-from app.models.billing import BillableExpense, ChargeAttempt, ClientPaymentMethod, PaymentAuthorization
+from app.dealer_os.services import consent_delivery, rep_workflows
+from app.dealer_os.services import sms_consent as sms_consent_svc
+from app.models.billing import (
+    BillableExpense,
+    ChargeAttempt,
+    ClientPaymentMethod,
+    PaymentAuthorization,
+)
+from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 
 log = logging.getLogger(__name__)
 
@@ -115,56 +122,21 @@ async def gmail_push(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/aws-sms")
-async def aws_sms_inbound(request: Request, token: str = "") -> Response:
-    """AWS End User Messaging inbound receiver for rep inbox SMS.
-
-    The provider shape can arrive directly or wrapped by SNS. We accept the
-    common field names, dedupe by provider message id, and route by the sender's
-    E.164 phone number to the latest rep contact that has that number.
-    """
-    settings = get_settings()
-    expected = settings.sms_webhook_token
-    if not expected or token != expected:
-        log.warning("aws sms webhook: rejected push (bad/missing token)")
-        return Response(status_code=status.HTTP_403_FORBIDDEN)
-    try:
-        raw = await request.json()
-    except Exception:  # noqa: BLE001
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
-    payload = _sms_payload(raw if isinstance(raw, dict) else {})
-    provider_id = _first_str(
-        payload.get("messageId"),
-        payload.get("MessageId"),
-        payload.get("message_id"),
-        payload.get("smsMessageId"),
-    )
-    from_phone = consent_delivery.normalize_phone(
-        _first_str(
-            payload.get("originationNumber"),
-            payload.get("from"),
-            payload.get("sourcePhoneNumber"),
-            payload.get("sender"),
-        )
-    )
-    to_phone = consent_delivery.normalize_phone(
-        _first_str(
-            payload.get("destinationNumber"),
-            payload.get("to"),
-            payload.get("destinationPhoneNumber"),
-        )
-    )
-    body = _first_str(payload.get("messageBody"), payload.get("body"), payload.get("text"), payload.get("message"))
-    if not from_phone or not body:
-        log.warning("aws sms webhook: missing sender/body keys=%s", sorted(payload.keys()))
-        return Response(status_code=status.HTTP_202_ACCEPTED)
-
+async def _store_inbound_sms(
+    *,
+    provider: str,
+    provider_id: str | None,
+    from_phone: str,
+    to_phone: str | None,
+    body: str,
+) -> Response:
     async with SessionLocal() as db:
         if provider_id:
+            provider_names = [provider, "pinpoint"] if provider == "aws" else [provider]
             duplicate = (
                 await db.execute(
                     select(DealerRepInboxMessage.id).where(
-                        DealerRepInboxMessage.provider == "pinpoint",
+                        DealerRepInboxMessage.provider.in_(provider_names),
                         DealerRepInboxMessage.provider_message_id == provider_id,
                     )
                 )
@@ -192,7 +164,7 @@ async def aws_sms_inbound(request: Request, token: str = "") -> Response:
 
         contact = contacts[0] if contacts else None
         if contact is None or contact.owner_user_id is None:
-            log.warning("aws sms webhook: no rep contact for sender=%s", from_phone)
+            log.warning("%s sms webhook: no rep contact for sender=%s", provider, from_phone)
             return Response(status_code=status.HTTP_202_ACCEPTED)
 
         now = datetime.now(timezone.utc)
@@ -221,25 +193,132 @@ async def aws_sms_inbound(request: Request, token: str = "") -> Response:
             )
             db.add(thread)
             await db.flush()
-        msg = DealerRepInboxMessage(
-            thread_id=thread.id,
-            owner_user_id=thread.owner_user_id,
-            contact_id=contact.id,
-            dealer_id=thread.dealer_id,
-            direction="inbound",
-            channel="sms",
-            subject=thread.subject,
-            body=body,
-            provider="pinpoint",
-            provider_message_id=provider_id,
-            delivery_status="received",
-            sender=from_phone,
-            recipient=to_phone,
+        db.add(
+            DealerRepInboxMessage(
+                thread_id=thread.id,
+                owner_user_id=thread.owner_user_id,
+                contact_id=contact.id,
+                dealer_id=thread.dealer_id,
+                direction="inbound",
+                channel="sms",
+                subject=thread.subject,
+                body=body,
+                provider=provider,
+                provider_message_id=provider_id,
+                delivery_status="received",
+                sender=from_phone,
+                recipient=to_phone,
+            )
         )
-        db.add(msg)
         thread.last_message_at = now
         thread.unread_count = int(thread.unread_count or 0) + 1
         contact.last_activity_at = now
+        await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/aws-sms")
+async def aws_sms_inbound(request: Request, token: str = "") -> Response:
+    settings = get_settings()
+    if not settings.sms_webhook_token or token != settings.sms_webhook_token:
+        log.warning("aws sms webhook: rejected push (bad/missing token)")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+    try:
+        raw = await request.json()
+    except Exception:  # noqa: BLE001
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    payload = _sms_payload(raw if isinstance(raw, dict) else {})
+    provider_id = _first_str(payload.get("messageId"), payload.get("MessageId"), payload.get("message_id"), payload.get("smsMessageId"))
+    from_phone = consent_delivery.normalize_phone(_first_str(payload.get("originationNumber"), payload.get("from"), payload.get("sourcePhoneNumber"), payload.get("sender")))
+    to_phone = consent_delivery.normalize_phone(_first_str(payload.get("destinationNumber"), payload.get("to"), payload.get("destinationPhoneNumber")))
+    body = _first_str(payload.get("messageBody"), payload.get("body"), payload.get("text"), payload.get("message"))
+    if not from_phone or not body:
+        log.warning("aws sms webhook: missing sender/body keys=%s", sorted(payload.keys()))
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    return await _store_inbound_sms(provider="aws", provider_id=provider_id, from_phone=from_phone, to_phone=to_phone, body=body)
+
+
+async def _twilio_form(request: Request) -> tuple[dict[str, str], bool]:
+    from app.dealer_os.services.sms_provider import validate_twilio_signature
+
+    form_data = await request.form()
+    form = {str(key): str(value) for key, value in form_data.items()}
+    settings = get_settings()
+    if not settings.twilio_validate_signatures and settings.app_env != "production":
+        return form, True
+    canonical_url = f"{settings.public_api_url.rstrip('/')}{request.url.path}"
+    signature = request.headers.get("X-Twilio-Signature", "")
+    return form, validate_twilio_signature(
+        url=canonical_url,
+        form=form,
+        signature=signature,
+        auth_token=settings.twilio_auth_token,
+    )
+
+
+@router.post("/twilio/sms/inbound")
+async def twilio_sms_inbound(request: Request) -> Response:
+    form, valid = await _twilio_form(request)
+    if not valid:
+        log.warning("twilio sms webhook: rejected invalid signature")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+    from_phone = consent_delivery.normalize_phone(form.get("From"))
+    to_phone = consent_delivery.normalize_phone(form.get("To"))
+    body = _first_str(form.get("Body"))
+    if not from_phone or not body:
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    return await _store_inbound_sms(
+        provider="twilio",
+        provider_id=_first_str(form.get("MessageSid"), form.get("SmsSid")),
+        from_phone=from_phone,
+        to_phone=to_phone,
+        body=body,
+    )
+
+
+@router.post("/twilio/sms/status")
+async def twilio_sms_status(request: Request) -> Response:
+    form, valid = await _twilio_form(request)
+    if not valid:
+        log.warning("twilio status webhook: rejected invalid signature")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+    message_sid = _first_str(form.get("MessageSid"), form.get("SmsSid"))
+    message_status = _first_str(form.get("MessageStatus"), form.get("SmsStatus"))
+    if not message_sid or not message_status:
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    async with SessionLocal() as db:
+        message = (
+            await db.execute(
+                select(DealerRepInboxMessage).where(
+                    DealerRepInboxMessage.provider == "twilio",
+                    DealerRepInboxMessage.provider_message_id == message_sid,
+                )
+            )
+        ).scalar_one_or_none()
+        if message is not None:
+            message.delivery_status = message_status[:24]
+        reminder = (
+            await db.execute(
+                select(BookingNotificationReminder).where(
+                    BookingNotificationReminder.provider_message_id == message_sid,
+                    BookingNotificationReminder.channel == "sms",
+                )
+            )
+        ).scalar_one_or_none()
+        if reminder is not None:
+            terminal_status = (
+                "sent"
+                if message_status in {"sent", "delivered", "read"}
+                else "failed" if message_status in {"failed", "undelivered", "canceled"} else None
+            )
+            if terminal_status is not None:
+                reminder.status = terminal_status
+                reminder.error = None if terminal_status == "sent" else f"twilio_{message_status}"
+                notice = await db.get(BookingNotification, reminder.booking_notification_id)
+                if notice is not None:
+                    notice.sms_reminder_status = terminal_status
+                    if terminal_status == "failed":
+                        notice.last_error = f"Twilio reminder delivery {message_status}."
         await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

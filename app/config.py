@@ -162,13 +162,21 @@ class Settings(BaseSettings):
     # the role needs ses:SendEmail. When ses_from_address is empty the
     # SES path no-ops silently — the re-engagement engine still runs,
     # the email rung just logs "dormant".
-    # AWS End User Messaging (SNS SMS). Dormant until the account leaves the
-    # SMS sandbox and the toll-free number finishes verification; until then
-    # sms_production stays false and every SMS path reports honestly rather
-    # than pretending to send.
+    # Transactional SMS. The selected provider is explicit and there is no
+    # automatic fallback: a failed Twilio send must not unexpectedly leave by
+    # AWS (or vice versa). Keep both providers configured so switching is one
+    # environment change plus a service restart.
+    sms_provider: str = "aws"  # aws | twilio
     sms_origination_number: str = ""
     sms_production: bool = False
     sms_webhook_token: str = ""
+    twilio_account_sid: str = ""
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
+    twilio_auth_token: str = ""
+    twilio_messaging_service_sid: str = ""
+    twilio_from_number: str = ""
+    twilio_validate_signatures: bool = True
 
     ses_region: str = "us-east-1"
     ses_from_address: str = ""

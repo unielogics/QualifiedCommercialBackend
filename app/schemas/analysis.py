@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from app.schemas.common import ORMModel
 from app.schemas.prequal import PrequalRequestRead
 
-
 AnalysisProduct = Literal["dscr_purchase", "dscr_refi", "fix_flip"]
 AnalysisSource = Literal["deal_analyzer", "simulator", "loan_recalc"]
 
@@ -17,6 +16,9 @@ AnalysisSource = Literal["deal_analyzer", "simulator", "loan_recalc"]
 class ProviderSettingsRead(BaseModel):
     rentcast_configured: bool
     google_server_configured: bool
+    geoapify_configured: bool = False
+    address_provider: Literal["google", "geoapify"] = "google"
+    address_provider_ready: bool = False
     google_maps_browser_key_configured: bool
     google_maps_ios_key_configured: bool = False
     google_maps_android_key_configured: bool = False
@@ -27,6 +29,7 @@ class ProviderSettingsRead(BaseModel):
     google_maps_ios_key: str | None = None
     google_maps_android_key: str | None = None
     google_maps_mobile_key: str | None = None
+    geoapify_api_key: str | None = None
     property_analysis_ai_enabled: bool = True
     property_intelligence_cache_ttl_hours: int = 24
 
@@ -38,6 +41,8 @@ class ProviderSettingsUpdate(BaseModel):
     google_maps_ios_key: str | None = None
     google_maps_android_key: str | None = None
     google_maps_mobile_key: str | None = None
+    geoapify_api_key: str | None = None
+    address_provider: Literal["google", "geoapify"] | None = None
     property_analysis_ai_enabled: bool | None = None
     property_intelligence_cache_ttl_hours: int | None = Field(default=None, ge=1, le=720)
 
@@ -61,6 +66,7 @@ class AddressSuggestion(BaseModel):
     place_id: str
     text: str
     secondary_text: str | None = None
+    provider: Literal["google", "geoapify"] = "google"
 
 
 class AddressResolveRequest(BaseModel):
@@ -72,6 +78,8 @@ class AddressResolveRequest(BaseModel):
 class AddressResolveResponse(BaseModel):
     address: AddressParts
     google_place: dict[str, Any] | None = None
+    provider: Literal["google", "geoapify"] = "google"
+    provider_place: dict[str, Any] | None = None
 
 
 class PropertyIntelligenceLookupRequest(BaseModel):

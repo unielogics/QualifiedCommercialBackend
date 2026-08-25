@@ -252,6 +252,8 @@ class IntegrationProviderStatus(BaseModel):
 class DealerIntegrationStatus(BaseModel):
     isoftpull: IntegrationProviderStatus
     plaid: IntegrationProviderStatus
+    sms: IntegrationProviderStatus
+    address: IntegrationProviderStatus
 
 
 class TargetRead(ORM):

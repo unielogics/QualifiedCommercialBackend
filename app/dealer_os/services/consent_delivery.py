@@ -15,10 +15,10 @@ substitute: asking for a text sends both. That way a request is never lost
 because texting is switched off or the number was wrong.
 
   email  works today, through the SES identity verified for this domain.
-  sms    built and inert until AWS End User Messaging is out of sandbox and the
-         toll-free number finishes verification. It degrades to a clear, honest
-         failure rather than silently reporting success, because a rep who
-         thinks the text went out will stand there waiting for it.
+  sms    uses the explicitly selected AWS or Twilio provider. It remains inert
+         until that provider is production-ready and degrades to a clear,
+         honest failure rather than silently reporting success or switching to
+         the other provider.
 
 The link itself is never logged. Tokens ride in the URL fragment, which browsers
 do not send to servers, and the delivery record stores only which channel was
@@ -40,6 +40,8 @@ __all__ = [
     "deliver_link",
     "deliver_link_checked",
     "sms_available",
+    "sms_provider_status",
+    "sms_sender",
     "normalize_phone",
 ]
 
@@ -60,6 +62,15 @@ class DeliveryResult:
     detail: str
     email_ok: bool = False
     sms_ok: bool = False
+    provider: str | None = None
+    provider_message_id: str | None = None
+    sender: str | None = None
+    delivery_status: str | None = None
+
+    @property
+    def message_id(self) -> str | None:
+        """Compatibility alias used by reminder and delivery audit records."""
+        return self.provider_message_id
 
 
 def normalize_phone(raw: str | None) -> str | None:
@@ -82,48 +93,62 @@ def normalize_phone(raw: str | None) -> str | None:
 def sms_available() -> bool:
     """Whether an SMS send can actually reach a stranger's phone.
 
-    Requires an origination number AND production access. In the AWS sandbox
-    only pre-verified destinations receive anything, which for this use case is
-    the same as not working.
+    Requires complete configuration and production access for the explicitly
+    selected provider. Provider failures never trigger cross-provider fallback.
     """
-    from app.config import get_settings
+    from .sms_provider import sms_available as provider_available
 
-    s = get_settings()
-    return bool(getattr(s, "sms_origination_number", "") and getattr(s, "sms_production", False))
+    return provider_available()
+
+
+def sms_provider_status() -> dict[str, object]:
+    from .sms_provider import provider_readiness
+
+    return provider_readiness()
+
+
+def sms_sender() -> str | None:
+    from .sms_provider import provider_sender
+
+    return provider_sender()
 
 
 def _send_sms(to_phone: str, body: str) -> DeliveryResult:
-    if not sms_available():
-        return DeliveryResult(
-            False,
-            "sms",
-            "Texting is not switched on yet. Send it by email, or read the link to them.",
-        )
-    try:
-        import boto3
+    from .sms_provider import send_sms
 
-        from app.config import get_settings
-
-        s = get_settings()
-        client = boto3.client("pinpoint-sms-voice-v2", region_name=s.ses_region or "us-east-1")
-        resp = client.send_text_message(
-            DestinationPhoneNumber=to_phone,
-            OriginationIdentity=s.sms_origination_number,
-            MessageBody=body,
-            MessageType="TRANSACTIONAL",
-        )
-        return DeliveryResult(True, "sms", resp.get("MessageId", "sent"))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("consent delivery: sms failed to=%s: %s", to_phone, exc)
-        return DeliveryResult(False, "sms", f"Text could not be sent: {exc}")
+    result = send_sms(to_phone, body)
+    return DeliveryResult(
+        result.ok,
+        "sms",
+        result.detail,
+        sms_ok=result.ok,
+        provider=result.provider,
+        provider_message_id=result.message_id,
+        sender=result.sender,
+        delivery_status=result.status,
+    )
 
 
 def _send_email(to_email: str, subject: str, body: str) -> DeliveryResult:
     result = ses_client.send_email(to_email=to_email, subject=subject, body_text=body)
     if result.ok:
-        return DeliveryResult(True, "email", result.message_id or "sent")
+        return DeliveryResult(
+            True,
+            "email",
+            result.message_id or "sent",
+            email_ok=True,
+            provider="ses",
+            provider_message_id=result.message_id,
+            delivery_status="sent",
+        )
     log.warning("consent delivery: email failed to=%s detail=%s", to_email, result.detail)
-    return DeliveryResult(False, "email", f"Email could not be sent: {result.detail}")
+    return DeliveryResult(
+        False,
+        "email",
+        f"Email could not be sent: {result.detail}",
+        provider="ses",
+        delivery_status="failed",
+    )
 
 
 def deliver_link(
@@ -223,7 +248,25 @@ def deliver_link(
     channel_label = (
         "email+sms" if email_ok and sms_ok else "email" if email_ok else "sms" if sms_ok else "none"
     )
-    return DeliveryResult(email_ok or sms_ok, channel_label, detail, email_ok, sms_ok)
+    return DeliveryResult(
+        email_ok or sms_ok,
+        channel_label,
+        detail,
+        email_ok,
+        sms_ok,
+        provider=sms_res.provider if sms_res is not None else "ses" if email_res is not None else None,
+        provider_message_id=(
+            sms_res.provider_message_id
+            if sms_res is not None and sms_res.provider_message_id
+            else email_res.provider_message_id if email_res is not None else None
+        ),
+        sender=sms_res.sender if sms_res is not None else None,
+        delivery_status=(
+            sms_res.delivery_status
+            if sms_res is not None
+            else "sent" if email_ok else "failed"
+        ),
+    )
 
 
 async def deliver_link_checked(db, **kwargs) -> DeliveryResult:

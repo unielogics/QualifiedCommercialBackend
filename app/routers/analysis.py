@@ -30,10 +30,10 @@ from app.schemas.analysis import (
     AnalysisRunPrequalResponse,
     AnalysisRunRead,
     AnalysisRunUpdate,
-    ProviderSettingsRead,
-    ProviderSettingsUpdate,
     PropertyIntelligenceLookupRequest,
     PropertyIntelligenceSnapshotRead,
+    ProviderSettingsRead,
+    ProviderSettingsUpdate,
     ShareAnalysisResponse,
 )
 from app.schemas.prequal import PrequalRequestRead
@@ -41,13 +41,12 @@ from app.schemas.settings import AppSettingsData
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services.analysis_reports import generate_analysis_report
 from app.services.property_intelligence import (
-    google_autocomplete,
-    google_resolve,
-    lookup_property_intelligence,
+    address_autocomplete,
+    address_resolve,
     log_provider_usage,
+    lookup_property_intelligence,
 )
 from app.services.provider_secrets import provider_settings_status, set_secret
-
 
 router = APIRouter(prefix="/analysis-runs", tags=["analysis-runs"])
 property_router = APIRouter(prefix="/property-intelligence", tags=["property-intelligence"])
@@ -390,10 +389,25 @@ async def update_provider_settings(
         "google_maps_ios_key",
         "google_maps_android_key",
         "google_maps_mobile_key",
+        "geoapify_api_key",
     ):
         value = data.pop(key, None)
         if isinstance(value, str) and value.strip():
             await set_secret(db, key=key, value=value.strip(), updated_by_id=user.id)
+
+    requested_provider = data.get("address_provider")
+    if requested_provider is not None:
+        provider_status = await provider_settings_status(db)
+        configured = (
+            provider_status["geoapify_configured"]
+            if requested_provider == "geoapify"
+            else provider_status["google_server_configured"]
+        )
+        if not configured:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Configure the {requested_provider.title()} server key before activating it.",
+            )
 
     if data:
         row = await _get_app_settings(db)
@@ -403,6 +417,8 @@ async def update_provider_settings(
             pi["ai_report_enabled"] = bool(data["property_analysis_ai_enabled"])
         if "property_intelligence_cache_ttl_hours" in data and data["property_intelligence_cache_ttl_hours"] is not None:
             pi["cache_ttl_hours"] = int(data["property_intelligence_cache_ttl_hours"])
+        if "address_provider" in data and data["address_provider"] is not None:
+            pi["address_provider"] = data["address_provider"]
         current["property_intelligence"] = pi
         row.data = current
         db.add(
@@ -425,10 +441,16 @@ async def autocomplete_address(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[AddressSuggestion]:
-    rows = await google_autocomplete(db, payload.input, payload.session_token)
+    readiness = await provider_settings_status(db)
+    if not readiness["address_provider_ready"]:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"{str(readiness['address_provider']).title()} address search is not configured.",
+        )
+    provider, rows = await address_autocomplete(db, payload.input, payload.session_token)
     await log_provider_usage(
         db,
-        provider="google",
+        provider=provider,
         feature="property_intelligence",
         request_type="places_autocomplete",
         user=user,
@@ -445,7 +467,19 @@ async def resolve_address(
 ) -> AddressResolveResponse:
     if not payload.place_id and not payload.address:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "place_id or address is required")
-    address, google_place = await google_resolve(
+    readiness = await provider_settings_status(db)
+    requested_provider = "geoapify" if (payload.place_id or "").startswith("geoapify:") else readiness["address_provider"]
+    requested_ready = (
+        readiness["geoapify_configured"]
+        if requested_provider == "geoapify"
+        else readiness["google_server_configured"]
+    )
+    if not requested_ready:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"{str(requested_provider).title()} address resolution is not configured.",
+        )
+    provider, address, provider_place = await address_resolve(
         db,
         place_id=payload.place_id,
         address=payload.address,
@@ -453,13 +487,18 @@ async def resolve_address(
     )
     await log_provider_usage(
         db,
-        provider="google",
+        provider=provider,
         feature="property_intelligence",
         request_type="place_resolve",
         user=user,
         metadata={"place_id": payload.place_id, "session_token": bool(payload.session_token)},
     )
-    return AddressResolveResponse(address=address, google_place=google_place)
+    return AddressResolveResponse(
+        address=address,
+        provider=provider,
+        provider_place=provider_place,
+        google_place=provider_place if provider == "google" else None,
+    )
 
 
 @property_router.post("/lookup", response_model=PropertyIntelligenceSnapshotRead)

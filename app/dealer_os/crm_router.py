@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import hashlib
 import html
+import io
 import re
 import secrets
 import uuid
@@ -18,12 +18,12 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
-from app.models.user import User
 from app.models.booking_settings import BookingSettings
-from app.config import get_settings
+from app.models.user import User
 from app.services.email import ses_client
 from app.services.payment_authorization import primary_super_admin
 
@@ -52,8 +52,7 @@ from .models import (
     DealerRepLead,
     DealerSourceConnection,
 )
-from .services import buckets_link
-from .services import consent_delivery, storage
+from .services import buckets_link, consent_delivery, storage
 from .services.product_finder import QUESTIONS, screen_products
 from .services.targets import propose_targets
 
@@ -723,6 +722,7 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
     thread = None
     delivery = "presented"
     provider_detail = ""
+    sms_result = None
     if payload.channel in {"email", "sms"}:
         if payload.channel == "email" and not contact.email: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Contact email is required")
         if payload.channel == "sms" and not contact.phone_e164: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Contact phone is required")
@@ -798,8 +798,13 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
             subject=subject if payload.channel == "email" else None,
             body=body,
             delivery_status=delivery,
-            provider_message_id=provider_detail[:160] or None,
-            sender=user.email,
+            provider=sms_result.provider if sms_result is not None else "ses",
+            provider_message_id=(
+                sms_result.provider_message_id
+                if sms_result is not None
+                else provider_detail[:160] or None
+            ),
+            sender=sms_result.sender if sms_result is not None else user.email,
             recipient=contact.email if payload.channel == "email" else contact.phone_e164,
             read_at=datetime.now(timezone.utc),
         ))

@@ -17,6 +17,8 @@ Status of each external service.
 | RentCast (property) | ⏳ awaiting key | `RENTCAST_API_KEY`. SmartIntake autofill (sqft, taxes, comps). |
 | EAS (mobile) | ⏳ awaiting Expo login | `unielogics/QCMobile`. Apple/Google accounts needed for store distribution. |
 | Gmail Pub/Sub | 🛑 deferred | Local fake inbox covers the air-gap logic until prod. |
+| Transactional SMS | Provider-switch ready | Set `SMS_PROVIDER=twilio` or `aws`. Both implementations remain available; sends never fall back silently. Twilio requires a Messaging Service or sender plus signature-validated webhooks. |
+| Address search | Provider-switch ready | Super admins select Google or Geoapify in Settings. Geoapify keys are encrypted in `provider_secrets`; the Field Desk keeps the same backend API. |
 | Pinecone | ❌ replaced | Using pgvector (architecture constraint #1). |
 | OpenAI | ❌ replaced | Using AWS Bedrock Claude only (architecture constraint #3). |
 | Vercel | ❌ replaced | Switched to AWS Amplify (architecture constraint #9). |
@@ -30,6 +32,32 @@ In rough order:
 4. **Plaid production credentials and Statements approval** — the current `qcbackend/prod` configuration remains sandbox and must not be relabeled as production
 5. **RentCast API key** — when SmartIntake autofill is needed
 6. **Apple Developer + Google Play accounts** — for mobile store distribution
+
+## SMS provider switch
+
+Keep `SMS_PRODUCTION=false` until the selected provider is fully registered and
+tested. To use Twilio, configure `TWILIO_ACCOUNT_SID`, a Standard API key pair
+(`TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`), `TWILIO_AUTH_TOKEN`, and either
+`TWILIO_MESSAGING_SERVICE_SID` (recommended) or `TWILIO_FROM_NUMBER`. Configure
+the Messaging Service inbound webhook as:
+
+`https://api.qualifiedcommercial.com/api/v1/webhooks/twilio/sms/inbound`
+
+Delivery callbacks are attached automatically at:
+
+`https://api.qualifiedcommercial.com/api/v1/webhooks/twilio/sms/status`
+
+Then set `SMS_PROVIDER=twilio`, `SMS_PRODUCTION=true`, and restart the backend.
+Switching back to AWS only requires `SMS_PROVIDER=aws` plus the existing AWS
+origination identity and webhook token.
+
+## Geoapify address switch
+
+In the super-admin Settings page, save a Geoapify server API key and select
+`Geoapify (recommended)` as the address provider. Restrict the key to Geocoding,
+Address Autocomplete, and Place Details APIs and to production backend traffic.
+No Field Desk frontend key or route change is required. Google stays configured
+as a reversible option but is not used while Geoapify is selected.
 
 ## What's live in production right now
 

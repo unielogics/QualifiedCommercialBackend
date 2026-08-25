@@ -31,6 +31,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
 from app.models.application_profile import PlaidAssetReport
@@ -699,7 +700,10 @@ async def restore_dealer(
 
 
 @router.get("/integrations/status", response_model=DealerIntegrationStatus)
-async def dealer_integration_status(user: CurrentUser) -> DealerIntegrationStatus:
+async def dealer_integration_status(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntegrationStatus:
     """Credential-presence diagnostics only; secrets and bureau payloads never leave the server."""
     require_super_admin(user)
     settings = get_settings()
@@ -712,6 +716,9 @@ async def dealer_integration_status(user: CurrentUser) -> DealerIntegrationStatu
     except plaid_client.PlaidUnavailable as exc:
         plaid_env = "invalid"
         plaid_env_error = str(exc)
+    sms_status = consent_delivery.sms_provider_status()
+    address_status = await provider_settings_status(db)
+    address_provider = str(address_status["address_provider"])
     return DealerIntegrationStatus(
         isoftpull={
             "configured": isoftpull_ready,
@@ -728,6 +735,18 @@ async def dealer_integration_status(user: CurrentUser) -> DealerIntegrationStatu
                 if plaid_ready and plaid_env == "production"
                 else "Configured outside production" if plaid_ready else "Client ID/secret are not configured"
             ),
+        },
+        sms={
+            "configured": bool(sms_status["configured"] and sms_status["production"]),
+            "environment": str(sms_status["provider"]),
+            "endpoint": f"{settings.public_api_url.rstrip('/')}/api/v1/webhooks/{'twilio/sms/inbound' if sms_status['provider'] == 'twilio' else 'aws-sms'}",
+            "detail": str(sms_status["detail"]),
+        },
+        address={
+            "configured": bool(address_status["address_provider_ready"]),
+            "environment": address_provider,
+            "endpoint": "/api/v1/property-intelligence/address/autocomplete",
+            "detail": "Ready" if address_status["address_provider_ready"] else f"{address_provider.title()} key is not configured",
         },
     )
 
@@ -5253,7 +5272,7 @@ async def create_standalone_rep_appointment(
         body=f"Appointment booked for {payload.invitee_name}: {starts_at.isoformat()}",
         provider="calendar",
         delivery_status="stored",
-        sender=user.email if thread.channel == "email" else get_settings().sms_origination_number or None,
+        sender=user.email if thread.channel == "email" else consent_delivery.sms_sender(),
         recipient=payload.invitee_email or phone,
     )
     await notify_users(
@@ -6282,6 +6301,7 @@ async def create_contact_share(
             recipient=email,
         )
     if payload.channel in {"sms", "email_sms"}:
+        sms_res = None
         sms_allowed = bool(
             phone
             and contact.sms_opted_out_at is None
@@ -6295,7 +6315,8 @@ async def create_contact_share(
             sms_res = await asyncio.to_thread(consent_delivery._send_sms, phone, copy.sms_body)  # noqa: SLF001
             share.sms_status = "sent" if sms_res.ok else "failed"
             if sms_res.ok:
-                refs["sms_message_id"] = sms_res.detail
+                refs["sms_message_id"] = sms_res.provider_message_id
+                refs["sms_provider"] = sms_res.provider
         thread = await _ensure_rep_thread(
             db,
             owner_user_id=user.id,
@@ -6314,10 +6335,10 @@ async def create_contact_share(
             channel="sms",
             subject=copy.subject,
             body=copy.sms_body,
-            provider="pinpoint",
+            provider=sms_res.provider if sms_res else str(consent_delivery.sms_provider_status()["provider"]),
             provider_message_id=refs.get("sms_message_id"),
             delivery_status=share.sms_status,
-            sender=get_settings().sms_origination_number or None,
+            sender=sms_res.sender if sms_res else consent_delivery.sms_sender(),
             recipient=phone,
         )
     share.provider_refs = refs
@@ -6519,10 +6540,10 @@ async def create_rep_inbox_thread(
             delivery_status = "sent" if res.ok else "failed"
         else:
             recipient = phone
-            sender = get_settings().sms_origination_number or None
             res = await asyncio.to_thread(consent_delivery._send_sms, phone, payload.body)  # noqa: SLF001
-            provider = "pinpoint"
-            provider_id = res.detail if res.ok else None
+            sender = res.sender
+            provider = res.provider
+            provider_id = res.provider_message_id if res.ok else None
             delivery_status = "sent" if res.ok else "failed"
         msg = await _append_rep_inbox_message(
             db,
@@ -6708,10 +6729,10 @@ async def create_rep_inbox_message(
         if not allowed:
             raise HTTPException(status.HTTP_409_CONFLICT, "This contact has not granted SMS consent.")
         res = await asyncio.to_thread(consent_delivery._send_sms, recipient, payload.body)  # noqa: SLF001
-        provider = "pinpoint"
-        provider_id = res.detail if res.ok else None
+        provider = res.provider
+        provider_id = res.provider_message_id if res.ok else None
         delivery_status = "sent" if res.ok else "failed"
-        sender = get_settings().sms_origination_number or None
+        sender = res.sender
     msg = await _append_rep_inbox_message(
         db,
         thread=thread,
