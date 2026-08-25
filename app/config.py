@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -184,6 +184,20 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
+
+    @field_validator("twilio_validate_signatures", mode="before")
+    @classmethod
+    def fail_closed_on_invalid_twilio_signature_flag(cls, value: object) -> bool:
+        """A malformed secret must never disable verification or stop startup."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return True
 
     @property
     def cors_origins_list(self) -> list[str]:

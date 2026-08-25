@@ -62,6 +62,12 @@ def test_sms_provider_selection_never_falls_back() -> None:
     assert status["configured"] is False
 
 
+def test_invalid_twilio_signature_flag_fails_closed() -> None:
+    settings = Settings(_env_file=None, twilio_validate_signatures="not-a-boolean-secret")
+
+    assert settings.twilio_validate_signatures is True
+
+
 def test_twilio_signature_validation_uses_public_callback_url_and_sorted_form() -> None:
     url = "https://api.qualifiedcommercial.com/api/v1/webhooks/twilio/sms/inbound"
     form = {"From": "+12015550100", "To": "+18555550100", "Body": "Hello"}

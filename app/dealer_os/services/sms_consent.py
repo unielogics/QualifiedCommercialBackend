@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -246,7 +246,7 @@ async def revoke(
     if kind:
         stmt = stmt.where(DealerSmsConsent.consent_kind == kind)
     rows = (await db.execute(stmt)).scalars().all()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for r in rows:
         r.revoked_at = now
         r.revoked_reason = reason[:120]
