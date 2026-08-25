@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -38,6 +39,81 @@ log = logging.getLogger(__name__)
 
 _GOOGLE_PULL_KIND = "google_pull"
 _DEFAULT_DURATION_MIN = 30
+
+
+@dataclass(frozen=True)
+class CalendarBusySnapshot:
+    """Live busy periods from the connected Google primary calendar.
+
+    `status` is deliberately small and safe to expose to booking clients. It
+    never includes OAuth/provider error text.
+    """
+
+    status: str
+    intervals: list[tuple[datetime, datetime]]
+
+
+async def busy_periods(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    time_min: datetime,
+    time_max: datetime,
+) -> CalendarBusySnapshot:
+    """Read the owner's current Google FreeBusy state.
+
+    Availability calls use this in addition to the local event ledger. This is
+    intentionally on-demand: the five-minute incremental pull is useful for the
+    in-app calendar, but is not sufficiently fresh to prevent a booking race
+    immediately after a personal Google event is created.
+    """
+    try:
+        creds = await google_oauth_client.credentials_for_user(
+            db, user_id, CALENDAR_SCOPES
+        )
+    except (
+        google_oauth_client.GoogleNotConnected,
+        google_oauth_client.GoogleScopeMissing,
+        google_oauth_client.GoogleTokenRevoked,
+    ):
+        return CalendarBusySnapshot(status="disconnected", intervals=[])
+    except Exception:  # noqa: BLE001
+        log.exception("calendar freebusy: credential resolution failed user=%s", user_id)
+        return CalendarBusySnapshot(status="unavailable", intervals=[])
+
+    start = time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)
+    end = time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)
+
+    def _query() -> dict:
+        return (
+            _service(creds)
+            .freebusy()
+            .query(
+                body={
+                    "timeMin": start.astimezone(UTC).isoformat(),
+                    "timeMax": end.astimezone(UTC).isoformat(),
+                    "items": [{"id": "primary"}],
+                }
+            )
+            .execute()
+        )
+
+    try:
+        import asyncio
+
+        response = await asyncio.to_thread(_query)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("calendar freebusy failed user=%s: %s", user_id, exc)
+        return CalendarBusySnapshot(status="unavailable", intervals=[])
+
+    intervals: list[tuple[datetime, datetime]] = []
+    for item in ((response.get("calendars") or {}).get("primary") or {}).get("busy") or []:
+        busy_start = _parse_google_dt({"dateTime": item.get("start")})
+        busy_end = _parse_google_dt({"dateTime": item.get("end")})
+        if busy_start is None or busy_end is None or busy_end <= busy_start:
+            continue
+        intervals.append((busy_start.astimezone(UTC), busy_end.astimezone(UTC)))
+    return CalendarBusySnapshot(status="connected", intervals=intervals)
 
 
 def _event_body(ev: CalendarEvent) -> dict:

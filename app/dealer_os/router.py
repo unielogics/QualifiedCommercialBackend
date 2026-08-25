@@ -37,9 +37,10 @@ from app.models.application_profile import PlaidAssetReport
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.services import booking_notify, booking_reminders
-from app.services.team_calendar import team_booking_settings
+from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle
 from app.services.email import ses_client
+from app.services.google import calendar_sync
 from app.services import clerk as clerk_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 
@@ -4452,6 +4453,25 @@ async def _booking_slots(
     now_local = datetime.now(zone)
     earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
     window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    live_google = await calendar_sync.busy_periods(
+        db,
+        host.id,
+        time_min=now_local.astimezone(timezone.utc),
+        time_max=window_end_local.astimezone(timezone.utc),
+    )
+    # Field Desk books against the shared Franco calendar. Fail closed when the
+    # live calendar cannot be consulted; otherwise a revoked token or Google
+    # outage could expose a slot that is already occupied outside QC.
+    if live_google.status != "connected":
+        return BookingAvailabilityRead(
+            timezone=booking.timezone,
+            duration_min=duration,
+            buffer_before_min=booking.buffer_before_min,
+            buffer_after_min=booking.buffer_after_min,
+            host_name=host.name,
+            calendar_sync_status=live_google.status,
+            slots=[],
+        )
     busy_rows = (
         await db.execute(
             select(CalendarEvent)
@@ -4472,6 +4492,13 @@ async def _booking_slots(
         )
         for ev in busy_rows
     ]
+    busy.extend(
+        (
+            start.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
+            end.astimezone(zone) + timedelta(minutes=booking.buffer_after_min),
+        )
+        for start, end in live_google.intervals
+    )
     start_min = _parse_hhmm(booking.start_time or "09:00")
     end_min = _parse_hhmm(booking.end_time or "17:00")
     slot_duration = timedelta(minutes=duration)
@@ -4500,6 +4527,7 @@ async def _booking_slots(
                         buffer_before_min=booking.buffer_before_min,
                         buffer_after_min=booking.buffer_after_min,
                         host_name=host.name,
+                        calendar_sync_status=live_google.status,
                         slots=slots,
                     )
             cursor += timedelta(minutes=5)
@@ -4509,6 +4537,7 @@ async def _booking_slots(
         buffer_before_min=booking.buffer_before_min,
         buffer_after_min=booking.buffer_after_min,
         host_name=host.name,
+        calendar_sync_status=live_google.status,
         slots=slots,
     )
 
@@ -4980,6 +5009,7 @@ async def create_standalone_rep_appointment(
     require_team_or_rep(user)
     host = await _rep_host_for(db, None, user)
     booking = await _booking_settings_for(db, host)
+    await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
     duration = booking.duration_min or 20
     slots = await _booking_slots(db, host, booking, duration_min=duration)
@@ -5172,6 +5202,7 @@ async def create_rep_appointment(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
+    await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
     duration = booking.duration_min or 20
     slots = await _booking_slots(db, host, booking, duration_min=duration)

@@ -43,6 +43,8 @@ from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
 from app.services import booking_notify, booking_reminders
 from app.services import fred as fred_service
+from app.services.google import calendar_sync
+from app.services.team_calendar import lock_calendar_owner
 
 log = logging.getLogger(__name__)
 
@@ -370,6 +372,7 @@ async def public_booking_create(
     _LAST_SUBMIT[ip] = now
 
     user, booking = await _load_public_booking(db, slug)
+    await lock_calendar_owner(db, user.id)
     starts_at = _to_utc_minute(payload.starts_at)
     slots = await _available_booking_slots(db, user, booking)
     valid_slot = any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots)
@@ -470,6 +473,12 @@ async def _available_booking_slots(
     now_local = datetime.now(tz)
     earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
     window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    live_google = await calendar_sync.busy_periods(
+        db,
+        user.id,
+        time_min=now_local.astimezone(timezone.utc),
+        time_max=window_end_local.astimezone(timezone.utc),
+    )
     busy_rows = (
         await db.execute(
             select(CalendarEvent)
@@ -490,6 +499,13 @@ async def _available_booking_slots(
         )
         for ev in busy_rows
     ]
+    busy.extend(
+        (
+            start.astimezone(tz) - timedelta(minutes=booking.buffer_before_min),
+            end.astimezone(tz) + timedelta(minutes=booking.buffer_after_min),
+        )
+        for start, end in live_google.intervals
+    )
 
     start_min = _parse_hhmm(booking.start_time)
     end_min = _parse_hhmm(booking.end_time)

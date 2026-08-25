@@ -580,6 +580,7 @@ class BookingAvailabilityRead(BaseModel):
     buffer_before_min: int = 0
     buffer_after_min: int = 0
     host_name: str | None = None
+    calendar_sync_status: Literal["connected", "disconnected", "unavailable"] = "disconnected"
     slots: list[BookingAvailabilitySlot]
 
 

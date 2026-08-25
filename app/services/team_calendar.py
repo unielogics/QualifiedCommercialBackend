@@ -10,6 +10,11 @@ from app.models.user import User
 from app.services.payment_authorization import primary_super_admin
 
 
+async def lock_calendar_owner(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Serialize bookings for one calendar owner inside the caller transaction."""
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+
+
 async def team_calendar_host(db: AsyncSession) -> User:
     host = await primary_super_admin(db)
     if host is None:

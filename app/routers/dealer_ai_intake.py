@@ -109,7 +109,7 @@ from app.services.main_street_programs import (
 )
 from app.services.payment_authorization import primary_super_admin
 from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
-from app.services.team_calendar import team_booking_settings
+from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
@@ -3519,10 +3519,14 @@ async def _booking_settings_for_primary_admin(db: AsyncSession) -> tuple[Any | N
     return owner, booking if booking.enabled else None
 
 
-async def _dealer_call_slots(db: AsyncSession) -> tuple[Any | None, BookingSettings | None, list[dict[str, str]]]:
+async def _dealer_call_slots(
+    db: AsyncSession, *, lock_host: bool = False
+) -> tuple[Any | None, BookingSettings | None, list[dict[str, str]]]:
     owner, booking = await _booking_settings_for_primary_admin(db)
     if owner is None or booking is None:
         return owner, booking, []
+    if lock_host:
+        await lock_calendar_owner(db, owner.id)
     slots = await _available_booking_slots(db, owner, booking)
     now = _now()
     next_day = now + timedelta(hours=24)
@@ -9037,7 +9041,7 @@ async def book_dealer_call(
             assistant_message="Your call is already booked. Keep uploading baseline documents here if anything is still missing before the meeting.",
         )
     starts_at = _to_utc_minute(payload.starts_at)
-    owner, booking, slots = await _dealer_call_slots(db)
+    owner, booking, slots = await _dealer_call_slots(db, lock_host=True)
     if owner is None or booking is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
     if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
@@ -9703,7 +9707,7 @@ async def book_funding_review_call(
             assistant_message="Your call is already booked. Keep uploading property and rent evidence here if anything is still missing before the meeting.",
         )
     starts_at = _to_utc_minute(payload.starts_at)
-    owner, booking, slots = await _dealer_call_slots(db)
+    owner, booking, slots = await _dealer_call_slots(db, lock_host=True)
     if owner is None or booking is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
     if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
@@ -10668,7 +10672,7 @@ async def book_mca_refinance_call(
             assistant_message="Your call is already booked. If any of the three items is still open, closing it before the meeting speeds everything up.",
         )
     starts_at = _to_utc_minute(payload.starts_at)
-    owner, booking, slots = await _dealer_call_slots(db)
+    owner, booking, slots = await _dealer_call_slots(db, lock_host=True)
     if owner is None or booking is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Call scheduling is not available right now.")
     if not any(abs((datetime.fromisoformat(slot["starts_at"]) - starts_at).total_seconds()) < 1 for slot in slots):
