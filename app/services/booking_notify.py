@@ -121,6 +121,9 @@ def send_invitee_invite(
     invitee_name: str,
     invitee_email: str,
     join_url: str | None = None,
+    cancel: bool = False,
+    sequence: int = 0,
+    staff: bool = False,
 ) -> SesSendResult | None:
     """Send the person who booked a genuine calendar invitation. Never raises."""
     to = (invitee_email or "").strip()
@@ -130,14 +133,24 @@ def send_invitee_invite(
         tz = _tz(booking.timezone)
         when = _when(starts_at, tz, booking.duration_min)
         host_name = user.name or "Qualified Commercial"
-        title = booking.title or f"Call with {host_name}"
+        title = event.title or booking.title or f"Call with {host_name}"
 
-        detail = [
-            f"You are booked with {host_name}.",
-            "",
-            f"When: {when}",
-            f"Duration: {booking.duration_min} minutes",
-        ]
+        detail = (
+            [
+                "A client appointment is scheduled on the Qualified Commercial shared calendar.",
+                "",
+                f"Client: {event.who or invitee_name}",
+                f"When: {when}",
+                f"Duration: {event.duration_min or booking.duration_min} minutes",
+            ]
+            if staff
+            else [
+                f"You are booked with {host_name}.",
+                "",
+                f"When: {when}",
+                f"Duration: {event.duration_min or booking.duration_min} minutes",
+            ]
+        )
         if join_url:
             detail += ["", f"Join here: {join_url}"]
         detail += [
@@ -156,18 +169,26 @@ def send_invitee_invite(
             uid=f"{event.id}@qualifiedcommercial.com",
             summary=title,
             starts_at=starts_at,
-            duration_min=booking.duration_min or 30,
+            duration_min=event.duration_min or booking.duration_min or 30,
             organizer_email=_from_address(),
             organizer_name=host_name,
             attendee_email=to,
             attendee_name=invitee_name,
-            description=body,
+            description=(event.description or body) if staff else body,
             location=join_url or "",
+            sequence=sequence,
+            cancel=cancel,
         )
 
         result = ses_client.send_raw_email(
             to_emails=[to],
-            subject=f"Confirmed: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}",
+            subject=(
+                f"Cancelled: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
+                if cancel
+                else f"Updated: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
+                if sequence
+                else f"Confirmed: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
+            ),
             body_text=body,
             attachments=[("invite.ics", ics, ICS_CONTENT_TYPE)],
         )
@@ -179,13 +200,44 @@ def send_invitee_invite(
         return SesSendResult(False, None, "invite_exception")
 
 
+def send_rep_invite(
+    host: User,
+    booking: BookingSettings,
+    event: CalendarEvent,
+    starts_at: datetime,
+    *,
+    rep: User | None,
+    join_url: str | None = None,
+    cancel: bool = False,
+    sequence: int = 0,
+) -> SesSendResult | None:
+    """Send the originating rep a portable ICS, even when Google is offline."""
+    if rep is None or not rep.email or rep.id == host.id:
+        return None
+    return send_invitee_invite(
+        host,
+        booking,
+        event,
+        starts_at,
+        invitee_name=rep.name or rep.email,
+        invitee_email=rep.email,
+        join_url=join_url,
+        cancel=cancel,
+        sequence=sequence,
+        staff=True,
+    )
+
+
 async def push_to_google(
     db: AsyncSession,
     event: CalendarEvent,
     *,
     invitee_email: str | None,
     invitee_name: str,
+    rep_email: str | None = None,
+    rep_name: str | None = None,
     want_meet: bool = True,
+    color_id: str | None = None,
 ) -> str | None:
     """Mirror the booking to the host's Google Calendar with the invitee on it.
 
@@ -196,17 +248,18 @@ async def push_to_google(
     try:
         from app.services.google.calendar_sync import push_event
 
-        attendees = (
-            [{"email": invitee_email, "displayName": invitee_name}]
-            if invitee_email
-            else None
-        )
+        attendees: list[dict] = []
+        if invitee_email:
+            attendees.append({"email": invitee_email, "displayName": invitee_name})
+        if rep_email and rep_email.lower() != (invitee_email or "").lower():
+            attendees.append({"email": rep_email, "displayName": rep_name or rep_email})
         return await push_event(
             db,
             event,
-            attendees=attendees,
+            attendees=attendees or None,
             want_conference=want_meet,
             send_updates="all",
+            color_id=color_id,
         )
     except Exception:  # noqa: BLE001
         log.exception("booking: google push failed event=%s", getattr(event, "id", None))

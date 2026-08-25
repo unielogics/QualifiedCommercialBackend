@@ -116,7 +116,7 @@ async def busy_periods(
     return CalendarBusySnapshot(status="connected", intervals=intervals)
 
 
-def _event_body(ev: CalendarEvent) -> dict:
+def _event_body(ev: CalendarEvent, *, color_id: str | None = None) -> dict:
     """Map an internal CalendarEvent to a Google Calendar event resource."""
     start = ev.starts_at
     if start.tzinfo is None:
@@ -129,6 +129,8 @@ def _event_body(ev: CalendarEvent) -> dict:
     }
     if ev.description:
         body["description"] = ev.description
+    if color_id:
+        body["colorId"] = color_id
     # Cancelled internal events map to a Google 'cancelled' status on patch.
     if ev.status == CalendarEventStatus.CANCELLED:
         body["status"] = "cancelled"
@@ -169,6 +171,7 @@ async def push_event(
     attendees: list[dict] | None = None,
     want_conference: bool = False,
     send_updates: str | None = None,
+    color_id: str | None = None,
 ) -> str | None:
     """Mirror one internal event to the owner's Google primary calendar.
 
@@ -201,7 +204,7 @@ async def push_event(
     # the same internal row can't create two Google events. Google-origin rows
     # already carry their real google_event_id.
     gid = ev.google_event_id or _deterministic_google_id(ev)
-    body = _event_body(ev)
+    body = _event_body(ev, color_id=color_id)
     if attendees:
         body["attendees"] = attendees
     if want_conference and not ev.google_event_id:

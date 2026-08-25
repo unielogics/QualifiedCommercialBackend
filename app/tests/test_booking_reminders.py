@@ -105,6 +105,42 @@ async def test_register_booking_never_schedules_sms_without_consent() -> None:
     assert not any(isinstance(item, BookingNotificationReminder) for item in db.added)
 
 
+@pytest.mark.asyncio
+async def test_register_booking_schedules_rep_email_and_in_app_reminders_only() -> None:
+    starts_at = datetime(2026, 9, 2, 15, 0, tzinfo=UTC)
+    event = SimpleNamespace(id=uuid4(), starts_at=starts_at)
+    rep_id = uuid4()
+    booking = BookingSettings(
+        user_id=uuid4(),
+        reminder_email_enabled=True,
+        reminder_email_minutes=[1440, 60],
+        reminder_sms_enabled=True,
+        reminder_sms_minutes=[120],
+    )
+    db = _FakeSession()
+
+    await register_booking(
+        db,
+        event=event,
+        booking=booking,
+        invitee_name="Client Name",
+        invitee_email="client@example.com",
+        invitee_phone="2015550100",
+        sms_consent=True,
+        booked_by_user_id=rep_id,
+    )
+
+    reminders = [item for item in db.added if isinstance(item, BookingNotificationReminder)]
+    assert [(item.channel, item.minutes_before) for item in reminders] == [
+        ("email", 1440),
+        ("email", 60),
+        ("rep", 1440),
+        ("rep", 60),
+        ("sms", 120),
+    ]
+    assert all(item.channel != "rep_sms" for item in reminders)
+
+
 def test_booking_settings_accepts_independent_buffers_and_twenty_minute_meetings() -> None:
     payload = UserBookingSettingsUpdate(
         duration_min=20,

@@ -35,8 +35,11 @@ from app.config import get_settings
 from app.models.user import User
 from app.models.application_profile import PlaidAssetReport
 from app.models.booking_settings import BookingSettings
+from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.event import CalendarEvent
+from app.models.notification import Notification
 from app.services import booking_notify, booking_reminders
+from app.services.notifications import notify_users
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle
 from app.services.email import ses_client
@@ -69,6 +72,7 @@ from .models import (
     DealerRepAppointment,
     DealerRepContact,
     DealerRepContactAssignment,
+    DealerApplicationContact,
     DealerRepContactShare,
     DealerRepInboxMessage,
     DealerRepInboxThread,
@@ -299,6 +303,8 @@ from .schemas import (
     ContactShareRead,
     ProgramPdfAttachmentRead,
     RepAppointmentCreate,
+    RepAppointmentCancel,
+    RepAppointmentOutcomePatch,
     RepAppointmentPatch,
     RepAppointmentRead,
     RepInboxComposeResult,
@@ -4447,6 +4453,7 @@ async def _booking_slots(
     booking: BookingSettings,
     *,
     duration_min: int | None = None,
+    exclude_event_id: UUID | None = None,
 ) -> BookingAvailabilityRead:
     zone = rep_workflows.tz(booking.timezone)
     duration = duration_min or booking.duration_min or 30
@@ -4484,6 +4491,9 @@ async def _booking_slots(
             .order_by(CalendarEvent.starts_at)
         )
     ).scalars().all()
+    excluded_event = next((ev for ev in busy_rows if ev.id == exclude_event_id), None)
+    if exclude_event_id:
+        busy_rows = [ev for ev in busy_rows if ev.id != exclude_event_id]
     busy = [
         (
             ev.starts_at.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
@@ -4492,13 +4502,19 @@ async def _booking_slots(
         )
         for ev in busy_rows
     ]
-    busy.extend(
-        (
+    for start, end in live_google.intervals:
+        # FreeBusy does not return event ids. Ignore only the exact mirrored
+        # interval of the appointment being rescheduled; merged/overlapping
+        # busy ranges remain blocking so another Google event cannot be hidden.
+        if excluded_event is not None:
+            expected_start = excluded_event.starts_at.astimezone(timezone.utc)
+            expected_end = expected_start + timedelta(minutes=excluded_event.duration_min or duration)
+            if abs((start - expected_start).total_seconds()) < 2 and abs((end - expected_end).total_seconds()) < 2:
+                continue
+        busy.append((
             start.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
             end.astimezone(zone) + timedelta(minutes=booking.buffer_after_min),
-        )
-        for start, end in live_google.intervals
-    )
+        ))
     start_min = _parse_hhmm(booking.start_time or "09:00")
     end_min = _parse_hhmm(booking.end_time or "17:00")
     slot_duration = timedelta(minutes=duration)
@@ -4593,6 +4609,7 @@ def _booking_description(
 async def _load_owned_appointment(
     db: AsyncSession, appointment_id: UUID, user: User
 ) -> DealerRepAppointment:
+    require_team_or_rep(user)
     row = (
         await db.execute(
             select(DealerRepAppointment).where(DealerRepAppointment.id == appointment_id)
@@ -4602,8 +4619,119 @@ async def _load_owned_appointment(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     if user.role == Role.FIELD_REP and row.booked_by_user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
-    require_team_or_rep(user)
     return row
+
+
+async def _appointment_read_rows(
+    db: AsyncSession, rows: list[DealerRepAppointment]
+) -> list[dict]:
+    event_ids = [row.calendar_event_id for row in rows if row.calendar_event_id]
+    notices = {}
+    events = {}
+    rep_reminders: dict[UUID, list[BookingNotificationReminder]] = {}
+    rep_notifications: dict[str, Notification] = {}
+    if event_ids:
+        notice_rows = (
+            await db.execute(select(BookingNotification).where(BookingNotification.event_id.in_(event_ids)))
+        ).scalars().all()
+        notices = {row.event_id: row for row in notice_rows}
+        notice_ids = [row.id for row in notice_rows]
+        if notice_ids:
+            reminder_rows = (
+                await db.execute(
+                    select(BookingNotificationReminder).where(
+                        BookingNotificationReminder.booking_notification_id.in_(notice_ids),
+                        BookingNotificationReminder.channel == "rep",
+                    )
+                )
+            ).scalars().all()
+            for reminder in reminder_rows:
+                rep_reminders.setdefault(reminder.booking_notification_id, []).append(reminder)
+        event_rows = (
+            await db.execute(select(CalendarEvent).where(CalendarEvent.id.in_(event_ids)))
+        ).scalars().all()
+        events = {row.id: row for row in event_rows}
+    appointment_ids = [str(row.id) for row in rows]
+    if appointment_ids:
+        notification_rows = (
+            await db.execute(
+                select(Notification)
+                .where(
+                    Notification.target_type == "dealer_rep_appointment",
+                    Notification.target_id.in_(appointment_ids),
+                )
+                .order_by(Notification.created_at.desc())
+            )
+        ).scalars().all()
+        for notification in notification_rows:
+            if notification.target_id:
+                rep_notifications.setdefault(notification.target_id, notification)
+    payloads: list[dict] = []
+    for row in rows:
+        data = RepAppointmentRead.model_validate(row).model_dump()
+        notice = notices.get(row.calendar_event_id)
+        event = events.get(row.calendar_event_id)
+        if notice:
+            data.update({
+                "confirmation_email_status": notice.confirmation_email_status,
+                "confirmation_sms_status": notice.confirmation_sms_status,
+                "email_reminder_status": notice.email_reminder_status,
+                "sms_reminder_status": notice.sms_reminder_status,
+                "delivery_error": notice.last_error,
+            })
+            staff_rows = rep_reminders.get(notice.id, [])
+            staff_statuses = {item.status for item in staff_rows}
+            data["rep_reminder_status"] = (
+                "failed" if "failed" in staff_statuses
+                else "pending" if "pending" in staff_statuses
+                else "sent" if "sent" in staff_statuses
+                else "cancelled" if staff_rows and staff_statuses == {"cancelled"}
+                else "disabled"
+            )
+        notification = rep_notifications.get(str(row.id))
+        data["rep_notification_status"] = (
+            "emailed" if notification and notification.emailed_at
+            else "in_app" if notification
+            else "unavailable"
+        )
+        data["google_sync_status"] = (
+            "connected" if event and event.google_event_id
+            else "pending" if event and event.owner_user_id
+            else "unavailable"
+        )
+        payloads.append(data)
+    return payloads
+
+
+def _appointment_payload(
+    appt: DealerRepAppointment, *, transactional_sms_consent: bool = False
+) -> RepAppointmentCreate:
+    return RepAppointmentCreate(
+        kind=appt.kind,
+        title=appt.title,
+        starts_at=appt.starts_at,
+        duration_min=appt.duration_min,
+        timezone=appt.timezone,
+        invitee_name=appt.invitee_name,
+        company=appt.company,
+        invitee_email=appt.invitee_email,
+        invitee_phone=appt.invitee_phone,
+        join_url=appt.join_url,
+        notes=appt.notes,
+        program_name=appt.program_name,
+        requested_amount=appt.requested_amount,
+        full_address=appt.full_address,
+        transactional_sms_consent=transactional_sms_consent,
+    )
+
+
+def _appointment_google_color(outcome: str | None) -> str | None:
+    # Google Calendar event palette: tomato, banana, basil.
+    return {"not_converted": "11", "did_not_show": "5", "converted": "10"}.get(outcome or "")
+
+
+def _appointment_local_time(starts_at: datetime, timezone_name: str | None) -> str:
+    return starts_at.astimezone(rep_workflows.tz(timezone_name)).strftime("%b %d at %I:%M %p %Z")
 
 
 async def _ensure_rep_contact(
@@ -4981,7 +5109,8 @@ async def list_all_rep_appointments(
     starts_from: datetime | None = Query(default=None, alias="from"),
     starts_to: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=250, ge=1, le=500),
-) -> list[DealerRepAppointment]:
+    include_cancelled: bool = Query(default=False),
+) -> list[dict]:
     require_team_or_rep(user)
     q = select(DealerRepAppointment)
     if user.role == Role.FIELD_REP:
@@ -4990,13 +5119,13 @@ async def list_all_rep_appointments(
         q = q.where(DealerRepAppointment.starts_at >= _to_utc_minute(starts_from))
     if starts_to is not None:
         q = q.where(DealerRepAppointment.starts_at <= _to_utc_minute(starts_to))
-    return list(
-        (
-            await db.execute(
-                q.order_by(DealerRepAppointment.starts_at.asc()).limit(limit)
-            )
-        ).scalars().all()
-    )
+    if not include_cancelled:
+        q = q.where(
+            DealerRepAppointment.archived_at.is_(None),
+            DealerRepAppointment.status != "cancelled",
+        )
+    rows = list((await db.execute(q.order_by(DealerRepAppointment.starts_at.asc()).limit(limit))).scalars().all())
+    return await _appointment_read_rows(db, rows)
 
 
 @router.post("/appointments", response_model=RepAppointmentRead, status_code=status.HTTP_201_CREATED)
@@ -5050,6 +5179,10 @@ async def create_standalone_rep_appointment(
         invitee_name=payload.invitee_name.strip(),
         invitee_email=payload.invitee_email,
         invitee_phone=payload.invitee_phone,
+        company=payload.company,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
         join_url=payload.join_url,
         notes=payload.notes,
         status="confirmed",
@@ -5057,6 +5190,7 @@ async def create_standalone_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    ev.external_ref_id = str(appt.id)
     notice = await booking_reminders.register_booking(
         db,
         event=ev,
@@ -5087,6 +5221,7 @@ async def create_standalone_rep_appointment(
         phone_e164=phone,
         source="appointment",
     )
+    appt.contact_id = contact.id
     await _capture_rep_contact_sms_consent(
         db,
         request=request,
@@ -5121,6 +5256,21 @@ async def create_standalone_rep_appointment(
         sender=user.email if thread.channel == "email" else get_settings().sms_origination_number or None,
         recipient=payload.invitee_email or phone,
     )
+    await notify_users(
+        db,
+        recipient_ids={user.id},
+        event_type="appointment_created",
+        category="calendar",
+        priority="high",
+        title=f"Appointment booked: {payload.invitee_name}",
+        body=f"{title} is scheduled for {_appointment_local_time(starts_at, appt.timezone)}.",
+        target_type="dealer_rep_appointment",
+        target_id=str(appt.id),
+        deep_link=f"/calendar?appointment={appt.id}",
+        meta={"appointment_id": str(appt.id), "calendar_event_id": str(ev.id)},
+        email=True,
+        push=True,
+    )
     await db.commit()
     await db.refresh(appt)
     join = await booking_notify.push_to_google(
@@ -5128,6 +5278,8 @@ async def create_standalone_rep_appointment(
         ev,
         invitee_email=payload.invitee_email,
         invitee_name=payload.invitee_name,
+        rep_email=user.email,
+        rep_name=user.name,
         want_meet=booking.google_meet_enabled,
     )
     if join and not appt.join_url:
@@ -5163,27 +5315,27 @@ async def create_standalone_rep_appointment(
             if email_result and not email_result.ok:
                 notice.last_error = email_result.detail[:1000]
         await db.commit()
+    booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
         db, notice, ev, timezone_name=booking.timezone
     )
-    return appt
+    return (await _appointment_read_rows(db, [appt]))[0]
 
 
 @router.get("/dealers/{dealer_id}/appointments", response_model=list[RepAppointmentRead])
 async def list_rep_appointments(
-    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
-) -> list[DealerRepAppointment]:
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    include_cancelled: bool = Query(default=False),
+) -> list[dict]:
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    return list(
-        (
-            await db.execute(
-                select(DealerRepAppointment)
-                .where(DealerRepAppointment.dealer_id == dealer.id)
-                .order_by(DealerRepAppointment.starts_at.asc())
-            )
-        ).scalars().all()
-    )
+    q = select(DealerRepAppointment).where(DealerRepAppointment.dealer_id == dealer.id)
+    if not include_cancelled:
+        q = q.where(DealerRepAppointment.archived_at.is_(None), DealerRepAppointment.status != "cancelled")
+    rows = list((await db.execute(q.order_by(DealerRepAppointment.starts_at.asc()))).scalars().all())
+    return await _appointment_read_rows(db, rows)
 
 
 @router.post(
@@ -5243,6 +5395,10 @@ async def create_rep_appointment(
         invitee_name=payload.invitee_name.strip(),
         invitee_email=payload.invitee_email,
         invitee_phone=payload.invitee_phone,
+        company=payload.company or dealer.name,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
         join_url=payload.join_url,
         notes=payload.notes,
         status="confirmed",
@@ -5250,6 +5406,7 @@ async def create_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    ev.external_ref_id = str(appt.id)
     notice = await booking_reminders.register_booking(
         db,
         event=ev,
@@ -5277,6 +5434,7 @@ async def create_rep_appointment(
         phone_e164=phone,
         source="appointment",
     )
+    appt.contact_id = contact.id
     await _capture_rep_contact_sms_consent(
         db,
         request=request,
@@ -5303,6 +5461,21 @@ async def create_rep_appointment(
             "calendar_event_id": str(ev.id),
         },
     )
+    await notify_users(
+        db,
+        recipient_ids={user.id},
+        event_type="appointment_created",
+        category="calendar",
+        priority="high",
+        title=f"Appointment booked: {payload.invitee_name}",
+        body=f"{title} is scheduled for {_appointment_local_time(starts_at, appt.timezone)}.",
+        target_type="dealer_rep_appointment",
+        target_id=str(appt.id),
+        deep_link=f"/calendar?appointment={appt.id}",
+        meta={"appointment_id": str(appt.id), "calendar_event_id": str(ev.id)},
+        email=True,
+        push=True,
+    )
     await db.commit()
     await db.refresh(appt)
     join = await booking_notify.push_to_google(
@@ -5310,6 +5483,8 @@ async def create_rep_appointment(
         ev,
         invitee_email=payload.invitee_email,
         invitee_name=payload.invitee_name,
+        rep_email=user.email,
+        rep_name=user.name,
         want_meet=booking.google_meet_enabled,
     )
     if join and not appt.join_url:
@@ -5345,10 +5520,119 @@ async def create_rep_appointment(
             if email_result and not email_result.ok:
                 notice.last_error = email_result.detail[:1000]
         await db.commit()
+    booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
         db, notice, ev, timezone_name=booking.timezone
     )
-    return appt
+    return (await _appointment_read_rows(db, [appt]))[0]
+
+
+async def _cancel_rep_appointment(
+    db: AsyncSession,
+    *,
+    appt: DealerRepAppointment,
+    user: User,
+    reason: str | None,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    if appt.archived_at is not None and appt.status == "cancelled":
+        return (await _appointment_read_rows(db, [appt]))[0]
+    event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
+    host = await db.get(User, appt.owner_user_id) if appt.owner_user_id else user
+    rep = await db.get(User, appt.booked_by_user_id) if appt.booked_by_user_id else user
+    booking = await _booking_settings_for(db, host or user)
+    notice = (
+        await db.execute(select(BookingNotification).where(BookingNotification.event_id == appt.calendar_event_id))
+    ).scalar_one_or_none() if appt.calendar_event_id else None
+
+    appt.status = "cancelled"
+    appt.archived_at = now
+    appt.archived_by_user_id = user.id
+    appt.cancellation_reason = (reason or "").strip() or None
+    if event:
+        event.status = CalendarEventStatus.CANCELLED
+    if notice:
+        await booking_reminders.cancel_pending(db, notice)
+    if appt.dealer_id:
+        await log_action(
+            db, appt.dealer_id, user, "appointment.cancelled", "appointment",
+            entity_id=appt.id,
+            after={"reason": appt.cancellation_reason, "archived_at": now.isoformat()},
+        )
+    if rep:
+        await notify_users(
+            db,
+            recipient_ids={rep.id},
+            event_type="appointment_cancelled",
+            category="calendar",
+            priority="high",
+            title=f"Appointment cancelled: {appt.invitee_name}",
+            body=f"{appt.title} was cancelled and archived.",
+            target_type="dealer_rep_appointment",
+            target_id=str(appt.id),
+            deep_link="/calendar?include_cancelled=1",
+            email=True,
+            push=True,
+        )
+    await db.commit()
+
+    results: dict[str, str] = {"rep": "queued" if rep else "unavailable"}
+    if event:
+        await booking_notify.push_to_google(
+            db,
+            event,
+            invitee_email=appt.invitee_email,
+            invitee_name=appt.invitee_name,
+            rep_email=rep.email if rep else None,
+            rep_name=rep.name if rep else None,
+            want_meet=False,
+            color_id=_appointment_google_color(appt.outcome),
+        )
+        results["google"] = "sent" if event.google_event_id else "unavailable"
+        rep_result = booking_notify.send_rep_invite(
+            host or user,
+            booking,
+            event,
+            appt.starts_at,
+            rep=rep,
+            join_url=appt.join_url,
+            cancel=True,
+            sequence=int(now.timestamp()),
+        )
+        results["rep_calendar"] = "sent" if rep_result and rep_result.ok else "unavailable" if rep_result is None else "failed"
+    if event and appt.invitee_email:
+        email_result = booking_notify.send_invitee_invite(
+            host or user,
+            booking,
+            event,
+            appt.starts_at,
+            invitee_name=appt.invitee_name,
+            invitee_email=appt.invitee_email,
+            join_url=appt.join_url,
+            cancel=True,
+            sequence=int(now.timestamp()),
+        )
+        results["client_email"] = "sent" if email_result and email_result.ok else "failed"
+        if notice and email_result and not email_result.ok:
+            notice.last_error = email_result.detail[:1000]
+    if notice and notice.invitee_phone and notice.sms_consent:
+        sms_body = f"Qualified Commercial: your appointment on {_appointment_local_time(appt.starts_at, appt.timezone)} was cancelled."
+        try:
+            sms_result = await asyncio.to_thread(consent_delivery._send_sms, notice.invitee_phone, sms_body)  # noqa: SLF001
+            results["client_sms"] = "sent" if sms_result.ok else "failed"
+            if not sms_result.ok:
+                notice.last_error = sms_result.detail[:1000]
+        except Exception:  # noqa: BLE001
+            logger.exception("appointment cancellation SMS raised appointment=%s", appt.id)
+            results["client_sms"] = "failed"
+            notice.last_error = "sms_provider_exception"
+    elif appt.invitee_phone:
+        results["client_sms"] = "blocked_no_consent"
+    await db.commit()
+    await db.refresh(appt)
+    data = (await _appointment_read_rows(db, [appt]))[0]
+    data["notification_results"] = results
+    return data
 
 
 @router.patch("/appointments/{appointment_id}", response_model=RepAppointmentRead)
@@ -5357,64 +5641,426 @@ async def patch_rep_appointment(
     payload: RepAppointmentPatch,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> DealerRepAppointment:
+) -> dict:
     appt = await _load_owned_appointment(db, appointment_id, user)
-    before = {
-        "dealer_id": str(appt.dealer_id) if appt.dealer_id else None,
-        "starts_at": appt.starts_at.isoformat(),
-        "status": appt.status,
-        "join_url": appt.join_url,
-        "notes": appt.notes,
-    }
+    if payload.status == "cancelled":
+        return await _cancel_rep_appointment(db, appt=appt, user=user, reason=None)
+    event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
+    host = await db.get(User, appt.owner_user_id) if appt.owner_user_id else user
+    rep = await db.get(User, appt.booked_by_user_id) if appt.booked_by_user_id else user
+    booking = await _booking_settings_for(db, host or user)
+    notice = (
+        await db.execute(select(BookingNotification).where(BookingNotification.event_id == appt.calendar_event_id))
+    ).scalar_one_or_none() if appt.calendar_event_id else None
+    before = RepAppointmentRead.model_validate(appt).model_dump(mode="json")
+    old_starts_at = appt.starts_at
+    old_email = appt.invitee_email
+    old_phone = consent_delivery.normalize_phone(appt.invitee_phone)
+
     if "dealer_id" in payload.model_fields_set and payload.dealer_id is not None:
         dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
-        if appt.dealer_id != dealer.id:
-            appt.dealer_id = dealer.id
-            if appt.calendar_event_id:
-                ev = await db.get(CalendarEvent, appt.calendar_event_id)
-                if ev is not None and "Rep appointment for" not in (ev.description or ""):
-                    ev.description = f"Linked file: {dealer.name}\n\n{ev.description or ''}".strip()
-            await log_action(
-                db,
-                dealer.id,
-                user,
-                "appointment.link_file",
-                "appointment",
-                entity_id=appt.id,
-                before=before,
-                after={"dealer_id": str(dealer.id)},
+        appt.dealer_id = dealer.id
+    else:
+        dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
+
+    proposed_start = _to_utc_minute(payload.starts_at) if payload.starts_at is not None else appt.starts_at
+    proposed_duration = payload.duration_min or appt.duration_min
+    rescheduled = proposed_start != appt.starts_at or proposed_duration != appt.duration_min
+    if rescheduled:
+        await lock_calendar_owner(db, (host or user).id)
+        availability = await _booking_slots(
+            db,
+            host or user,
+            booking,
+            duration_min=proposed_duration,
+            exclude_event_id=event.id if event else None,
+        )
+        if not any(abs((slot.starts_at - proposed_start).total_seconds()) < 1 for slot in availability.slots):
+            raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available on the shared calendar.")
+        appt.starts_at = proposed_start
+        appt.duration_min = proposed_duration
+        if appt.outcome in {"not_converted", "did_not_show"} and not payload.reopen_outcome:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Confirm that rescheduling should reopen the recorded outcome.",
             )
-    if payload.starts_at is not None:
-        appt.starts_at = _to_utc_minute(payload.starts_at)
-        ev = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
-        if ev is not None:
-            ev.starts_at = appt.starts_at
+        if appt.outcome in {"not_converted", "did_not_show"}:
+            appt.outcome = None
+            appt.outcome_note = None
+            appt.outcome_at = None
+            appt.outcome_by_user_id = None
+
+    for field in (
+        "kind", "title", "timezone", "invitee_name", "company", "program_name",
+        "requested_amount", "full_address", "join_url", "notes",
+    ):
+        value = getattr(payload, field)
+        if field in payload.model_fields_set:
+            setattr(appt, field, value.strip() if isinstance(value, str) and value.strip() else value or None)
+    if payload.invitee_email is not None:
+        appt.invitee_email = payload.invitee_email.strip().lower() or None
+    if payload.invitee_phone is not None:
+        appt.invitee_phone = consent_delivery.normalize_phone(payload.invitee_phone)
     if payload.status is not None:
         appt.status = payload.status
-        ev = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
-        if ev is not None and payload.status == "cancelled":
-            ev.status = CalendarEventStatus.CANCELLED
-        elif ev is not None and payload.status == "done":
-            ev.status = CalendarEventStatus.DONE
-    if payload.join_url is not None:
-        appt.join_url = payload.join_url or None
-    if payload.notes is not None:
-        appt.notes = payload.notes or None
+    if not appt.invitee_email and not appt.invitee_phone:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Provide an invitee email or phone.")
+
+    if event:
+        event.title = appt.title
+        event.starts_at = appt.starts_at
+        event.duration_min = appt.duration_min
+        event.who = (
+            f"{appt.invitee_name} <{appt.invitee_email}>" if appt.invitee_email else appt.invitee_name
+        )[:160]
+        event.status = CalendarEventStatus.DONE if appt.status == "done" else CalendarEventStatus.PENDING
+        description, _, _, _ = _booking_description(
+            user=rep or user,
+            payload=_appointment_payload(appt, transactional_sms_consent=bool(notice and notice.sms_consent)),
+            dealer=dealer,
+        )
+        event.description = f"{description}\n\nJoin: {appt.join_url}" if appt.join_url else description
+
+    if appt.contact_id:
+        contact = await db.get(DealerRepContact, appt.contact_id)
+        if contact:
+            contact.full_name = appt.invitee_name
+            contact.company = appt.company or contact.company
+            contact.email = appt.invitee_email
+            contact.phone_e164 = consent_delivery.normalize_phone(appt.invitee_phone)
+            contact.last_activity_at = datetime.now(timezone.utc)
+            if old_phone != contact.phone_e164:
+                contact.sms_transactional_consented_at = None
+                contact.sms_marketing_consented_at = None
+                contact.sms_consent_meta = None
+
+    if notice:
+        notice.invitee_name = appt.invitee_name
+        notice.invitee_email = appt.invitee_email
+        notice.invitee_phone = consent_delivery.normalize_phone(appt.invitee_phone)
+        notice.program_name = appt.program_name
+        notice.requested_amount = appt.requested_amount
+        notice.full_address = appt.full_address
+        notice.join_url = appt.join_url
+        if old_phone != notice.invitee_phone:
+            notice.sms_consent = False
+            notice.sms_consent_at = None
+            notice.sms_consent_method = None
+            notice.sms_reminder_status = "blocked_no_consent" if notice.invitee_phone else "disabled"
+            notice.confirmation_sms_status = "blocked_no_consent" if notice.invitee_phone else "disabled"
+        if rescheduled:
+            await booking_reminders.reschedule_pending(db, notice, appt.starts_at)
+
     if appt.dealer_id:
-        dealer = await resolve_dealer_scope(db, user, appt.dealer_id)
         await log_action(
-            db,
-            dealer.id,
-            user,
-            "appointment.update",
-            "appointment",
-            entity_id=appt.id,
-            before=before,
+            db, appt.dealer_id, user,
+            "appointment.rescheduled" if rescheduled else "appointment.updated",
+            "appointment", entity_id=appt.id, before=before,
             after=payload.model_dump(exclude_unset=True, mode="json"),
         )
+    if rep:
+        await notify_users(
+            db,
+            recipient_ids={rep.id},
+            event_type="appointment_rescheduled" if rescheduled else "appointment_updated",
+            category="calendar",
+            priority="high",
+            title=f"Appointment {'rescheduled' if rescheduled else 'updated'}: {appt.invitee_name}",
+            body=f"{appt.title} is scheduled for {_appointment_local_time(appt.starts_at, appt.timezone)}.",
+            target_type="dealer_rep_appointment",
+            target_id=str(appt.id),
+            deep_link=f"/calendar?appointment={appt.id}",
+            email=True,
+            push=True,
+        )
+    await db.commit()
+
+    results: dict[str, str] = {"rep": "queued" if rep else "unavailable"}
+    if event:
+        join = await booking_notify.push_to_google(
+            db,
+            event,
+            invitee_email=appt.invitee_email,
+            invitee_name=appt.invitee_name,
+            rep_email=rep.email if rep else None,
+            rep_name=rep.name if rep else None,
+            want_meet=booking.google_meet_enabled,
+            color_id=_appointment_google_color(appt.outcome),
+        )
+        if join and not appt.join_url:
+            appt.join_url = join
+            if notice:
+                notice.join_url = join
+        results["google"] = "sent" if event.google_event_id else "unavailable"
+        sequence = int(datetime.now(timezone.utc).timestamp())
+        if old_email and old_email != appt.invitee_email:
+            booking_notify.send_invitee_invite(
+                host or user, booking, event, old_starts_at,
+                invitee_name=appt.invitee_name, invitee_email=old_email,
+                join_url=appt.join_url, cancel=True, sequence=sequence,
+            )
+        if appt.invitee_email:
+            email_result = booking_notify.send_invitee_invite(
+                host or user, booking, event, appt.starts_at,
+                invitee_name=appt.invitee_name, invitee_email=appt.invitee_email,
+                join_url=appt.join_url, sequence=sequence,
+            )
+            results["client_email"] = "sent" if email_result and email_result.ok else "failed"
+            if notice:
+                notice.confirmation_email_status = results["client_email"]
+                if email_result and not email_result.ok:
+                    notice.last_error = email_result.detail[:1000]
+        rep_result = booking_notify.send_rep_invite(
+            host or user,
+            booking,
+            event,
+            appt.starts_at,
+            rep=rep,
+            join_url=appt.join_url,
+            sequence=sequence,
+        )
+        results["rep_calendar"] = "sent" if rep_result and rep_result.ok else "unavailable" if rep_result is None else "failed"
     await db.commit()
     await db.refresh(appt)
-    return appt
+    data = (await _appointment_read_rows(db, [appt]))[0]
+    data["notification_results"] = results
+    return data
+
+
+@router.post("/appointments/{appointment_id}/cancel", response_model=RepAppointmentRead)
+async def cancel_rep_appointment(
+    appointment_id: UUID,
+    payload: RepAppointmentCancel,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    appt = await _load_owned_appointment(db, appointment_id, user)
+    return await _cancel_rep_appointment(db, appt=appt, user=user, reason=payload.reason)
+
+
+def _appointment_amount(value: str | None) -> float | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^0-9.]", "", value)
+    try:
+        return float(cleaned) if cleaned else None
+    except ValueError:
+        return None
+
+
+async def _convert_appointment_to_field_desk(
+    db: AsyncSession, appt: DealerRepAppointment, user: User
+) -> DealerBusiness:
+    if appt.converted_dealer_id:
+        existing = await db.get(DealerBusiness, appt.converted_dealer_id)
+        if existing:
+            return existing
+    if appt.dealer_id:
+        existing = await db.get(DealerBusiness, appt.dealer_id)
+        if existing:
+            return existing
+    owner_id = appt.booked_by_user_id or user.id
+    dealer = DealerBusiness(
+        name=appt.company or appt.invitee_name,
+        legal_name=appt.company or appt.invitee_name,
+        email=appt.invitee_email,
+        phone=appt.invitee_phone,
+        address=appt.full_address,
+        funding_goal=_appointment_amount(appt.requested_amount),
+        client_requested_amount=_appointment_amount(appt.requested_amount),
+        funding_purpose=(appt.program_name or "other")[:48],
+        notes="\n\n".join(part for part in [appt.notes, "Created from converted appointment."] if part),
+        application_lifecycle="draft",
+        owner_user_id=owner_id,
+        case_ref=await _next_case_ref(db),
+    )
+    db.add(dealer)
+    await db.flush()
+    db.add(DealerSourceConnection(dealer_id=dealer.id, kind="uploads", status="active"))
+    await propose_targets(db, dealer)
+    await buckets_link.ensure_bucket(db, dealer)
+    db.add(
+        DealerRepLead(
+            dealer_id=dealer.id,
+            rep_user_id=owner_id,
+            status="draft",
+            status_history=[{
+                "at": datetime.now(timezone.utc).isoformat(),
+                "from": None,
+                "to": "draft",
+                "by": str(user.id),
+                "by_name": user.name,
+                "source": "appointment_conversion",
+            }],
+        )
+    )
+    if appt.contact_id:
+        db.add(
+            DealerApplicationContact(
+                dealer_id=dealer.id,
+                contact_id=appt.contact_id,
+                relationship="primary_contact",
+                is_primary=True,
+            )
+        )
+        contact = await db.get(DealerRepContact, appt.contact_id)
+        if contact:
+            contact.dealer_id = dealer.id
+    await db.flush()
+    return dealer
+
+
+async def _convert_appointment_to_ai_intake(
+    db: AsyncSession,
+    *,
+    appt: DealerRepAppointment,
+    user: User,
+    request: Request,
+    variant: str,
+    notify_client: bool,
+) -> UUID:
+    if appt.converted_intake_id:
+        return appt.converted_intake_id
+    # Reuse the production admin-intake path so bucket setup, access controls,
+    # requested documents, client ownership, and notification behavior stay
+    # identical to an intake created from the lead-management screen.
+    from app.routers import dealer_ai_intake as intake_api
+
+    variant_const = intake_api.FUNDING_VARIANT if variant == "real_estate" else intake_api.DEALER_VARIANT
+    existing = await intake_api._latest_active_intake_by_email(
+        db, appt.invitee_email or "", variant=variant_const
+    ) if appt.invitee_email else None
+    if existing:
+        return existing.id
+    if not appt.invitee_email:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "An email is required to create an AI intake.")
+    result = await intake_api.create_admin_ai_lead(
+        intake_api.AdminLeadCreate(
+            variant=variant,
+            full_name=appt.invitee_name,
+            email=appt.invitee_email,
+            phone=appt.invitee_phone,
+            business_name=appt.company,
+            investor_name=appt.company if variant == "real_estate" else None,
+            target_property_address=appt.full_address if variant == "real_estate" else None,
+            transaction_type=appt.program_name if variant == "real_estate" else None,
+            requested_amount=_appointment_amount(appt.requested_amount),
+            notify_client=notify_client,
+            secure_room_pin=f"{secrets.randbelow(1_000_000):06d}",
+        ),
+        request,
+        user,
+        db,
+    )
+    return result.intake.id
+
+
+@router.patch("/appointments/{appointment_id}/outcome", response_model=RepAppointmentRead)
+async def set_rep_appointment_outcome(
+    appointment_id: UUID,
+    payload: RepAppointmentOutcomePatch,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    require_super_admin(user)
+    appt = (
+        await db.execute(
+            select(DealerRepAppointment)
+            .where(DealerRepAppointment.id == appointment_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if appt is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
+    if appt.status == "cancelled" or appt.archived_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A cancelled appointment cannot receive an outcome.")
+    if appt.outcome == "converted" and appt.conversion_target:
+        if payload.outcome != "converted" or payload.conversion_target != appt.conversion_target:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This appointment has already been converted.")
+        return (await _appointment_read_rows(db, [appt]))[0]
+
+    converted_dealer: DealerBusiness | None = None
+    converted_intake_id: UUID | None = None
+    if payload.outcome == "converted":
+        if payload.conversion_target == "field_desk":
+            converted_dealer = await _convert_appointment_to_field_desk(db, appt, user)
+        else:
+            converted_intake_id = await _convert_appointment_to_ai_intake(
+                db,
+                appt=appt,
+                user=user,
+                request=request,
+                variant=payload.ai_variant or "dealer",
+                notify_client=payload.notify_client,
+            )
+            # The admin-intake helper commits. Re-lock before finalizing the
+            # appointment so a retried request cannot create another target.
+            appt = (
+                await db.execute(
+                    select(DealerRepAppointment)
+                    .where(DealerRepAppointment.id == appointment_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            if appt.converted_intake_id:
+                converted_intake_id = appt.converted_intake_id
+
+    now = datetime.now(timezone.utc)
+    appt.outcome = payload.outcome
+    appt.outcome_note = (payload.note or "").strip() or None
+    appt.outcome_at = now
+    appt.outcome_by_user_id = user.id
+    if payload.outcome == "converted":
+        appt.conversion_target = payload.conversion_target
+        appt.converted_dealer_id = converted_dealer.id if converted_dealer else appt.converted_dealer_id
+        appt.converted_intake_id = converted_intake_id or appt.converted_intake_id
+        if converted_dealer:
+            appt.dealer_id = converted_dealer.id
+    event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
+    if appt.dealer_id:
+        await log_action(
+            db, appt.dealer_id, user, "appointment.outcome_changed", "appointment",
+            entity_id=appt.id,
+            after={
+                "outcome": payload.outcome,
+                "note": appt.outcome_note,
+                "conversion_target": appt.conversion_target,
+                "converted_dealer_id": str(appt.converted_dealer_id) if appt.converted_dealer_id else None,
+                "converted_intake_id": str(appt.converted_intake_id) if appt.converted_intake_id else None,
+            },
+        )
+    rep = await db.get(User, appt.booked_by_user_id) if appt.booked_by_user_id else None
+    if rep:
+        await notify_users(
+            db,
+            recipient_ids={rep.id},
+            event_type="appointment_outcome_changed",
+            category="calendar",
+            priority="medium",
+            title=f"Appointment outcome: {appt.invitee_name}",
+            body=payload.outcome.replace("_", " ").title(),
+            target_type="dealer_rep_appointment",
+            target_id=str(appt.id),
+            deep_link=f"/calendar?appointment={appt.id}",
+            email=False,
+            push=True,
+        )
+    await db.commit()
+    if event:
+        await booking_notify.push_to_google(
+            db,
+            event,
+            invitee_email=appt.invitee_email,
+            invitee_name=appt.invitee_name,
+            rep_email=rep.email if rep else None,
+            rep_name=rep.name if rep else None,
+            want_meet=False,
+            color_id=_appointment_google_color(appt.outcome),
+        )
+        await db.commit()
+    await db.refresh(appt)
+    return (await _appointment_read_rows(db, [appt]))[0]
 
 
 @router.get(

@@ -16,6 +16,7 @@ from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.services.email import ses_client
+from app.services.notifications import notify_users
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,18 @@ async def register_booking(
                     due_at=event.starts_at - timedelta(minutes=minutes_before),
                 )
             )
+    # Staff reminders intentionally use email + in-app only. Client SMS
+    # consent never authorizes messaging an employee phone number.
+    if booking.reminder_email_enabled and booked_by_user_id:
+        for minutes_before in email_schedule:
+            db.add(
+                BookingNotificationReminder(
+                    booking_notification_id=row.id,
+                    channel="rep",
+                    minutes_before=minutes_before,
+                    due_at=event.starts_at - timedelta(minutes=minutes_before),
+                )
+            )
     if booking.reminder_sms_enabled and row.invitee_phone and row.sms_consent:
         for minutes_before in sms_schedule:
             db.add(
@@ -109,6 +122,43 @@ async def register_booking(
             )
     await db.flush()
     return row
+
+
+async def reschedule_pending(
+    db: AsyncSession, notice: BookingNotification, starts_at: datetime
+) -> None:
+    reminders = (
+        await db.execute(
+            select(BookingNotificationReminder).where(
+                BookingNotificationReminder.booking_notification_id == notice.id,
+                BookingNotificationReminder.status == "pending",
+            )
+        )
+    ).scalars().all()
+    for reminder in reminders:
+        reminder.due_at = starts_at - timedelta(minutes=reminder.minutes_before)
+    email_rows = [row for row in reminders if row.channel == "email"]
+    sms_rows = [row for row in reminders if row.channel == "sms"]
+    notice.email_reminder_due_at = min((row.due_at for row in email_rows), default=None)
+    notice.sms_reminder_due_at = min((row.due_at for row in sms_rows), default=None)
+
+
+async def cancel_pending(db: AsyncSession, notice: BookingNotification) -> None:
+    reminders = (
+        await db.execute(
+            select(BookingNotificationReminder).where(
+                BookingNotificationReminder.booking_notification_id == notice.id,
+                BookingNotificationReminder.status == "pending",
+            )
+        )
+    ).scalars().all()
+    for reminder in reminders:
+        reminder.status = "cancelled"
+        reminder.error = None
+    if notice.email_reminder_status == "pending":
+        notice.email_reminder_status = "cancelled"
+    if notice.sms_reminder_status == "pending":
+        notice.sms_reminder_status = "cancelled"
 
 
 def _detail_lines(row: BookingNotification) -> list[str]:
@@ -137,7 +187,14 @@ async def send_confirmation_sms(
         f"{local_start.strftime('%b %d at %I:%M %p %Z')}. "
         f"{'Join: ' + row.join_url + ' ' if row.join_url else ''}Reply STOP to opt out."
     )
-    result = await asyncio.to_thread(consent_delivery._send_sms, row.invitee_phone, body)  # noqa: SLF001
+    try:
+        result = await asyncio.to_thread(consent_delivery._send_sms, row.invitee_phone, body)  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        log.exception("booking confirmation SMS raised notification=%s", row.id)
+        row.confirmation_sms_status = "failed"
+        row.last_error = "sms_provider_exception"
+        await db.commit()
+        return
     row.confirmation_sms_status = "sent" if result.ok else "failed"
     if not result.ok:
         row.last_error = result.detail[:1000]
@@ -202,7 +259,19 @@ async def dispatch_due_reminders() -> int:
                     f"Qualified Commercial reminder: {event.title}, {when}. "
                     f"{'Join: ' + notice.join_url + ' ' if notice.join_url else ''}Reply STOP to opt out."
                 )
-                result = await asyncio.to_thread(consent_delivery._send_sms, notice.invitee_phone or "", body)  # noqa: SLF001
+                try:
+                    result = await asyncio.to_thread(
+                        consent_delivery._send_sms, notice.invitee_phone or "", body  # noqa: SLF001
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("booking reminder SMS raised notification=%s", notice.id)
+                    reminder.status = "failed"
+                    reminder.sent_at = now
+                    reminder.error = "sms_provider_exception"
+                    notice.sms_reminder_status = "failed"
+                    notice.sms_reminder_sent_at = now
+                    notice.last_error = "sms_provider_exception"
+                    continue
                 reminder.status = "sent" if result.ok else "failed"
                 reminder.sent_at = now
                 reminder.provider_message_id = getattr(result, "message_id", None)
@@ -212,5 +281,31 @@ async def dispatch_due_reminders() -> int:
                 if not result.ok:
                     notice.last_error = result.detail[:1000]
                 sent += int(result.ok)
+            elif reminder.channel == "rep":
+                rep = await db.get(User, notice.booked_by_user_id) if notice.booked_by_user_id else None
+                if rep is None:
+                    reminder.status = "failed"
+                    reminder.sent_at = now
+                    reminder.error = "booking_rep_missing"
+                    continue
+                await notify_users(
+                    db,
+                    recipient_ids={rep.id},
+                    event_type="appointment_reminder",
+                    category="calendar",
+                    priority="high",
+                    title=f"Upcoming appointment: {event.title}",
+                    body=f"Your appointment starts {when}.",
+                    target_type="dealer_rep_appointment",
+                    target_id=str(event.external_ref_id or event.id),
+                    deep_link=f"/calendar?appointment={event.external_ref_id}" if event.external_ref_id else "/calendar",
+                    meta={"event_id": str(event.id), "join_url": notice.join_url},
+                    email=True,
+                    push=True,
+                )
+                reminder.status = "sent"
+                reminder.sent_at = now
+                reminder.error = None
+                sent += 1
         await db.commit()
     return sent

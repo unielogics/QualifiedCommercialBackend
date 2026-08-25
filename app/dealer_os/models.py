@@ -456,6 +456,8 @@ class DealerSession(TimestampMixin, Base):
 
 REP_APPOINTMENT_KINDS: tuple[str, ...] = ("callback", "program_intro", "underwriting_review")
 REP_APPOINTMENT_STATUSES: tuple[str, ...] = ("pending", "confirmed", "cancelled", "done")
+REP_APPOINTMENT_OUTCOMES: tuple[str, ...] = ("not_converted", "did_not_show", "converted")
+REP_APPOINTMENT_CONVERSION_TARGETS: tuple[str, ...] = ("field_desk", "ai_intake")
 
 
 class DealerRepAppointment(TimestampMixin, Base):
@@ -478,6 +480,9 @@ class DealerRepAppointment(TimestampMixin, Base):
     calendar_event_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("calendar_events.id", ondelete="SET NULL")
     )
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="SET NULL")
+    )
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="callback", server_default="callback")
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -486,11 +491,33 @@ class DealerRepAppointment(TimestampMixin, Base):
     invitee_name: Mapped[str] = mapped_column(String(160), nullable=False)
     invitee_email: Mapped[str | None] = mapped_column(String(320))
     invitee_phone: Mapped[str | None] = mapped_column(String(32))
+    company: Mapped[str | None] = mapped_column(String(180))
+    program_name: Mapped[str | None] = mapped_column(String(180))
+    requested_amount: Mapped[str | None] = mapped_column(String(40))
+    full_address: Mapped[str | None] = mapped_column(String(500))
     join_url: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     booked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    outcome: Mapped[str | None] = mapped_column(String(24))
+    outcome_note: Mapped[str | None] = mapped_column(Text)
+    outcome_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(Text)
+    conversion_target: Mapped[str | None] = mapped_column(String(24))
+    converted_dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    converted_intake_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL")
     )
 
 

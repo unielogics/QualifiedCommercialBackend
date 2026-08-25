@@ -589,6 +589,7 @@ class RepAppointmentRead(ORM):
     dealer_id: UUID | None = None
     owner_user_id: UUID | None = None
     calendar_event_id: UUID | None = None
+    contact_id: UUID | None = None
     kind: str
     title: str
     starts_at: datetime
@@ -597,10 +598,33 @@ class RepAppointmentRead(ORM):
     invitee_name: str
     invitee_email: str | None = None
     invitee_phone: str | None = None
+    company: str | None = None
+    program_name: str | None = None
+    requested_amount: str | None = None
+    full_address: str | None = None
     join_url: str | None = None
     notes: str | None = None
     status: str
     booked_by_user_id: UUID | None = None
+    outcome: Literal["not_converted", "did_not_show", "converted"] | None = None
+    outcome_note: str | None = None
+    outcome_at: datetime | None = None
+    outcome_by_user_id: UUID | None = None
+    archived_at: datetime | None = None
+    archived_by_user_id: UUID | None = None
+    cancellation_reason: str | None = None
+    conversion_target: Literal["field_desk", "ai_intake"] | None = None
+    converted_dealer_id: UUID | None = None
+    converted_intake_id: UUID | None = None
+    confirmation_email_status: str | None = None
+    confirmation_sms_status: str | None = None
+    email_reminder_status: str | None = None
+    sms_reminder_status: str | None = None
+    google_sync_status: str | None = None
+    rep_notification_status: str | None = None
+    rep_reminder_status: str | None = None
+    delivery_error: str | None = None
+    notification_results: dict[str, str] | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -631,10 +655,42 @@ class RepAppointmentCreate(BaseModel):
 
 class RepAppointmentPatch(BaseModel):
     dealer_id: UUID | None = None
+    kind: Literal["callback", "program_intro", "underwriting_review"] | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=200)
     starts_at: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=80)
+    duration_min: int | None = Field(default=None, ge=15, le=180)
+    invitee_name: str | None = Field(default=None, min_length=1, max_length=160)
+    invitee_email: str | None = Field(default=None, max_length=320)
+    invitee_phone: str | None = Field(default=None, max_length=32)
+    company: str | None = Field(default=None, max_length=180)
+    program_name: str | None = Field(default=None, max_length=180)
+    requested_amount: str | None = Field(default=None, max_length=40)
+    full_address: str | None = Field(default=None, max_length=500)
     status: Literal["pending", "confirmed", "cancelled", "done"] | None = None
     join_url: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
+    reopen_outcome: bool = False
+
+
+class RepAppointmentCancel(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class RepAppointmentOutcomePatch(BaseModel):
+    outcome: Literal["not_converted", "did_not_show", "converted"]
+    note: str | None = Field(default=None, max_length=2000)
+    conversion_target: Literal["field_desk", "ai_intake"] | None = None
+    ai_variant: Literal["dealer", "real_estate"] | None = None
+    notify_client: bool = False
+
+    @model_validator(mode="after")
+    def _conversion_requires_destination(self) -> "RepAppointmentOutcomePatch":
+        if self.outcome == "converted" and self.conversion_target is None:
+            raise ValueError("Choose a conversion destination.")
+        if self.conversion_target == "ai_intake" and self.ai_variant is None:
+            raise ValueError("Choose Dealer or Real Estate AI intake.")
+        return self
 
 
 class UnderwritingReviewPreferenceRead(ORM):
