@@ -79,6 +79,23 @@ def _actor_label(user) -> str:
     return role.value if hasattr(role, "value") else str(role or "user")
 
 
+def _provider_switch_ready(
+    *,
+    current_provider: str,
+    requested_provider: str,
+    provider_status: dict[str, Any],
+    supplied_secrets: set[str],
+) -> bool:
+    if requested_provider == current_provider:
+        return True
+    if requested_provider == "geoapify":
+        return "geoapify_api_key" in supplied_secrets or bool(provider_status["geoapify_configured"])
+    return bool(
+        {"google_server_api_key", "google_maps_browser_key"} & supplied_secrets
+        or provider_status["google_server_configured"]
+    )
+
+
 def _to_read(row: AnalysisRun) -> AnalysisRunRead:
     return AnalysisRunRead.model_validate(row)
 
@@ -382,6 +399,7 @@ async def update_provider_settings(
     db: AsyncSession = Depends(get_db),
 ) -> ProviderSettingsRead:
     data = payload.model_dump(exclude_unset=True)
+    supplied_secrets: set[str] = set()
     for key in (
         "rentcast_api_key",
         "google_server_api_key",
@@ -394,16 +412,23 @@ async def update_provider_settings(
         value = data.pop(key, None)
         if isinstance(value, str) and value.strip():
             await set_secret(db, key=key, value=value.strip(), updated_by_id=user.id)
+            supplied_secrets.add(key)
 
     requested_provider = data.get("address_provider")
     if requested_provider is not None:
+        settings_row = await _get_app_settings(db)
+        current_settings = AppSettingsData.model_validate(settings_row.data or {}).model_dump(mode="json")
+        current_provider = (current_settings.get("property_intelligence") or {}).get("address_provider", "google")
+
+        # Re-sending the selected provider must not block an otherwise valid
+        # key update. A key supplied with a real switch makes it atomic.
         provider_status = await provider_settings_status(db)
-        configured = (
-            provider_status["geoapify_configured"]
-            if requested_provider == "geoapify"
-            else provider_status["google_server_configured"]
-        )
-        if not configured:
+        if not _provider_switch_ready(
+            current_provider=current_provider,
+            requested_provider=requested_provider,
+            provider_status=provider_status,
+            supplied_secrets=supplied_secrets,
+        ):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"Configure the {requested_provider.title()} server key before activating it.",

@@ -5,6 +5,7 @@ import hmac
 from app.config import Settings
 from app.dealer_os.services import sms_provider
 from app.dealer_os.services.sms_provider import provider_readiness, validate_twilio_signature
+from app.routers.analysis import _provider_switch_ready
 from app.services.property_intelligence import _address_from_geoapify_properties
 
 
@@ -27,6 +28,33 @@ def test_geoapify_address_maps_to_existing_split_address_contract() -> None:
     assert parts.zip == "07102"
     assert parts.latitude == 40.7357
     assert parts.longitude == -74.1724
+
+
+def test_saving_geoapify_key_does_not_revalidate_unchanged_google_provider() -> None:
+    assert _provider_switch_ready(
+        current_provider="google",
+        requested_provider="google",
+        provider_status={"google_server_configured": False, "geoapify_configured": False},
+        supplied_secrets={"geoapify_api_key"},
+    )
+
+
+def test_geoapify_key_can_be_saved_and_activated_atomically() -> None:
+    assert _provider_switch_ready(
+        current_provider="google",
+        requested_provider="geoapify",
+        provider_status={"google_server_configured": False, "geoapify_configured": False},
+        supplied_secrets={"geoapify_api_key"},
+    )
+
+
+def test_provider_switch_still_requires_a_configured_target() -> None:
+    assert not _provider_switch_ready(
+        current_provider="google",
+        requested_provider="geoapify",
+        provider_status={"google_server_configured": False, "geoapify_configured": False},
+        supplied_secrets=set(),
+    )
 
 
 def test_twilio_readiness_requires_webhook_token_and_sender() -> None:
