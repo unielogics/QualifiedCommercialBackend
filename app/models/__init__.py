@@ -76,7 +76,7 @@ from app.models.bucket import (  # noqa: F401
     BucketUploadLink,
     BucketVendorAccess,
 )
-from app.models.booking_notification import BookingNotification  # noqa: F401
+from app.models.booking_notification import BookingNotification, BookingNotificationReminder  # noqa: F401
 from app.models.capital_partner_application import (  # noqa: F401
     APPLICATION_STATUSES,
     CapitalPartnerApplication,

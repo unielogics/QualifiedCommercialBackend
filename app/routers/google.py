@@ -32,6 +32,8 @@ class AuthUrlResponse(BaseModel):
 
 class ConnectionStatus(BaseModel):
     connected: bool
+    oauth_configured: bool = False
+    oauth_configuration_message: str | None = None
     google_email: str | None = None
     gmail_connected: bool = False
     calendar_connected: bool = False
@@ -95,11 +97,21 @@ async def google_oauth_callback(
 
 @router.get("/connection", response_model=ConnectionStatus)
 async def google_connection_status(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ConnectionStatus:
+    oauth_configured = goog._oauth_configured()
+    configuration_message = None if oauth_configured else (
+        "Google OAuth requires a web client ID, client secret, and production callback URI in the backend secret."
+    )
     row = await goog.get_account(db, user.id)
     if row is None:
-        return ConnectionStatus(connected=False)
+        return ConnectionStatus(
+            connected=False,
+            oauth_configured=oauth_configured,
+            oauth_configuration_message=configuration_message,
+        )
     return ConnectionStatus(
         connected=row.status == "active" and bool(row.encrypted_refresh_token),
+        oauth_configured=oauth_configured,
+        oauth_configuration_message=configuration_message,
         google_email=row.google_email,
         gmail_connected=row.gmail_connected,
         calendar_connected=row.calendar_connected,

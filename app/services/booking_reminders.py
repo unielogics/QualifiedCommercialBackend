@@ -5,13 +5,13 @@ import logging
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.services import consent_delivery
 from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventStatus
-from app.models.booking_notification import BookingNotification
+from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
@@ -44,14 +44,22 @@ async def register_booking(
     requested_amount: str | None = None,
     full_address: str | None = None,
 ) -> BookingNotification:
+    email_schedule = sorted(
+        set(booking.reminder_email_minutes or [booking.reminder_email_minutes_before]),
+        reverse=True,
+    )
+    sms_schedule = sorted(
+        set(booking.reminder_sms_minutes or [booking.reminder_sms_minutes_before]),
+        reverse=True,
+    )
     email_due = (
-        event.starts_at - timedelta(minutes=booking.reminder_email_minutes_before)
-        if booking.reminder_email_enabled and invitee_email
+        event.starts_at - timedelta(minutes=email_schedule[0])
+        if booking.reminder_email_enabled and invitee_email and email_schedule
         else None
     )
     sms_due = (
-        event.starts_at - timedelta(minutes=booking.reminder_sms_minutes_before)
-        if booking.reminder_sms_enabled and invitee_phone and sms_consent
+        event.starts_at - timedelta(minutes=sms_schedule[0])
+        if booking.reminder_sms_enabled and invitee_phone and sms_consent and sms_schedule
         else None
     )
     row = BookingNotification(
@@ -78,6 +86,27 @@ async def register_booking(
         confirmation_sms_status="pending" if booking.confirmation_sms_enabled and invitee_phone and sms_consent else ("blocked_no_consent" if invitee_phone and not sms_consent else "disabled"),
     )
     db.add(row)
+    await db.flush()
+    if booking.reminder_email_enabled and row.invitee_email:
+        for minutes_before in email_schedule:
+            db.add(
+                BookingNotificationReminder(
+                    booking_notification_id=row.id,
+                    channel="email",
+                    minutes_before=minutes_before,
+                    due_at=event.starts_at - timedelta(minutes=minutes_before),
+                )
+            )
+    if booking.reminder_sms_enabled and row.invitee_phone and row.sms_consent:
+        for minutes_before in sms_schedule:
+            db.add(
+                BookingNotificationReminder(
+                    booking_notification_id=row.id,
+                    channel="sms",
+                    minutes_before=minutes_before,
+                    due_at=event.starts_at - timedelta(minutes=minutes_before),
+                )
+            )
     await db.flush()
     return row
 
@@ -123,35 +152,26 @@ async def dispatch_due_reminders() -> int:
         now = datetime.now(UTC)
         rows = (
             await db.execute(
-                select(BookingNotification, CalendarEvent, BookingSettings, User)
+                select(BookingNotificationReminder, BookingNotification, CalendarEvent, BookingSettings, User)
+                .join(BookingNotification, BookingNotification.id == BookingNotificationReminder.booking_notification_id)
                 .join(CalendarEvent, CalendarEvent.id == BookingNotification.event_id)
                 .join(User, User.id == CalendarEvent.owner_user_id)
                 .join(BookingSettings, BookingSettings.user_id == User.id)
                 .where(
                     CalendarEvent.status != CalendarEventStatus.CANCELLED,
                     CalendarEvent.starts_at > now,
-                    or_(
-                        (
-                            BookingNotification.email_reminder_due_at.is_not(None)
-                            & (BookingNotification.email_reminder_due_at <= now)
-                            & BookingNotification.email_reminder_sent_at.is_(None)
-                        ),
-                        (
-                            BookingNotification.sms_reminder_due_at.is_not(None)
-                            & (BookingNotification.sms_reminder_due_at <= now)
-                            & BookingNotification.sms_reminder_sent_at.is_(None)
-                        ),
-                    ),
+                    BookingNotificationReminder.status == "pending",
+                    BookingNotificationReminder.due_at <= now,
                 )
                 .with_for_update(skip_locked=True)
                 .limit(100)
             )
         ).all()
-        for notice, event, booking, host in rows:
+        for reminder, notice, event, booking, host in rows:
             local = event.starts_at.astimezone(_timezone(booking.timezone))
             when = local.strftime("%A, %B %d at %I:%M %p %Z")
             details = _detail_lines(notice)
-            if notice.email_reminder_due_at and notice.email_reminder_due_at <= now and notice.email_reminder_sent_at is None:
+            if reminder.channel == "email":
                 body = "\n".join([
                     f"Reminder: your meeting with {host.name or 'Qualified Commercial'} is coming up.",
                     "",
@@ -168,18 +188,26 @@ async def dispatch_due_reminders() -> int:
                     subject=f"Reminder: {event.title}",
                     body_text=body,
                 )
-                notice.email_reminder_status = "sent" if result.ok else "failed"
+                reminder.status = "sent" if result.ok else "failed"
+                reminder.sent_at = now
+                reminder.provider_message_id = getattr(result, "message_id", None)
+                reminder.error = None if result.ok else result.detail[:1000]
+                notice.email_reminder_status = reminder.status
                 notice.email_reminder_sent_at = now
                 if not result.ok:
                     notice.last_error = result.detail[:1000]
                 sent += int(result.ok)
-            if notice.sms_reminder_due_at and notice.sms_reminder_due_at <= now and notice.sms_reminder_sent_at is None:
+            elif reminder.channel == "sms":
                 body = (
                     f"Qualified Commercial reminder: {event.title}, {when}. "
                     f"{'Join: ' + notice.join_url + ' ' if notice.join_url else ''}Reply STOP to opt out."
                 )
                 result = await asyncio.to_thread(consent_delivery._send_sms, notice.invitee_phone or "", body)  # noqa: SLF001
-                notice.sms_reminder_status = "sent" if result.ok else "failed"
+                reminder.status = "sent" if result.ok else "failed"
+                reminder.sent_at = now
+                reminder.provider_message_id = getattr(result, "message_id", None)
+                reminder.error = None if result.ok else result.detail[:1000]
+                notice.sms_reminder_status = reminder.status
                 notice.sms_reminder_sent_at = now
                 if not result.ok:
                     notice.last_error = result.detail[:1000]

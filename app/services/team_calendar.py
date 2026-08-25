@@ -46,8 +46,10 @@ async def team_booking_settings(db: AsyncSession, host: User | None = None) -> t
             confirmation_sms_enabled=True,
             reminder_email_enabled=True,
             reminder_email_minutes_before=1440,
+            reminder_email_minutes=[1440],
             reminder_sms_enabled=True,
             reminder_sms_minutes_before=120,
+            reminder_sms_minutes=[120],
             google_meet_enabled=True,
         )
         db.add(row)

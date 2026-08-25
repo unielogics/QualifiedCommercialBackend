@@ -20,8 +20,10 @@ class UserBookingSettingsBase(BaseModel):
     confirmation_sms_enabled: bool = True
     reminder_email_enabled: bool = True
     reminder_email_minutes_before: int = Field(default=1440, ge=15, le=10080)
+    reminder_email_minutes: list[int] = Field(default_factory=lambda: [1440], max_length=5)
     reminder_sms_enabled: bool = True
     reminder_sms_minutes_before: int = Field(default=120, ge=15, le=10080)
+    reminder_sms_minutes: list[int] = Field(default_factory=lambda: [120], max_length=5)
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
@@ -32,6 +34,20 @@ class UserBookingSettingsBase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_booking_window(self) -> UserBookingSettingsBase:
+        for field_name in ("reminder_email_minutes", "reminder_sms_minutes"):
+            values = getattr(self, field_name)
+            if any(value < 15 or value > 10080 for value in values):
+                raise ValueError(f"{field_name} values must be between 15 minutes and 7 days")
+            normalized = sorted(set(values), reverse=True)
+            if len(normalized) != len(values):
+                raise ValueError(f"{field_name} cannot contain duplicate reminder times")
+            setattr(self, field_name, normalized)
+
+        if self.reminder_email_enabled and not self.reminder_email_minutes:
+            raise ValueError("At least one email reminder time is required when email reminders are enabled")
+        if self.reminder_sms_enabled and not self.reminder_sms_minutes:
+            raise ValueError("At least one SMS reminder time is required when SMS reminders are enabled")
+
         days = sorted(set(self.available_days))
         if any(day < 0 or day > 6 for day in days):
             raise ValueError("available_days must use 0=Sunday through 6=Saturday")

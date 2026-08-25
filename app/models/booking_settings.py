@@ -38,8 +38,20 @@ class BookingSettings(TimestampMixin, Base):
     confirmation_sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     reminder_email_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     reminder_email_minutes_before: Mapped[int] = mapped_column(Integer, nullable=False, default=1440, server_default="1440")
+    reminder_email_minutes: Mapped[list[int]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: [1440],
+        server_default="[1440]",
+    )
     reminder_sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     reminder_sms_minutes_before: Mapped[int] = mapped_column(Integer, nullable=False, default=120, server_default="120")
+    reminder_sms_minutes: Mapped[list[int]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: [120],
+        server_default="[120]",
+    )
     google_meet_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York")
     available_days: Mapped[list[int]] = mapped_column(

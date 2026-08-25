@@ -27,7 +27,7 @@ the firm SES/Gmail fallback.
      `drive.file` is not a restricted scope, which keeps review lighter).
 4. **Credentials → Create credentials → OAuth client ID → Web application**:
    - Authorized redirect URIs:
-     - Prod: `https://<API_HOST>/api/v1/google/oauth/callback`
+     - Prod: `https://api.qualifiedcommercial.com/api/v1/google/oauth/callback`
      - Local: `http://localhost:8000/api/v1/google/oauth/callback`
    - Copy the **Client ID** and **Client secret**.
 
@@ -38,7 +38,7 @@ Set on the server (and locally for testing):
 ```
 GMAIL_OAUTH_CLIENT_ID=<client id>
 GMAIL_OAUTH_CLIENT_SECRET=<client secret>
-GOOGLE_OAUTH_REDIRECT_URI=https://<API_HOST>/api/v1/google/oauth/callback
+GOOGLE_OAUTH_REDIRECT_URI=https://api.qualifiedcommercial.com/api/v1/google/oauth/callback
 ```
 
 (`GMAIL_OAUTH_CLIENT_ID` / `GMAIL_OAUTH_CLIENT_SECRET` already exist in config;
