@@ -135,7 +135,7 @@ def upgrade() -> None:
               FROM dos_product_catalog
               WHERE active = true
               ORDER BY program_key, version DESC
-            ) AS current_catalog
+            ) AS catalog_source
             """
         ).bindparams(
             ez=json.dumps(ez_pricing),
