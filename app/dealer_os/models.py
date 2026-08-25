@@ -1016,7 +1016,7 @@ class DealerRepLead(TimestampMixin, Base):
 # WORDING, not just the fact of a checkbox, so the text lives here beside the
 # record and every consent stores which version it accepted. Changing the
 # wording means a new version, never an edit in place.
-SMS_DISCLOSURE_VERSION = "2026-08-20-1"
+SMS_DISCLOSURE_VERSION = "2026-08-25-1"
 
 SMS_CONSENT_KINDS: tuple[str, ...] = ("transactional", "marketing")
 

@@ -68,23 +68,25 @@ TERMS_URL = "https://qualifiedcommercial.com/terms"
 PRIVACY_URL = "https://qualifiedcommercial.com/privacy"
 SUPPORT_EMAIL = "support@qualifiedcommercial.com"
 
-# Transactional: the messages the file itself needs to move. Someone who asked
-# us to look at their business expects these; they are not marketing and are not
-# what "consent is not a condition of purchase" refers to.
+# Transactional: operational messages about the account and funding file. The
+# channel remains optional because required file communications can use email.
 TRANSACTIONAL_TEXT = (
     f"I agree to receive account and application text messages from {BRAND} about this "
-    "funding file, including secure links to connect a bank account, document requests, "
-    "signature requests and status updates. Message frequency varies. Message and data "
-    "rates may apply. Reply STOP to opt out. Reply HELP for help."
+    "funding file, including appointment reminders, secure links, bank-connection requests, "
+    "document and signature requests, and status updates. Consent is optional and is not a "
+    "condition of purchase, applying for funding, receiving funding, or using the platform. "
+    "Message frequency varies. Message and data rates may apply. Reply STOP to opt out. "
+    "Reply HELP for help."
 )
 
 # Marketing: everything that is us reaching out rather than the file needing
 # something. Separate checkbox, separate row in the table, separately revocable.
 MARKETING_TEXT = (
     f"I agree to receive promotional and marketing text messages from {BRAND}, including "
-    "new loan program announcements, rate updates and offers. Consent is not a condition "
-    "of purchase. Message frequency varies. Message and data rates may apply. Reply STOP "
-    "to opt out. Reply HELP for help."
+    "new loan program announcements, rate updates and offers. This is a separate optional "
+    "consent and is not a condition of purchase, applying for funding, receiving funding, "
+    "or using the platform. Message frequency varies. Message and data rates may apply. "
+    "Reply STOP to opt out. Reply HELP for help."
 )
 
 # Not SMS consent, and deliberately its own checkbox rather than a line inside
