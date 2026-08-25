@@ -1,11 +1,17 @@
 import base64
 import hashlib
 import hmac
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
 
 from app.config import Settings
 from app.dealer_os.services import sms_provider
 from app.dealer_os.services.sms_provider import provider_readiness, validate_twilio_signature
-from app.routers.analysis import _provider_switch_ready
+from app.routers.analysis import _provider_switch_ready, _public_address_throttle
+from app.schemas.analysis import ProviderSettingsRead
+from app.services import provider_secrets
 from app.services.property_intelligence import _address_from_geoapify_properties
 
 
@@ -30,21 +36,19 @@ def test_geoapify_address_maps_to_existing_split_address_contract() -> None:
     assert parts.longitude == -74.1724
 
 
-def test_saving_geoapify_key_does_not_revalidate_unchanged_google_provider() -> None:
+def test_unchanged_provider_does_not_require_a_configured_key() -> None:
     assert _provider_switch_ready(
         current_provider="google",
         requested_provider="google",
         provider_status={"google_server_configured": False, "geoapify_configured": False},
-        supplied_secrets={"geoapify_api_key"},
     )
 
 
-def test_geoapify_key_can_be_saved_and_activated_atomically() -> None:
+def test_geoapify_switch_uses_environment_readiness() -> None:
     assert _provider_switch_ready(
         current_provider="google",
         requested_provider="geoapify",
-        provider_status={"google_server_configured": False, "geoapify_configured": False},
-        supplied_secrets={"geoapify_api_key"},
+        provider_status={"google_server_configured": False, "geoapify_configured": True},
     )
 
 
@@ -53,8 +57,58 @@ def test_provider_switch_still_requires_a_configured_target() -> None:
         current_provider="google",
         requested_provider="geoapify",
         provider_status={"google_server_configured": False, "geoapify_configured": False},
-        supplied_secrets=set(),
     )
+
+
+@pytest.mark.asyncio
+async def test_address_provider_status_never_discloses_environment_keys(monkeypatch) -> None:
+    async def fake_runtime_settings(_db):
+        return SimpleNamespace(
+            rentcast_api_key="rentcast-visible-to-super-admin",
+            google_server_api_key="google-backend-secret",
+            geoapify_api_key="geoapify-backend-secret",
+            address_provider="geoapify",
+            property_analysis_ai_enabled=True,
+            property_intelligence_cache_ttl_hours=24,
+        )
+
+    monkeypatch.setattr(provider_secrets, "runtime_settings", fake_runtime_settings)
+
+    status = await provider_secrets.provider_settings_status(object(), include_secret_values=True)
+
+    assert status["geoapify_configured"] is True
+    assert status["google_server_configured"] is True
+    assert status["address_provider_ready"] is True
+    assert status["address_credentials_source"] == "environment"
+    assert "geoapify_api_key" not in status
+    assert "google_server_api_key" not in status
+
+
+def test_provider_settings_read_contract_has_no_address_secret_fields() -> None:
+    secret_fields = {
+        "geoapify_api_key",
+        "google_server_api_key",
+        "google_maps_browser_key",
+        "google_maps_ios_key",
+        "google_maps_android_key",
+        "google_maps_mobile_key",
+    }
+
+    assert secret_fields.isdisjoint(ProviderSettingsRead.model_fields)
+
+
+def test_public_address_throttle_is_scoped_by_request_ip() -> None:
+    store = {}
+    request = SimpleNamespace(headers={"x-forwarded-for": "203.0.113.10"}, client=None)
+
+    _public_address_throttle(store, request, 1)
+
+    with pytest.raises(HTTPException) as error:
+        _public_address_throttle(store, request, 1)
+    assert error.value.status_code == 429
+
+    other_request = SimpleNamespace(headers={"x-forwarded-for": "203.0.113.11"}, client=None)
+    _public_address_throttle(store, other_request, 1)
 
 
 def test_twilio_readiness_requires_webhook_token_and_sender() -> None:

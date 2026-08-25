@@ -195,6 +195,7 @@ for r in [
     analysis.router,
     application_profiles.router,
     analysis.property_router,
+    analysis.public_address_router,
     calendar.router,
     billing.router,
     credit.router,

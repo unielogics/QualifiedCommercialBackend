@@ -19,17 +19,8 @@ class ProviderSettingsRead(BaseModel):
     geoapify_configured: bool = False
     address_provider: Literal["google", "geoapify"] = "google"
     address_provider_ready: bool = False
-    google_maps_browser_key_configured: bool
-    google_maps_ios_key_configured: bool = False
-    google_maps_android_key_configured: bool = False
-    google_maps_mobile_key_configured: bool = False
+    address_credentials_source: Literal["environment"] = "environment"
     rentcast_api_key: str | None = None
-    google_server_api_key: str | None = None
-    google_maps_browser_key: str | None = None
-    google_maps_ios_key: str | None = None
-    google_maps_android_key: str | None = None
-    google_maps_mobile_key: str | None = None
-    geoapify_api_key: str | None = None
     property_analysis_ai_enabled: bool = True
     property_intelligence_cache_ttl_hours: int = 24
 
@@ -49,9 +40,11 @@ class ProviderSettingsUpdate(BaseModel):
 
 class AddressParts(BaseModel):
     street: str | None = None
+    line2: str | None = None
     city: str | None = None
     state: str | None = None
     zip: str | None = None
+    country_code: str = "US"
     full: str | None = None
     latitude: float | None = None
     longitude: float | None = None

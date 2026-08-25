@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
 import uuid
+from collections import deque
 from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +45,7 @@ from app.services.analysis_reports import generate_analysis_report
 from app.services.property_intelligence import (
     address_autocomplete,
     address_resolve,
+    address_static_map,
     log_provider_usage,
     lookup_property_intelligence,
 )
@@ -50,6 +53,10 @@ from app.services.provider_secrets import provider_settings_status, set_secret
 
 router = APIRouter(prefix="/analysis-runs", tags=["analysis-runs"])
 property_router = APIRouter(prefix="/property-intelligence", tags=["property-intelligence"])
+public_address_router = APIRouter(prefix="/public/address", tags=["public-address"])
+
+_PUBLIC_AUTOCOMPLETE: dict[str, deque[float]] = {}
+_PUBLIC_RESOLVE: dict[str, deque[float]] = {}
 
 
 def _is_operator(user) -> bool:
@@ -84,16 +91,28 @@ def _provider_switch_ready(
     current_provider: str,
     requested_provider: str,
     provider_status: dict[str, Any],
-    supplied_secrets: set[str],
 ) -> bool:
     if requested_provider == current_provider:
         return True
     if requested_provider == "geoapify":
-        return "geoapify_api_key" in supplied_secrets or bool(provider_status["geoapify_configured"])
-    return bool(
-        {"google_server_api_key", "google_maps_browser_key"} & supplied_secrets
-        or provider_status["google_server_configured"]
-    )
+        return bool(provider_status["geoapify_configured"])
+    return bool(provider_status["google_server_configured"])
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    return (forwarded.split(",", 1)[0].strip() if forwarded else request.client.host if request.client else "?")[:80]
+
+
+def _public_address_throttle(store: dict[str, deque[float]], request: Request, limit: int) -> None:
+    key = _request_ip(request)
+    now = time.monotonic()
+    rows = store.setdefault(key, deque())
+    while rows and now - rows[0] >= 60:
+        rows.popleft()
+    if len(rows) >= limit:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many address searches. Please wait a minute.")
+    rows.append(now)
 
 
 def _to_read(row: AnalysisRun) -> AnalysisRunRead:
@@ -399,20 +418,27 @@ async def update_provider_settings(
     db: AsyncSession = Depends(get_db),
 ) -> ProviderSettingsRead:
     data = payload.model_dump(exclude_unset=True)
-    supplied_secrets: set[str] = set()
-    for key in (
-        "rentcast_api_key",
+    environment_managed = {
         "google_server_api_key",
         "google_maps_browser_key",
         "google_maps_ios_key",
         "google_maps_android_key",
         "google_maps_mobile_key",
         "geoapify_api_key",
+    }
+    if any(isinstance(data.get(key), str) and data[key].strip() for key in environment_managed):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Address provider credentials are managed in the backend environment.",
+        )
+    for key in (
+        "rentcast_api_key",
     ):
         value = data.pop(key, None)
         if isinstance(value, str) and value.strip():
             await set_secret(db, key=key, value=value.strip(), updated_by_id=user.id)
-            supplied_secrets.add(key)
+    for key in environment_managed:
+        data.pop(key, None)
 
     requested_provider = data.get("address_provider")
     if requested_provider is not None:
@@ -420,14 +446,13 @@ async def update_provider_settings(
         current_settings = AppSettingsData.model_validate(settings_row.data or {}).model_dump(mode="json")
         current_provider = (current_settings.get("property_intelligence") or {}).get("address_provider", "google")
 
-        # Re-sending the selected provider must not block an otherwise valid
-        # key update. A key supplied with a real switch makes it atomic.
+        # Re-saving the current provider is allowed so unrelated settings can
+        # be updated even if deployment configuration is temporarily missing.
         provider_status = await provider_settings_status(db)
         if not _provider_switch_ready(
             current_provider=current_provider,
             requested_provider=requested_provider,
             provider_status=provider_status,
-            supplied_secrets=supplied_secrets,
         ):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -517,6 +542,71 @@ async def resolve_address(
         request_type="place_resolve",
         user=user,
         metadata={"place_id": payload.place_id, "session_token": bool(payload.session_token)},
+    )
+    return AddressResolveResponse(
+        address=address,
+        provider=provider,
+        provider_place=provider_place,
+        google_place=provider_place if provider == "google" else None,
+    )
+
+
+@property_router.get("/address/static-map")
+async def static_address_map(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    latitude: float = Query(ge=-90, le=90),
+    longitude: float = Query(ge=-180, le=180),
+    width: int = Query(720, ge=240, le=1200),
+    height: int = Query(280, ge=160, le=800),
+    zoom: int = Query(15, ge=1, le=20),
+) -> Response:
+    del user
+    try:
+        content, content_type = await address_static_map(
+            db,
+            latitude=latitude,
+            longitude=longitude,
+            width=width,
+            height=height,
+            zoom=zoom,
+        )
+    except Exception as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address map is temporarily unavailable.") from exc
+    return Response(content=content, media_type=content_type, headers={"Cache-Control": "private, max-age=86400"})
+
+
+@public_address_router.post("/autocomplete", response_model=list[AddressSuggestion])
+async def public_autocomplete_address(
+    payload: AddressAutocompleteRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> list[AddressSuggestion]:
+    _public_address_throttle(_PUBLIC_AUTOCOMPLETE, request, 60)
+    readiness = await provider_settings_status(db)
+    if not readiness["address_provider_ready"]:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address search is not configured.")
+    _provider, rows = await address_autocomplete(db, payload.input, payload.session_token)
+    return [AddressSuggestion(**row) for row in rows]
+
+
+@public_address_router.post("/resolve", response_model=AddressResolveResponse)
+async def public_resolve_address(
+    payload: AddressResolveRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> AddressResolveResponse:
+    _public_address_throttle(_PUBLIC_RESOLVE, request, 20)
+    if not payload.place_id and not payload.address:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "place_id or address is required")
+    readiness = await provider_settings_status(db)
+    if not readiness["address_provider_ready"]:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address resolution is not configured.")
+    provider, address, provider_place = await address_resolve(
+        db,
+        place_id=payload.place_id,
+        address=payload.address,
+        session_token=payload.session_token,
     )
     return AddressResolveResponse(
         address=address,

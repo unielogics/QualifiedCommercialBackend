@@ -17,9 +17,11 @@ from app.services.provider_secrets import runtime_settings
 RENTCAST_BASE = "https://api.rentcast.io/v1"
 GOOGLE_PLACES_BASE = "https://places.googleapis.com/v1"
 GOOGLE_GEOCODE_BASE = "https://maps.googleapis.com/maps/api/geocode/json"
+GOOGLE_STATIC_MAP = "https://maps.googleapis.com/maps/api/staticmap"
 GEOAPIFY_AUTOCOMPLETE = "https://api.geoapify.com/v1/geocode/autocomplete"
 GEOAPIFY_GEOCODE = "https://api.geoapify.com/v1/geocode/search"
 GEOAPIFY_PLACE_DETAILS = "https://api.geoapify.com/v2/place-details"
+GEOAPIFY_STATIC_MAP = "https://maps.geoapify.com/v1/staticmap"
 FEMA_NFHL_LAYER = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query"
 logger = logging.getLogger(__name__)
 
@@ -70,12 +72,7 @@ async def log_provider_usage(
 
 async def google_autocomplete(db: AsyncSession, input_text: str, session_token: str | None) -> list[dict[str, Any]]:
     settings = await runtime_settings(db)
-    # Field Desk uses the authenticated backend proxy. Prefer the restricted
-    # server key, but installations that already configured the web Places key
-    # should not silently lose autocomplete while the server key is being
-    # rolled out. The browser key is already public by design and remains
-    # protected by its Google API restrictions.
-    api_key = settings.google_server_api_key or settings.google_maps_browser_key
+    api_key = settings.google_server_api_key
     if not api_key:
         return []
     body: dict[str, Any] = {
@@ -219,7 +216,7 @@ async def google_resolve(
     session_token: str | None,
 ) -> tuple[AddressParts, dict[str, Any] | None]:
     settings = await runtime_settings(db)
-    api_key = settings.google_server_api_key or settings.google_maps_browser_key
+    api_key = settings.google_server_api_key
     if not api_key:
         return AddressParts(full=address), None
     try:
@@ -243,7 +240,10 @@ async def google_resolve(
                 parts.longitude = loc.get("longitude")
                 return parts, data
             if address:
-                resp = await client.get(GOOGLE_GEOCODE_BASE, params={"address": address, "key": api_key})
+                resp = await client.get(
+                    GOOGLE_GEOCODE_BASE,
+                    params={"address": address, "key": api_key, "region": "us", "components": "country:US"},
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 first = (data.get("results") or [None])[0]
@@ -348,6 +348,51 @@ async def address_resolve(
         session_token=session_token,
     )
     return "google", parts, provider_place
+
+
+async def address_static_map(
+    db: AsyncSession,
+    *,
+    latitude: float,
+    longitude: float,
+    width: int,
+    height: int,
+    zoom: int,
+) -> tuple[bytes, str]:
+    settings = await runtime_settings(db)
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        if settings.address_provider == "geoapify":
+            if not settings.geoapify_api_key:
+                raise RuntimeError("Geoapify is not configured")
+            marker = f"lonlat:{longitude},{latitude};color:%231d4ed8;size:medium"
+            response = await client.get(
+                GEOAPIFY_STATIC_MAP,
+                params={
+                    "style": "osm-bright",
+                    "width": width,
+                    "height": height,
+                    "center": f"lonlat:{longitude},{latitude}",
+                    "zoom": zoom,
+                    "marker": marker,
+                    "apiKey": settings.geoapify_api_key,
+                },
+            )
+        else:
+            if not settings.google_server_api_key:
+                raise RuntimeError("Google is not configured")
+            response = await client.get(
+                GOOGLE_STATIC_MAP,
+                params={
+                    "center": f"{latitude},{longitude}",
+                    "zoom": zoom,
+                    "size": f"{width}x{height}",
+                    "scale": 1,
+                    "markers": f"color:blue|{latitude},{longitude}",
+                    "key": settings.google_server_api_key,
+                },
+            )
+        response.raise_for_status()
+        return response.content, response.headers.get("content-type", "image/png")
 
 
 async def _rentcast_get(

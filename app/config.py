@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     # RentCast
     rentcast_api_key: str = ""
 
+    # Address providers. These credentials are deployment-managed and are
+    # never accepted from or returned to a frontend. QCDashboard only selects
+    # which configured provider is active.
+    geoapify_api_key: str = ""
+    google_server_api_key: str = ""
+
     # Provider secrets
     # Super-admin managed provider keys are encrypted before they are stored
     # in Postgres. In production, set provider_secrets_kms_key_id so EC2 IAM
