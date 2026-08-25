@@ -8,7 +8,7 @@ The runtime warns once at startup if dev mode is active.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 
 import httpx
@@ -281,7 +281,7 @@ async def _recover_primary_super_admin_user(
 async def get_current_user(
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> User:
     """Returns the User row matching the Clerk JWT subject.
 
@@ -357,7 +357,7 @@ async def get_current_user(
         if recovered_user is not None:
             from datetime import timedelta as _td
 
-            now_dt = datetime.now(timezone.utc)
+            now_dt = datetime.now(UTC)
             if recovered_user.last_seen_at is None or (now_dt - recovered_user.last_seen_at) >= _td(seconds=60):
                 recovered_user.last_seen_at = now_dt
                 await db.flush()
@@ -545,7 +545,7 @@ async def get_current_user(
     # avoid hammering Postgres on the chatty endpoints (workspace,
     # secretary, recalc) that fire 5-10x per page load.
     from datetime import timedelta as _td
-    now_dt = datetime.now(timezone.utc)
+    now_dt = datetime.now(UTC)
     if user.last_seen_at is None or (now_dt - user.last_seen_at) >= _td(seconds=60):
         user.last_seen_at = now_dt
         await db.flush()
@@ -571,7 +571,7 @@ def _looks_like_email_fallback_name(name: str | None, email: str | None) -> bool
 def require_role(*roles: Role):
     """Dependency factory for role-gated endpoints."""
 
-    async def checker(user: User = Depends(get_current_user)) -> User:
+    async def checker(user: User = Depends(get_current_user)) -> User:  # noqa: B008
         if user.role not in roles:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
         return user
@@ -583,8 +583,8 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 async def require_valid_credit_pull(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> User:
     """Soft-pull gate for client-facing rate views.
 
@@ -597,8 +597,6 @@ async def require_valid_credit_pull(
     can detect it and trigger the repull modal — distinct from generic
     role 403s.
     """
-    from datetime import datetime, timezone
-
     from app.enums import CreditPullStatus
     from app.models.credit_pull import CreditPull
 
@@ -620,7 +618,7 @@ async def require_valid_credit_pull(
         select(CreditPull)
         .where(CreditPull.client_id == cid)
         .where(CreditPull.status == CreditPullStatus.COMPLETED)
-        .where(CreditPull.expires_at > datetime.now(timezone.utc))
+        .where(CreditPull.expires_at > datetime.now(UTC))
         .limit(1)
     )
     row = (await db.execute(stmt)).scalar_one_or_none()
