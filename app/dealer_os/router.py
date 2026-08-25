@@ -36,7 +36,8 @@ from app.models.user import User
 from app.models.application_profile import PlaidAssetReport
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
-from app.services import booking_notify
+from app.services import booking_notify, booking_reminders
+from app.services.team_calendar import team_booking_settings
 from app.services import plaid_lifecycle
 from app.services.email import ses_client
 from app.services import clerk as clerk_service
@@ -4410,11 +4411,12 @@ def _date_label(value: datetime) -> str:
 async def _rep_host_for(
     db: AsyncSession, dealer: DealerBusiness | None, user: User
 ) -> User:
-    if dealer and dealer.owner_user_id:
-        host = await db.get(User, dealer.owner_user_id)
-        if host is not None:
-            return host
-    return user
+    # Field Desk intentionally shares one authoritative calendar. The rep who
+    # books is retained on DealerRepAppointment/booked_by_user_id and in the
+    # event description; the event itself belongs to the primary super admin so
+    # Google Calendar, Meet links and collision checks all use Franco's diary.
+    host, _ = await team_booking_settings(db)
+    return host
 
 
 async def _booking_settings_for(db: AsyncSession, host: User) -> BookingSettings:
@@ -4428,7 +4430,9 @@ async def _booking_settings_for(db: AsyncSession, host: User) -> BookingSettings
         enabled=True,
         title=f"Book a meeting with {host.name or 'Qualified Commercial'}",
         intro="Choose a time that works for you.",
-        duration_min=30,
+        duration_min=20,
+        buffer_before_min=5,
+        buffer_after_min=5,
         timezone="America/New_York",
         available_days=[1, 2, 3, 4, 5],
         start_time="09:00",
@@ -4446,7 +4450,7 @@ async def _booking_slots(
     zone = rep_workflows.tz(booking.timezone)
     duration = duration_min or booking.duration_min or 30
     now_local = datetime.now(zone)
-    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 15)
+    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
     window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
     busy_rows = (
         await db.execute(
@@ -4462,8 +4466,9 @@ async def _booking_slots(
     ).scalars().all()
     busy = [
         (
-            ev.starts_at.astimezone(zone),
-            ev.starts_at.astimezone(zone) + timedelta(minutes=max(15, ev.duration_min or duration)),
+            ev.starts_at.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
+            ev.starts_at.astimezone(zone)
+            + timedelta(minutes=max(15, ev.duration_min or duration) + booking.buffer_after_min),
         )
         for ev in busy_rows
     ]
@@ -4478,7 +4483,7 @@ async def _booking_slots(
         day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=zone)
         day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=zone)
         cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-        cursor = _round_up_to_step(cursor, 15)
+        cursor = _round_up_to_step(cursor, 5)
         while cursor + slot_duration <= day_end:
             slot_end = cursor + slot_duration
             if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
@@ -4489,9 +4494,23 @@ async def _booking_slots(
                     date_label=_date_label(cursor),
                 ))
                 if len(slots) >= 80:
-                    return BookingAvailabilityRead(timezone=booking.timezone, duration_min=duration, slots=slots)
-            cursor += slot_duration
-    return BookingAvailabilityRead(timezone=booking.timezone, duration_min=duration, slots=slots)
+                    return BookingAvailabilityRead(
+                        timezone=booking.timezone,
+                        duration_min=duration,
+                        buffer_before_min=booking.buffer_before_min,
+                        buffer_after_min=booking.buffer_after_min,
+                        host_name=host.name,
+                        slots=slots,
+                    )
+            cursor += timedelta(minutes=5)
+    return BookingAvailabilityRead(
+        timezone=booking.timezone,
+        duration_min=duration,
+        buffer_before_min=booking.buffer_before_min,
+        buffer_after_min=booking.buffer_after_min,
+        host_name=host.name,
+        slots=slots,
+    )
 
 
 def _appointment_title(kind: str, invitee_name: str, dealer: DealerBusiness | None) -> str:
@@ -4504,6 +4523,44 @@ def _appointment_title(kind: str, invitee_name: str, dealer: DealerBusiness | No
     return f"{labels.get(kind, 'Appointment')}: {invitee_name}{suffix}"
 
 
+def _booking_description(
+    *,
+    user: User,
+    payload: RepAppointmentCreate,
+    dealer: DealerBusiness | None,
+) -> tuple[str, str | None, str | None, str | None]:
+    program = (payload.program_name or (dealer.funding_purpose if dealer else None) or "").strip() or None
+    amount = (payload.requested_amount or "").strip() or None
+    if amount is None and dealer and dealer.funding_goal is not None:
+        amount = f"$" + format(float(dealer.funding_goal), ",.0f")
+    address = (payload.full_address or "").strip() or None
+    if address is None and dealer:
+        address = ", ".join(
+            part for part in [
+                dealer.address,
+                " ".join(part for part in [dealer.city, dealer.state, dealer.zip] if part).strip(),
+            ]
+            if part
+        ) or None
+    lines = [
+        "Qualified Commercial Field Desk appointment.",
+        f"Booked by: {user.name or user.email or 'Field Desk'}",
+        f"Agent email: {user.email or '(not provided)'}",
+        f"Meeting type: {payload.kind}",
+        f"Client: {payload.invitee_name}",
+        f"Company: {payload.company or (dealer.name if dealer else None) or '(not provided)'}",
+        f"Client email: {payload.invitee_email or '(not provided)'}",
+        f"Client phone: {payload.invitee_phone or '(not provided)'}",
+        f"Program: {program or '(to be discussed)'}",
+        f"Interested amount: {amount or '(not provided)'}",
+        f"Address: {address or '(not provided)'}",
+        "",
+        "Agent notes:",
+        payload.notes or "(none)",
+    ]
+    return "\n".join(lines), program, amount, address
+
+
 async def _load_owned_appointment(
     db: AsyncSession, appointment_id: UUID, user: User
 ) -> DealerRepAppointment:
@@ -4514,7 +4571,7 @@ async def _load_owned_appointment(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
-    if user.role == Role.FIELD_REP and row.owner_user_id != user.id:
+    if user.role == Role.FIELD_REP and row.booked_by_user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     require_team_or_rep(user)
     return row
@@ -4883,7 +4940,9 @@ async def booking_availability(
         dealer = await resolve_dealer_scope(db, user, dealer_id)
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
-    return await _booking_slots(db, host, booking, duration_min=duration_min)
+    # Availability follows the shared host policy. The retained query argument
+    # is ignored for API compatibility so callers cannot bypass meeting length.
+    return await _booking_slots(db, host, booking, duration_min=booking.duration_min)
 
 
 @router.get("/appointments", response_model=list[RepAppointmentRead])
@@ -4897,7 +4956,7 @@ async def list_all_rep_appointments(
     require_team_or_rep(user)
     q = select(DealerRepAppointment)
     if user.role == Role.FIELD_REP:
-        q = q.where(DealerRepAppointment.owner_user_id == user.id)
+        q = q.where(DealerRepAppointment.booked_by_user_id == user.id)
     if starts_from is not None:
         q = q.where(DealerRepAppointment.starts_at >= _to_utc_minute(starts_from))
     if starts_to is not None:
@@ -4914,14 +4973,15 @@ async def list_all_rep_appointments(
 @router.post("/appointments", response_model=RepAppointmentRead, status_code=status.HTTP_201_CREATED)
 async def create_standalone_rep_appointment(
     payload: RepAppointmentCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepAppointment:
     require_team_or_rep(user)
-    host = user
+    host = await _rep_host_for(db, None, user)
     booking = await _booking_settings_for(db, host)
     starts_at = _to_utc_minute(payload.starts_at)
-    duration = payload.duration_min or booking.duration_min or 30
+    duration = booking.duration_min or 20
     slots = await _booking_slots(db, host, booking, duration_min=duration)
     if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
@@ -4929,12 +4989,8 @@ async def create_standalone_rep_appointment(
     who = payload.invitee_name
     if payload.invitee_email:
         who = f"{payload.invitee_name} <{payload.invitee_email}>"
-    description = (
-        "Standalone rep appointment.\n"
-        f"Kind: {payload.kind}\n"
-        f"Company: {payload.company or '(not provided)'}\n"
-        f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
-        f"Notes:\n{payload.notes or '(none)'}"
+    description, program, requested_amount, full_address = _booking_description(
+        user=user, payload=payload, dealer=None
     )
     ev = CalendarEvent(
         loan_id=None,
@@ -4971,6 +5027,22 @@ async def create_standalone_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    notice = await booking_reminders.register_booking(
+        db,
+        event=ev,
+        booking=booking,
+        invitee_name=payload.invitee_name,
+        invitee_email=payload.invitee_email,
+        invitee_phone=payload.invitee_phone,
+        sms_consent=payload.transactional_sms_consent,
+        sms_consent_method="in_person_device" if payload.transactional_sms_consent else None,
+        sms_consent_ip=request.client.host if request.client else None,
+        sms_consent_user_agent=request.headers.get("user-agent"),
+        booked_by_user_id=user.id,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
+    )
 
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     if not payload.invitee_email and not phone:
@@ -4984,6 +5056,18 @@ async def create_standalone_rep_appointment(
         email=payload.invitee_email.strip().lower() if payload.invitee_email else None,
         phone_e164=phone,
         source="appointment",
+    )
+    await _capture_rep_contact_sms_consent(
+        db,
+        request=request,
+        user=user,
+        contact=contact,
+        dealer=None,
+        phone_e164=phone,
+        recipient_name=payload.invitee_name,
+        transactional=payload.transactional_sms_consent,
+        marketing=False,
+        method="in_person_device",
     )
     thread = await _ensure_rep_thread(
         db,
@@ -5009,34 +5093,49 @@ async def create_standalone_rep_appointment(
     )
     await db.commit()
     await db.refresh(appt)
+    join = await booking_notify.push_to_google(
+        db,
+        ev,
+        invitee_email=payload.invitee_email,
+        invitee_name=payload.invitee_name,
+        want_meet=booking.google_meet_enabled,
+    )
+    if join and not appt.join_url:
+        appt.join_url = join
+        notice.join_url = join
+        ev.description = f"{description}\n\nJoin: {join}"
+        await db.commit()
+        await db.refresh(appt)
+    booking_notify.notify_host(
+        host,
+        booking,
+        starts_at,
+        invitee_name=payload.invitee_name,
+        invitee_email=payload.invitee_email or "not provided",
+        invitee_phone=payload.invitee_phone,
+        notes=payload.notes,
+        join_url=appt.join_url,
+    )
     if payload.invitee_email:
-        join = await booking_notify.push_to_google(
-            db, ev, invitee_email=payload.invitee_email, invitee_name=payload.invitee_name
-        )
-        if join and not appt.join_url:
-            appt.join_url = join
-            ev.description = f"{description}\n\nJoin: {join}"
-            await db.commit()
-            await db.refresh(appt)
-        booking_notify.notify_host(
-            host,
-            booking,
-            starts_at,
-            invitee_name=payload.invitee_name,
-            invitee_email=payload.invitee_email,
-            invitee_phone=payload.invitee_phone,
-            notes=payload.notes,
-            join_url=appt.join_url,
-        )
-        booking_notify.send_invitee_invite(
-            host,
-            booking,
-            ev,
-            starts_at,
-            invitee_name=payload.invitee_name,
-            invitee_email=payload.invitee_email,
-            join_url=appt.join_url,
-        )
+        if booking.confirmation_email_enabled:
+            email_result = booking_notify.send_invitee_invite(
+                host,
+                booking,
+                ev,
+                starts_at,
+                invitee_name=payload.invitee_name,
+                invitee_email=payload.invitee_email,
+                join_url=appt.join_url,
+            )
+            notice.confirmation_email_status = (
+                "sent" if email_result and email_result.ok else "failed"
+            )
+            if email_result and not email_result.ok:
+                notice.last_error = email_result.detail[:1000]
+        await db.commit()
+    await booking_reminders.send_confirmation_sms(
+        db, notice, ev, timezone_name=booking.timezone
+    )
     return appt
 
 
@@ -5065,6 +5164,7 @@ async def list_rep_appointments(
 async def create_rep_appointment(
     dealer_id: UUID,
     payload: RepAppointmentCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepAppointment:
@@ -5073,7 +5173,7 @@ async def create_rep_appointment(
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
     starts_at = _to_utc_minute(payload.starts_at)
-    duration = payload.duration_min or booking.duration_min or 30
+    duration = booking.duration_min or 20
     slots = await _booking_slots(db, host, booking, duration_min=duration)
     if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
@@ -5081,12 +5181,8 @@ async def create_rep_appointment(
     who = payload.invitee_name
     if payload.invitee_email:
         who = f"{payload.invitee_name} <{payload.invitee_email}>"
-    description = (
-        f"Rep appointment for {dealer.name}.\n"
-        f"Kind: {payload.kind}\n"
-        f"Company: {payload.company or dealer.name or '(not provided)'}\n"
-        f"Phone: {payload.invitee_phone or '(not provided)'}\n\n"
-        f"Notes:\n{payload.notes or '(none)'}"
+    description, program, requested_amount, full_address = _booking_description(
+        user=user, payload=payload, dealer=dealer
     )
     ev = CalendarEvent(
         loan_id=None,
@@ -5123,6 +5219,45 @@ async def create_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    notice = await booking_reminders.register_booking(
+        db,
+        event=ev,
+        booking=booking,
+        invitee_name=payload.invitee_name,
+        invitee_email=payload.invitee_email,
+        invitee_phone=payload.invitee_phone,
+        sms_consent=payload.transactional_sms_consent,
+        sms_consent_method="in_person_device" if payload.transactional_sms_consent else None,
+        sms_consent_ip=request.client.host if request.client else None,
+        sms_consent_user_agent=request.headers.get("user-agent"),
+        booked_by_user_id=user.id,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
+    )
+    phone = consent_delivery.normalize_phone(payload.invitee_phone)
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=user.id,
+        dealer_id=dealer.id,
+        full_name=payload.invitee_name,
+        company=payload.company or dealer.name,
+        email=payload.invitee_email.strip().lower() if payload.invitee_email else None,
+        phone_e164=phone,
+        source="appointment",
+    )
+    await _capture_rep_contact_sms_consent(
+        db,
+        request=request,
+        user=user,
+        contact=contact,
+        dealer=dealer,
+        phone_e164=phone,
+        recipient_name=payload.invitee_name,
+        transactional=payload.transactional_sms_consent,
+        marketing=False,
+        method="in_person_device",
+    )
     await log_action(
         db,
         dealer.id,
@@ -5139,34 +5274,49 @@ async def create_rep_appointment(
     )
     await db.commit()
     await db.refresh(appt)
+    join = await booking_notify.push_to_google(
+        db,
+        ev,
+        invitee_email=payload.invitee_email,
+        invitee_name=payload.invitee_name,
+        want_meet=booking.google_meet_enabled,
+    )
+    if join and not appt.join_url:
+        appt.join_url = join
+        notice.join_url = join
+        ev.description = f"{description}\n\nJoin: {join}"
+        await db.commit()
+        await db.refresh(appt)
+    booking_notify.notify_host(
+        host,
+        booking,
+        starts_at,
+        invitee_name=payload.invitee_name,
+        invitee_email=payload.invitee_email or "not provided",
+        invitee_phone=payload.invitee_phone,
+        notes=payload.notes,
+        join_url=appt.join_url,
+    )
     if payload.invitee_email:
-        join = await booking_notify.push_to_google(
-            db, ev, invitee_email=payload.invitee_email, invitee_name=payload.invitee_name
-        )
-        if join and not appt.join_url:
-            appt.join_url = join
-            ev.description = f"{description}\n\nJoin: {join}"
-            await db.commit()
-            await db.refresh(appt)
-        booking_notify.notify_host(
-            host,
-            booking,
-            starts_at,
-            invitee_name=payload.invitee_name,
-            invitee_email=payload.invitee_email,
-            invitee_phone=payload.invitee_phone,
-            notes=payload.notes,
-            join_url=appt.join_url,
-        )
-        booking_notify.send_invitee_invite(
-            host,
-            booking,
-            ev,
-            starts_at,
-            invitee_name=payload.invitee_name,
-            invitee_email=payload.invitee_email,
-            join_url=appt.join_url,
-        )
+        if booking.confirmation_email_enabled:
+            email_result = booking_notify.send_invitee_invite(
+                host,
+                booking,
+                ev,
+                starts_at,
+                invitee_name=payload.invitee_name,
+                invitee_email=payload.invitee_email,
+                join_url=appt.join_url,
+            )
+            notice.confirmation_email_status = (
+                "sent" if email_result and email_result.ok else "failed"
+            )
+            if email_result and not email_result.ok:
+                notice.last_error = email_result.detail[:1000]
+        await db.commit()
+    await booking_reminders.send_confirmation_sms(
+        db, notice, ev, timezone_name=booking.timezone
+    )
     return appt
 
 

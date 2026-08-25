@@ -30,7 +30,16 @@ class BookingSettings(TimestampMixin, Base):
     intro: Mapped[str | None] = mapped_column(String(600), nullable=True)
     primary_color: Mapped[str] = mapped_column(String(7), nullable=False, default="#5eead4")
     background_color: Mapped[str] = mapped_column(String(7), nullable=False, default="#05070d")
-    duration_min: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    duration_min: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
+    buffer_before_min: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    buffer_after_min: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    confirmation_email_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    confirmation_sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    reminder_email_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    reminder_email_minutes_before: Mapped[int] = mapped_column(Integer, nullable=False, default=1440, server_default="1440")
+    reminder_sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    reminder_sms_minutes_before: Mapped[int] = mapped_column(Integer, nullable=False, default=120, server_default="120")
+    google_meet_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York")
     available_days: Mapped[list[int]] = mapped_column(
         JSONB,

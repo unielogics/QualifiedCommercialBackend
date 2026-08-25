@@ -96,6 +96,8 @@ from app.services.bucket_ai import (
     run_bucket_ai_review,
     upload_link_visible_summary,
 )
+from app.services import booking_notify, booking_reminders
+from app.services.team_calendar import team_booking_settings
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
@@ -3510,18 +3512,11 @@ async def _log_dealer_update_events(
 
 
 async def _booking_settings_for_primary_admin(db: AsyncSession) -> tuple[Any | None, BookingSettings | None]:
-    owner = await primary_super_admin(db)
-    if owner is None:
+    try:
+        owner, booking = await team_booking_settings(db)
+    except RuntimeError:
         return None, None
-    booking = (
-        await db.execute(
-            select(BookingSettings).where(
-                BookingSettings.user_id == owner.id,
-                BookingSettings.enabled.is_(True),
-            )
-        )
-    ).scalar_one_or_none()
-    return owner, booking
+    return owner, booking if booking.enabled else None
 
 
 async def _dealer_call_slots(db: AsyncSession) -> tuple[Any | None, BookingSettings | None, list[dict[str, str]]]:
@@ -3541,6 +3536,77 @@ async def _dealer_call_slots(db: AsyncSession) -> tuple[Any | None, BookingSetti
         }
         for slot in chosen
     ]
+
+
+async def _register_intake_booking(
+    db: AsyncSession,
+    *,
+    intake: PublicUnderwritingIntake,
+    booking: BookingSettings,
+    event: CalendarEvent,
+):
+    return await booking_reminders.register_booking(
+        db,
+        event=event,
+        booking=booking,
+        invitee_name=intake.full_name,
+        invitee_email=intake.email,
+        invitee_phone=intake.phone,
+        # Public AI intakes do not currently capture the carrier disclosure at
+        # booking time. Email reminders remain active; SMS stays safely gated.
+        sms_consent=False,
+        program_name=intake.loan_purpose,
+        requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
+        full_address=str((_intake_state(intake).get("property_address") or "")).strip() or None,
+    )
+
+
+async def _deliver_intake_booking(
+    db: AsyncSession,
+    *,
+    intake: PublicUnderwritingIntake,
+    owner: User,
+    booking: BookingSettings,
+    event: CalendarEvent,
+    notice,
+) -> None:
+    join_url = await booking_notify.push_to_google(
+        db,
+        event,
+        invitee_email=intake.email,
+        invitee_name=intake.full_name,
+        want_meet=booking.google_meet_enabled,
+    )
+    if join_url:
+        notice.join_url = join_url
+        event.description = f"{event.description or ''}\n\nJoin: {join_url}".strip()
+        await db.commit()
+    await asyncio.to_thread(
+        booking_notify.notify_host,
+        owner,
+        booking,
+        event.starts_at,
+        invitee_name=intake.full_name,
+        invitee_email=intake.email,
+        invitee_phone=intake.phone,
+        notes=event.description,
+        join_url=join_url,
+    )
+    if booking.confirmation_email_enabled:
+        email_result = await asyncio.to_thread(
+            booking_notify.send_invitee_invite,
+            owner,
+            booking,
+            event,
+            event.starts_at,
+            invitee_name=intake.full_name,
+            invitee_email=intake.email,
+            join_url=join_url,
+        )
+        notice.confirmation_email_status = "sent" if email_result and email_result.ok else "failed"
+        if email_result and not email_result.ok:
+            notice.last_error = email_result.detail[:1000]
+    await db.commit()
 
 
 async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, widget: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -9005,6 +9071,7 @@ async def book_dealer_call(
     )
     db.add(ev)
     await db.flush()
+    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
 
     state = _intake_state(intake)
     state["call_booking"] = {
@@ -9044,6 +9111,9 @@ async def book_dealer_call(
         detail=f"Dealer AI call booked for {starts_at.isoformat()}",
     )
     await db.commit()
+    await _deliver_intake_booking(
+        db, intake=intake, owner=owner, booking=booking, event=ev, notice=notice
+    )
     intake = await _load_public_intake(db, token)
     return await _response(
         db,
@@ -9666,6 +9736,7 @@ async def book_funding_review_call(
     )
     db.add(ev)
     await db.flush()
+    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
     state = _intake_state(intake)
     state["call_booking"] = {
         "event_id": str(ev.id),
@@ -9704,6 +9775,9 @@ async def book_funding_review_call(
         detail=f"Funding review call booked for {starts_at.isoformat()}",
     )
     await db.commit()
+    await _deliver_intake_booking(
+        db, intake=intake, owner=owner, booking=booking, event=ev, notice=notice
+    )
     intake = await _load_public_intake(db, token)
     return await _response(
         db,
@@ -10625,6 +10699,7 @@ async def book_mca_refinance_call(
     )
     db.add(ev)
     await db.flush()
+    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
     state = _intake_state(intake)
     state["call_booking"] = {
         "event_id": str(ev.id),
@@ -10663,6 +10738,9 @@ async def book_mca_refinance_call(
         detail=f"MCA refinance call booked for {starts_at.isoformat()}",
     )
     await db.commit()
+    await _deliver_intake_booking(
+        db, intake=intake, owner=owner, booking=booking, event=ev, notice=notice
+    )
     intake = await _load_public_intake(db, token)
     return await _response(
         db,

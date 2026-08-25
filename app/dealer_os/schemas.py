@@ -133,6 +133,8 @@ class DealerUpdate(BaseModel):
 class DealerRead(ORM):
     id: UUID
     name: str
+    email: str | None = None
+    phone: str | None = None
     case_ref: str | None = None
     audit_client_since: datetime | None = None
     use_of_proceeds: list[UseOfProceedsRow] | None = None
@@ -185,10 +187,14 @@ class ConvertToAuditResult(BaseModel):
 class DealerListItem(ORM):
     id: UUID
     name: str
+    email: str | None = None
+    phone: str | None = None
     case_ref: str | None = None
     audit_client_since: datetime | None = None
     city: str | None = None
     state: str | None = None
+    address: str | None = None
+    zip: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -212,6 +218,7 @@ class DealerListItem(ORM):
     credit_returned: bool = False
     verified: bool = False
     funding_goal: float | None = None
+    funding_purpose: str | None = None
     client_requested_amount: float | None = None
     application_lifecycle: str = "active"
 
@@ -570,6 +577,9 @@ class BookingAvailabilitySlot(BaseModel):
 class BookingAvailabilityRead(BaseModel):
     timezone: str
     duration_min: int
+    buffer_before_min: int = 0
+    buffer_after_min: int = 0
+    host_name: str | None = None
     slots: list[BookingAvailabilitySlot]
 
 
@@ -606,6 +616,10 @@ class RepAppointmentCreate(BaseModel):
     invitee_phone: str | None = Field(default=None, max_length=32)
     join_url: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
+    program_name: str | None = Field(default=None, max_length=180)
+    requested_amount: str | None = Field(default=None, max_length=40)
+    full_address: str | None = Field(default=None, max_length=500)
+    transactional_sms_consent: bool = False
 
     @model_validator(mode="after")
     def _needs_a_recipient(self) -> "RepAppointmentCreate":

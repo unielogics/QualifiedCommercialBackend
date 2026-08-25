@@ -33,6 +33,7 @@ from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.services.email import ses_client
+from app.services.email.ses_client import SesSendResult
 from app.services.email.ics import ICS_CONTENT_TYPE, build_invite
 
 log = logging.getLogger(__name__)
@@ -120,11 +121,11 @@ def send_invitee_invite(
     invitee_name: str,
     invitee_email: str,
     join_url: str | None = None,
-) -> None:
+) -> SesSendResult | None:
     """Send the person who booked a genuine calendar invitation. Never raises."""
     to = (invitee_email or "").strip()
     if not to or "@" not in to:
-        return
+        return None
     try:
         tz = _tz(booking.timezone)
         when = _when(starts_at, tz, booking.duration_min)
@@ -172,15 +173,17 @@ def send_invitee_invite(
         )
         if not result.ok:
             log.warning("booking: invitee invite failed to=%s detail=%s", to, result.detail)
+        return result
     except Exception:  # noqa: BLE001
         log.exception("booking: invitee invite raised")
+        return SesSendResult(False, None, "invite_exception")
 
 
 async def push_to_google(
     db: AsyncSession,
     event: CalendarEvent,
     *,
-    invitee_email: str,
+    invitee_email: str | None,
     invitee_name: str,
     want_meet: bool = True,
 ) -> str | None:
@@ -193,10 +196,15 @@ async def push_to_google(
     try:
         from app.services.google.calendar_sync import push_event
 
+        attendees = (
+            [{"email": invitee_email, "displayName": invitee_name}]
+            if invitee_email
+            else None
+        )
         return await push_event(
             db,
             event,
-            attendees=[{"email": invitee_email, "displayName": invitee_name}],
+            attendees=attendees,
             want_conference=want_meet,
             send_updates="all",
         )

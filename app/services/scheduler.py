@@ -169,6 +169,15 @@ def start_scheduler() -> None:
         max_instances=1,
     )
     scheduler.add_job(
+        _wrap(job_booking_reminders),
+        "interval",
+        minutes=1,
+        id="booking_reminders",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
         _wrap(job_application_plaid_refresh),
         "cron",
         hour=7,
@@ -449,6 +458,15 @@ async def job_calendar_lookahead() -> None:
             emitted += 1
         await db.commit()
         log.info("calendar_lookahead emitted=%d horizon=24h", emitted)
+
+
+async def job_booking_reminders() -> None:
+    """Deliver persisted booking reminders exactly once per channel."""
+    from app.services.booking_reminders import dispatch_due_reminders
+
+    sent = await dispatch_due_reminders()
+    if sent:
+        log.info("booking_reminders sent=%d", sent)
 
 
 async def job_account_summary_refresh() -> None:

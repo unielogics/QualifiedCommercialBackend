@@ -35,7 +35,7 @@ from app.db import get_db
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.services import booking_notify
+from app.services import booking_notify, booking_reminders
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
@@ -314,6 +314,7 @@ class PublicBookingCreate(BaseModel):
     email: str = Field(min_length=5, max_length=320)
     phone: str | None = Field(default=None, max_length=40)
     notes: str | None = Field(default=None, max_length=1000)
+    transactional_sms_consent: bool = False
 
 
 class PublicBookingCreateResult(BaseModel):
@@ -397,6 +398,18 @@ async def public_booking_create(
     )
     db.add(ev)
     await db.flush()
+    notice = await booking_reminders.register_booking(
+        db,
+        event=ev,
+        booking=booking,
+        invitee_name=payload.full_name,
+        invitee_email=payload.email,
+        invitee_phone=payload.phone,
+        sms_consent=payload.transactional_sms_consent,
+        sms_consent_method="self_web" if payload.transactional_sms_consent else None,
+        sms_consent_ip=ip,
+        sms_consent_user_agent=request.headers.get("user-agent"),
+    )
 
     db.add(
         Activity(
@@ -422,7 +435,7 @@ async def public_booking_create(
     await db.commit()
     await db.refresh(ev)
 
-    await _deliver_booking(db, user, payload, starts_at, booking, ev)
+    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice)
     return PublicBookingCreateResult(ok=True, event_id=str(ev.id))
 
 
@@ -453,7 +466,7 @@ async def _available_booking_slots(
 ) -> list[PublicBookingSlot]:
     tz = _booking_tz(booking.timezone)
     now_local = datetime.now(tz)
-    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 15)
+    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
     window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
     busy_rows = (
         await db.execute(
@@ -469,8 +482,9 @@ async def _available_booking_slots(
     ).scalars().all()
     busy = [
         (
-            ev.starts_at.astimezone(tz),
-            ev.starts_at.astimezone(tz) + timedelta(minutes=max(15, ev.duration_min or booking.duration_min)),
+            ev.starts_at.astimezone(tz) - timedelta(minutes=booking.buffer_before_min),
+            ev.starts_at.astimezone(tz)
+            + timedelta(minutes=max(15, ev.duration_min or booking.duration_min) + booking.buffer_after_min),
         )
         for ev in busy_rows
     ]
@@ -487,7 +501,7 @@ async def _available_booking_slots(
         day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=tz)
         day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=tz)
         cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-        cursor = _round_up_to_step(cursor, 15)
+        cursor = _round_up_to_step(cursor, 5)
         while cursor + duration <= day_end:
             slot_end = cursor + duration
             if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
@@ -501,7 +515,7 @@ async def _available_booking_slots(
                 )
                 if len(slots) >= 80:
                     return slots
-            cursor += duration
+            cursor += timedelta(minutes=5)
     return slots
 
 
@@ -554,6 +568,7 @@ async def _deliver_booking(
     starts_at: datetime,
     booking: BookingSettings,
     ev: CalendarEvent,
+    notice,
 ) -> None:
     """Everything that happens after the booking row is safely committed.
 
@@ -570,8 +585,10 @@ async def _deliver_booking(
         ev,
         invitee_email=payload.email,
         invitee_name=payload.full_name,
+        want_meet=booking.google_meet_enabled,
     )
     if join_url:
+        notice.join_url = join_url
         try:
             ev.description = f"{ev.description or ''}\n\nJoin: {join_url}".strip()
             await db.commit()
@@ -591,15 +608,25 @@ async def _deliver_booking(
         notes=payload.notes,
         join_url=join_url,
     )
-    await asyncio.to_thread(
-        booking_notify.send_invitee_invite,
-        user,
-        booking,
-        ev,
-        starts_at,
-        invitee_name=payload.full_name,
-        invitee_email=payload.email,
-        join_url=join_url,
+    if booking.confirmation_email_enabled:
+        email_result = await asyncio.to_thread(
+            booking_notify.send_invitee_invite,
+            user,
+            booking,
+            ev,
+            starts_at,
+            invitee_name=payload.full_name,
+            invitee_email=payload.email,
+            join_url=join_url,
+        )
+        notice.confirmation_email_status = (
+            "sent" if email_result and email_result.ok else "failed"
+        )
+        if email_result and not email_result.ok:
+            notice.last_error = email_result.detail[:1000]
+    await db.commit()
+    await booking_reminders.send_confirmation_sms(
+        db, notice, ev, timezone_name=booking.timezone
     )
 
 
