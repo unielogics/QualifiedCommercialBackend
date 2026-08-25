@@ -4,8 +4,8 @@ from uuid import uuid4
 
 import pytest
 
-from app.models.booking_settings import BookingSettings
 from app.models.booking_notification import BookingNotificationReminder
+from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
 from app.services.booking_reminders import register_booking

@@ -82,3 +82,4 @@ ignore = ["E501"]
 # changed-file gate focused on behavioral errors until they are reformatted.
 "app/dealer_os/router.py" = ["B008", "I001", "UP017", "UP037"]
 "app/dealer_os/schemas.py" = ["I001", "UP037"]
+"app/routers/google.py" = ["B008"]
