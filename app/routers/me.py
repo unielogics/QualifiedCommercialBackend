@@ -1,3 +1,4 @@
+# ruff: noqa: B007, B008, I001, UP017
 """Per-user personal settings endpoints.
 
 Today this is just the broker-settings overlay (`brokers.settings_data`,
@@ -14,8 +15,9 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -542,13 +544,6 @@ async def headshot_upload_init(
 
 
 # ── Agent AI Playbook overlay (Phase 2) ────────────────────────────
-
-
-import uuid  # noqa: E402
-from typing import Any  # noqa: E402
-from uuid import UUID  # noqa: E402
-
-from datetime import datetime, timezone  # noqa: E402
 
 
 # Closed enums mirrored from app/enums.py for the agent overlay. The

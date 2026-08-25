@@ -1,3 +1,4 @@
+# ruff: noqa: I001, UP017
 """In-process APScheduler for recurring AI / calendar / digest work.
 
 ⚠️ SINGLE-INSTANCE ASSUMPTION ⚠️
@@ -531,8 +532,6 @@ async def job_document_scan_drain() -> None:
     no Anthropic calls). Realistic steady state at borrower-side
     volume is single-digit scans per day.
     """
-    import asyncio
-
     from sqlalchemy import select
 
     from app.db import SessionLocal
@@ -757,7 +756,6 @@ async def job_ai_agent_pass() -> None:
     message, and either drafts it (draft-first / warm-up) or sends it
     (auto). Honors per-agent cadence + exit rules. Separate job from
     the existing cadence engine — scoped only to ai_agent_leads."""
-    import asyncio
     from datetime import datetime, timedelta, timezone
 
     from sqlalchemy import select

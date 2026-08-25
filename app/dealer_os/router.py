@@ -4532,7 +4532,7 @@ def _booking_description(
     program = (payload.program_name or (dealer.funding_purpose if dealer else None) or "").strip() or None
     amount = (payload.requested_amount or "").strip() or None
     if amount is None and dealer and dealer.funding_goal is not None:
-        amount = f"$" + format(float(dealer.funding_goal), ",.0f")
+        amount = "$" + format(float(dealer.funding_goal), ",.0f")
     address = (payload.full_address or "").strip() or None
     if address is None and dealer:
         address = ", ".join(

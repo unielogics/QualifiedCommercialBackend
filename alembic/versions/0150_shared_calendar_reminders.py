@@ -4,10 +4,10 @@ Revision ID: 0150_shared_calendar_reminders
 Revises: 0149_product_booklet_prescreen
 """
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
 
 revision = "0150_shared_calendar_reminders"
 down_revision = "0149_product_booklet_prescreen"

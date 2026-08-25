@@ -86,6 +86,7 @@ from app.schemas.bucket import (
     BucketRequestUploadedFileRead,
 )
 from app.schemas.common import ORMModel
+from app.services import booking_notify, booking_reminders
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.bucket_ai import (
@@ -96,8 +97,6 @@ from app.services.bucket_ai import (
     run_bucket_ai_review,
     upload_link_visible_summary,
 )
-from app.services import booking_notify, booking_reminders
-from app.services.team_calendar import team_booking_settings
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
@@ -110,6 +109,7 @@ from app.services.main_street_programs import (
 )
 from app.services.payment_authorization import primary_super_admin
 from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
+from app.services.team_calendar import team_booking_settings
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
 funding_router = APIRouter(prefix="/public/funding-review", tags=["public-funding-review"])
@@ -3557,7 +3557,7 @@ async def _register_intake_booking(
         sms_consent=False,
         program_name=intake.loan_purpose,
         requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
-        full_address=str((_intake_state(intake).get("property_address") or "")).strip() or None,
+        full_address=str(_intake_state(intake).get("property_address") or "").strip() or None,
     )
 
 

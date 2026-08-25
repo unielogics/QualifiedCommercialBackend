@@ -31,7 +31,7 @@ class UserBookingSettingsBase(BaseModel):
     profile_photo_s3_key: str | None = None
 
     @model_validator(mode="after")
-    def _validate_booking_window(self) -> "UserBookingSettingsBase":
+    def _validate_booking_window(self) -> UserBookingSettingsBase:
         days = sorted(set(self.available_days))
         if any(day < 0 or day > 6 for day in days):
             raise ValueError("available_days must use 0=Sunday through 6=Saturday")

@@ -1,3 +1,4 @@
+# ruff: noqa: I001
 """ORM models — single import surface so Alembic autogenerate sees everything."""
 
 from app.dealer_os import (

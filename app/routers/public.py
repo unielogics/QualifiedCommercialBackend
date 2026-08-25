@@ -1,3 +1,4 @@
+# ruff: noqa: B008, UP017, UP037
 """Public, UNauthenticated endpoints for the marketing site (QCWeb).
 
 Two surfaces, both intentionally auth-free (the public site has no
@@ -19,11 +20,12 @@ best-effort per-IP throttle). No DB writes other than the Activity log.
 
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 import time
 import uuid
-from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import time as dt_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -35,11 +37,11 @@ from app.db import get_db
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
-from app.services import booking_notify, booking_reminders
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
+from app.services import booking_notify, booking_reminders
 from app.services import fred as fred_service
 
 log = logging.getLogger(__name__)

@@ -33,8 +33,8 @@ from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.services.email import ses_client
-from app.services.email.ses_client import SesSendResult
 from app.services.email.ics import ICS_CONTENT_TYPE, build_invite
+from app.services.email.ses_client import SesSendResult
 
 log = logging.getLogger(__name__)
 
