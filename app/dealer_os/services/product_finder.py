@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 QUESTIONS: tuple[dict[str, Any], ...] = (
     {"key": "use_of_funds", "kind": "text", "en": "Describe exactly how the funds will be used.", "es": "Describa exactamente como se usaran los fondos."},
     {"key": "years_in_business", "kind": "number", "en": "How many years has the business operated?", "es": "¿Cuantos anos lleva operando el negocio?"},

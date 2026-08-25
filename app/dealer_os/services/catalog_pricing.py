@@ -10,7 +10,6 @@ from __future__ import annotations
 from math import isfinite
 from typing import Any
 
-
 DEFAULT_ILLUSTRATION_AMOUNT = 100_000.0
 
 

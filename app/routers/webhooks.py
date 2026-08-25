@@ -31,7 +31,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response, status
@@ -156,7 +156,7 @@ async def _store_inbound_sms(
         )
         if rep_workflows.is_stop_message(body):
             await sms_consent_svc.revoke(db, phone_e164=from_phone, reason="STOP")
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             for contact in contacts:
                 contact.sms_opted_out_at = now
                 contact.last_activity_at = now
@@ -168,7 +168,7 @@ async def _store_inbound_sms(
             log.warning("%s sms webhook: no rep contact for sender=%s", provider, from_phone)
             return Response(status_code=status.HTTP_202_ACCEPTED)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         thread = (
             await db.execute(
                 select(DealerRepInboxThread)
@@ -356,7 +356,7 @@ def _verify_stripe_signature(
         return False
     if abs(time.time() - timestamp) > tolerance_seconds:
         return False
-    signed_payload = f"{timestamp}.{payload.decode('utf-8')}".encode("utf-8")
+    signed_payload = f"{timestamp}.{payload.decode('utf-8')}".encode()
     expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
     return any(hmac.compare_digest(expected, sig) for sig in signatures)
 
@@ -443,7 +443,7 @@ async def _sync_payment_intent(db: AsyncSession, payment_intent: dict) -> None:
         return
     if status_value == "succeeded":
         expense.status = "charged"
-        expense.charged_at = datetime.now(timezone.utc)
+        expense.charged_at = datetime.now(UTC)
         expense.failure_message = None
     elif status_value in {"requires_payment_method", "canceled"}:
         expense.status = "failed"

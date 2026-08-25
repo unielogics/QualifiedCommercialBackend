@@ -10,11 +10,12 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse, StreamingResponse
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -22,8 +23,8 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
-from app.models.booking_settings import BookingSettings
 from app.models.application_profile import ApplicationTaxonomyEntry
+from app.models.booking_settings import BookingSettings
 from app.models.user import User
 from app.schemas.application_profile import TaxonomyContributionCreate, TaxonomyEntryRead
 from app.services.email import ses_client
