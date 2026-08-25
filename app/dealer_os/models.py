@@ -120,6 +120,16 @@ class DealerBusiness(TimestampMixin, Base):
     entity_type: Mapped[str | None] = mapped_column(String(32))  # llc|s_corp|c_corp|partnership|sole_prop
     naics_code: Mapped[str | None] = mapped_column(String(8))
     naics_label: Mapped[str | None] = mapped_column(String(180))
+    subindustry: Mapped[str | None] = mapped_column(String(120))
+    industry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    subindustry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    activity_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
 
 
 class DealerApplicationProfile(TimestampMixin, Base):
@@ -1100,6 +1110,20 @@ class DealerRepCompany(TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(String(180), nullable=False)
     industry: Mapped[str | None] = mapped_column(String(80))
+    industry_label: Mapped[str | None] = mapped_column(String(180))
+    subindustry: Mapped[str | None] = mapped_column(String(120))
+    subindustry_label: Mapped[str | None] = mapped_column(String(180))
+    naics_code: Mapped[str | None] = mapped_column(String(8))
+    naics_label: Mapped[str | None] = mapped_column(String(180))
+    industry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    subindustry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
+    activity_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
+    )
     address: Mapped[str | None] = mapped_column(String(240))
     city: Mapped[str | None] = mapped_column(String(120))
     state: Mapped[str | None] = mapped_column(String(8))
@@ -1258,6 +1282,33 @@ class DealerProductScreeningSnapshot(TimestampMixin, Base):
     )
 
 
+class DealerFieldDeskProfile(TimestampMixin, Base):
+    """One public-facing Field Desk identity per internal staff user."""
+
+    __tablename__ = "dos_field_desk_profiles"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_dos_field_desk_profile_user"),
+        Index("ix_dos_field_desk_profiles_visible", "card_visible", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    display_name: Mapped[str | None] = mapped_column(String(160))
+    title: Mapped[str | None] = mapped_column(String(120))
+    phone: Mapped[str | None] = mapped_column(String(32))
+    display_email: Mapped[str | None] = mapped_column(String(320))
+    short_bio: Mapped[str | None] = mapped_column(Text)
+    preferred_locale: Mapped[str] = mapped_column(
+        String(2), nullable=False, default="en", server_default="en"
+    )
+    card_visible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    headshot_s3_key: Mapped[str | None] = mapped_column(String(720))
+
+
 class DealerRepContactShare(TimestampMixin, Base):
     """A business-card/program intro sent by a rep."""
 
@@ -1357,6 +1408,7 @@ class DealerRepInboxMessage(TimestampMixin, Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     provider: Mapped[str | None] = mapped_column(String(32))
     provider_message_id: Mapped[str | None] = mapped_column(String(160))
+    provider_error: Mapped[str | None] = mapped_column(String(500))
     delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="stored", server_default="stored")
     sender: Mapped[str | None] = mapped_column(String(320))
     recipient: Mapped[str | None] = mapped_column(String(320))

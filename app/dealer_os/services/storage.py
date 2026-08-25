@@ -145,3 +145,32 @@ def get_bytes(key: str) -> bytes | None:
     except Exception:
         logger.exception("dealer-os: S3 fetch failed for %s", key)
         return None
+
+
+def presign_put(key: str, *, content_type: str, ttl: int = 300) -> dict[str, object] | None:
+    """Create an encrypted direct-upload contract for a private S3 object."""
+    cfg = get_settings()
+    if not cfg.s3_bucket:
+        return None
+    params: dict[str, object] = {
+        "Bucket": cfg.s3_bucket,
+        "Key": key,
+        "ContentType": content_type,
+    }
+    headers: dict[str, str] = {"Content-Type": content_type}
+    if cfg.buckets_kms_key_id:
+        params["ServerSideEncryption"] = "aws:kms"
+        params["SSEKMSKeyId"] = cfg.buckets_kms_key_id
+        headers["x-amz-server-side-encryption"] = "aws:kms"
+        headers["x-amz-server-side-encryption-aws-kms-key-id"] = cfg.buckets_kms_key_id
+    else:
+        params["ServerSideEncryption"] = "AES256"
+        headers["x-amz-server-side-encryption"] = "AES256"
+    try:
+        url = _s3_client().generate_presigned_url(
+            "put_object", Params=params, ExpiresIn=ttl
+        )
+        return {"upload_url": url, "headers": headers, "s3_key": key}
+    except Exception:
+        logger.exception("dealer-os: upload presign failed for %s", key)
+        return None

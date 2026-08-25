@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from uuid import UUID
@@ -284,6 +285,10 @@ async def twilio_sms_status(request: Request) -> Response:
         return Response(status_code=status.HTTP_403_FORBIDDEN)
     message_sid = _first_str(form.get("MessageSid"), form.get("SmsSid"))
     message_status = _first_str(form.get("MessageStatus"), form.get("SmsStatus"))
+    error_code = _first_str(form.get("ErrorCode"))
+    error_message = _first_str(form.get("ErrorMessage"))
+    if error_message:
+        error_message = re.sub(r"\+\d{8,15}", "[phone number]", error_message)[:320]
     if not message_sid or not message_status:
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
     async with SessionLocal() as db:
@@ -297,6 +302,11 @@ async def twilio_sms_status(request: Request) -> Response:
         ).scalar_one_or_none()
         if message is not None:
             message.delivery_status = message_status[:24]
+            message.provider_error = (
+                f"Twilio {error_code or message_status}: {error_message or 'delivery failed'}"[:500]
+                if message_status in {"failed", "undelivered", "canceled"}
+                else None
+            )
         reminder = (
             await db.execute(
                 select(BookingNotificationReminder).where(

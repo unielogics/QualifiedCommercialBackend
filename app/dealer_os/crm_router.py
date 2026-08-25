@@ -23,13 +23,17 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.booking_settings import BookingSettings
+from app.models.application_profile import ApplicationTaxonomyEntry
 from app.models.user import User
+from app.schemas.application_profile import TaxonomyContributionCreate, TaxonomyEntryRead
 from app.services.email import ses_client
 from app.services.payment_authorization import primary_super_admin
 
 from .crm_schemas import (
     CompanyContactIn,
     ContactAssignmentIn,
+    FieldDeskHeadshotUploadInit,
+    FieldDeskProfileUpdate,
     FinderAnswersIn,
     FundingGoalConfirmIn,
     ProductCatalogUpdate,
@@ -39,6 +43,7 @@ from .deps import require_super_admin, require_team_or_rep
 from .models import (
     DealerApplicationContact,
     DealerBusiness,
+    DealerFieldDeskProfile,
     DealerProductCatalog,
     DealerProductFinderSession,
     DealerProductPresentation,
@@ -53,6 +58,7 @@ from .models import (
     DealerSourceConnection,
 )
 from .services import buckets_link, consent_delivery, storage
+from .services.catalog_pricing import normalize_catalog_pricing
 from .services.product_finder import QUESTIONS, screen_products
 from .services.targets import propose_targets
 
@@ -319,18 +325,350 @@ async def _next_case_ref(db: AsyncSession) -> str:
     return f"{prefix}{number + 1:05d}"
 
 
-def _catalog_item(row: DealerProductCatalog, locale: str) -> dict:
+async def _validate_taxonomy_selection(
+    db: AsyncSession, payload: CompanyContactIn
+) -> str:
+    """Validate and canonicalize the Product Finder NAICS hierarchy.
+
+    Product routing may only use the canonical activity code. Pending custom
+    entries are accepted for discovery, but their status is propagated so the
+    routing engine cannot turn them into deterministic exclusions.
+    """
+
+    entry_ids = (
+        payload.industry_entry_id,
+        payload.subindustry_entry_id,
+        payload.activity_entry_id,
+    )
+    if not any(entry_ids):
+        if payload.naics_code:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Select the NAICS category, subcategory, and business activity.",
+            )
+        return "unclassified"
+    if not all(entry_ids):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select the complete NAICS category, subcategory, and business activity.",
+        )
+
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationTaxonomyEntry).where(
+                    ApplicationTaxonomyEntry.id.in_(entry_ids)
+                )
+            )
+        ).scalars().all()
+    )
+    by_id = {row.id: row for row in rows}
+    industry = by_id.get(payload.industry_entry_id)
+    subindustry = by_id.get(payload.subindustry_entry_id)
+    activity = by_id.get(payload.activity_entry_id)
+    if not industry or not subindustry or not activity:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "One or more NAICS selections are no longer available.",
+        )
+    if industry.level != 2 or subindustry.level != 3 or activity.level != 6:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select a valid 2-digit, 3-digit, and 6-digit NAICS hierarchy.",
+        )
+    if subindustry.parent_id != industry.id or activity.parent_id != subindustry.id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The selected NAICS activity does not belong to that category and subcategory.",
+        )
+    statuses = {industry.status, subindustry.status, activity.status}
+    if not statuses.issubset({"official", "approved", "pending"}):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The selected NAICS classification is not available for screening.",
+        )
+
+    payload.industry = industry.code or payload.industry
+    payload.industry_label = industry.label
+    payload.subindustry = subindustry.code or payload.subindustry
+    payload.subindustry_label = subindustry.label
+    payload.naics_code = activity.code
+    payload.naics_label = activity.label
+    return "pending" if "pending" in statuses else "official"
+
+
+def _finder_taxonomy_read(row: ApplicationTaxonomyEntry) -> TaxonomyEntryRead:
+    return TaxonomyEntryRead(
+        id=row.id,
+        level=row.level,
+        code=row.code,
+        label=row.label,
+        parent_id=row.parent_id,
+        source=row.source,
+        taxonomy_version=row.taxonomy_version,
+        status=row.status,
+        aliases=[str(value) for value in (row.aliases or [])],
+        originating_profile_id=row.originating_profile_id,
+        canonical_entry_id=row.canonical_entry_id,
+    )
+
+
+@router.post(
+    "/product-finder/taxonomy/contributions",
+    response_model=TaxonomyEntryRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def contribute_product_finder_taxonomy(
+    payload: TaxonomyContributionCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> TaxonomyEntryRead:
+    """Accept a staff suggestion without making it a deterministic rule."""
+
+    require_team_or_rep(user)
+    parent = (
+        await db.get(ApplicationTaxonomyEntry, payload.parent_id)
+        if payload.parent_id
+        else None
+    )
+    expected_parent_level = {3: 2, 6: 3}.get(payload.level)
+    if expected_parent_level and (
+        parent is None or parent.level != expected_parent_level
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select a valid parent classification.",
+        )
+
+    normalized = " ".join(payload.label.casefold().strip().split())
+    duplicate = (
+        await db.execute(
+            select(ApplicationTaxonomyEntry)
+            .where(
+                ApplicationTaxonomyEntry.level == payload.level,
+                ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
+                or_(
+                    ApplicationTaxonomyEntry.normalized_label == normalized,
+                    ApplicationTaxonomyEntry.code == payload.code
+                    if payload.code
+                    else False,
+                ),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if duplicate and (
+        not payload.code or duplicate.label.casefold() == payload.label.casefold()
+    ):
+        return _finder_taxonomy_read(duplicate)
+
+    pending = (
+        await db.execute(
+            select(ApplicationTaxonomyEntry)
+            .where(
+                ApplicationTaxonomyEntry.created_by_user_id == user.id,
+                ApplicationTaxonomyEntry.originating_profile_id.is_(None),
+                ApplicationTaxonomyEntry.level == payload.level,
+                ApplicationTaxonomyEntry.parent_id == payload.parent_id,
+                ApplicationTaxonomyEntry.status == "pending",
+                ApplicationTaxonomyEntry.normalized_label == normalized,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if pending:
+        return _finder_taxonomy_read(pending)
+
+    row = ApplicationTaxonomyEntry(
+        level=payload.level,
+        code=payload.code,
+        label=payload.label.strip(),
+        normalized_label=normalized,
+        parent_id=parent.id if parent else None,
+        source="product_finder_custom",
+        status="pending",
+        created_by_user_id=user.id,
+        canonical_entry_id=duplicate.id if duplicate else None,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _finder_taxonomy_read(row)
+
+
+async def _canonicalize_session_taxonomy(
+    db: AsyncSession, answers: dict[str, Any]
+) -> dict[str, Any]:
+    """Revalidate finder taxonomy on every screen calculation.
+
+    Finder answers are intentionally flexible JSON, but taxonomy fields must
+    never be trusted from browser labels or codes. The three stored entry IDs
+    are resolved again and overwrite every routing-facing value.
+    """
+
+    raw_ids = (
+        answers.get("industry_entry_id"),
+        answers.get("subindustry_entry_id"),
+        answers.get("activity_entry_id"),
+    )
+    if not any(raw_ids):
+        if answers.get("naics_code"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Select the complete NAICS category, subcategory, and business activity.",
+            )
+        return {**answers, "taxonomy_status": "unclassified"}
+    if not all(raw_ids):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select the complete NAICS category, subcategory, and business activity.",
+        )
+    try:
+        entry_ids = tuple(UUID(str(raw_id)) for raw_id in raw_ids)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "One or more NAICS selections are invalid.",
+        ) from exc
+
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationTaxonomyEntry).where(
+                    ApplicationTaxonomyEntry.id.in_(entry_ids)
+                )
+            )
+        ).scalars().all()
+    )
+    by_id = {row.id: row for row in rows}
+    industry, subindustry, activity = (by_id.get(entry_id) for entry_id in entry_ids)
+    if not industry or not subindustry or not activity:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "One or more NAICS selections are no longer available.",
+        )
+    if (
+        industry.level != 2
+        or subindustry.level != 3
+        or activity.level != 6
+        or subindustry.parent_id != industry.id
+        or activity.parent_id != subindustry.id
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select a valid 2-digit, 3-digit, and 6-digit NAICS hierarchy.",
+        )
+    statuses = {industry.status, subindustry.status, activity.status}
+    if not statuses.issubset({"official", "approved", "pending"}):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The selected NAICS classification is not available for screening.",
+        )
+    return {
+        **answers,
+        "industry_entry_id": str(industry.id),
+        "industry": industry.code,
+        "industry_label": industry.label,
+        "subindustry_entry_id": str(subindustry.id),
+        "subindustry": subindustry.code,
+        "subindustry_label": subindustry.label,
+        "activity_entry_id": str(activity.id),
+        "naics_code": activity.code,
+        "naics_label": activity.label,
+        "taxonomy_status": "pending" if "pending" in statuses else "official",
+    }
+
+
+async def _field_desk_profile_for(
+    db: AsyncSession, owner: User, *, create: bool
+) -> DealerFieldDeskProfile | None:
+    profile = (
+        await db.execute(
+            select(DealerFieldDeskProfile).where(
+                DealerFieldDeskProfile.user_id == owner.id
+            )
+        )
+    ).scalar_one_or_none()
+    if profile is not None or not create:
+        return profile
+    booking = (
+        await db.execute(
+            select(BookingSettings).where(BookingSettings.user_id == owner.id)
+        )
+    ).scalar_one_or_none()
+    profile = DealerFieldDeskProfile(
+        user_id=owner.id,
+        display_name=owner.name or None,
+        display_email=owner.email,
+        preferred_locale="en",
+        card_visible=True,
+        headshot_s3_key=booking.profile_photo_s3_key if booking else None,
+    )
+    db.add(profile)
+    await db.flush()
+    return profile
+
+
+async def _field_desk_profile_read(
+    db: AsyncSession, owner: User, profile: DealerFieldDeskProfile
+) -> dict:
+    booking = (
+        await db.execute(
+            select(BookingSettings).where(
+                BookingSettings.user_id == owner.id,
+                BookingSettings.enabled.is_(True),
+                BookingSettings.slug.is_not(None),
+            )
+        )
+    ).scalar_one_or_none()
+    app_url = get_settings().rep_app_url.rstrip("/")
+    booking_base = get_settings().frontend_app_url.rstrip("/")
+    return {
+        "id": str(profile.id),
+        "user_id": str(owner.id),
+        "display_name": profile.display_name or owner.name,
+        "title": profile.title,
+        "phone": profile.phone,
+        "display_email": profile.display_email or owner.email,
+        "short_bio": profile.short_bio,
+        "preferred_locale": profile.preferred_locale,
+        "card_visible": profile.card_visible,
+        "headshot_s3_key": profile.headshot_s3_key,
+        "headshot_url": storage.presign_get(
+            profile.headshot_s3_key,
+            content_type="image/jpeg",
+        )
+        if profile.headshot_s3_key
+        else None,
+        "booking_url": f"{booking_base}/book/{booking.slug}"
+        if booking and booking.slug
+        else None,
+        "application_url": f"{app_url}/?new=1",
+        "updated_at": profile.updated_at,
+    }
+
+
+def _catalog_item(
+    row: DealerProductCatalog,
+    locale: str,
+    requested_amount: float | None = None,
+) -> dict:
     language = "es" if locale == "es" else "en"
     copy = (row.copy or {}).get(language) or (row.copy or {}).get("en") or {}
     disclosure = (row.disclosures or {}).get(language) or (row.disclosures or {}).get("en")
-    pricing = (row.pricing or {}).get(language) or (row.pricing or {}).get("en")
+    pricing_result = normalize_catalog_pricing(
+        row.pricing, locale=language, requested_amount=requested_amount
+    )
     defaults = (_CATALOG_DETAILS.get(row.program_key) or {}).get(language) or _GENERIC_DETAIL_COPY[language]
     detail = {**defaults, **(copy.get("details") or {})}
     return {
         "id": str(row.id), "program_key": row.program_key, "version": row.version,
         "category": row.category, "name": copy.get("name", row.program_key.replace("_", " ").title()),
         "summary": copy.get("summary") or _CATALOG_SUMMARIES.get(row.program_key, {}).get(language), "highlights": copy.get("highlights", []),
-        "pricing": pricing, "disclosure": disclosure,
+        "pricing": pricing_result["display"], "disclosure": disclosure,
+        "term_scenarios": pricing_result["term_scenarios"],
+        "illustration_amount": pricing_result["illustration_amount"],
+        "illustration_amount_source": pricing_result["amount_source"],
         "amount_min": float(row.amount_min) if row.amount_min is not None else None,
         "amount_max": float(row.amount_max) if row.amount_max is not None else None,
         "term_min_months": row.term_min_months, "term_max_months": row.term_max_months,
@@ -341,7 +679,11 @@ def _catalog_item(row: DealerProductCatalog, locale: str) -> dict:
     }
 
 
-def _render_catalog_pdf(rows: list[DealerProductCatalog], locale: str) -> bytes:
+def _render_catalog_pdf(
+    rows: list[DealerProductCatalog],
+    locale: str,
+    requested_amount: float | None = None,
+) -> bytes:
     from weasyprint import HTML
 
     def bullet_list(items: list[str]) -> str:
@@ -349,7 +691,7 @@ def _render_catalog_pdf(rows: list[DealerProductCatalog], locale: str) -> bytes:
 
     cards = ""
     for row in rows:
-        item = _catalog_item(row, locale)
+        item = _catalog_item(row, locale, requested_amount)
         details = item["details"]
         sections = [
             ("Uses" if locale == "en" else "Usos", details.get("uses") or []),
@@ -358,12 +700,33 @@ def _render_catalog_pdf(rows: list[DealerProductCatalog], locale: str) -> bytes:
             ("Expected documents" if locale == "en" else "Documentos esperados", details.get("documents") or []),
             ("Limitations" if locale == "en" else "Limitaciones", details.get("exclusions") or []),
         ]
+        scenario_html = ""
+        for scenario in item.get("term_scenarios") or []:
+            heading = f"{int(scenario['term_months'])} {'meses' if locale == 'es' else 'months'}"
+            if not scenario.get("calculation_available"):
+                scenario_html += (
+                    f"<div class='scenario'><b>{heading}</b><span>"
+                    f"{html.escape(str(scenario.get('unavailable_reason') or 'Terms determined after review'))}"
+                    "</span></div>"
+                )
+                continue
+            scenario_html += f"<div class='scenario'><b>{heading}</b><table><thead><tr><th></th><th>{'Mejor tasa' if locale == 'es' else 'Best published'}</th><th>{'Mayor costo' if locale == 'es' else 'Highest configured'}</th></tr></thead><tbody>"
+            labels = (
+                ("annual_rate", "Tasa" if locale == "es" else "Rate", lambda value: f"{float(value) * 100:.2f}%"),
+                ("monthly_payment", "Pago mensual" if locale == "es" else "Monthly payment", lambda value: f"${float(value):,.2f}"),
+                ("total_payments", "Pagos totales" if locale == "es" else "Total payments", lambda value: f"${float(value):,.2f}"),
+                ("total_interest", "Interes total" if locale == "es" else "Total interest", lambda value: f"${float(value):,.2f}"),
+            )
+            for key, label, formatter in labels:
+                scenario_html += f"<tr><th>{label}</th><td>{formatter(scenario['best'][key])}</td><td>{formatter(scenario['highest_cost'][key])}</td></tr>"
+            scenario_html += "</tbody></table></div>"
         cards += (
             f"<section><h2>{html.escape(str(item['name']))}</h2>"
             f"<p>{html.escape(str(item.get('summary') or ''))}</p>"
             f"<div class='terms'><b>${float(row.amount_min or 0):,.0f}-${float(row.amount_max or 0):,.0f}</b>"
             f"<span>{html.escape(str(item.get('pricing') or 'Pricing subject to review'))}</span></div>"
             f"<p><b>{html.escape(str(details.get('closing_timeline') or ''))}</b></p>"
+            + scenario_html
             + "".join(f"<h3>{title}</h3>{bullet_list(list(values))}" for title, values in sections)
             + f"<p class='disclosure'>{html.escape(str(item.get('disclosure') or ''))}</p></section>"
         )
@@ -372,23 +735,146 @@ def _render_catalog_pdf(rows: list[DealerProductCatalog], locale: str) -> bytes:
         "h1{color:#174b84}h2{margin:0 0 6px}h3{font-size:11px;text-transform:uppercase;color:#526070;margin:12px 0 3px}"
         "section{border:1px solid #d8e0ea;padding:18px;margin:14px 0;border-radius:8px;page-break-inside:avoid}"
         ".terms{display:flex;justify-content:space-between;border-top:1px solid #e5e9ef;border-bottom:1px solid #e5e9ef;padding:9px 0}"
-        "ul{margin:4px 0 0;padding-left:20px}li{margin:3px 0}.disclosure,small{color:#667085}</style>"
+        "ul{margin:4px 0 0;padding-left:20px}li{margin:3px 0}.disclosure,small{color:#667085}"
+        ".scenario{margin:12px 0;padding:10px;background:#f6f8fb}.scenario>b{display:block;margin-bottom:6px}"
+        "table{width:100%;border-collapse:collapse}th,td{padding:5px;border-bottom:1px solid #d8e0ea;text-align:right}th:first-child{text-align:left}</style>"
         f"<h1>{'Catálogo de financiamiento' if locale == 'es' else 'Funding program catalog'}</h1>"
         f"{cards}<small>{'Evaluación preliminar; no es un compromiso de préstamo.' if locale == 'es' else 'Preliminary fit only; not a commitment to lend.'}</small>"
     )
     return HTML(string=document_html).write_pdf()
 
 
+def _apply_field_desk_profile_update(
+    profile: DealerFieldDeskProfile,
+    payload: FieldDeskProfileUpdate,
+    *,
+    owner_id: UUID,
+) -> None:
+    changes = payload.model_dump(exclude_unset=True)
+    headshot_key = changes.get("headshot_s3_key")
+    if headshot_key and not str(headshot_key).startswith(
+        f"dealer-os/profiles/{owner_id}/"
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Select a headshot uploaded for this Field Desk profile.",
+        )
+    for field, value in changes.items():
+        setattr(profile, field, str(value) if field == "display_email" and value else value)
+
+
+@router.get("/me/profile")
+async def read_my_field_desk_profile(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    require_team_or_rep(user)
+    profile = await _field_desk_profile_for(db, user, create=True)
+    assert profile is not None
+    await db.commit()
+    await db.refresh(profile)
+    return await _field_desk_profile_read(db, user, profile)
+
+
+@router.put("/me/profile")
+async def update_my_field_desk_profile(
+    payload: FieldDeskProfileUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    require_team_or_rep(user)
+    profile = await _field_desk_profile_for(db, user, create=True)
+    assert profile is not None
+    _apply_field_desk_profile_update(profile, payload, owner_id=user.id)
+    await db.commit()
+    await db.refresh(profile)
+    return await _field_desk_profile_read(db, user, profile)
+
+
+@router.post("/me/profile/headshot/upload-init")
+async def field_desk_headshot_upload_init(
+    payload: FieldDeskHeadshotUploadInit,
+    user: CurrentUser,
+) -> dict:
+    require_team_or_rep(user)
+    extension = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }[payload.content_type]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", payload.filename).strip(".-")
+    stem = stem[:80] or "headshot"
+    if not stem.lower().endswith(extension):
+        stem = f"{stem}{extension}"
+    key = f"dealer-os/profiles/{user.id}/{uuid.uuid4()}-{stem}"
+    upload = storage.presign_put(key, content_type=payload.content_type)
+    if upload is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Secure headshot storage is not configured.",
+        )
+    return upload
+
+
+@router.get("/admin/rep-profiles")
+async def list_field_desk_profiles(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> dict:
+    require_super_admin(user)
+    owners = list(
+        (
+            await db.execute(
+                select(User)
+                .where(
+                    User.deleted_at.is_(None),
+                    User.role.in_([Role.FIELD_REP, Role.LOAN_EXEC, Role.SUPER_ADMIN]),
+                )
+                .order_by(User.name, User.email)
+            )
+        ).scalars().all()
+    )
+    items = []
+    for owner in owners:
+        profile = await _field_desk_profile_for(db, owner, create=True)
+        assert profile is not None
+        items.append(await _field_desk_profile_read(db, owner, profile))
+    await db.commit()
+    return {"items": items, "total": len(items)}
+
+
+@router.put("/admin/rep-profiles/{owner_id}")
+async def update_field_desk_profile_as_admin(
+    owner_id: UUID,
+    payload: FieldDeskProfileUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    require_super_admin(user)
+    owner = await db.get(User, owner_id)
+    if owner is None or owner.deleted_at is not None or owner.role not in {
+        Role.FIELD_REP,
+        Role.LOAN_EXEC,
+        Role.SUPER_ADMIN,
+    }:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Field Desk user not found")
+    profile = await _field_desk_profile_for(db, owner, create=True)
+    assert profile is not None
+    _apply_field_desk_profile_update(profile, payload, owner_id=owner.id)
+    await db.commit()
+    await db.refresh(profile)
+    return await _field_desk_profile_read(db, owner, profile)
+
+
 @router.get("/products")
 async def list_products(
     user: CurrentUser, db: AsyncSession = Depends(get_db), locale: str = Query("en", pattern="^(en|es)$"),
     q: str = Query("", max_length=120), category: str = Query("all", max_length=48),
+    amount: float | None = Query(default=None, gt=0, le=50_000_000),
 ) -> dict:
     require_team_or_rep(user)
     stmt = select(DealerProductCatalog).where(DealerProductCatalog.active.is_(True))
     if category != "all": stmt = stmt.where(DealerProductCatalog.category == category)
     rows = (await db.execute(stmt.order_by(DealerProductCatalog.sort_order, DealerProductCatalog.program_key))).scalars().all()
-    items = [_catalog_item(row, locale) for row in rows]
+    items = [_catalog_item(row, locale, amount) for row in rows]
     needle = q.strip().lower()
     if needle:
         items = [item for item in items if needle in f"{item['name']} {item['category']} {item.get('summary') or ''}".lower()]
@@ -428,6 +914,7 @@ async def product_detail(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     locale: str = Query("en", pattern="^(en|es)$"),
+    amount: float | None = Query(default=None, gt=0, le=50_000_000),
 ) -> dict:
     require_team_or_rep(user)
     row = (
@@ -452,7 +939,7 @@ async def product_detail(
     keys = [item.program_key for item in siblings]
     index = keys.index(row.program_key)
     return {
-        "item": _catalog_item(row, locale),
+        "item": _catalog_item(row, locale, amount),
         "position": index + 1,
         "total": len(keys),
         "previous_key": keys[index - 1] if index > 0 else keys[-1],
@@ -488,9 +975,34 @@ async def _find_or_create_company_contact(db: AsyncSession, user: User, payload:
             func.lower(DealerRepCompany.name) == payload.company_name.strip().lower(),
         ).order_by(DealerRepCompany.updated_at.desc()))).scalars().first()
     if company is None:
-        company = DealerRepCompany(owner_user_id=user.id, name=payload.company_name.strip(), industry=payload.industry,
-            address=payload.address, city=payload.city, state=payload.state, zip=payload.zip)
+        company = DealerRepCompany(
+            owner_user_id=user.id,
+            name=payload.company_name.strip(),
+            industry=payload.industry,
+            industry_label=payload.industry_label,
+            subindustry=payload.subindustry,
+            subindustry_label=payload.subindustry_label,
+            naics_code=payload.naics_code,
+            naics_label=payload.naics_label,
+            industry_entry_id=payload.industry_entry_id,
+            subindustry_entry_id=payload.subindustry_entry_id,
+            activity_entry_id=payload.activity_entry_id,
+            address=payload.address,
+            city=payload.city,
+            state=payload.state,
+            zip=payload.zip,
+        )
         db.add(company); await db.flush()
+    else:
+        company.industry = payload.industry or company.industry
+        company.industry_label = payload.industry_label or company.industry_label
+        company.subindustry = payload.subindustry or company.subindustry
+        company.subindustry_label = payload.subindustry_label or company.subindustry_label
+        company.naics_code = payload.naics_code or company.naics_code
+        company.naics_label = payload.naics_label or company.naics_label
+        company.industry_entry_id = payload.industry_entry_id or company.industry_entry_id
+        company.subindustry_entry_id = payload.subindustry_entry_id or company.subindustry_entry_id
+        company.activity_entry_id = payload.activity_entry_id or company.activity_entry_id
     if contact is None:
         contact = DealerRepContact(owner_user_id=user.id, company_id=company.id, full_name=payload.contact_name.strip(),
             company=company.name, email=email, phone_e164=payload.phone, source="product_finder", last_activity_at=datetime.now(timezone.utc))
@@ -505,6 +1017,7 @@ async def _find_or_create_company_contact(db: AsyncSession, user: User, payload:
 @router.post("/product-finder/sessions", status_code=status.HTTP_201_CREATED)
 async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     require_team_or_rep(user)
+    taxonomy_status = await _validate_taxonomy_selection(db, payload)
     company, contact = await _find_or_create_company_contact(db, user, payload)
     existing = (await db.execute(select(DealerProductFinderSession).where(
         DealerProductFinderSession.owner_user_id == user.id,
@@ -517,6 +1030,12 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
             "client_requested_amount": float(existing.client_requested_amount or 0), "reused": True}
     dealer = DealerBusiness(name=company.name, legal_name=company.name, email=contact.email, phone=contact.phone_e164,
         address=company.address, city=company.city, state=company.state, zip=company.zip, industry=payload.industry or "other",
+        subindustry=payload.subindustry,
+        naics_code=payload.naics_code,
+        naics_label=payload.naics_label,
+        industry_entry_id=payload.industry_entry_id,
+        subindustry_entry_id=payload.subindustry_entry_id,
+        activity_entry_id=payload.activity_entry_id,
         entity_type="unknown", funding_goal=Decimal(str(payload.requested_amount)),
         client_requested_amount=Decimal(str(payload.requested_amount)), funding_purpose="other",
         use_of_proceeds_note=payload.use_of_funds, owner_user_id=user.id, case_ref=await _next_case_ref(db),
@@ -524,7 +1043,20 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
     db.add(dealer); await db.flush()
     contact.dealer_id = contact.dealer_id or dealer.id
     db.add(DealerApplicationContact(dealer_id=dealer.id, contact_id=contact.id, relationship="prospect", is_primary=True))
-    answers = {"requested_amount": payload.requested_amount, "use_of_funds": payload.use_of_funds, "industry": payload.industry}
+    answers = {
+        "requested_amount": payload.requested_amount,
+        "use_of_funds": payload.use_of_funds,
+        "industry": payload.industry,
+        "industry_label": payload.industry_label,
+        "subindustry": payload.subindustry,
+        "subindustry_label": payload.subindustry_label,
+        "naics_code": payload.naics_code,
+        "naics_label": payload.naics_label,
+        "industry_entry_id": str(payload.industry_entry_id) if payload.industry_entry_id else None,
+        "subindustry_entry_id": str(payload.subindustry_entry_id) if payload.subindustry_entry_id else None,
+        "activity_entry_id": str(payload.activity_entry_id) if payload.activity_entry_id else None,
+        "taxonomy_status": taxonomy_status,
+    }
     session = DealerProductFinderSession(owner_user_id=user.id, company_id=company.id, contact_id=contact.id,
         dealer_id=dealer.id, locale=payload.locale, answers=answers, client_requested_amount=Decimal(str(payload.requested_amount)))
     db.add(session); await db.commit(); await db.refresh(session)
@@ -542,9 +1074,31 @@ async def _load_session(db: AsyncSession, user: User, session_id: UUID) -> Deale
 @router.post("/product-finder/sessions/{session_id}/screen")
 async def screen_session(session_id: UUID, payload: FinderAnswersIn, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     session = await _load_session(db, user, session_id)
-    answers = {**(session.answers or {}), **payload.answers}
+    answers = await _canonicalize_session_taxonomy(
+        db, {**(session.answers or {}), **payload.answers}
+    )
     result = screen_products(answers, session.locale)
     session.answers = answers; session.current_result = result
+    company = await db.get(DealerRepCompany, session.company_id)
+    dealer = await db.get(DealerBusiness, session.dealer_id)
+    if company is not None:
+        company.industry = str(answers.get("industry") or company.industry or "") or None
+        company.industry_label = str(answers.get("industry_label") or company.industry_label or "") or None
+        company.subindustry = str(answers.get("subindustry") or company.subindustry or "") or None
+        company.subindustry_label = str(answers.get("subindustry_label") or company.subindustry_label or "") or None
+        company.naics_code = str(answers.get("naics_code") or company.naics_code or "") or None
+        company.naics_label = str(answers.get("naics_label") or company.naics_label or "") or None
+        company.industry_entry_id = UUID(str(answers["industry_entry_id"])) if answers.get("industry_entry_id") else None
+        company.subindustry_entry_id = UUID(str(answers["subindustry_entry_id"])) if answers.get("subindustry_entry_id") else None
+        company.activity_entry_id = UUID(str(answers["activity_entry_id"])) if answers.get("activity_entry_id") else None
+    if dealer is not None:
+        dealer.industry = str(answers.get("industry") or dealer.industry or "other")[:48]
+        dealer.subindustry = str(answers.get("subindustry") or dealer.subindustry or "") or None
+        dealer.naics_code = str(answers.get("naics_code") or dealer.naics_code or "") or None
+        dealer.naics_label = str(answers.get("naics_label") or dealer.naics_label or "") or None
+        dealer.industry_entry_id = UUID(str(answers["industry_entry_id"])) if answers.get("industry_entry_id") else None
+        dealer.subindustry_entry_id = UUID(str(answers["subindustry_entry_id"])) if answers.get("subindustry_entry_id") else None
+        dealer.activity_entry_id = UUID(str(answers["activity_entry_id"])) if answers.get("activity_entry_id") else None
     session.recommended_amount = Decimal(str(result["recommended_amount"])) if result.get("recommended_amount") else None
     db.add(DealerProductScreeningSnapshot(session_id=session.id, source="self_reported", inputs=answers, result=result, created_by_user_id=user.id))
     await db.commit()
@@ -602,7 +1156,7 @@ async def list_companies(user: CurrentUser, db: AsyncSession = Depends(get_db), 
         filters.append(or_(func.lower(DealerRepCompany.name).like(like), func.lower(func.coalesce(DealerRepCompany.address, "")).like(like), func.lower(func.coalesce(DealerRepCompany.city, "")).like(like)))
     total = int((await db.execute(select(func.count()).select_from(DealerRepCompany).where(*filters))).scalar_one())
     rows = (await db.execute(select(DealerRepCompany).where(*filters).order_by(DealerRepCompany.updated_at.desc()).limit(limit).offset(offset))).scalars().all()
-    return {"items": [{"id": str(row.id), "name": row.name, "industry": row.industry, "address": row.address, "city": row.city, "state": row.state, "status": row.status, "updated_at": row.updated_at} for row in rows], "total": total, "limit": limit, "offset": offset}
+    return {"items": [{"id": str(row.id), "name": row.name, "industry": row.industry, "industry_label": row.industry_label, "subindustry": row.subindustry, "subindustry_label": row.subindustry_label, "naics_code": row.naics_code, "naics_label": row.naics_label, "address": row.address, "city": row.city, "state": row.state, "status": row.status, "updated_at": row.updated_at} for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/companies/{company_id}")
@@ -718,7 +1272,14 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
     ).order_by(DealerProductCatalog.sort_order))).scalars().all())
     if not catalog_rows:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one active program")
-    pdf = await run_in_threadpool(_render_catalog_pdf, catalog_rows, payload.locale)
+    illustration_amount = None
+    if payload.session_id:
+        finder = await db.get(DealerProductFinderSession, payload.session_id)
+        if finder is not None and finder.owner_user_id == user.id:
+            illustration_amount = float(finder.client_requested_amount or 0) or None
+    pdf = await run_in_threadpool(
+        _render_catalog_pdf, catalog_rows, payload.locale, illustration_amount
+    )
     thread = None
     delivery = "presented"
     provider_detail = ""
@@ -804,6 +1365,11 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
                 if sms_result is not None
                 else provider_detail[:160] or None
             ),
+            provider_error=(
+                sms_result.detail
+                if sms_result is not None and not sms_result.ok
+                else None
+            ),
             sender=sms_result.sender if sms_result is not None else user.email,
             recipient=contact.email if payload.channel == "email" else contact.phone_e164,
             read_at=datetime.now(timezone.utc),
@@ -850,11 +1416,17 @@ async def public_product_presentation(
 
 
 @router.get("/products/pdf")
-async def products_pdf(user: CurrentUser, db: AsyncSession = Depends(get_db), keys: str = Query(...), locale: str = Query("en", pattern="^(en|es)$")):
+async def products_pdf(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    keys: str = Query(...),
+    locale: str = Query("en", pattern="^(en|es)$"),
+    amount: float | None = Query(default=None, gt=0, le=50_000_000),
+):
     require_team_or_rep(user); wanted = [key for key in keys.split(",") if key][:12]
     rows = (await db.execute(select(DealerProductCatalog).where(DealerProductCatalog.program_key.in_(wanted), DealerProductCatalog.active.is_(True)).order_by(DealerProductCatalog.sort_order))).scalars().all()
     try:
-        content = await run_in_threadpool(_render_catalog_pdf, list(rows), locale)
+        content = await run_in_threadpool(_render_catalog_pdf, list(rows), locale, amount)
     except Exception as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"PDF generation unavailable: {exc}") from exc
     return StreamingResponse(io.BytesIO(content), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="qc-product-catalog-{locale}.pdf"'})

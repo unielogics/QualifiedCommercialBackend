@@ -751,6 +751,11 @@ class ContactCardRead(BaseModel):
     company: str | None = None
     rep_name: str
     rep_email: str | None = None
+    rep_title: str | None = None
+    rep_phone: str | None = None
+    rep_bio: str | None = None
+    rep_locale: Literal["en", "es"] = "en"
+    headshot_url: str | None = None
     subject: str
     body: str
     booking_url: str
@@ -832,6 +837,7 @@ class RepInboxMessageRead(ORM):
     body: str
     provider: str | None = None
     provider_message_id: str | None = None
+    provider_error: str | None = None
     delivery_status: str
     sender: str | None = None
     recipient: str | None = None

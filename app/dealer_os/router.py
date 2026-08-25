@@ -74,6 +74,7 @@ from .models import (
     DealerRepContact,
     DealerRepContactAssignment,
     DealerApplicationContact,
+    DealerFieldDeskProfile,
     DealerRepContactShare,
     DealerRepInboxMessage,
     DealerRepInboxThread,
@@ -717,6 +718,19 @@ async def dealer_integration_status(
         plaid_env = "invalid"
         plaid_env_error = str(exc)
     sms_status = consent_delivery.sms_provider_status()
+    latest_sms_failure = (
+        await db.execute(
+            select(DealerRepInboxMessage.provider_error)
+            .where(
+                DealerRepInboxMessage.channel == "sms",
+                DealerRepInboxMessage.provider == str(sms_status["provider"]),
+                DealerRepInboxMessage.delivery_status.in_(["failed", "undelivered"]),
+                DealerRepInboxMessage.provider_error.is_not(None),
+            )
+            .order_by(DealerRepInboxMessage.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     address_status = await provider_settings_status(db)
     address_provider = str(address_status["address_provider"])
     return DealerIntegrationStatus(
@@ -740,7 +754,11 @@ async def dealer_integration_status(
             "configured": bool(sms_status["configured"] and sms_status["production"]),
             "environment": str(sms_status["provider"]),
             "endpoint": f"{settings.public_api_url.rstrip('/')}/api/v1/webhooks/{'twilio/sms/inbound' if sms_status['provider'] == 'twilio' else 'aws-sms'}",
-            "detail": str(sms_status["detail"]),
+            "detail": (
+                f"{sms_status['detail']}. Latest delivery failure: {latest_sms_failure}"
+                if latest_sms_failure
+                else str(sms_status["detail"])
+            ),
         },
         address={
             "configured": bool(address_status["address_provider_ready"]),
@@ -4915,6 +4933,7 @@ async def _append_rep_inbox_message(
     subject: str | None = None,
     provider: str | None = None,
     provider_message_id: str | None = None,
+    provider_error: str | None = None,
     delivery_status: str = "stored",
     sender: str | None = None,
     recipient: str | None = None,
@@ -4931,6 +4950,7 @@ async def _append_rep_inbox_message(
         body=body,
         provider=provider,
         provider_message_id=provider_message_id,
+        provider_error=provider_error,
         delivery_status=delivery_status,
         sender=sender,
         recipient=recipient,
@@ -6220,10 +6240,26 @@ async def create_contact_share(
     ).scalar_one_or_none()
     booking_url = f"{base}/book/{booking_row.slug}" if booking_row and booking_row.slug else card_url
     application_url = f"{base}/?new=1"
+    profile = (
+        await db.execute(
+            select(DealerFieldDeskProfile).where(
+                DealerFieldDeskProfile.user_id == user.id
+            )
+        )
+    ).scalar_one_or_none()
+    profile_snapshot = {
+        "display_name": (profile.display_name if profile else None) or user.name,
+        "title": profile.title if profile else None,
+        "phone": profile.phone if profile else None,
+        "display_email": (profile.display_email if profile else None) or user.email,
+        "short_bio": profile.short_bio if profile else None,
+        "preferred_locale": (profile.preferred_locale if profile else None) or "en",
+        "headshot_s3_key": profile.headshot_s3_key if profile else None,
+    }
     copy = rep_workflows.build_contact_share_copy(
-        rep_name=user.name or "Qualified Commercial",
-        rep_email=user.email,
-        rep_phone=None,
+        rep_name=profile_snapshot["display_name"] or "Qualified Commercial",
+        rep_email=profile_snapshot["display_email"] or user.email,
+        rep_phone=profile_snapshot["phone"],
         recipient_name=payload.recipient_name,
         card_url=card_url,
         booking_url=booking_url,
@@ -6243,13 +6279,19 @@ async def create_contact_share(
         body=copy.email_body,
         email_status="not_requested",
         sms_status="not_requested",
-        provider_refs={"program_pdf_keys": [pdf.key for pdf in selected_pdfs]},
+        provider_refs={
+            "program_pdf_keys": [pdf.key for pdf in selected_pdfs],
+            "profile_snapshot": profile_snapshot,
+        },
         created_by_user_id=user.id,
     )
     db.add(share)
     await db.flush()
 
-    refs: dict[str, object] = {"program_pdf_keys": [pdf.key for pdf in selected_pdfs]}
+    refs: dict[str, object] = {
+        "program_pdf_keys": [pdf.key for pdf in selected_pdfs],
+        "profile_snapshot": profile_snapshot,
+    }
     if payload.channel in {"email", "email_sms"}:
         if email:
             attachments = [
@@ -6337,6 +6379,7 @@ async def create_contact_share(
             body=copy.sms_body,
             provider=sms_res.provider if sms_res else str(consent_delivery.sms_provider_status()["provider"]),
             provider_message_id=refs.get("sms_message_id"),
+            provider_error=sms_res.detail if sms_res and not sms_res.ok else None,
             delivery_status=share.sms_status,
             sender=sms_res.sender if sms_res else consent_delivery.sms_sender(),
             recipient=phone,
@@ -6393,6 +6436,35 @@ async def read_contact_card(
         ).scalar_one_or_none()
     booking_url = f"{base}/book/{booking_row.slug}" if booking_row and booking_row.slug else f"{base}/?new=1"
     refs = share.provider_refs or {}
+    profile = None
+    if share.owner_user_id:
+        profile = (
+            await db.execute(
+                select(DealerFieldDeskProfile).where(
+                    DealerFieldDeskProfile.user_id == share.owner_user_id
+                )
+            )
+        ).scalar_one_or_none()
+    if profile is not None and not profile.card_visible:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact card not found.")
+    snapshot = refs.get("profile_snapshot") if isinstance(refs, dict) else None
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    use_profile = profile is not None
+    rep_name = (
+        profile.display_name if use_profile else snapshot.get("display_name")
+    ) or (rep.name if rep else None) or "Qualified Commercial"
+    rep_email = (
+        profile.display_email if use_profile else snapshot.get("display_email")
+    ) or (rep.email if rep else None)
+    rep_title = profile.title if use_profile else snapshot.get("title")
+    rep_phone = profile.phone if use_profile else snapshot.get("phone")
+    rep_bio = profile.short_bio if use_profile else snapshot.get("short_bio")
+    rep_locale = (
+        profile.preferred_locale if use_profile else snapshot.get("preferred_locale")
+    ) or "en"
+    headshot_key = (
+        profile.headshot_s3_key if use_profile else snapshot.get("headshot_s3_key")
+    )
     pdf_keys = refs.get("program_pdf_keys") if isinstance(refs, dict) else None
     program_pdfs: list[ContactCardProgramPdfRead] = []
     if isinstance(pdf_keys, list):
@@ -6420,8 +6492,17 @@ async def read_contact_card(
     return ContactCardRead(
         recipient_name=share.recipient_name,
         company=contact.company if contact else None,
-        rep_name=(rep.name if rep else None) or "Qualified Commercial",
-        rep_email=rep.email if rep else None,
+        rep_name=rep_name,
+        rep_email=rep_email,
+        rep_title=rep_title,
+        rep_phone=rep_phone,
+        rep_bio=rep_bio,
+        rep_locale="es" if rep_locale == "es" else "en",
+        headshot_url=storage.presign_get(
+            str(headshot_key), content_type="image/jpeg"
+        )
+        if headshot_key
+        else None,
         subject=share.subject,
         body=share.body,
         booking_url=booking_url,
@@ -6704,6 +6785,7 @@ async def create_rep_inbox_message(
     delivery_status = "stored"
     provider = None
     provider_id = None
+    provider_error = None
     recipient = None
     sender = user.email
     if channel == "email":
@@ -6719,6 +6801,7 @@ async def create_rep_inbox_message(
         provider = "ses"
         provider_id = res.message_id
         delivery_status = "sent" if res.ok else "failed"
+        provider_error = None if res.ok else res.detail
     else:
         recipient = contact.phone_e164 if contact else None
         if not recipient:
@@ -6732,6 +6815,7 @@ async def create_rep_inbox_message(
         provider = res.provider
         provider_id = res.provider_message_id if res.ok else None
         delivery_status = "sent" if res.ok else "failed"
+        provider_error = None if res.ok else res.detail
         sender = res.sender
     msg = await _append_rep_inbox_message(
         db,
@@ -6743,6 +6827,7 @@ async def create_rep_inbox_message(
         body=payload.body,
         provider=provider,
         provider_message_id=provider_id,
+        provider_error=provider_error,
         delivery_status=delivery_status,
         sender=sender,
         recipient=recipient,

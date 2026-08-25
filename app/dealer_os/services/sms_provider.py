@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -118,6 +119,36 @@ def _safe_failure(provider: str, exc: Exception) -> SmsSendResult:
     )
 
 
+def _safe_twilio_failure(exc: Exception) -> SmsSendResult:
+    """Retain a carrier-safe Twilio code without leaking phone numbers."""
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    code: str | None = None
+    message: str | None = None
+    if response is not None:
+        try:
+            payload = response.json()
+            code = str(payload.get("code")) if payload.get("code") is not None else None
+            message = str(payload.get("message") or "").strip() or None
+        except Exception:  # noqa: BLE001
+            pass
+    if message:
+        message = re.sub(r"\+\d{8,15}", "[phone number]", message)[:320]
+    category = code or (f"http_{status_code}" if status_code else type(exc).__name__)
+    log.warning("twilio SMS send failed category=%s", category)
+    detail = f"Twilio rejected the message ({category})"
+    if message:
+        detail = f"{detail}: {message}"
+    return SmsSendResult(
+        ok=False,
+        provider="twilio",
+        detail=detail[:500],
+        sender=provider_sender(),
+        status="failed",
+    )
+
+
 def _send_aws(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
     try:
         import boto3
@@ -173,7 +204,7 @@ def _send_twilio(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
             status=str(data.get("status") or "accepted"),
         )
     except Exception as exc:  # noqa: BLE001
-        return _safe_failure("twilio", exc)
+        return _safe_twilio_failure(exc)
 
 
 def send_sms(to_phone: str, body: str) -> SmsSendResult:

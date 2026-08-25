@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class CompanyContactIn(BaseModel):
@@ -13,6 +13,14 @@ class CompanyContactIn(BaseModel):
     email: str | None = Field(default=None, max_length=320)
     phone: str | None = Field(default=None, max_length=32)
     industry: str | None = Field(default=None, max_length=80)
+    industry_label: str | None = Field(default=None, max_length=180)
+    subindustry: str | None = Field(default=None, max_length=120)
+    subindustry_label: str | None = Field(default=None, max_length=180)
+    naics_code: str | None = Field(default=None, max_length=8)
+    naics_label: str | None = Field(default=None, max_length=180)
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
     address: str | None = Field(default=None, max_length=240)
     city: str | None = Field(default=None, max_length=120)
     state: str | None = Field(default=None, max_length=8)
@@ -62,3 +70,26 @@ class ProductPresentationIn(BaseModel):
     channel: Literal["in_person", "email", "sms"] = "in_person"
     subject: str | None = Field(default=None, max_length=200)
     message: str | None = Field(default=None, max_length=4000)
+
+
+class FieldDeskProfileUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=160)
+    title: str | None = Field(default=None, max_length=120)
+    phone: str | None = Field(default=None, max_length=32)
+    display_email: EmailStr | None = None
+    short_bio: str | None = Field(default=None, max_length=1000)
+    preferred_locale: Literal["en", "es"] | None = None
+    card_visible: bool | None = None
+    headshot_s3_key: str | None = Field(default=None, max_length=720)
+
+    @field_validator("display_name", "title", "phone", "short_bio", "headshot_s3_key")
+    @classmethod
+    def trim_optional(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
+class FieldDeskHeadshotUploadInit(BaseModel):
+    filename: str = Field(min_length=1, max_length=180)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"]
