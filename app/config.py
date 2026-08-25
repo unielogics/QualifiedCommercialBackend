@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     stripe_publishable_key: str = ""
     stripe_webhook_secret: str = ""
     primary_super_admin_email: str = "franco@qualifiedcommercial.com"
+    primary_super_admin_emails: str = ""
 
     # RentCast
     rentcast_api_key: str = ""

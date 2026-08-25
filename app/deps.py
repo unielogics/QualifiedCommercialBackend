@@ -190,6 +190,94 @@ def _profile_from_clerk(payload: dict, clerk_user: dict | None, clerk_id: str) -
     return email, name
 
 
+def _configured_primary_super_admin_emails() -> set[str]:
+    settings = get_settings()
+    raw = ",".join(
+        value
+        for value in (
+            settings.primary_super_admin_email,
+            settings.primary_super_admin_emails,
+        )
+        if value
+    )
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _is_primary_super_admin_email(email: str | None) -> bool:
+    return bool(email and email.strip().lower() in _configured_primary_super_admin_emails())
+
+
+async def _recover_primary_super_admin_user(
+    db: AsyncSession,
+    *,
+    clerk_id: str,
+    email: str | None,
+    name: str | None,
+    with_client,
+    with_broker,
+) -> User | None:
+    """Bind or restore the configured owner account without widening access.
+
+    JIT auth still defaults unknown sign-ins to CLIENT. This recovery path only
+    applies to exact emails configured as primary super admins, so a normal user
+    cannot obtain broader access through Clerk re-creation or a stale role row.
+    """
+    normalized = (email or "").strip().lower()
+    if normalized not in _configured_primary_super_admin_emails():
+        return None
+
+    user = (
+        await db.execute(
+            select(User)
+            .options(with_client, with_broker)
+            .where(func.lower(User.email) == normalized)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if user is None:
+        user = User(
+            clerk_id=clerk_id,
+            email=normalized,
+            name=name or normalized.split("@")[0],
+            role=Role.SUPER_ADMIN,
+        )
+        db.add(user)
+        await db.flush()
+        log.warning(
+            "Provisioned configured primary super admin email=%s clerk_id=%s",
+            normalized,
+            clerk_id,
+        )
+    else:
+        changed = False
+        if user.clerk_id != clerk_id:
+            user.clerk_id = clerk_id
+            changed = True
+        if user.role != Role.SUPER_ADMIN:
+            user.role = Role.SUPER_ADMIN
+            changed = True
+        if user.deleted_at is not None:
+            user.deleted_at = None
+            changed = True
+        if name and (not user.name or _looks_like_email_fallback_name(user.name, user.email)):
+            user.name = name
+            changed = True
+        if changed:
+            await db.flush()
+            log.warning(
+                "Recovered configured primary super admin email=%s clerk_id=%s",
+                normalized,
+                clerk_id,
+            )
+
+    return (
+        await db.execute(
+            select(User).options(with_client, with_broker).where(User.id == user.id)
+        )
+    ).scalar_one()
+
+
 async def get_current_user(
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
@@ -240,6 +328,17 @@ async def get_current_user(
             select(User).options(_with_client, _with_broker).where(User.clerk_id == clerk_id)
         )
     ).scalar_one_or_none()
+    if user is not None and _is_primary_super_admin_email(user.email) and (
+        user.role != Role.SUPER_ADMIN or user.deleted_at is not None
+    ):
+        user = await _recover_primary_super_admin_user(
+            db,
+            clerk_id=clerk_id,
+            email=user.email,
+            name=user.name,
+            with_client=_with_client,
+            with_broker=_with_broker,
+        )
     if user is None:
         # Auto-provision on first sign-in. Default Clerk JWTs only carry the
         # `sub` claim, so we hit Clerk's REST API to pull the real email +
@@ -247,6 +346,22 @@ async def get_current_user(
         # the dashboard can't personalize.
         clerk_user = await _fetch_clerk_user(clerk_id)
         email, name = _profile_from_clerk(payload, clerk_user, clerk_id)
+        recovered_user = await _recover_primary_super_admin_user(
+            db,
+            clerk_id=clerk_id,
+            email=email,
+            name=name,
+            with_client=_with_client,
+            with_broker=_with_broker,
+        )
+        if recovered_user is not None:
+            from datetime import timedelta as _td
+
+            now_dt = datetime.now(timezone.utc)
+            if recovered_user.last_seen_at is None or (now_dt - recovered_user.last_seen_at) >= _td(seconds=60):
+                recovered_user.last_seen_at = now_dt
+                await db.flush()
+            return recovered_user
         # If a row was pre-created by a team invite (has email + role but no
         # clerk_id yet), bind it instead of creating a duplicate.
         # Case-insensitive match: invited rows (e.g. vendor bucket access) are
