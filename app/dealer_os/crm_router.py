@@ -753,8 +753,10 @@ def _apply_field_desk_profile_update(
 ) -> None:
     changes = payload.model_dump(exclude_unset=True)
     headshot_key = changes.get("headshot_s3_key")
-    if headshot_key and not str(headshot_key).startswith(
-        f"dealer-os/profiles/{owner_id}/"
+    if (
+        headshot_key
+        and headshot_key != profile.headshot_s3_key
+        and not str(headshot_key).startswith(f"dealer-os/profiles/{owner_id}/")
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -762,6 +764,30 @@ def _apply_field_desk_profile_update(
         )
     for field, value in changes.items():
         setattr(profile, field, str(value) if field == "display_email" and value else value)
+
+
+def _field_desk_headshot_upload_contract(
+    payload: FieldDeskHeadshotUploadInit,
+    *,
+    owner_id: UUID,
+) -> dict:
+    extension = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }[payload.content_type]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", payload.filename).strip(".-")
+    stem = stem[:80] or "headshot"
+    if not stem.lower().endswith(extension):
+        stem = f"{stem}{extension}"
+    key = f"dealer-os/profiles/{owner_id}/{uuid.uuid4()}-{stem}"
+    upload = storage.presign_put(key, content_type=payload.content_type)
+    if upload is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Secure headshot storage is not configured.",
+        )
+    return upload
 
 
 @router.get("/me/profile")
@@ -797,23 +823,7 @@ async def field_desk_headshot_upload_init(
     user: CurrentUser,
 ) -> dict:
     require_team_or_rep(user)
-    extension = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-    }[payload.content_type]
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", payload.filename).strip(".-")
-    stem = stem[:80] or "headshot"
-    if not stem.lower().endswith(extension):
-        stem = f"{stem}{extension}"
-    key = f"dealer-os/profiles/{user.id}/{uuid.uuid4()}-{stem}"
-    upload = storage.presign_put(key, content_type=payload.content_type)
-    if upload is None:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Secure headshot storage is not configured.",
-        )
-    return upload
+    return _field_desk_headshot_upload_contract(payload, owner_id=user.id)
 
 
 @router.get("/admin/rep-profiles")
@@ -863,6 +873,24 @@ async def update_field_desk_profile_as_admin(
     await db.commit()
     await db.refresh(profile)
     return await _field_desk_profile_read(db, owner, profile)
+
+
+@router.post("/admin/rep-profiles/{owner_id}/headshot/upload-init")
+async def field_desk_headshot_upload_init_as_admin(
+    owner_id: UUID,
+    payload: FieldDeskHeadshotUploadInit,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    require_super_admin(user)
+    owner = await db.get(User, owner_id)
+    if owner is None or owner.deleted_at is not None or owner.role not in {
+        Role.FIELD_REP,
+        Role.LOAN_EXEC,
+        Role.SUPER_ADMIN,
+    }:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Field Desk user not found")
+    return _field_desk_headshot_upload_contract(payload, owner_id=owner.id)
 
 
 @router.get("/products")

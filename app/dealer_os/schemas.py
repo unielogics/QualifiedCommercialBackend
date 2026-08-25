@@ -758,8 +758,10 @@ class ContactCardRead(BaseModel):
     headshot_url: str | None = None
     subject: str
     body: str
+    message: str
     booking_url: str
     application_url: str
+    vcard_url: str
     program_pdfs: list[ContactCardProgramPdfRead] = Field(default_factory=list)
 
 

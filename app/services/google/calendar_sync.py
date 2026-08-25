@@ -21,6 +21,7 @@ best-effort: callers wrap it so a Google outage never breaks the local write.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -38,6 +39,14 @@ from app.services.google.google_oauth_client import CALENDAR_SCOPES
 log = logging.getLogger(__name__)
 
 _GOOGLE_PULL_KIND = "google_pull"
+
+
+def _google_pull_external_ref(user_id: uuid.UUID, google_event_id: str) -> str:
+    """Fit globally unique per-user Google IDs into CalendarEvent's 64 chars."""
+    digest = hashlib.sha256(google_event_id.encode("utf-8")).hexdigest()[:31]
+    return f"{user_id.hex}:{digest}"
+
+
 _DEFAULT_DURATION_MIN = 30
 
 
@@ -421,11 +430,10 @@ async def _apply_pulled_event(db: AsyncSession, user_id: uuid.UUID, item: dict) 
         status=CalendarEventStatus.PENDING,
         source=CalendarEventSource.MANUAL,
         owner_user_id=user_id,
-        # Per-user external_ref_id: the (kind, id) partial-unique index is global,
-        # so a shared Google event id must be namespaced by user to avoid a
-        # cross-user IntegrityError.
+        # Google recurrence IDs can be very long and often share their first
+        # characters. Truncating the raw value causes unique-key collisions.
         external_ref_kind=_GOOGLE_PULL_KIND,
-        external_ref_id=f"{user_id}:{gid}"[:64],
+        external_ref_id=_google_pull_external_ref(user_id, gid),
         google_event_id=gid,
         google_calendar_id="primary",
         google_etag=etag,

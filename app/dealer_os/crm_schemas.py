@@ -82,6 +82,13 @@ class FieldDeskProfileUpdate(BaseModel):
     card_visible: bool | None = None
     headshot_s3_key: str | None = Field(default=None, max_length=720)
 
+    @field_validator("display_email", mode="before")
+    @classmethod
+    def blank_email_is_unset(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("display_name", "title", "phone", "short_bio", "headshot_s3_key")
     @classmethod
     def trim_optional(cls, value: str | None) -> str | None:

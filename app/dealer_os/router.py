@@ -6282,6 +6282,7 @@ async def create_contact_share(
         provider_refs={
             "program_pdf_keys": [pdf.key for pdf in selected_pdfs],
             "profile_snapshot": profile_snapshot,
+            "personal_note": payload.notes.strip() if payload.notes else None,
         },
         created_by_user_id=user.id,
     )
@@ -6291,6 +6292,7 @@ async def create_contact_share(
     refs: dict[str, object] = {
         "program_pdf_keys": [pdf.key for pdf in selected_pdfs],
         "profile_snapshot": profile_snapshot,
+        "personal_note": payload.notes.strip() if payload.notes else None,
     }
     if payload.channel in {"email", "email_sms"}:
         if email:
@@ -6505,9 +6507,126 @@ async def read_contact_card(
         else None,
         subject=share.subject,
         body=share.body,
+        message=_contact_card_message(share.body, refs),
         booking_url=booking_url,
         application_url=f"{base}/?new=1",
+        vcard_url=str(request.url_for("read_contact_card_vcard", token=token)),
         program_pdfs=program_pdfs,
+    )
+
+
+def _contact_card_message(body: str, refs: dict) -> str:
+    personal_note = refs.get("personal_note") if isinstance(refs, dict) else None
+    if isinstance(personal_note, str) and personal_note.strip():
+        return personal_note.strip()
+    lines = [line.strip() for line in (body or "").splitlines()]
+    excluded_prefixes = (
+        "Contact card:",
+        "Book a time:",
+        "Open an application:",
+        "Email:",
+        "Phone:",
+    )
+    meaningful = [
+        line
+        for line in lines
+        if line
+        and not line.startswith(excluded_prefixes)
+        and line != "Qualified Commercial"
+        and not line.startswith("You can keep my contact card")
+    ]
+    if meaningful and meaningful[0].lower().startswith("hi "):
+        meaningful = meaningful[1:]
+    return "\n\n".join(meaningful).strip()
+
+
+def _vcard_escape(value: str | None) -> str:
+    return (
+        (value or "")
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+@router.get("/contact-shares/card/{token}/vcard", name="read_contact_card_vcard")
+async def read_contact_card_vcard(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    share_row = (
+        await db.execute(
+            select(DealerRepContactShare, User)
+            .outerjoin(User, User.id == DealerRepContactShare.owner_user_id)
+            .where(DealerRepContactShare.card_token == token)
+        )
+    ).first()
+    if share_row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact card not found.")
+    share, rep = share_row
+    profile = None
+    if share.owner_user_id:
+        profile = (
+            await db.execute(
+                select(DealerFieldDeskProfile).where(
+                    DealerFieldDeskProfile.user_id == share.owner_user_id
+                )
+            )
+        ).scalar_one_or_none()
+    if profile is not None and not profile.card_visible:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact card not found.")
+    refs = share.provider_refs or {}
+    snapshot = refs.get("profile_snapshot") if isinstance(refs, dict) else None
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    use_profile = profile is not None
+    name = (
+        (profile.display_name if use_profile else snapshot.get("display_name"))
+        or (rep.name if rep else None)
+        or "Qualified Commercial"
+    )
+    email = (
+        (profile.display_email if use_profile else snapshot.get("display_email"))
+        or (rep.email if rep else None)
+    )
+    phone = profile.phone if use_profile else snapshot.get("phone")
+    title = profile.title if use_profile else snapshot.get("title")
+    base = get_settings().rep_app_url.rstrip("/")
+    booking = None
+    if share.owner_user_id:
+        booking = (
+            await db.execute(
+                select(BookingSettings).where(
+                    BookingSettings.user_id == share.owner_user_id,
+                    BookingSettings.enabled.is_(True),
+                    BookingSettings.slug.is_not(None),
+                )
+            )
+        ).scalar_one_or_none()
+    name_parts = str(name).split(None, 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+    lines = [
+        "BEGIN:VCARD",
+        "VERSION:3.0",
+        f"N:{_vcard_escape(last_name)};{_vcard_escape(first_name)};;;",
+        f"FN:{_vcard_escape(str(name))}",
+        "ORG:Qualified Commercial LLC",
+    ]
+    if title:
+        lines.append(f"TITLE:{_vcard_escape(str(title))}")
+    if email:
+        lines.append(f"EMAIL;TYPE=INTERNET,WORK:{_vcard_escape(str(email))}")
+    if phone:
+        lines.append(f"TEL;TYPE=CELL,VOICE:{_vcard_escape(str(phone))}")
+    if booking and booking.slug:
+        lines.append(f"URL;TYPE=WORK:{_vcard_escape(f'{base}/book/{booking.slug}')}")
+    lines.extend([f"URL:{_vcard_escape(f'{base}/card/{token}')}", "END:VCARD", ""])
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name)).strip("-") or "qualified-commercial-contact"
+    return StreamingResponse(
+        io.BytesIO("\r\n".join(lines).encode("utf-8")),
+        media_type="text/vcard; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}.vcf"'},
     )
 
 
