@@ -1260,7 +1260,10 @@ async def contact_detail(contact_id: UUID, user: CurrentUser, db: AsyncSession =
     applications = (await db.execute(select(DealerBusiness).join(DealerApplicationContact, DealerApplicationContact.dealer_id == DealerBusiness.id).where(DealerApplicationContact.contact_id == contact.id).order_by(DealerBusiness.updated_at.desc()))).scalars().all()
     sessions = (await db.execute(select(DealerProductFinderSession).where(DealerProductFinderSession.contact_id == contact.id).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().all()
     presentations = (await db.execute(select(DealerProductPresentation).where(DealerProductPresentation.contact_id == contact.id).order_by(DealerProductPresentation.created_at.desc()))).scalars().all()
-    threads = (await db.execute(select(DealerRepInboxThread).where(DealerRepInboxThread.contact_id == contact.id).order_by(DealerRepInboxThread.updated_at.desc()))).scalars().all()
+    threads = (await db.execute(select(DealerRepInboxThread).where(
+        DealerRepInboxThread.contact_id == contact.id,
+        DealerRepInboxThread.owner_user_id == user.id,
+    ).order_by(DealerRepInboxThread.updated_at.desc()))).scalars().all()
     return {"id": str(contact.id), "name": contact.full_name, "company": contact.company, "email": contact.email, "phone": contact.phone_e164,
         "applications": [{"id": str(row.id), "name": row.name, "case_ref": row.case_ref, "lifecycle": row.application_lifecycle, "status": row.status, "funding_goal": float(row.funding_goal or 0), "updated_at": row.updated_at} for row in applications],
         "sessions": [{"id": str(row.id), "status": row.status, "result": row.current_result, "updated_at": row.updated_at} for row in sessions],
@@ -1372,11 +1375,16 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Affirmative transactional SMS consent is required before texting",
             )
-        filters = [DealerRepInboxThread.contact_id == contact.id, DealerRepInboxThread.channel == payload.channel, DealerRepInboxThread.status == "open"]
+        filters = [
+            DealerRepInboxThread.owner_user_id == user.id,
+            DealerRepInboxThread.contact_id == contact.id,
+            DealerRepInboxThread.channel == payload.channel,
+            DealerRepInboxThread.status == "open",
+        ]
         if payload.channel == "email": filters.append(DealerRepInboxThread.subject_key == _normalize_subject(subject))
         thread = (await db.execute(select(DealerRepInboxThread).where(*filters).order_by(DealerRepInboxThread.updated_at.desc()))).scalars().first()
         if thread is None:
-            thread = DealerRepInboxThread(owner_user_id=contact.owner_user_id, contact_id=contact.id, dealer_id=contact.dealer_id, subject=subject, subject_key=_normalize_subject(subject) if payload.channel == "email" else None, channel=payload.channel, source="product_presentation", last_message_at=datetime.now(timezone.utc)); db.add(thread); await db.flush()
+            thread = DealerRepInboxThread(owner_user_id=user.id, contact_id=contact.id, dealer_id=contact.dealer_id, subject=subject, subject_key=_normalize_subject(subject) if payload.channel == "email" else None, channel=payload.channel, source="product_presentation", last_message_at=datetime.now(timezone.utc)); db.add(thread); await db.flush()
         body = payload.message or ("Attached are the funding options we discussed." if payload.locale == "en" else "Adjuntamos las opciones de financiamiento que conversamos.")
         if payload.channel == "email":
             result = await run_in_threadpool(

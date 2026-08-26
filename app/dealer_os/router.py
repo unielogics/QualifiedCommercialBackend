@@ -72,7 +72,6 @@ from .models import (
     DealerAIMessage,
     DealerRepAppointment,
     DealerRepContact,
-    DealerRepContactAssignment,
     DealerApplicationContact,
     DealerFieldDeskProfile,
     DealerRepContactShare,
@@ -5108,6 +5107,11 @@ def _thread_read(thread: DealerRepInboxThread, contact: DealerRepContact | None)
     )
 
 
+def _rep_inbox_access_filter(user: User):
+    """Keep the Field Desk Inbox personal for every staff role."""
+    return DealerRepInboxThread.owner_user_id == user.id
+
+
 async def _mirror_file_message_to_rep_inbox(
     db: AsyncSession,
     *,
@@ -7469,21 +7473,10 @@ async def list_rep_inbox_threads(
     channel: str | None = None,
 ) -> list[RepInboxThreadRead]:
     require_team_or_rep(user)
-    access_filter = (
-        or_(
-            DealerRepInboxThread.owner_user_id == user.id,
-            exists(select(DealerRepContactAssignment.id).where(
-                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
-                DealerRepContactAssignment.user_id == user.id,
-            )),
-        )
-        if user.role == Role.FIELD_REP
-        else True
-    )
     q = (
         select(DealerRepInboxThread, DealerRepContact)
         .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-        .where(access_filter)
+        .where(_rep_inbox_access_filter(user))
         .order_by(DealerRepInboxThread.last_message_at.desc().nullslast(), DealerRepInboxThread.created_at.desc())
     )
     if channel:
@@ -7501,20 +7494,11 @@ async def list_rep_inbox_messages(
     db: AsyncSession = Depends(get_db),
 ) -> list[DealerRepInboxMessage]:
     require_team_or_rep(user)
-    access_filter = (
-        or_(
-            DealerRepInboxThread.owner_user_id == user.id,
-            exists(select(DealerRepContactAssignment.id).where(
-                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
-                DealerRepContactAssignment.user_id == user.id,
-            )),
-        ) if user.role == Role.FIELD_REP else True
-    )
     thread = (
         await db.execute(
             select(DealerRepInboxThread).where(
                 DealerRepInboxThread.id == thread_id,
-                access_filter,
+                _rep_inbox_access_filter(user),
             )
         )
     ).scalar_one_or_none()
@@ -7550,20 +7534,11 @@ async def create_rep_inbox_message(
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepInboxMessage:
     require_team_or_rep(user)
-    access_filter = (
-        or_(
-            DealerRepInboxThread.owner_user_id == user.id,
-            exists(select(DealerRepContactAssignment.id).where(
-                DealerRepContactAssignment.contact_id == DealerRepInboxThread.contact_id,
-                DealerRepContactAssignment.user_id == user.id,
-            )),
-        ) if user.role == Role.FIELD_REP else True
-    )
     row = (
         await db.execute(
             select(DealerRepInboxThread, DealerRepContact)
             .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-            .where(DealerRepInboxThread.id == thread_id, access_filter)
+            .where(DealerRepInboxThread.id == thread_id, _rep_inbox_access_filter(user))
         )
     ).first()
     if row is None:
@@ -7623,8 +7598,8 @@ async def create_rep_inbox_message(
         recipient=recipient,
     )
     if thread.dealer_id is not None:
-        # Thread access was already checked above. Assigned reps may reply to a
-        # shared contact even when they do not own the linked application.
+        # Thread ownership was checked above. The linked application remains a
+        # case activity target; it does not broaden mailbox visibility.
         dealer = await load_dealer(db, thread.dealer_id)
         db.add(
             DealerMessage(

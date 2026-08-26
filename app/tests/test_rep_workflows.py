@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from app.dealer_os.router import _rep_inbox_access_filter
 from app.dealer_os.schemas import RepInboxThreadCreate
 from app.dealer_os.services.rep_workflows import (
     SlotValidationError,
@@ -102,3 +105,12 @@ def test_inbox_compose_requires_contact_for_selected_channels() -> None:
         body="Hello",
     )
     assert payload.channels == ["email", "sms"]
+
+
+def test_field_desk_inbox_filter_is_owner_only_for_every_staff_role() -> None:
+    user_id = uuid4()
+
+    clause = _rep_inbox_access_filter(SimpleNamespace(id=user_id))
+
+    assert clause.right.value == user_id
+    assert "owner_user_id" in str(clause.left)

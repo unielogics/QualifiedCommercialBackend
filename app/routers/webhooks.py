@@ -173,12 +173,15 @@ async def _store_inbound_sms(
             await db.execute(
                 select(DealerRepInboxThread)
                 .where(
-                    DealerRepInboxThread.owner_user_id == contact.owner_user_id,
                     DealerRepInboxThread.contact_id == contact.id,
                     DealerRepInboxThread.channel == "sms",
                     DealerRepInboxThread.status == "open",
                 )
-                .order_by(DealerRepInboxThread.updated_at.desc())
+                .order_by(
+                    DealerRepInboxThread.last_message_at.desc().nullslast(),
+                    DealerRepInboxThread.updated_at.desc(),
+                )
+                .limit(1)
             )
         ).scalar_one_or_none()
         if thread is None:
