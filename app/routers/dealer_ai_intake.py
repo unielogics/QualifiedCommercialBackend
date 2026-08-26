@@ -5663,6 +5663,38 @@ def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
     )
 
 
+def _intake_search_clause(query: str):
+    raw = query.strip()
+    needle = f"%{raw.lower()}%"
+    clauses = [
+        func.lower(PublicUnderwritingIntake.full_name).like(needle),
+        func.lower(PublicUnderwritingIntake.email).like(needle),
+        func.lower(PublicUnderwritingIntake.business_name).like(needle),
+        func.lower(PublicUnderwritingIntake.phone).like(needle),
+    ]
+    digits = re.sub(r"\D+", "", raw)
+    if digits:
+        phone_digits = func.replace(
+            func.replace(
+                func.replace(
+                    func.replace(
+                        func.replace(func.coalesce(PublicUnderwritingIntake.phone, ""), " ", ""),
+                        "-",
+                        "",
+                    ),
+                    "(",
+                    "",
+                ),
+                ")",
+                "",
+            ),
+            "+",
+            "",
+        )
+        clauses.append(phone_digits.like(f"%{digits}%"))
+    return or_(*clauses)
+
+
 async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUnderwritingIntake:
     intake = (
         await db.execute(
@@ -5949,13 +5981,8 @@ async def list_dealer_ai_leads(
             stmt = stmt.where(PublicUnderwritingIntake.variant == FUNDING_VARIANT)
         else:
             stmt = stmt.where(PublicUnderwritingIntake.variant == variant_filter)
-    if q:
-        needle = f"%{q.strip().lower()}%"
-        stmt = stmt.where(
-            func.lower(PublicUnderwritingIntake.full_name).like(needle)
-            | func.lower(PublicUnderwritingIntake.email).like(needle)
-            | func.lower(PublicUnderwritingIntake.business_name).like(needle)
-        )
+    if q and q.strip():
+        stmt = stmt.where(_intake_search_clause(q))
     rows = list((await db.execute(stmt)).scalars().unique().all())
     if probability_status and probability_status != "all":
         rows = [
@@ -6887,13 +6914,8 @@ async def list_broker_dealer_leads(
     )
     if status_filter and status_filter != "all":
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
-    if q:
-        needle = f"%{q.strip().lower()}%"
-        stmt = stmt.where(
-            func.lower(PublicUnderwritingIntake.full_name).like(needle)
-            | func.lower(PublicUnderwritingIntake.email).like(needle)
-            | func.lower(PublicUnderwritingIntake.business_name).like(needle)
-        )
+    if q and q.strip():
+        stmt = stmt.where(_intake_search_clause(q))
     rows = list((await db.execute(stmt)).scalars().unique().all())
     if probability_status and probability_status != "all":
         rows = [row for row in rows if str(_lead_result(row).get("probability_status") or "") == probability_status]
