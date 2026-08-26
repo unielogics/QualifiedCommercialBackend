@@ -3192,7 +3192,7 @@ async def document_coverage(
             )
         )
     ).all()
-    for kind, detected_kind, extracted in doc_rows:
+    for kind, detected_kind, _extracted in doc_rows:
         effective = detected_kind or _KIND_TO_DETECTED.get(kind)
         if effective == "profit_and_loss":
             has_pl = True
