@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+from app.dealer_os.crm_router import _apply_taxonomy_to_record
 from app.dealer_os.services.product_finder import screen_products
 
 
@@ -52,6 +56,44 @@ def complete_answers(**overrides):
 
 def by_key(result, key):
     return next(row for row in result["evaluated_programs"] if row["program_key"] == key)
+
+
+def test_product_finder_taxonomy_transfers_into_step_one_application() -> None:
+    category_id, subcategory_id, activity_id = uuid4(), uuid4(), uuid4()
+    dealer = SimpleNamespace(
+        industry="other",
+        industry_label=None,
+        subindustry=None,
+        subindustry_label=None,
+        naics_code=None,
+        naics_label=None,
+        industry_entry_id=None,
+        subindustry_entry_id=None,
+        activity_entry_id=None,
+    )
+
+    _apply_taxonomy_to_record(
+        dealer,
+        {
+            "industry": "54",
+            "industry_label": "Professional, Scientific, and Technical Services",
+            "subindustry": "541",
+            "subindustry_label": "Professional, Scientific, and Technical Services",
+            "naics_code": "541611",
+            "naics_label": "Administrative Management and General Management Consulting Services",
+            "industry_entry_id": str(category_id),
+            "subindustry_entry_id": str(subcategory_id),
+            "activity_entry_id": str(activity_id),
+        },
+    )
+
+    assert dealer.industry_label == "Professional, Scientific, and Technical Services"
+    assert dealer.subindustry_label == "Professional, Scientific, and Technical Services"
+    assert dealer.naics_code == "541611"
+    assert dealer.naics_label.startswith("Administrative Management")
+    assert dealer.industry_entry_id == UUID(str(category_id))
+    assert dealer.subindustry_entry_id == UUID(str(subcategory_id))
+    assert dealer.activity_entry_id == UUID(str(activity_id))
 
 
 def test_direct_program_thresholds_are_inclusive():

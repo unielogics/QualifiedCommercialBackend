@@ -398,6 +398,55 @@ async def _validate_taxonomy_selection(
     return "pending" if "pending" in statuses else "official"
 
 
+_TAXONOMY_RECORD_FIELDS = (
+    "industry",
+    "industry_label",
+    "subindustry",
+    "subindustry_label",
+    "naics_code",
+    "naics_label",
+)
+_TAXONOMY_ID_FIELDS = (
+    "industry_entry_id",
+    "subindustry_entry_id",
+    "activity_entry_id",
+)
+
+
+def _apply_taxonomy_to_record(record: Any, values: dict[str, Any]) -> None:
+    """Copy one canonical taxonomy selection onto a company or application.
+
+    Product Finder stores UUIDs as strings in its JSON snapshot, while model
+    columns use UUID objects. Keeping this conversion in one helper prevents a
+    promotion path from copying only the six-digit code and dropping the
+    category/subcategory labels that Step 1 needs to hydrate its selectors.
+    """
+
+    for field in _TAXONOMY_RECORD_FIELDS:
+        value = values.get(field)
+        if value is not None:
+            setattr(record, field, str(value))
+    for field in _TAXONOMY_ID_FIELDS:
+        value = values.get(field)
+        if value is not None:
+            setattr(record, field, value if isinstance(value, UUID) else UUID(str(value)))
+
+
+def _finder_taxonomy_values(payload: CompanyContactIn, taxonomy_status: str) -> dict[str, Any]:
+    return {
+        "industry": payload.industry,
+        "industry_label": payload.industry_label,
+        "subindustry": payload.subindustry,
+        "subindustry_label": payload.subindustry_label,
+        "naics_code": payload.naics_code,
+        "naics_label": payload.naics_label,
+        "industry_entry_id": str(payload.industry_entry_id) if payload.industry_entry_id else None,
+        "subindustry_entry_id": str(payload.subindustry_entry_id) if payload.subindustry_entry_id else None,
+        "activity_entry_id": str(payload.activity_entry_id) if payload.activity_entry_id else None,
+        "taxonomy_status": taxonomy_status,
+    }
+
+
 def _finder_taxonomy_read(row: ApplicationTaxonomyEntry) -> TaxonomyEntryRead:
     return TaxonomyEntryRead(
         id=row.id,
@@ -1048,18 +1097,37 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
     require_team_or_rep(user)
     taxonomy_status = await _validate_taxonomy_selection(db, payload)
     company, contact = await _find_or_create_company_contact(db, user, payload)
+    taxonomy_answers = _finder_taxonomy_values(payload, taxonomy_status)
     existing = (await db.execute(select(DealerProductFinderSession).where(
         DealerProductFinderSession.owner_user_id == user.id,
         DealerProductFinderSession.contact_id == contact.id,
         DealerProductFinderSession.status.in_(["screening", "draft"]),
     ).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().first()
     if existing:
+        existing.answers = {
+            **(existing.answers or {}),
+            "requested_amount": payload.requested_amount,
+            "use_of_funds": payload.use_of_funds,
+            **taxonomy_answers,
+        }
+        existing.client_requested_amount = Decimal(str(payload.requested_amount))
+        existing.current_result = None
+        existing.recommended_amount = None
+        existing.funding_goal_confirmed_at = None
+        dealer = await db.get(DealerBusiness, existing.dealer_id)
+        if dealer is not None:
+            _apply_taxonomy_to_record(dealer, taxonomy_answers)
+            dealer.client_requested_amount = Decimal(str(payload.requested_amount))
+            dealer.funding_goal = Decimal(str(payload.requested_amount))
+            dealer.use_of_proceeds_note = payload.use_of_funds
+        await db.commit()
         return {"id": str(existing.id), "dealer_id": str(existing.dealer_id), "contact_id": str(contact.id),
             "company_id": str(company.id), "answers": existing.answers, "result": existing.current_result,
             "client_requested_amount": float(existing.client_requested_amount or 0), "reused": True}
     dealer = DealerBusiness(name=company.name, legal_name=company.name, email=contact.email, phone=contact.phone_e164,
         address=company.address, city=company.city, state=company.state, zip=company.zip, industry=payload.industry or "other",
-        subindustry=payload.subindustry,
+        industry_label=payload.industry_label, subindustry=payload.subindustry,
+        subindustry_label=payload.subindustry_label,
         naics_code=payload.naics_code,
         naics_label=payload.naics_label,
         industry_entry_id=payload.industry_entry_id,
@@ -1075,16 +1143,7 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
     answers = {
         "requested_amount": payload.requested_amount,
         "use_of_funds": payload.use_of_funds,
-        "industry": payload.industry,
-        "industry_label": payload.industry_label,
-        "subindustry": payload.subindustry,
-        "subindustry_label": payload.subindustry_label,
-        "naics_code": payload.naics_code,
-        "naics_label": payload.naics_label,
-        "industry_entry_id": str(payload.industry_entry_id) if payload.industry_entry_id else None,
-        "subindustry_entry_id": str(payload.subindustry_entry_id) if payload.subindustry_entry_id else None,
-        "activity_entry_id": str(payload.activity_entry_id) if payload.activity_entry_id else None,
-        "taxonomy_status": taxonomy_status,
+        **taxonomy_answers,
     }
     session = DealerProductFinderSession(owner_user_id=user.id, company_id=company.id, contact_id=contact.id,
         dealer_id=dealer.id, locale=payload.locale, answers=answers, client_requested_amount=Decimal(str(payload.requested_amount)))
@@ -1111,23 +1170,9 @@ async def screen_session(session_id: UUID, payload: FinderAnswersIn, user: Curre
     company = await db.get(DealerRepCompany, session.company_id)
     dealer = await db.get(DealerBusiness, session.dealer_id)
     if company is not None:
-        company.industry = str(answers.get("industry") or company.industry or "") or None
-        company.industry_label = str(answers.get("industry_label") or company.industry_label or "") or None
-        company.subindustry = str(answers.get("subindustry") or company.subindustry or "") or None
-        company.subindustry_label = str(answers.get("subindustry_label") or company.subindustry_label or "") or None
-        company.naics_code = str(answers.get("naics_code") or company.naics_code or "") or None
-        company.naics_label = str(answers.get("naics_label") or company.naics_label or "") or None
-        company.industry_entry_id = UUID(str(answers["industry_entry_id"])) if answers.get("industry_entry_id") else None
-        company.subindustry_entry_id = UUID(str(answers["subindustry_entry_id"])) if answers.get("subindustry_entry_id") else None
-        company.activity_entry_id = UUID(str(answers["activity_entry_id"])) if answers.get("activity_entry_id") else None
+        _apply_taxonomy_to_record(company, answers)
     if dealer is not None:
-        dealer.industry = str(answers.get("industry") or dealer.industry or "other")[:48]
-        dealer.subindustry = str(answers.get("subindustry") or dealer.subindustry or "") or None
-        dealer.naics_code = str(answers.get("naics_code") or dealer.naics_code or "") or None
-        dealer.naics_label = str(answers.get("naics_label") or dealer.naics_label or "") or None
-        dealer.industry_entry_id = UUID(str(answers["industry_entry_id"])) if answers.get("industry_entry_id") else None
-        dealer.subindustry_entry_id = UUID(str(answers["subindustry_entry_id"])) if answers.get("subindustry_entry_id") else None
-        dealer.activity_entry_id = UUID(str(answers["activity_entry_id"])) if answers.get("activity_entry_id") else None
+        _apply_taxonomy_to_record(dealer, answers)
     session.recommended_amount = Decimal(str(result["recommended_amount"])) if result.get("recommended_amount") else None
     db.add(DealerProductScreeningSnapshot(session_id=session.id, source="self_reported", inputs=answers, result=result, created_by_user_id=user.id))
     await db.commit()
@@ -1149,6 +1194,12 @@ async def confirm_funding_goal(session_id: UUID, payload: FundingGoalConfirmIn, 
 async def start_application(session_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     session = await _load_session(db, user, session_id); dealer = await db.get(DealerBusiness, session.dealer_id)
     if dealer is None: raise HTTPException(status.HTTP_404_NOT_FOUND, "Draft file not found")
+    answers = await _canonicalize_session_taxonomy(db, session.answers or {})
+    session.answers = answers
+    _apply_taxonomy_to_record(dealer, answers)
+    company = await db.get(DealerRepCompany, session.company_id)
+    if company is not None:
+        _apply_taxonomy_to_record(company, answers)
     if dealer.application_lifecycle == "draft":
         dealer.application_lifecycle = "active"; dealer.status = "active"; session.status = "promoted"
         db.add(DealerSourceConnection(dealer_id=dealer.id, kind="uploads", status="active"))
@@ -1157,7 +1208,7 @@ async def start_application(session_id: UUID, user: CurrentUser, db: AsyncSessio
         except Exception: pass
         if user.role == Role.FIELD_REP:
             db.add(DealerRepLead(dealer_id=dealer.id, rep_user_id=user.id, status="draft", status_history=[]))
-        await db.commit()
+    await db.commit()
     return {"dealer_id": str(dealer.id), "route": f"/applications/{dealer.id}?step=1"}
 
 
