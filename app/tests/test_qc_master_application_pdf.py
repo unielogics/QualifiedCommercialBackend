@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +16,7 @@ from app.dealer_os.services.lender_neutral_routing import (
 
 
 def _sample_context() -> dict:
-    completed_at = datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc)
+    completed_at = datetime(2026, 8, 25, 14, 30, tzinfo=UTC)
     profile = SimpleNamespace(
         human_review_status="fundable",
         human_review_note="Cash flow, ownership, and direct-program eligibility reviewed.",
@@ -181,7 +181,7 @@ def _signature_png() -> bytes:
         (225, 67),
         (310, 80),
     ]
-    for start, end in zip(points, points[1:]):
+    for start, end in zip(points, points[1:], strict=False):
         page.draw_line(fitz.Point(*start), fitz.Point(*end), color=(0.04, 0.10, 0.24), width=2.2)
     return page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=True).tobytes("png")
 
@@ -233,7 +233,7 @@ def test_master_application_stamp_replaces_unsigned_placeholders() -> None:
         qc_master_application.MASTER_TEMPLATE_KEY,
         typed_name="Jordan Rivera",
         signature_png=_signature_png(),
-        signed_at=datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc),
+        signed_at=datetime(2026, 8, 25, 15, 0, tzinfo=UTC),
     )
     executed = fitz.open(stream=stamped, filetype="pdf")
     executed_text = "\n".join(result.get_text() for result in executed)
@@ -273,7 +273,7 @@ def _prepare_visual_sample(output_dir: Path) -> None:
 def _prepare_visual_certificate(output_dir: Path) -> None:
     unsigned = (output_dir / "unsigned.pdf").read_bytes()
     signature = (output_dir / "signature.png").read_bytes()
-    signed_at = datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc)
+    signed_at = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
     stamped = contract_sign._stamp(
         unsigned,
         qc_master_application.MASTER_TEMPLATE_KEY,
