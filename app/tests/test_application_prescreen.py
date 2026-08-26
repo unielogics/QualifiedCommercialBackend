@@ -3,11 +3,17 @@ from app.dealer_os.services.application_prescreen import owner_answer_complete, 
 
 def answer(**overrides):
     data = {
-        "citizen_or_lpr": True,
+        "residency_status": "citizen",
         "credit_660_or_higher": True,
         "bankruptcy_timing": "none",
         "foreclosure_within_3_years": False,
         "felony_timing": "none",
+        "misdemeanor_within_5_years": False,
+        "misdemeanor_involving_minor": False,
+        "arrest_within_6_months": False,
+        "financial_related_crime": False,
+        "active_legal_charges": False,
+        "ofac_match": False,
     }
     data.update(overrides)
     return data
@@ -28,7 +34,7 @@ def eligible(result):
 
 def test_owner_answer_requires_every_question():
     assert owner_answer_complete(answer())
-    assert not owner_answer_complete({"citizen_or_lpr": True})
+    assert not owner_answer_complete({"residency_status": "citizen"})
 
 
 def test_amount_boundaries_route_the_two_direct_programs():
@@ -51,6 +57,5 @@ def test_owner_exclusions_apply_per_program():
     assert eligible(screen(40_000, owner=answer(bankruptcy_timing="4_to_7_years"))) == {"term_loan_10_year"}
     assert eligible(screen(40_000, owner=answer(felony_timing="more_than_10_years"))) == {"term_loan_3_5_year"}
     assert eligible(screen(40_000, owner=answer(foreclosure_within_3_years=True))) == {"term_loan_3_5_year"}
-    assert eligible(screen(40_000, owner=answer(citizen_or_lpr=False))) == set()
+    assert eligible(screen(40_000, owner=answer(residency_status="other"))) == set()
     assert eligible(screen(40_000, owner=answer(credit_660_or_higher=False))) == set()
-

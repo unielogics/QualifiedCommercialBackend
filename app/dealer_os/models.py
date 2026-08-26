@@ -91,6 +91,7 @@ class DealerBusiness(TimestampMixin, Base):
     )
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
+    industry_label: Mapped[str | None] = mapped_column(String(180))
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     # Rep-facing deletion is an archive tombstone. The file and every related
     # credit, bank, document, message, and audit row remain intact.
@@ -121,6 +122,7 @@ class DealerBusiness(TimestampMixin, Base):
     naics_code: Mapped[str | None] = mapped_column(String(8))
     naics_label: Mapped[str | None] = mapped_column(String(180))
     subindustry: Mapped[str | None] = mapped_column(String(120))
+    subindustry_label: Mapped[str | None] = mapped_column(String(180))
     industry_entry_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("application_taxonomy_entries.id", ondelete="SET NULL")
     )
@@ -148,6 +150,27 @@ class DealerApplicationProfile(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = _pk()
     dealer_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    dba_name: Mapped[str | None] = mapped_column(String(180))
+    website: Mapped[str | None] = mapped_column(String(500))
+    state_of_formation: Mapped[str | None] = mapped_column(String(2))
+    location_type: Mapped[str | None] = mapped_column(String(32))
+    mailing_address: Mapped[str | None] = mapped_column(String(300))
+    mailing_city: Mapped[str | None] = mapped_column(String(120))
+    mailing_state: Mapped[str | None] = mapped_column(String(2))
+    mailing_zip: Mapped[str | None] = mapped_column(String(12))
+    annual_sales: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    annual_cash_flow_available_for_debt: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    monthly_debt_payments: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    signer_title: Mapped[str | None] = mapped_column(String(120))
+    # The engine recommends; an authorized desk reviewer releases the file.
+    human_review_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    human_review_note: Mapped[str | None] = mapped_column(Text)
+    human_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    human_reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     landlord_mortgagee: Mapped[str | None] = mapped_column(String(200))
     guarantor_home_address: Mapped[str | None] = mapped_column(String(300))
@@ -1479,11 +1502,14 @@ class DealerApplicationPreScreen(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
     )
     rules_version: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="quidity_step1_v1", server_default="quidity_step1_v1"
+        String(48), nullable=False, default="qc_direct_programs_v2", server_default="qc_direct_programs_v2"
     )
     file_answers: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     owner_answers: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     routing_result: Mapped[dict | None] = mapped_column(JSONB)
+    self_report_routing_result: Mapped[dict | None] = mapped_column(JSONB)
+    verified_routing_result: Mapped[dict | None] = mapped_column(JSONB)
+    routing_history: Mapped[list | None] = mapped_column(JSONB)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
@@ -1631,6 +1657,9 @@ class ContractTemplate(TimestampMixin, Base):
     key: Mapped[str] = mapped_column(String(48), unique=True, nullable=False)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     s3_key: Mapped[str | None] = mapped_column(String(512))
+    render_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="uploaded_pdf", server_default="uploaded_pdf"
+    )
     page_count: Mapped[int | None] = mapped_column(Integer)
     # True when the PDF carries a real AcroForm. False means a flat scan:
     # filling needs the PyMuPDF coordinate overlay instead.
@@ -1681,5 +1710,7 @@ class ContractDocument(TimestampMixin, Base):
     esign_consent_ip: Mapped[str | None] = mapped_column(String(64))
     signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     signer_name: Mapped[str | None] = mapped_column(String(160))
+    signer_title: Mapped[str | None] = mapped_column(String(120))
+    signature_sha256: Mapped[str | None] = mapped_column(String(64))
     signer_ip: Mapped[str | None] = mapped_column(String(64))
     signer_user_agent: Mapped[str | None] = mapped_column(String(400))

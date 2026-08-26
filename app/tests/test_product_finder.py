@@ -21,13 +21,24 @@ def complete_answers(**overrides):
         "positive_month_end_count": 3,
         "nsf_count": 1,
         "negative_balance_days": 2,
+        "average_monthly_bank_deposits": 100_000,
         "business_dscr": 1.25,
-        "citizen_or_lpr": True,
+        "residency_status": "citizen",
         "bankruptcy_timing": "none",
         "foreclosure_within_3_years": False,
         "felony_timing": "none",
-        "misdemeanor_5y": False,
-        "open_tax_liens_or_judgments": False,
+        "misdemeanor_within_5_years": False,
+        "misdemeanor_involving_minor": False,
+        "arrest_within_6_months": False,
+        "financial_related_crime": False,
+        "open_tax_liens": False,
+        "tax_liability_over_10000": False,
+        "open_judgments": False,
+        "open_civil_actions_as_defendant": False,
+        "civil_action_financial_institution_within_10_years": False,
+        "judgment_over_2000_within_12_months": False,
+        "judgment_over_50000_within_7_years": False,
+        "aggregate_liens_judgments_over_25000_within_7_years": False,
         "ofac_match": False,
         "active_legal_charges": False,
         "active_ucc_count": 2,
@@ -43,7 +54,7 @@ def by_key(result, key):
     return next(row for row in result["evaluated_programs"] if row["program_key"] == key)
 
 
-def test_exact_quidity_thresholds_are_inclusive():
+def test_direct_program_thresholds_are_inclusive():
     result = screen_products(complete_answers(requested_amount=50_000, years_in_business=2, annual_revenue=50_000, primary_owner_credit_660_or_higher=True, business_dscr=1.1))
     assert by_key(result, "term_loan_3_5_year")["status"] == "recommended"
     assert by_key(result, "term_loan_10_year")["status"] == "recommended"
@@ -86,8 +97,12 @@ def test_pending_custom_taxonomy_does_not_create_a_deterministic_exclusion():
         naics_code="722511",
         naics_label="Pending custom restaurant activity",
     ))
-    assert by_key(result, "term_loan_10_year")["status"] == "recommended"
+    assert by_key(result, "term_loan_10_year")["status"] == "potential"
     assert result["canonical_naics_code"] is None
+    assert any(
+        "Classification review required" in item
+        for item in by_key(result, "term_loan_10_year")["unresolved"]
+    )
 
 
 def test_real_estate_rows_calculate_unverified_equity_and_ltv():

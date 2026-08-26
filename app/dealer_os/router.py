@@ -34,7 +34,7 @@ from app.deps import CurrentUser
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
-from app.models.application_profile import PlaidAssetReport
+from app.models.application_profile import ApplicationTaxonomyEntry, PlaidAssetReport
 from app.models.booking_settings import BookingSettings
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.event import CalendarEvent
@@ -297,6 +297,8 @@ from .schemas import (
     RoomBankConsentGrant,
     ApplicationProfilePatch,
     ApplicationProfileRead,
+    ApplicationHumanReviewPatch,
+    SubmissionReadinessRead,
     BookingAvailabilityRead,
     BookingAvailabilitySlot,
     ContactCardRead,
@@ -317,7 +319,7 @@ from .schemas import (
     UnderwritingReviewPreferenceCreate,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, application_prescreen, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -345,7 +347,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, program_fit, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -906,7 +908,7 @@ async def _notify_client_request(
         await db.execute(
             select(DealerOwner)
             .where(DealerOwner.dealer_id == dealer.id)
-            .order_by(DealerOwner.created_at.asc())
+            .order_by(DealerOwner.is_primary.desc(), DealerOwner.created_at.asc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -992,10 +994,10 @@ async def send_bank_upload_request(
     requested = await client_room.request_document(
         db,
         dealer,
-        name="Last 6 months business bank statements",
+        name="Three current months of business bank statements",
         description=(
-            "Upload the six most recent completed months of business bank statements. "
-            "PDF statements are preferred."
+            "Upload the three most recent completed months of bank-produced business "
+            "statements. PDF statements are required; CSVs and screenshots are supplemental."
         ),
         category="financials",
         required=True,
@@ -1005,7 +1007,7 @@ async def send_bank_upload_request(
         db,
         dealer,
         user,
-        purpose="upload the last 6 months of business bank statements",
+        purpose="upload three current months of bank-produced business statements",
         path=room.url,
         channel=req.channel,
         action="client_request.bank_upload",
@@ -1205,6 +1207,20 @@ async def send_contract_for_signature(
         )
     if doc.status == "executed":
         raise HTTPException(status.HTTP_409_CONFLICT, "This document is already signed.")
+    if key == qc_master_application.MASTER_TEMPLATE_KEY:
+        readiness = qc_master_application.build_readiness(
+            await qc_master_application.build_context(db, dealer)
+        )
+        if not readiness["ready"]:
+            open_items = [
+                row["requirement"]
+                for row in readiness["items"]
+                if row["status"] in {"missing", "supplemental"}
+            ]
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The QC application cannot be released yet: " + "; ".join(open_items[:5]),
+            )
     doc.status = "out_for_signature"
     await db.flush()
 
@@ -1251,10 +1267,28 @@ async def case_contract_url(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No generated copy yet.")
     from app.services.payment_authorization import presign_private_s3_object
 
-    url = presign_private_s3_object(doc.filled_s3_key, ttl_seconds=900)
+    source_key = (
+        doc.executed_s3_key
+        if doc.status == "executed" and doc.executed_s3_key
+        else doc.filled_s3_key
+    )
+    filename = (
+        f"{dealer.case_ref or 'QC'}-business-financing-application.pdf"
+        if key == qc_master_application.MASTER_TEMPLATE_KEY
+        else f"{dealer.case_ref or 'QC'}-{key}.pdf"
+    )
+    url = presign_private_s3_object(
+        source_key,
+        ttl_seconds=900,
+        download_filename=filename if doc.status == "executed" else None,
+    )
     if not url:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not sign a download link.")
-    return {"url": url, "sha256": doc.filled_sha256, "status": doc.status}
+    return {
+        "url": url,
+        "sha256": doc.executed_sha256 if doc.status == "executed" else doc.filled_sha256,
+        "status": doc.status,
+    }
 
 
 @router.get("/contract-templates", response_model=list[ContractTemplateRead])
@@ -1436,6 +1470,8 @@ async def create_dealer(
     # sms_consent is captured alongside the file but is not a column on it: it
     # becomes its own evidence row below.
     fields = payload.model_dump(exclude={"sms_consent"})
+    taxonomy = await application_taxonomy.canonicalize_selection(db, fields, required=False)
+    fields.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
     dealer = DealerBusiness(**fields, owner_user_id=user.id, case_ref=await _next_case_ref(db))
     db.add(dealer)
     await db.flush()
@@ -1827,25 +1863,20 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
 
 async def _statement_month_coverage(
     db: AsyncSession, dealer_id: UUID
-) -> tuple[list[str], list[str]]:
-    """Statement months covered by extracted uploads or financial periods."""
-    months: set[str] = set()
-    period_rows = (
-        await db.execute(
-            select(
-                DealerFinancialPeriod.period,
-                DealerFinancialPeriod.deposits,
-                DealerFinancialPeriod.withdrawals,
-            ).where(DealerFinancialPeriod.dealer_id == dealer_id)
-        )
-    ).all()
-    for period, deposits, withdrawals in period_rows:
-        if deposits is not None or withdrawals is not None:
-            months.add(f"{period.year:04d}-{period.month:02d}")
+) -> tuple[list[str], list[str], str]:
+    """Three current months proved by bank-produced statement artifacts.
 
+    CSVs, screenshots, and financial periods derived from supplemental files
+    are useful analysis inputs but cannot satisfy an official-statement gate.
+    A Plaid connection also does not count until statement PDFs are imported.
+    """
+    months: set[str] = set()
+    has_plaid_statement = False
     doc_rows = (
         await db.execute(
             select(
+                DealerDocument.content_type,
+                DealerDocument.plaid_item_id,
                 DealerDocument.kind,
                 DealerDocument.detected_kind,
                 DealerDocument.extracted,
@@ -1855,46 +1886,41 @@ async def _statement_month_coverage(
             )
         )
     ).all()
-    for kind, detected_kind, extracted in doc_rows:
+    for content_type, plaid_item_id, kind, detected_kind, extracted in doc_rows:
         effective = detected_kind or _KIND_TO_DETECTED.get(kind)
         if effective != "bank_statement":
             continue
+        is_plaid_statement = plaid_item_id is not None
+        is_bank_pdf = str(content_type or "").lower() == "application/pdf"
+        if not (is_plaid_statement or is_bank_pdf):
+            continue
+        has_plaid_statement = has_plaid_statement or is_plaid_statement
         for m in (extracted or {}).get("months") or []:
             key = str(m.get("month") or "") if isinstance(m, dict) else ""
             if _COVERAGE_MONTH_RE.match(key):
                 months.add(key)
 
-    freshness = recurrence.compute_freshness(months, date.today())
-    return sorted(months), list(freshness.get("missing_months") or [])
+    freshness = recurrence.compute_freshness(months, date.today(), window=3)
+    source = "plaid" if has_plaid_statement else ("upload" if months else "none")
+    return sorted(months), list(freshness.get("missing_months") or []), source
 
 
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     """Read the two authorizations off the file.
 
-    Bank is an *active* Plaid item: a revoked or errored connection is not a
-    connection, and treating it as one would unlock a profile computed from
-    statements that stopped arriving weeks ago.
+    Bank readiness requires three current bank-produced statement months.
+    Plaid is a transport, not evidence by itself; a connected item cannot
+    unlock underwriting until its statement artifacts have been imported.
 
     Credit is complete only when ownership totals 100% and every disclosed
     owner at 20% or more has completed their own pull. Each pull remains tied
     to its owner row and consent link.
     """
-    plaid_linked = bool(
-        (
-            await db.execute(
-                select(DealerPlaidItem.id).where(
-                    DealerPlaidItem.dealer_id == dealer.id,
-                    DealerPlaidItem.status == "active",
-                    DealerPlaidItem.environment == plaid_client.environment(),
-                    DealerPlaidItem.is_primary_operating.is_(True),
-                ).limit(1)
-            )
-        ).scalar_one_or_none()
+    statement_months, missing_statement_months, statement_source = await _statement_month_coverage(
+        db, dealer.id
     )
-    statement_months, missing_statement_months = await _statement_month_coverage(db, dealer.id)
-    upload_linked = len(statement_months) >= 6 and not missing_statement_months
-    bank_linked = plaid_linked or upload_linked
-    bank_source = "plaid" if plaid_linked else ("upload" if upload_linked else "none")
+    bank_linked = len(statement_months) >= 3 and not missing_statement_months
+    bank_source = statement_source if bank_linked else "none"
     owner_state = await _owner_requirement_state(db, dealer.id)
     pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
     credit_returned = bool(
@@ -1940,12 +1966,25 @@ async def dealer_decision(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     ver = await _assess_verification(db, dealer)
+    pre_screen = await _application_pre_screen_state(db, dealer)
+    direct_programs = [
+        {
+            "key": row.get("program_key"),
+            "label": row.get("name"),
+            "eligible": row.get("status") != "blocked",
+            "needs": list(row.get("unresolved") or []),
+            "blocked_by": list(row.get("borrower_safe_reasons") or []),
+            "matched_rules": list(row.get("matched_rules") or []),
+            "rules_version": (pre_screen.get("routing_result") or {}).get("rules_version"),
+        }
+        for row in ((pre_screen.get("routing_result") or {}).get("programs") or [])
+    ]
 
     try:
         metrics = await _latest_snapshot_metrics(db, dealer.id)
     except HTTPException:
         d = decision.decide({"verdict": "no_data"}, None, ver)
-        return DecisionRead(**asdict(d), programs=[])
+        return DecisionRead(**asdict(d), programs=direct_programs)
 
     targets = await _effective_targets(db, dealer.id)
     settings = await _global_program_settings(db)
@@ -1990,25 +2029,8 @@ async def dealer_decision(
         [{"period": r.period, "ending_balance": r.ending_balance} for r in period_rows]
     )
 
-    # Which real programs this file reaches, easiest first. compute_paths
-    # answers in seven generic categories; this answers in the fourteen the
-    # desk actually submits to, so a rep can name the program rather than a
-    # readiness percentage.
-    docs = (
-        (
-            await db.execute(
-                select(DealerDocument.filename).where(DealerDocument.dealer_id == dealer.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    programs = program_fit.screen(
-        dealer, tree, [{"name": f} for f in docs if f]
-    )
-
     out = decision.decide(fundability, health, ver)
-    return DecisionRead(**asdict(out), programs=[asdict(p) for p in programs])
+    return DecisionRead(**asdict(out), programs=direct_programs)
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
@@ -2046,13 +2068,31 @@ async def update_dealer(
         # A client may complete the always-required business-profile fields
         # on their OWN file — nothing else.
         changes = payload.model_dump(exclude_unset=True)
-        allowed = {"legal_name", "ein", "naics_code", "entity_type", "started_on"}
+        allowed = {
+            "legal_name", "ein", "entity_type", "started_on",
+            "industry", "industry_label", "subindustry", "subindustry_label",
+            "industry_entry_id", "subindustry_entry_id", "activity_entry_id",
+            "naics_code", "naics_label",
+        }
         illegal = sorted(set(changes) - allowed)
         if illegal:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 f"These fields are maintained by your advisor: {', '.join(illegal)}",
             )
+        taxonomy_fields = {
+            "industry", "industry_label", "subindustry", "subindustry_label",
+            "industry_entry_id", "subindustry_entry_id", "activity_entry_id",
+            "naics_code", "naics_label",
+        }
+        if taxonomy_fields.intersection(changes):
+            current = {
+                "industry_entry_id": changes.get("industry_entry_id", dealer.industry_entry_id),
+                "subindustry_entry_id": changes.get("subindustry_entry_id", dealer.subindustry_entry_id),
+                "activity_entry_id": changes.get("activity_entry_id", dealer.activity_entry_id),
+            }
+            taxonomy = await application_taxonomy.canonicalize_selection(db, current, required=False)
+            changes.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
         before = {k: getattr(dealer, k) for k in changes}
         for k, v in changes.items():
             setattr(dealer, k, v)
@@ -2067,6 +2107,19 @@ async def update_dealer(
         r.notes = None
         return r
     changes = payload.model_dump(exclude_unset=True)
+    taxonomy_fields = {
+        "industry", "industry_label", "subindustry", "subindustry_label",
+        "industry_entry_id", "subindustry_entry_id", "activity_entry_id",
+        "naics_code", "naics_label",
+    }
+    if taxonomy_fields.intersection(changes):
+        current = {
+            "industry_entry_id": changes.get("industry_entry_id", dealer.industry_entry_id),
+            "subindustry_entry_id": changes.get("subindustry_entry_id", dealer.subindustry_entry_id),
+            "activity_entry_id": changes.get("activity_entry_id", dealer.activity_entry_id),
+        }
+        taxonomy = await application_taxonomy.canonicalize_selection(db, current, required=False)
+        changes.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
     before = {k: getattr(dealer, k) for k in changes}
     bucket_changed = (
         "bucket_id" in changes and changes["bucket_id"] != dealer.bucket_id
@@ -3084,25 +3137,15 @@ async def document_coverage(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DocumentCoverageRead:
     """Intake completeness for the Documents tab: which statement months are
-    covered (extracted statement docs OR period rows with statement flow
-    data), which tax years have a filing row, whether a P&L / debt schedule
-    has landed, and how many doc requests are still open."""
+    covered by official statement artifacts, which tax years have a filing
+    row, whether a P&L / debt schedule has landed, and how many requests are
+    still open. Supplemental CSV and screenshot data never satisfies the
+    official statement count."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
-    months: set[str] = set()
-    period_rows = (
-        await db.execute(
-            select(
-                DealerFinancialPeriod.period,
-                DealerFinancialPeriod.deposits,
-                DealerFinancialPeriod.withdrawals,
-            ).where(DealerFinancialPeriod.dealer_id == dealer.id)
-        )
-    ).all()
-    for period, deposits, withdrawals in period_rows:
-        if deposits is not None or withdrawals is not None:
-            months.add(f"{period.year:04d}-{period.month:02d}")
+    covered_months, _, _ = await _statement_month_coverage(db, dealer.id)
+    months: set[str] = set(covered_months)
 
     has_pl = False
     has_debt_schedule = bool(
@@ -3125,12 +3168,7 @@ async def document_coverage(
     ).all()
     for kind, detected_kind, extracted in doc_rows:
         effective = detected_kind or _KIND_TO_DETECTED.get(kind)
-        if effective == "bank_statement":
-            for m in (extracted or {}).get("months") or []:
-                key = str(m.get("month") or "") if isinstance(m, dict) else ""
-                if _COVERAGE_MONTH_RE.match(key):
-                    months.add(key)
-        elif effective == "profit_and_loss":
+        if effective == "profit_and_loss":
             has_pl = True
         elif effective == "debt_schedule":
             has_debt_schedule = True
@@ -3159,7 +3197,7 @@ async def document_coverage(
         has_debt_schedule=has_debt_schedule,
         open_doc_requests=int(open_doc_requests or 0),
         # Deterministic freshness vs. today (pure helper — services.recurrence).
-        **recurrence.compute_freshness(months, date.today()),
+        **recurrence.compute_freshness(months, date.today(), window=3),
     )
 
 
@@ -5078,16 +5116,9 @@ async def patch_application_profile(
     if row is None:
         row = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
         db.add(row)
-    before = {
-        "landlord_mortgagee": row.landlord_mortgagee,
-        "guarantor_home_address": row.guarantor_home_address,
-        "guarantor_dob": row.guarantor_dob.isoformat() if row.guarantor_dob else None,
-        "selected_program": row.selected_program,
-        "term_requested_months": row.term_requested_months,
-        "collateral_description": row.collateral_description,
-        "use_of_proceeds_text": row.use_of_proceeds_text,
-    }
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    patch = payload.model_dump(exclude_unset=True)
+    before = jsonable_encoder({key: getattr(row, key, None) for key in patch})
+    for key, value in patch.items():
         setattr(row, key, value)
     row.updated_by_user_id = user.id
     await db.flush()
@@ -5121,6 +5152,68 @@ async def patch_application_profile(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+@router.get(
+    "/dealers/{dealer_id}/submission-readiness",
+    response_model=SubmissionReadinessRead,
+)
+async def get_submission_readiness(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> SubmissionReadinessRead:
+    """Source-by-source release gate for the QC master application."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    context = await qc_master_application.build_context(db, dealer)
+    return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
+
+
+@router.patch(
+    "/dealers/{dealer_id}/submission-readiness/human-review",
+    response_model=SubmissionReadinessRead,
+)
+async def patch_submission_human_review(
+    dealer_id: UUID,
+    payload: ApplicationHumanReviewPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SubmissionReadinessRead:
+    """Record the authorized desk decision that controls signature release."""
+    require_super_admin(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerApplicationProfile).where(
+                DealerApplicationProfile.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
+        db.add(row)
+        await db.flush()
+    before = {
+        "status": row.human_review_status,
+        "note": row.human_review_note,
+        "reviewed_at": row.human_reviewed_at.isoformat() if row.human_reviewed_at else None,
+    }
+    row.human_review_status = payload.status
+    row.human_review_note = (payload.note or "").strip() or None
+    row.human_reviewed_at = datetime.now(timezone.utc) if payload.status != "pending" else None
+    row.human_reviewed_by_user_id = user.id if payload.status != "pending" else None
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.human_review_updated",
+        "application_profile",
+        entity_id=row.id,
+        before=before,
+        after={"status": row.human_review_status, "note": row.human_review_note},
+    )
+    await db.commit()
+    context = await qc_master_application.build_context(db, dealer)
+    return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
 
 
 @router.get("/booking/availability", response_model=BookingAvailabilityRead)
@@ -9596,6 +9689,15 @@ async def public_room_features(
                 raw_pdf = storage.get_bytes(d.filled_s3_key)
                 if raw_pdf is not None:
                     text_full = contract_sign.agreement_text(raw_pdf)
+            executed_url = None
+            if d.status == "executed" and d.executed_s3_key:
+                from app.services.payment_authorization import presign_private_s3_object
+
+                executed_url = presign_private_s3_object(
+                    d.executed_s3_key,
+                    ttl_seconds=3600,
+                    download_filename=f"{dealer.case_ref or 'QC'}-{d.template_key}.pdf",
+                )
             contract_rows.append(
                 RoomContractRead(
                     id=d.id,
@@ -9608,6 +9710,8 @@ async def public_room_features(
                         if d.template_key == "consulting_agreement"
                         else None
                     ),
+                    download_url=executed_url,
+                    pdf_sha256=d.executed_sha256,
                 )
             )
 
@@ -9673,6 +9777,23 @@ async def public_room_sign_contract(
         )
     ).scalar_one_or_none()
     title = tpl.title if tpl else doc.template_key
+    primary_signer = None
+    if doc.template_key == qc_master_application.MASTER_TEMPLATE_KEY:
+        primary_signer = (
+            await db.execute(
+                select(DealerOwner)
+                .where(DealerOwner.dealer_id == dealer.id)
+                .order_by(DealerOwner.is_primary.desc(), DealerOwner.created_at.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        expected_name = " ".join((primary_signer.full_name if primary_signer else "").lower().split())
+        supplied_name = " ".join(payload.typed_name.lower().split())
+        if not expected_name or supplied_name != expected_name:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "The typed name must match the designated authorized representative.",
+            )
 
     try:
         executed_pdf, executed_sha = await contract_sign.execute(
@@ -9699,12 +9820,17 @@ async def public_room_sign_contract(
     await db.commit()
 
     # The signer's copy, immediately. Retention and delivery are compliance.
-    to = link.recipient_email or dealer.email
+    to = (
+        primary_signer.email
+        if primary_signer and primary_signer.email
+        else link.recipient_email or dealer.email
+    )
+    delivery_ok = True
     if to and "@" in to:
         from app.services.email.ses_client import send_raw_email
 
         try:
-            send_raw_email(
+            delivery = send_raw_email(
                 to_emails=[to],
                 subject=f"Your executed {title} — Qualified Commercial",
                 body_text=(
@@ -9715,13 +9841,30 @@ async def public_room_sign_contract(
                 ),
                 attachments=[(f"{doc.template_key}-executed.pdf", executed_pdf, "application/pdf")],
             )
+            delivery_ok = delivery.ok
         except Exception:  # noqa: BLE001 — the signature is already sealed; mail is retryable
             logger.exception("executed-copy email failed for contract %s", doc.id)
+            delivery_ok = False
+
+    from app.services.payment_authorization import presign_private_s3_object
+
+    download_url = presign_private_s3_object(
+        doc.executed_s3_key,
+        ttl_seconds=3600,
+        download_filename=f"{dealer.case_ref or 'QC'}-business-financing-application.pdf",
+    )
 
     return RoomSignResult(
         signed=True,
         certificate_file_id=None,
-        message="Signed. Your executed copy, certificate included, has been emailed to you.",
+        message=(
+            "Signed. Your executed copy is ready to download and has been emailed to you."
+            if delivery_ok
+            else "Signed. Your executed copy is ready to download; email delivery needs attention."
+        ),
+        execution_status="executed" if delivery_ok else "delivery_warning",
+        pdf_sha256=executed_sha,
+        download_url=download_url,
     )
 
 
@@ -9786,6 +9929,7 @@ async def public_room_sign(
         signed=True,
         certificate_file_id=result_file.id,
         message="Signed. A copy of the executed document has been emailed to you.",
+        execution_status="executed",
     )
 
 
@@ -10884,21 +11028,218 @@ async def _application_pre_screen_state(
     ]
     incomplete_ids = [owner_id for owner_id in required_ids if owner_id not in completed_ids]
     blockers: list[str] = []
-    if not isinstance(file_answers.get("refinance_debt"), bool):
-        blockers.append("Confirm whether any proceeds will refinance debt.")
+    missing_file_answers = [
+        key
+        for key in application_prescreen.REQUIRED_FILE_FIELDS
+        if not isinstance(file_answers.get(key), bool)
+    ]
+    if file_answers.get("tax_liability_over_10000") is True and not isinstance(
+        file_answers.get("tax_payment_plan_current"), bool
+    ):
+        missing_file_answers.append("tax_payment_plan_current")
+    if (
+        file_answers.get("judgment_over_50000_within_7_years") is True
+        or file_answers.get("aggregate_liens_judgments_over_25000_within_7_years") is True
+    ) and not isinstance(file_answers.get("term_obligations_released_or_on_plan"), bool):
+        missing_file_answers.append("term_obligations_released_or_on_plan")
+    if missing_file_answers:
+        blockers.append(f"Complete {len(missing_file_answers)} business eligibility question(s).")
     if incomplete_ids:
         blockers.append(f"Complete eligibility for {len(incomplete_ids)} required owner(s).")
     complete = not blockers and bool(required_ids)
     verified_scores = {
         str(owner.id): owner.credit_score for owner in owner_state["required"]
     }
-    result = application_prescreen.screen_application(
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(
+                DealerApplicationProfile.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    years_in_business = None
+    if dealer.started_on:
+        years_in_business = max((date.today() - dealer.started_on).days / 365.2425, 0)
+    taxonomy_status = "unclassified"
+    taxonomy_ids = [
+        value
+        for value in (dealer.industry_entry_id, dealer.subindustry_entry_id, dealer.activity_entry_id)
+        if value is not None
+    ]
+    if len(taxonomy_ids) == 3:
+        taxonomy_rows = list(
+            (
+                await db.execute(
+                    select(ApplicationTaxonomyEntry).where(
+                        ApplicationTaxonomyEntry.id.in_(taxonomy_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        taxonomy_status = (
+            "pending" if any(entry.status == "pending" for entry in taxonomy_rows)
+            else "official" if len(taxonomy_rows) == 3
+            else "unclassified"
+        )
+    application_facts = {
+        "years_in_business": years_in_business,
+        "annual_revenue": float(profile.annual_sales) if profile and profile.annual_sales is not None else None,
+        "annual_cash_flow_available_for_debt": (
+            float(profile.annual_cash_flow_available_for_debt)
+            if profile and profile.annual_cash_flow_available_for_debt is not None
+            else None
+        ),
+        "monthly_debt_payments": (
+            float(profile.monthly_debt_payments)
+            if profile and profile.monthly_debt_payments is not None
+            else None
+        ),
+        "owner_count": len(owner_state["owners"]),
+        "naics_code": dealer.naics_code,
+        "taxonomy_status": taxonomy_status,
+        "state": dealer.state,
+    }
+    # Verified evidence enriches a separate result. It never overwrites the
+    # original Step 1.5 self-report snapshot.
+    statement_months, missing_statement_months, _statement_source = (
+        await _statement_month_coverage(db, dealer.id)
+    )
+    metric_inputs = await load_metric_inputs(db, dealer.id)
+    # Coverage is returned in ascending order. Use the newest three completed
+    # months for current-program metrics when a file contains a longer history.
+    statement_month_set = set(sorted(statement_months)[-3:])
+    period_rows = [
+        row
+        for row in metric_inputs.periods
+        if row.get("period") and row["period"].strftime("%Y-%m") in statement_month_set
+    ][:3]
+    debts = list(
+        (
+            await db.execute(
+                select(DealerDebt).where(
+                    DealerDebt.dealer_id == dealer.id,
+                    DealerDebt.status == "active",
+                )
+            )
+        ).scalars().all()
+    )
+    official_statements_complete = len(statement_months) >= 3 and not missing_statement_months
+    annualized_bank_sales = None
+    if (
+        official_statements_complete
+        and len(period_rows) >= 3
+        and all(row.get("deposits") is not None for row in period_rows)
+    ):
+        annualized_bank_sales = round(
+            sum(float(row["deposits"]) for row in period_rows) / len(period_rows) * 12,
+            2,
+        )
+    metric_tree = compute_metrics(
+        metric_inputs.periods,
+        metric_inputs.addbacks_annual_verified,
+        metric_inputs.targets,
+        fallbacks=metric_inputs.fallbacks,
+    )
+    verified_dscr = (metric_tree.get("dscr") or {}).get("current")
+
+    statement_documents = list(
+        (
+            await db.execute(
+                select(DealerDocument).where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.status == "extracted",
+                )
+            )
+        ).scalars().all()
+    )
+    negative_dates: set[str] = set()
+    negative_balance_evidence_seen = False
+    for document in statement_documents:
+        extracted = document.extracted if isinstance(document.extracted, dict) else {}
+        for month in extracted.get("months") or []:
+            if not isinstance(month, dict) or str(month.get("month") or "") not in statement_month_set:
+                continue
+            raw_negative_dates = month.get("negative_balance_dates")
+            if isinstance(raw_negative_dates, list):
+                negative_balance_evidence_seen = True
+            for raw_date in raw_negative_dates or []:
+                value = str(raw_date or "").strip()
+                if value:
+                    negative_dates.add(value)
+
+    def _counts_mca_or_sba(debt: DealerDebt) -> bool:
+        evidence = debt.evidence if isinstance(debt.evidence, dict) else {}
+        descriptor = " ".join(
+            str(value or "").lower()
+            for value in (
+                debt.category,
+                debt.lender,
+                debt.notes,
+                evidence.get("program_type"),
+                evidence.get("loan_type"),
+            )
+        )
+        if any(exempt in descriptor for exempt in ("eidl", "paycheck protection", " ppp", "sba 504", "504 loan")):
+            return False
+        return str(debt.category or "").lower() in {
+            "mca", "sba", "merchant_cash_advance", "sba_loan"
+        } or "merchant cash advance" in descriptor
+
+    mca_sba_debts = [debt for debt in debts if _counts_mca_or_sba(debt)]
+    mca_ages: list[int] = []
+    for debt in mca_sba_debts:
+        evidence = debt.evidence if isinstance(debt.evidence, dict) else {}
+        raw_date = next(
+            (
+                evidence.get(key)
+                for key in ("funded_on", "funded_at", "origination_date", "funding_date")
+                if evidence.get(key)
+            ),
+            None,
+        )
+        try:
+            funded_on = date.fromisoformat(str(raw_date)[:10]) if raw_date else None
+        except ValueError:
+            funded_on = None
+        if funded_on is not None:
+            mca_ages.append(max((date.today() - funded_on).days, 0))
+
+    application_facts.update(
+        {
+            "official_bank_statements": official_statements_complete,
+            "positive_month_end_count": sum(
+                row.get("ending_balance") is not None and float(row["ending_balance"]) > 0
+                for row in period_rows
+            ) if period_rows else None,
+            "nsf_count": sum(int(row.get("nsf_count") or 0) for row in period_rows) if period_rows else None,
+            "negative_balance_days": len(negative_dates) if negative_balance_evidence_seen else None,
+            "annualized_bank_sales": annualized_bank_sales,
+            "verified_dscr": float(verified_dscr) if verified_dscr is not None else None,
+            "mca_count": len(mca_sba_debts),
+            "youngest_mca_days": min(mca_ages) if len(mca_ages) == len(mca_sba_debts) and mca_ages else (None if mca_sba_debts else 0),
+            "active_ucc_count": sum(bool((debt.evidence or {}).get("ucc")) for debt in debts),
+        }
+    )
+    self_report_result = application_prescreen.screen_application(
+        requested_amount=float(dealer.funding_goal or dealer.client_requested_amount or 0),
+        refinance_debt=bool(file_answers.get("refinance_debt")),
+        required_owner_ids=required_ids,
+        owner_answers=owner_answers,
+        verified_credit_by_owner={},
+        file_answers=file_answers,
+        application_facts=application_facts,
+    ) if complete else None
+    has_verified_credit = any(value is not None for value in verified_scores.values())
+    verified_result = application_prescreen.screen_application(
         requested_amount=float(dealer.funding_goal or dealer.client_requested_amount or 0),
         refinance_debt=bool(file_answers.get("refinance_debt")),
         required_owner_ids=required_ids,
         owner_answers=owner_answers,
         verified_credit_by_owner=verified_scores,
-    ) if complete else None
+        file_answers=file_answers,
+        application_facts=application_facts,
+    ) if complete and (has_verified_credit or application_facts["official_bank_statements"]) else None
+    result = verified_result or self_report_result
     return {
         "row": row,
         "rules_version": row.rules_version if row else application_prescreen.RULES_VERSION,
@@ -10910,6 +11251,13 @@ async def _application_pre_screen_state(
         "complete": complete,
         "blockers": blockers,
         "routing_result": result,
+        "self_report_routing_result": self_report_result or (
+            dict(row.self_report_routing_result or {}) if row and row.self_report_routing_result else None
+        ),
+        "verified_routing_result": verified_result or (
+            dict(row.verified_routing_result or {}) if row and row.verified_routing_result else None
+        ),
+        "routing_history": list(row.routing_history or []) if row else [],
         "completed_at": row.completed_at if row else None,
     }
 
@@ -10925,6 +11273,9 @@ def _pre_screen_read(state: dict) -> ApplicationPreScreenRead:
         complete=state["complete"],
         blockers=state["blockers"],
         routing_result=state["routing_result"],
+        self_report_routing_result=state.get("self_report_routing_result"),
+        verified_routing_result=state.get("verified_routing_result"),
+        routing_history=state.get("routing_history", []),
         completed_at=state["completed_at"],
     )
 
@@ -10975,12 +11326,26 @@ async def patch_application_pre_screen(
     owner_answers = dict(row.owner_answers or {})
     if body.refinance_debt is not None:
         file_answers["refinance_debt"] = body.refinance_debt
+    if body.file_answers is not None:
+        incoming_file = dict(body.file_answers)
+        unknown_file = set(incoming_file) - set(application_prescreen.ALLOWED_FILE_FIELDS)
+        if unknown_file:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Unsupported business eligibility fields: {', '.join(sorted(unknown_file))}",
+            )
+        if any(not isinstance(value, bool) for value in incoming_file.values()):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Business eligibility answers must be yes or no.",
+            )
+        file_answers.update(incoming_file)
     if body.owner_id is not None:
         owner = next((item for item in owner_state["owners"] if item.id == body.owner_id), None)
         if owner is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
         incoming = dict(body.owner_answers or {})
-        unknown = set(incoming) - set(application_prescreen.REQUIRED_OWNER_FIELDS)
+        unknown = set(incoming) - set(application_prescreen.ALLOWED_OWNER_FIELDS)
         if unknown:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -10992,13 +11357,42 @@ async def patch_application_pre_screen(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid bankruptcy timing")
         if "felony_timing" in current and current["felony_timing"] not in application_prescreen.FELONY_VALUES:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid felony timing")
+        if "residency_status" in current and current["residency_status"] not in application_prescreen.RESIDENCY_VALUES:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid residency status")
+        owner_boolean_fields = set(application_prescreen.REQUIRED_OWNER_FIELDS) - {
+            "residency_status", "bankruptcy_timing", "felony_timing"
+        }
+        invalid_boolean_fields = sorted(
+            key for key in owner_boolean_fields
+            if key in current and not isinstance(current.get(key), bool)
+        )
+        if invalid_boolean_fields:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Owner eligibility answers must be yes or no: {', '.join(invalid_boolean_fields)}",
+            )
         owner_answers[str(owner.id)] = current
 
+    prior_snapshot = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "rules_version": row.rules_version,
+        "file_answers": dict(row.file_answers or {}),
+        "owner_answers": dict(row.owner_answers or {}),
+        "self_report_routing_result": row.self_report_routing_result or row.routing_result,
+        "verified_routing_result": row.verified_routing_result,
+    }
+    history = list(row.routing_history or [])
+    if prior_snapshot["file_answers"] or prior_snapshot["owner_answers"]:
+        history.append(prior_snapshot)
+    row.rules_version = application_prescreen.RULES_VERSION
+    row.routing_history = history[-25:]
     row.file_answers = file_answers
     row.owner_answers = owner_answers
     await db.flush()
     state = await _application_pre_screen_state(db, dealer, owner_state)
     row.routing_result = state["routing_result"]
+    row.self_report_routing_result = state["self_report_routing_result"]
+    row.verified_routing_result = state["verified_routing_result"]
     if state["complete"]:
         row.completed_at = row.completed_at or datetime.now(timezone.utc)
         row.completed_by_user_id = user.id
@@ -11627,6 +12021,8 @@ async def rep_production(
             await db.execute(
                 select(
                     DealerDocument.dealer_id,
+                    DealerDocument.content_type,
+                    DealerDocument.plaid_item_id,
                     DealerDocument.kind,
                     DealerDocument.detected_kind,
                     DealerDocument.extracted,
@@ -11636,9 +12032,11 @@ async def rep_production(
                 )
             )
         ).all()
-        for did, kind, detected_kind, extracted in extracted_doc_rows:
+        for did, content_type, plaid_item_id, kind, detected_kind, extracted in extracted_doc_rows:
             effective = detected_kind or _KIND_TO_DETECTED.get(kind)
             if effective != "bank_statement":
+                continue
+            if plaid_item_id is None and str(content_type or "").lower() != "application/pdf":
                 continue
             for m in (extracted or {}).get("months") or []:
                 key = str(m.get("month") or "") if isinstance(m, dict) else ""
@@ -11650,25 +12048,10 @@ async def rep_production(
         # otherwise fire twelve hundred queries to draw six bars.
         linked = {
             did
-            for (did,) in (
-                await db.execute(
-                    select(DealerPlaidItem.dealer_id)
-                    .where(
-                        DealerPlaidItem.dealer_id.in_(dealer_ids),
-                        DealerPlaidItem.status == "active",
-                        DealerPlaidItem.environment == plaid_client.environment(),
-                    )
-                    .distinct()
-                )
-            ).all()
-        }
-        uploaded_bank = {
-            did
             for did, months in statement_months.items()
-            if len(months) >= 6
-            and not recurrence.compute_freshness(months, date.today()).get("missing_months")
+            if len(months) >= 3
+            and not recurrence.compute_freshness(months, date.today(), window=3).get("missing_months")
         }
-        linked |= uploaded_bank
         pulled = {
             did
             for (did,) in (

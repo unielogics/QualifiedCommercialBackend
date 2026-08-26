@@ -40,6 +40,14 @@ class DealerCreate(BaseModel):
     state: str | None = None
     zip: str | None = None
     industry: str = "auto_dealer"
+    industry_label: str | None = None
+    subindustry: str | None = None
+    subindustry_label: str | None = None
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
+    naics_code: str | None = Field(default=None, min_length=6, max_length=6)
+    naics_label: str | None = Field(default=None, min_length=1, max_length=180)
     notes: str | None = None
     funding_goal: float = Field(gt=0, le=999_999_999_999.99)
     funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
@@ -115,6 +123,12 @@ class DealerUpdate(BaseModel):
     state: str | None = None
     zip: str | None = None
     industry: str | None = None
+    industry_label: str | None = None
+    subindustry: str | None = None
+    subindustry_label: str | None = None
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
     status: str | None = None
     notes: str | None = None
     # Team links (or unlinks) a dealer self-serve login to this business.
@@ -150,6 +164,12 @@ class DealerRead(ORM):
     state: str | None = None
     zip: str | None = None
     industry: str
+    industry_label: str | None = None
+    subindustry: str | None = None
+    subindustry_label: str | None = None
+    industry_entry_id: UUID | None = None
+    subindustry_entry_id: UUID | None = None
+    activity_entry_id: UUID | None = None
     status: str
     notes: str | None = None
     bucket_id: UUID | None = None
@@ -548,6 +568,22 @@ class SessionCreate(BaseModel):
 class ApplicationProfileRead(ORM):
     id: UUID
     dealer_id: UUID
+    dba_name: str | None = None
+    website: str | None = None
+    state_of_formation: str | None = None
+    location_type: str | None = None
+    mailing_address: str | None = None
+    mailing_city: str | None = None
+    mailing_state: str | None = None
+    mailing_zip: str | None = None
+    annual_sales: float | None = None
+    annual_cash_flow_available_for_debt: float | None = None
+    monthly_debt_payments: float | None = None
+    signer_title: str | None = None
+    human_review_status: Literal["pending", "fundable", "not_fundable"] = "pending"
+    human_review_note: str | None = None
+    human_reviewed_at: datetime | None = None
+    human_reviewed_by_user_id: UUID | None = None
     landlord_mortgagee: str | None = None
     guarantor_home_address: str | None = None
     guarantor_dob: date | None = None
@@ -561,6 +597,18 @@ class ApplicationProfileRead(ORM):
 
 
 class ApplicationProfilePatch(BaseModel):
+    dba_name: str | None = Field(default=None, max_length=180)
+    website: str | None = Field(default=None, max_length=500)
+    state_of_formation: str | None = Field(default=None, max_length=2)
+    location_type: str | None = Field(default=None, max_length=32)
+    mailing_address: str | None = Field(default=None, max_length=300)
+    mailing_city: str | None = Field(default=None, max_length=120)
+    mailing_state: str | None = Field(default=None, max_length=2)
+    mailing_zip: str | None = Field(default=None, max_length=12)
+    annual_sales: float | None = Field(default=None, ge=0)
+    annual_cash_flow_available_for_debt: float | None = Field(default=None, ge=0)
+    monthly_debt_payments: float | None = Field(default=None, ge=0)
+    signer_title: str | None = Field(default=None, max_length=120)
     landlord_mortgagee: str | None = Field(default=None, max_length=200)
     guarantor_home_address: str | None = Field(default=None, max_length=300)
     guarantor_dob: date | None = None
@@ -568,6 +616,29 @@ class ApplicationProfilePatch(BaseModel):
     term_requested_months: int | None = Field(default=None, ge=1, le=360)
     collateral_description: str | None = Field(default=None, max_length=4000)
     use_of_proceeds_text: str | None = Field(default=None, max_length=4000)
+
+
+class ApplicationHumanReviewPatch(BaseModel):
+    status: Literal["pending", "fundable", "not_fundable"]
+    note: str | None = Field(default=None, max_length=4000)
+
+
+class SubmissionReadinessItem(BaseModel):
+    requirement: str
+    status: Literal["complete", "missing", "supplemental", "not_applicable"]
+    evidence: str
+    route: str = "all"
+    source: str | None = None
+
+
+class SubmissionReadinessRead(BaseModel):
+    ready: bool = False
+    route_key: str | None = None
+    route_label: str | None = None
+    human_review_status: Literal["pending", "fundable", "not_fundable"] = "pending"
+    rules_version: str | None = None
+    items: list[SubmissionReadinessItem] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
 
 
 class BookingAvailabilitySlot(BaseModel):
@@ -897,6 +968,7 @@ class VerificationRead(BaseModel):
 
 class ApplicationPreScreenPatch(BaseModel):
     refinance_debt: bool | None = None
+    file_answers: dict | None = None
     owner_id: UUID | None = None
     owner_answers: dict | None = None
 
@@ -911,6 +983,9 @@ class ApplicationPreScreenRead(BaseModel):
     complete: bool = False
     blockers: list[str] = Field(default_factory=list)
     routing_result: dict | None = None
+    self_report_routing_result: dict | None = None
+    verified_routing_result: dict | None = None
+    routing_history: list[dict] = Field(default_factory=list)
     completed_at: datetime | None = None
 
 
@@ -948,6 +1023,7 @@ class ContractTemplateRead(ORM):
     active: bool = True
     # Derived convenience: paper uploaded and at least one field mapped.
     s3_key: str | None = None
+    render_kind: Literal["uploaded_pdf", "generated_html"] = "uploaded_pdf"
 
 
 class ContractDocRead(ORM):
@@ -959,6 +1035,8 @@ class ContractDocRead(ORM):
     filled_sha256: str | None = None
     signed_at: datetime | None = None
     signer_name: str | None = None
+    signer_title: str | None = None
+    signature_sha256: str | None = None
     updated_at: datetime
 
 
@@ -1041,7 +1119,7 @@ class DocumentCoverageRead(BaseModel):
     needs to collect vs. what the extracted documents already cover."""
 
     statement_months: list[str] = []   # distinct "YYYY-MM" covered by statements/periods
-    statement_target: int = 6
+    statement_target: int = 3
     tax_years: list[int] = []          # years with a dos_tax_filings row
     tax_target: int = 2
     has_pl: bool = False
@@ -1049,7 +1127,7 @@ class DocumentCoverageRead(BaseModel):
     open_doc_requests: int = 0
     # Freshness (deterministic date math vs. today — services.recurrence):
     current_through: str | None = None  # latest covered "YYYY-MM", null = no coverage
-    expected_months: list[str] = []     # the 6 most recent COMPLETED months
+    expected_months: list[str] = []     # the 3 most recent COMPLETED months
     missing_months: list[str] = []      # expected minus covered, sorted
     is_current: bool = False            # the most recent completed month is covered
     days_since_latest: int | None = None  # days from END of latest covered month to today
@@ -1405,6 +1483,7 @@ class RoomFeaturesRead(BaseModel):
     bank_connections: list[PublicPlaidItemRead] = Field(default_factory=list)
     plaid_assets_enabled: bool = False
     signable: list[RoomSignableRead] = []
+    contracts: list["RoomContractRead"] = Field(default_factory=list)
 
 
 class RoomContractRead(BaseModel):
@@ -1418,6 +1497,8 @@ class RoomContractRead(BaseModel):
     status: str
     agreement_text: str = ""
     commission_note: str | None = None
+    download_url: str | None = None
+    pdf_sha256: str | None = None
 
 
 class RoomContractSignRequest(RoomPasscode):
@@ -1439,6 +1520,9 @@ class RoomSignResult(BaseModel):
     signed: bool
     certificate_file_id: UUID | None = None
     message: str
+    execution_status: Literal["executed", "delivery_warning"] = "executed"
+    pdf_sha256: str | None = None
+    download_url: str | None = None
 
 
 class ClientRequestSend(BaseModel):
@@ -1476,7 +1560,7 @@ class BankEvidenceRead(BaseModel):
     bank_source: Literal["plaid", "upload", "none"] = "none"
     statement_months: list[str] = Field(default_factory=list)
     missing_statement_months: list[str] = []
-    statement_target: int = 6
+    statement_target: int = 3
     bucket_id: UUID | None = None
     upload_url: str | None = None
     passcode: str | None = None

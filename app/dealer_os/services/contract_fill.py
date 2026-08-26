@@ -44,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import User
 
 from ..models import ContractDocument, ContractTemplate, DealerBusiness, DealerOwner
-from . import storage
+from . import qc_master_application, storage
 
 logger = logging.getLogger(__name__)
 
@@ -388,10 +388,12 @@ async def generate(
     tpl = (
         await db.execute(select(ContractTemplate).where(ContractTemplate.key == key))
     ).scalar_one_or_none()
-    if tpl is None or not tpl.s3_key or not tpl.active:
+    if tpl is None or not tpl.active:
+        raise ValueError("That agreement is not available.")
+    if tpl.render_kind == "uploaded_pdf" and not tpl.s3_key:
         raise ValueError("That agreement has no uploaded paper yet.")
     verified = VERIFIED_REVISIONS.get(key)
-    if verified is None or tpl.revision != verified:
+    if tpl.render_kind == "uploaded_pdf" and (verified is None or tpl.revision != verified):
         raise ValueError(
             f"The overlay map for {key!r} is verified against revision {verified}, "
             f"but the uploaded paper is revision {tpl.revision}. Re-verify the map first."
@@ -411,12 +413,33 @@ async def generate(
             "cannot be replaced underneath them. Void it first if the terms changed."
         )
 
-    raw = storage.get_bytes(tpl.s3_key)
-    if raw is None:
-        raise RuntimeError("The template PDF could not be read from storage.")
-
-    values, missing_data = await build_values(db, dealer)
-    result = fill_pdf(key, raw, values)
+    if tpl.render_kind == "generated_html":
+        if key != qc_master_application.MASTER_TEMPLATE_KEY:
+            raise ValueError(f"No generated renderer is registered for {key!r}.")
+        context, readiness, pdf, sha256, missing_data = (
+            await qc_master_application.build_application(db, dealer)
+        )
+        result = FillResult(
+            pdf=pdf,
+            sha256=sha256,
+            placed={
+                "case_ref": context["case_ref"],
+                "business_name": context["business"]["legal_name"],
+                "authorized_signer": context["primary_signer"]["name"],
+                "signer_title": context["primary_signer"]["title"],
+                "route": context["route_label"],
+                "rules_version": context["rules_version"],
+                "submission_ready": "yes" if readiness["ready"] else "no",
+            },
+        )
+        ready = readiness["ready"]
+    else:
+        raw = storage.get_bytes(tpl.s3_key)
+        if raw is None:
+            raise RuntimeError("The template PDF could not be read from storage.")
+        values, missing_data = await build_values(db, dealer)
+        result = fill_pdf(key, raw, values)
+        ready = not missing_data
 
     s3_key = f"contract-fills/{dealer.id}/{key}/r{tpl.revision}-{result.sha256[:16]}.pdf"
     if not storage.put_bytes(s3_key, result.pdf, "application/pdf"):
@@ -429,6 +452,6 @@ async def generate(
     existing.field_values = result.placed
     existing.filled_s3_key = s3_key
     existing.filled_sha256 = result.sha256
-    existing.status = "ready" if not missing_data else "draft"
+    existing.status = "ready" if ready else "draft"
     await db.flush()
     return existing, result, missing_data

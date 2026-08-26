@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from .lender_neutral_routing import evaluate_direct_programs
+
 QUESTIONS: tuple[dict[str, Any], ...] = (
     {"key": "use_of_funds", "kind": "text", "en": "Describe exactly how the funds will be used.", "es": "Describa exactamente como se usaran los fondos."},
     {"key": "years_in_business", "kind": "number", "en": "How many years has the business operated?", "es": "¿Cuantos anos lleva operando el negocio?"},
     {"key": "annual_revenue", "kind": "money", "en": "What is the approximate annual revenue?", "es": "¿Cual es el ingreso anual aproximado?"},
-    {"key": "citizen_or_lpr", "kind": "boolean", "en": "Is the primary owner a U.S. citizen or legal permanent resident?", "es": "¿El propietario principal es ciudadano estadounidense o residente permanente legal?"},
+    {"key": "residency_status", "kind": "select", "options": ["citizen", "legal_permanent_resident", "other"], "en": "What is the primary owner's U.S. residency status?", "es": "¿Cual es el estatus migratorio del propietario principal en EE. UU.?"},
     {"key": "primary_owner_credit_660_or_higher", "kind": "boolean", "en": "Is the primary owner's estimated credit 660 or higher?", "es": "¿El credito estimado del propietario principal es 660 o mayor?"},
     {"key": "bankruptcy_timing", "kind": "select", "options": ["none", "within_3_years", "4_to_7_years", "more_than_7_years"], "en": "When was the primary owner's most recent bankruptcy?", "es": "¿Cuando fue la bancarrota mas reciente del propietario principal?"},
     {"key": "foreclosure_within_3_years", "kind": "boolean", "en": "Has the primary owner had a foreclosure in the last 3 years?", "es": "¿El propietario principal tuvo una ejecucion hipotecaria en los ultimos 3 anos?"},
@@ -27,11 +29,32 @@ QUESTIONS: tuple[dict[str, Any], ...] = (
     {"key": "nsf_count", "kind": "number", "en": "How many NSF charges appear in the review period?", "es": "¿Cuantos cargos NSF aparecen en el periodo revisado?"},
     {"key": "negative_balance_days", "kind": "number", "en": "How many negative-balance days occurred?", "es": "¿Cuantos dias hubo saldo negativo?"},
     {"key": "official_bank_statements", "kind": "boolean", "en": "Can the business provide official downloaded bank statements?", "es": "¿Puede el negocio proporcionar estados bancarios oficiales descargados?"},
-    {"key": "business_dscr", "kind": "number", "en": "What is the estimated business DSCR, if known?", "es": "¿Cual es el DSCR comercial estimado, si se conoce?"},
+    {"key": "average_monthly_bank_deposits", "kind": "money", "en": "What were the average monthly deposits across the 3 current business bank statements?", "es": "¿Cuales fueron los depositos mensuales promedio en los 3 estados bancarios actuales?"},
+    {"key": "annual_cash_flow_available_for_debt", "kind": "money", "en": "How much annual business cash flow is available to pay debt?", "es": "¿Cuanto flujo de caja anual del negocio esta disponible para pagar deudas?"},
+    {"key": "monthly_debt_payments", "kind": "money", "en": "What are the business's current total monthly debt payments? Include loans, equipment, MCA, SBA, mortgages, and other required business debt payments.", "es": "¿Cual es el total actual de pagos mensuales de deuda del negocio? Incluya prestamos, equipo, MCA, SBA, hipotecas y otras deudas obligatorias."},
     {"key": "misdemeanor_5y", "kind": "boolean", "en": "Has the primary owner had a misdemeanor in the last 5 years?", "es": "¿El propietario principal tuvo un delito menor en los ultimos 5 anos?"},
-    {"key": "open_tax_liens_or_judgments", "kind": "boolean", "en": "Are there open tax liens or judgments?", "es": "¿Hay gravamenes fiscales o sentencias abiertas?"},
+    {"key": "misdemeanor_involving_minor", "kind": "boolean", "en": "Has the primary owner ever had a misdemeanor involving a minor?", "es": "¿El propietario principal ha tenido un delito menor relacionado con un menor?"},
+    {"key": "arrest_within_6_months", "kind": "boolean", "en": "Has the primary owner been arrested within the last 6 months?", "es": "¿El propietario principal fue arrestado en los ultimos 6 meses?"},
+    {"key": "financial_related_crime", "kind": "boolean", "en": "Has the primary owner had a financial-related crime?", "es": "¿El propietario principal ha tenido un delito financiero?"},
+    {"key": "open_tax_liens", "kind": "boolean", "en": "Are there any open tax liens?", "es": "¿Hay gravamenes fiscales abiertos?"},
+    {"key": "tax_liability_over_10000", "kind": "boolean", "en": "Is any outstanding tax liability above $10,000?", "es": "¿Alguna deuda fiscal pendiente supera $10,000?"},
+    {"key": "tax_payment_plan_current", "kind": "boolean", "en": "Is that tax liability on a current payment plan and being paid as agreed?", "es": "¿Esa deuda fiscal tiene un plan de pago vigente y al dia?"},
+    {"key": "open_judgments", "kind": "boolean", "en": "Are there any open judgments?", "es": "¿Hay sentencias abiertas?"},
+    {"key": "open_civil_actions_as_defendant", "kind": "boolean", "en": "Is the business or primary owner currently a defendant in a civil action?", "es": "¿El negocio o propietario principal es actualmente demandado en una accion civil?"},
+    {"key": "civil_action_financial_institution_within_10_years", "kind": "boolean", "en": "Within 10 years, has a financial institution brought a civil action against the business or primary owner?", "es": "En los ultimos 10 anos, ¿una institucion financiera inicio una accion civil contra el negocio o propietario?"},
+    {"key": "judgment_over_2000_within_12_months", "kind": "boolean", "en": "Was a judgment above $2,000 filed within the past 12 months?", "es": "¿Se presento una sentencia superior a $2,000 en los ultimos 12 meses?"},
+    {"key": "judgment_over_50000_within_7_years", "kind": "boolean", "en": "Was a judgment of $50,000 or more filed within the past 7 years?", "es": "¿Se presento una sentencia de $50,000 o mas en los ultimos 7 anos?"},
+    {"key": "aggregate_liens_judgments_over_25000_within_7_years", "kind": "boolean", "en": "Did aggregate tax liens and judgments reach $25,000 or more within the past 7 years?", "es": "¿Los gravamenes fiscales y sentencias sumaron $25,000 o mas en los ultimos 7 anos?"},
+    {"key": "term_obligations_released_or_on_plan", "kind": "boolean", "en": "Are those disclosed liens or judgments released or on a current payment plan?", "es": "¿Esos gravamenes o sentencias fueron liberados o estan en un plan de pago vigente?"},
     {"key": "ofac_match", "kind": "boolean", "en": "Is the primary owner aware of an OFAC sanctions match?", "es": "¿El propietario principal conoce una coincidencia con sanciones de OFAC?"},
     {"key": "active_legal_charges", "kind": "boolean", "en": "Are there active criminal or disqualifying legal charges?", "es": "¿Hay cargos penales activos u otros cargos legales descalificadores?"},
+    {"key": "speculative_real_estate_flipping", "kind": "boolean", "en": "Is the primary business speculative real-estate flipping?", "es": "¿La actividad principal es la reventa especulativa de bienes raices?"},
+    {"key": "gambling_or_bail_bonds", "kind": "boolean", "en": "Does the business operate gambling or bail-bond services?", "es": "¿El negocio ofrece juegos de azar o fianzas judiciales?"},
+    {"key": "lending_investment_crypto_mlm", "kind": "boolean", "en": "Is the business primarily lending, investment, crypto, or multi-level marketing?", "es": "¿El negocio se dedica principalmente a prestamos, inversiones, cripto o mercadeo multinivel?"},
+    {"key": "nonprofit_or_government", "kind": "boolean", "en": "Is the applicant a nonprofit or government entity?", "es": "¿El solicitante es una entidad sin fines de lucro o gubernamental?"},
+    {"key": "marijuana_or_firearms", "kind": "boolean", "en": "Is the business marijuana- or firearm-related?", "es": "¿El negocio esta relacionado con marihuana o armas de fuego?"},
+    {"key": "prurient_business", "kind": "boolean", "en": "Is the business adult-oriented or prurient in nature?", "es": "¿El negocio es de naturaleza adulta o pruriente?"},
+    {"key": "auto_or_title_asset_sales", "kind": "boolean", "en": "Does the business sell auto- or title-secured assets as its primary activity?", "es": "¿La actividad principal vende activos garantizados por autos o titulos?"},
     {"key": "real_estate_involved", "kind": "boolean", "en": "Does the request involve purchasing, refinancing, improving, or leveraging real estate?", "es": "¿La solicitud implica comprar, refinanciar, mejorar o aprovechar bienes raices?"},
     {"key": "real_estate_purpose", "kind": "select", "options": ["purchase", "refinance", "cash_out", "construction", "other"], "en": "What is the real-estate purpose?", "es": "¿Cual es el proposito relacionado con los bienes raices?"},
     {"key": "owned_real_estate_available", "kind": "boolean", "en": "Can owned real estate support the request as collateral?", "es": "¿Puede un inmueble propio respaldar la solicitud como garantia?"},
@@ -364,4 +387,78 @@ def screen_products(answers: dict[str, Any], locale: str = "en") -> dict[str, An
         "canonical_naics_code": naics,
         "next_question": unanswered[0] if unanswered else None,
         "evaluated_programs": exact + advisory,
+    }
+
+
+# Product Finder and formal applications intentionally terminate in the same
+# deterministic service. The original implementation above is retained only
+# to keep historical snapshot code readable; this final definition is the
+# exported runtime implementation.
+def screen_products(answers: dict[str, Any], locale: str = "en") -> dict[str, Any]:  # noqa: F811
+    locale = "es" if locale == "es" else "en"
+    facts = dict(answers)
+    if facts.get("verified_dscr") in (None, "") and facts.get("business_dscr") not in (None, ""):
+        # Compatibility for previously stored Product Finder sessions. New
+        # sessions collect cash flow and debt payments and calculate DSCR.
+        facts["verified_dscr"] = facts["business_dscr"]
+    if facts.get("residency_status") in (None, "") and isinstance(facts.get("citizen_or_lpr"), bool):
+        facts["residency_status"] = "citizen" if facts["citizen_or_lpr"] else "other"
+    if facts.get("annualized_bank_sales") in (None, ""):
+        average_monthly_deposits = _number(facts, "average_monthly_bank_deposits")
+        if average_monthly_deposits is not None:
+            facts["annualized_bank_sales"] = round(average_monthly_deposits * 12, 2)
+
+    direct = evaluate_direct_programs(facts)
+    exact = direct["evaluated_programs"]
+    if locale == "es":
+        names = {
+            "term_loan_3_5_year": "Prestamo comercial de 3 a 5 anos",
+            "term_loan_10_year": "Capital de trabajo a 10 anos",
+        }
+        common = {
+            "At least 2 years in business are required.": "Se requieren al menos 2 anos en operacion.",
+            "Annual revenue is below the $50,000 minimum.": "Los ingresos anuales estan por debajo del minimo de $50,000.",
+            "The requested amount is outside the $25,000-$500,000 range.": "El monto esta fuera del rango de $25,000-$500,000.",
+            "The requested amount is outside the $15,000-$50,000 range.": "El monto esta fuera del rango de $15,000-$50,000.",
+        }
+        for row in exact:
+            row["name"] = names.get(row["program_key"], row["name"])
+            row["borrower_safe_reasons"] = [common.get(value, value) for value in row["borrower_safe_reasons"]]
+            row["blocked_by"] = list(row["borrower_safe_reasons"])
+
+    real_estate = _properties(facts)
+    advisory = _advisory_results(facts, locale, direct.get("canonical_naics_code"), real_estate)
+    unanswered: list[dict[str, Any]] = []
+    for question in QUESTIONS:
+        key = question["key"]
+        if key in {"real_estate_purpose", "owned_real_estate_available"} and facts.get("real_estate_involved") is False:
+            continue
+        if key == "youngest_mca_days" and _number(facts, "mca_count") == 0:
+            continue
+        if key == "tax_payment_plan_current" and facts.get("tax_liability_over_10000") is not True:
+            continue
+        if key == "term_obligations_released_or_on_plan" and not (
+            facts.get("judgment_over_50000_within_7_years") is True
+            or facts.get("aggregate_liens_judgments_over_25000_within_7_years") is True
+        ):
+            continue
+        if facts.get(key) in (None, ""):
+            unanswered.append(question)
+
+    return {
+        **direct,
+        "source": "self_reported",
+        "screening_scope": "primary_owner",
+        "verification": (
+            "Propietario principal, autodeclarado y sin verificar"
+            if locale == "es"
+            else "Primary-owner, self-reported, and unverified"
+        ),
+        "advisory": advisory,
+        "real_estate_analysis": real_estate,
+        "next_question": unanswered[0] if unanswered else None,
+        "evaluated_programs": exact + advisory,
+        "recommended": [row for row in exact if row["status"] == "recommended"],
+        "potential": [row for row in exact if row["status"] == "potential"],
+        "blocked": [row for row in exact if row["status"] == "blocked"],
     }

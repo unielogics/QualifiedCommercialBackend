@@ -256,7 +256,9 @@ _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 EXPECTED_MONTHS_WINDOW = 6
 
 
-def compute_freshness(covered_months: Iterable[str], today: date) -> dict[str, Any]:
+def compute_freshness(
+    covered_months: Iterable[str], today: date, *, window: int = EXPECTED_MONTHS_WINDOW
+) -> dict[str, Any]:
     """Deterministic coverage freshness relative to `today` (injected — pure,
     unit-testable). Expected months are the EXPECTED_MONTHS_WINDOW most recent
     COMPLETED calendar months (for 2026-08-15 that is 2026-02..2026-07).
@@ -269,7 +271,9 @@ def compute_freshness(covered_months: Iterable[str], today: date) -> dict[str, A
     }
     y, m = today.year, today.month
     expected: list[str] = []
-    for _ in range(EXPECTED_MONTHS_WINDOW):
+    if window < 1 or window > 24:
+        raise ValueError("window must be between 1 and 24 months")
+    for _ in range(window):
         m -= 1
         if m == 0:
             y, m = y - 1, 12

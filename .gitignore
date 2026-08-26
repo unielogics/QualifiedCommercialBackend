@@ -28,6 +28,7 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+output/
 *.egg-info/
 
 # Terraform

@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import ContractDocument, DealerBusiness
-from . import storage
+from . import qc_master_application, storage
 
 logger = logging.getLogger(__name__)
 
@@ -76,29 +76,64 @@ def _stamp(
     import fitz
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-    spots = _SIGN_SPOTS.get(template_key, _SIGN_SPOTS["consulting_agreement"])
-    sx, sy = spots["signature"]
+    if template_key == qc_master_application.MASTER_TEMPLATE_KEY:
+        page = doc[-1]
+        marker = []
+        for page_index in range(doc.page_count - 1, -1, -1):
+            candidate = doc[page_index]
+            marker = candidate.search_for("SIGNATURE OF AUTHORIZED REPRESENTATIVE")
+            if marker:
+                page = candidate
+                break
+        anchor = marker[0] if marker else fitz.Rect(40, page.rect.height - 180, 300, page.rect.height - 160)
+        signature_placeholder = page.search_for("Electronic signature")
+        date_placeholder = page.search_for("Signed electronically after review")
+        signature_rect = signature_placeholder[0] if signature_placeholder else fitz.Rect(
+            anchor.x0, anchor.y1 + 20, min(anchor.x0 + 210, page.rect.width - 260), anchor.y1 + 62
+        )
+        date_rect = date_placeholder[0] if date_placeholder else fitz.Rect(
+            page.rect.width - 230, signature_rect.y0, page.rect.width - 40, signature_rect.y1
+        )
+        # Remove the unsigned placeholders before laying down the adopted signature and date.
+        # Leaving them visible makes the executed application look as if it has two signatures.
+        for placeholder in (*signature_placeholder, *date_placeholder):
+            page.add_redact_annot(
+                fitz.Rect(
+                    placeholder.x0 - 2,
+                    placeholder.y0 - 2,
+                    placeholder.x1 + 2,
+                    placeholder.y1 + 2,
+                ),
+                fill=(1, 1, 1),
+            )
+        if signature_placeholder or date_placeholder:
+            page.apply_redactions()
+        sx, sy = signature_rect.x0, signature_rect.y1 - 2
+        date_spot = (date_rect.x0, date_rect.y1 - 2)
+    else:
+        page = doc[0]
+        spots = _SIGN_SPOTS.get(template_key, _SIGN_SPOTS["consulting_agreement"])
+        sx, sy = spots["signature"]
+        date_spot = spots["date"]
     if signature_png:
-        rect = fitz.Rect(sx, sy - 26, sx + 150, sy + 2)
+        height = 38 if template_key == qc_master_application.MASTER_TEMPLATE_KEY else 28
+        rect = fitz.Rect(sx, sy - height, min(sx + 190, page.rect.width - 36), sy + 2)
         page.insert_image(rect, stream=signature_png, keep_proportion=True)
     else:
         # The conformed-signature convention for an adopted typed signature.
         page.insert_text((sx, sy), f"/s/ {typed_name}", fontname="helv", fontsize=11,
                          color=(0.08, 0.15, 0.36))
-    dx, dy = spots["date"]
+    dx, dy = date_spot
     page.insert_text((dx, dy), signed_at.strftime("%B %d, %Y"), fontname="helv",
                      fontsize=8, color=(0.08, 0.15, 0.36))
     return doc.tobytes(deflate=True)
 
 
-def _certificate_page(rows: list[tuple[str, str]], title: str) -> bytes:
-    from weasyprint import HTML
-
+def _certificate_html(rows: list[tuple[str, str]], title: str) -> str:
     row_html = "".join(
         f"<tr><th>{html_mod.escape(k)}</th><td>{html_mod.escape(v)}</td></tr>" for k, v in rows
     )
-    body = f"""
+    return f"""
     <html><head><style>
       body {{ font-family: Inter, Arial, sans-serif; color: #111827; margin: 44px; }}
       h1 {{ font-size: 20px; margin-bottom: 2px; }}
@@ -112,13 +147,19 @@ def _certificate_page(rows: list[tuple[str, str]], title: str) -> bytes:
       <h1>Certificate of Completion</h1>
       <div class="muted">{html_mod.escape(title)} — Qualified Commercial LLC</div>
       <table>{row_html}</table>
-      <div class="foot">This certificate is bound to the agreement it follows. The document
-      SHA-256 above was computed on the exact prepopulated agreement presented to the signer
-      before signing; the executed SHA-256 covers the signed document. Any alteration of
-      either file will no longer match its recorded hash. Electronic signature adopted under
-      the U.S. E-SIGN Act and UETA with the signer's recorded consent.</div>
+      <div class="foot">This certificate is bound to the agreement it follows. The pre-signing
+      SHA-256 was computed on the exact populated agreement presented to the signer. The signed
+      agreement SHA-256 was computed after the signature was embedded and before this certificate
+      was appended. The final executed-document SHA-256 is retained with the audit and delivery
+      record. Any alteration will no longer match the applicable recorded hash. Electronic
+      signature adopted under the U.S. E-SIGN Act and UETA with the signer's recorded consent.</div>
     </body></html>"""
-    pdf = HTML(string=body).write_pdf()
+
+
+def _certificate_page(rows: list[tuple[str, str]], title: str) -> bytes:
+    from weasyprint import HTML
+
+    pdf = HTML(string=_certificate_html(rows, title)).write_pdf()
     if pdf is None:
         raise RuntimeError("certificate render failed")
     return pdf
@@ -165,15 +206,18 @@ async def execute(
         raw, doc.template_key,
         typed_name=typed_name, signature_png=signature_png, signed_at=now,
     )
+    signed_body_sha = hashlib.sha256(stamped).hexdigest()
 
     cert_rows = [
         ("Agreement", title),
         ("Case", getattr(dealer, "case_ref", None) or str(dealer.id)),
         ("Client", dealer.legal_name or dealer.name or ""),
         ("Signer", typed_name),
+        ("Signer title", str((doc.field_values or {}).get("signer_title") or "")),
         ("Signature method", "Drawn on device" if signature_png else "Typed and adopted (/s/)"),
         ("Signature SHA-256", signature_sha256 or "typed adoption, no image"),
         ("Document SHA-256 (pre-signing)", doc.filled_sha256),
+        ("Signed agreement SHA-256 (before certificate)", signed_body_sha),
         ("E-SIGN consent recorded", now.isoformat()),
         ("Signed at", now.isoformat()),
         ("IP address", ip or ""),
@@ -201,6 +245,8 @@ async def execute(
     doc.esign_consent_ip = ip
     doc.signed_at = now
     doc.signer_name = typed_name
+    doc.signer_title = str((doc.field_values or {}).get("signer_title") or "") or None
+    doc.signature_sha256 = signature_sha256
     doc.signer_ip = ip
     doc.signer_user_agent = (user_agent or "")[:400]
     doc.status = "executed"

@@ -7,7 +7,7 @@ extraction dict:
     {
       "months": [{"month": "YYYY-MM", "total_deposits", "total_withdrawals",
                   "ending_balance", "average_ledger_balance",
-                  "low_daily_balance", "nsf_count"}],
+                  "low_daily_balance", "nsf_count", "negative_balance_dates"}],
       "transactions": [{"date": "YYYY-MM-DD", "description", "amount"}],
     }
 
@@ -264,6 +264,20 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
                     fields["nsf_count"] = max(0, int(float(nsf)))
                 except (TypeError, ValueError):
                     pass
+            negative_balance_dates: list[str] | None = None
+            raw_negative_dates = m.get("negative_balance_dates")
+            if isinstance(raw_negative_dates, list):
+                negative_balance_dates = []
+                for raw_date in raw_negative_dates:
+                    parsed = _parse_date(raw_date)
+                    if parsed is not None and parsed.year == y and parsed.month == mo:
+                        value = parsed.isoformat()
+                        if value not in negative_balance_dates:
+                            negative_balance_dates.append(value)
+                fields["liquidity"] = {
+                    "negative_balance_dates": negative_balance_dates,
+                    "negative_balance_days": len(negative_balance_dates),
+                }
             # Summary deposits/withdrawals only where the ledger has no events
             # for this month — otherwise rebuild_periods recomputes from events.
             if period not in event_periods:
@@ -281,6 +295,7 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
                     "average_ledger_balance": _num(m.get("average_ledger_balance")),
                     "low_daily_balance": _num(m.get("low_daily_balance")),
                     "nsf_count": fields.get("nsf_count"),
+                    "negative_balance_dates": negative_balance_dates,
                 }
             )
 
@@ -824,7 +839,8 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
   "months": [
     {"month": "YYYY-MM", "total_deposits": number|null, "total_withdrawals": number|null,
      "ending_balance": number|null, "average_ledger_balance": number|null,
-     "low_daily_balance": number|null, "nsf_count": number|null}
+     "low_daily_balance": number|null, "nsf_count": number|null,
+     "negative_balance_dates": ["YYYY-MM-DD"]}
   ],
   "transactions": [
     {"date": "YYYY-MM-DD", "description": "string", "amount": number}
@@ -843,6 +859,7 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 Rules:
 - "doc_type" is REQUIRED: classify what the document actually IS, regardless of what the uploader called it. Use "other" only when none of the listed types fits.
 - months[] and transactions[] are for BANK STATEMENTS: one months[] entry per statement month present in the document. For any non-statement document return "months": [] and "transactions": [].
+- negative_balance_dates must list each calendar date whose end-of-day balance is visibly negative. Return [] only when the full statement establishes there were none; use null when daily balances are not readable enough to determine this.
 - "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
 - "tax_years" is for TAX RETURNS: one entry per tax year covered, revenue = gross receipts / total revenue as reported on the return (null when not stated). [] for other documents.
 - "business_identity" is best-effort from ANY document that states it (tax returns and statements print these): legal_name = the entity's legal name as printed; ein = employer identification number formatted XX-XXXXXXX; naics_code = the business activity code when the return shows one. Null anything not clearly printed — never guess.
