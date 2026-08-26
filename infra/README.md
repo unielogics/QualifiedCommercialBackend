@@ -54,6 +54,24 @@ The `aws_secretsmanager_secret_version` resource creates a new version. The EC2 
 - Schema change → push to `main` → container start runs `alembic upgrade head` automatically.
 - Secret rotation → edit `terraform.tfvars` → `terraform apply` → trigger redeploy.
 
+## Production document-bucket CORS
+
+Browser uploads use short-lived, signed S3 `PUT` URLs. Keep the production
+bucket's CORS configuration synchronized with `s3-cors.production.json` so
+both authenticated web applications can send the signed content-type and
+server-side-encryption headers:
+
+```bash
+aws s3api put-bucket-cors \
+  --bucket qc-documents-prod \
+  --cors-configuration file://s3-cors.production.json \
+  --region us-east-1
+```
+
+Do not replace the explicit application origins with `*`. CORS only controls
+which browser origins may use a signed request; S3 objects remain private and
+still require a presigned URL and KMS-authorized backend identity.
+
 ## Tearing down what we added (without touching your hand-built infra)
 
 ```bash
