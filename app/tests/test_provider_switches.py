@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +145,30 @@ def test_sms_provider_selection_never_falls_back() -> None:
     assert status["configured"] is False
 
 
+def test_aws_readiness_requires_origination_identity() -> None:
+    missing_sender = Settings(_env_file=None, sms_provider="aws", sms_production=True)
+    assert provider_readiness(missing_sender) == {
+        "provider": "aws",
+        "configured": False,
+        "production": True,
+        "sender": None,
+        "detail": "AWS origination identity is not configured",
+    }
+
+    ready = Settings(
+        _env_file=None,
+        sms_provider="aws",
+        sms_production=True,
+        sms_origination_number="+12015550100",
+    )
+    status = provider_readiness(ready)
+    assert status["provider"] == "aws"
+    assert status["configured"] is True
+    assert status["production"] is True
+    assert status["sender"] == "+12015550100"
+    assert status["detail"] == "Ready"
+
+
 def test_invalid_twilio_signature_flag_fails_closed() -> None:
     settings = Settings(_env_file=None, twilio_validate_signatures="not-a-boolean-secret")
 
@@ -223,4 +248,42 @@ def test_twilio_outbound_uses_messaging_service_and_status_callback(monkeypatch)
         "Body": "Qualified Commercial test",
         "MessagingServiceSid": "MG123",
         "StatusCallback": "https://api.qualifiedcommercial.com/api/v1/webhooks/twilio/sms/status",
+    }
+
+
+def test_aws_outbound_uses_pinpoint_sms_voice_v2(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        aws_region="us-east-1",
+        sms_provider="aws",
+        sms_production=True,
+        sms_origination_number="+18555550100",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeAwsSmsClient:
+        def send_text_message(self, **kwargs: object) -> dict[str, str]:
+            captured["send_text_message"] = kwargs
+            return {"MessageId": "aws-message-123"}
+
+    fake_boto3 = SimpleNamespace(
+        client=lambda service, *, region_name: captured.update(service=service, region_name=region_name)
+        or FakeAwsSmsClient()
+    )
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(sms_provider, "get_settings", lambda: settings)
+
+    result = sms_provider.send_sms("+12015550100", "Qualified Commercial test")
+
+    assert result.ok is True
+    assert result.provider == "aws"
+    assert result.message_id == "aws-message-123"
+    assert result.status == "accepted"
+    assert captured["service"] == "pinpoint-sms-voice-v2"
+    assert captured["region_name"] == "us-east-1"
+    assert captured["send_text_message"] == {
+        "DestinationPhoneNumber": "+12015550100",
+        "OriginationIdentity": "+18555550100",
+        "MessageBody": "Qualified Commercial test",
+        "MessageType": "TRANSACTIONAL",
     }

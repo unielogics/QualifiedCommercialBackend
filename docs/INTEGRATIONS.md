@@ -51,6 +51,19 @@ Then set `SMS_PROVIDER=twilio`, `SMS_PRODUCTION=true`, and restart the backend.
 Switching back to AWS only requires `SMS_PROVIDER=aws` plus the existing AWS
 origination identity and webhook token.
 
+To use AWS End User Messaging, configure the production secret with:
+
+- `SMS_PROVIDER=aws`
+- `SMS_PRODUCTION=true`
+- `SMS_ORIGINATION_NUMBER=<AWS phone number, pool ARN, or sender identity>`
+- `SMS_WEBHOOK_TOKEN=<strong random token for inbound SMS callbacks>`
+
+The EC2 backend role must allow `sms-voice:SendTextMessage` for outbound
+transactional messages. It also needs `DescribeAccountAttributes`,
+`DescribePhoneNumbers`, `DescribePools`, and `DescribeSenderIds` for production
+readiness checks. The Terraform role policy in `infra/secrets.tf` includes
+these permissions.
+
 ## Geoapify address switch
 
 In the super-admin Settings page, save a Geoapify server API key and select

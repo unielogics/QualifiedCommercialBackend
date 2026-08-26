@@ -165,6 +165,53 @@ resource "aws_iam_role_policy" "qcbackend_ses_send" {
   })
 }
 
+resource "aws_iam_role_policy" "qcbackend_sms" {
+  name = "qcbackend-sms-end-user-messaging"
+  role = aws_iam_role.qcbackend_instance.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "SendTransactionalSmsFromConfiguredIdentities"
+        Effect = "Allow"
+        Action = [
+          "sms-voice:SendTextMessage"
+        ]
+        Resource = [
+          "arn:aws:sms-voice:${var.aws_region}:${data.aws_caller_identity.current.account_id}:phone-number/*",
+          "arn:aws:sms-voice:${var.aws_region}:${data.aws_caller_identity.current.account_id}:pool/*"
+        ]
+      },
+      {
+        Sid    = "ReadConfiguredSmsIdentities"
+        Effect = "Allow"
+        Action = [
+          "sms-voice:DescribePhoneNumbers"
+        ]
+        Resource = "arn:aws:sms-voice:${var.aws_region}:${data.aws_caller_identity.current.account_id}:phone-number/*"
+      },
+      {
+        Sid    = "ReadConfiguredSmsPools"
+        Effect = "Allow"
+        Action = [
+          "sms-voice:DescribePools",
+          "sms-voice:ListPoolOriginationIdentities"
+        ]
+        Resource = "arn:aws:sms-voice:${var.aws_region}:${data.aws_caller_identity.current.account_id}:pool/*"
+      },
+      {
+        Sid    = "ReadSmsAccountAttributes"
+        Effect = "Allow"
+        Action = [
+          "sms-voice:DescribeAccountAttributes"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # SSM Session Manager + patch agent — lets us shell into the box without SSH keys.
 resource "aws_iam_role_policy_attachment" "qcbackend_ssm" {
   role       = aws_iam_role.qcbackend_instance.name
