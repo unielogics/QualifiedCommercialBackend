@@ -202,7 +202,7 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     assert "raw credit score" in rendered
 
 
-def test_package_advances_to_step_five_before_human_decision() -> None:
+def test_package_reaches_signature_checkpoint_before_human_decision() -> None:
     context = _sample_context()
     context["profile"] = SimpleNamespace(
         human_review_status="pending",

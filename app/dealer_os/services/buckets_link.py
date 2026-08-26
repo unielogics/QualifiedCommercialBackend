@@ -143,12 +143,12 @@ def adapt_analysis_to_extraction(analysis: dict[str, Any]) -> dict[str, Any]:
     """Adapt one BucketFileAnalysis.analysis JSON (the bank-statement
     key_facts shape read by public_underwriting_packet_pdf.extract_bank_months:
     statement_period / total_deposits_and_credits / total_withdrawals_and_debits
-    / ending_balance / average_ledger_balance / low_daily_balance /
+    / beginning_balance / ending_balance / average_ledger_balance / low_daily_balance /
     nsf_or_overdraft_count, either flat or as a key_facts.months[] list) into
     the exact canonical dict services.extract.apply_extraction expects:
 
         {"months": [{"month": "YYYY-MM", "total_deposits", "total_withdrawals",
-                     "ending_balance", "average_ledger_balance",
+                     "beginning_balance", "ending_balance", "average_ledger_balance",
                      "low_daily_balance", "nsf_count"}],
          "transactions": []}
 
@@ -177,6 +177,11 @@ def adapt_analysis_to_extraction(analysis: dict[str, Any]) -> dict[str, Any]:
                 "total_deposits": _parse_amount(src.get("total_deposits_and_credits")),
                 # canonical shape wants withdrawals as a positive magnitude
                 "total_withdrawals": _abs_num(src.get("total_withdrawals_and_debits")),
+                "beginning_balance": _parse_amount(
+                    src.get("beginning_balance")
+                    if src.get("beginning_balance") is not None
+                    else src.get("starting_balance")
+                ),
                 "ending_balance": _parse_amount(src.get("ending_balance")),
                 "average_ledger_balance": _parse_amount(src.get("average_ledger_balance")),
                 "low_daily_balance": _parse_amount(src.get("low_daily_balance")),

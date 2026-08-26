@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import hashlib
 import html
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.application_profile import ApplicationTaxonomyEntry
 
 from ..models import (
@@ -260,7 +260,7 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
     metrics = dict(routing.get("calculated_metrics") or {})
 
     return {
-        "generated_at": datetime.now(timezone.utc),
+        "generated_at": datetime.now(UTC),
         "template_version": MASTER_VERSION,
         "rules_version": routing.get("rules_version") or (pre_screen.rules_version if pre_screen else RULES_VERSION),
         "case_ref": dealer.case_ref or str(dealer.id),
@@ -555,5 +555,10 @@ async def build_application(
     context = await build_context(db, dealer)
     readiness = build_readiness(context)
     pdf, sha256 = render_pdf(context, readiness)
-    missing = [row["requirement"] for row in readiness["items"] if row["status"] in {"missing", "supplemental"}]
+    missing = [
+        row["requirement"]
+        for row in readiness["items"]
+        if row["requirement"] != "Human-reviewed fundable path"
+        and row["status"] in {"missing", "supplemental"}
+    ]
     return context, readiness, pdf, sha256, missing

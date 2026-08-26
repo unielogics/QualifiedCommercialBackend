@@ -6,7 +6,7 @@ extraction dict:
 
     {
       "months": [{"month": "YYYY-MM", "total_deposits", "total_withdrawals",
-                  "ending_balance", "average_ledger_balance",
+                  "beginning_balance", "ending_balance", "average_ledger_balance",
                   "low_daily_balance", "nsf_count", "negative_balance_dates"}],
       "transactions": [{"date": "YYYY-MM-DD", "description", "amount"}],
     }
@@ -43,14 +43,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.ai.bedrock_client import get_client, model_heavy
 from app.services.ai.usage import tracked_messages_create
 
-from ..models import DealerCashEvent, DealerDebt, DealerDocument, DealerFinancialPeriod, DealerTaxFiling
+from ..models import (
+    DealerCashEvent,
+    DealerDebt,
+    DealerDocument,
+    DealerFinancialPeriod,
+    DealerTaxFiling,
+)
+from . import storage
 from .accounts import match_or_create_account
 from .engines import recompute_snapshot
 from .normalize import classify_with_rules, load_active_rules, period_of, rebuild_periods
 from .recurrence import stamp_recurrence
 from .refinance import FREQUENCY_MONTHLY_MULT, key_matches
 from .vendors import normalize_vendor
-from . import storage
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +143,9 @@ def _rows_from_table(raw_rows: list[list[Any]]) -> tuple[list[dict[str, Any]], l
     for i in range(start, len(raw_rows)):
         cells = raw_rows[i]
 
-        def cell(j: int) -> Any:
+        row_cells = tuple(cells)
+
+        def cell(j: int, cells=row_cells) -> Any:
             return cells[j] if j < len(cells) else ""
 
         d = _parse_date(cell(idx["date"]))
@@ -190,7 +198,7 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
     {
       "events":  [{occurred_on, period, description, amount, category, flags,
                    categorized_by}],
-      "period_upserts": {date(period): {deposits?, withdrawals?, ending_balance?,
+      "period_upserts": {date(period): {deposits?, withdrawals?, starting_balance?, ending_balance?,
                                         low_balance?, avg_daily_balance?, nsf_count?}},
       "event_periods": set[date],   # months whose ledger changed -> rebuild_periods
       "months": [...],              # normalized month summaries for doc.extracted
@@ -254,6 +262,11 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
                 continue
             period = date(y, mo, 1)
             fields: dict[str, Any] = {
+                "starting_balance": _num(
+                    m.get("beginning_balance")
+                    if m.get("beginning_balance") is not None
+                    else m.get("starting_balance")
+                ),
                 "ending_balance": _num(m.get("ending_balance")),
                 "avg_daily_balance": _num(m.get("average_ledger_balance")),
                 "low_balance": _num(m.get("low_daily_balance")),
@@ -291,6 +304,11 @@ def apply_extraction(extraction: dict[str, Any], rules: list[dict] | None = None
                     "month": f"{y:04d}-{mo:02d}",
                     "total_deposits": _num(m.get("total_deposits")),
                     "total_withdrawals": _num(m.get("total_withdrawals")),
+                    "beginning_balance": _num(
+                        m.get("beginning_balance")
+                        if m.get("beginning_balance") is not None
+                        else m.get("starting_balance")
+                    ),
                     "ending_balance": _num(m.get("ending_balance")),
                     "average_ledger_balance": _num(m.get("average_ledger_balance")),
                     "low_daily_balance": _num(m.get("low_daily_balance")),
@@ -838,7 +856,7 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
   "doc_type": "bank_statement|tax_return|profit_and_loss|balance_sheet|debt_schedule|loan_agreement|credit_report|other",
   "months": [
     {"month": "YYYY-MM", "total_deposits": number|null, "total_withdrawals": number|null,
-     "ending_balance": number|null, "average_ledger_balance": number|null,
+     "beginning_balance": number|null, "ending_balance": number|null, "average_ledger_balance": number|null,
      "low_daily_balance": number|null, "nsf_count": number|null,
      "negative_balance_dates": ["YYYY-MM-DD"]}
   ],
@@ -859,6 +877,7 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 Rules:
 - "doc_type" is REQUIRED: classify what the document actually IS, regardless of what the uploader called it. Use "other" only when none of the listed types fits.
 - months[] and transactions[] are for BANK STATEMENTS: one months[] entry per statement month present in the document. For any non-statement document return "months": [] and "transactions": [].
+- beginning_balance is the opening/starting balance printed for that statement month. Use null when it is not explicitly readable; never infer it from deposits and withdrawals.
 - negative_balance_dates must list each calendar date whose end-of-day balance is visibly negative. Return [] only when the full statement establishes there were none; use null when daily balances are not readable enough to determine this.
 - "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
 - "tax_years" is for TAX RETURNS: one entry per tax year covered, revenue = gross receipts / total revenue as reported on the return (null when not stated). [] for other documents.

@@ -1364,21 +1364,20 @@ async def generate_case_contract(
 ) -> ContractGenerateResult:
     """Prepopulate one agreement from what the case has collected.
 
-    Values come from steps 1-4 (client entity, principal, the 3% commission,
-    the use-of-funds sentence) and the rep on the case goes on the consultant
-    line — the rep is who signs at the bottom. Anything the case does not yet
-    know is NAMED as missing rather than defaulted: a blank on a legal
-    document must be a decision, not an accident."""
+    Values come from Steps 1-4. The primary owner or authorized representative
+    signs the master application in the secure client room. Anything the case
+    does not yet know is named as missing rather than defaulted: a blank on a
+    legal document must be a decision, not an accident."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     if key == qc_master_application.MASTER_TEMPLATE_KEY:
         readiness = qc_master_application.build_readiness(
             await qc_master_application.build_context(db, dealer)
         )
-        if not readiness["ready"]:
+        if not readiness["package_ready"]:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "A super-admin fundable decision is required before generating the QC application.",
+                "Complete the Step 4 underwriting package before generating the QC application.",
             )
     try:
         doc, result, missing = await contract_fill.generate(db, dealer, key)
@@ -1442,15 +1441,16 @@ async def send_contract_for_signature(
         readiness = qc_master_application.build_readiness(
             await qc_master_application.build_context(db, dealer)
         )
-        if not readiness["ready"]:
+        if not readiness["package_ready"]:
             open_items = [
                 row["requirement"]
                 for row in readiness["items"]
-                if row["status"] in {"missing", "supplemental"}
+                if row["requirement"] != "Human-reviewed fundable path"
+                and row["status"] in {"missing", "supplemental"}
             ]
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "The QC application cannot be released yet: " + "; ".join(open_items[:5]),
+                "The QC application cannot be sent yet: " + "; ".join(open_items[:5]),
             )
     doc.status = "out_for_signature"
     await db.flush()

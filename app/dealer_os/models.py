@@ -252,6 +252,7 @@ class DealerFinancialPeriod(TimestampMixin, Base):
     debt_service: Mapped[float | None] = mapped_column(Numeric(14, 2))
     deposits: Mapped[float | None] = mapped_column(Numeric(14, 2))
     withdrawals: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    starting_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
     ending_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
     low_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
     avg_daily_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))

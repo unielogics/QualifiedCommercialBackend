@@ -32,11 +32,9 @@ generated — the same association-of-record discipline as the sign flow.
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -124,7 +122,7 @@ async def build_values(
     if dealer.owner_user_id:
         rep = await db.get(User, dealer.owner_user_id)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     full_addr = ", ".join(
         x for x in (dealer.address, dealer.city, f"{dealer.state or ''} {dealer.zip or ''}".strip()) if x
     )
@@ -429,10 +427,10 @@ async def generate(
                 "signer_title": context["primary_signer"]["title"],
                 "route": context["route_label"],
                 "rules_version": context["rules_version"],
-                "submission_ready": "yes" if readiness["ready"] else "no",
+                "package_ready_for_signature": "yes" if readiness["package_ready"] else "no",
             },
         )
-        ready = readiness["ready"]
+        ready = readiness["package_ready"]
     else:
         raw = storage.get_bytes(tpl.s3_key)
         if raw is None:

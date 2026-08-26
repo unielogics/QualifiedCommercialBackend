@@ -12,22 +12,22 @@ transaction boundary.
 from __future__ import annotations
 
 import types
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
-from typing import Iterable
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.underwriting_intelligence import calculate_dscr
 
 from ..models import (
     DealerAccount,
-    DealerBusiness,
     DealerAddback,
-    DealerCashEvent,
     DealerAlert,
+    DealerBusiness,
+    DealerCashEvent,
     DealerDebt,
     DealerFinancialPeriod,
     DealerMetricLineage,
@@ -500,7 +500,7 @@ async def load_metric_inputs(
             legacy_rows = [r for r in rows if r.account_id is None]
             tagged_rows = [r for r in rows if r.account_id is not None]
 
-            def _sum(field):
+            def _sum(field, legacy_rows=legacy_rows, tagged_rows=tagged_rows, rows=rows):
                 # A legacy (blended) statement row already contains whatever
                 # tagged rows re-attribute from it — summing both double-
                 # counts (user-confirmed defect). When both exist, take the
@@ -517,7 +517,7 @@ async def load_metric_inputs(
                     return max(a, b)
                 return _tot(rows)
 
-            def _pref(field):
+            def _pref(field, rows=rows):
                 for r in rows:
                     v = getattr(r, field)
                     if v is not None:
@@ -540,6 +540,7 @@ async def load_metric_inputs(
                 ebitda_reported=_pref("ebitda_reported"),
                 debt_service=_pref("debt_service"),
                 avg_daily_balance=_pref("avg_daily_balance"),
+                starting_balance=_pref("starting_balance"),
                 ending_balance=_pref("ending_balance"),
                 low_balance=_pref("low_balance"),
             )
@@ -575,6 +576,7 @@ async def load_metric_inputs(
             "ebitda_reported": _f(p.ebitda_reported),
             "debt_service": _f(p.debt_service),
             "avg_daily_balance": _f(p.avg_daily_balance),
+            "starting_balance": _f(p.starting_balance),
             "ending_balance": _f(p.ending_balance),
             "low_balance": _f(p.low_balance),
             "nsf_count": int(p.nsf_count or 0),
@@ -650,8 +652,8 @@ async def load_metric_inputs(
     observed_avg_by_debt: dict = {}
     event_rows = []
     if period_rows:
-        from .vendors import DEBT_CATEGORIES, rollup_vendors
         from ..models import DealerCategoryRule
+        from .vendors import rollup_vendors
 
         rule_rows = (
             (
@@ -696,9 +698,8 @@ async def load_metric_inputs(
             # (origin='admin', count_in_dscr=false) pull their vendors out.
             draft_keys = {v.key for v in rolled if v.debt_like}
             if debt_keys or draft_keys:
-                from .vendors import normalize_vendor
-
                 from .refinance import key_matches as _km
+                from .vendors import normalize_vendor
                 excluded_rows = (
                     (
                         await db.execute(
@@ -750,7 +751,8 @@ async def load_metric_inputs(
         # Per-schedule-row observed averages (containment-tolerant identity —
         # the same matcher the refinance workbench uses).
         if dscr_debt_rows and event_rows:
-            from .refinance import key_matches as _km_sib, observed_monthly as _debt_observed
+            from .refinance import key_matches as _km_sib
+            from .refinance import observed_monthly as _debt_observed
             from .vendors import normalize_vendor as _norm_sib
 
             attributable = event_rows
@@ -778,7 +780,8 @@ async def load_metric_inputs(
                         sum(by_m.get(m, 0.0) for m in months_covered) / n_months, 2
                     )
 
-    from .refinance import key_matches as _km_rows, monthly_equivalent as _stated_monthly
+    from .refinance import key_matches as _km_rows
+    from .refinance import monthly_equivalent as _stated_monthly
 
     drafted_monthly = 0.0
     _counted_keys: list = []

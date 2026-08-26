@@ -378,6 +378,7 @@ class PeriodRead(ORM):
     debt_service: float | None = None
     deposits: float | None = None
     withdrawals: float | None = None
+    starting_balance: float | None = None
     ending_balance: float | None = None
     low_balance: float | None = None
     avg_daily_balance: float | None = None
@@ -396,6 +397,7 @@ class PeriodUpsert(BaseModel):
     debt_service: float | None = None
     deposits: float | None = None
     withdrawals: float | None = None
+    starting_balance: float | None = None
     ending_balance: float | None = None
     low_balance: float | None = None
     avg_daily_balance: float | None = None
