@@ -396,13 +396,27 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         ),
         _status("Human-reviewed fundable path", "complete" if human_status == "fundable" else "missing", getattr(profile, "human_review_note", None) or human_status.replace("_", " ").title(), source="Qualified Commercial desk"),
     ]
-    relevant = [row for row in items if row["status"] != "not_applicable"]
-    ready = bool(route_key and relevant and all(row["status"] == "complete" for row in relevant))
+    package_items = [
+        row
+        for row in items
+        if row["status"] != "not_applicable"
+        and row["requirement"] != "Human-reviewed fundable path"
+    ]
+    package_ready = bool(
+        route_key
+        and package_items
+        and all(row["status"] == "complete" for row in package_items)
+    )
+    ready = bool(package_ready and human_status == "fundable")
     return {
         "ready": ready,
+        "package_ready": package_ready,
         "route_key": route_key,
         "route_label": context.get("route_label"),
         "human_review_status": human_status,
+        "human_review_note": getattr(profile, "human_review_note", None),
+        "human_reviewed_at": getattr(profile, "human_reviewed_at", None),
+        "human_reviewed_by_user_id": getattr(profile, "human_reviewed_by_user_id", None),
         "rules_version": context.get("rules_version"),
         "items": items,
         "counts": {

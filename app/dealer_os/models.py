@@ -85,6 +85,9 @@ class DealerBusiness(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealer_groups.id", ondelete="SET NULL")
     )
     funding_goal: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    # Final amount actually funded. This is a desk-controlled closing fact,
+    # separate from both the client's request and the working funding goal.
+    funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     client_requested_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     application_lifecycle: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"

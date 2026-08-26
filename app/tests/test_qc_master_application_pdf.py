@@ -191,6 +191,7 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     readiness = qc_master_application.build_readiness(context)
     rendered = qc_master_application.render_html(context, readiness)
 
+    assert readiness["package_ready"] is True
     assert readiness["ready"] is True
     assert "Qualified Commercial Business Financing Application" in rendered
     assert "332710" in rendered
@@ -199,6 +200,26 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     assert "123-45-6789" not in rendered
     assert "Quidity" not in rendered
     assert "raw credit score" in rendered
+
+
+def test_package_advances_to_step_five_before_human_decision() -> None:
+    context = _sample_context()
+    context["profile"] = SimpleNamespace(
+        human_review_status="pending",
+        human_review_note=None,
+        human_reviewed_at=None,
+        human_reviewed_by_user_id=None,
+    )
+
+    readiness = qc_master_application.build_readiness(context)
+
+    assert readiness["package_ready"] is True
+    assert readiness["ready"] is False
+    assert readiness["human_review_status"] == "pending"
+    assert next(
+        item for item in readiness["items"]
+        if item["requirement"] == "Human-reviewed fundable path"
+    )["status"] == "missing"
 
 
 def test_master_application_stamp_replaces_unsigned_placeholders() -> None:

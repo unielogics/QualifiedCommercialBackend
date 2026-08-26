@@ -151,6 +151,10 @@ class DealerRead(ORM):
     phone: str | None = None
     case_ref: str | None = None
     audit_client_since: datetime | None = None
+    owner_user_id: UUID | None = None
+    submitting_agent_name: str | None = None
+    submitting_agent_email: str | None = None
+    handoff_intake_id: UUID | None = None
     use_of_proceeds: list[UseOfProceedsRow] | None = None
     use_of_proceeds_note: str | None = None
     dealer_user_id: UUID | None = None
@@ -182,6 +186,7 @@ class DealerRead(ORM):
     naics_code: str | None = None
     naics_label: str | None = None
     funding_goal: float | None = None
+    funded_amount: float | None = None
     client_requested_amount: float | None = None
     application_lifecycle: str = "active"
     funding_purpose: str | None = None
@@ -623,6 +628,19 @@ class ApplicationHumanReviewPatch(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
 
 
+class ApplicationFinalizationPatch(BaseModel):
+    status: Literal[
+        "active", "decision_ready", "forms_out", "signed", "complete", "declined"
+    ] | None = None
+    funded_amount: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
+
+    @model_validator(mode="after")
+    def _requires_a_change(self) -> "ApplicationFinalizationPatch":
+        if self.status is None and self.funded_amount is None:
+            raise ValueError("Provide a status or funded amount.")
+        return self
+
+
 class SubmissionReadinessItem(BaseModel):
     requirement: str
     status: Literal["complete", "missing", "supplemental", "not_applicable"]
@@ -633,9 +651,13 @@ class SubmissionReadinessItem(BaseModel):
 
 class SubmissionReadinessRead(BaseModel):
     ready: bool = False
+    package_ready: bool = False
     route_key: str | None = None
     route_label: str | None = None
     human_review_status: Literal["pending", "fundable", "not_fundable"] = "pending"
+    human_review_note: str | None = None
+    human_reviewed_at: datetime | None = None
+    human_reviewed_by_user_id: UUID | None = None
     rules_version: str | None = None
     items: list[SubmissionReadinessItem] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)

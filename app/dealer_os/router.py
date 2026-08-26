@@ -298,6 +298,7 @@ from .schemas import (
     ApplicationProfilePatch,
     ApplicationProfileRead,
     ApplicationHumanReviewPatch,
+    ApplicationFinalizationPatch,
     SubmissionReadinessRead,
     BookingAvailabilityRead,
     BookingAvailabilitySlot,
@@ -1149,6 +1150,15 @@ async def generate_case_contract(
     document must be a decision, not an accident."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if key == qc_master_application.MASTER_TEMPLATE_KEY:
+        readiness = qc_master_application.build_readiness(
+            await qc_master_application.build_context(db, dealer)
+        )
+        if not readiness["ready"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "A super-admin fundable decision is required before generating the QC application.",
+            )
     try:
         doc, result, missing = await contract_fill.generate(db, dealer, key)
     except ValueError as exc:
@@ -1516,6 +1526,15 @@ async def create_dealer(
 
 async def _dealer_read(db: AsyncSession, dealer: DealerBusiness) -> DealerRead:
     r = DealerRead.model_validate(dealer)
+    if dealer.owner_user_id is not None:
+        submitting_agent = (
+            await db.execute(
+                select(User.name, User.email).where(User.id == dealer.owner_user_id)
+            )
+        ).one_or_none()
+        if submitting_agent is not None:
+            r.submitting_agent_name = submitting_agent.name or None
+            r.submitting_agent_email = submitting_agent.email or None
     if dealer.bucket_id is not None:
         r.bucket_name = (
             await db.execute(select(Bucket.name).where(Bucket.id == dealer.bucket_id))
@@ -2107,6 +2126,11 @@ async def update_dealer(
         r.notes = None
         return r
     changes = payload.model_dump(exclude_unset=True)
+    if "status" in changes and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a super admin can change the file status.",
+        )
     taxonomy_fields = {
         "industry", "industry_label", "subindustry", "subindustry_label",
         "industry_entry_id", "subindustry_entry_id", "activity_entry_id",
@@ -5181,6 +5205,20 @@ async def patch_submission_human_review(
     """Record the authorized desk decision that controls signature release."""
     require_super_admin(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    review_context = await qc_master_application.build_context(db, dealer)
+    current_readiness = qc_master_application.build_readiness(review_context)
+    if payload.status == "fundable" and not current_readiness["package_ready"]:
+        blockers = [
+            item["requirement"]
+            for item in current_readiness["items"]
+            if item["requirement"] != "Human-reviewed fundable path"
+            and item["status"] in {"missing", "supplemental"}
+        ]
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Complete the underwriting package before marking the file fundable: "
+            + "; ".join(blockers[:5]),
+        )
     row = (
         await db.execute(
             select(DealerApplicationProfile).where(
@@ -5201,6 +5239,21 @@ async def patch_submission_human_review(
     row.human_review_note = (payload.note or "").strip() or None
     row.human_reviewed_at = datetime.now(timezone.utc) if payload.status != "pending" else None
     row.human_reviewed_by_user_id = user.id if payload.status != "pending" else None
+    lead = (
+        await db.execute(
+            select(DealerRepLead)
+            .where(DealerRepLead.dealer_id == dealer.id)
+            .order_by(DealerRepLead.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if lead is not None:
+        lead.decision = (
+            "fundable" if payload.status == "fundable"
+            else "not_yet" if payload.status == "not_fundable"
+            else None
+        )
+        lead.decision_at = datetime.now(timezone.utc) if payload.status != "pending" else None
     await log_action(
         db,
         dealer.id,
@@ -5214,6 +5267,105 @@ async def patch_submission_human_review(
     await db.commit()
     context = await qc_master_application.build_context(db, dealer)
     return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
+
+
+@router.patch(
+    "/dealers/{dealer_id}/finalization",
+    response_model=DealerRead,
+)
+async def patch_application_finalization(
+    dealer_id: UUID,
+    payload: ApplicationFinalizationPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRead:
+    """Record desk-controlled closing status and the amount actually funded."""
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    target_status = payload.status or dealer.status
+    if target_status == "complete" and payload.funded_amount is None and dealer.funded_amount is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Enter the amount funded before marking this file funded.",
+        )
+    if payload.funded_amount is not None and target_status != "complete":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Funded amount can only be recorded when the file status is Funded.",
+        )
+
+    before = {
+        "status": dealer.status,
+        "funded_amount": float(dealer.funded_amount) if dealer.funded_amount is not None else None,
+    }
+    contract = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.dealer_id == dealer.id,
+                ContractDocument.template_key == qc_master_application.MASTER_TEMPLATE_KEY,
+            )
+        )
+    ).scalars().first()
+    if target_status == "forms_out" and (contract is None or contract.status not in {"out_for_signature", "executed"}):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Send the QC application for signature before marking agreements sent.",
+        )
+    if target_status in {"signed", "complete"} and (contract is None or contract.status != "executed"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The QC application must be executed before using Signed or Funded status.",
+        )
+
+    if payload.status is not None:
+        dealer.status = payload.status
+        if payload.status != "complete":
+            dealer.funded_amount = None
+    if payload.funded_amount is not None:
+        dealer.funded_amount = payload.funded_amount
+
+    lead = (
+        await db.execute(
+            select(DealerRepLead)
+            .where(DealerRepLead.dealer_id == dealer.id)
+            .order_by(DealerRepLead.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    lead_status = "decision_ready" if payload.status == "active" else payload.status
+    if lead is not None and lead_status is not None and lead.status != lead_status:
+        changed_at = datetime.now(timezone.utc)
+        history = list(lead.status_history or [])
+        history.append(
+            {
+                "at": changed_at.isoformat(),
+                "from": lead.status,
+                "to": lead_status,
+                "by": str(user.id),
+                "by_name": user.name,
+                "note": "Step 5 status updated",
+            }
+        )
+        lead.status = lead_status
+        lead.status_history = history[-50:]
+        lead.completed_at = changed_at if lead_status in {"complete", "declined"} else None
+
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.finalization_updated",
+        "dealer",
+        entity_id=dealer.id,
+        before=before,
+        after={
+            "status": dealer.status,
+            "funded_amount": float(dealer.funded_amount) if dealer.funded_amount is not None else None,
+        },
+    )
+    await db.commit()
+    await db.refresh(dealer)
+    return await _dealer_read(db, dealer)
 
 
 @router.get("/booking/availability", response_model=BookingAvailabilityRead)
