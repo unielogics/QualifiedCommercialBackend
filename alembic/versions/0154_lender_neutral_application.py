@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0154_lender_neutral_application"
 down_revision = "0153_product_finder_taxonomy_profiles"
@@ -144,7 +145,7 @@ def upgrade() -> None:
             SELECT gen_random_uuid(), program_key,
               (SELECT MAX(all_versions.version) + 1
                FROM dos_product_catalog AS all_versions
-               WHERE all_versions.program_key = current_catalog.program_key),
+               WHERE all_versions.program_key = latest_catalog.program_key),
               category, copy,
               CASE
                 WHEN program_key = 'term_loan_3_5_year' THEN CAST(:term_pricing AS jsonb)
@@ -166,7 +167,7 @@ def upgrade() -> None:
               FROM dos_product_catalog
               WHERE active = true
               ORDER BY program_key, version DESC
-            ) AS current_catalog
+            ) AS latest_catalog
             """
         ).bindparams(
             term_pricing=json.dumps(pricing_term),
