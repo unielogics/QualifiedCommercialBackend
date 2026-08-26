@@ -558,7 +558,7 @@ UNDERWRITING_PREFERENCE_STATUSES: tuple[str, ...] = ("pending", "selected", "boo
 
 
 class DealerUnderwritingReviewPreference(TimestampMixin, Base):
-    """Three client-friendly underwriting-review slots gathered after step 5."""
+    """Three client-friendly review windows required between steps 3 and 4."""
 
     __tablename__ = "dos_underwriting_review_preferences"
     __table_args__ = (

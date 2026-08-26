@@ -6215,6 +6215,38 @@ async def list_underwriting_review_preferences(
     )
 
 
+@router.get(
+    "/dealers/{dealer_id}/underwriting-review-preferences/availability",
+    response_model=BookingAvailabilityRead,
+)
+async def underwriting_review_preference_availability(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingAvailabilityRead:
+    """Return shared-calendar openings inside the required review window."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    host = await _rep_host_for(db, dealer, user)
+    booking = await _booking_settings_for(db, host)
+    availability = await _booking_slots(
+        db,
+        host,
+        booking,
+        duration_min=booking.duration_min,
+    )
+    window_end = rep_workflows.underwriting_window_end(
+        timezone_name=booking.timezone,
+    )
+    availability.slots = [
+        slot
+        for slot in availability.slots
+        if slot.starts_at <= window_end
+        and slot.starts_at.astimezone(rep_workflows.tz(booking.timezone)).weekday() < 5
+    ]
+    return availability
+
+
 @router.post(
     "/dealers/{dealer_id}/underwriting-review-preferences",
     response_model=UnderwritingReviewPreferenceRead,
@@ -6228,13 +6260,59 @@ async def create_underwriting_review_preference(
 ) -> DealerUnderwritingReviewPreference:
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    host = await _rep_host_for(db, dealer, user)
+    booking = await _booking_settings_for(db, host)
     try:
         slots = rep_workflows.validate_underwriting_slots(
             payload.slots, timezone_name=payload.timezone
         )
     except rep_workflows.SlotValidationError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    availability = await _booking_slots(
+        db,
+        host,
+        booking,
+        duration_min=booking.duration_min,
+    )
+    if availability.calendar_sync_status != "connected":
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The shared calendar is unavailable. Reconnect it before choosing review windows.",
+        )
+    available_starts = {
+        slot.starts_at.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        for slot in availability.slots
+    }
+    selected_starts = {
+        datetime.fromisoformat(slot["starts_at"]).astimezone(timezone.utc).replace(second=0, microsecond=0)
+        for slot in slots
+    }
+    if not selected_starts.issubset(available_starts):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "One or more review windows are no longer available. Choose three current openings.",
+        )
+
     now = datetime.now(timezone.utc)
+    for existing in (
+        await db.execute(
+            select(DealerUnderwritingReviewPreference).where(
+                DealerUnderwritingReviewPreference.dealer_id == dealer.id,
+                DealerUnderwritingReviewPreference.status == "pending",
+            )
+        )
+    ).scalars().all():
+        existing.status = "expired"
+    slots = [
+        {
+            **slot,
+            "duration_min": booking.duration_min,
+            "buffer_before_min": booking.buffer_before_min,
+            "buffer_after_min": booking.buffer_after_min,
+        }
+        for slot in slots
+    ]
     row = DealerUnderwritingReviewPreference(
         dealer_id=dealer.id,
         rep_user_id=user.id,
@@ -6245,21 +6323,6 @@ async def create_underwriting_review_preference(
     )
     db.add(row)
     await db.flush()
-    lead = (
-        await db.execute(select(DealerRepLead).where(DealerRepLead.dealer_id == dealer.id))
-    ).scalar_one_or_none()
-    if lead is not None and lead.status in {"decision_ready", "forms_out"}:
-        history = list(lead.status_history or [])
-        history.append({
-            "at": now.isoformat(),
-            "from": lead.status,
-            "to": "signed",
-            "by": str(user.id),
-            "by_name": user.name,
-            "note": "underwriting review times collected",
-        })
-        lead.status = "signed"
-        lead.status_history = history[-50:]
     await log_action(
         db,
         dealer.id,
@@ -6267,7 +6330,11 @@ async def create_underwriting_review_preference(
         "underwriting_review_preferences.create",
         "underwriting_review_preference",
         entity_id=row.id,
-        after={"timezone": row.timezone, "slots": slots},
+        after={
+            "timezone": row.timezone,
+            "slots": slots,
+            "calendar_host_user_id": str(host.id),
+        },
     )
     await db.commit()
     await db.refresh(row)

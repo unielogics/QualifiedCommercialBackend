@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -12,16 +12,17 @@ from app.dealer_os.services.rep_workflows import (
     program_pdf_options,
     render_program_pdf,
     selected_program_pdfs,
+    underwriting_window_end,
     validate_underwriting_slots,
 )
 
 
 def test_underwriting_slots_allow_weekdays_inside_48_business_hours() -> None:
-    now = datetime(2026, 8, 21, 19, 0, tzinfo=timezone.utc)  # Friday 3 PM ET
+    now = datetime(2026, 8, 21, 19, 0, tzinfo=UTC)  # Friday 3 PM ET
     slots = [
-        datetime(2026, 8, 21, 20, 0, tzinfo=timezone.utc),
-        datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc),
-        datetime(2026, 8, 25, 18, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 21, 20, 0, tzinfo=UTC),
+        datetime(2026, 8, 24, 14, 0, tzinfo=UTC),
+        datetime(2026, 8, 25, 18, 0, tzinfo=UTC),
     ]
 
     out = validate_underwriting_slots(slots, timezone_name="America/New_York", now=now)
@@ -34,11 +35,11 @@ def test_underwriting_slots_allow_weekdays_inside_48_business_hours() -> None:
 
 
 def test_underwriting_slots_reject_weekends() -> None:
-    now = datetime(2026, 8, 21, 19, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 19, 0, tzinfo=UTC)
     slots = [
-        datetime(2026, 8, 22, 16, 0, tzinfo=timezone.utc),
-        datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc),
-        datetime(2026, 8, 25, 18, 0, tzinfo=timezone.utc),
+        datetime(2026, 8, 22, 16, 0, tzinfo=UTC),
+        datetime(2026, 8, 24, 14, 0, tzinfo=UTC),
+        datetime(2026, 8, 25, 18, 0, tzinfo=UTC),
     ]
 
     with pytest.raises(SlotValidationError, match="Saturday and Sunday"):
@@ -46,11 +47,22 @@ def test_underwriting_slots_reject_weekends() -> None:
 
 
 def test_underwriting_slots_reject_duplicates() -> None:
-    now = datetime(2026, 8, 21, 19, 0, tzinfo=timezone.utc)
-    slot = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, 19, 0, tzinfo=UTC)
+    slot = datetime(2026, 8, 24, 14, 0, tzinfo=UTC)
 
     with pytest.raises(SlotValidationError, match="different"):
-        validate_underwriting_slots([slot, slot, datetime(2026, 8, 25, 18, 0, tzinfo=timezone.utc)], timezone_name="America/New_York", now=now)
+        validate_underwriting_slots([slot, slot, datetime(2026, 8, 25, 18, 0, tzinfo=UTC)], timezone_name="America/New_York", now=now)
+
+
+def test_underwriting_window_skips_weekend_hours() -> None:
+    now = datetime(2026, 8, 21, 19, 0, tzinfo=UTC)  # Friday 3 PM ET
+
+    end = underwriting_window_end(
+        timezone_name="America/New_York",
+        now=now,
+    )
+
+    assert end == datetime(2026, 8, 25, 19, 0, tzinfo=UTC)
 
 
 @pytest.mark.parametrize("body", ["STOP", " stop ", "Unsubscribe", "quit"])

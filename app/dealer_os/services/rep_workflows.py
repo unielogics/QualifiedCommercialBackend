@@ -8,7 +8,7 @@ and the shared business-card copy.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
@@ -29,8 +29,8 @@ def tz(name: str | None) -> ZoneInfo:
 
 def _aware_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _is_weekday(dt: datetime) -> bool:
@@ -50,11 +50,22 @@ def add_business_hours(start: datetime, hours: int) -> datetime:
     return cursor
 
 
+def underwriting_window_end(
+    *,
+    timezone_name: str,
+    now: datetime | None = None,
+) -> datetime:
+    """Return the UTC end of the rolling 48-weekday-hour review window."""
+    zone = tz(timezone_name)
+    base = _aware_utc(now or datetime.now(UTC))
+    return add_business_hours(base.astimezone(zone), 48).astimezone(UTC)
+
+
 def _label(local: datetime) -> str:
     minute = f"{local.minute:02d}"
     hour = local.hour % 12 or 12
     suffix = "AM" if local.hour < 12 else "PM"
-    return f"{local.strftime('%a, %b')} {local.day} at {hour}:{minute} {suffix}"
+    return f"{hour}:{minute} {suffix}"
 
 
 def _date_label(local: datetime) -> str:
@@ -72,8 +83,8 @@ def validate_underwriting_slots(
         raise SlotValidationError("Choose exactly three underwriting review times.")
 
     zone = tz(timezone_name)
-    base = _aware_utc(now or datetime.now(timezone.utc))
-    window_end = add_business_hours(base.astimezone(zone), 48).astimezone(timezone.utc)
+    base = _aware_utc(now or datetime.now(UTC))
+    window_end = underwriting_window_end(timezone_name=timezone_name, now=base)
 
     normalized: list[datetime] = []
     seen: set[datetime] = set()
@@ -83,7 +94,7 @@ def validate_underwriting_slots(
         if slot <= base:
             raise SlotValidationError("Every underwriting review time must be in the future.")
         if slot > window_end:
-            raise SlotValidationError("Underwriting review times must be within the next 48 business hours.")
+            raise SlotValidationError("Review windows must be within the next 48 hours, excluding weekends.")
         if not _is_weekday(local):
             raise SlotValidationError("Saturday and Sunday are not available for underwriting reviews.")
         if slot in seen:
