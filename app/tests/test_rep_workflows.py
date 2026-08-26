@@ -7,7 +7,13 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.dealer_os.router import _rep_inbox_access_filter
+from app.dealer_os.router import (
+    _global_search_appointment_access_filter,
+    _global_search_contact_access_filter,
+    _global_search_file_access_filter,
+    _rep_inbox_access_filter,
+    _search_context,
+)
 from app.dealer_os.schemas import RepInboxThreadCreate
 from app.dealer_os.services.rep_workflows import (
     SlotValidationError,
@@ -18,6 +24,7 @@ from app.dealer_os.services.rep_workflows import (
     underwriting_window_end,
     validate_underwriting_slots,
 )
+from app.enums import Role
 
 
 def test_underwriting_slots_allow_weekdays_inside_48_business_hours() -> None:
@@ -114,3 +121,40 @@ def test_field_desk_inbox_filter_is_owner_only_for_every_staff_role() -> None:
 
     assert clause.right.value == user_id
     assert "owner_user_id" in str(clause.left)
+
+
+def test_global_search_keeps_rep_files_and_bookings_owner_scoped() -> None:
+    user_id = uuid4()
+    user = SimpleNamespace(id=user_id, role=Role.FIELD_REP)
+
+    file_clause = _global_search_file_access_filter(user)
+    appointment_clause = _global_search_appointment_access_filter(user)
+
+    assert "owner_user_id" in str(file_clause)
+    assert user_id.hex in str(file_clause.compile(compile_kwargs={"literal_binds": True}))
+    assert "booked_by_user_id" in str(appointment_clause)
+    assert appointment_clause.right.value == user_id
+
+
+def test_global_search_keeps_assigned_contacts_available_to_reps() -> None:
+    user_id = uuid4()
+    clause = _global_search_contact_access_filter(
+        SimpleNamespace(id=user_id, role=Role.FIELD_REP)
+    )
+
+    rendered = str(clause.compile(compile_kwargs={"literal_binds": True}))
+    assert "dos_rep_contacts.owner_user_id" in rendered
+    assert "dos_rep_contact_assignments" in rendered
+    assert user_id.hex in rendered
+
+
+def test_global_search_team_roles_retain_team_scope() -> None:
+    user = SimpleNamespace(id=uuid4(), role=Role.SUPER_ADMIN)
+
+    assert "archived_at IS NULL" in str(_global_search_file_access_filter(user))
+    assert _global_search_contact_access_filter(user) is True
+    assert _global_search_appointment_access_filter(user) is True
+
+
+def test_global_search_context_deduplicates_blank_values() -> None:
+    assert _search_context("Client", "", None, "Client", "File") == "Client · File"

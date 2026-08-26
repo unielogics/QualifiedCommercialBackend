@@ -267,6 +267,22 @@ class DealerPortfolioPage(BaseModel):
     offset: int
 
 
+class FieldDeskGlobalSearchItem(BaseModel):
+    id: UUID
+    kind: Literal["file", "contact", "email", "sms", "booking"]
+    title: str
+    subtitle: str | None = None
+    context: str | None = None
+    href: str
+    dealer_id: UUID | None = None
+    occurred_at: datetime | None = None
+
+
+class FieldDeskGlobalSearchRead(BaseModel):
+    query: str
+    items: list[FieldDeskGlobalSearchItem] = Field(default_factory=list)
+
+
 class IntegrationProviderStatus(BaseModel):
     configured: bool
     environment: str

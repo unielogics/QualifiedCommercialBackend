@@ -19,6 +19,7 @@ from dataclasses import asdict
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
@@ -72,6 +73,7 @@ from .models import (
     DealerAIMessage,
     DealerRepAppointment,
     DealerRepContact,
+    DealerRepContactAssignment,
     DealerApplicationContact,
     DealerFieldDeskProfile,
     DealerRepContactShare,
@@ -183,6 +185,8 @@ from .schemas import (
     DealerListItem,
     DealerPortfolioItem,
     DealerPortfolioPage,
+    FieldDeskGlobalSearchItem,
+    FieldDeskGlobalSearchRead,
     DealerRead,
     DealerUpdate,
     DebtCreate,
@@ -661,6 +665,222 @@ async def dealer_portfolio(
         item.verified = item.bank_linked and item.credit_returned
         items.append(item)
     return DealerPortfolioPage(items=items, total=total, limit=limit, offset=offset)
+
+
+def _global_search_file_access_filter(user: User):
+    if user.role == Role.FIELD_REP:
+        return and_(
+            DealerBusiness.owner_user_id == user.id,
+            DealerBusiness.archived_at.is_(None),
+        )
+    return DealerBusiness.archived_at.is_(None)
+
+
+def _global_search_contact_access_filter(user: User):
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        return True
+    return or_(
+        DealerRepContact.owner_user_id == user.id,
+        exists(
+            select(DealerRepContactAssignment.id).where(
+                DealerRepContactAssignment.contact_id == DealerRepContact.id,
+                DealerRepContactAssignment.user_id == user.id,
+            )
+        ),
+    )
+
+
+def _global_search_appointment_access_filter(user: User):
+    if user.role == Role.FIELD_REP:
+        return DealerRepAppointment.booked_by_user_id == user.id
+    return True
+
+
+def _search_context(*values: str | None) -> str | None:
+    parts = [str(value).strip() for value in values if value and str(value).strip()]
+    return " · ".join(dict.fromkeys(parts)) or None
+
+
+@router.get("/global-search", response_model=FieldDeskGlobalSearchRead)
+async def field_desk_global_search(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str = Query(min_length=2, max_length=160),
+    limit: int = Query(default=24, ge=4, le=40),
+) -> FieldDeskGlobalSearchRead:
+    """Search every Field Desk surface without widening any access boundary."""
+    require_team_or_rep(user)
+    needle = q.strip().lower()
+    if len(needle) < 2:
+        return FieldDeskGlobalSearchRead(query=needle)
+
+    like = f"%{needle}%"
+    per_kind = max(3, min(10, (limit + 3) // 4))
+    owner_match = exists(
+        select(DealerOwner.id).where(
+            DealerOwner.dealer_id == DealerBusiness.id,
+            or_(
+                func.lower(func.concat(DealerOwner.first_name, " ", DealerOwner.last_name)).like(like),
+                func.lower(func.coalesce(DealerOwner.email, "")).like(like),
+                func.lower(func.coalesce(DealerOwner.phone, "")).like(like),
+            ),
+        )
+    )
+    file_rows = list(
+        (
+            await db.execute(
+                select(DealerBusiness)
+                .where(
+                    _global_search_file_access_filter(user),
+                    or_(
+                        func.lower(DealerBusiness.name).like(like),
+                        func.lower(func.coalesce(DealerBusiness.legal_name, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.case_ref, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.email, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.phone, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.address, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.city, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.state, "")).like(like),
+                        func.lower(func.coalesce(DealerBusiness.zip, "")).like(like),
+                        owner_match,
+                    ),
+                )
+                .order_by(DealerBusiness.updated_at.desc())
+                .limit(per_kind)
+            )
+        ).scalars().all()
+    )
+
+    contact_rows = (
+        await db.execute(
+            select(DealerRepContact, DealerBusiness)
+            .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepContact.dealer_id)
+            .where(
+                _global_search_contact_access_filter(user),
+                or_(
+                    func.lower(DealerRepContact.full_name).like(like),
+                    func.lower(func.coalesce(DealerRepContact.company, "")).like(like),
+                    func.lower(func.coalesce(DealerRepContact.email, "")).like(like),
+                    func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.name, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.address, "")).like(like),
+                ),
+            )
+            .order_by(DealerRepContact.updated_at.desc())
+            .limit(per_kind)
+        )
+    ).all()
+
+    thread_rows = (
+        await db.execute(
+            select(DealerRepInboxThread, DealerRepContact, DealerBusiness)
+            .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+            .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepInboxThread.dealer_id)
+            .where(
+                DealerRepInboxThread.owner_user_id == user.id,
+                or_(
+                    func.lower(DealerRepInboxThread.subject).like(like),
+                    func.lower(func.coalesce(DealerRepContact.full_name, "")).like(like),
+                    func.lower(func.coalesce(DealerRepContact.company, "")).like(like),
+                    func.lower(func.coalesce(DealerRepContact.email, "")).like(like),
+                    func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.name, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.address, "")).like(like),
+                ),
+            )
+            .order_by(
+                DealerRepInboxThread.last_message_at.desc().nullslast(),
+                DealerRepInboxThread.updated_at.desc(),
+            )
+            .limit(per_kind)
+        )
+    ).all()
+
+    appointment_rows = (
+        await db.execute(
+            select(DealerRepAppointment, DealerBusiness)
+            .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepAppointment.dealer_id)
+            .where(
+                _global_search_appointment_access_filter(user),
+                or_(
+                    func.lower(DealerRepAppointment.invitee_name).like(like),
+                    func.lower(func.coalesce(DealerRepAppointment.invitee_email, "")).like(like),
+                    func.lower(func.coalesce(DealerRepAppointment.invitee_phone, "")).like(like),
+                    func.lower(func.coalesce(DealerRepAppointment.company, "")).like(like),
+                    func.lower(func.coalesce(DealerRepAppointment.full_address, "")).like(like),
+                    func.lower(DealerRepAppointment.title).like(like),
+                    func.lower(func.coalesce(DealerRepAppointment.program_name, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.name, "")).like(like),
+                    func.lower(func.coalesce(DealerBusiness.address, "")).like(like),
+                ),
+            )
+            .order_by(DealerRepAppointment.updated_at.desc())
+            .limit(per_kind)
+        )
+    ).all()
+
+    items: list[FieldDeskGlobalSearchItem] = []
+    for dealer in file_rows:
+        address = _search_context(dealer.address, dealer.city, dealer.state, dealer.zip)
+        items.append(
+            FieldDeskGlobalSearchItem(
+                id=dealer.id,
+                kind="file",
+                title=dealer.name,
+                subtitle=_search_context(dealer.case_ref, address),
+                context=_search_context(dealer.email, dealer.phone),
+                href=f"/applications/{dealer.id}",
+                dealer_id=dealer.id,
+                occurred_at=dealer.updated_at,
+            )
+        )
+    for contact, dealer in contact_rows:
+        items.append(
+            FieldDeskGlobalSearchItem(
+                id=contact.id,
+                kind="contact",
+                title=contact.full_name,
+                subtitle=_search_context(contact.company, dealer.name if dealer else None),
+                context=_search_context(contact.email, contact.phone_e164),
+                href=f"/contacts/{contact.id}",
+                dealer_id=contact.dealer_id,
+                occurred_at=contact.last_activity_at or contact.updated_at,
+            )
+        )
+    for thread, contact, dealer in thread_rows:
+        channel_label = "SMS conversation" if thread.channel == "sms" else "Email conversation"
+        items.append(
+            FieldDeskGlobalSearchItem(
+                id=thread.id,
+                kind="sms" if thread.channel == "sms" else "email",
+                title=contact.full_name if contact else thread.subject,
+                subtitle=_search_context(channel_label, contact.company if contact else None),
+                context=_search_context(thread.subject, dealer.name if dealer else None),
+                href=f"/inbox?thread={thread.id}",
+                dealer_id=thread.dealer_id,
+                occurred_at=thread.last_message_at or thread.updated_at,
+            )
+        )
+    for appointment, dealer in appointment_rows:
+        try:
+            appointment_date = appointment.starts_at.astimezone(
+                ZoneInfo(appointment.timezone)
+            ).date()
+        except (KeyError, ValueError):
+            appointment_date = appointment.starts_at.date()
+        items.append(
+            FieldDeskGlobalSearchItem(
+                id=appointment.id,
+                kind="booking",
+                title=appointment.invitee_name,
+                subtitle=_search_context(appointment.program_name, appointment.company, dealer.name if dealer else None),
+                context=_search_context(appointment.full_address, appointment.title),
+                href=f"/calendar?appointment={appointment.id}&date={appointment_date.isoformat()}",
+                dealer_id=appointment.dealer_id,
+                occurred_at=appointment.starts_at,
+            )
+        )
+    return FieldDeskGlobalSearchRead(query=needle, items=items[:limit])
 
 
 @router.post("/dealers/{dealer_id}/archive", response_model=DealerRead)
