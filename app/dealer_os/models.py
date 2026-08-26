@@ -492,6 +492,13 @@ class DealerSession(TimestampMixin, Base):
 
 REP_APPOINTMENT_KINDS: tuple[str, ...] = ("callback", "program_intro", "underwriting_review")
 REP_APPOINTMENT_STATUSES: tuple[str, ...] = ("pending", "confirmed", "cancelled", "done")
+REP_APPOINTMENT_RSVP_STATUSES: tuple[str, ...] = (
+    "needs_action",
+    "accepted",
+    "tentative",
+    "declined",
+    "unknown",
+)
 REP_APPOINTMENT_OUTCOMES: tuple[str, ...] = ("not_converted", "did_not_show", "converted")
 REP_APPOINTMENT_CONVERSION_TARGETS: tuple[str, ...] = ("field_desk", "ai_intake")
 
@@ -528,12 +535,18 @@ class DealerRepAppointment(TimestampMixin, Base):
     invitee_email: Mapped[str | None] = mapped_column(String(320))
     invitee_phone: Mapped[str | None] = mapped_column(String(32))
     company: Mapped[str | None] = mapped_column(String(180))
+    program_key: Mapped[str | None] = mapped_column(String(64))
     program_name: Mapped[str | None] = mapped_column(String(180))
     requested_amount: Mapped[str | None] = mapped_column(String(40))
     full_address: Mapped[str | None] = mapped_column(String(500))
     join_url: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    client_rsvp_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    client_rsvp_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rsvp_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     booked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )

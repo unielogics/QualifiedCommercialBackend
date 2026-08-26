@@ -187,7 +187,7 @@ def send_invitee_invite(
                 if cancel
                 else f"Updated: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
                 if sequence
-                else f"Confirmed: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
+                else f"Invitation: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
             ),
             body_text=body,
             attachments=[("invite.ics", ics, ICS_CONTENT_TYPE)],

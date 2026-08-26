@@ -30,11 +30,14 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
+from app.dealer_os.models import DealerRepAppointment, DealerUnderwritingReviewPreference
+from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.event import CalendarEvent
 from app.models.google_account import GoogleAccount
+from app.models.user import User
 from app.services.google import google_oauth_client
 from app.services.google.google_oauth_client import CALENDAR_SCOPES
+from app.services.notifications import notify_users
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,119 @@ def _google_pull_external_ref(user_id: uuid.UUID, google_event_id: str) -> str:
 
 
 _DEFAULT_DURATION_MIN = 30
+
+_RSVP_MAP = {
+    "needsaction": "needs_action",
+    "accepted": "accepted",
+    "tentative": "tentative",
+    "declined": "declined",
+}
+
+
+def client_rsvp_status(item: dict, invitee_email: str | None) -> str:
+    """Read only the exact client attendee; host/rep responses never count."""
+    normalized = (invitee_email or "").strip().casefold()
+    if not normalized:
+        return "unknown"
+    for attendee in item.get("attendees") or []:
+        if str(attendee.get("email") or "").strip().casefold() != normalized:
+            continue
+        response = str(attendee.get("responseStatus") or "").replace("_", "").casefold()
+        return _RSVP_MAP.get(response, "unknown")
+    return "unknown"
+
+
+def _google_updated_at(item: dict, fallback: datetime) -> datetime:
+    raw = str(item.get("updated") or "").strip()
+    if not raw:
+        return fallback
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return fallback
+
+
+async def _sync_rep_appointment_rsvp(
+    db: AsyncSession,
+    event: CalendarEvent | None,
+    item: dict,
+) -> bool:
+    if event is None:
+        return False
+    appointment = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.calendar_event_id == event.id
+            )
+        )
+    ).scalar_one_or_none()
+    if appointment is None:
+        return False
+
+    now = datetime.now(UTC)
+    current = appointment.client_rsvp_status or "unknown"
+    incoming = client_rsvp_status(item, appointment.invitee_email)
+    appointment.rsvp_checked_at = now
+    desired_status = appointment.status
+    if appointment.status not in {"cancelled", "done"}:
+        desired_status = "confirmed" if incoming == "accepted" else "pending"
+    status_needs_reconcile = desired_status != appointment.status
+    if incoming == current and not status_needs_reconcile:
+        return False
+
+    rsvp_changed = incoming != current
+    if rsvp_changed:
+        appointment.client_rsvp_status = incoming
+        appointment.client_rsvp_at = (
+            _google_updated_at(item, now)
+            if incoming in {"accepted", "tentative", "declined"}
+            else None
+        )
+    appointment.status = desired_status
+
+    preference = (
+        await db.execute(
+            select(DealerUnderwritingReviewPreference).where(
+                DealerUnderwritingReviewPreference.appointment_id == appointment.id
+            )
+        )
+    ).scalar_one_or_none()
+    if preference is not None:
+        preference.status = "booked" if incoming == "accepted" else "selected"
+
+    if rsvp_changed and incoming in {"accepted", "declined"}:
+        recipient_ids = {appointment.booked_by_user_id} if appointment.booked_by_user_id else set()
+        super_admin_ids = set(
+            (
+                await db.execute(
+                    select(User.id).where(
+                        User.role == Role.SUPER_ADMIN,
+                        User.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        recipient_ids.update(super_admin_ids)
+        await notify_users(
+            db,
+            recipient_ids={value for value in recipient_ids if value},
+            event_type=f"appointment_rsvp_{incoming}",
+            category="calendar",
+            priority="high",
+            title=f"Client {incoming}: {appointment.invitee_name}",
+            body=(
+                f"{appointment.invitee_name} {'accepted' if incoming == 'accepted' else 'declined'} "
+                f"the invitation for {appointment.title}."
+            ),
+            target_type="dealer_rep_appointment",
+            target_id=str(appointment.id),
+            deep_link=f"/calendar?appointment={appointment.id}",
+            meta={"appointment_id": str(appointment.id), "client_rsvp_status": incoming},
+            email=True,
+            push=True,
+        )
+    await db.flush()
+    return True
 
 
 @dataclass(frozen=True)
@@ -391,9 +507,11 @@ async def _apply_pulled_event(db: AsyncSession, user_id: uuid.UUID, item: dict) 
         )
     ).scalar_one_or_none()
 
+    rsvp_changed = await _sync_rep_appointment_rsvp(db, existing, item)
+
     # Loop guard: this is our own echo (etag matches what we last pushed) → skip.
     if existing is not None and etag and existing.google_etag == etag:
-        return False
+        return rsvp_changed
 
     if item.get("status") == "cancelled":
         if existing is not None and existing.status != CalendarEventStatus.CANCELLED:
@@ -403,7 +521,7 @@ async def _apply_pulled_event(db: AsyncSession, user_id: uuid.UUID, item: dict) 
             existing.sync_origin = "google"
             await db.flush()
             return True
-        return False
+        return rsvp_changed
 
     start = _parse_google_dt(item.get("start"))
     if start is None:

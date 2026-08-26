@@ -93,6 +93,7 @@ from app.schemas.application_profile import (
     SecureBankFileUploadInit,
     TaxonomyContributionCreate,
     TaxonomyEntryRead,
+    TaxonomyPathEntry,
     TaxonomyReviewRequest,
     TaxonomySearchRead,
     UnifiedAuditEvent,
@@ -114,13 +115,75 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
 
 
-def _taxonomy_read(row: ApplicationTaxonomyEntry) -> TaxonomyEntryRead:
+def _taxonomy_read(
+    row: ApplicationTaxonomyEntry,
+    *,
+    path: list[ApplicationTaxonomyEntry] | None = None,
+) -> TaxonomyEntryRead:
     return TaxonomyEntryRead(
         id=row.id, level=row.level, code=row.code, label=row.label, parent_id=row.parent_id,
         source=row.source, taxonomy_version=row.taxonomy_version, status=row.status,
         aliases=[str(value) for value in (row.aliases or [])],
         originating_profile_id=row.originating_profile_id, canonical_entry_id=row.canonical_entry_id,
+        path=[
+            TaxonomyPathEntry(
+                id=item.id,
+                level=item.level,
+                code=item.code,
+                label=item.label,
+                parent_id=item.parent_id,
+            )
+            for item in (path or [])
+        ],
     )
+
+
+async def _taxonomy_paths(
+    db: AsyncSession, rows: list[ApplicationTaxonomyEntry]
+) -> dict[UUID, list[ApplicationTaxonomyEntry]]:
+    """Return root-to-leaf paths for a mixed set of taxonomy search rows."""
+    by_id = {row.id: row for row in rows}
+    missing_parent_ids = {row.parent_id for row in rows if row.parent_id and row.parent_id not in by_id}
+    if missing_parent_ids:
+        parents = list(
+            (
+                await db.execute(
+                    select(ApplicationTaxonomyEntry).where(
+                        ApplicationTaxonomyEntry.id.in_(missing_parent_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        by_id.update({row.id: row for row in parents})
+    missing_grandparent_ids = {
+        row.parent_id for row in by_id.values() if row.parent_id and row.parent_id not in by_id
+    }
+    if missing_grandparent_ids:
+        grandparents = list(
+            (
+                await db.execute(
+                    select(ApplicationTaxonomyEntry).where(
+                        ApplicationTaxonomyEntry.id.in_(missing_grandparent_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        by_id.update({row.id: row for row in grandparents})
+
+    result: dict[UUID, list[ApplicationTaxonomyEntry]] = {}
+    for row in rows:
+        path = [row]
+        cursor = row
+        seen = {row.id}
+        while cursor.parent_id and cursor.parent_id not in seen:
+            parent = by_id.get(cursor.parent_id)
+            if parent is None:
+                break
+            path.append(parent)
+            seen.add(parent.id)
+            cursor = parent
+        result[row.id] = list(reversed(path))
+    return result
 
 
 @router.get("/taxonomy/search", response_model=TaxonomySearchRead)
@@ -163,7 +226,13 @@ async def search_application_taxonomy(
         stmt.order_by(ApplicationTaxonomyEntry.code.asc().nullslast(), ApplicationTaxonomyEntry.label.asc())
         .offset((page - 1) * page_size).limit(page_size)
     )).scalars().all())
-    return TaxonomySearchRead(items=[_taxonomy_read(row) for row in rows], total=total, page=page, page_size=page_size)
+    paths = await _taxonomy_paths(db, rows)
+    return TaxonomySearchRead(
+        items=[_taxonomy_read(row, path=paths.get(row.id)) for row in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/taxonomy/review-queue", response_model=TaxonomySearchRead)

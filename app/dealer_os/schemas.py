@@ -694,12 +694,16 @@ class RepAppointmentRead(ORM):
     invitee_email: str | None = None
     invitee_phone: str | None = None
     company: str | None = None
+    program_key: str | None = None
     program_name: str | None = None
     requested_amount: str | None = None
     full_address: str | None = None
     join_url: str | None = None
     notes: str | None = None
     status: str
+    client_rsvp_status: Literal["needs_action", "accepted", "tentative", "declined", "unknown"] = "unknown"
+    client_rsvp_at: datetime | None = None
+    rsvp_checked_at: datetime | None = None
     booked_by_user_id: UUID | None = None
     outcome: Literal["not_converted", "did_not_show", "converted"] | None = None
     outcome_note: str | None = None
@@ -736,6 +740,7 @@ class RepAppointmentCreate(BaseModel):
     invitee_phone: str | None = Field(default=None, max_length=32)
     join_url: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
+    program_key: str | None = Field(default=None, max_length=64)
     program_name: str | None = Field(default=None, max_length=180)
     requested_amount: str | None = Field(default=None, max_length=40)
     full_address: str | None = Field(default=None, max_length=500)
@@ -759,6 +764,7 @@ class RepAppointmentPatch(BaseModel):
     invitee_email: str | None = Field(default=None, max_length=320)
     invitee_phone: str | None = Field(default=None, max_length=32)
     company: str | None = Field(default=None, max_length=180)
+    program_key: str | None = Field(default=None, max_length=64)
     program_name: str | None = Field(default=None, max_length=180)
     requested_amount: str | None = Field(default=None, max_length=40)
     full_address: str | None = Field(default=None, max_length=500)
@@ -806,6 +812,19 @@ class UnderwritingReviewPreferenceRead(ORM):
 class UnderwritingReviewPreferenceCreate(BaseModel):
     timezone: str = Field(default="America/New_York", max_length=80)
     slots: list[datetime] = Field(min_length=3, max_length=3)
+
+
+class UnderwritingReviewPreferenceBook(BaseModel):
+    starts_at: datetime
+    invitee_name: str = Field(min_length=1, max_length=160)
+    invitee_email: EmailStr
+    invitee_phone: str | None = Field(default=None, max_length=32)
+    program_key: str | None = Field(default=None, max_length=64)
+    program_name: str | None = Field(default=None, max_length=180)
+    requested_amount: str | None = Field(default=None, max_length=40)
+    full_address: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=4000)
+    transactional_sms_consent: bool = False
 
 
 class ContactShareRead(ORM):

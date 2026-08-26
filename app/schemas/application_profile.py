@@ -271,6 +271,14 @@ class ClassificationPatch(BaseModel):
         return value or None
 
 
+class TaxonomyPathEntry(BaseModel):
+    id: UUID
+    level: Literal[2, 3, 6]
+    code: str | None = None
+    label: str
+    parent_id: UUID | None = None
+
+
 class TaxonomyEntryRead(BaseModel):
     id: UUID
     level: Literal[2, 3, 6]
@@ -283,6 +291,7 @@ class TaxonomyEntryRead(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     originating_profile_id: UUID | None = None
     canonical_entry_id: UUID | None = None
+    path: list[TaxonomyPathEntry] = Field(default_factory=list)
 
 
 class TaxonomySearchRead(BaseModel):

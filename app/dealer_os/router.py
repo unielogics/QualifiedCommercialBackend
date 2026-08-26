@@ -106,6 +106,7 @@ from .models import (
     DealerPaymentShift,
     DealerPlanAction,
     DealerPlanComment,
+    DealerProductCatalog,
     DealerProgramSetting,
     DealerSession,
     DealerSourceConnection,
@@ -318,6 +319,7 @@ from .schemas import (
     RepInboxThreadCreate,
     RepInboxThreadRead,
     UnderwritingReviewPreferenceCreate,
+    UnderwritingReviewPreferenceBook,
     UnderwritingReviewPreferenceRead,
 )
 from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
@@ -4667,6 +4669,62 @@ def _appointment_title(kind: str, invitee_name: str, dealer: DealerBusiness | No
     return f"{labels.get(kind, 'Appointment')}: {invitee_name}{suffix}"
 
 
+GENERAL_PROGRAM_KEY = "general_funding_discussion"
+GENERAL_PROGRAM_NAME = "General funding discussion / Not decided yet"
+
+
+async def _resolve_appointment_program(
+    db: AsyncSession,
+    *,
+    program_key: str | None,
+    program_name: str | None,
+    existing: DealerRepAppointment | None = None,
+) -> tuple[str | None, str]:
+    key = (program_key or "").strip()
+    name = (program_name or "").strip()
+    if key == GENERAL_PROGRAM_KEY or (not key and not name):
+        return GENERAL_PROGRAM_KEY, GENERAL_PROGRAM_NAME
+    if key:
+        row = (
+            await db.execute(
+                select(DealerProductCatalog)
+                .where(
+                    DealerProductCatalog.program_key == key,
+                    DealerProductCatalog.active.is_(True),
+                )
+                .order_by(DealerProductCatalog.version.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            if existing and existing.program_key == key:
+                return key, existing.program_name or name or key.replace("_", " ").title()
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose an active funding program.")
+        copy = (row.copy or {}).get("en") or {}
+        return row.program_key, str(copy.get("name") or row.program_key.replace("_", " ").title())
+
+    if existing and name == (existing.program_name or ""):
+        return existing.program_key, name
+    if name == GENERAL_PROGRAM_NAME:
+        return GENERAL_PROGRAM_KEY, GENERAL_PROGRAM_NAME
+    # Backward compatibility for older clients that sent a catalog label only.
+    rows = list(
+        (
+            await db.execute(
+                select(DealerProductCatalog)
+                .where(DealerProductCatalog.active.is_(True))
+                .order_by(DealerProductCatalog.version.desc())
+            )
+        ).scalars().all()
+    )
+    for row in rows:
+        copy = (row.copy or {}).get("en") or {}
+        catalog_name = str(copy.get("name") or row.program_key.replace("_", " ").title())
+        if catalog_name.casefold() == name.casefold():
+            return row.program_key, catalog_name
+    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a program from the active catalog.")
+
+
 def _booking_description(
     *,
     user: User,
@@ -4817,6 +4875,7 @@ def _appointment_payload(
         invitee_phone=appt.invitee_phone,
         join_url=appt.join_url,
         notes=appt.notes,
+        program_key=appt.program_key,
         program_name=appt.program_name,
         requested_amount=appt.requested_amount,
         full_address=appt.full_address,
@@ -5428,6 +5487,12 @@ async def create_standalone_rep_appointment(
     slots = await _booking_slots(db, host, booking, duration_min=duration)
     if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    program_key, program_name = await _resolve_appointment_program(
+        db,
+        program_key=payload.program_key,
+        program_name=payload.program_name,
+    )
+    payload = payload.model_copy(update={"program_key": program_key, "program_name": program_name})
     title = payload.title or _appointment_title(payload.kind, payload.invitee_name, None)
     who = payload.invitee_name
     if payload.invitee_email:
@@ -5464,12 +5529,14 @@ async def create_standalone_rep_appointment(
         invitee_email=payload.invitee_email,
         invitee_phone=payload.invitee_phone,
         company=payload.company,
+        program_key=program_key,
         program_name=program,
         requested_amount=requested_amount,
         full_address=full_address,
         join_url=payload.join_url,
         notes=payload.notes,
-        status="confirmed",
+        status="pending",
+        client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
         booked_by_user_id=user.id,
     )
     db.add(appt)
@@ -5644,6 +5711,12 @@ async def create_rep_appointment(
     slots = await _booking_slots(db, host, booking, duration_min=duration)
     if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    program_key, program_name = await _resolve_appointment_program(
+        db,
+        program_key=payload.program_key,
+        program_name=payload.program_name,
+    )
+    payload = payload.model_copy(update={"program_key": program_key, "program_name": program_name})
     title = payload.title or _appointment_title(payload.kind, payload.invitee_name, dealer)
     who = payload.invitee_name
     if payload.invitee_email:
@@ -5680,12 +5753,14 @@ async def create_rep_appointment(
         invitee_email=payload.invitee_email,
         invitee_phone=payload.invitee_phone,
         company=payload.company or dealer.name,
+        program_key=program_key,
         program_name=program,
         requested_amount=requested_amount,
         full_address=full_address,
         join_url=payload.join_url,
         notes=payload.notes,
-        status="confirmed",
+        status="pending",
+        client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
         booked_by_user_id=user.id,
     )
     db.add(appt)
@@ -5974,8 +6049,18 @@ async def patch_rep_appointment(
             appt.outcome_at = None
             appt.outcome_by_user_id = None
 
+    if "program_key" in payload.model_fields_set or "program_name" in payload.model_fields_set:
+        program_key, program_name = await _resolve_appointment_program(
+            db,
+            program_key=(payload.program_key if "program_key" in payload.model_fields_set else appt.program_key),
+            program_name=(payload.program_name if "program_name" in payload.model_fields_set else appt.program_name),
+            existing=appt,
+        )
+        appt.program_key = program_key
+        appt.program_name = program_name
+
     for field in (
-        "kind", "title", "timezone", "invitee_name", "company", "program_name",
+        "kind", "title", "timezone", "invitee_name", "company",
         "requested_amount", "full_address", "join_url", "notes",
     ):
         value = getattr(payload, field)
@@ -5986,9 +6071,22 @@ async def patch_rep_appointment(
     if payload.invitee_phone is not None:
         appt.invitee_phone = consent_delivery.normalize_phone(payload.invitee_phone)
     if payload.status is not None:
+        if payload.status == "confirmed" and appt.client_rsvp_status != "accepted":
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Only the client's accepted Google invitation can confirm an appointment.",
+            )
         appt.status = payload.status
     if not appt.invitee_email and not appt.invitee_phone:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Provide an invitee email or phone.")
+
+    email_changed = old_email != appt.invitee_email
+    if rescheduled or email_changed:
+        appt.client_rsvp_status = "needs_action" if appt.invitee_email else "unknown"
+        appt.client_rsvp_at = None
+        appt.rsvp_checked_at = None
+        if appt.status != "cancelled":
+            appt.status = "pending"
 
     if event:
         event.title = appt.title
@@ -6491,6 +6589,267 @@ async def create_underwriting_review_preference(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+@router.post(
+    "/dealers/{dealer_id}/underwriting-review-preferences/{preference_id}/book",
+    response_model=RepAppointmentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def book_underwriting_review_preference(
+    dealer_id: UUID,
+    preference_id: UUID,
+    payload: UnderwritingReviewPreferenceBook,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Turn one proposed window into the single real calendar appointment."""
+    require_super_admin(user)
+    dealer = await load_dealer(db, dealer_id)
+    preference = (
+        await db.execute(
+            select(DealerUnderwritingReviewPreference)
+            .where(
+                DealerUnderwritingReviewPreference.id == preference_id,
+                DealerUnderwritingReviewPreference.dealer_id == dealer.id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if preference is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Review-window proposal not found.")
+    if preference.appointment_id:
+        existing = await db.get(DealerRepAppointment, preference.appointment_id)
+        if existing is not None:
+            existing_start = _to_utc_minute(existing.starts_at)
+            requested_start = _to_utc_minute(payload.starts_at)
+            if existing_start == requested_start or existing.client_rsvp_status != "declined":
+                return (await _appointment_read_rows(db, [existing]))[0]
+            # A declined invitation may be replaced by one of the other stored
+            # proposals. Keep the declined appointment as immutable history.
+
+    starts_at = _to_utc_minute(payload.starts_at)
+    proposed_starts = {
+        _to_utc_minute(datetime.fromisoformat(str(slot.get("starts_at")).replace("Z", "+00:00")))
+        for slot in (preference.slots or [])
+        if slot.get("starts_at")
+    }
+    if starts_at not in proposed_starts:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Choose one of the three proposed review windows.",
+        )
+
+    booking_rep = await db.get(User, preference.rep_user_id) if preference.rep_user_id else None
+    booking_rep = booking_rep or user
+    host = await _rep_host_for(db, dealer, booking_rep)
+    booking = await _booking_settings_for(db, host)
+    await lock_calendar_owner(db, host.id)
+    availability = await _booking_slots(
+        db,
+        host,
+        booking,
+        duration_min=booking.duration_min,
+    )
+    if availability.calendar_sync_status != "connected":
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The shared calendar is unavailable. Reconnect it before sending the invitation.",
+        )
+    if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in availability.slots):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "That proposed time is no longer available. Choose another window or request new options.",
+        )
+
+    program_key, program_name = await _resolve_appointment_program(
+        db,
+        program_key=payload.program_key,
+        program_name=payload.program_name,
+    )
+    appointment_payload = RepAppointmentCreate(
+        kind="underwriting_review",
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        timezone=preference.timezone or booking.timezone,
+        invitee_name=payload.invitee_name,
+        invitee_email=str(payload.invitee_email),
+        invitee_phone=payload.invitee_phone,
+        company=dealer.name,
+        program_key=program_key,
+        program_name=program_name,
+        requested_amount=payload.requested_amount,
+        full_address=payload.full_address,
+        notes=payload.notes,
+        transactional_sms_consent=payload.transactional_sms_consent,
+    )
+    title = _appointment_title("underwriting_review", payload.invitee_name, dealer)
+    description, program, requested_amount, full_address = _booking_description(
+        user=booking_rep,
+        payload=appointment_payload,
+        dealer=dealer,
+    )
+    event = CalendarEvent(
+        kind=CalendarEventKind.CALL,
+        title=title,
+        description=description,
+        who=f"{payload.invitee_name} <{payload.invitee_email}>"[:160],
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.MANUAL,
+        owner_user_id=host.id,
+        external_ref_kind="dealer_rep_appointment",
+        external_ref_id=secrets.token_urlsafe(12),
+    )
+    db.add(event)
+    await db.flush()
+    appointment = DealerRepAppointment(
+        dealer_id=dealer.id,
+        owner_user_id=host.id,
+        calendar_event_id=event.id,
+        kind="underwriting_review",
+        title=title,
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        timezone=preference.timezone or booking.timezone,
+        invitee_name=payload.invitee_name.strip(),
+        invitee_email=str(payload.invitee_email).strip().lower(),
+        invitee_phone=payload.invitee_phone,
+        company=dealer.name,
+        program_key=program_key,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
+        notes=payload.notes,
+        status="pending",
+        client_rsvp_status="needs_action",
+        booked_by_user_id=booking_rep.id,
+    )
+    db.add(appointment)
+    await db.flush()
+    event.external_ref_id = str(appointment.id)
+    preference.selected_slot_at = starts_at
+    preference.selected_by_user_id = user.id
+    preference.appointment_id = appointment.id
+    preference.status = "selected"
+
+    notice = await booking_reminders.register_booking(
+        db,
+        event=event,
+        booking=booking,
+        invitee_name=payload.invitee_name,
+        invitee_email=str(payload.invitee_email),
+        invitee_phone=payload.invitee_phone,
+        sms_consent=payload.transactional_sms_consent,
+        sms_consent_method="in_person_device" if payload.transactional_sms_consent else None,
+        sms_consent_ip=request.client.host if request.client else None,
+        sms_consent_user_agent=request.headers.get("user-agent"),
+        booked_by_user_id=booking_rep.id,
+        program_name=program,
+        requested_amount=requested_amount,
+        full_address=full_address,
+    )
+    phone = consent_delivery.normalize_phone(payload.invitee_phone)
+    contact = await _ensure_rep_contact(
+        db,
+        owner_user_id=booking_rep.id,
+        dealer_id=dealer.id,
+        full_name=payload.invitee_name,
+        company=dealer.name,
+        email=str(payload.invitee_email).strip().lower(),
+        phone_e164=phone,
+        source="underwriting_review_appointment",
+    )
+    appointment.contact_id = contact.id
+    await _capture_rep_contact_sms_consent(
+        db,
+        request=request,
+        user=user,
+        contact=contact,
+        dealer=dealer,
+        phone_e164=phone,
+        recipient_name=payload.invitee_name,
+        transactional=payload.transactional_sms_consent,
+        marketing=False,
+        method="in_person_device",
+    )
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "underwriting_review_preference.booked",
+        "underwriting_review_preference",
+        entity_id=preference.id,
+        after={
+            "appointment_id": str(appointment.id),
+            "starts_at": starts_at.isoformat(),
+            "client_rsvp_status": "needs_action",
+        },
+    )
+    await notify_users(
+        db,
+        recipient_ids={booking_rep.id, user.id},
+        event_type="underwriting_review_invitation_sent",
+        category="calendar",
+        priority="high",
+        title=f"Invitation sent: {payload.invitee_name}",
+        body=f"Client response is pending for {_appointment_local_time(starts_at, appointment.timezone)}.",
+        target_type="dealer_rep_appointment",
+        target_id=str(appointment.id),
+        deep_link=f"/calendar?appointment={appointment.id}",
+        meta={"appointment_id": str(appointment.id), "preference_id": str(preference.id)},
+        email=True,
+        push=True,
+    )
+    # Appointment, selected preference, and idempotency link commit together.
+    await db.commit()
+    await db.refresh(appointment)
+
+    join = await booking_notify.push_to_google(
+        db,
+        event,
+        invitee_email=str(payload.invitee_email),
+        invitee_name=payload.invitee_name,
+        rep_email=booking_rep.email,
+        rep_name=booking_rep.name,
+        want_meet=booking.google_meet_enabled,
+    )
+    if join:
+        appointment.join_url = join
+        notice.join_url = join
+        event.description = f"{description}\n\nJoin: {join}"
+    if booking.confirmation_email_enabled:
+        email_result = booking_notify.send_invitee_invite(
+            host,
+            booking,
+            event,
+            starts_at,
+            invitee_name=payload.invitee_name,
+            invitee_email=str(payload.invitee_email),
+            join_url=join,
+        )
+        notice.confirmation_email_status = "sent" if email_result and email_result.ok else "failed"
+        if email_result and not email_result.ok:
+            notice.last_error = email_result.detail[:1000]
+    booking_notify.send_rep_invite(
+        host,
+        booking,
+        event,
+        starts_at,
+        rep=booking_rep,
+        join_url=join,
+    )
+    await booking_reminders.send_confirmation_sms(
+        db,
+        notice,
+        event,
+        timezone_name=booking.timezone,
+    )
+    await db.commit()
+    await db.refresh(appointment)
+    return (await _appointment_read_rows(db, [appointment]))[0]
 
 
 @router.get("/contact-shares/program-pdfs", response_model=list[ProgramPdfAttachmentRead])
