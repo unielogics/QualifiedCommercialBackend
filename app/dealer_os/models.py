@@ -166,6 +166,14 @@ class DealerApplicationProfile(TimestampMixin, Base):
     annual_cash_flow_available_for_debt: Mapped[float | None] = mapped_column(Numeric(14, 2))
     monthly_debt_payments: Mapped[float | None] = mapped_column(Numeric(14, 2))
     signer_title: Mapped[str | None] = mapped_column(String(120))
+    guaranty_type: Mapped[str | None] = mapped_column(String(32))
+    office_space: Mapped[str | None] = mapped_column(String(80))
+    business_stage: Mapped[str | None] = mapped_column(String(24))
+    existing_mca_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    existing_sba_balance: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    active_ucc_filings: Mapped[int | None] = mapped_column(Integer)
+    affiliate_businesses: Mapped[bool | None] = mapped_column(Boolean)
+    send_welcome_email: Mapped[bool | None] = mapped_column(Boolean)
     # The engine recommends; an authorized desk reviewer releases the file.
     human_review_status: Mapped[str] = mapped_column(
         String(24), nullable=False, default="pending", server_default="pending"
@@ -1692,6 +1700,122 @@ class ContractTemplate(TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class ContractTemplateVersion(TimestampMixin, Base):
+    """Immutable paper plus its verified coordinate/field map."""
+
+    __tablename__ = "dos_contract_template_versions"
+    __table_args__ = (
+        UniqueConstraint("template_id", "revision", name="uq_dos_contract_template_version"),
+        Index("ix_dos_contract_template_versions_template", "template_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_contract_templates.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    s3_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    has_acroform: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    field_names: Mapped[list | None] = mapped_column(JSONB)
+    overlay_map: Mapped[dict | None] = mapped_column(JSONB)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class ContractPackage(TimestampMixin, Base):
+    """A versioned ordered signing package for one catalog program."""
+
+    __tablename__ = "dos_contract_packages"
+    __table_args__ = (
+        UniqueConstraint("program_key", "version", name="uq_dos_contract_package_program_version"),
+        Index("ix_dos_contract_packages_program", "program_key", "active"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    key: Mapped[str] = mapped_column(String(80), nullable=False)
+    program_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class ContractPackageItem(TimestampMixin, Base):
+    __tablename__ = "dos_contract_package_items"
+    __table_args__ = (
+        UniqueConstraint("package_id", "template_key", name="uq_dos_contract_package_item"),
+        Index("ix_dos_contract_package_items_package", "package_id", "sort_order"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    package_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_packages.id", ondelete="CASCADE"), nullable=False
+    )
+    template_key: Mapped[str] = mapped_column(String(48), nullable=False)
+    template_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_contract_template_versions.id", ondelete="RESTRICT"),
+    )
+    title_snapshot: Mapped[str] = mapped_column(String(180), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    conditions: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class ContractEnvelope(TimestampMixin, Base):
+    """One frozen package instance sent to one authorized representative."""
+
+    __tablename__ = "dos_contract_envelopes"
+    __table_args__ = (
+        Index("ix_dos_contract_envelopes_dealer", "dealer_id", "created_at"),
+        Index("ix_dos_contract_envelopes_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    package_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_packages.id", ondelete="RESTRICT"), nullable=False
+    )
+    package_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    package_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    program_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
+    source_sha256: Mapped[str | None] = mapped_column(String(64))
+    recipient_owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_owners.id", ondelete="SET NULL")
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    voided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    void_reason: Mapped[str | None] = mapped_column(Text)
+    signer_name: Mapped[str | None] = mapped_column(String(160))
+    signer_title: Mapped[str | None] = mapped_column(String(120))
+    signature_sha256: Mapped[str | None] = mapped_column(String(64))
+    signer_ip: Mapped[str | None] = mapped_column(String(64))
+    signer_user_agent: Mapped[str | None] = mapped_column(String(400))
+    bundle_s3_key: Mapped[str | None] = mapped_column(String(512))
+    bundle_sha256: Mapped[str | None] = mapped_column(String(64))
+    delivery_history: Mapped[list | None] = mapped_column(JSONB)
+
+
 class ContractDocument(TimestampMixin, Base):
     """One case's instance of a template: its values, state and executed copy.
 
@@ -1706,7 +1830,14 @@ class ContractDocument(TimestampMixin, Base):
     __tablename__ = "dos_contract_documents"
     __table_args__ = (
         Index("ix_dos_contract_docs_dealer", "dealer_id"),
-        UniqueConstraint("dealer_id", "template_key", name="uq_dos_contract_doc"),
+        Index(
+            "uq_dos_contract_doc_legacy",
+            "dealer_id",
+            "template_key",
+            unique=True,
+            postgresql_where=text("envelope_id IS NULL"),
+        ),
+        UniqueConstraint("envelope_id", "template_key", name="uq_dos_contract_doc_envelope"),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -1714,6 +1845,12 @@ class ContractDocument(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
     )
     template_key: Mapped[str] = mapped_column(String(48), nullable=False)
+    envelope_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_envelopes.id", ondelete="CASCADE")
+    )
+    template_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_template_versions.id", ondelete="RESTRICT")
+    )
     template_revision: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
     field_values: Mapped[dict | None] = mapped_column(JSONB)
@@ -1731,3 +1868,24 @@ class ContractDocument(TimestampMixin, Base):
     signature_sha256: Mapped[str | None] = mapped_column(String(64))
     signer_ip: Mapped[str | None] = mapped_column(String(64))
     signer_user_agent: Mapped[str | None] = mapped_column(String(400))
+
+
+class ContractEnvelopeDocument(TimestampMixin, Base):
+    __tablename__ = "dos_contract_envelope_documents"
+    __table_args__ = (
+        UniqueConstraint("envelope_id", "contract_document_id", name="uq_dos_envelope_document"),
+        Index("ix_dos_envelope_documents_order", "envelope_id", "sort_order"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    envelope_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_envelopes.id", ondelete="CASCADE"), nullable=False
+    )
+    contract_document_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_contract_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    title_snapshot: Mapped[str] = mapped_column(String(180), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

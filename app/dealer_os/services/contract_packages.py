@@ -1,0 +1,568 @@
+"""Versioned program packages and one-signature multi-document envelopes.
+
+The blank program application is immutable once uploaded.  A package freezes
+the exact template version, populated source values and document hashes before
+delivery.  One signature may execute every explicitly acknowledged document,
+but each resulting PDF keeps its own signature, certificate and SHA-256.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.enums import Role
+from app.models.user import User
+
+from ..models import (
+    ContractDocument,
+    ContractEnvelope,
+    ContractEnvelopeDocument,
+    ContractPackage,
+    ContractPackageItem,
+    ContractTemplate,
+    ContractTemplateVersion,
+    DealerApplicationProfile,
+    DealerBusiness,
+    DealerOwner,
+)
+from . import contract_fill, contract_sign, qc_master_application, storage
+
+PROGRAM_APPLICATION_KEY = "qc_program_application"
+PROGRAM_APPLICATION_TITLE = "Business Loan Application"
+EZ_PROGRAM_KEY = "term_loan_3_5_year"
+MICRO_PROGRAM_KEY = "term_loan_10_year"
+SUPPORTED_PROGRAMS = frozenset({EZ_PROGRAM_KEY, MICRO_PROGRAM_KEY})
+SOURCE_ASSET = Path(__file__).resolve().parents[1] / "templates" / "qc-program-application-v1.pdf"
+
+# Normalized locations are retained with the immutable template version.  The
+# renderer still locates labels by text where possible, while these anchors
+# make signature/program placement explicit and auditable.
+DEFAULT_OVERLAY_MAP: dict[str, Any] = {
+    "coordinate_space": "normalized_top_left",
+    "page": {"width": 612, "height": 792},
+    "program": {"ez_term": [0.243, 0.127], "microcap": [0.433, 0.127]},
+    "signature": [0.453, 0.955],
+    "signature_date": [0.707, 0.955],
+    "ssn_policy": "provider_only_notice",
+}
+
+
+def _sha(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def ensure_defaults(db: AsyncSession, actor_user_id: UUID | None = None) -> None:
+    """Ensure the bundled v1 paper has an immutable S3-backed version."""
+    template = (
+        await db.execute(select(ContractTemplate).where(ContractTemplate.key == PROGRAM_APPLICATION_KEY))
+    ).scalar_one_or_none()
+    if template is None:
+        template = ContractTemplate(
+            key=PROGRAM_APPLICATION_KEY,
+            title=PROGRAM_APPLICATION_TITLE,
+            render_kind="uploaded_pdf",
+            revision=1,
+            active=True,
+            has_acroform=False,
+            field_names=[],
+            field_map={},
+        )
+        db.add(template)
+        await db.flush()
+
+    version = (
+        await db.execute(
+            select(ContractTemplateVersion)
+            .where(ContractTemplateVersion.template_id == template.id)
+            .order_by(ContractTemplateVersion.revision.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raw = SOURCE_ASSET.read_bytes()
+        digest = _sha(raw)
+        key = f"contract-templates/{PROGRAM_APPLICATION_KEY}/r1-{digest[:16]}.pdf"
+        if not storage.put_bytes(key, raw, "application/pdf"):
+            raise RuntimeError("The program application template could not be stored.")
+        version = ContractTemplateVersion(
+            template_id=template.id,
+            revision=1,
+            s3_key=key,
+            sha256=digest,
+            page_count=1,
+            has_acroform=False,
+            field_names=[],
+            overlay_map=DEFAULT_OVERLAY_MAP,
+            uploaded_by_user_id=actor_user_id,
+            active=True,
+        )
+        db.add(version)
+        template.s3_key = key
+        template.page_count = 1
+        template.revision = 1
+        await db.flush()
+
+    items = list(
+        (
+            await db.execute(
+                select(ContractPackageItem).where(
+                    ContractPackageItem.template_key == PROGRAM_APPLICATION_KEY,
+                    ContractPackageItem.template_version_id.is_(None),
+                )
+            )
+        ).scalars().all()
+    )
+    for item in items:
+        item.template_version_id = version.id
+    await db.flush()
+
+
+async def create_template_version(
+    db: AsyncSession,
+    *,
+    template_key: str,
+    title: str,
+    raw: bytes,
+    actor_user_id: UUID,
+    overlay_map: dict[str, Any] | None = None,
+) -> ContractTemplateVersion:
+    if not raw.startswith(b"%PDF"):
+        raise ValueError("Upload a PDF template.")
+    template = (
+        await db.execute(select(ContractTemplate).where(ContractTemplate.key == template_key))
+    ).scalar_one_or_none()
+    if template is None:
+        template = ContractTemplate(
+            key=template_key,
+            title=title,
+            render_kind="uploaded_pdf",
+            revision=1,
+            active=True,
+            has_acroform=False,
+            field_names=[],
+            field_map={},
+        )
+        db.add(template)
+        await db.flush()
+    elif template.render_kind != "uploaded_pdf":
+        raise ValueError("Only uploaded-PDF templates can be versioned in Forms and Packages.")
+    template.title = title
+
+    import fitz
+
+    source = fitz.open(stream=raw, filetype="pdf")
+    if source.page_count < 1:
+        raise ValueError("The PDF template has no pages.")
+    page = source[0]
+    page_width = float(page.rect.width)
+    page_height = float(page.rect.height)
+    selected_overlay = overlay_map or (
+        DEFAULT_OVERLAY_MAP
+        if template_key == PROGRAM_APPLICATION_KEY
+        else {
+            "coordinate_space": "pdf_points_top_left",
+            "page": {"width": page_width, "height": page_height},
+            "signature": [72.0, max(72.0, page_height - 54.0)],
+            "signature_date": [max(330.0, page_width - 180.0), max(72.0, page_height - 54.0)],
+            "static_supporting_document": True,
+        }
+    )
+    latest = int(
+        (
+            await db.execute(
+                select(ContractTemplateVersion.revision)
+                .where(ContractTemplateVersion.template_id == template.id)
+                .order_by(ContractTemplateVersion.revision.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        or 0
+    )
+    revision = latest + 1
+    digest = _sha(raw)
+    key = f"contract-templates/{template_key}/r{revision}-{digest[:16]}.pdf"
+    if not storage.put_bytes(key, raw, "application/pdf"):
+        raise RuntimeError("The template PDF could not be stored.")
+    version = ContractTemplateVersion(
+        template_id=template.id,
+        revision=revision,
+        s3_key=key,
+        sha256=digest,
+        page_count=source.page_count,
+        has_acroform=False,
+        field_names=[],
+        overlay_map=selected_overlay,
+        uploaded_by_user_id=actor_user_id,
+        active=True,
+    )
+    db.add(version)
+    template.s3_key = key
+    template.revision = revision
+    template.active = True
+    await db.flush()
+    return version
+
+
+def signature_spots(overlay_map: dict[str, Any] | None) -> dict[str, list[float]] | None:
+    overlay = overlay_map or {}
+    signature = overlay.get("signature")
+    signature_date = overlay.get("signature_date")
+    if not (
+        isinstance(signature, list)
+        and len(signature) == 2
+        and isinstance(signature_date, list)
+        and len(signature_date) == 2
+    ):
+        return None
+    if overlay.get("coordinate_space") == "normalized_top_left":
+        page = overlay.get("page") or {}
+        width = float(page.get("width") or 612)
+        height = float(page.get("height") or 792)
+        return {
+            "signature": [float(signature[0]) * width, float(signature[1]) * height],
+            "date": [float(signature_date[0]) * width, float(signature_date[1]) * height],
+        }
+    return {
+        "signature": [float(signature[0]), float(signature[1])],
+        "date": [float(signature_date[0]), float(signature_date[1])],
+    }
+
+
+async def packages(db: AsyncSession) -> list[tuple[ContractPackage, list[ContractPackageItem]]]:
+    await ensure_defaults(db)
+    rows = list(
+        (
+            await db.execute(
+                select(ContractPackage)
+                .where(ContractPackage.program_key.in_(SUPPORTED_PROGRAMS))
+                .order_by(ContractPackage.program_key, ContractPackage.version.desc())
+            )
+        ).scalars().all()
+    )
+    out = []
+    for package in rows:
+        items = list(
+            (
+                await db.execute(
+                    select(ContractPackageItem)
+                    .where(ContractPackageItem.package_id == package.id)
+                    .order_by(ContractPackageItem.sort_order)
+                )
+            ).scalars().all()
+        )
+        out.append((package, items))
+    return out
+
+
+def _program_viable(context: dict[str, Any], program_key: str) -> bool:
+    programs = (context.get("routing") or {}).get("programs") or []
+    row = next((item for item in programs if item.get("program_key") == program_key), None)
+    return bool(row and row.get("status") in {"recommended", "potential"})
+
+
+def _missing_for_program(values: dict[str, str], base_missing: list[str], program_key: str) -> list[str]:
+    required = {
+        "principal name": "owner_full",
+        "principal email": "owner_email",
+        "principal phone": "owner_phone",
+        "principal home address": "owner_street",
+        "guaranty type": "guaranty",
+        "business legal name": "biz_legal",
+        "business entity type": "biz_entity",
+        "business formation state": "biz_formation_state",
+        "business start date": "biz_start",
+        "physical business address": "biz_address",
+        "annual sales": "annual_sales",
+        "funding amount requested": "amount_requested",
+        "detailed use of funds": "use_of_funds",
+        "existing MCA balance (enter zero when none)": "mca_balance",
+        "existing SBA balance (enter zero when none)": "sba_balance",
+        "authorized signer title": "signer_title",
+    }
+    # `build_values` is shared with older standalone agreements and therefore
+    # reports requirements that are not present on this program application
+    # (for example, the assigned rep).  A package is blocked only by fields
+    # its configured PDF actually needs.
+    missing: set[str] = set()
+    for label, key in required.items():
+        if not str(values.get(key) or "").strip():
+            missing.add(label)
+    if program_key == MICRO_PROGRAM_KEY:
+        for label, key in (
+            ("business DSCR inputs", "business_dscr"),
+            ("owner count", "owner_count"),
+            ("active UCC disclosure", "ucc_filings"),
+            ("affiliate-business disclosure", "affiliates"),
+        ):
+            if values.get(key) in {None, "", "N/A"}:
+                missing.add(label)
+    return sorted(missing)
+
+
+async def generate_envelope(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    program_key: str,
+    actor: User,
+    override_reason: str | None = None,
+) -> ContractEnvelope:
+    if program_key not in SUPPORTED_PROGRAMS:
+        raise ValueError("Choose EZ Term or MicroCap.")
+    await ensure_defaults(db, actor.id)
+    context = await qc_master_application.build_context(db, dealer)
+    viable = _program_viable(context, program_key)
+    if not viable:
+        if actor.role != Role.SUPER_ADMIN:
+            raise PermissionError("That program is blocked by the current routing result.")
+        if not (override_reason or "").strip():
+            raise ValueError("A documented super-admin override reason is required.")
+
+    package = (
+        await db.execute(
+            select(ContractPackage)
+            .where(ContractPackage.program_key == program_key, ContractPackage.active.is_(True))
+            .order_by(ContractPackage.version.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if package is None:
+        raise ValueError("No active forms package is configured for that program.")
+    items = list(
+        (
+            await db.execute(
+                select(ContractPackageItem)
+                .where(ContractPackageItem.package_id == package.id)
+                .order_by(ContractPackageItem.sort_order)
+            )
+        ).scalars().all()
+    )
+    if not items:
+        raise ValueError("The selected package has no documents.")
+
+    active = (
+        await db.execute(
+            select(ContractEnvelope)
+            .where(
+                ContractEnvelope.dealer_id == dealer.id,
+                ContractEnvelope.status.notin_(["void", "executed"]),
+            )
+            .order_by(ContractEnvelope.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active and active.status == "out_for_signature":
+        raise ValueError("Void the sent package before changing or regenerating it.")
+    if active and active.program_key != program_key:
+        active.status = "void"
+        active.voided_at = datetime.now(UTC)
+        active.voided_by_user_id = actor.id
+        active.void_reason = "Replaced before delivery by a different program package."
+        active = None
+
+    primary = (
+        await db.execute(
+            select(DealerOwner)
+            .where(DealerOwner.dealer_id == dealer.id)
+            .order_by(DealerOwner.is_primary.desc(), DealerOwner.created_at.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if primary is None:
+        raise ValueError("Add a designated primary owner before generating forms.")
+
+    envelope = active or ContractEnvelope(
+        dealer_id=dealer.id,
+        package_id=package.id,
+        package_key=package.key,
+        package_version=package.version,
+        program_key=program_key,
+        title=package.title,
+        recipient_owner_id=primary.id,
+        created_by_user_id=actor.id,
+        delivery_history=[],
+    )
+    if active is None:
+        db.add(envelope)
+        await db.flush()
+    else:
+        await db.execute(delete(ContractEnvelopeDocument).where(
+            ContractEnvelopeDocument.envelope_id == envelope.id
+        ))
+        await db.execute(delete(ContractDocument).where(
+            ContractDocument.envelope_id == envelope.id
+        ))
+        await db.flush()
+
+    profile = context.get("profile")
+    if profile is None:
+        profile = DealerApplicationProfile(dealer_id=dealer.id)
+        db.add(profile)
+    profile.selected_program = program_key
+    profile.updated_by_user_id = actor.id
+    values, base_missing = await contract_fill.build_values(db, dealer)
+    values["selected_program"] = program_key
+    values["signer_title"] = profile.signer_title or ""
+    missing = _missing_for_program(values, base_missing, program_key)
+    values["_missing_data"] = missing
+    values["_override_reason"] = (override_reason or "").strip() or None
+    envelope.source_sha256 = _sha(json.dumps(values, sort_keys=True, default=str).encode())
+    envelope.status = "draft" if missing else "ready"
+    envelope_missing = set(missing)
+
+    for item in items:
+        version = await db.get(ContractTemplateVersion, item.template_version_id) if item.template_version_id else None
+        if version is None or not version.active:
+            raise ValueError(f"{item.title_snapshot} has no active immutable template version.")
+        raw = storage.get_bytes(version.s3_key)
+        if raw is None:
+            raise RuntimeError(f"The template for {item.title_snapshot} could not be read.")
+        result = contract_fill.fill_pdf(
+            item.template_key,
+            raw,
+            values,
+            overlay_map=version.overlay_map,
+        )
+        document_key = (
+            f"contract-fills/{dealer.id}/envelopes/{envelope.id}/"
+            f"{item.sort_order:02d}-{item.template_key}-{result.sha256[:16]}.pdf"
+        )
+        if not storage.put_bytes(document_key, result.pdf, "application/pdf"):
+            raise RuntimeError(f"The populated {item.title_snapshot} could not be stored.")
+        document_missing = sorted(set(missing) | set(result.missing))
+        envelope_missing.update(document_missing)
+        doc = ContractDocument(
+            dealer_id=dealer.id,
+            template_key=item.template_key,
+            envelope_id=envelope.id,
+            template_version_id=version.id,
+            template_revision=version.revision,
+            status="draft" if document_missing else "ready",
+            field_values={
+                **result.placed,
+                "signer_title": profile.signer_title or "",
+                "_missing_data": document_missing,
+                "_overlay_problems": result.missing,
+                "_signature_spots": signature_spots(version.overlay_map),
+            },
+            filled_s3_key=document_key,
+            filled_sha256=result.sha256,
+        )
+        db.add(doc)
+        await db.flush()
+        db.add(ContractEnvelopeDocument(
+            envelope_id=envelope.id,
+            contract_document_id=doc.id,
+            title_snapshot=item.title_snapshot,
+            sort_order=item.sort_order,
+            required=item.required,
+        ))
+    envelope.status = "draft" if envelope_missing else "ready"
+    await db.flush()
+    return envelope
+
+
+async def execute_envelope(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    envelope: ContractEnvelope,
+    *,
+    typed_name: str,
+    signature_png: bytes | None,
+    signature_sha256: str | None,
+    ip: str | None,
+    user_agent: str | None,
+) -> tuple[bytes, str]:
+    if not signature_png or not signature_sha256:
+        raise ValueError("A drawn signature is required for this application package.")
+    if envelope.status == "executed" and envelope.bundle_s3_key and envelope.bundle_sha256:
+        existing = storage.get_bytes(envelope.bundle_s3_key)
+        if existing is None:
+            raise RuntimeError("The executed package could not be read.")
+        return existing, envelope.bundle_sha256
+    if envelope.status != "out_for_signature":
+        raise ValueError("This package is not out for signature.")
+    rows = list(
+        (
+            await db.execute(
+                select(ContractEnvelopeDocument, ContractDocument)
+                .join(ContractDocument, ContractDocument.id == ContractEnvelopeDocument.contract_document_id)
+                .where(ContractEnvelopeDocument.envelope_id == envelope.id)
+                .order_by(ContractEnvelopeDocument.sort_order)
+            )
+        ).all()
+    )
+    if not rows or any(link.required and not link.acknowledged_at for link, _ in rows):
+        raise ValueError("Review and acknowledge every required document before signing.")
+
+    import fitz
+
+    bundle = fitz.open()
+    evidence: list[tuple[str, str]] = []
+    for link, doc in rows:
+        executed, digest = await contract_sign.execute(
+            db,
+            dealer,
+            doc,
+            typed_name=typed_name,
+            signature_png=signature_png,
+            signature_sha256=signature_sha256,
+            ip=ip,
+            user_agent=user_agent,
+            title=link.title_snapshot,
+        )
+        child = fitz.open(stream=executed, filetype="pdf")
+        bundle.insert_pdf(child)
+        evidence.append((link.title_snapshot, digest))
+
+    now = datetime.now(UTC)
+    rows_html = "".join(
+        f"<tr><td>{html.escape(title)}</td><td>{html.escape(digest)}</td></tr>"
+        for title, digest in evidence
+    )
+    from weasyprint import HTML
+
+    cert = HTML(string=f"""
+      <html><head><style>
+      body{{font-family:Arial,sans-serif;margin:44px;color:#111827}}
+      h1{{font-size:21px}} p,td,th{{font-size:11px;line-height:1.5}}
+      table{{width:100%;border-collapse:collapse}}td,th{{border:1px solid #d1d5db;padding:8px;text-align:left}}
+      </style></head><body><h1>Package Certificate of Completion</h1>
+      <p><b>{html.escape(envelope.title)}</b><br>Case: {html.escape(dealer.case_ref or str(dealer.id))}<br>
+      Signer: {html.escape(typed_name)}<br>Signed: {now.isoformat()}<br>
+      Program: {html.escape(envelope.program_key)}<br>
+      Package version: {envelope.package_version}<br>
+      Source SHA-256: {html.escape(envelope.source_sha256 or '')}<br>
+      Signature SHA-256: {html.escape(signature_sha256)}<br>
+      Signing IP: {html.escape(ip or '')}<br>
+      Device: {html.escape((user_agent or '')[:220])}<br>
+      The signer reviewed and acknowledged every required document and affirmed that one electronic signature applies to each listed document.</p>
+      <table><tr><th>Executed document</th><th>SHA-256</th></tr>{rows_html}</table></body></html>
+    """).write_pdf()
+    cert_doc = fitz.open(stream=cert, filetype="pdf")
+    bundle.insert_pdf(cert_doc)
+    output = bundle.tobytes(deflate=True)
+    digest = _sha(output)
+    key = f"contract-executed/{dealer.id}/envelopes/{envelope.id}/{digest[:16]}-package.pdf"
+    if not storage.put_bytes(key, output, "application/pdf"):
+        raise RuntimeError("The executed package could not be stored.")
+    envelope.status = "executed"
+    envelope.completed_at = now
+    envelope.signer_name = typed_name
+    envelope.signer_title = str((rows[0][1].field_values or {}).get("signer_title") or "") or None
+    envelope.signature_sha256 = signature_sha256
+    envelope.signer_ip = ip
+    envelope.signer_user_agent = (user_agent or "")[:400]
+    envelope.bundle_s3_key = key
+    envelope.bundle_sha256 = digest
+    await db.flush()
+    return output, digest

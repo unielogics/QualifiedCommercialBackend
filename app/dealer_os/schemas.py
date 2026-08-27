@@ -603,6 +603,14 @@ class ApplicationProfileRead(ORM):
     annual_cash_flow_available_for_debt: float | None = None
     monthly_debt_payments: float | None = None
     signer_title: str | None = None
+    guaranty_type: str | None = None
+    office_space: str | None = None
+    business_stage: str | None = None
+    existing_mca_balance: float | None = None
+    existing_sba_balance: float | None = None
+    active_ucc_filings: int | None = None
+    affiliate_businesses: bool | None = None
+    send_welcome_email: bool | None = None
     human_review_status: Literal["pending", "fundable", "not_fundable"] = "pending"
     human_review_note: str | None = None
     human_reviewed_at: datetime | None = None
@@ -632,6 +640,14 @@ class ApplicationProfilePatch(BaseModel):
     annual_cash_flow_available_for_debt: float | None = Field(default=None, ge=0)
     monthly_debt_payments: float | None = Field(default=None, ge=0)
     signer_title: str | None = Field(default=None, max_length=120)
+    guaranty_type: Literal["personal", "business", "limited", "none"] | None = None
+    office_space: str | None = Field(default=None, max_length=80)
+    business_stage: Literal["startup", "existing", "acquisition"] | None = None
+    existing_mca_balance: float | None = Field(default=None, ge=0)
+    existing_sba_balance: float | None = Field(default=None, ge=0)
+    active_ucc_filings: int | None = Field(default=None, ge=0, le=999)
+    affiliate_businesses: bool | None = None
+    send_welcome_email: bool | None = None
     landlord_mortgagee: str | None = Field(default=None, max_length=200)
     guarantor_home_address: str | None = Field(default=None, max_length=300)
     guarantor_dob: date | None = None
@@ -1088,6 +1104,8 @@ class ContractTemplateRead(ORM):
 class ContractDocRead(ORM):
     id: UUID
     template_key: str
+    envelope_id: UUID | None = None
+    template_version_id: UUID | None = None
     template_revision: int | None = None
     status: str
     field_values: dict | None = None
@@ -1543,6 +1561,7 @@ class RoomFeaturesRead(BaseModel):
     plaid_assets_enabled: bool = False
     signable: list[RoomSignableRead] = []
     contracts: list["RoomContractRead"] = Field(default_factory=list)
+    envelopes: list["ContractEnvelopeRead"] = Field(default_factory=list)
 
 
 class RoomContractRead(BaseModel):
@@ -1557,6 +1576,115 @@ class RoomContractRead(BaseModel):
     agreement_text: str = ""
     commission_note: str | None = None
     download_url: str | None = None
+
+
+class ContractTemplateVersionRead(ORM):
+    id: UUID
+    template_id: UUID
+    revision: int
+    sha256: str
+    page_count: int
+    has_acroform: bool = False
+    field_names: list | None = None
+    overlay_map: dict | None = None
+    active: bool = True
+    created_at: datetime
+
+
+class ContractTemplateVersionCatalogRead(ContractTemplateVersionRead):
+    template_key: str
+    title: str
+    preview_url: str | None = None
+
+
+class ContractPackageItemRead(BaseModel):
+    id: UUID
+    template_key: str
+    template_version_id: UUID | None = None
+    title: str
+    sort_order: int
+    required: bool
+
+
+class ContractPackageRead(BaseModel):
+    id: UUID
+    key: str
+    program_key: str
+    title: str
+    version: int
+    active: bool
+    items: list[ContractPackageItemRead] = Field(default_factory=list)
+
+
+class ContractPackageItemWrite(BaseModel):
+    template_key: str = Field(min_length=1, max_length=48)
+    template_version_id: UUID | None = None
+    title: str = Field(min_length=1, max_length=180)
+    sort_order: int = Field(default=0, ge=0, le=100)
+    required: bool = True
+
+
+class ContractPackageWrite(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    active: bool = True
+    items: list[ContractPackageItemWrite] = Field(min_length=1, max_length=20)
+
+
+class ContractEnvelopeDocumentRead(BaseModel):
+    id: UUID
+    contract_document_id: UUID
+    template_key: str
+    title: str
+    sort_order: int
+    required: bool
+    status: str
+    missing_data: list[str] = Field(default_factory=list)
+    filled_sha256: str | None = None
+    executed_sha256: str | None = None
+    reviewed_at: datetime | None = None
+    acknowledged_at: datetime | None = None
+    preview_url: str | None = None
+    download_url: str | None = None
+
+
+class ContractEnvelopeRead(BaseModel):
+    id: UUID
+    dealer_id: UUID
+    package_key: str
+    package_version: int
+    program_key: str
+    title: str
+    status: str
+    signer_name: str | None = None
+    signer_title: str | None = None
+    sent_at: datetime | None = None
+    opened_at: datetime | None = None
+    completed_at: datetime | None = None
+    voided_at: datetime | None = None
+    bundle_sha256: str | None = None
+    bundle_download_url: str | None = None
+    delivery_history: list = Field(default_factory=list)
+    documents: list[ContractEnvelopeDocumentRead] = Field(default_factory=list)
+
+
+class ContractEnvelopeGenerateRequest(BaseModel):
+    program_key: Literal["term_loan_3_5_year", "term_loan_10_year"]
+    override_reason: str | None = Field(default=None, max_length=2000)
+
+
+class ContractEnvelopeVoidRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=2000)
+
+
+class ContractEnvelopeAcknowledgeRequest(RoomPasscode):
+    acknowledged: bool = True
+
+
+class ContractEnvelopeSignRequest(RoomPasscode):
+    typed_name: str = Field(min_length=2, max_length=160)
+    esign_consent: bool
+    applies_to_all_documents: bool
+    signature_data_url: str = Field(min_length=1, max_length=400_000)
     pdf_sha256: str | None = None
 
 
@@ -2743,3 +2871,7 @@ class RepProductionRead(BaseModel):
     since: datetime | None = None
     totals: RepProduction
     reps: list[RepProduction] = []
+
+
+# Contract envelopes are declared after the public-room feature schema.
+RoomFeaturesRead.model_rebuild()

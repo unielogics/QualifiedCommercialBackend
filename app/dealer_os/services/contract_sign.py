@@ -35,7 +35,7 @@ from __future__ import annotations
 import hashlib
 import html as html_mod
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +53,7 @@ __all__ = ["execute", "agreement_text"]
 _SIGN_SPOTS: dict[str, dict[str, tuple[float, float]]] = {
     "consulting_agreement": {"signature": (322.0, 674.0), "date": (322.0, 745.0)},
     "loan_app": {"signature": (277.3, 718.0), "date": (432.7, 718.0)},
+    "qc_program_application": {"signature": (277.3, 756.0), "date": (432.7, 756.0)},
 }
 
 
@@ -72,6 +73,7 @@ def _stamp(
     typed_name: str,
     signature_png: bytes | None,
     signed_at: datetime,
+    signature_spots: dict[str, tuple[float, float]] | None = None,
 ) -> bytes:
     import fitz
 
@@ -112,7 +114,9 @@ def _stamp(
         date_spot = (date_rect.x0, date_rect.y1 - 2)
     else:
         page = doc[0]
-        spots = _SIGN_SPOTS.get(template_key, _SIGN_SPOTS["consulting_agreement"])
+        spots = signature_spots or _SIGN_SPOTS.get(
+            template_key, _SIGN_SPOTS["consulting_agreement"]
+        )
         sx, sy = spots["signature"]
         date_spot = spots["date"]
     if signature_png:
@@ -201,10 +205,13 @@ async def execute(
             "Signing is refused; ask the desk to regenerate the document."
         )
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     stamped = _stamp(
         raw, doc.template_key,
-        typed_name=typed_name, signature_png=signature_png, signed_at=now,
+        typed_name=typed_name,
+        signature_png=signature_png,
+        signed_at=now,
+        signature_spots=(doc.field_values or {}).get("_signature_spots"),
     )
     signed_body_sha = hashlib.sha256(stamped).hexdigest()
 

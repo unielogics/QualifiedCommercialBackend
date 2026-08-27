@@ -36,12 +36,18 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
 
-from ..models import ContractDocument, ContractTemplate, DealerBusiness, DealerOwner
+from ..models import (
+    ContractDocument,
+    ContractTemplate,
+    DealerApplicationProfile,
+    DealerBusiness,
+    DealerOwner,
+)
 from . import qc_master_application, storage
 
 logger = logging.getLogger(__name__)
@@ -59,7 +65,11 @@ QC_LAW_STATE = "New Jersey"
 # Overlay maps are verified against a specific upload of each PDF. A replaced
 # template re-orders blanks silently, so a fill against an unverified revision
 # is refused rather than risked.
-VERIFIED_REVISIONS: dict[str, int] = {"consulting_agreement": 1, "loan_app": 1}
+VERIFIED_REVISIONS: dict[str, int] = {
+    "consulting_agreement": 1,
+    "loan_app": 1,
+    "qc_program_application": 1,
+}
 
 _FONT = "helv"
 _SIZE = 8.0
@@ -121,6 +131,13 @@ async def build_values(
     rep = None
     if dealer.owner_user_id:
         rep = await db.get(User, dealer.owner_user_id)
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(
+                DealerApplicationProfile.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
 
     now = datetime.now(UTC)
     full_addr = ", ".join(
@@ -143,31 +160,79 @@ async def build_values(
         "owner_full": "",  # composed from first + last below
         "owner_email": (owner.email if owner else "") or "",
         "owner_phone": (owner.phone if owner else "") or "",
+        # The downstream form has an SSN box, but QC never receives or retains
+        # raw SSNs. Identity is collected directly by the credit provider.
+        "owner_ssn_notice": "Collected securely through credit authorization",
         "owner_pct": (
             f"{owner.ownership_pct:g}" if owner and owner.ownership_pct is not None else ""
         ),
         "owner_street": (owner.street if owner else "") or "",
+        "owner_address_2": "N/A",
         "owner_city": (owner.city if owner else "") or "",
         "owner_state": (owner.state if owner else "") or "",
         "owner_zip": (owner.zip if owner else "") or "",
-        "guaranty": "Personal" if owner and owner.is_guarantor else "",
+        "guaranty": (
+            (profile.guaranty_type or "").replace("_", " ").title()
+            if profile and profile.guaranty_type
+            else "Personal" if owner and owner.is_guarantor else ""
+        ),
         "biz_legal": dealer.legal_name or dealer.name or "",
         "biz_dba": dealer.name if dealer.legal_name and dealer.legal_name != dealer.name else "",
         "biz_industry": _INDUSTRY_LABELS.get(dealer.industry or "", dealer.industry or ""),
         "biz_entity": dealer.entity_type or "",
+        "biz_office_space": (profile.office_space if profile else None) or "N/A",
+        "biz_location_type": (profile.location_type if profile else None) or "N/A",
+        "biz_formation_state": (profile.state_of_formation if profile else None) or dealer.state or "",
         "biz_start": dealer.started_on.strftime("%m/%Y") if dealer.started_on else "",
+        "biz_website": (profile.website if profile else None) or "N/A",
+        "business_stage": (profile.business_stage if profile else None) or "existing",
         "biz_address": dealer.address or "",
         "biz_city": dealer.city or "",
         "biz_state": dealer.state or "",
         "biz_zip": dealer.zip or "",
+        "mail_address": (profile.mailing_address if profile else None) or dealer.address or "",
+        "mail_city": (profile.mailing_city if profile else None) or dealer.city or "",
+        "mail_state": (profile.mailing_state if profile else None) or dealer.state or "",
+        "mail_zip": (profile.mailing_zip if profile else None) or dealer.zip or "",
+        "mail_same_as_physical": "yes" if not profile or not any((
+            profile.mailing_address,
+            profile.mailing_city,
+            profile.mailing_state,
+            profile.mailing_zip,
+        )) else "no",
+        "annual_sales": _fmt_money(float(profile.annual_sales)) if profile and profile.annual_sales is not None else "",
         "amount_requested": _fmt_money(
             float(dealer.funding_goal) if dealer.funding_goal is not None else None
         ),
         "use_of_funds": dealer.use_of_proceeds_note or "",
+        # A blank debt disclosure must never be converted into a factual $0.
+        # The rep explicitly enters zero when the business has no such balance.
+        "mca_balance": _fmt_money(float(profile.existing_mca_balance)) if profile and profile.existing_mca_balance is not None else "",
+        "sba_balance": _fmt_money(float(profile.existing_sba_balance)) if profile and profile.existing_sba_balance is not None else "",
+        "business_dscr": (
+            f"{(float(profile.annual_cash_flow_available_for_debt) / (float(profile.monthly_debt_payments) * 12)):.2f}x"
+            if profile
+            and profile.annual_cash_flow_available_for_debt is not None
+            and profile.monthly_debt_payments
+            and float(profile.monthly_debt_payments) > 0
+            else "N/A"
+        ),
+        "owner_count": "",  # populated below from the complete ownership schedule
+        "ucc_filings": str(profile.active_ucc_filings) if profile and profile.active_ucc_filings is not None else "N/A",
+        "affiliates": "Yes" if profile and profile.affiliate_businesses is True else "No" if profile and profile.affiliate_businesses is False else "N/A",
+        "welcome_email": "Yes" if not profile or profile.send_welcome_email is not False else "No",
+        "signer_title": (profile.signer_title if profile else None) or "",
+        "selected_program": (profile.selected_program if profile else None) or "",
         "program_checkbox": _PROGRAM_FOR_PURPOSE.get(dealer.funding_purpose or "", ""),
     }
     if not v["owner_full"]:
         v["owner_full"] = " ".join(x for x in (v["owner_first"], v["owner_last"]) if x)
+    owner_count = int(
+        (await db.execute(select(func.count()).select_from(DealerOwner).where(
+            DealerOwner.dealer_id == dealer.id
+        ))).scalar_one()
+    )
+    v["owner_count"] = str(owner_count)
 
     missing = sorted(
         {
@@ -212,7 +277,15 @@ def _put(page, x: float, y: float, text: str, size: float = _SIZE) -> None:
     page.insert_text((x, y), text, fontname=_FONT, fontsize=size, color=(0.106, 0.294, 0.62))
 
 
-def _under_label(page, label: str, value: str, *, dy: float = 13.0, occurrence: int = 0) -> bool:
+def _under_label(
+    page,
+    label: str,
+    value: str,
+    *,
+    dy: float = 13.0,
+    occurrence: int = 0,
+    size: float = _SIZE,
+) -> bool:
     """Place a value just beneath a searched label. Returns False when the
     label is not found, so a re-export that renames a box surfaces as an
     unplaced value instead of text floating in space."""
@@ -220,7 +293,7 @@ def _under_label(page, label: str, value: str, *, dy: float = 13.0, occurrence: 
     if len(rects) <= occurrence:
         return False
     r = rects[occurrence]
-    _put(page, r.x0, r.y1 + dy, value)
+    _put(page, r.x0, r.y1 + dy, value, size=size)
     return True
 
 
@@ -288,20 +361,30 @@ _LOANAPP_LABELS: list[tuple[str, str, int]] = [
     ("LAST NAME", "owner_last", 0),
     ("EMAIL", "owner_email", 0),
     ("PHONE", "owner_phone", 0),
+    ("SSN", "owner_ssn_notice", 0),
     ("OWNERSHIP %", "owner_pct", 0),
     ("GUARANTY TYPE", "guaranty", 0),
     ("STREET ADDRESS", "owner_street", 0),  # first occurrence = borrower's
-    ("STATE", "owner_state", 0),
+    ("ADDRESS 2", "owner_address_2", 0),
+    # The source PDF contains lowercase uses of "state" in its instructions
+    # plus STATE OF INCORPORATION. These source-specific occurrences target
+    # the actual borrower and business-address boxes.
+    ("STATE", "owner_state", 2),
     ("ZIP", "owner_zip", 0),
     ("LEGAL / CORPORATE NAME", "biz_legal", 0),
     ("COMPANY NAME (DBA)", "biz_dba", 0),
     ("INDUSTRY", "biz_industry", 0),
     ("BUSINESS TYPE", "biz_entity", 0),
-    ("STATE OF INCORPORATION", "biz_state", 0),
+    ("OFFICE SPACE", "biz_office_space", 0),
+    ("BUSINESS LOCATION TYPE", "biz_location_type", 0),
+    ("STATE OF INCORPORATION", "biz_formation_state", 0),
     ("BUSINESS START DATE", "biz_start", 0),
+    ("WEBSITE", "biz_website", 0),
     ("PHYSICAL STREET ADDRESS", "biz_address", 0),
-    ("GROSS ANNUAL SALES", "", 0),  # not collected; named missing upstream
+    ("GROSS ANNUAL SALES", "annual_sales", 0),
     ("FUNDING AMOUNT REQUESTED", "amount_requested", 0),
+    ("EXISTING MCA BALANCE", "mca_balance", 0),
+    ("EXISTING SBA BALANCE", "sba_balance", 0),
 ]
 
 
@@ -312,7 +395,14 @@ def _fill_loanapp(page, v: dict[str, str]) -> tuple[dict[str, str], list[str]]:
     for label, key, occ in _LOANAPP_LABELS:
         if not key or not v.get(key):
             continue
-        if _under_label(page, label, v[key], occurrence=occ):
+        if _under_label(
+            page,
+            label,
+            v[key],
+            occurrence=occ,
+            dy=11.0 if key == "owner_ssn_notice" else 13.0,
+            size=4.5 if key == "owner_ssn_notice" else _SIZE,
+        ):
             placed[label.title()] = v[key]
         else:
             problems.append(f"label not found: {label}")
@@ -324,22 +414,65 @@ def _fill_loanapp(page, v: dict[str, str]) -> tuple[dict[str, str], list[str]]:
     if v.get("biz_city") and _under_label(page, "CITY", v["biz_city"], occurrence=1):
         placed["Business City"] = v["biz_city"]
     # Business state/zip on the physical row (STATE occ 1, ZIP occ 1).
-    if v.get("biz_state") and _under_label(page, "STATE", v["biz_state"], occurrence=1):
+    if v.get("biz_state") and _under_label(page, "STATE", v["biz_state"], occurrence=4):
         placed["Business State"] = v["biz_state"]
     if v.get("biz_zip") and _under_label(page, "ZIP", v["biz_zip"], occurrence=1):
         placed["Business Zip"] = v["biz_zip"]
 
+    # Mailing row. A separate mailing address is preserved when provided;
+    # otherwise the same-as-physical box is selected below.
+    for label, key, occurrence in (
+        ("MAILING STREET ADDRESS", "mail_address", 0),
+        ("CITY", "mail_city", 2),
+        ("STATE", "mail_state", 5),
+        ("ZIP", "mail_zip", 2),
+    ):
+        if v.get(key) and _under_label(page, label, v[key], occurrence=occurrence):
+            placed[f"Mailing {label.title()}"] = v[key]
+
     # Type of business: an operating file is an existing business.
-    if v.get("biz_start"):
-        rects = page.search_for("Existing business")
+    if v.get("business_stage"):
+        stage_label = {
+            "startup": "Startup",
+            "existing": "Existing business",
+            "acquisition": "Acquisition",
+        }.get(v["business_stage"].lower(), "Existing business")
+        rects = page.search_for(stage_label)
         if rects:
             _put(page, rects[0].x0 - 11, rects[0].y1 - 1.0, "X", size=9.0)
-            placed["Type: Existing business"] = "X"
+            placed[f"Type: {stage_label}"] = "X"
     # One address collected means mailing == physical.
     rects = page.search_for("Mailing address same as physical")
-    if rects and v.get("biz_address"):
+    if rects and v.get("biz_address") and v.get("mail_same_as_physical") == "yes":
         _put(page, rects[0].x0 - 11, rects[0].y1 - 1.0, "X", size=9.0)
         placed["Mailing same as physical"] = "X"
+
+    # Program selection is deterministic from the package, never guessed
+    # from free-text use of funds.
+    selected = (v.get("selected_program") or "").lower()
+    program_label = (
+        "EZ Term" if selected == "term_loan_3_5_year"
+        else "MicroCap" if selected == "term_loan_10_year"
+        else ""
+    )
+    if program_label:
+        rects = page.search_for(program_label)
+        if rects:
+            # The program names also appear in the dark header and document
+            # checklist. Select the occurrence on the PROGRAM APPLIED FOR row.
+            candidate = min(rects, key=lambda rect: abs(rect.y0 - 97.0))
+            _put(page, candidate.x0 - 11, candidate.y1 - 1.0, "X", size=9.0)
+            placed[f"Program: {program_label}"] = "X"
+
+    welcome_label = "Yes" if v.get("welcome_email") == "Yes" else "No"
+    welcome_heading = page.search_for("WELCOME EMAIL")
+    candidates = page.search_for(welcome_label)
+    if welcome_heading and candidates:
+        heading = welcome_heading[0]
+        candidate = min(candidates, key=lambda r: abs(r.y0 - heading.y1))
+        if abs(candidate.y0 - heading.y1) < 40:
+            _put(page, candidate.x0 - 10, candidate.y1 - 1, "X", size=9.0)
+            placed[f"Welcome email: {welcome_label}"] = "X"
 
     # Use of funds: the big box under its label, wrapped.
     if v.get("use_of_funds"):
@@ -355,10 +488,47 @@ def _fill_loanapp(page, v: dict[str, str]) -> tuple[dict[str, str], list[str]]:
             )
             placed["Use Of Funds Description"] = v["use_of_funds"][:120]
 
+    # MicroCap-only fields are populated only for MicroCap. The EZ package
+    # explicitly says N/A so conditional boxes are never ambiguous.
+    is_microcap = selected == "term_loan_10_year"
+    for label, key in (
+        ("BUSINESS DSCR", "business_dscr"),
+        ("NUMBER OF OWNERS", "owner_count"),
+        ("ACTIVE UCC", "ucc_filings"),
+    ):
+        value = v.get(key) if is_microcap else "N/A"
+        if value and _under_label(page, label, value):
+            placed[label.title()] = value
+
+    # Affiliate businesses is a Yes/No checkbox pair, not a text field.
+    affiliate_heading = page.search_for("AFFILIATE")
+    if affiliate_heading and not is_microcap:
+        heading = affiliate_heading[-1]
+        _put(page, heading.x0, heading.y1 + 10, "N/A", size=7.5)
+        placed["Affiliate businesses"] = "N/A"
+    else:
+        affiliate_label = "Yes" if v.get("affiliates") == "Yes" else "No"
+        affiliate_candidates = page.search_for(affiliate_label)
+    if is_microcap and affiliate_heading and affiliate_candidates:
+        heading = affiliate_heading[-1]
+        candidate = min(
+            affiliate_candidates,
+            key=lambda rect: abs(rect.y0 - heading.y0),
+        )
+        if abs(candidate.y0 - heading.y0) < 30:
+            _put(page, candidate.x0 - 10, candidate.y1 - 1, "X", size=9.0)
+            placed[f"Affiliate businesses: {affiliate_label}"] = "X"
+
     return placed, problems
 
 
-def fill_pdf(key: str, template_bytes: bytes, v: dict[str, str]) -> FillResult:
+def fill_pdf(
+    key: str,
+    template_bytes: bytes,
+    v: dict[str, str],
+    *,
+    overlay_map: dict | None = None,
+) -> FillResult:
     """Apply one template's overlay. Pure aside from PyMuPDF."""
     import fitz
 
@@ -366,8 +536,13 @@ def fill_pdf(key: str, template_bytes: bytes, v: dict[str, str]) -> FillResult:
     page = doc[0]
     if key == "consulting_agreement":
         placed, problems = _fill_consulting(page, v)
-    elif key == "loan_app":
+    elif key in {"loan_app", "qc_program_application"}:
         placed, problems = _fill_loanapp(page, v)
+    elif (overlay_map or {}).get("static_supporting_document"):
+        # Supporting agreements may be included verbatim. Their immutable
+        # template version carries the signature/date anchors used at
+        # execution time, while the source PDF itself remains untouched.
+        placed, problems = {}, []
     else:
         raise ValueError(f"no overlay map for template {key!r}")
     out = doc.tobytes(deflate=True)

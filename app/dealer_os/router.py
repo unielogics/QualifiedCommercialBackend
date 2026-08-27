@@ -68,7 +68,12 @@ from .models import (
     DealerRepLead,
     DealerApplicationProfile,
     ContractTemplate,
+    ContractTemplateVersion,
     ContractDocument,
+    ContractPackage,
+    ContractPackageItem,
+    ContractEnvelope,
+    ContractEnvelopeDocument,
     DealerSmsConsent,
     DealerAIMessage,
     DealerRepAppointment,
@@ -161,6 +166,17 @@ from .schemas import (
     ContractGenerateResult,
     ContractTemplateMapPatch,
     ContractTemplateRead,
+    ContractTemplateVersionRead,
+    ContractTemplateVersionCatalogRead,
+    ContractPackageRead,
+    ContractPackageItemRead,
+    ContractPackageWrite,
+    ContractEnvelopeRead,
+    ContractEnvelopeDocumentRead,
+    ContractEnvelopeGenerateRequest,
+    ContractEnvelopeVoidRequest,
+    ContractEnvelopeAcknowledgeRequest,
+    ContractEnvelopeSignRequest,
     DeliveryRowRead,
     DecisionRead,
     UnreadSummary,
@@ -353,7 +369,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -1115,6 +1131,9 @@ async def _notify_client_request(
     path: str,
     channel: str,
     action: str,
+    recipient_email: str | None = None,
+    recipient_phone: str | None = None,
+    strict_recipient: bool = False,
 ) -> "consent_delivery.DeliveryResult":
     """Tell the client that something is being asked of them.
 
@@ -1135,8 +1154,12 @@ async def _notify_client_request(
         )
     ).scalar_one_or_none()
 
-    to_email = (owner.email if owner and owner.email else None) or dealer.email
-    to_phone = (owner.phone if owner and owner.phone else None) or dealer.phone
+    if strict_recipient:
+        to_email = recipient_email
+        to_phone = recipient_phone
+    else:
+        to_email = recipient_email or (owner.email if owner and owner.email else None) or dealer.email
+        to_phone = recipient_phone or (owner.phone if owner and owner.phone else None) or dealer.phone
     delivery = await consent_delivery.deliver_link_checked(
         db,
         channel=channel,
@@ -1353,6 +1376,493 @@ async def list_case_contracts(
         .all()
     )
     return [ContractDocRead.model_validate(r) for r in rows]
+
+
+async def _contract_envelope_read(
+    db: AsyncSession,
+    envelope: ContractEnvelope,
+    *,
+    public: bool = False,
+) -> ContractEnvelopeRead:
+    from app.services.payment_authorization import presign_private_s3_object
+
+    rows = list(
+        (
+            await db.execute(
+                select(ContractEnvelopeDocument, ContractDocument)
+                .join(
+                    ContractDocument,
+                    ContractDocument.id == ContractEnvelopeDocument.contract_document_id,
+                )
+                .where(ContractEnvelopeDocument.envelope_id == envelope.id)
+                .order_by(ContractEnvelopeDocument.sort_order)
+            )
+        ).all()
+    )
+    documents = []
+    for link, document in rows:
+        source_key = (
+            document.executed_s3_key
+            if document.status == "executed" and document.executed_s3_key
+            else document.filled_s3_key
+        )
+        preview_url = None
+        download_url = None
+        if source_key:
+            preview_url = presign_private_s3_object(source_key, ttl_seconds=3600)
+            if document.status == "executed":
+                download_url = presign_private_s3_object(
+                    source_key,
+                    ttl_seconds=3600,
+                    download_filename=f"{document.template_key}-executed.pdf",
+                )
+        values = document.field_values or {}
+        documents.append(
+            ContractEnvelopeDocumentRead(
+                id=link.id,
+                contract_document_id=document.id,
+                template_key=document.template_key,
+                title=link.title_snapshot,
+                sort_order=link.sort_order,
+                required=link.required,
+                status=document.status,
+                missing_data=list(values.get("_missing_data") or []),
+                filled_sha256=document.filled_sha256,
+                executed_sha256=document.executed_sha256,
+                reviewed_at=link.reviewed_at,
+                acknowledged_at=link.acknowledged_at,
+                preview_url=preview_url,
+                download_url=download_url,
+            )
+        )
+    bundle_url = None
+    if envelope.bundle_s3_key:
+        bundle_url = presign_private_s3_object(
+            envelope.bundle_s3_key,
+            ttl_seconds=3600,
+            download_filename=f"{envelope.package_key}-executed-package.pdf",
+        )
+    return ContractEnvelopeRead(
+        id=envelope.id,
+        dealer_id=envelope.dealer_id,
+        package_key=envelope.package_key,
+        package_version=envelope.package_version,
+        program_key=envelope.program_key,
+        title=envelope.title,
+        status=envelope.status,
+        signer_name=envelope.signer_name,
+        signer_title=envelope.signer_title,
+        sent_at=envelope.sent_at,
+        opened_at=envelope.opened_at,
+        completed_at=envelope.completed_at,
+        voided_at=envelope.voided_at,
+        bundle_sha256=envelope.bundle_sha256,
+        bundle_download_url=bundle_url,
+        delivery_history=list(envelope.delivery_history or []),
+        documents=documents,
+    )
+
+
+@router.get("/contract-packages", response_model=list[ContractPackageRead])
+async def list_contract_packages(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ContractPackageRead]:
+    require_team_or_rep(user)
+    rows = await contract_packages.packages(db)
+    await db.commit()
+    return [
+        ContractPackageRead(
+            id=package.id,
+            key=package.key,
+            program_key=package.program_key,
+            title=package.title,
+            version=package.version,
+            active=package.active,
+            items=[
+                ContractPackageItemRead(
+                    id=item.id,
+                    template_key=item.template_key,
+                    template_version_id=item.template_version_id,
+                    title=item.title_snapshot,
+                    sort_order=item.sort_order,
+                    required=item.required,
+                )
+                for item in items
+            ],
+        )
+        for package, items in rows
+    ]
+
+
+@router.put("/contract-packages/{program_key}", response_model=ContractPackageRead)
+async def publish_contract_package(
+    program_key: str,
+    payload: ContractPackageWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContractPackageRead:
+    require_super_admin(user)
+    if program_key not in contract_packages.SUPPORTED_PROGRAMS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported direct program.")
+    template_keys = [item.template_key for item in payload.items]
+    if len(template_keys) != len(set(template_keys)):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A forms package cannot contain the same document template more than once.",
+        )
+    if contract_packages.PROGRAM_APPLICATION_KEY not in template_keys:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The Business Loan Application is required in every direct-program package.",
+        )
+    existing = list(
+        (
+            await db.execute(
+                select(ContractPackage)
+                .where(ContractPackage.program_key == program_key)
+                .order_by(ContractPackage.version.desc())
+            )
+        ).scalars().all()
+    )
+    version = (existing[0].version if existing else 0) + 1
+    for row in existing:
+        row.active = False
+    package = ContractPackage(
+        key=f"{program_key}_v{version}",
+        program_key=program_key,
+        title=payload.title,
+        version=version,
+        active=payload.active,
+        created_by_user_id=user.id,
+    )
+    db.add(package)
+    await db.flush()
+    for item in sorted(payload.items, key=lambda value: value.sort_order):
+        template = (
+            await db.execute(select(ContractTemplate).where(ContractTemplate.key == item.template_key))
+        ).scalar_one_or_none()
+        template_version = await db.get(ContractTemplateVersion, item.template_version_id) if item.template_version_id else None
+        if template is None or template_version is None or template_version.template_id != template.id:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"No valid template version for {item.title}.")
+        db.add(ContractPackageItem(
+            package_id=package.id,
+            template_key=item.template_key,
+            template_version_id=template_version.id,
+            title_snapshot=item.title,
+            sort_order=item.sort_order,
+            required=item.required,
+            conditions={},
+        ))
+    await db.commit()
+    rows = await contract_packages.packages(db)
+    selected = next((row for row in rows if row[0].id == package.id), None)
+    if selected is None:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Package publish failed.")
+    package, items = selected
+    return ContractPackageRead(
+        id=package.id,
+        key=package.key,
+        program_key=package.program_key,
+        title=package.title,
+        version=package.version,
+        active=package.active,
+        items=[ContractPackageItemRead(
+            id=item.id,
+            template_key=item.template_key,
+            template_version_id=item.template_version_id,
+            title=item.title_snapshot,
+            sort_order=item.sort_order,
+            required=item.required,
+        ) for item in items],
+    )
+
+
+@router.get(
+    "/contract-templates/{key}/versions",
+    response_model=list[ContractTemplateVersionRead],
+)
+async def list_contract_template_versions(
+    key: str, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ContractTemplateVersion]:
+    require_team_or_rep(user)
+    await contract_packages.ensure_defaults(db, user.id)
+    template = (
+        await db.execute(select(ContractTemplate).where(ContractTemplate.key == key))
+    ).scalar_one_or_none()
+    if template is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Template not found.")
+    rows = list((await db.execute(
+        select(ContractTemplateVersion)
+        .where(ContractTemplateVersion.template_id == template.id)
+        .order_by(ContractTemplateVersion.revision.desc())
+    )).scalars().all())
+    await db.commit()
+    return rows
+
+
+@router.get(
+    "/contract-template-versions",
+    response_model=list[ContractTemplateVersionCatalogRead],
+)
+async def list_contract_template_version_catalog(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ContractTemplateVersionCatalogRead]:
+    """Version catalog used by the super-admin Forms and Packages workspace."""
+    require_super_admin(user)
+    await contract_packages.ensure_defaults(db, user.id)
+    from app.services.payment_authorization import presign_private_s3_object
+
+    rows = list((await db.execute(
+        select(ContractTemplateVersion, ContractTemplate)
+        .join(ContractTemplate, ContractTemplate.id == ContractTemplateVersion.template_id)
+        .order_by(ContractTemplate.title, ContractTemplateVersion.revision.desc())
+    )).all())
+    await db.commit()
+    return [
+        ContractTemplateVersionCatalogRead(
+            id=version.id,
+            template_id=version.template_id,
+            revision=version.revision,
+            sha256=version.sha256,
+            page_count=version.page_count,
+            has_acroform=version.has_acroform,
+            field_names=version.field_names,
+            overlay_map=version.overlay_map,
+            active=version.active,
+            created_at=version.created_at,
+            template_key=template.key,
+            title=template.title,
+            preview_url=presign_private_s3_object(version.s3_key, ttl_seconds=3600),
+        )
+        for version, template in rows
+    ]
+
+
+@router.post(
+    "/contract-templates/{key}/versions",
+    response_model=ContractTemplateVersionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_contract_template_version(
+    key: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    signature_x: float | None = Form(default=None),
+    signature_y: float | None = Form(default=None),
+    signature_date_x: float | None = Form(default=None),
+    signature_date_y: float | None = Form(default=None),
+) -> ContractTemplateVersion:
+    require_super_admin(user)
+    if not re.fullmatch(r"[a-z][a-z0-9_]{2,47}", key):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Template keys use lowercase letters, numbers, and underscores.",
+        )
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF templates are limited to 20 MB.")
+    anchor_values = (signature_x, signature_y, signature_date_x, signature_date_y)
+    if any(value is not None for value in anchor_values) and not all(
+        value is not None for value in anchor_values
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Provide all four signature and date coordinates, or leave all four blank.",
+        )
+    overlay_map = None
+    if all(value is not None for value in anchor_values):
+        overlay_map = {
+            "coordinate_space": "pdf_points_top_left",
+            "signature": [signature_x, signature_y],
+            "signature_date": [signature_date_x, signature_date_y],
+            "static_supporting_document": key != contract_packages.PROGRAM_APPLICATION_KEY,
+        }
+    try:
+        version = await contract_packages.create_template_version(
+            db,
+            template_key=key,
+            title=(
+                title
+                or (
+                    contract_packages.PROGRAM_APPLICATION_TITLE
+                    if key == contract_packages.PROGRAM_APPLICATION_KEY
+                    else file.filename or "Supporting agreement"
+                )
+            ).strip()[:180],
+            raw=raw,
+            actor_user_id=user.id,
+            overlay_map=overlay_map,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await db.commit()
+    await db.refresh(version)
+    return version
+
+
+@router.get(
+    "/dealers/{dealer_id}/contract-envelopes",
+    response_model=list[ContractEnvelopeRead],
+)
+async def list_case_contract_envelopes(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> list[ContractEnvelopeRead]:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = list((await db.execute(
+        select(ContractEnvelope)
+        .where(ContractEnvelope.dealer_id == dealer.id)
+        .order_by(ContractEnvelope.created_at.desc())
+    )).scalars().all())
+    return [await _contract_envelope_read(db, row) for row in rows]
+
+
+@router.post(
+    "/dealers/{dealer_id}/contract-envelopes/generate",
+    response_model=ContractEnvelopeRead,
+)
+async def generate_case_contract_envelope(
+    dealer_id: UUID,
+    payload: ContractEnvelopeGenerateRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContractEnvelopeRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        envelope = await contract_packages.generate_envelope(
+            db,
+            dealer,
+            program_key=payload.program_key,
+            actor=user,
+            override_reason=payload.override_reason,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "contract_envelope.generated",
+        "contract_envelope",
+        entity_id=envelope.id,
+        after={
+            "program_key": payload.program_key,
+            "package_version": envelope.package_version,
+            "status": envelope.status,
+            "override_reason": payload.override_reason,
+        },
+    )
+    await db.commit()
+    await db.refresh(envelope)
+    return await _contract_envelope_read(db, envelope)
+
+
+@router.post(
+    "/dealers/{dealer_id}/contract-envelopes/{envelope_id}/send",
+    response_model=ClientRequestResult,
+)
+async def send_case_contract_envelope(
+    dealer_id: UUID,
+    envelope_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    payload: ClientRequestSend | None = None,
+) -> ClientRequestResult:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    envelope = await db.get(ContractEnvelope, envelope_id)
+    if envelope is None or envelope.dealer_id != dealer.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Package not found.")
+    if envelope.status not in {"ready", "out_for_signature"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Complete every required source field before sending.")
+    owner = await db.get(DealerOwner, envelope.recipient_owner_id) if envelope.recipient_owner_id else None
+    if owner is None or not owner.email:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The primary signer needs a personal email address.")
+    docs = list((await db.execute(
+        select(ContractDocument).where(ContractDocument.envelope_id == envelope.id)
+    )).scalars().all())
+    if not docs or any(document.status not in {"ready", "out_for_signature"} for document in docs):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "One or more package documents are not ready.")
+    now = datetime.now(timezone.utc)
+    for document in docs:
+        document.status = "out_for_signature"
+    envelope.status = "out_for_signature"
+    envelope.sent_at = envelope.sent_at or now
+    room = await client_room.ensure_room(db, dealer)
+    req = payload or ClientRequestSend(channel="email")
+    delivery = await _notify_client_request(
+        db,
+        dealer,
+        user,
+        purpose=f"review and sign the {envelope.title}",
+        path=room.url,
+        channel=req.channel,
+        action="contract_envelope.sent_for_signature",
+        recipient_email=owner.email,
+        recipient_phone=owner.phone,
+        strict_recipient=True,
+    )
+    envelope.delivery_history = [
+        *(envelope.delivery_history or []),
+        {
+            "at": now.isoformat(),
+            "channel": req.channel,
+            "email": owner.email,
+            "ok": delivery.ok,
+            "email_ok": delivery.email_ok,
+            "sms_ok": delivery.sms_ok,
+            "detail": delivery.detail,
+        },
+    ]
+    await db.commit()
+    return ClientRequestResult(
+        url=room.url,
+        passcode=room.passcode,
+        delivered=delivery.ok,
+        emailed=delivery.email_ok,
+        texted=delivery.sms_ok,
+        detail=delivery.detail,
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/contract-envelopes/{envelope_id}/void",
+    response_model=ContractEnvelopeRead,
+)
+async def void_case_contract_envelope(
+    dealer_id: UUID,
+    envelope_id: UUID,
+    payload: ContractEnvelopeVoidRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContractEnvelopeRead:
+    require_super_admin(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    envelope = await db.get(ContractEnvelope, envelope_id)
+    if envelope is None or envelope.dealer_id != dealer.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Package not found.")
+    if envelope.status == "executed":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Executed packages are immutable.")
+    now = datetime.now(timezone.utc)
+    envelope.status = "void"
+    envelope.voided_at = now
+    envelope.voided_by_user_id = user.id
+    envelope.void_reason = payload.reason.strip()
+    await db.execute(sa_update(ContractDocument).where(
+        ContractDocument.envelope_id == envelope.id
+    ).values(status="void"))
+    await db.commit()
+    await db.refresh(envelope)
+    return await _contract_envelope_read(db, envelope)
 
 
 @router.post(
@@ -10442,6 +10952,7 @@ async def public_room_features(
             await db.execute(
                 select(ContractDocument).where(
                     ContractDocument.dealer_id == dealer.id,
+                    ContractDocument.envelope_id.is_(None),
                     ContractDocument.status.in_(["out_for_signature", "executed"]),
                 )
             )
@@ -10488,6 +10999,25 @@ async def public_room_features(
                 )
             )
 
+    envelope_rows = list(
+        (
+            await db.execute(
+                select(ContractEnvelope)
+                .where(
+                    ContractEnvelope.dealer_id == dealer.id,
+                    ContractEnvelope.status.in_(["out_for_signature", "executed"]),
+                )
+                .order_by(ContractEnvelope.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    if envelope_rows:
+        now = datetime.now(timezone.utc)
+        for envelope in envelope_rows:
+            if envelope.status == "out_for_signature" and envelope.opened_at is None:
+                envelope.opened_at = now
+        await db.commit()
+
     return RoomFeaturesRead(
         business_name=dealer.name,
         bank_connect_available=plaid_client.enabled(),
@@ -10498,6 +11028,155 @@ async def public_room_features(
         plaid_assets_enabled=plaid_client.assets_enabled(),
         signable=rows,
         contracts=contract_rows,
+        envelopes=[await _contract_envelope_read(db, envelope, public=True) for envelope in envelope_rows],
+    )
+
+
+@router.post(
+    "/public/room/{token}/contract-envelopes/{envelope_id}/documents/{envelope_document_id}/acknowledge",
+    response_model=ContractEnvelopeRead,
+)
+async def public_room_acknowledge_envelope_document(
+    token: str,
+    envelope_id: UUID,
+    envelope_document_id: UUID,
+    payload: ContractEnvelopeAcknowledgeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ContractEnvelopeRead:
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    envelope = await db.get(ContractEnvelope, envelope_id)
+    if envelope is None or envelope.dealer_id != dealer.id or envelope.status != "out_for_signature":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such signing package in this room.")
+    row = await db.get(ContractEnvelopeDocument, envelope_document_id)
+    if row is None or row.envelope_id != envelope.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such package document.")
+    now = datetime.now(timezone.utc)
+    row.reviewed_at = row.reviewed_at or now
+    row.acknowledged_at = now if payload.acknowledged else None
+    envelope.opened_at = envelope.opened_at or now
+    await db.commit()
+    await db.refresh(envelope)
+    return await _contract_envelope_read(db, envelope, public=True)
+
+
+@router.post(
+    "/public/room/{token}/contract-envelopes/{envelope_id}/sign",
+    response_model=RoomSignResult,
+)
+async def public_room_sign_contract_envelope(
+    token: str,
+    envelope_id: UUID,
+    payload: ContractEnvelopeSignRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> RoomSignResult:
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if not payload.esign_consent or not payload.applies_to_all_documents:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "E-SIGN consent and the package-wide signature affirmation are required.",
+        )
+    # Serialize execution for this envelope so simultaneous retries cannot
+    # produce duplicate executed artifacts or certificates.
+    envelope = (
+        await db.execute(
+            select(ContractEnvelope)
+            .where(ContractEnvelope.id == envelope_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if envelope is None or envelope.dealer_id != dealer.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such signing package in this room.")
+    owner = await db.get(DealerOwner, envelope.recipient_owner_id) if envelope.recipient_owner_id else None
+    expected = " ".join((owner.full_name if owner else "").lower().split())
+    supplied = " ".join(payload.typed_name.lower().split())
+    if not expected or supplied != expected:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "The typed name must match the designated authorized representative.",
+        )
+
+    from app.services.payment_authorization import decode_signature_data_url, presign_private_s3_object
+
+    sig_bytes, sig_sha, _ctype = decode_signature_data_url(payload.signature_data_url)
+    already_completed = envelope.status == "executed"
+    try:
+        bundle, bundle_sha = await contract_packages.execute_envelope(
+            db,
+            dealer,
+            envelope,
+            typed_name=payload.typed_name.strip(),
+            signature_png=sig_bytes,
+            signature_sha256=sig_sha,
+            ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    if not already_completed:
+        await log_action(
+            db,
+            dealer.id,
+            None,
+            "contract_envelope.executed",
+            "contract_envelope",
+            entity_id=envelope.id,
+            after={
+                "program_key": envelope.program_key,
+                "signer": payload.typed_name.strip(),
+                "bundle_sha256": bundle_sha[:16],
+                "via": "client_room",
+            },
+        )
+    await db.commit()
+
+    delivery_ok = True
+    to = owner.email if owner and owner.email else link.recipient_email or dealer.email
+    if not already_completed and to and "@" in to:
+        from app.services.email.ses_client import send_raw_email
+
+        try:
+            sent = send_raw_email(
+                to_emails=[to],
+                subject=f"Your executed {envelope.title} — Qualified Commercial",
+                body_text=(
+                    f"Attached is your completed {envelope.title}. The package includes a "
+                    "certificate and a separate fingerprint for every signed document. "
+                    "Keep this copy for your records.\n\nQualified Commercial"
+                ),
+                attachments=[(
+                    f"{envelope.package_key}-executed-package.pdf",
+                    bundle,
+                    "application/pdf",
+                )],
+            )
+            delivery_ok = sent.ok
+        except Exception:  # noqa: BLE001 - execution remains valid; delivery is retryable
+            logger.exception("executed package email failed for envelope %s", envelope.id)
+            delivery_ok = False
+    download_url = presign_private_s3_object(
+        envelope.bundle_s3_key,
+        ttl_seconds=3600,
+        download_filename=f"{envelope.package_key}-executed-package.pdf",
+    )
+    return RoomSignResult(
+        signed=True,
+        message=(
+            "The package was already completed. Your signed copy is available below."
+            if already_completed
+            else "Every acknowledged document was signed. Your completed package is ready."
+        ),
+        execution_status="executed" if delivery_ok else "delivery_warning",
+        pdf_sha256=bundle_sha,
+        download_url=download_url,
     )
 
 
