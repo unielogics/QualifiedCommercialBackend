@@ -55,6 +55,28 @@ fi
 echo "==> Caddyfile (auto-TLS via Let's Encrypt)"
 cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
+    @cors_origin header_regexp Origin ^https://(app|agreement|audit|rep)\\.qualifiedcommercial\\.com$
+    header @cors_origin {
+        ?Access-Control-Allow-Origin "{http.request.header.Origin}"
+        ?Access-Control-Allow-Credentials "true"
+        ?Access-Control-Expose-Headers "Content-Disposition"
+        ?Vary "Origin"
+    }
+
+    @cors_preflight {
+        method OPTIONS
+        header_regexp Origin ^https://(app|agreement|audit|rep)\\.qualifiedcommercial\\.com$
+    }
+    handle @cors_preflight {
+        header Access-Control-Allow-Origin "{http.request.header.Origin}"
+        header Access-Control-Allow-Credentials "true"
+        header Access-Control-Allow-Methods "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+        header Access-Control-Allow-Headers "{http.request.header.Access-Control-Request-Headers}"
+        header Access-Control-Max-Age "600"
+        header Vary "Origin"
+        respond "" 204
+    }
+
     reverse_proxy 127.0.0.1:8000
     encode gzip
     log {
