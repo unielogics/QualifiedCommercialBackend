@@ -1,4 +1,9 @@
-from app.dealer_os.services.application_prescreen import owner_answer_complete, screen_application
+from app.dealer_os.services.application_prescreen import (
+    applicable_business_questions,
+    business_answer_blockers,
+    owner_answer_complete,
+    screen_application,
+)
 
 
 def answer(**overrides):
@@ -59,3 +64,21 @@ def test_owner_exclusions_apply_per_program():
     assert eligible(screen(40_000, owner=answer(foreclosure_within_3_years=True))) == {"term_loan_3_5_year"}
     assert eligible(screen(40_000, owner=answer(residency_status="other"))) == set()
     assert eligible(screen(40_000, owner=answer(credit_660_or_higher=False))) == set()
+
+
+def test_step_four_business_questions_enforce_only_visible_followups():
+    groups = applicable_business_questions(naics_code="541611", routing_result=None)
+    answers = {
+        question["key"]: False
+        for group in groups
+        for question in group["questions"]
+        if not question.get("show_when") and not question.get("show_when_any")
+    }
+    assert business_answer_blockers(groups, answers) == []
+
+    answers["tax_liability_over_10000"] = True
+    assert business_answer_blockers(groups, answers) == [
+        "Is the disclosed tax balance on a current payment plan?"
+    ]
+    answers["tax_payment_plan_current"] = True
+    assert business_answer_blockers(groups, answers) == []

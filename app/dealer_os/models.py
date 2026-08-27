@@ -89,6 +89,10 @@ class DealerBusiness(TimestampMixin, Base):
     # separate from both the client's request and the working funding goal.
     funded_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     client_requested_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    # Immutable snapshot of the program first discussed with the client. The
+    # working route lives on the application profile and may change only after
+    # an audited recommendation response.
+    client_requested_program: Mapped[str | None] = mapped_column(String(80))
     application_lifecycle: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"
     )
@@ -190,6 +194,15 @@ class DealerApplicationProfile(TimestampMixin, Base):
     term_requested_months: Mapped[int | None] = mapped_column(Integer)
     collateral_description: Mapped[str | None] = mapped_column(Text)
     use_of_proceeds_text: Mapped[str | None] = mapped_column(Text)
+    # Per-field source and confirmation metadata. These JSON objects keep the
+    # extraction pipeline advisory: a machine suggestion may fill a blank,
+    # but it cannot replace a value a rep already confirmed.
+    field_provenance: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    field_confirmations: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -772,6 +785,7 @@ class DealerDebt(TimestampMixin, Base):
     payment_frequency: Mapped[str | None] = mapped_column(String(12))  # daily|weekly|biweekly|monthly
     factor_rate: Mapped[float | None] = mapped_column(Numeric(6, 3))
     payoff_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    collateral: Mapped[str | None] = mapped_column(Text)
     document_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
     )
@@ -1539,6 +1553,76 @@ class DealerApplicationPreScreen(TimestampMixin, Base):
     completed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class DealerApplicationRecommendation(TimestampMixin, Base):
+    """An explicit proposed change to amount/program and the rep's response."""
+
+    __tablename__ = "dos_application_recommendations"
+    __table_args__ = (
+        Index("ix_dos_application_recommendations_dealer", "dealer_id", "created_at"),
+        Index("ix_dos_application_recommendations_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    rules_version: Mapped[str] = mapped_column(String(48), nullable=False)
+    current_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    current_program: Mapped[str | None] = mapped_column(String(80))
+    recommended_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    recommended_program: Mapped[str | None] = mapped_column(String(80))
+    supported_min: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    supported_max: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    reasons: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    response_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    response_program: Mapped[str | None] = mapped_column(String(80))
+    response_note: Mapped[str | None] = mapped_column(Text)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    responded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DealerProgramRuleResolution(TimestampMixin, Base):
+    """One routing blocker, correction, or hard-rule exception request."""
+
+    __tablename__ = "dos_program_rule_resolutions"
+    __table_args__ = (
+        Index("ix_dos_program_rule_resolutions_dealer", "dealer_id", "status"),
+        Index("ix_dos_program_rule_resolutions_rule", "program_key", "rule_key"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    dealer_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    )
+    program_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    rule_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    source: Mapped[str | None] = mapped_column(String(160))
+    current_value: Mapped[dict | None] = mapped_column(JSONB)
+    recommended_action: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="open", server_default="open"
+    )
+    rep_note: Mapped[str | None] = mapped_column(Text)
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
 
 
 class DealerProductPresentationArtifact(TimestampMixin, Base):

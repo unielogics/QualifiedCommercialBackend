@@ -95,6 +95,8 @@ from .models import (
     DealerAuditLog,
     DealerBusiness,
     DealerApplicationPreScreen,
+    DealerApplicationRecommendation,
+    DealerProgramRuleResolution,
     DealerCashEvent,
     DealerCategoryRule,
     DealerCreditProfile,
@@ -128,6 +130,12 @@ from .schemas import (
     AlertRead,
     ApplicationPreScreenPatch,
     ApplicationPreScreenRead,
+    ApplicationRecommendationRead,
+    ApplicationRecommendationResponse,
+    ProgramExceptionRequest,
+    ProgramExceptionDecision,
+    ProgramRuleResolutionRead,
+    UnderwritingResolutionRead,
     AuditRead,
     BucketFileItem,
     BucketSearchItem,
@@ -369,7 +377,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -1239,9 +1247,9 @@ async def send_bank_upload_request(
     requested = await client_room.request_document(
         db,
         dealer,
-        name="Three current months of business bank statements",
+        name="Six current months of business bank statements",
         description=(
-            "Upload the three most recent completed months of bank-produced business "
+            "Upload the six most recent completed months of bank-produced business "
             "statements. PDF statements are required; CSVs and screenshots are supplemental."
         ),
         category="financials",
@@ -1252,7 +1260,7 @@ async def send_bank_upload_request(
         db,
         dealer,
         user,
-        purpose="upload three current months of bank-produced business statements",
+        purpose="upload six current months of bank-produced business statements",
         path=room.url,
         channel=req.channel,
         action="client_request.bank_upload",
@@ -1911,6 +1919,59 @@ async def generate_case_contract(
         overlay_problems=result.missing,
         sha256=result.sha256,
         download_url=presign_private_s3_object(doc.filled_s3_key, ttl_seconds=900),
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/underwriting-summary",
+    response_model=ContractGenerateResult,
+)
+async def generate_underwriting_summary(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ContractGenerateResult:
+    """Generate a review-only QC application and evidence summary.
+
+    This may be rendered while the file is incomplete. It names every missing
+    condition and is not eligible for signature through this endpoint.
+    """
+
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    try:
+        doc, result, missing = await contract_fill.generate(
+            db,
+            dealer,
+            qc_master_application.MASTER_TEMPLATE_KEY,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "underwriting_summary.generated",
+        "contract_document",
+        entity_id=doc.id,
+        after={"sha256": result.sha256[:16], "missing": missing},
+    )
+    await db.commit()
+    from app.services.payment_authorization import presign_private_s3_object
+
+    return ContractGenerateResult(
+        status=doc.status,
+        placed=result.placed,
+        missing_data=missing,
+        overlay_problems=result.missing,
+        sha256=result.sha256,
+        download_url=presign_private_s3_object(
+            doc.filled_s3_key,
+            ttl_seconds=900,
+            download_filename=f"{dealer.case_ref or 'QC'}-underwriting-summary.pdf",
+        ),
     )
 
 
@@ -2614,7 +2675,7 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
 async def _statement_month_coverage(
     db: AsyncSession, dealer_id: UUID
 ) -> tuple[list[str], list[str], str]:
-    """Three current months proved by bank-produced statement artifacts.
+    """Six current months proved by bank-produced statement artifacts.
 
     CSVs, screenshots, and financial periods derived from supplemental files
     are useful analysis inputs but cannot satisfy an official-statement gate.
@@ -2650,7 +2711,7 @@ async def _statement_month_coverage(
             if _COVERAGE_MONTH_RE.match(key):
                 months.add(key)
 
-    freshness = recurrence.compute_freshness(months, date.today(), window=3)
+    freshness = recurrence.compute_freshness(months, date.today(), window=6)
     source = "plaid" if has_plaid_statement else ("upload" if months else "none")
     return sorted(months), list(freshness.get("missing_months") or []), source
 
@@ -2658,7 +2719,7 @@ async def _statement_month_coverage(
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     """Read the two authorizations off the file.
 
-    Bank readiness requires three current bank-produced statement months.
+    Bank readiness requires six current bank-produced statement months.
     Plaid is a transport, not evidence by itself; a connected item cannot
     unlock underwriting until its statement artifacts have been imported.
 
@@ -2669,7 +2730,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     statement_months, missing_statement_months, statement_source = await _statement_month_coverage(
         db, dealer.id
     )
-    bank_linked = len(statement_months) >= 3 and not missing_statement_months
+    bank_linked = len(statement_months) >= 6 and not missing_statement_months
     bank_source = statement_source if bank_linked else "none"
     owner_state = await _owner_requirement_state(db, dealer.id)
     pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
@@ -3952,7 +4013,7 @@ async def document_coverage(
         has_debt_schedule=has_debt_schedule,
         open_doc_requests=int(open_doc_requests or 0),
         # Deterministic freshness vs. today (pure helper — services.recurrence).
-        **recurrence.compute_freshness(months, date.today(), window=3),
+        **recurrence.compute_freshness(months, date.today(), window=6),
     )
 
 
@@ -5934,9 +5995,59 @@ async def patch_application_profile(
         row = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
         db.add(row)
     patch = payload.model_dump(exclude_unset=True)
+    confirm_fields = set(patch.pop("confirm_fields", None) or [])
+    editable_fields = set(ApplicationProfilePatch.model_fields) - {"confirm_fields"}
+    unknown_confirmations = sorted(confirm_fields - editable_fields)
+    if unknown_confirmations:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Unsupported confirmation fields: {', '.join(unknown_confirmations)}",
+        )
     before = jsonable_encoder({key: getattr(row, key, None) for key in patch})
+    provenance = dict(row.field_provenance or {})
+    confirmations = dict(row.field_confirmations or {})
+    now_iso = datetime.now(timezone.utc).isoformat()
     for key, value in patch.items():
         setattr(row, key, value)
+        if key in confirm_fields:
+            provenance[key] = {
+                "source": "agent_confirmed",
+                "label": "Agent confirmed",
+                "confirmed_at": now_iso,
+                "confirmed_by_user_id": str(user.id),
+            }
+            confirmations[key] = {
+                "value": jsonable_encoder(value),
+                "confirmed_at": now_iso,
+                "confirmed_by_user_id": str(user.id),
+            }
+        elif key not in confirmations:
+            provenance[key] = {
+                "source": "agent_entered",
+                "label": "Agent entered",
+                "updated_at": now_iso,
+                "updated_by_user_id": str(user.id),
+            }
+    for key in confirm_fields - set(patch):
+        value = getattr(row, key, None)
+        if value is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"{key.replace('_', ' ').title()} cannot be confirmed while empty.",
+            )
+        provenance[key] = {
+            "source": "agent_confirmed",
+            "label": "Agent confirmed",
+            "confirmed_at": now_iso,
+            "confirmed_by_user_id": str(user.id),
+        }
+        confirmations[key] = {
+            "value": jsonable_encoder(value),
+            "confirmed_at": now_iso,
+            "confirmed_by_user_id": str(user.id),
+        }
+    row.field_provenance = provenance
+    row.field_confirmations = confirmations
     row.updated_by_user_id = user.id
     await db.flush()
     lead = (
@@ -5964,7 +6075,7 @@ async def patch_application_profile(
         "application_profile",
         entity_id=row.id,
         before=before,
-        after=payload.model_dump(exclude_unset=True, mode="json"),
+        after={**payload.model_dump(exclude_unset=True, mode="json"), "confirmed_fields": sorted(confirm_fields)},
     )
     await db.commit()
     await db.refresh(row)
@@ -6203,6 +6314,133 @@ async def list_all_rep_appointments(
         )
     rows = list((await db.execute(q.order_by(DealerRepAppointment.starts_at.asc()).limit(limit))).scalars().all())
     return await _appointment_read_rows(db, rows)
+
+
+async def _prepare_underwriting_review_room(
+    db: AsyncSession,
+    *,
+    dealer: DealerBusiness,
+    user: User,
+    recipient_email: str | None,
+    recipient_phone: str | None,
+    requested_document_keys: list[str] | None = None,
+) -> dict[str, str]:
+    """Create the post-booking checklist without risking the appointment.
+
+    This runs only after an actual underwriting-review time is selected. The
+    three proposed windows never call it, so they cannot create rooms, rotate
+    codes, or send document requests. Checklist writes are idempotent.
+    """
+
+    results: dict[str, str] = {}
+    try:
+        room = await client_room.rotate_passcode(db, dealer)
+        results["secure_room"] = "ready"
+        results["access_code"] = room.passcode or "rotated"
+        tax_years = (date.today().year - 1, date.today().year - 2)
+        for year in tax_years:
+            await client_room.request_document(
+                db,
+                dealer,
+                name=f"Business federal tax return - {year}",
+                description=(
+                    f"Upload the complete filed federal business tax return for {year}, "
+                    "including all schedules and statements."
+                ),
+                category="tax_returns",
+                required=True,
+            )
+        owner_state = await _owner_requirement_state(db, dealer.id)
+        for owner in owner_state["required"]:
+            for year in tax_years:
+                await client_room.request_document(
+                    db,
+                    dealer,
+                    name=f"Personal federal tax return - {year} - {owner.full_name}",
+                    description=(
+                        f"Upload the complete filed federal personal tax return for "
+                        f"{owner.full_name} for {year}, including all schedules."
+                    ),
+                    category="tax_returns",
+                    required=True,
+                )
+        optional_requests = {
+            "ytd_profit_and_loss": (
+                "Current year-to-date profit and loss statement",
+                "Upload the current year-to-date business profit and loss statement.",
+                "financial_statements",
+            ),
+            "debt_schedule": (
+                "Current business debt schedule",
+                "Upload the current debt schedule showing lender, balance, and payment for each obligation.",
+                "debt_schedule",
+            ),
+            "use_of_funds_support": (
+                "Use-of-funds supporting documents",
+                "Upload estimates, invoices, payoff letters, or other documents supporting the intended use of funds.",
+                "use_of_funds",
+            ),
+            "entity_documents": (
+                "Business entity documents",
+                "Upload formation, ownership, or authority documents relevant to the financing request.",
+                "entity_documents",
+            ),
+        }
+        selected_optional = sorted(set(requested_document_keys or []))
+        for key in selected_optional:
+            configured = optional_requests.get(key)
+            if configured is None:
+                continue
+            name, description, category = configured
+            await client_room.request_document(
+                db,
+                dealer,
+                name=name,
+                description=description,
+                category=category,
+                required=True,
+            )
+        results["tax_return_checklist"] = "ready"
+        results["additional_document_requests"] = str(len(selected_optional))
+
+        purpose = "review the underwriting document request"
+        if room.passcode:
+            purpose += f" using access code {room.passcode}"
+        delivery = await _notify_client_request(
+            db,
+            dealer,
+            user,
+            purpose=purpose,
+            path=room.url,
+            channel="email" if recipient_email else "sms",
+            action="client_request.underwriting_review_documents",
+            recipient_email=recipient_email,
+            recipient_phone=recipient_phone,
+            strict_recipient=True,
+        )
+        results["document_request_delivery"] = "sent" if delivery.ok else "failed"
+        if not delivery.ok:
+            results["document_request_error"] = (delivery.detail or "delivery_failed")[:240]
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "underwriting_review.room_prepared",
+            "appointment",
+            entity_id=dealer.id,
+            after={
+                "room_link_id": str(room.link.id),
+                "required_owner_count": len(owner_state["required"]),
+                "tax_years": list(tax_years),
+                "delivery": results["document_request_delivery"],
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("underwriting review room setup failed dealer=%s", dealer.id)
+        results["secure_room"] = "failed"
+        results["document_request_delivery"] = "failed"
+        results["document_request_error"] = "secure_room_setup_failed"
+    return results
 
 
 @router.post("/appointments", response_model=RepAppointmentRead, status_code=status.HTTP_201_CREATED)
@@ -6554,6 +6792,16 @@ async def create_rep_appointment(
             "calendar_event_id": str(ev.id),
         },
     )
+    room_results: dict[str, str] = {}
+    if payload.kind == "underwriting_review":
+        room_results = await _prepare_underwriting_review_room(
+            db,
+            dealer=dealer,
+            user=user,
+            recipient_email=payload.invitee_email,
+            recipient_phone=payload.invitee_phone,
+            requested_document_keys=payload.requested_document_keys,
+        )
     await notify_users(
         db,
         recipient_ids={user.id},
@@ -6617,7 +6865,13 @@ async def create_rep_appointment(
     await booking_reminders.send_confirmation_sms(
         db, notice, ev, timezone_name=booking.timezone
     )
-    return (await _appointment_read_rows(db, [appt]))[0]
+    result = (await _appointment_read_rows(db, [appt]))[0]
+    if room_results:
+        result["notification_results"] = {
+            **(result.get("notification_results") or {}),
+            **room_results,
+        }
+    return result
 
 
 async def _cancel_rep_appointment(
@@ -7417,6 +7671,7 @@ async def book_underwriting_review_preference(
         full_address=payload.full_address,
         notes=payload.notes,
         transactional_sms_consent=payload.transactional_sms_consent,
+        requested_document_keys=payload.requested_document_keys,
     )
     title = _appointment_title("underwriting_review", payload.invitee_name, dealer)
     description, program, requested_amount, full_address = _booking_description(
@@ -7522,6 +7777,14 @@ async def book_underwriting_review_preference(
             "client_rsvp_status": "needs_action",
         },
     )
+    room_results = await _prepare_underwriting_review_room(
+        db,
+        dealer=dealer,
+        user=user,
+        recipient_email=str(payload.invitee_email),
+        recipient_phone=payload.invitee_phone,
+        requested_document_keys=payload.requested_document_keys,
+    )
     await notify_users(
         db,
         recipient_ids={booking_rep.id, user.id},
@@ -7583,7 +7846,13 @@ async def book_underwriting_review_preference(
     )
     await db.commit()
     await db.refresh(appointment)
-    return (await _appointment_read_rows(db, [appointment]))[0]
+    result = (await _appointment_read_rows(db, [appointment]))[0]
+    if room_results:
+        result["notification_results"] = {
+            **(result.get("notification_results") or {}),
+            **room_results,
+        }
+    return result
 
 
 @router.get("/contact-shares/program-pdfs", response_model=list[ProgramPdfAttachmentRead])
@@ -10088,7 +10357,7 @@ async def draft_debt_schedule(
     A baseline, not an answer: every row is editable and a row a human has
     touched (origin='admin') is never rewritten. Dismissed rows stay dismissed
     so a re-draft does not resurrect something the admin rejected."""
-    require_team(user)
+    require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rolled, _ = await _vendor_rollup(db, dealer)
     proposals = vendors.draft_debt_rows(rolled)
@@ -10172,7 +10441,7 @@ async def draft_debt_schedule(
 async def create_debt(
     dealer_id: UUID, body: DebtCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerDebt:
-    require_team(user)
+    require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     fields = body.model_dump()
     if fields.get("monthly_payment") is None and fields.get("payment_amount") and fields.get("payment_frequency"):
@@ -10199,7 +10468,7 @@ async def patch_debt(
 ) -> DealerDebt:
     """Edit a debt row. Any human edit promotes origin to 'admin', which is
     what stops a later re-draft from overwriting the correction."""
-    require_team(user)
+    require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -10235,7 +10504,7 @@ async def delete_debt(
 ) -> None:
     """Delete a hand-added row; a DRAFTED row is dismissed instead so the next
     draft does not resurrect it."""
-    require_team(user)
+    require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     row = (
         await db.execute(
@@ -12480,24 +12749,10 @@ async def _application_pre_screen_state(
     ]
     incomplete_ids = [owner_id for owner_id in required_ids if owner_id not in completed_ids]
     blockers: list[str] = []
-    missing_file_answers = [
-        key
-        for key in application_prescreen.REQUIRED_FILE_FIELDS
-        if not isinstance(file_answers.get(key), bool)
-    ]
-    if file_answers.get("tax_liability_over_10000") is True and not isinstance(
-        file_answers.get("tax_payment_plan_current"), bool
-    ):
-        missing_file_answers.append("tax_payment_plan_current")
-    if (
-        file_answers.get("judgment_over_50000_within_7_years") is True
-        or file_answers.get("aggregate_liens_judgments_over_25000_within_7_years") is True
-    ) and not isinstance(file_answers.get("term_obligations_released_or_on_plan"), bool):
-        missing_file_answers.append("term_obligations_released_or_on_plan")
-    if missing_file_answers:
-        blockers.append(f"Complete {len(missing_file_answers)} business eligibility question(s).")
     if incomplete_ids:
         blockers.append(f"Complete eligibility for {len(incomplete_ids)} required owner(s).")
+    # Step 1.5 is personal eligibility only. Business questions are collected
+    # in Step 4 and remain unresolved routing facts until answered there.
     complete = not blockers and bool(required_ids)
     verified_scores = {
         str(owner.id): owner.credit_score for owner in owner_state["required"]
@@ -12557,14 +12812,14 @@ async def _application_pre_screen_state(
         await _statement_month_coverage(db, dealer.id)
     )
     metric_inputs = await load_metric_inputs(db, dealer.id)
-    # Coverage is returned in ascending order. Use the newest three completed
+    # Coverage is returned in ascending order. Use the newest six completed
     # months for current-program metrics when a file contains a longer history.
-    statement_month_set = set(sorted(statement_months)[-3:])
+    statement_month_set = set(sorted(statement_months)[-6:])
     period_rows = [
         row
         for row in metric_inputs.periods
         if row.get("period") and row["period"].strftime("%Y-%m") in statement_month_set
-    ][:3]
+    ][:6]
     debts = list(
         (
             await db.execute(
@@ -12575,11 +12830,11 @@ async def _application_pre_screen_state(
             )
         ).scalars().all()
     )
-    official_statements_complete = len(statement_months) >= 3 and not missing_statement_months
+    official_statements_complete = len(statement_months) >= 6 and not missing_statement_months
     annualized_bank_sales = None
     if (
         official_statements_complete
-        and len(period_rows) >= 3
+        and len(period_rows) >= 6
         and all(row.get("deposits") is not None for row in period_rows)
     ):
         annualized_bank_sales = round(
@@ -12656,6 +12911,82 @@ async def _application_pre_screen_state(
         if funded_on is not None:
             mca_ages.append(max((date.today() - funded_on).days, 0))
 
+    confirmations = set((profile.field_confirmations or {}).keys()) if profile else set()
+    financial_suggestions: dict[str, dict] = {}
+
+    def _suggest(field: str, value, source: str, evidence: str) -> None:
+        if value is None or field in confirmations:
+            return
+        if profile is not None and getattr(profile, field, None) is not None:
+            return
+        try:
+            normalized = round(float(value), 2)
+        except (TypeError, ValueError):
+            return
+        if normalized != normalized or normalized in {float("inf"), float("-inf")}:
+            return
+        financial_suggestions[field] = {
+            "value": normalized,
+            "source": source,
+            "label": "Extracted",
+            "evidence": evidence,
+        }
+
+    ebitda_metrics = metric_tree.get("ebitda") or {}
+    dscr_metrics = metric_tree.get("dscr") or {}
+    _suggest(
+        "annual_sales",
+        annualized_bank_sales,
+        "verified_bank_statements",
+        f"Annualized from {len(period_rows)} qualifying statement months.",
+    )
+    _suggest(
+        "annual_cash_flow_available_for_debt",
+        ebitda_metrics.get("bankable"),
+        "verified_financial_metrics",
+        "Bankable annual cash flow calculated from extracted financial evidence.",
+    )
+    _suggest(
+        "monthly_debt_payments",
+        dscr_metrics.get("monthly_debt_service"),
+        "debt_schedule_and_bank_activity",
+        "Monthly debt service calculated from active obligations and observed payments.",
+    )
+    mca_balances = [
+        float(debt.payoff_amount or debt.balance)
+        for debt in debts
+        if str(debt.category or "").lower() in {"mca", "merchant_cash_advance"}
+        and (debt.payoff_amount is not None or debt.balance is not None)
+    ]
+    sba_balances = [
+        float(debt.payoff_amount or debt.balance)
+        for debt in debts
+        if str(debt.category or "").lower() in {"sba", "sba_loan"}
+        and (debt.payoff_amount is not None or debt.balance is not None)
+    ]
+    if mca_balances:
+        _suggest(
+            "existing_mca_balance",
+            sum(mca_balances),
+            "confirmed_debt_schedule",
+            f"Sum of {len(mca_balances)} active MCA obligation(s).",
+        )
+    if sba_balances:
+        _suggest(
+            "existing_sba_balance",
+            sum(sba_balances),
+            "confirmed_debt_schedule",
+            f"Sum of {len(sba_balances)} active SBA obligation(s).",
+        )
+    ucc_count = sum(bool((debt.evidence or {}).get("ucc")) for debt in debts)
+    if ucc_count:
+        _suggest(
+            "active_ucc_filings",
+            ucc_count,
+            "debt_schedule_evidence",
+            f"{ucc_count} active obligation(s) include UCC evidence.",
+        )
+
     application_facts.update(
         {
             "official_bank_statements": official_statements_complete,
@@ -12692,6 +13023,14 @@ async def _application_pre_screen_state(
         application_facts=application_facts,
     ) if complete and (has_verified_credit or application_facts["official_bank_statements"]) else None
     result = verified_result or self_report_result
+    applicable_questions = application_prescreen.applicable_business_questions(
+        naics_code=dealer.naics_code,
+        routing_result=result,
+    )
+    business_question_blockers = application_prescreen.business_answer_blockers(
+        applicable_questions,
+        file_answers,
+    )
     return {
         "row": row,
         "rules_version": row.rules_version if row else application_prescreen.RULES_VERSION,
@@ -12711,6 +13050,10 @@ async def _application_pre_screen_state(
         ),
         "routing_history": list(row.routing_history or []) if row else [],
         "completed_at": row.completed_at if row else None,
+        "applicable_business_questions": applicable_questions,
+        "business_questions_complete": not business_question_blockers,
+        "business_question_blockers": business_question_blockers,
+        "financial_suggestions": financial_suggestions,
     }
 
 
@@ -12729,6 +13072,9 @@ def _pre_screen_read(state: dict) -> ApplicationPreScreenRead:
         verified_routing_result=state.get("verified_routing_result"),
         routing_history=state.get("routing_history", []),
         completed_at=state["completed_at"],
+        applicable_business_questions=state.get("applicable_business_questions", []),
+        business_questions_complete=state.get("business_questions_complete", False),
+        business_question_blockers=state.get("business_question_blockers", []),
     )
 
 
@@ -12868,6 +13214,270 @@ async def patch_application_pre_screen(
     )
     await db.commit()
     return _pre_screen_read(state)
+
+
+@router.get(
+    "/dealers/{dealer_id}/underwriting-resolution",
+    response_model=UnderwritingResolutionRead,
+)
+async def get_underwriting_resolution(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnderwritingResolutionRead:
+    """One Step 4 view of the current route, blockers, and drafted change.
+
+    Reading this endpoint may persist a new recommendation when verified facts
+    make the current amount or program unsupported. It never applies the draft.
+    """
+
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    state = await _application_pre_screen_state(db, dealer)
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(
+                DealerApplicationProfile.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    recommendation, recommendation_created = await routing_resolution.ensure_recommendation(
+        db,
+        dealer,
+        profile,
+        state.get("routing_result"),
+        user.id,
+    )
+    exceptions = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution)
+                .where(DealerProgramRuleResolution.dealer_id == dealer.id)
+                .order_by(DealerProgramRuleResolution.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    if recommendation is not None and recommendation_created:
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "application.recommendation_drafted",
+            "application_recommendation",
+            entity_id=recommendation.id,
+            after={
+                "current_amount": recommendation.current_amount,
+                "current_program": recommendation.current_program,
+                "recommended_amount": recommendation.recommended_amount,
+                "recommended_program": recommendation.recommended_program,
+                "rules_version": recommendation.rules_version,
+            },
+        )
+    await db.commit()
+    programs = list((state.get("routing_result") or {}).get("programs") or [])
+    direct_viable = any(row.get("status") in {"recommended", "potential"} for row in programs)
+    return UnderwritingResolutionRead(
+        rules_version=state["rules_version"],
+        original_amount=float(dealer.client_requested_amount or dealer.funding_goal) if (dealer.client_requested_amount or dealer.funding_goal) is not None else None,
+        working_amount=float(dealer.funding_goal) if dealer.funding_goal is not None else None,
+        original_program=dealer.client_requested_program,
+        working_program=profile.selected_program if profile else None,
+        recommended=ApplicationRecommendationRead.model_validate(recommendation) if recommendation else None,
+        programs=programs,
+        blockers=routing_resolution.blockers(state.get("routing_result")),
+        applicable_business_questions=state.get("applicable_business_questions", []),
+        business_questions_complete=state.get("business_questions_complete", False),
+        business_question_blockers=state.get("business_question_blockers", []),
+        financial_suggestions=state.get("financial_suggestions", {}),
+        exception_requests=[ProgramRuleResolutionRead.model_validate(row) for row in exceptions],
+        direct_program_viable=direct_viable,
+        signing_mode="program_package" if direct_viable else "qc_summary_booking",
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/application-recommendations/{recommendation_id}/respond",
+    response_model=ApplicationRecommendationRead,
+)
+async def respond_to_application_recommendation(
+    dealer_id: UUID,
+    recommendation_id: UUID,
+    payload: ApplicationRecommendationResponse,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerApplicationRecommendation:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerApplicationRecommendation)
+            .where(
+                DealerApplicationRecommendation.id == recommendation_id,
+                DealerApplicationRecommendation.dealer_id == dealer.id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recommendation not found for this file")
+    if row.status != "pending":
+        return row
+
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(
+                DealerApplicationProfile.dealer_id == dealer.id
+            )
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        profile = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
+        db.add(profile)
+        await db.flush()
+
+    applied_amount = payload.amount if payload.action == "edit" else (
+        float(row.recommended_amount) if row.recommended_amount is not None else None
+    )
+    applied_program = payload.program_key if payload.action == "edit" else row.recommended_program
+    if payload.action in {"apply", "edit"}:
+        if applied_amount is None or not applied_program:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "A supported amount and program are required before applying the draft.",
+            )
+        if applied_program not in routing_resolution.PROGRAM_RANGES:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a supported direct program")
+        active_envelopes = list(
+            (
+                await db.execute(
+                    select(ContractEnvelope).where(
+                        ContractEnvelope.dealer_id == dealer.id,
+                        ContractEnvelope.status.notin_(["void"]),
+                    )
+                )
+            ).scalars().all()
+        )
+        if any(envelope.status == "executed" for envelope in active_envelopes):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Executed documents are immutable. Keep the original for super-admin review.",
+            )
+        if any(envelope.status == "out_for_signature" for envelope in active_envelopes):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Void the sent signing package before applying a new amount or program.",
+            )
+        for envelope in active_envelopes:
+            if envelope.status in {"draft", "ready", "failed"}:
+                envelope.status = "void"
+                envelope.voided_at = datetime.now(timezone.utc)
+                envelope.voided_by_user_id = user.id
+                envelope.void_reason = "Replaced by an acknowledged Step 4 routing recommendation."
+
+        dealer.client_requested_amount = dealer.client_requested_amount or dealer.funding_goal
+        dealer.client_requested_program = dealer.client_requested_program or profile.selected_program
+        dealer.funding_goal = Decimal(str(applied_amount))
+        profile.selected_program = applied_program
+        profile.updated_by_user_id = user.id
+        row.response_amount = Decimal(str(applied_amount))
+        row.response_program = applied_program
+        row.status = "applied" if payload.action == "apply" else "edited_and_applied"
+    else:
+        row.status = "kept_for_review"
+    row.response_note = payload.note
+    row.responded_by_user_id = user.id
+    row.responded_at = datetime.now(timezone.utc)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.recommendation_responded",
+        "application_recommendation",
+        entity_id=row.id,
+        after={
+            "action": payload.action,
+            "response_amount": row.response_amount,
+            "response_program": row.response_program,
+            "status": row.status,
+            "rules_version": row.rules_version,
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.post(
+    "/dealers/{dealer_id}/program-exceptions",
+    response_model=ProgramRuleResolutionRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def request_program_exception(
+    dealer_id: UUID,
+    payload: ProgramExceptionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerProgramRuleResolution:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = DealerProgramRuleResolution(
+        dealer_id=dealer.id,
+        program_key=payload.program_key,
+        rule_key=payload.rule_key,
+        kind=payload.kind,
+        source=payload.source,
+        current_value=payload.current_value,
+        recommended_action=payload.recommended_action,
+        status="requested",
+        rep_note=payload.note,
+        requested_by_user_id=user.id,
+        requested_at=datetime.now(timezone.utc),
+    )
+    db.add(row)
+    await db.flush()
+    await log_action(
+        db, dealer.id, user, "application.exception_requested", "program_rule_resolution",
+        entity_id=row.id, after=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.patch(
+    "/dealers/{dealer_id}/program-exceptions/{resolution_id}",
+    response_model=ProgramRuleResolutionRead,
+)
+async def decide_program_exception(
+    dealer_id: UUID,
+    resolution_id: UUID,
+    payload: ProgramExceptionDecision,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerProgramRuleResolution:
+    require_super_admin(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    row = (
+        await db.execute(
+            select(DealerProgramRuleResolution).where(
+                DealerProgramRuleResolution.id == resolution_id,
+                DealerProgramRuleResolution.dealer_id == dealer.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Exception request not found")
+    row.status = payload.decision
+    row.resolution_note = payload.note
+    row.resolved_by_user_id = user.id
+    row.resolved_at = datetime.now(timezone.utc)
+    await log_action(
+        db, dealer.id, user, f"application.exception_{payload.decision}", "program_rule_resolution",
+        entity_id=row.id, after=payload.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
 
 
 @router.get("/dealers/{dealer_id}/owners", response_model=list[OwnerRead])

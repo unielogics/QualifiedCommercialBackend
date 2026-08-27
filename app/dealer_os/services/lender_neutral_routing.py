@@ -299,11 +299,11 @@ def evaluate_direct_programs(facts: dict[str, Any]) -> dict[str, Any]:
 
     official = _bool(facts, "official_bank_statements")
     if official is None:
-        term_open.append("Confirm three current bank-produced statement months.")
-        working_open.append("Confirm three current bank-produced statement months.")
+        term_open.append("Confirm six current bank-produced statement months.")
+        working_open.append("Confirm six current bank-produced statement months.")
     elif official is False:
-        term_open.append("Three current bank-produced statements are still required; CSVs and screenshots are supplemental.")
-        working_open.append("Three current bank-produced statements are still required; CSVs and screenshots are supplemental.")
+        term_open.append("Six current bank-produced statements are still required; CSVs and screenshots are supplemental.")
+        working_open.append("Six current bank-produced statements are still required; CSVs and screenshots are supplemental.")
 
     nsfs = _number(facts, "nsf_count")
     if nsfs is None:
@@ -394,7 +394,7 @@ def evaluate_direct_programs(facts: dict[str, Any]) -> dict[str, Any]:
     annualized_bank_sales = _number(facts, "annualized_bank_sales")
     working_cap = 50_000.0
     if annualized_bank_sales is None:
-        working_open.append("Calculate annualized sales from the three current bank statements to confirm the 10-year amount cap.")
+        working_open.append("Calculate annualized sales from the six current bank statements to confirm the 10-year amount cap.")
     else:
         working_cap = min(working_cap, round(max(annualized_bank_sales, 0.0) * 0.50, 2))
         if working_cap < 15_000:
@@ -450,6 +450,6 @@ def evaluate_direct_programs(facts: dict[str, Any]) -> dict[str, Any]:
             "annual_cash_flow_available_for_debt": cash_flow,
             "annualized_bank_sales": annualized_bank_sales,
             "working_capital_amount_cap": working_cap if annualized_bank_sales is not None else None,
-            "working_capital_amount_cap_source": "three_current_bank_statements" if annualized_bank_sales is not None else "unavailable",
+            "working_capital_amount_cap_source": "six_current_bank_statements" if annualized_bank_sales is not None else "unavailable",
         },
     }

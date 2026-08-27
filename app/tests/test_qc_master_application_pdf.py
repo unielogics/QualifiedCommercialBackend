@@ -22,7 +22,24 @@ def _sample_context() -> dict:
         human_review_note="Cash flow, ownership, and direct-program eligibility reviewed.",
     )
     pre_screen = SimpleNamespace(
-        file_answers={"refinance_debt": True},
+        file_answers={
+            "refinance_debt": True,
+            "open_tax_liens": False,
+            "tax_liability_over_10000": False,
+            "open_judgments": False,
+            "open_civil_actions_as_defendant": False,
+            "civil_action_financial_institution_within_10_years": False,
+            "judgment_over_2000_within_12_months": False,
+            "judgment_over_50000_within_7_years": False,
+            "aggregate_liens_judgments_over_25000_within_7_years": False,
+            "speculative_real_estate_flipping": False,
+            "gambling_or_bail_bonds": False,
+            "lending_investment_crypto_mlm": False,
+            "nonprofit_or_government": False,
+            "marijuana_or_firearms": False,
+            "prurient_business": False,
+            "auto_or_title_asset_sales": False,
+        },
         completed_at=completed_at,
     )
     matched_rule = {
@@ -88,7 +105,14 @@ def _sample_context() -> dict:
             "monthly_debt_payments": 20000.0,
             "dscr": 1.42,
             "dscr_source": "verified cash flow and debt schedule",
-            "statement_months": ["2026-05", "2026-06", "2026-07"],
+            "statement_months": [
+                "2026-02",
+                "2026-03",
+                "2026-04",
+                "2026-05",
+                "2026-06",
+                "2026-07",
+            ],
             "missing_statement_months": [],
         },
         "owners": [

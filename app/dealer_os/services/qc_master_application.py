@@ -27,7 +27,7 @@ from ..models import (
     DealerDocument,
     DealerOwner,
 )
-from . import recurrence
+from . import application_prescreen, recurrence
 from .lender_neutral_routing import (
     RULES_VERSION,
     TERM_DISPLAY_NAME,
@@ -39,7 +39,7 @@ from .lender_neutral_routing import (
 MASTER_TEMPLATE_KEY = "qc_business_financing_application"
 MASTER_TITLE = "Qualified Commercial Business Financing Application and Certifications"
 MASTER_VERSION = "2026-08-25-1"
-STATEMENT_MONTH_TARGET = 3
+STATEMENT_MONTH_TARGET = 6
 
 
 def _text(value: Any) -> str:
@@ -342,6 +342,15 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
     required_owners = [row for row in owners if row["credit_required"]]
     credit_complete = bool(required_owners) and all(row["credit_status"].startswith("Completed") for row in required_owners)
     primary = context.get("primary_signer") or {}
+    business_groups = application_prescreen.applicable_business_questions(
+        naics_code=taxonomy.get("naics_code"),
+        routing_result=context.get("routing"),
+    )
+    business_question_blockers = application_prescreen.business_answer_blockers(
+        business_groups,
+        dict(pre_screen.file_answers or {}) if pre_screen else {},
+    )
+    business_questions_complete = not business_question_blockers
     app_complete = all(
         [
             _text(business.get("legal_name")),
@@ -373,7 +382,7 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         _status("Canonical six-digit NAICS classification", "complete" if taxonomy["canonical"] else "missing", f"{taxonomy['naics_code']} - {taxonomy['naics_label']}", source="Taxonomy"),
         _status("Independent credit verification for every 20%+ owner", "complete" if credit_complete else "missing", f"{sum(row['credit_status'].startswith('Completed') for row in required_owners)} of {len(required_owners)} completed", source="iSoftPull"),
         _status(
-            "Three current bank-produced statement months",
+            "Six current bank-produced statement months",
             "complete" if statement_complete else "supplemental" if has_supplemental_bank else "missing",
             ", ".join(financial.get("statement_months") or []) or "No qualifying statement months",
             source="Plaid or uploaded PDF",
@@ -389,10 +398,13 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         _status("Business tax return", "complete" if has_tax else "missing" if route_key == WORKING_CAPITAL_PROGRAM_KEY else "not_applicable", "Extracted tax return in file" if has_tax else "No extracted business tax return", route=WORKING_CAPITAL_PROGRAM_KEY, source="Documents"),
         _status(
             "Business eligibility questionnaire",
-            "not_applicable" if route_key != WORKING_CAPITAL_PROGRAM_KEY else "complete" if pre_screen and pre_screen.completed_at else "missing",
-            "Versioned owner and business disclosures",
-            route=WORKING_CAPITAL_PROGRAM_KEY,
-            source="Step 1.5",
+            "complete" if business_questions_complete else "missing",
+            (
+                "Every applicable business disclosure is complete"
+                if business_questions_complete
+                else "; ".join(business_question_blockers[:4])
+            ),
+            source="Step 4",
         ),
         _status("Human-reviewed fundable path", "complete" if human_status == "fundable" else "missing", getattr(profile, "human_review_note", None) or human_status.replace("_", " ").title(), source="Qualified Commercial desk"),
     ]

@@ -188,6 +188,7 @@ class DealerRead(ORM):
     funding_goal: float | None = None
     funded_amount: float | None = None
     client_requested_amount: float | None = None
+    client_requested_program: str | None = None
     application_lifecycle: str = "active"
     funding_purpose: str | None = None
     group_id: UUID | None = None
@@ -622,6 +623,8 @@ class ApplicationProfileRead(ORM):
     term_requested_months: int | None = None
     collateral_description: str | None = None
     use_of_proceeds_text: str | None = None
+    field_provenance: dict = Field(default_factory=dict)
+    field_confirmations: dict = Field(default_factory=dict)
     updated_by_user_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
@@ -655,6 +658,7 @@ class ApplicationProfilePatch(BaseModel):
     term_requested_months: int | None = Field(default=None, ge=1, le=360)
     collateral_description: str | None = Field(default=None, max_length=4000)
     use_of_proceeds_text: str | None = Field(default=None, max_length=4000)
+    confirm_fields: list[str] | None = Field(default=None, max_length=20)
 
 
 class ApplicationHumanReviewPatch(BaseModel):
@@ -779,6 +783,14 @@ class RepAppointmentCreate(BaseModel):
     requested_amount: str | None = Field(default=None, max_length=40)
     full_address: str | None = Field(default=None, max_length=500)
     transactional_sms_consent: bool = False
+    requested_document_keys: list[
+        Literal[
+            "ytd_profit_and_loss",
+            "debt_schedule",
+            "use_of_funds_support",
+            "entity_documents",
+        ]
+    ] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="after")
     def _needs_a_recipient(self) -> "RepAppointmentCreate":
@@ -859,6 +871,14 @@ class UnderwritingReviewPreferenceBook(BaseModel):
     full_address: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
     transactional_sms_consent: bool = False
+    requested_document_keys: list[
+        Literal[
+            "ytd_profit_and_loss",
+            "debt_schedule",
+            "use_of_funds_support",
+            "entity_documents",
+        ]
+    ] = Field(default_factory=list, max_length=4)
 
 
 class ContactShareRead(ORM):
@@ -1062,6 +1082,97 @@ class ApplicationPreScreenRead(BaseModel):
     verified_routing_result: dict | None = None
     routing_history: list[dict] = Field(default_factory=list)
     completed_at: datetime | None = None
+    applicable_business_questions: list[dict] = Field(default_factory=list)
+    business_questions_complete: bool = False
+    business_question_blockers: list[str] = Field(default_factory=list)
+
+
+class ApplicationRecommendationRead(ORM):
+    id: UUID
+    dealer_id: UUID
+    rules_version: str
+    current_amount: float | None = None
+    current_program: str | None = None
+    recommended_amount: float | None = None
+    recommended_program: str | None = None
+    supported_min: float | None = None
+    supported_max: float | None = None
+    reasons: list[dict] = Field(default_factory=list)
+    status: str
+    response_amount: float | None = None
+    response_program: str | None = None
+    response_note: str | None = None
+    created_by_user_id: UUID | None = None
+    responded_by_user_id: UUID | None = None
+    responded_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApplicationRecommendationResponse(BaseModel):
+    action: Literal["apply", "edit", "keep_for_review"]
+    amount: float | None = Field(default=None, gt=0, le=999_999_999_999.99)
+    program_key: str | None = Field(default=None, max_length=80)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ProgramRuleResolutionRead(ORM):
+    id: UUID
+    dealer_id: UUID
+    program_key: str
+    rule_key: str
+    kind: str
+    source: str | None = None
+    current_value: dict | None = None
+    recommended_action: str | None = None
+    status: str
+    rep_note: str | None = None
+    requested_by_user_id: UUID | None = None
+    requested_at: datetime | None = None
+    resolved_by_user_id: UUID | None = None
+    resolved_at: datetime | None = None
+    resolution_note: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProgramExceptionRequest(BaseModel):
+    program_key: str = Field(min_length=1, max_length=80)
+    rule_key: str = Field(min_length=1, max_length=160)
+    kind: Literal[
+        "missing_evidence",
+        "conflicting_information",
+        "unsupported_amount",
+        "alternative_program",
+        "hard_restriction",
+    ]
+    source: str | None = Field(default=None, max_length=160)
+    current_value: dict | None = None
+    recommended_action: str | None = Field(default=None, max_length=2000)
+    note: str = Field(min_length=1, max_length=2000)
+
+
+class ProgramExceptionDecision(BaseModel):
+    decision: Literal["approved", "denied"]
+    note: str = Field(min_length=1, max_length=2000)
+
+
+class UnderwritingResolutionRead(BaseModel):
+    rules_version: str
+    original_amount: float | None = None
+    working_amount: float | None = None
+    original_program: str | None = None
+    working_program: str | None = None
+    recommended: ApplicationRecommendationRead | None = None
+    programs: list[dict] = Field(default_factory=list)
+    blockers: list[dict] = Field(default_factory=list)
+    applicable_business_questions: list[dict] = Field(default_factory=list)
+    business_questions_complete: bool = False
+    business_question_blockers: list[str] = Field(default_factory=list)
+    financial_suggestions: dict[str, dict] = Field(default_factory=dict)
+    exception_requests: list[ProgramRuleResolutionRead] = Field(default_factory=list)
+    direct_program_viable: bool = False
+    signing_mode: Literal["program_package", "qc_summary_booking"] = "qc_summary_booking"
 
 
 class DecisionRead(BaseModel):
@@ -1196,7 +1307,7 @@ class DocumentCoverageRead(BaseModel):
     needs to collect vs. what the extracted documents already cover."""
 
     statement_months: list[str] = []   # distinct "YYYY-MM" covered by statements/periods
-    statement_target: int = 3
+    statement_target: int = 6
     tax_years: list[int] = []          # years with a dos_tax_filings row
     tax_target: int = 2
     has_pl: bool = False
@@ -1204,7 +1315,7 @@ class DocumentCoverageRead(BaseModel):
     open_doc_requests: int = 0
     # Freshness (deterministic date math vs. today — services.recurrence):
     current_through: str | None = None  # latest covered "YYYY-MM", null = no coverage
-    expected_months: list[str] = []     # the 3 most recent COMPLETED months
+    expected_months: list[str] = []     # the 6 most recent COMPLETED months
     missing_months: list[str] = []      # expected minus covered, sorted
     is_current: bool = False            # the most recent completed month is covered
     days_since_latest: int | None = None  # days from END of latest covered month to today
@@ -1867,6 +1978,7 @@ class DebtRead(BaseModel):
     payment_frequency: str | None = None
     factor_rate: float | None = None
     payoff_amount: float | None = None
+    collateral: str | None = None
     document_id: UUID | None = None
     count_in_dscr: bool = True
 
@@ -1889,6 +2001,8 @@ class DebtCreate(BaseModel):
     payment_frequency: str | None = Field(default=None, pattern=_FREQ_PATTERN)
     factor_rate: float | None = Field(default=None, gt=0, le=5)
     payoff_amount: float | None = Field(default=None, ge=0)
+    collateral: str | None = Field(default=None, max_length=2000)
+    count_in_dscr: bool = True
 
 
 class DebtPatch(BaseModel):
@@ -1905,6 +2019,8 @@ class DebtPatch(BaseModel):
     payment_frequency: str | None = Field(default=None, pattern=_FREQ_PATTERN)
     factor_rate: float | None = Field(default=None, gt=0, le=5)
     payoff_amount: float | None = Field(default=None, ge=0)
+    collateral: str | None = Field(default=None, max_length=2000)
+    count_in_dscr: bool | None = None
 
 
 class DebtDraftResult(BaseModel):
