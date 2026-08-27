@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from app.models.application_profile import ApplicationProfile
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.routers.operator_files import (
     _collapse_logical_rows,
     _funding_stage,
+    _pipeline_status_for_row,
     _reconcile_link_files,
     _rollup,
     _variant_vertical,
@@ -75,6 +77,28 @@ def test_rollup_counts_vertical_origin_attention_and_promoted():
     assert rollup.real_estate == 1
     assert rollup.dealer == 1
     assert rollup.working == 1
+
+
+def test_rollup_counts_pipeline_lifecycle_when_present():
+    row = _row(vertical="dealer", origin="ai_intake", stage="Applicant intake")
+    row.pipeline_status = "in_underwriting"
+
+    rollup = _rollup([row])
+
+    assert rollup.by_stage == {"in_underwriting": 1}
+
+
+def test_pipeline_status_prefers_profile_underwriting_lifecycle():
+    row = _row(vertical="dealer", origin="ai_intake", stage="Applicant intake")
+    profile = ApplicationProfile(underwriting_status="approved")
+
+    assert _pipeline_status_for_row(row, profile) == "approved"
+
+
+def test_pipeline_status_maps_promoted_loan_stage():
+    row = _row(vertical="main_street", origin="console", stage="funded")
+
+    assert _pipeline_status_for_row(row, None) == "closed_won"
 
 
 def test_row_computed_aliases_match_desktop_contract():

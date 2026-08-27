@@ -8,6 +8,16 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 ApplicationSourceKind = Literal["deal", "loan", "intake", "dealer"]
 ApplicationVertical = Literal["real_estate", "main_street", "dealer", "mca"]
+UnderwritingLifecycleStatus = Literal[
+    "submitted",
+    "collecting_docs",
+    "in_underwriting",
+    "term_sheet_provided",
+    "approved",
+    "closed_won",
+    "closed_lost",
+    "denied",
+]
 
 
 class ApplicationProfileResolve(BaseModel):
@@ -45,7 +55,45 @@ class ApplicationProfileRead(BaseModel):
     extraction_reviewed_at: datetime | None = None
     bank_verification_override_at: datetime | None = None
     bank_verification_override_reason: str | None = None
+    underwriting_status: UnderwritingLifecycleStatus = "submitted"
+    underwriting_approved_amount: float | None = None
+    underwriting_term_sheet_amount: float | None = None
+    underwriting_current_dscr: float | None = None
+    underwriting_target_dscr: float | None = None
+    underwriting_approved_dscr: float | None = None
+    underwriting_close_outcome: str | None = None
+    underwriting_notes: str | None = None
+    underwriting_updated_by_user_id: UUID | None = None
+    underwriting_updated_at: datetime | None = None
     owner_storage: Literal["application", "dealer"]
+
+
+class ApplicationUnderwritingRead(BaseModel):
+    profile_id: UUID
+    source_kind: ApplicationSourceKind | None = None
+    source_id: UUID | None = None
+    loan_id: UUID | None = None
+    underwriting_status: UnderwritingLifecycleStatus = "submitted"
+    approved_amount: float | None = None
+    term_sheet_amount: float | None = None
+    current_dscr: float | None = None
+    target_dscr: float | None = None
+    approved_dscr: float | None = None
+    close_outcome: str | None = None
+    reviewer_notes: str | None = None
+    updated_by_user_id: UUID | None = None
+    updated_at: datetime | None = None
+
+
+class ApplicationUnderwritingPatch(BaseModel):
+    underwriting_status: UnderwritingLifecycleStatus | None = None
+    approved_amount: float | None = Field(default=None, ge=0)
+    term_sheet_amount: float | None = Field(default=None, ge=0)
+    current_dscr: float | None = Field(default=None, ge=0)
+    target_dscr: float | None = Field(default=None, ge=0)
+    approved_dscr: float | None = Field(default=None, ge=0)
+    close_outcome: str | None = Field(default=None, max_length=32)
+    reviewer_notes: str | None = Field(default=None, max_length=5000)
 
 
 class FileOwnerCreate(BaseModel):

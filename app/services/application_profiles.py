@@ -171,6 +171,16 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         extraction_reviewed_at=profile.extraction_reviewed_at,
         bank_verification_override_at=profile.bank_verification_override_at,
         bank_verification_override_reason=profile.bank_verification_override_reason,
+        underwriting_status=profile.underwriting_status,
+        underwriting_approved_amount=profile.underwriting_approved_amount,
+        underwriting_term_sheet_amount=profile.underwriting_term_sheet_amount,
+        underwriting_current_dscr=profile.underwriting_current_dscr,
+        underwriting_target_dscr=profile.underwriting_target_dscr,
+        underwriting_approved_dscr=profile.underwriting_approved_dscr,
+        underwriting_close_outcome=profile.underwriting_close_outcome,
+        underwriting_notes=profile.underwriting_notes,
+        underwriting_updated_by_user_id=profile.underwriting_updated_by_user_id,
+        underwriting_updated_at=profile.underwriting_updated_at,
         owner_storage="dealer" if profile.dealer_id else "application",
     )
 

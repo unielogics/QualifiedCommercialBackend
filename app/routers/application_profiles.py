@@ -22,7 +22,7 @@ from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
 from app.dealer_os.services import consent_delivery, plaid_client
 from app.deps import CurrentUser
-from app.enums import Role
+from app.enums import LoanStage, Role
 from app.models.application_profile import (
     ApplicationBankConsent,
     ApplicationExtractedFact,
@@ -37,6 +37,7 @@ from app.models.application_profile import (
 )
 from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
+from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.routers.buckets import _hash_passcode, _verify_passcode
@@ -54,6 +55,8 @@ from app.schemas.application_profile import (
     ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
+    ApplicationUnderwritingPatch,
+    ApplicationUnderwritingRead,
     ApplicationRoomAccess,
     ApplicationRoomConsentGrant,
     ApplicationRoomPlaidExchange,
@@ -101,10 +104,20 @@ from app.schemas.application_profile import (
     VerificationInvitationRead,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
+from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services import application_profiles as profiles
 from app.services import plaid_lifecycle
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
+
+UNDERWRITING_TO_LOAN_STAGE: dict[str, LoanStage] = {
+    "submitted": LoanStage.PREQUALIFIED,
+    "collecting_docs": LoanStage.COLLECTING_DOCS,
+    "in_underwriting": LoanStage.PROCESSING,
+    "term_sheet_provided": LoanStage.LENDER_CONNECTED,
+    "approved": LoanStage.CLOSING,
+    "closed_won": LoanStage.FUNDED,
+}
 
 
 def _normalize_label(value: str) -> str:
@@ -452,6 +465,79 @@ def _require_profile_bank_client(profile: ApplicationProfile, user: User) -> Non
         )
 
 
+def _role_value(user: User) -> str:
+    return user.role.value if hasattr(user.role, "value") else str(user.role)
+
+
+def _require_underwriting_actor(user: User) -> None:
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Underwriting role required",
+        )
+
+
+def _underwriting_read(
+    profile: ApplicationProfile,
+    *,
+    source_kind: str | None = None,
+    source_id: UUID | None = None,
+) -> ApplicationUnderwritingRead:
+    return ApplicationUnderwritingRead(
+        profile_id=profile.id,
+        source_kind=source_kind,  # type: ignore[arg-type]
+        source_id=source_id,
+        loan_id=profile.loan_id,
+        underwriting_status=profile.underwriting_status,  # type: ignore[arg-type]
+        approved_amount=profile.underwriting_approved_amount,
+        term_sheet_amount=profile.underwriting_term_sheet_amount,
+        current_dscr=profile.underwriting_current_dscr,
+        target_dscr=profile.underwriting_target_dscr,
+        approved_dscr=profile.underwriting_approved_dscr,
+        close_outcome=profile.underwriting_close_outcome,
+        reviewer_notes=profile.underwriting_notes,
+        updated_by_user_id=profile.underwriting_updated_by_user_id,
+        updated_at=profile.underwriting_updated_at,
+    )
+
+
+async def _sync_profile_loan_stage(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    user: User,
+    status_value: str,
+    *,
+    note: str | None = None,
+) -> Loan | None:
+    target = UNDERWRITING_TO_LOAN_STAGE.get(status_value)
+    if target is None or profile.loan_id is None:
+        return None
+    loan = await db.get(Loan, profile.loan_id)
+    if loan is None:
+        return None
+    old = loan.stage
+    if old == target:
+        return loan
+    loan.stage = target
+    await log_activity(
+        db,
+        loan_id=loan.id,
+        actor_id=user.id,
+        actor_label=_role_value(user),
+        kind="underwriting.stage_sync",
+        summary=f"Underwriting lifecycle moved loan stage {old} -> {target}",
+        payload={
+            "profile_id": str(profile.id),
+            "underwriting_status": status_value,
+            "from": old.value if hasattr(old, "value") else str(old),
+            "to": target.value,
+            "note": note,
+        },
+    )
+    await mark_loan_dirty(db, loan.id)
+    return loan
+
+
 async def _owner_for_profile(
     db: AsyncSession, profile: ApplicationProfile, owner_id: UUID
 ) -> ApplicationOwner | DealerOwner:
@@ -512,6 +598,81 @@ async def get_application_profile(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationProfileRead:
     return profiles.profile_read(await profiles.load_profile(db, profile_id, user))
+
+
+@router.get("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)
+async def get_application_underwriting(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationUnderwritingRead:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    return _underwriting_read(profile)
+
+
+@router.patch("/{profile_id}/underwriting", response_model=ApplicationUnderwritingRead)
+async def update_application_underwriting(
+    profile_id: UUID,
+    payload: ApplicationUnderwritingPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationUnderwritingRead:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return _underwriting_read(profile)
+
+    now = datetime.now(UTC)
+    status_value = changes.get("underwriting_status")
+    if status_value is not None:
+        profile.underwriting_status = status_value
+        if status_value == "closed_won":
+            profile.underwriting_close_outcome = "won"
+        elif status_value in {"closed_lost", "denied"}:
+            profile.underwriting_close_outcome = status_value
+    if "approved_amount" in changes:
+        profile.underwriting_approved_amount = changes["approved_amount"]
+    if "term_sheet_amount" in changes:
+        profile.underwriting_term_sheet_amount = changes["term_sheet_amount"]
+    if "current_dscr" in changes:
+        profile.underwriting_current_dscr = changes["current_dscr"]
+    if "target_dscr" in changes:
+        profile.underwriting_target_dscr = changes["target_dscr"]
+    if "approved_dscr" in changes:
+        profile.underwriting_approved_dscr = changes["approved_dscr"]
+    if "close_outcome" in changes:
+        profile.underwriting_close_outcome = changes["close_outcome"]
+    if "reviewer_notes" in changes:
+        profile.underwriting_notes = changes["reviewer_notes"]
+    profile.underwriting_updated_by_user_id = user.id
+    profile.underwriting_updated_at = now
+
+    loan = await _sync_profile_loan_stage(
+        db,
+        profile,
+        user,
+        profile.underwriting_status,
+        note=profile.underwriting_notes,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "underwriting.updated",
+        f"Updated underwriting lifecycle to {profile.underwriting_status.replace('_', ' ')}",
+        target_type="loan" if loan else "application_profile",
+        target_id=loan.id if loan else profile.id,
+        metadata={
+            "changes": changes,
+            "loan_id": str(loan.id) if loan else None,
+            "loan_stage": loan.stage.value if loan else None,
+        },
+    )
+    await db.commit()
+    await db.refresh(profile)
+    return _underwriting_read(profile)
 
 
 def _masked_recipient(channel: str, email: str | None, phone: str | None) -> str | None:

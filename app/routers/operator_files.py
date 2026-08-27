@@ -25,6 +25,7 @@ from app.dealer_os.models import DealerAuditLog, DealerBusiness, DealerRepLead
 from app.deps import CurrentUser
 from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
 from app.models.activity import Activity
+from app.models.application_profile import ApplicationProfile
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
@@ -47,6 +48,8 @@ from app.schemas.operator_file import (
     BucketIntakeLinkUpdate,
     IntakePromotionRequest,
     IntakePromotionResult,
+    PipelineMoveRequest,
+    PipelineMoveResult,
     UnifiedActionDefinition,
     UnifiedActivity,
     UnifiedAuditItem,
@@ -64,7 +67,8 @@ from app.schemas.operator_file import (
     UnifiedStage,
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
-from app.services.activity_log import log_activity
+from app.services.activity_log import log_activity, mark_loan_dirty
+from app.services import application_profiles as profiles
 from app.services.operator_file_links import (
     active_links_for_sources,
     queue_link_change_review,
@@ -111,6 +115,93 @@ FUNDING_LADDER = [
     ("closing", "Closing"),
     ("funded", "Funded"),
 ]
+PIPELINE_LIFECYCLE = [
+    "submitted",
+    "collecting_docs",
+    "in_underwriting",
+    "term_sheet_provided",
+    "approved",
+    "closed_won",
+    "closed_lost",
+    "denied",
+]
+OPEN_PIPELINE_LIFECYCLE = [
+    "submitted",
+    "collecting_docs",
+    "in_underwriting",
+    "term_sheet_provided",
+    "approved",
+    "closed_won",
+]
+LOAN_STAGE_TO_UNDERWRITING = {
+    "prequalified": "submitted",
+    "collecting_docs": "collecting_docs",
+    "lender_connected": "term_sheet_provided",
+    "processing": "in_underwriting",
+    "closing": "approved",
+    "funded": "closed_won",
+}
+UNDERWRITING_TO_LOAN_STAGE = {
+    "submitted": LoanStage.PREQUALIFIED,
+    "collecting_docs": LoanStage.COLLECTING_DOCS,
+    "in_underwriting": LoanStage.PROCESSING,
+    "term_sheet_provided": LoanStage.LENDER_CONNECTED,
+    "approved": LoanStage.CLOSING,
+    "closed_won": LoanStage.FUNDED,
+}
+INTAKE_STATUS_TO_UNDERWRITING = {
+    "collecting": "submitted",
+    "submitted": "submitted",
+    "reviewing": "collecting_docs",
+    "reviewed": "in_underwriting",
+    "completed": "approved",
+    "closed": "closed_lost",
+    "denied": "denied",
+}
+WORKING_STAGE_TO_UNDERWRITING = {
+    "lead": "submitted",
+    "contacted": "collecting_docs",
+    "verified": "collecting_docs",
+    "ready_for_lending": "in_underwriting",
+    "applicant_intake": "submitted",
+    "verification": "collecting_docs",
+    "financial_profile": "collecting_docs",
+    "credit_application": "in_underwriting",
+    "contracts_execution": "approved",
+}
+PIPELINE_TO_INTAKE_STATUS = {
+    "submitted": "collecting",
+    "collecting_docs": "reviewing",
+    "in_underwriting": "reviewed",
+    "term_sheet_provided": "reviewed",
+    "approved": "completed",
+    "closed_won": "completed",
+    "closed_lost": "completed",
+    "denied": "completed",
+}
+PIPELINE_TO_INTAKE_OUTCOME = {
+    "submitted": "submitted",
+    "collecting_docs": "submitted",
+    "in_underwriting": "submitted",
+    "term_sheet_provided": "submitted",
+    "approved": "submitted",
+    "closed_won": "closed",
+    "closed_lost": "closed",
+    "denied": "denied",
+}
+PIPELINE_PROMOTION_REQUIRED = {
+    "in_underwriting",
+    "term_sheet_provided",
+    "approved",
+    "closed_won",
+}
+PIPELINE_SOURCE_ALIASES = {
+    "deals": "deal",
+    "loans": "loan",
+    "intakes": "intake",
+    "buckets": "bucket",
+    "dealers": "dealer",
+}
 
 DOCUMENT_PACKS: dict[str, tuple[list[str], list[str]]] = {
     "real_estate": (
@@ -821,6 +912,105 @@ def _collapse_logical_rows(rows: list[UnifiedFileRow]) -> list[UnifiedFileRow]:
     return [row for row in rows if row.id not in suppressed]
 
 
+def _profile_key_candidates(row: UnifiedFileRow) -> list[tuple[str, UUID]]:
+    candidates: list[tuple[str, UUID]] = []
+    for name, value in (
+        ("deal", row.deal_id),
+        ("loan", row.loan_id),
+        ("intake", row.intake_id),
+        ("dealer", row.dealer_id),
+    ):
+        if value:
+            candidates.append((name, value))
+    return candidates
+
+
+async def _profile_map_for_rows(
+    rows: list[UnifiedFileRow],
+    db: AsyncSession,
+) -> dict[tuple[str, UUID], ApplicationProfile]:
+    ids = {
+        "deal": {row.deal_id for row in rows if row.deal_id},
+        "loan": {row.loan_id for row in rows if row.loan_id},
+        "intake": {row.intake_id for row in rows if row.intake_id},
+        "dealer": {row.dealer_id for row in rows if row.dealer_id},
+    }
+    predicates = []
+    if ids["deal"]:
+        predicates.append(ApplicationProfile.deal_id.in_(ids["deal"]))
+    if ids["loan"]:
+        predicates.append(ApplicationProfile.loan_id.in_(ids["loan"]))
+    if ids["intake"]:
+        predicates.append(ApplicationProfile.intake_id.in_(ids["intake"]))
+    if ids["dealer"]:
+        predicates.append(ApplicationProfile.dealer_id.in_(ids["dealer"]))
+    if not predicates:
+        return {}
+    profiles_rows = list((await db.execute(select(ApplicationProfile).where(or_(*predicates)))).scalars().all())
+    result: dict[tuple[str, UUID], ApplicationProfile] = {}
+    for profile in profiles_rows:
+        if profile.deal_id:
+            result[("deal", profile.deal_id)] = profile
+        if profile.loan_id:
+            result[("loan", profile.loan_id)] = profile
+        if profile.intake_id:
+            result[("intake", profile.intake_id)] = profile
+        if profile.dealer_id:
+            result[("dealer", profile.dealer_id)] = profile
+    return result
+
+
+def _profile_for_row(
+    row: UnifiedFileRow,
+    profile_map: dict[tuple[str, UUID], ApplicationProfile],
+) -> ApplicationProfile | None:
+    for key in _profile_key_candidates(row):
+        profile = profile_map.get(key)
+        if profile:
+            return profile
+    return None
+
+
+def _pipeline_status_for_row(
+    row: UnifiedFileRow,
+    profile: ApplicationProfile | None,
+) -> str:
+    if profile and profile.underwriting_status in PIPELINE_LIFECYCLE:
+        return profile.underwriting_status
+    if row.funding_stage:
+        return LOAN_STAGE_TO_UNDERWRITING.get(row.funding_stage.key, "submitted")
+    if row.intake_id:
+        key = row.working_stage.key if row.working_stage else row.normalized_stage.lower()
+        return WORKING_STAGE_TO_UNDERWRITING.get(key, "submitted")
+    if row.working_stage:
+        return WORKING_STAGE_TO_UNDERWRITING.get(row.working_stage.key, "submitted")
+    return "submitted"
+
+
+async def _decorate_pipeline_state(
+    rows: list[UnifiedFileRow],
+    user: User,
+    db: AsyncSession,
+) -> None:
+    profile_map = await _profile_map_for_rows(rows, db)
+    for row in rows:
+        profile = _profile_for_row(row, profile_map)
+        status_value = _pipeline_status_for_row(row, profile)
+        row.pipeline_status = status_value  # type: ignore[assignment]
+        row.underwriting_status = status_value  # type: ignore[assignment]
+        row.approved_amount = _money(profile.underwriting_approved_amount) if profile else None
+        row.approved_dscr = (
+            float(profile.underwriting_approved_dscr)
+            if profile and profile.underwriting_approved_dscr is not None
+            else None
+        )
+        can_move = user.role in INTERNAL_ROLES and (
+            row.source_kind in {"intake", "loan", "dealer"} or row.loan_id is not None
+        )
+        row.can_move_pipeline = can_move
+        row.allowed_transitions = list(PIPELINE_LIFECYCLE) if can_move else []  # type: ignore[assignment]
+
+
 async def _decorate_durable_links(rows: list[UnifiedFileRow], user: User, db: AsyncSession) -> None:
     visible_bucket_ids = {bucket_id for row in rows for bucket_id in row.linked_bucket_ids}
     visible_intake_ids = {intake_id for row in rows for intake_id in row.linked_intake_ids}
@@ -851,6 +1041,7 @@ async def _all_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     rows.extend(await _dealer_rows(user, db))
     await _decorate_durable_links(rows, user, db)
     rows = _collapse_logical_rows(rows)
+    await _decorate_pipeline_state(rows, user, db)
     rows.sort(key=lambda row: row.updated_at, reverse=True)
     return rows
 
@@ -880,7 +1071,13 @@ def _apply_filters(
                     row.subtitle or "",
                     row.principal or "",
                     row.client_name or "",
+                    row.phone or "",
+                    row.owner_name or "",
+                    row.rep_name or "",
+                    row.dealer_name or "",
                     row.source_label,
+                    row.pipeline_status or "",
+                    row.underwriting_status or "",
                     " ".join(row.program_tags),
                 ]
             ).lower()
@@ -891,7 +1088,7 @@ def _apply_filters(
 def _rollup(rows: list[UnifiedFileRow]) -> UnifiedRollup:
     by_vertical = Counter(row.vertical for row in rows)
     by_origin = Counter(row.origin for row in rows)
-    by_stage = Counter(row.normalized_stage for row in rows)
+    by_stage = Counter(row.pipeline_status or row.normalized_stage for row in rows)
     return UnifiedRollup(
         total=len(rows),
         by_vertical=dict(by_vertical),
@@ -924,6 +1121,153 @@ async def list_operator_files(
         rollup=_rollup(rows),
         limit=limit,
         filters={"vertical": vertical, "origin": origin, "q": q},
+    )
+
+
+def _normalize_pipeline_source_kind(source_kind: str) -> str:
+    normalized = PIPELINE_SOURCE_ALIASES.get(source_kind, source_kind)
+    if normalized not in {"deal", "loan", "intake", "dealer"}:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Only deal, loan, intake, and dealer files have an underwriting lifecycle",
+        )
+    return normalized
+
+
+async def _sync_pipeline_loan_stage(
+    db: AsyncSession,
+    *,
+    profile: ApplicationProfile,
+    target_status: str,
+    user: User,
+    note: str | None,
+) -> Loan | None:
+    target_stage = UNDERWRITING_TO_LOAN_STAGE.get(target_status)
+    if target_stage is None or profile.loan_id is None:
+        return None
+    loan = await db.get(Loan, profile.loan_id)
+    if loan is None:
+        return None
+    previous = loan.stage
+    if previous == target_stage:
+        return loan
+    loan.stage = target_stage
+    await log_activity(
+        db,
+        loan_id=loan.id,
+        actor_id=user.id,
+        actor_label=_role_value(user),
+        kind="pipeline.lifecycle_stage_sync",
+        summary=f"Pipeline lifecycle synced loan stage {previous.value} -> {target_stage.value}",
+        payload={
+            "profile_id": str(profile.id),
+            "underwriting_status": target_status,
+            "from": previous.value,
+            "to": target_stage.value,
+            "note": note,
+        },
+    )
+    await mark_loan_dirty(db, loan.id)
+    return loan
+
+
+@router.post("/{source_kind}/{source_id}/pipeline-move", response_model=PipelineMoveResult)
+async def move_operator_file_pipeline(
+    source_kind: str,
+    source_id: UUID,
+    payload: PipelineMoveRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PipelineMoveResult:
+    _require_internal(user)
+    normalized_kind = _normalize_pipeline_source_kind(source_kind)
+    profile = await profiles.resolve_profile(db, normalized_kind, source_id, user)
+    current_status = (
+        profile.underwriting_status
+        if profile.underwriting_status in PIPELINE_LIFECYCLE
+        else "submitted"
+    )
+    if payload.expected_status and payload.expected_status != current_status:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"File moved from {payload.expected_status} to {current_status}; refresh and try again",
+        )
+
+    created_loan = False
+    if payload.target_status in PIPELINE_PROMOTION_REQUIRED and profile.loan_id is None:
+        if profile.intake_id is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Move requires a linked AI intake before a funding loan can be created",
+            )
+        promotion = await promote_intake_to_funding(
+            profile.intake_id,
+            IntakePromotionRequest(
+                notes=payload.note
+                or f"Created funding file from pipeline move to {payload.target_status}",
+            ),
+            request,
+            user,
+            db,
+        )
+        profile.loan_id = promotion.loan_id
+        created_loan = promotion.created
+
+    now = datetime.now(UTC)
+    profile.underwriting_status = payload.target_status
+    profile.underwriting_updated_by_user_id = user.id
+    profile.underwriting_updated_at = now
+    if payload.target_status == "closed_won":
+        profile.underwriting_close_outcome = "won"
+    elif payload.target_status in {"closed_lost", "denied"}:
+        profile.underwriting_close_outcome = payload.target_status
+
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    if intake is not None:
+        intake.status = PIPELINE_TO_INTAKE_STATUS[payload.target_status]
+        intake.outcome_status = PIPELINE_TO_INTAKE_OUTCOME[payload.target_status]
+        if profile.loan_id:
+            intake.promoted_loan_id = profile.loan_id
+
+    loan = await _sync_pipeline_loan_stage(
+        db,
+        profile=profile,
+        target_status=payload.target_status,
+        user=user,
+        note=payload.note,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "pipeline.lifecycle_moved",
+        f"Pipeline moved {current_status.replace('_', ' ')} -> {payload.target_status.replace('_', ' ')}",
+        target_type="loan" if loan else "application_profile",
+        target_id=loan.id if loan else profile.id,
+        metadata={
+            "from": current_status,
+            "to": payload.target_status,
+            "source_kind": normalized_kind,
+            "source_id": str(source_id),
+            "loan_id": str(profile.loan_id) if profile.loan_id else None,
+            "loan_stage": loan.stage.value if loan else None,
+            "created_loan": created_loan,
+            "note": payload.note,
+        },
+    )
+    await db.commit()
+    await db.refresh(profile)
+    if profile.loan_id and loan is None:
+        loan = await db.get(Loan, profile.loan_id)
+    return PipelineMoveResult(
+        source_kind=normalized_kind,  # type: ignore[arg-type]
+        source_id=source_id,
+        profile_id=profile.id,
+        underwriting_status=profile.underwriting_status,  # type: ignore[arg-type]
+        loan_id=profile.loan_id,
+        loan_stage=loan.stage.value if loan else None,
+        created_loan=created_loan,
     )
 
 

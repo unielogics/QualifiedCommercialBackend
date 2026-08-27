@@ -17,6 +17,16 @@ UnifiedVertical = Literal["real_estate", "main_street", "dealer", "mca"]
 UnifiedOrigin = Literal["console", "agent", "rep", "dealer", "ai_intake"]
 UnifiedSourceKind = Literal["deal", "loan", "intake", "bucket", "dealer"]
 UnifiedTone = Literal["ok", "warn", "bad", "mut", "acc", "gold", "pet"]
+UnderwritingLifecycleStatus = Literal[
+    "submitted",
+    "collecting_docs",
+    "in_underwriting",
+    "term_sheet_provided",
+    "approved",
+    "closed_won",
+    "closed_lost",
+    "denied",
+]
 
 
 class UnifiedStage(BaseModel):
@@ -129,6 +139,12 @@ class UnifiedFileRow(BaseModel):
     funding_stage: UnifiedStage | None = None
     normalized_stage: str
     stage_tone: UnifiedTone = "mut"
+    pipeline_status: UnderwritingLifecycleStatus | None = None
+    underwriting_status: UnderwritingLifecycleStatus | None = None
+    approved_amount: float | None = None
+    approved_dscr: float | None = None
+    can_move_pipeline: bool = False
+    allowed_transitions: list[UnderwritingLifecycleStatus] = Field(default_factory=list)
     health: str
     health_tone: UnifiedTone = "mut"
     document_progress: UnifiedDocumentProgress = Field(default_factory=UnifiedDocumentProgress)
@@ -240,6 +256,23 @@ class UnifiedFilePage(BaseModel):
     rollup: UnifiedRollup
     limit: int = 250
     filters: dict[str, str | None] = Field(default_factory=dict)
+
+
+class PipelineMoveRequest(BaseModel):
+    target_status: UnderwritingLifecycleStatus
+    note: str | None = Field(default=None, max_length=1000)
+    expected_status: UnderwritingLifecycleStatus | None = None
+
+
+class PipelineMoveResult(BaseModel):
+    source_kind: UnifiedSourceKind
+    source_id: UUID
+    profile_id: UUID
+    underwriting_status: UnderwritingLifecycleStatus
+    loan_id: UUID | None = None
+    loan_stage: str | None = None
+    created_loan: bool = False
+    audit_id: UUID | None = None
 
 
 class UnifiedAuditItem(BaseModel):

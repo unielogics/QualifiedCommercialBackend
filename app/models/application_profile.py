@@ -36,6 +36,7 @@ class ApplicationProfile(TimestampMixin, Base):
         UniqueConstraint("dealer_id", name="uq_application_profiles_dealer"),
         Index("ix_application_profiles_client", "client_id"),
         Index("ix_application_profiles_bucket", "primary_bucket_id"),
+        Index("ix_application_profiles_underwriting_status", "underwriting_status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -105,6 +106,20 @@ class ApplicationProfile(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     bank_verification_override_reason: Mapped[str | None] = mapped_column(Text)
+    underwriting_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="submitted", server_default="submitted"
+    )
+    underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
+    underwriting_current_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
+    underwriting_target_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
+    underwriting_approved_dscr: Mapped[float | None] = mapped_column(Numeric(8, 4))
+    underwriting_close_outcome: Mapped[str | None] = mapped_column(String(32))
+    underwriting_notes: Mapped[str | None] = mapped_column(Text)
+    underwriting_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    underwriting_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class FundingCategory(TimestampMixin, Base):
