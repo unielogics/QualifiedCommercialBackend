@@ -92,6 +92,7 @@ from app.schemas.bucket import (
     BucketSharePatch,
     BucketShareRead,
     BucketTemplateRead,
+    BucketUpdate,
     BucketUploadComplete,
     BucketUploadLinkCreate,
     BucketUploadLinkPasscodeResetRead,
@@ -800,6 +801,44 @@ async def get_bucket(
 ) -> BucketDetail:
     bucket = await _load_bucket_detail_or_404(db, bucket_id)
     return _bucket_detail_read(bucket)
+
+
+@router.patch("/admin/{bucket_id}", response_model=BucketDetail)
+async def update_bucket(
+    bucket_id: UUID,
+    payload: BucketUpdate,
+    request: Request,
+    user: User = Depends(require_role(Role.SUPER_ADMIN)),
+    db: AsyncSession = Depends(get_db),
+) -> BucketDetail:
+    bucket = await _load_bucket_or_404(db, bucket_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return _bucket_detail_read(await _load_bucket_detail_or_404(db, bucket_id))
+
+    changed_fields: list[str] = []
+    for field, value in changes.items():
+        next_value = value.strip() if isinstance(value, str) else value
+        if getattr(bucket, field) != next_value:
+            setattr(bucket, field, next_value)
+            changed_fields.append(field)
+
+    if changed_fields:
+        await _log(
+            db,
+            bucket_id,
+            "bucket_updated",
+            request=request,
+            user=user,
+            target_type="bucket",
+            target_id=str(bucket.id),
+            detail=", ".join(changed_fields),
+        )
+        await db.commit()
+    else:
+        await db.rollback()
+
+    return _bucket_detail_read(await _load_bucket_detail_or_404(db, bucket_id))
 
 
 @router.get("/admin/{bucket_id}/activity", response_model=BucketActivityPage)

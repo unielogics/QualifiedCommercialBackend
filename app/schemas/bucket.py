@@ -62,6 +62,15 @@ class BucketCreate(BaseModel):
     description: str | None = None
 
 
+class BucketUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=180)
+    bucket_type: str | None = Field(default=None, max_length=80)
+    client_name: str | None = Field(default=None, max_length=180)
+    purpose: str | None = Field(default=None, max_length=255)
+    description: str | None = None
+    status: str | None = Field(default=None, max_length=40)
+
+
 class BucketRead(ORMModel):
     id: UUID
     name: str
