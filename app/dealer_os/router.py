@@ -2412,6 +2412,8 @@ async def create_dealer(
     fields = payload.model_dump(exclude={"sms_consent"})
     taxonomy = await application_taxonomy.canonicalize_selection(db, fields, required=False)
     fields.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
+    if fields.get("is_training"):
+        fields["workflow_ungated"] = True
     dealer = DealerBusiness(**fields, owner_user_id=user.id, case_ref=await _next_case_ref(db))
     db.add(dealer)
     await db.flush()
@@ -2458,6 +2460,16 @@ async def create_dealer(
             entity_id=dealer.id,
             before={"is_training": False},
             after={"is_training": True},
+        )
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "dealer.workflow_ungated",
+            "dealer",
+            entity_id=dealer.id,
+            before={"workflow_ungated": False},
+            after={"workflow_ungated": True, "reason": "training_enabled"},
         )
     await db.commit()
     await db.refresh(dealer)
@@ -2526,6 +2538,15 @@ async def match_bucket_by_email(
     return await _dealer_read(db, dealer)
 
 
+def _effective_workflow_settings(
+    dealer: DealerBusiness, payload: DealerWorkflowSettingsPatch
+) -> dict[str, bool]:
+    requested = payload.model_dump(exclude_none=True)
+    if bool(requested.get("is_training", dealer.is_training)):
+        requested["workflow_ungated"] = True
+    return requested
+
+
 @router.patch("/dealers/{dealer_id}/workflow-settings", response_model=DealerRead)
 async def patch_dealer_workflow_settings(
     dealer_id: UUID,
@@ -2541,7 +2562,7 @@ async def patch_dealer_workflow_settings(
     """
     require_super_admin(user)
     dealer = await _load_visible_dealer(db, dealer_id, user)
-    requested = payload.model_dump(exclude_none=True)
+    requested = _effective_workflow_settings(dealer, payload)
     before = {key: bool(getattr(dealer, key)) for key in requested}
     changed = {
         key: bool(value)

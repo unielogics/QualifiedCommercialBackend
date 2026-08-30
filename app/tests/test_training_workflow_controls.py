@@ -43,12 +43,42 @@ def test_new_files_default_to_live_and_gated() -> None:
         DealerWorkflowSettingsPatch()
 
 
-def test_workflow_settings_keep_training_and_gating_independent() -> None:
+def test_workflow_settings_payloads_remain_partial() -> None:
     training = DealerWorkflowSettingsPatch(is_training=True)
     ungated = DealerWorkflowSettingsPatch(workflow_ungated=True)
 
     assert training.model_dump(exclude_none=True) == {"is_training": True}
     assert ungated.model_dump(exclude_none=True) == {"workflow_ungated": True}
+
+
+def test_enabling_training_automatically_ungates_workflow() -> None:
+    dealer = SimpleNamespace(is_training=False, workflow_ungated=False)
+
+    requested = router._effective_workflow_settings(
+        dealer, DealerWorkflowSettingsPatch(is_training=True)
+    )
+
+    assert requested == {"is_training": True, "workflow_ungated": True}
+
+
+def test_training_file_cannot_be_gated() -> None:
+    dealer = SimpleNamespace(is_training=True, workflow_ungated=True)
+
+    requested = router._effective_workflow_settings(
+        dealer, DealerWorkflowSettingsPatch(workflow_ungated=False)
+    )
+
+    assert requested == {"workflow_ungated": True}
+
+
+def test_returning_training_file_to_live_preserves_ungated_state() -> None:
+    dealer = SimpleNamespace(is_training=True, workflow_ungated=True)
+
+    requested = router._effective_workflow_settings(
+        dealer, DealerWorkflowSettingsPatch(is_training=False)
+    )
+
+    assert requested == {"is_training": False}
 
 
 @pytest.mark.asyncio
