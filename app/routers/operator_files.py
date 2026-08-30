@@ -6,6 +6,10 @@ Dealer OS rep files. The dashboard should not have to rediscover those joins on
 every screen, so this router projects them into one normalized file shape.
 """
 
+# FastAPI dependency injection is expressed through callable defaults throughout
+# this router. Ruff B008 is not applicable to those framework declarations.
+# ruff: noqa: B008
+
 from __future__ import annotations
 
 from collections import Counter
@@ -67,8 +71,8 @@ from app.schemas.operator_file import (
     UnifiedStage,
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
-from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services import application_profiles as profiles
+from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.operator_file_links import (
     active_links_for_sources,
     queue_link_change_review,
