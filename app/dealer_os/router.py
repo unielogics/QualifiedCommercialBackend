@@ -213,6 +213,7 @@ from .schemas import (
     FieldDeskGlobalSearchRead,
     DealerRead,
     DealerUpdate,
+    DealerWorkflowSettingsPatch,
     DebtCreate,
     DebtDraftResult,
     PlaidExchange,
@@ -384,6 +385,69 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
 
+_TRAINING_LIVE_ACTION_HEADER = "x-qc-training-live-action"
+
+
+async def _require_training_live_action(
+    db: AsyncSession,
+    *,
+    dealer: DealerBusiness,
+    user: User,
+    request: Request,
+    action: str,
+    provider: str,
+    recipient: str | None,
+    effect: str,
+) -> None:
+    """Require an explicit, per-request confirmation for training side effects.
+
+    Navigation and internal file work stay frictionless. Calls that can contact
+    a person, create a third-party record, or incur provider cost must be
+    acknowledged by the super-admin and are recorded in the existing audit
+    stream. The endpoint's own transaction decides whether the audit row and
+    side effect commit together.
+    """
+    if not dealer.is_training:
+        return
+    require_super_admin(user)
+    if request.headers.get(_TRAINING_LIVE_ACTION_HEADER, "").strip().lower() != "confirmed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "training_live_action_confirmation_required",
+                "action": action,
+                "provider": provider,
+                "recipient": recipient,
+                "effect": effect,
+            },
+        )
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "training.live_action_confirmed",
+        "dealer",
+        entity_id=dealer.id,
+        after={
+            "action": action,
+            "provider": provider,
+            "recipient": recipient,
+            "effect": effect,
+        },
+    )
+
+
+async def _load_visible_dealer(
+    db: AsyncSession,
+    dealer_id: UUID,
+    user: User,
+) -> DealerBusiness:
+    """Load a file while keeping Training records super-admin-only."""
+    dealer = await load_dealer(db=db, dealer_id=dealer_id)
+    if dealer.is_training and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application not found")
+    return dealer
+
 
 @router.get("/dealers", response_model=list[DealerListItem])
 async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[DealerListItem]:
@@ -396,7 +460,10 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     stmt = (
         select(DealerBusiness, DealerGroup.name)
         .outerjoin(DealerGroup, DealerBusiness.group_id == DealerGroup.id)
-        .where(DealerBusiness.archived_at.is_(None))
+        .where(
+            DealerBusiness.archived_at.is_(None),
+            DealerBusiness.is_training.is_(False),
+        )
         .order_by(DealerBusiness.created_at.desc())
     )
     if user.role == Role.DEALER:
@@ -538,6 +605,7 @@ async def dealer_portfolio(
     credit: str = Query(default="all", pattern="^(all|returned|awaiting)$"),
     archive: str = Query(default="active", pattern="^(active|archived|all)$"),
     lifecycle: str = Query(default="active", pattern="^(active|draft|all)$"),
+    training: str = Query(default="exclude", pattern="^(exclude|only|all)$"),
     sort_by: str = Query(default="updated_at", pattern="^(created_at|updated_at)$"),
     sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
     limit: int = Query(default=10, ge=1, le=10),
@@ -567,6 +635,12 @@ async def dealer_portfolio(
     )
     credit_returned = and_(required_credit_owner, not_(pending_credit_owner))
     filters = []
+    if training != "exclude" and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
+    if training == "exclude":
+        filters.append(DealerBusiness.is_training.is_(False))
+    elif training == "only":
+        filters.append(DealerBusiness.is_training.is_(True))
     if user.role == Role.FIELD_REP:
         filters.extend(
             [DealerBusiness.owner_user_id == user.id, DealerBusiness.archived_at.is_(None)]
@@ -696,8 +770,12 @@ def _global_search_file_access_filter(user: User):
         return and_(
             DealerBusiness.owner_user_id == user.id,
             DealerBusiness.archived_at.is_(None),
+            DealerBusiness.is_training.is_(False),
         )
-    return DealerBusiness.archived_at.is_(None)
+    return and_(
+        DealerBusiness.archived_at.is_(None),
+        DealerBusiness.is_training.is_(False),
+    )
 
 
 def _global_search_contact_access_filter(user: User):
@@ -781,6 +859,7 @@ async def field_desk_global_search(
             .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepContact.dealer_id)
             .where(
                 _global_search_contact_access_filter(user),
+                or_(DealerBusiness.id.is_(None), DealerBusiness.is_training.is_(False)),
                 or_(
                     func.lower(DealerRepContact.full_name).like(like),
                     func.lower(func.coalesce(DealerRepContact.company, "")).like(like),
@@ -802,6 +881,7 @@ async def field_desk_global_search(
             .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepInboxThread.dealer_id)
             .where(
                 DealerRepInboxThread.owner_user_id == user.id,
+                or_(DealerBusiness.id.is_(None), DealerBusiness.is_training.is_(False)),
                 or_(
                     func.lower(DealerRepInboxThread.subject).like(like),
                     func.lower(func.coalesce(DealerRepContact.full_name, "")).like(like),
@@ -826,6 +906,7 @@ async def field_desk_global_search(
             .outerjoin(DealerBusiness, DealerBusiness.id == DealerRepAppointment.dealer_id)
             .where(
                 _global_search_appointment_access_filter(user),
+                or_(DealerBusiness.id.is_(None), DealerBusiness.is_training.is_(False)),
                 or_(
                     func.lower(DealerRepAppointment.invitee_name).like(like),
                     func.lower(func.coalesce(DealerRepAppointment.invitee_email, "")).like(like),
@@ -934,7 +1015,7 @@ async def restore_dealer(
     db: AsyncSession = Depends(get_db),
 ) -> DealerRead:
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if dealer.archived_at is not None:
         before = {"archived_at": dealer.archived_at.isoformat()}
         dealer.archived_at = None
@@ -1202,6 +1283,7 @@ async def _notify_client_request(
 )
 async def send_bank_connect_invite(
     dealer_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
@@ -1210,6 +1292,16 @@ async def send_bank_connect_invite(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     req = payload or ClientRequestSend()
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send bank connection request",
+        provider="SES / SMS / Plaid",
+        recipient=dealer.email or dealer.phone,
+        effect="Send the client a secure room link for a live Plaid connection.",
+    )
     room = await client_room.ensure_room(db, dealer)
     delivery = await _notify_client_request(
         db, dealer, user,
@@ -1236,6 +1328,7 @@ async def send_bank_connect_invite(
 )
 async def send_bank_upload_request(
     dealer_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
@@ -1244,6 +1337,16 @@ async def send_bank_upload_request(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     req = payload or ClientRequestSend()
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Request bank statements",
+        provider="SES / SMS",
+        recipient=dealer.email or dealer.phone,
+        effect="Send a live secure-room document request to the client.",
+    )
     requested = await client_room.request_document(
         db,
         dealer,
@@ -1322,6 +1425,7 @@ async def bank_evidence(
 async def send_signature_request(
     dealer_id: UUID,
     payload: SignatureRequestSend,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ClientRequestResult:
@@ -1332,6 +1436,16 @@ async def send_signature_request(
     have to be told about separately."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send signature request",
+        provider="SES / SMS",
+        recipient=dealer.email or dealer.phone,
+        effect=f"Send the client a live request to sign {payload.title}.",
+    )
     room = await client_room.ensure_room(db, dealer)
     # The signable text IS the document. Composed from what the rep wrote so
     # the client signs words a person chose, and refused when there are none:
@@ -1781,6 +1895,7 @@ async def generate_case_contract_envelope(
 async def send_case_contract_envelope(
     dealer_id: UUID,
     envelope_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
@@ -1795,6 +1910,16 @@ async def send_case_contract_envelope(
     owner = await db.get(DealerOwner, envelope.recipient_owner_id) if envelope.recipient_owner_id else None
     if owner is None or not owner.email:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The primary signer needs a personal email address.")
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send contract package",
+        provider="SES / SMS / secure signing room",
+        recipient=owner.email,
+        effect=f"Deliver the live {envelope.title} signing package to the client.",
+    )
     docs = list((await db.execute(
         select(ContractDocument).where(ContractDocument.envelope_id == envelope.id)
     )).scalars().all())
@@ -1982,6 +2107,7 @@ async def generate_underwriting_summary(
 async def send_contract_for_signature(
     dealer_id: UUID,
     key: str,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     payload: ClientRequestSend | None = None,
@@ -1993,6 +2119,16 @@ async def send_contract_for_signature(
     on their own device — the rep's session has no signing surface at all."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send contract for signature",
+        provider="SES / SMS / secure signing room",
+        recipient=dealer.email or dealer.phone,
+        effect=f"Deliver the live {key} agreement to the client for signature.",
+    )
     doc = (
         await db.execute(
             select(ContractDocument).where(
@@ -2267,6 +2403,8 @@ async def create_dealer(
     bucket matched by email when the business is already in the funding
     funnel, so this does not mint a second room for an existing client."""
     require_team_or_rep(user)
+    if payload.is_training and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
     if payload.group_id is not None:
         await _require_group(db, payload.group_id)
     # sms_consent is captured alongside the file but is not a column on it: it
@@ -2309,6 +2447,17 @@ async def create_dealer(
                     }
                 ],
             )
+        )
+    if dealer.is_training:
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            "dealer.training_enabled",
+            "dealer",
+            entity_id=dealer.id,
+            before={"is_training": False},
+            after={"is_training": True},
         )
     await db.commit()
     await db.refresh(dealer)
@@ -2354,7 +2503,7 @@ async def match_bucket_by_email(
     """Explicitly find this dealer's intake bucket by email (no bucket creation —
     manual linking or ensure_bucket handle the rest)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if not dealer.email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Client has no email on file — add one, or link a bucket manually.")
     from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -2374,6 +2523,58 @@ async def match_bucket_by_email(
     await db.commit()
     await db.refresh(dealer)
     background.add_task(_background_ingest_bucket_files, dealer.id)
+    return await _dealer_read(db, dealer)
+
+
+@router.patch("/dealers/{dealer_id}/workflow-settings", response_model=DealerRead)
+async def patch_dealer_workflow_settings(
+    dealer_id: UUID,
+    payload: DealerWorkflowSettingsPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRead:
+    """Change training classification or the persistent presentation gate.
+
+    These controls are deliberately absent from DealerUpdate. They affect
+    reporting visibility and every staff member's workflow, so only a
+    super-admin may reach this explicit audited endpoint.
+    """
+    require_super_admin(user)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
+    requested = payload.model_dump(exclude_none=True)
+    before = {key: bool(getattr(dealer, key)) for key in requested}
+    changed = {
+        key: bool(value)
+        for key, value in requested.items()
+        if bool(getattr(dealer, key)) != bool(value)
+    }
+    if not changed:
+        return await _dealer_read(db, dealer)
+
+    for key, value in changed.items():
+        setattr(dealer, key, value)
+    for key, value in changed.items():
+        action = (
+            "dealer.training_enabled"
+            if key == "is_training" and value
+            else "dealer.training_disabled"
+            if key == "is_training"
+            else "dealer.workflow_ungated"
+            if value
+            else "dealer.workflow_gated"
+        )
+        await log_action(
+            db,
+            dealer.id,
+            user,
+            action,
+            "dealer",
+            entity_id=dealer.id,
+            before={key: before[key]},
+            after={key: value},
+        )
+    await db.commit()
+    await db.refresh(dealer)
     return await _dealer_read(db, dealer)
 
 
@@ -2421,7 +2622,7 @@ async def create_dealer_bucket(
     arbitrary existing bucket stays where it already lives: PATCH /dealers
     with DealerUpdate.bucket_id."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     before_bucket_id = dealer.bucket_id
     if dealer.bucket_id is None:
         bucket = await buckets_link.ensure_bucket(db, dealer)
@@ -2529,6 +2730,7 @@ async def dealer_delivery_log(
 @router.post("/dealers/{dealer_id}/convert-to-audit", response_model=ConvertToAuditResult)
 async def convert_to_audit(
     dealer_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     payload: ConvertToAuditRequest | None = None,
@@ -2544,7 +2746,7 @@ async def convert_to_audit(
     file counts as a conversion in production, and owner_user_id stays so the
     rep can still see the client they brought in."""
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if dealer.audit_client_since is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This file is already an audit client.")
     dealer.audit_client_since = datetime.now(timezone.utc)
@@ -2585,6 +2787,16 @@ async def convert_to_audit(
                 )
             ).scalar_one_or_none()
             email = owner_email or ""
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Convert file and invite client",
+            provider="Clerk email",
+            recipient=email or None,
+            effect="Convert this file to an audit client and send a live login invitation.",
+        )
         if email:
             try:
                 invite = await _invite_dealer_login_core(db, dealer, email, None)
@@ -3017,14 +3229,30 @@ async def _invite_dealer_login_core(
 
 @router.post("/dealers/{dealer_id}/invite", response_model=DealerInviteResult, status_code=status.HTTP_201_CREATED)
 async def invite_dealer_login(
-    dealer_id: UUID, payload: DealerInvite, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID,
+    payload: DealerInvite,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
 ) -> DealerInviteResult:
     """Invite (or link) the dealer's self-serve login. Creates the local User
     row with Role.DEALER (clerk_id JIT-bound on first sign-in, same pattern as
     the operator invite flow), links it via dealer_user_id, and best-effort
     sends a Clerk invitation email that lands on audit.qualifiedcommercial.com."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
+    if dealer.is_training and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application not found")
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Invite client login",
+        provider="Clerk email",
+        recipient=payload.email,
+        effect="Create or link the client login and send a live account invitation.",
+    )
     result = await _invite_dealer_login_core(db, dealer, payload.email, payload.name)
     await db.commit()
     return result
@@ -3055,7 +3283,7 @@ async def repropose_targets(dealer_id: UUID, user: CurrentUser, db: AsyncSession
     """Refresh AI proposals. Never touches admin overrides — an overridden row
     keeps its admin_value and simply carries the newer suggestion beside it."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     rows = await propose_targets(db, dealer)
     await db.commit()
     return [_target_read(t) for t in rows]
@@ -3067,7 +3295,7 @@ async def override_target(
 ) -> TargetRead:
     """Set (or clear, with admin_value=null) the admin override. Override wins."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     row = (
         await db.execute(
             select(DealerMetricTarget).where(
@@ -3108,7 +3336,7 @@ async def import_cash_events(
     """Bulk-import statement/CSV lines. Each row is AI-classified via the
     normalization rules, then the affected monthly periods are rebuilt."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     rules = await load_active_rules(db, dealer.id)  # loaded once per request
     periods: set[date] = set()
     for row in payload.rows:
@@ -3268,7 +3496,7 @@ async def mark_event_recurrence(
     recurring view overlays these marks on top of detection."""
     require_team(user)
     is_dealer_actor = user.role == Role.DEALER
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     event = (
         await db.execute(
             select(DealerCashEvent).where(
@@ -3356,7 +3584,7 @@ async def patch_cash_event(
     """Admin recategorization. Moving a line to owner_personal/one_time also
     seeds a candidate add-back (once per source event)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     event = (
         await db.execute(
             select(DealerCashEvent).where(
@@ -3534,7 +3762,7 @@ async def upsert_period(
     event-driven rebuilds only recompute deposits/withdrawals, never the
     manually entered balance/EBITDA/revenue fields."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     fp = (
         await db.execute(
             select(DealerFinancialPeriod).where(
@@ -4125,7 +4353,7 @@ async def reextract_document(
     """Re-run extraction from the S3 archive. 409 when the original bytes were
     never archived (S3 unconfigured at upload time) — re-upload instead."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     doc = (
         await db.execute(
             select(DealerDocument).where(
@@ -4202,7 +4430,7 @@ async def approve_dealer_document(
     rejected document may be re-approved. Auto-fulfills a matching open doc
     request and mirrors into the linked bucket best-effort."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     doc = await _load_document(db, dealer.id, doc_id)
     if doc.status not in ("pending_review", "rejected"):
         raise HTTPException(
@@ -4245,7 +4473,7 @@ async def reject_dealer_document(
     visible to the dealer (status='rejected', error=note) so the outcome and
     the reason are self-serve — nothing ever reached the ledger."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     doc = await _load_document(db, dealer.id, doc_id)
     if doc.status != "pending_review":
         raise HTTPException(
@@ -4277,7 +4505,7 @@ async def list_bucket_files(
     be ingested without a model call; already_ingested marks files a
     DealerDocument already references."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     bucket = await buckets_link.ensure_bucket(db, dealer)
     await db.commit()  # persist the adoption/creation before the read
     files = (
@@ -4341,7 +4569,7 @@ async def bucket_file_url(
     bucket contents are not dealer-facing). The file must belong to the linked
     bucket and not be deleted. Same shape/TTL as the document URL."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     bucket_file = None
     if dealer.bucket_id is not None:
         bucket_file = (
@@ -4396,7 +4624,7 @@ async def ingest_bucket_file(
     the raw bytes are fetched from S3 and run through the normal extract
     pipeline (model call for PDF/image, pure parse for CSV/XLSX)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     doc = await _ingest_bucket_file_core(db, dealer, file_id)
     await db.commit()
     await db.refresh(doc)
@@ -4596,7 +4824,7 @@ async def ingest_all_bucket_files(
     """Schedule background ingestion of every pending bucket file (idempotent
     — already-ingested files are skipped). Returns the pending count."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if dealer.bucket_id is None:
         return {"pending": 0, "scheduled": False}
     ingested = set(
@@ -4631,7 +4859,7 @@ async def recompute_dealer(
 ) -> DealerMetricSnapshot:
     """Force a fresh metric snapshot (with lineage + alerts) for the dealer."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     snapshot = await recompute_snapshot(db, dealer.id)
     await db.commit()
     await db.refresh(snapshot)
@@ -4689,7 +4917,7 @@ async def resolve_alert(
     dealer_id: UUID, alert_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerAlert:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     alert = (
         await db.execute(
             select(DealerAlert).where(DealerAlert.id == alert_id, DealerAlert.dealer_id == dealer.id)
@@ -4783,7 +5011,7 @@ async def create_plan_action(
     dealer_id: UUID, payload: PlanActionCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerPlanAction:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     action = DealerPlanAction(dealer_id=dealer.id, **payload.model_dump())
     db.add(action)
     await db.commit()
@@ -4800,7 +5028,7 @@ async def update_plan_action(
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlanAction:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     action = await _load_plan_action(db, dealer.id, action_id)
     changes = payload.model_dump(exclude_unset=True)
     for k, v in changes.items():
@@ -4829,7 +5057,7 @@ async def delete_plan_action(
     dealer_id: UUID, action_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     action = await _load_plan_action(db, dealer.id, action_id)
     await db.delete(action)
     await db.commit()
@@ -4958,7 +5186,7 @@ async def publish_plan(
 ) -> list[DealerPlanAction]:
     """Publish the whole plan to the dealer portal (sets published=true on all)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     actions = (
         (
             await db.execute(
@@ -5564,6 +5792,10 @@ async def _load_owned_appointment(
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
+    if row.dealer_id is not None:
+        dealer = await db.get(DealerBusiness, row.dealer_id)
+        if dealer is not None and dealer.is_training and user.role != Role.SUPER_ADMIN:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     if user.role == Role.FIELD_REP and row.booked_by_user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     return row
@@ -5903,6 +6135,16 @@ def _rep_inbox_access_filter(user: User):
     return DealerRepInboxThread.owner_user_id == user.id
 
 
+def _rep_inbox_live_file_filter():
+    """Ordinary inbox views never surface a training-linked conversation."""
+    return or_(
+        DealerRepInboxThread.dealer_id.is_(None),
+        DealerRepInboxThread.dealer_id.in_(
+            select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+        ),
+    )
+
+
 async def _mirror_file_message_to_rep_inbox(
     db: AsyncSession,
     *,
@@ -6185,7 +6427,7 @@ async def patch_application_finalization(
 ) -> DealerRead:
     """Record desk-controlled closing status and the amount actually funded."""
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     target_status = payload.status or dealer.status
     if target_status == "complete" and payload.funded_amount is None and dealer.funded_amount is None:
         raise HTTPException(
@@ -6300,7 +6542,14 @@ async def list_all_rep_appointments(
     include_cancelled: bool = Query(default=False),
 ) -> list[dict]:
     require_team_or_rep(user)
-    q = select(DealerRepAppointment)
+    q = select(DealerRepAppointment).where(
+        or_(
+            DealerRepAppointment.dealer_id.is_(None),
+            DealerRepAppointment.dealer_id.in_(
+                select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            ),
+        )
+    )
     if user.role == Role.FIELD_REP:
         q = q.where(DealerRepAppointment.booked_by_user_id == user.id)
     if starts_from is not None:
@@ -6675,6 +6924,16 @@ async def create_rep_appointment(
 ) -> DealerRepAppointment:
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Book appointment",
+        provider="Google Calendar / Google Meet / SES",
+        recipient=payload.invitee_email or payload.invitee_phone,
+        effect="Create a live calendar event and send the client invitation.",
+    )
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
     await lock_calendar_owner(db, host.id)
@@ -6754,6 +7013,9 @@ async def create_rep_appointment(
         requested_amount=requested_amount,
         full_address=full_address,
     )
+    if dealer.is_training:
+        await booking_reminders.cancel_pending(db, notice)
+        notice.last_error = "Training file: unattended reminders are suppressed."
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
@@ -6986,10 +7248,23 @@ async def _cancel_rep_appointment(
 async def patch_rep_appointment(
     appointment_id: UUID,
     payload: RepAppointmentPatch,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     appt = await _load_owned_appointment(db, appointment_id, user)
+    dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
+    if dealer is not None:
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Update appointment",
+            provider="Google Calendar / SES / SMS",
+            recipient=payload.invitee_email or appt.invitee_email or appt.invitee_phone,
+            effect="Update the live event and send revised invitations when applicable.",
+        )
     if payload.status == "cancelled":
         return await _cancel_rep_appointment(db, appt=appt, user=user, reason=None)
     event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
@@ -7201,10 +7476,23 @@ async def patch_rep_appointment(
 async def cancel_rep_appointment(
     appointment_id: UUID,
     payload: RepAppointmentCancel,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     appt = await _load_owned_appointment(db, appointment_id, user)
+    dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
+    if dealer is not None:
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Cancel appointment",
+            provider="Google Calendar / SES / SMS",
+            recipient=appt.invitee_email or appt.invitee_phone,
+            effect="Cancel the live event and send cancellation notices.",
+        )
     return await _cancel_rep_appointment(db, appt=appt, user=user, reason=payload.reason)
 
 
@@ -7594,7 +7882,17 @@ async def book_underwriting_review_preference(
 ) -> dict:
     """Turn one proposed window into the single real calendar appointment."""
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Book underwriting review",
+        provider="Google Calendar / Google Meet / SES",
+        recipient=dealer.email or dealer.phone,
+        effect="Select a proposed window, create a live appointment, and send the client invitation.",
+    )
     preference = (
         await db.execute(
             select(DealerUnderwritingReviewPreference)
@@ -7740,6 +8038,9 @@ async def book_underwriting_review_preference(
         requested_amount=requested_amount,
         full_address=full_address,
     )
+    if dealer.is_training:
+        await booking_reminders.cancel_pending(db, notice)
+        notice.last_error = "Training file: unattended reminders are suppressed."
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
@@ -7872,6 +8173,16 @@ async def create_contact_share(
     dealer: DealerBusiness | None = None
     if payload.dealer_id is not None:
         dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Share business card",
+            provider="SES / SMS",
+            recipient=payload.recipient_email or payload.recipient_phone,
+            effect="Send the live contact card and selected program documents.",
+        )
     phone = consent_delivery.normalize_phone(payload.recipient_phone)
     email = payload.recipient_email.strip().lower() if payload.recipient_email else None
     try:
@@ -8346,6 +8657,16 @@ async def create_rep_inbox_thread(
     dealer: DealerBusiness | None = None
     if payload.dealer_id is not None:
         dealer = await resolve_dealer_scope(db, user, payload.dealer_id)
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Start inbox conversation",
+            provider="SES / SMS",
+            recipient=payload.recipient_email or payload.recipient_phone,
+            effect="Send the first live message through the selected providers.",
+        )
     phone = consent_delivery.normalize_phone(payload.recipient_phone)
     email = payload.recipient_email.strip().lower() if payload.recipient_email else None
     channels = list(dict.fromkeys(payload.channels))
@@ -8475,7 +8796,7 @@ async def list_rep_inbox_threads(
     q = (
         select(DealerRepInboxThread, DealerRepContact)
         .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-        .where(_rep_inbox_access_filter(user))
+        .where(_rep_inbox_access_filter(user), _rep_inbox_live_file_filter())
         .order_by(DealerRepInboxThread.last_message_at.desc().nullslast(), DealerRepInboxThread.created_at.desc())
     )
     if channel:
@@ -8498,6 +8819,7 @@ async def list_rep_inbox_messages(
             select(DealerRepInboxThread).where(
                 DealerRepInboxThread.id == thread_id,
                 _rep_inbox_access_filter(user),
+                _rep_inbox_live_file_filter(),
             )
         )
     ).scalar_one_or_none()
@@ -8529,6 +8851,7 @@ async def list_rep_inbox_messages(
 async def create_rep_inbox_message(
     thread_id: UUID,
     payload: RepInboxMessageCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepInboxMessage:
@@ -8537,12 +8860,28 @@ async def create_rep_inbox_message(
         await db.execute(
             select(DealerRepInboxThread, DealerRepContact)
             .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
-            .where(DealerRepInboxThread.id == thread_id, _rep_inbox_access_filter(user))
+            .where(
+                DealerRepInboxThread.id == thread_id,
+                _rep_inbox_access_filter(user),
+                _rep_inbox_live_file_filter(),
+            )
         )
     ).first()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found.")
     thread, contact = row
+    if thread.dealer_id is not None:
+        dealer = await load_dealer(db, thread.dealer_id)
+        await _require_training_live_action(
+            db,
+            dealer=dealer,
+            user=user,
+            request=request,
+            action="Reply from inbox",
+            provider="SES / SMS",
+            recipient=(contact.email or contact.phone_e164) if contact else None,
+            effect="Send this reply through the live messaging provider.",
+        )
     channel = payload.channel or thread.channel
     if channel not in {"email", "sms"}:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown inbox channel.")
@@ -8960,7 +9299,7 @@ async def unread_summary(
     would count messages on files the viewer cannot open."""
     require_team_or_dealer_or_rep(user)
 
-    visible = select(DealerBusiness.id)
+    visible = select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
     if user.role == Role.FIELD_REP:
         visible = visible.where(DealerBusiness.owner_user_id == user.id)
     elif user.role == Role.DEALER:
@@ -8994,7 +9333,7 @@ async def delete_session(
     dealer_id: UUID, session_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     session = (
         await db.execute(
             select(DealerSession).where(
@@ -9018,7 +9357,10 @@ async def list_global_alerts(
         await db.execute(
             select(DealerAlert, DealerBusiness.name)
             .join(DealerBusiness, DealerBusiness.id == DealerAlert.dealer_id)
-            .where(DealerAlert.resolved_at.is_(None))
+            .where(
+                DealerAlert.resolved_at.is_(None),
+                DealerBusiness.is_training.is_(False),
+            )
             .order_by(DealerAlert.created_at.desc())
         )
     ).all()
@@ -9064,7 +9406,7 @@ async def upsert_credit_profile(
     """Upsert the one dos_credit_profiles row. Only fields present in the
     payload change; business_history items are free-form (extras preserved)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     row = (
         await db.execute(
             select(DealerCreditProfile).where(DealerCreditProfile.dealer_id == dealer.id)
@@ -9193,7 +9535,7 @@ async def upsert_tax_filing(
     db: AsyncSession = Depends(get_db),
 ) -> TaxYearRead:
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if not 2000 <= year <= 2100:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "year must be between 2000 and 2100")
     filing = (
@@ -9333,7 +9675,7 @@ async def ai_insights(
     statement window-dressing). Nothing is persisted except tracked AI usage —
     accepting suggestions is a separate explicit call."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     bundle = (await _build_lender_package(db, dealer)).model_dump(mode="json")
     try:
         insights = await analyst.generate_insights(db, dealer, bundle)
@@ -9356,7 +9698,7 @@ async def accept_ai_insights(
     """Materialize accepted analyst suggestions as plan actions (status=todo,
     sort appended after the current plan, unpublished until plan publish)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     max_sort = (
         await db.execute(
             select(func.max(DealerPlanAction.sort)).where(DealerPlanAction.dealer_id == dealer.id)
@@ -9418,7 +9760,7 @@ async def patch_account(
     on AI rematches never touch the role again (proposals only land in
     ai_proposed_role). Every change lands in the audit log."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     account = (
         await db.execute(
             select(DealerAccount).where(
@@ -9456,7 +9798,7 @@ async def list_rules(
     """The dealer's effective rule set: dealer-scoped rows plus global
     (dealer_id NULL) rows, active first, newest first."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     return (
         (
             await db.execute(
@@ -9488,7 +9830,7 @@ async def create_rule(
     events — EXCEPT admin-corrected ones (categorized_by='admin' is a human
     decision and is never overwritten) — and rebuilds the affected periods."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     pattern = payload.pattern.strip().lower()
     if not pattern:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "pattern must not be blank")
@@ -9558,7 +9900,7 @@ async def deactivate_rule(
     audit trail keeps pointing at real rows). Only dealer-scoped rules can be
     deactivated here — global rules are shared and managed elsewhere."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     rule = (
         await db.execute(
             select(DealerCategoryRule).where(
@@ -9762,7 +10104,7 @@ async def patch_addback(
     a verified/excluded flip changes bankable EBITDA, so the snapshot is
     recomputed best-effort. Every change lands in the audit log."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     addback = (
         await db.execute(
             select(DealerAddback).where(
@@ -9823,7 +10165,7 @@ async def start_dealer_handoff(
     intake, that intake is returned; otherwise a new one is created through
     the same path the admin dealer-variant lead creation uses."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     intake_id = await handoff_service.start_handoff(db, dealer, user, request)
     await db.commit()
     return HandoffRead(intake_id=intake_id, url=handoff_service.handoff_url(intake_id))
@@ -9837,7 +10179,7 @@ async def get_dealer_handoff(
     started (or the intake it pointed at has since been deleted) — a normal
     state, returned as 200 so browsers don't log console errors for it."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     intake_id = await handoff_service.find_existing_handoff(db, dealer)
     if intake_id is None:
         return HandoffRead(intake_id=None, url=None)
@@ -9887,7 +10229,7 @@ async def list_doc_requests(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_doc_request(
-    dealer_id: UUID, payload: DocRequestCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    dealer_id: UUID, payload: DocRequestCreate, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DealerDocRequest:
     """Ask the client for a document, and tell them you have.
 
@@ -9895,6 +10237,16 @@ async def create_doc_request(
     is exactly who knows which statement is missing."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Request supporting document",
+        provider="SES / SMS / secure room",
+        recipient=dealer.email or dealer.phone,
+        effect=f"Create and send a live request for {payload.title}.",
+    )
     if payload.account_id is not None:
         account = (
             await db.execute(
@@ -9957,7 +10309,7 @@ async def update_doc_request(
     document (which must belong to this dealer). Setting fulfilled_document_id
     without a status also flips the request to fulfilled."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     req = await _load_doc_request(db, dealer.id, req_id)
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
@@ -9986,7 +10338,7 @@ async def cancel_doc_request(
     """Soft-cancel: requests are never hard-deleted (audit trail keeps pointing
     at real rows) — DELETE flips status to cancelled."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     req = await _load_doc_request(db, dealer.id, req_id)
     if req.status != "cancelled":
         before = {"status": req.status}
@@ -10071,7 +10423,7 @@ async def lender_package_pdf(
     endpoint serves (one code path for the facts). 501 when the runtime lacks
     weasyprint's native stack — the JSON endpoint remains the fallback."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     bundle = (await _build_lender_package(db, dealer)).model_dump(mode="json")
     html_doc = report_pdf.build_html(bundle)
     try:
@@ -10537,7 +10889,7 @@ async def mca_readiness_read(
     the four health checks, and a backed-into offer with the daily-pull
     stress test. Desk-facing (we structure these as term loans)."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     inputs = await load_metric_inputs(db, dealer.id)
     metrics = compute_metrics(
         inputs.periods, inputs.addbacks_annual_verified, inputs.targets, fallbacks=inputs.fallbacks
@@ -10751,7 +11103,7 @@ async def dscr_component_action(
     schedule (the single ledger). toggle flips count_in_dscr on a row;
     add_vendor materializes an observed lender into a schedule row."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
 
     if payload.action == "toggle":
         if payload.debt_id is None or payload.count_in_dscr is None:
@@ -12001,6 +12353,7 @@ async def _background_plaid_first_sync(item_pk: UUID) -> None:
 @router.post("/dealers/{dealer_id}/plaid/refresh", response_model=PlaidRefreshResult)
 async def plaid_refresh(
     dealer_id: UUID,
+    request: Request,
     background: BackgroundTasks,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
@@ -12011,7 +12364,17 @@ async def plaid_refresh(
     (statement-id dedupe), so mashing the button is harmless. Statements
     appear in Files as they extract."""
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Refresh Plaid statements",
+        provider="Plaid",
+        recipient=dealer.name,
+        effect="Queue live Plaid statement retrieval and extraction.",
+    )
     _plaid_cooldown("refresh", dealer.id, 60)
     items = [i for i in await _plaid_items(db, dealer.id) if i.status != "removed"]
     for item in items:
@@ -12093,7 +12456,7 @@ async def plaid_remove(
         dealer = await resolve_dealer_scope(db, user, dealer_id)
         action = "plaid.disconnect.client"
     elif user.role == Role.SUPER_ADMIN:
-        dealer = await load_dealer(db, dealer_id)
+        dealer = await _load_visible_dealer(db, dealer_id, user)
         action = "plaid.disconnect.recovery"
     else:
         raise HTTPException(
@@ -12152,7 +12515,7 @@ async def purge_dealer_plaid_on_offboarding(
 ) -> None:
     """Remove every Plaid Item and Asset Report when the file is offboarded."""
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     try:
         removed = await plaid_lifecycle.purge_owner_connections(
             db, dealer_id=dealer.id
@@ -12263,7 +12626,7 @@ async def delete_dealer_asset_report(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     require_super_admin(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     report = await _dealer_asset_report(db, dealer.id, report_id)
     try:
         await plaid_lifecycle.remove_asset_report(report)
@@ -12331,7 +12694,7 @@ async def dealer_refinance(
     ledger behavior (vendor-matched debits), plus the desk's DSCR programs
     to draft replacement terms from, plus the current baseline metrics."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     debts = await _refi_debt_rows(db, dealer)
     events, _overrides, _self_names = await _load_vendor_inputs(db, dealer)
     observed = refinance_svc.observed_monthly(events, debts)
@@ -12417,7 +12780,7 @@ async def simulate_refinance(
     payment in, and rerun the real metric engine on the adjusted months.
     Persists nothing — same discipline as /simulate."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     debts = await _refi_debt_rows(db, dealer)
     by_id = {d.id: d for d in debts}
     selected: list[DealerDebt] = []
@@ -13849,6 +14212,7 @@ async def owner_soft_pull(
     dealer_id: UUID,
     owner_id: UUID,
     body: SoftPullRequest,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> SoftPullResult:
@@ -13871,6 +14235,16 @@ async def owner_soft_pull(
     and it should stay with the desk."""
     require_team_or_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Run soft credit pull",
+        provider="iSoftPull",
+        recipient=str(owner_id),
+        effect="Submit the owner's information to the live credit provider.",
+    )
     owner = (
         await db.execute(
             select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id)
@@ -14029,6 +14403,7 @@ async def rep_production(
     production_filters = [
         DealerBusiness.owner_user_id.is_not(None),
         DealerBusiness.created_at >= since,
+        DealerBusiness.is_training.is_(False),
     ]
     if owner_user_id is not None:
         production_filters.append(DealerBusiness.owner_user_id == owner_user_id)
@@ -14537,6 +14912,7 @@ async def _resolve_consent_owner(db: AsyncSession, token: str) -> DealerOwner:
 async def owner_credit_invite(
     dealer_id: UUID,
     owner_id: UUID,
+    request: Request,
     user: CurrentUser,
     payload: CreditInviteRequest | None = None,
     db: AsyncSession = Depends(get_db),
@@ -14560,6 +14936,16 @@ async def owner_credit_invite(
     ).scalar_one_or_none()
     if owner is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send credit authorization",
+        provider="SES / SMS / iSoftPull",
+        recipient=owner.email or owner.phone,
+        effect="Create and optionally deliver a live credit-consent link.",
+    )
     owner_state = await _owner_requirement_state(db, dealer.id)
     if not owner_state["ownership_complete"]:
         raise HTTPException(
@@ -14651,12 +15037,23 @@ async def owner_credit_invite(
 async def bulk_owner_credit_invites(
     dealer_id: UUID,
     payload: BulkCreditInviteRequest,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> BulkCreditInviteResult:
     """Send one isolated consent link to every required owner still pending."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Send all credit authorizations",
+        provider="SES / SMS / iSoftPull",
+        recipient=dealer.name,
+        effect="Create and deliver live credit-consent links to every pending required owner.",
+    )
     owner_state = await _owner_requirement_state(db, dealer.id)
     if not owner_state["ownership_complete"]:
         raise HTTPException(
@@ -14680,11 +15077,12 @@ async def bulk_owner_credit_invites(
     for owner in owner_state["pending"]:
         try:
             sent = await owner_credit_invite(
-                dealer_id,
-                owner.id,
-                user,
-                CreditInviteRequest(channel=payload.channel),
-                db,
+                dealer_id=dealer_id,
+                owner_id=owner.id,
+                request=request,
+                user=user,
+                payload=CreditInviteRequest(channel=payload.channel),
+                db=db,
             )
             results.append(
                 OwnerCreditInviteResult(
@@ -15122,7 +15520,7 @@ async def optimize_timing(
     can stage explicitly. Moves already on the dealer's table (any status)
     are never re-proposed."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     rows, overrides, self_names = await _load_vendor_inputs(db, dealer)
     rolled, _ = _rollup_from_inputs(rows, overrides, self_names)
     window_start = date.today() - timedelta(days=_TIMING_WINDOW_DAYS)
@@ -15202,7 +15600,7 @@ async def create_payment_shift(
     """Draft a payment-date shift (team only). est_adb_impact is always
     computed server-side from monthly_amount and the day move."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     if payload.from_day == payload.to_day:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "from_day and to_day must differ")
     label = payload.label.strip()
@@ -15311,7 +15709,7 @@ async def update_payment_shift(
     (draft -> proposed -> done|dismissed; terminal states only reopen to
     proposed). The ADB estimate is recomputed whenever a day changes."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     shift = await _load_shift(db, dealer.id, shift_id)
     changes = payload.model_dump(exclude_unset=True)
     new_status = changes.get("status")
@@ -15365,7 +15763,7 @@ async def delete_payment_shift(
     """Only drafts are deletable — anything the dealer may have seen is
     dismissed (audited), never erased."""
     require_team(user)
-    dealer = await load_dealer(db, dealer_id)
+    dealer = await _load_visible_dealer(db, dealer_id, user)
     shift = await _load_shift(db, dealer.id, shift_id)
     if shift.status != "draft":
         raise HTTPException(

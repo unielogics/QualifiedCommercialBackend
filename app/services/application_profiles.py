@@ -188,6 +188,16 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
 async def _profile_is_visible(
     db: AsyncSession, profile: ApplicationProfile, user: User
 ) -> bool:
+    if profile.dealer_id:
+        is_training = (
+            await db.execute(
+                select(DealerBusiness.is_training).where(
+                    DealerBusiness.id == profile.dealer_id
+                )
+            )
+        ).scalar_one_or_none()
+        if is_training:
+            return user.role == Role.SUPER_ADMIN
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         return True
     if user.role == Role.VENDOR:

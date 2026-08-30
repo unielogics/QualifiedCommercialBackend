@@ -310,6 +310,14 @@ async def _load_contact(db: AsyncSession, user: User, contact_id: UUID) -> Deale
     ))).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
+    if row.dealer_id is not None and user.role != Role.SUPER_ADMIN:
+        training = (
+            await db.execute(
+                select(DealerBusiness.is_training).where(DealerBusiness.id == row.dealer_id)
+            )
+        ).scalar_one_or_none()
+        if training:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
     return row
 
 
@@ -1044,7 +1052,14 @@ async def _find_or_create_company_contact(db: AsyncSession, user: User, payload:
     contact = None
     if email:
         contact = (await db.execute(select(DealerRepContact).where(
-            DealerRepContact.owner_user_id == user.id, DealerRepContact.email == email
+            DealerRepContact.owner_user_id == user.id,
+            DealerRepContact.email == email,
+            or_(
+                DealerRepContact.dealer_id.is_(None),
+                DealerRepContact.dealer_id.in_(
+                    select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+                ),
+            ),
         ).order_by(DealerRepContact.updated_at.desc()))).scalars().first()
     company = await db.get(DealerRepCompany, contact.company_id) if contact and contact.company_id else None
     if company is None:
@@ -1102,6 +1117,9 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
         DealerProductFinderSession.owner_user_id == user.id,
         DealerProductFinderSession.contact_id == contact.id,
         DealerProductFinderSession.status.in_(["screening", "draft"]),
+        DealerProductFinderSession.dealer_id.in_(
+            select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+        ),
     ).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().first()
     if existing:
         existing.answers = {
@@ -1156,7 +1174,15 @@ async def _load_session(db: AsyncSession, user: User, session_id: UUID) -> Deale
     row = await db.get(DealerProductFinderSession, session_id)
     if row is None or (user.role == Role.FIELD_REP and row.owner_user_id != user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Screening session not found")
-    require_team_or_rep(user); return row
+    require_team_or_rep(user)
+    is_training = (
+        await db.execute(
+            select(DealerBusiness.is_training).where(DealerBusiness.id == row.dealer_id)
+        )
+    ).scalar_one_or_none()
+    if is_training and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Screening session not found")
+    return row
 
 
 @router.post("/product-finder/sessions/{session_id}/screen")
@@ -1214,7 +1240,15 @@ async def start_application(session_id: UUID, user: CurrentUser, db: AsyncSessio
 
 @router.get("/contacts")
 async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = Query("", max_length=160), limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0)) -> dict:
-    require_team_or_rep(user); filters = [await _contact_access_filter(user)]
+    require_team_or_rep(user); filters = [
+        await _contact_access_filter(user),
+        or_(
+            DealerRepContact.dealer_id.is_(None),
+            DealerRepContact.dealer_id.in_(
+                select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            ),
+        ),
+    ]
     if q.strip():
         like = f"%{q.strip().lower()}%"; filters.append(or_(func.lower(DealerRepContact.full_name).like(like), func.lower(func.coalesce(DealerRepContact.company, "")).like(like), func.lower(func.coalesce(DealerRepContact.email, "")).like(like), func.lower(func.coalesce(DealerRepContact.phone_e164, "")).like(like)))
     total = int((await db.execute(select(func.count()).select_from(DealerRepContact).where(*filters))).scalar_one())
@@ -1225,12 +1259,28 @@ async def list_contacts(user: CurrentUser, db: AsyncSession = Depends(get_db), q
 @router.get("/companies")
 async def list_companies(user: CurrentUser, db: AsyncSession = Depends(get_db), q: str = Query("", max_length=160), limit: int = Query(20, ge=1, le=50), offset: int = Query(0, ge=0)) -> dict:
     require_team_or_rep(user)
-    filters = [] if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} else [or_(
+    has_contacts = exists(
+        select(DealerRepContact.id).where(DealerRepContact.company_id == DealerRepCompany.id)
+    )
+    has_visible_contacts = exists(
+        select(DealerRepContact.id).where(
+            DealerRepContact.company_id == DealerRepCompany.id,
+            or_(
+                DealerRepContact.dealer_id.is_(None),
+                DealerRepContact.dealer_id.in_(
+                    select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+                ),
+            ),
+        )
+    )
+    filters = [or_(~has_contacts, has_visible_contacts)]
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        filters.append(or_(
         DealerRepCompany.owner_user_id == user.id,
         exists(select(DealerRepContactAssignment.id).join(
             DealerRepContact, DealerRepContact.id == DealerRepContactAssignment.contact_id
         ).where(DealerRepContact.company_id == DealerRepCompany.id, DealerRepContactAssignment.user_id == user.id)),
-    )]
+        ))
     if q.strip():
         like = f"%{q.strip().lower()}%"
         filters.append(or_(func.lower(DealerRepCompany.name).like(like), func.lower(func.coalesce(DealerRepCompany.address, "")).like(like), func.lower(func.coalesce(DealerRepCompany.city, "")).like(like)))
@@ -1250,19 +1300,51 @@ async def company_detail(company_id: UUID, user: CurrentUser, db: AsyncSession =
         ).where(DealerRepContact.company_id == company.id, DealerRepContactAssignment.user_id == user.id))))).scalar_one())
     if company is None or (user.role == Role.FIELD_REP and company.owner_user_id != user.id and not shared):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
-    contacts = (await db.execute(select(DealerRepContact).where(DealerRepContact.company_id == company.id).order_by(DealerRepContact.updated_at.desc()))).scalars().all()
+    contacts = (await db.execute(select(DealerRepContact).where(
+        DealerRepContact.company_id == company.id,
+        or_(
+            DealerRepContact.dealer_id.is_(None),
+            DealerRepContact.dealer_id.in_(
+                select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            ),
+        ),
+    ).order_by(DealerRepContact.updated_at.desc()))).scalars().all()
+    company_has_contacts = bool((await db.execute(select(exists(
+        select(DealerRepContact.id).where(DealerRepContact.company_id == company.id)
+    )))).scalar_one())
+    if company_has_contacts and not contacts:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
     return {"id": str(company.id), "name": company.name, "industry": company.industry, "address": company.address, "city": company.city, "state": company.state, "zip": company.zip, "contacts": [{"id": str(row.id), "name": row.full_name, "email": row.email, "phone": row.phone_e164} for row in contacts]}
 
 
 @router.get("/contacts/{contact_id}")
 async def contact_detail(contact_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     contact = await _load_contact(db, user, contact_id)
-    applications = (await db.execute(select(DealerBusiness).join(DealerApplicationContact, DealerApplicationContact.dealer_id == DealerBusiness.id).where(DealerApplicationContact.contact_id == contact.id).order_by(DealerBusiness.updated_at.desc()))).scalars().all()
-    sessions = (await db.execute(select(DealerProductFinderSession).where(DealerProductFinderSession.contact_id == contact.id).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().all()
-    presentations = (await db.execute(select(DealerProductPresentation).where(DealerProductPresentation.contact_id == contact.id).order_by(DealerProductPresentation.created_at.desc()))).scalars().all()
+    applications = (await db.execute(select(DealerBusiness).join(DealerApplicationContact, DealerApplicationContact.dealer_id == DealerBusiness.id).where(DealerApplicationContact.contact_id == contact.id, DealerBusiness.is_training.is_(False)).order_by(DealerBusiness.updated_at.desc()))).scalars().all()
+    sessions = (await db.execute(select(DealerProductFinderSession).where(
+        DealerProductFinderSession.contact_id == contact.id,
+        DealerProductFinderSession.dealer_id.in_(
+            select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+        ),
+    ).order_by(DealerProductFinderSession.updated_at.desc()))).scalars().all()
+    presentations = (await db.execute(select(DealerProductPresentation).where(
+        DealerProductPresentation.contact_id == contact.id,
+        or_(
+            DealerProductPresentation.dealer_id.is_(None),
+            DealerProductPresentation.dealer_id.in_(
+                select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            ),
+        ),
+    ).order_by(DealerProductPresentation.created_at.desc()))).scalars().all()
     threads = (await db.execute(select(DealerRepInboxThread).where(
         DealerRepInboxThread.contact_id == contact.id,
         DealerRepInboxThread.owner_user_id == user.id,
+        or_(
+            DealerRepInboxThread.dealer_id.is_(None),
+            DealerRepInboxThread.dealer_id.in_(
+                select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
+            ),
+        ),
     ).order_by(DealerRepInboxThread.updated_at.desc()))).scalars().all()
     return {"id": str(contact.id), "name": contact.full_name, "company": contact.company, "email": contact.email, "phone": contact.phone_e164,
         "applications": [{"id": str(row.id), "name": row.name, "case_ref": row.case_ref, "lifecycle": row.application_lifecycle, "status": row.status, "funding_goal": float(row.funding_goal or 0), "updated_at": row.updated_at} for row in applications],

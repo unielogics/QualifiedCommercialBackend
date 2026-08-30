@@ -102,6 +102,11 @@ async def resolve_dealer_scope(db: AsyncSession, user: User, dealer_id: UUID) ->
     gets 403 rather than falling through to unrestricted access, which is what
     the earlier shape did."""
     dealer = await load_dealer(db, dealer_id)
+    # Training files are intentionally absent from every ordinary staff view.
+    # Return the same 404 as an unknown id so the classification cannot be
+    # discovered by probing a URL.
+    if dealer.is_training and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     if user.role == Role.DEALER:
         if dealer.dealer_user_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")

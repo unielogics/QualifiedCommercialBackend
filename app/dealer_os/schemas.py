@@ -53,6 +53,9 @@ class DealerCreate(BaseModel):
     funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
     use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
+    # Accepted only for a super-admin by the route. Keeping this out of the
+    # general update schema prevents a rep from changing file classification.
+    is_training: bool = False
     # Consent captured in the same moment as the file. Optional, because a rep
     # may have only an email, or the owner may decline: a file must still open.
     sms_consent: "SmsConsentIn | None" = None
@@ -144,6 +147,19 @@ class DealerUpdate(BaseModel):
     use_of_proceeds_note: str | None = Field(default=None, max_length=4000)
 
 
+class DealerWorkflowSettingsPatch(BaseModel):
+    """Super-admin-only classification and workflow presentation controls."""
+
+    is_training: bool | None = None
+    workflow_ungated: bool | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self) -> "DealerWorkflowSettingsPatch":
+        if self.is_training is None and self.workflow_ungated is None:
+            raise ValueError("Provide is_training or workflow_ungated")
+        return self
+
+
 class DealerRead(ORM):
     id: UUID
     name: str
@@ -190,6 +206,8 @@ class DealerRead(ORM):
     client_requested_amount: float | None = None
     client_requested_program: str | None = None
     application_lifecycle: str = "active"
+    is_training: bool = False
+    workflow_ungated: bool = False
     funding_purpose: str | None = None
     group_id: UUID | None = None
 
@@ -247,6 +265,8 @@ class DealerListItem(ORM):
     funding_purpose: str | None = None
     client_requested_amount: float | None = None
     application_lifecycle: str = "active"
+    is_training: bool = False
+    workflow_ungated: bool = False
 
 
 class PortfolioOwnerSummary(BaseModel):

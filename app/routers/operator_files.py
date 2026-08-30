@@ -810,6 +810,7 @@ async def _dealer_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
         select(DealerBusiness, DealerRepLead, User)
         .outerjoin(DealerRepLead, DealerRepLead.dealer_id == DealerBusiness.id)
         .outerjoin(User, User.id == DealerBusiness.owner_user_id)
+        .where(DealerBusiness.is_training.is_(False))
         .order_by(DealerBusiness.updated_at.desc())
     )
     if user.role == Role.FIELD_REP:
