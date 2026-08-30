@@ -40,7 +40,7 @@ from .crm_schemas import (
     ProductCatalogUpdate,
     ProductPresentationIn,
 )
-from .deps import require_super_admin, require_team_or_rep
+from .deps import is_rep, require_super_admin, require_team_or_rep
 from .models import (
     DealerApplicationContact,
     DealerBusiness,
@@ -1172,7 +1172,7 @@ async def create_finder_session(payload: CompanyContactIn, user: CurrentUser, db
 
 async def _load_session(db: AsyncSession, user: User, session_id: UUID) -> DealerProductFinderSession:
     row = await db.get(DealerProductFinderSession, session_id)
-    if row is None or (user.role == Role.FIELD_REP and row.owner_user_id != user.id):
+    if row is None or (is_rep(user) and row.owner_user_id != user.id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Screening session not found")
     require_team_or_rep(user)
     is_training = (
@@ -1232,7 +1232,7 @@ async def start_application(session_id: UUID, user: CurrentUser, db: AsyncSessio
         await propose_targets(db, dealer)
         try: await buckets_link.ensure_bucket(db, dealer)
         except Exception: pass
-        if user.role == Role.FIELD_REP:
+        if is_rep(user):
             db.add(DealerRepLead(dealer_id=dealer.id, rep_user_id=user.id, status="draft", status_history=[]))
     await db.commit()
     return {"dealer_id": str(dealer.id), "route": f"/applications/{dealer.id}?step=1"}
@@ -1294,11 +1294,11 @@ async def company_detail(company_id: UUID, user: CurrentUser, db: AsyncSession =
     require_team_or_rep(user)
     company = await db.get(DealerRepCompany, company_id)
     shared = False
-    if company is not None and user.role == Role.FIELD_REP:
+    if company is not None and is_rep(user):
         shared = bool((await db.execute(select(exists(select(DealerRepContactAssignment.id).join(
             DealerRepContact, DealerRepContact.id == DealerRepContactAssignment.contact_id
         ).where(DealerRepContact.company_id == company.id, DealerRepContactAssignment.user_id == user.id))))).scalar_one())
-    if company is None or (user.role == Role.FIELD_REP and company.owner_user_id != user.id and not shared):
+    if company is None or (is_rep(user) and company.owner_user_id != user.id and not shared):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
     contacts = (await db.execute(select(DealerRepContact).where(
         DealerRepContact.company_id == company.id,
@@ -1356,7 +1356,7 @@ async def contact_detail(contact_id: UUID, user: CurrentUser, db: AsyncSession =
 @router.post("/contacts/{contact_id}/assignments", status_code=status.HTTP_201_CREATED)
 async def assign_contact(contact_id: UUID, payload: ContactAssignmentIn, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     contact = await _load_contact(db, user, contact_id)
-    if user.role == Role.FIELD_REP and contact.owner_user_id != user.id: raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the owning rep can share this contact")
+    if is_rep(user) and contact.owner_user_id != user.id: raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the owning rep can share this contact")
     existing = (await db.execute(select(DealerRepContactAssignment).where(DealerRepContactAssignment.contact_id == contact.id, DealerRepContactAssignment.user_id == payload.user_id))).scalar_one_or_none()
     if existing is None: db.add(DealerRepContactAssignment(contact_id=contact.id, user_id=payload.user_id, assigned_by_user_id=user.id)); await db.commit()
     return {"assigned": True}

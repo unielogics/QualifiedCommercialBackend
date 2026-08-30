@@ -9,9 +9,11 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.dealer_os import router
+from app.dealer_os.deps import is_rep
 from app.dealer_os.schemas import DealerCreate, DealerWorkflowSettingsPatch
 from app.enums import Role
 from app.routers import application_profiles as application_profiles_router
+from app.routers.users import _account_types
 from app.services import application_profiles as application_profiles_service
 
 
@@ -27,6 +29,40 @@ def _user(role: Role) -> SimpleNamespace:
 def _request(header: str | None = None) -> SimpleNamespace:
     headers = {"x-qc-training-live-action": header} if header else {}
     return SimpleNamespace(headers=headers)
+
+
+def test_broker_with_field_desk_entitlement_uses_rep_scope() -> None:
+    user = SimpleNamespace(
+        role=Role.BROKER,
+        deleted_at=None,
+        account_status="active",
+        account_access_types=["field_desk"],
+    )
+
+    assert is_rep(user) is True
+
+
+def test_broker_without_field_desk_entitlement_is_not_a_field_rep() -> None:
+    user = SimpleNamespace(
+        role=Role.BROKER,
+        deleted_at=None,
+        account_status="active",
+        account_access_types=[],
+    )
+
+    assert is_rep(user) is False
+
+
+def test_operator_access_combines_primary_role_and_additional_console() -> None:
+    user = SimpleNamespace(role=Role.BROKER, account_access_types=["field_desk"])
+
+    assert _account_types(user) == ["field_desk", "funding"]
+
+
+def test_super_admin_inherits_all_operator_accounts() -> None:
+    user = SimpleNamespace(role=Role.SUPER_ADMIN, account_access_types=[])
+
+    assert _account_types(user) == ["audit", "field_desk", "funding"]
 
 
 def test_new_files_default_to_live_and_gated() -> None:

@@ -8,6 +8,7 @@ from fastapi import APIRouter
 
 from app.deps import CurrentUser
 from app.enums import Role
+from app.routers.users import _account_types
 from app.schemas.common import ORMModel
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -25,6 +26,7 @@ class MeResponse(ORMModel):
     # since AppShell's gate needs BOTH the individual Platform Access
     # Agreement AND the company's Referral Protection Agreement status.
     referral_partner_company_id: UUID | None = None
+    account_types: list[str]
 
 
 @router.get("/me", response_model=MeResponse)
@@ -36,4 +38,5 @@ async def me(user: CurrentUser) -> MeResponse:
         name=user.name,
         role=user.role,
         referral_partner_company_id=user.referral_partner_company_id,
+        account_types=_account_types(user),
     )

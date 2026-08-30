@@ -55,6 +55,7 @@ from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequ
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
+    is_rep,
     load_dealer,
     require_dealer,
     require_super_admin,
@@ -468,7 +469,7 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
     )
     if user.role == Role.DEALER:
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
-    elif user.role == Role.FIELD_REP:
+    elif is_rep(user):
         stmt = stmt.where(DealerBusiness.owner_user_id == user.id)
     pairs = (await db.execute(stmt)).all()
     dealers = [d for d, _ in pairs]
@@ -641,7 +642,7 @@ async def dealer_portfolio(
         filters.append(DealerBusiness.is_training.is_(False))
     elif training == "only":
         filters.append(DealerBusiness.is_training.is_(True))
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         filters.extend(
             [DealerBusiness.owner_user_id == user.id, DealerBusiness.archived_at.is_(None)]
         )
@@ -766,7 +767,7 @@ async def dealer_portfolio(
 
 
 def _global_search_file_access_filter(user: User):
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         return and_(
             DealerBusiness.owner_user_id == user.id,
             DealerBusiness.archived_at.is_(None),
@@ -793,7 +794,7 @@ def _global_search_contact_access_filter(user: User):
 
 
 def _global_search_appointment_access_filter(user: User):
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         return DealerRepAppointment.booked_by_user_id == user.id
     return True
 
@@ -2433,7 +2434,7 @@ async def create_dealer(
     # up in production reporting immediately rather than only once it advances.
     # Team-created files deliberately get none: they are not field work and
     # counting them would inflate a rep's numbers with the desk's own.
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         db.add(
             DealerRepLead(
                 dealer_id=dealer.id,
@@ -5817,7 +5818,7 @@ async def _load_owned_appointment(
         dealer = await db.get(DealerBusiness, row.dealer_id)
         if dealer is not None and dealer.is_training and user.role != Role.SUPER_ADMIN:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
-    if user.role == Role.FIELD_REP and row.booked_by_user_id != user.id:
+    if is_rep(user) and row.booked_by_user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     return row
 
@@ -6571,7 +6572,7 @@ async def list_all_rep_appointments(
             ),
         )
     )
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         q = q.where(DealerRepAppointment.booked_by_user_id == user.id)
     if starts_from is not None:
         q = q.where(DealerRepAppointment.starts_at >= _to_utc_minute(starts_from))
@@ -9089,7 +9090,7 @@ async def create_message(
     elif payload.internal is not None:
         # Older callers that only know about the boolean still work.
         channel = "desk" if payload.internal else "client"
-    elif user.role == Role.FIELD_REP:
+    elif is_rep(user):
         # A rep typing a candid remark about a borrower and having it land in
         # front of that borrower is the failure that matters most here, so
         # silence defaults inward. Reaching the client is a deliberate act.
@@ -9321,7 +9322,7 @@ async def unread_summary(
     require_team_or_dealer_or_rep(user)
 
     visible = select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         visible = visible.where(DealerBusiness.owner_user_id == user.id)
     elif user.role == Role.DEALER:
         visible = visible.where(DealerBusiness.dealer_user_id == user.id)
@@ -14395,7 +14396,7 @@ def _location_rows(
 def _rep_production_access_scope(user: User) -> tuple[str, UUID | None]:
     """Resolve reporting scope before any production rows are queried."""
     require_team_or_rep(user)
-    if user.role == Role.FIELD_REP:
+    if is_rep(user):
         return "own", user.id
     return "firm", None
 
