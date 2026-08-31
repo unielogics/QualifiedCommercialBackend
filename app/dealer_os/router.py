@@ -379,7 +379,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_assets, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -1393,7 +1393,7 @@ async def send_bank_upload_request(
 async def bank_evidence(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> BankEvidenceRead:
-    """Current bank evidence source and statement-month coverage for Step 2."""
+    """Current verified bank source and monthly coverage for Step 2."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     ver = await _assess_verification(db, dealer)
@@ -1415,7 +1415,11 @@ async def bank_evidence(
             room_url = client_room.room_url(link.token)
     return BankEvidenceRead(
         bank_linked=ver.bank_linked,
-        bank_source=ver.bank_source if ver.bank_source in {"plaid", "upload"} else "none",
+        bank_source=(
+            ver.bank_source
+            if ver.bank_source in {"assets", "plaid", "upload"}
+            else "none"
+        ),
         statement_months=ver.statement_months,
         missing_statement_months=ver.missing_statement_months,
         bucket_id=dealer.bucket_id,
@@ -2915,13 +2919,15 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
 async def _statement_month_coverage(
     db: AsyncSession, dealer_id: UUID
 ) -> tuple[list[str], list[str], str]:
-    """Six current months proved by bank-produced statement artifacts.
+    """Six current months proved by verified bank evidence.
 
     CSVs, screenshots, and financial periods derived from supplemental files
-    are useful analysis inputs but cannot satisfy an official-statement gate.
-    A Plaid connection also does not count until statement PDFs are imported.
+    are useful analysis inputs but cannot satisfy the verification gate. A
+    Plaid connection does not count by itself; an ingested Asset Report or
+    bank-produced statement PDF does.
     """
     months: set[str] = set()
+    has_plaid_assets = False
     has_plaid_statement = False
     doc_rows = (
         await db.execute(
@@ -2931,37 +2937,53 @@ async def _statement_month_coverage(
                 DealerDocument.kind,
                 DealerDocument.detected_kind,
                 DealerDocument.extracted,
+                DealerDocument.doc_meta,
             ).where(
                 DealerDocument.dealer_id == dealer_id,
                 DealerDocument.status == "extracted",
             )
         )
     ).all()
-    for content_type, plaid_item_id, kind, detected_kind, extracted in doc_rows:
+    for content_type, plaid_item_id, kind, detected_kind, extracted, doc_meta in doc_rows:
         effective = detected_kind or _KIND_TO_DETECTED.get(kind)
         if effective != "bank_statement":
             continue
+        extracted = extracted if isinstance(extracted, dict) else {}
+        doc_meta = doc_meta if isinstance(doc_meta, dict) else {}
+        is_plaid_assets = (
+            doc_meta.get("source") == "plaid_assets"
+            or extracted.get("source") == "plaid_assets"
+        )
         is_plaid_statement = plaid_item_id is not None
         is_bank_pdf = str(content_type or "").lower() == "application/pdf"
-        if not (is_plaid_statement or is_bank_pdf):
+        if not (is_plaid_assets or is_plaid_statement or is_bank_pdf):
             continue
+        has_plaid_assets = has_plaid_assets or is_plaid_assets
         has_plaid_statement = has_plaid_statement or is_plaid_statement
-        for m in (extracted or {}).get("months") or []:
-            key = str(m.get("month") or "") if isinstance(m, dict) else ""
+        for m in extracted.get("months") or []:
+            key = str(m.get("month") or "") if isinstance(m, dict) else str(m or "")
             if _COVERAGE_MONTH_RE.match(key):
                 months.add(key)
 
     freshness = recurrence.compute_freshness(months, date.today(), window=6)
-    source = "plaid" if has_plaid_statement else ("upload" if months else "none")
+    source = (
+        "assets"
+        if has_plaid_assets
+        else "plaid"
+        if has_plaid_statement
+        else "upload"
+        if months
+        else "none"
+    )
     return sorted(months), list(freshness.get("missing_months") or []), source
 
 
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     """Read the two authorizations off the file.
 
-    Bank readiness requires six current bank-produced statement months.
-    Plaid is a transport, not evidence by itself; a connected item cannot
-    unlock underwriting until its statement artifacts have been imported.
+    Bank readiness requires six current months of verified bank evidence.
+    Plaid is a transport, not evidence by itself; an Item cannot unlock
+    underwriting until its Asset Report or statement artifacts are ingested.
 
     Credit is complete only when ownership totals 100% and every disclosed
     owner at 20% or more has completed their own pull. Each pull remains tied
@@ -4208,11 +4230,11 @@ _KIND_TO_DETECTED = {
 async def document_coverage(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> DocumentCoverageRead:
-    """Intake completeness for the Documents tab: which statement months are
-    covered by official statement artifacts, which tax years have a filing
-    row, whether a P&L / debt schedule has landed, and how many requests are
-    still open. Supplemental CSV and screenshot data never satisfies the
-    official statement count."""
+    """Intake completeness for the Documents tab.
+
+    Verified Plaid Asset Reports and bank-produced statement PDFs satisfy bank
+    month coverage. Supplemental CSV and screenshot data does not.
+    """
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
@@ -11491,7 +11513,7 @@ async def plaid_exchange(
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlaidItem:
     """Finish Link: swap the public token, store the encrypted access token,
-    and pull the first batch of statements in the background."""
+    and build the first verified bank report in the background."""
     require_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     await _lock_dealer_related_writes(db, dealer.id)
@@ -12363,7 +12385,9 @@ async def public_room_set_primary_bank(
     )
 
 
-async def _background_plaid_first_sync(item_pk: UUID) -> None:
+async def _background_plaid_first_sync(
+    item_pk: UUID, include_assets: bool = True
+) -> None:
     from app.db import SessionLocal
 
     try:
@@ -12372,7 +12396,19 @@ async def _background_plaid_first_sync(item_pk: UUID) -> None:
                 await db.execute(select(DealerPlaidItem).where(DealerPlaidItem.id == item_pk))
             ).scalar_one_or_none()
             if item is not None:
-                await plaid_sync.sync_item(db, item)
+                if include_assets and plaid_client.assets_enabled():
+                    report, _ = await plaid_assets.ensure_asset_report(
+                        db,
+                        dealer_id=item.dealer_id,
+                    )
+                    await db.commit()
+                    if report.status in {"ready", "ingest_error"}:
+                        await plaid_assets.ingest_asset_report(
+                            db, report.asset_report_id
+                        )
+                        await db.commit()
+                if plaid_client.statements_enabled():
+                    await plaid_sync.sync_item(db, item)
                 await db.commit()
     except Exception:
         logger.exception("dealer-os plaid: first sync failed for %s", item_pk)
@@ -12386,11 +12422,12 @@ async def plaid_refresh(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PlaidRefreshResult:
-    """Refresh now: queue a pull of any statements not yet ingested across the
-    dealer's connected banks. Runs in the background (each statement PDF goes
-    through extraction — minutes, not a request); idempotent by construction
-    (statement-id dedupe), so mashing the button is harmless. Statements
-    appear in Files as they extract."""
+    """Queue a refresh of verified Plaid bank evidence.
+
+    Assets produces one consolidated report across the connected business
+    accounts. Statements remains an optional additional PDF source when that
+    separate Plaid product is enabled.
+    """
     require_super_admin(user)
     dealer = await _load_visible_dealer(db, dealer_id, user)
     await _require_training_live_action(
@@ -12398,15 +12435,19 @@ async def plaid_refresh(
         dealer=dealer,
         user=user,
         request=request,
-        action="Refresh Plaid statements",
+        action="Refresh Plaid bank evidence",
         provider="Plaid",
         recipient=dealer.name,
-        effect="Queue live Plaid statement retrieval and extraction.",
+        effect="Queue live Plaid Asset Report retrieval and financial extraction.",
     )
     _plaid_cooldown("refresh", dealer.id, 60)
     items = [i for i in await _plaid_items(db, dealer.id) if i.status != "removed"]
-    for item in items:
-        background.add_task(_background_plaid_first_sync, item.id)
+    for index, item in enumerate(items):
+        background.add_task(
+            _background_plaid_first_sync,
+            item.id,
+            index == 0,
+        )
     await log_action(
         db,
         dealer.id,
@@ -12630,7 +12671,7 @@ async def download_dealer_asset_report(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     report = await _dealer_asset_report(db, dealer.id, report_id)
     report_token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
-    if report.status != "ready" or not report_token:
+    if report.status not in {"ready", "ingested"} or not report_token:
         raise HTTPException(status.HTTP_409_CONFLICT, "Asset Report is not ready")
     try:
         content = await plaid_client.asset_report_pdf(report_token)
@@ -13052,8 +13093,37 @@ async def _plaid_statement_months_by_item(
         if item_id is None or not isinstance(extracted, dict):
             continue
         for month in extracted.get("months") or []:
-            if isinstance(month, str) and re.fullmatch(r"\d{4}-\d{2}", month):
-                coverage.setdefault(item_id, set()).add(month)
+            key = month.get("month") if isinstance(month, dict) else month
+            if isinstance(key, str) and re.fullmatch(r"\d{4}-\d{2}", key):
+                coverage.setdefault(item_id, set()).add(key)
+
+    asset_rows = (
+        await db.execute(
+            select(PlaidAssetReport.source_item_ids, DealerDocument.extracted)
+            .join(DealerDocument, DealerDocument.id == PlaidAssetReport.document_id)
+            .where(
+                PlaidAssetReport.dealer_id == dealer_id,
+                PlaidAssetReport.ingested_at.is_not(None),
+                PlaidAssetReport.removed_at.is_(None),
+            )
+        )
+    ).all()
+    for source_item_ids, extracted in asset_rows:
+        if not isinstance(extracted, dict):
+            continue
+        report_months = {
+            str(month.get("month") if isinstance(month, dict) else month)
+            for month in extracted.get("months") or []
+        }
+        report_months = {
+            month for month in report_months if re.fullmatch(r"\d{4}-\d{2}", month)
+        }
+        for raw_item_id in source_item_ids or []:
+            try:
+                item_id = UUID(str(raw_item_id))
+            except ValueError:
+                continue
+            coverage.setdefault(item_id, set()).update(report_months)
     return {item_id: sorted(months) for item_id, months in coverage.items()}
 
 
@@ -13328,8 +13398,8 @@ async def _application_pre_screen_state(
     _suggest(
         "annual_sales",
         annualized_bank_sales,
-        "verified_bank_statements",
-        f"Annualized from {len(period_rows)} qualifying statement months.",
+        "verified_bank_evidence",
+        f"Annualized from {len(period_rows)} qualifying bank-evidence months.",
     )
     _suggest(
         "annual_cash_flow_available_for_debt",

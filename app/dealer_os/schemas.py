@@ -1060,7 +1060,7 @@ class DeliveryRowRead(BaseModel):
 
 class VerificationRead(BaseModel):
     bank_linked: bool = False
-    bank_source: Literal["plaid", "upload", "none"] = "none"
+    bank_source: Literal["assets", "plaid", "upload", "none"] = "none"
     statement_months: list[str] = []
     missing_statement_months: list[str] = []
     credit_returned: bool = False
@@ -1877,10 +1877,10 @@ class BankUploadRequestResult(ClientRequestResult):
 
 class BankEvidenceRead(BaseModel):
     bank_linked: bool = False
-    bank_source: Literal["plaid", "upload", "none"] = "none"
+    bank_source: Literal["assets", "plaid", "upload", "none"] = "none"
     statement_months: list[str] = Field(default_factory=list)
     missing_statement_months: list[str] = []
-    statement_target: int = 3
+    statement_target: int = 6
     bucket_id: UUID | None = None
     upload_url: str | None = None
     passcode: str | None = None
@@ -2252,11 +2252,13 @@ class PlaidAssetReportRead(ORM):
     days_requested: int
     error: str | None = None
     ready_at: datetime | None = None
+    ingested_at: datetime | None = None
+    document_id: UUID | None = None
     created_at: datetime
 
 
 class PlaidAssetReportCreate(BaseModel):
-    days_requested: int = Field(default=60, ge=0, le=731)
+    days_requested: int = Field(default=210, ge=0, le=731)
 
 
 class PlaidExchange(BaseModel):

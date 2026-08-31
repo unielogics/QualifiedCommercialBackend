@@ -1,10 +1,9 @@
-"""Plaid statement sync — pull PDFs into the normal document pipeline.
+"""Plaid bank-evidence sync.
 
-The whole integration is "fetch statement PDFs we haven't seen and drop them
-into the same pipeline an upload uses": extract_document does everything else
-(classification, account matching by mask, periods, events, recurrence,
-snapshot). Idempotency is the partial-unique (dealer_id, plaid_statement_id)
-index — a statement ingests exactly once, so refresh is always safe to run.
+Assets is the primary machine-readable source and is normalized into the same
+account, period, event, recurrence, and snapshot pipeline as uploaded evidence.
+When the separately entitled Statements product is configured, its exact PDFs
+are also fetched through the legacy statement-id-deduplicated path below.
 
 Plaid-pulled documents extract IMMEDIATELY regardless of who connected the
 bank: the content comes from the bank, not the uploader, so the dealer
@@ -66,7 +65,7 @@ async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days:
 
 
 async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
-    """Pull any not-yet-ingested statements for one connected bank.
+    """Refresh configured bank evidence for one connected bank.
 
     Each statement is COMMITTED individually — one bad PDF (or a unique-index
     race with a concurrent sync) never discards the others' work or poisons
@@ -80,6 +79,57 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
     item_pk = item.id
     dealer_id = item.dealer_id
     item_label = item.item_id[:12]
+
+    if plaid_client.assets_enabled():
+        from . import plaid_assets
+
+        try:
+            report, created = await plaid_assets.ensure_asset_report(
+                db,
+                dealer_id=dealer_id,
+            )
+            await db.commit()
+            if report.status in {"ready", "ingest_error"}:
+                await plaid_assets.ingest_asset_report(db, report.asset_report_id)
+                await db.commit()
+                report_status = "ingested"
+            else:
+                report_status = report.status
+        except Exception as exc:
+            logger.exception(
+                "dealer-os plaid: asset report refresh failed for item %s", item_label
+            )
+            if not plaid_client.statements_enabled():
+                await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
+                return {"pulled": 0, "skipped": 0, "failed": 1}
+        else:
+            if not plaid_client.statements_enabled():
+                await _bookkeep(
+                    db,
+                    item_pk,
+                    error=(
+                        report.error
+                        if report_status == "error"
+                        else None
+                    ),
+                    retry_days=(
+                        1 if report_status in {"pending", "error"} else plaid_client.REFRESH_EVERY_DAYS
+                    ),
+                )
+                return {
+                    "pulled": 1 if created or report_status == "ingested" else 0,
+                    "skipped": 0 if created else 1,
+                    "failed": 1 if report_status == "error" else 0,
+                }
+
+    if not plaid_client.statements_enabled():
+        await _bookkeep(
+            db,
+            item_pk,
+            error="No supported Plaid bank-evidence product is enabled.",
+            retry_days=1,
+        )
+        return {"pulled": 0, "skipped": 0, "failed": 1}
 
     token = plaid_client.decrypt_token(item.encrypted_access_token)
     if not token:

@@ -382,10 +382,10 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         _status("Canonical six-digit NAICS classification", "complete" if taxonomy["canonical"] else "missing", f"{taxonomy['naics_code']} - {taxonomy['naics_label']}", source="Taxonomy"),
         _status("Independent credit verification for every 20%+ owner", "complete" if credit_complete else "missing", f"{sum(row['credit_status'].startswith('Completed') for row in required_owners)} of {len(required_owners)} completed", source="iSoftPull"),
         _status(
-            "Six current bank-produced statement months",
+            "Six current verified bank-evidence months",
             "complete" if statement_complete else "supplemental" if has_supplemental_bank else "missing",
-            ", ".join(financial.get("statement_months") or []) or "No qualifying statement months",
-            source="Plaid or uploaded PDF",
+            ", ".join(financial.get("statement_months") or []) or "No qualifying bank months",
+            source="Plaid Assets or uploaded bank PDF",
         ),
         _status("Detailed written use of funds", "complete" if request["use_of_funds"] != "Awaiting evidence" else "missing", request["use_of_funds"], source="Application"),
         _status(
@@ -534,7 +534,7 @@ table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:5px 0 
 <div class="callout"><b>Detailed use of funds</b><br>{html.escape(_text(request['use_of_funds']))}</div>{line_items}
 
 <h2>5. Financial, Banking, and Debt Summary</h2>
-<div class="grid"><div class="field"><span class="label">Annual sales</span>{_money(financial['annual_sales'])}</div><div class="field"><span class="label">Annual cash flow available for debt</span>{_money(financial['annual_cash_flow_available_for_debt'])}</div><div class="field"><span class="label">Monthly debt payments</span>{_money(financial['monthly_debt_payments'])}</div><div class="field"><span class="label">Calculated DSCR</span>{html.escape(_text(financial['dscr']) or 'Awaiting evidence')} ({html.escape(_text(financial['dscr_source']))})</div><div class="field"><span class="label">Qualifying statement months</span>{html.escape(', '.join(financial['statement_months']) or 'Awaiting evidence')}</div><div class="field"><span class="label">Open statement months</span>{html.escape(', '.join(financial['missing_statement_months']) or 'None')}</div></div>
+<div class="grid"><div class="field"><span class="label">Annual sales</span>{_money(financial['annual_sales'])}</div><div class="field"><span class="label">Annual cash flow available for debt</span>{_money(financial['annual_cash_flow_available_for_debt'])}</div><div class="field"><span class="label">Monthly debt payments</span>{_money(financial['monthly_debt_payments'])}</div><div class="field"><span class="label">Calculated DSCR</span>{html.escape(_text(financial['dscr']) or 'Awaiting evidence')} ({html.escape(_text(financial['dscr_source']))})</div><div class="field"><span class="label">Qualifying bank months</span>{html.escape(', '.join(financial['statement_months']) or 'Awaiting evidence')}</div><div class="field"><span class="label">Open bank months</span>{html.escape(', '.join(financial['missing_statement_months']) or 'None')}</div></div>
 <h3>Debt, MCA/SBA, and UCC schedule</h3>{debts}
 
 <h2>6. Documents Reviewed and Source Readiness</h2>{evidence}{readiness_table}

@@ -275,7 +275,9 @@ async def test_login_repaired_dismisses_update_mode_prompt():
 
 @pytest.mark.asyncio
 async def test_asset_report_ready_webhook_marks_report_downloadable():
-    report = SimpleNamespace(status="pending", error="waiting", ready_at=None)
+    report = SimpleNamespace(
+        status="pending", error="waiting", ready_at=None, ingested_at=None
+    )
     out = await plaid_webhook.handle(
         _AssetDB(report),
         {
@@ -289,6 +291,25 @@ async def test_asset_report_ready_webhook_marks_report_downloadable():
     assert report.status == "ready"
     assert report.error is None
     assert report.ready_at is not None
+
+
+@pytest.mark.asyncio
+async def test_asset_report_ready_webhook_is_idempotent_after_ingestion():
+    report = SimpleNamespace(
+        status="ingested", error=None, ready_at="earlier", ingested_at="done"
+    )
+    out = await plaid_webhook.handle(
+        _AssetDB(report),
+        {
+            "webhook_type": "ASSETS",
+            "webhook_code": "PRODUCT_READY",
+            "asset_report_id": "asset-report-1",
+            "environment": "production",
+        },
+    )
+
+    assert out == "asset report already ingested"
+    assert report.status == "ingested"
 
 
 @pytest.mark.asyncio

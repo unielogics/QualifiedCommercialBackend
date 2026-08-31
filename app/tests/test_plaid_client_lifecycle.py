@@ -38,6 +38,27 @@ async def test_initial_link_uses_company_name_and_selected_products(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_assets_only_link_does_not_request_unentitled_statements(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("DEALER_OS_PLAID_PRODUCTS", "assets")
+
+    async def fake_post(path, payload, **_kwargs):
+        captured.update(path=path, payload=payload)
+        return SimpleNamespace(json=lambda: {"link_token": "link-assets"})
+
+    monkeypatch.setattr(plaid_client, "_post", fake_post)
+    token = await plaid_client.create_link_token(
+        dealer_id="file-1", dealer_name="Northstar Holdings LLC"
+    )
+
+    assert token == "link-assets"
+    assert captured["payload"]["products"] == ["assets"]
+    assert "statements" not in captured["payload"]
+    assert plaid_client.assets_enabled() is True
+    assert plaid_client.statements_enabled() is False
+
+
+@pytest.mark.asyncio
 async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkeypatch):
     captured = {}
 

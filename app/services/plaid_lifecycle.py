@@ -84,7 +84,7 @@ async def create_asset_report(
     items: list[PlaidItem],
     profile_id: UUID | None = None,
     dealer_id: UUID | None = None,
-    days_requested: int = 60,
+    days_requested: int = 210,
 ) -> PlaidAssetReport:
     if (profile_id is None) == (dealer_id is None):
         raise ValueError("Exactly one Asset Report owner is required")

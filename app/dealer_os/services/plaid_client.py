@@ -164,6 +164,10 @@ def assets_enabled() -> bool:
     return "assets" in products()
 
 
+def statements_enabled() -> bool:
+    return "statements" in products()
+
+
 def environment() -> str:
     env = _env("DEALER_OS_PLAID_ENV").lower() or "sandbox"
     if env not in _HOSTS:
