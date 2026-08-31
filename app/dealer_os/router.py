@@ -1310,6 +1310,9 @@ async def send_bank_connect_invite(
         path=room.url,
         channel=req.channel,
         action="client_request.bank_connect",
+        recipient_email=req.recipient_email,
+        recipient_phone=req.recipient_phone,
+        strict_recipient=bool(req.recipient_email or req.recipient_phone),
     )
     await db.commit()
     return ClientRequestResult(
@@ -1368,6 +1371,9 @@ async def send_bank_upload_request(
         path=room.url,
         channel=req.channel,
         action="client_request.bank_upload",
+        recipient_email=req.recipient_email,
+        recipient_phone=req.recipient_phone,
+        strict_recipient=bool(req.recipient_email or req.recipient_phone),
     )
     await db.commit()
     return BankUploadRequestResult(

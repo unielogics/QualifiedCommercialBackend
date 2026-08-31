@@ -1848,6 +1848,8 @@ class ClientRequestSend(BaseModel):
     caller explicitly asks for nothing; "sms" means email AND text."""
 
     channel: Literal["email", "sms", "none"] = "email"
+    recipient_email: str | None = Field(default=None, max_length=320)
+    recipient_phone: str | None = Field(default=None, max_length=32)
 
 
 class SignatureRequestSend(ClientRequestSend):
