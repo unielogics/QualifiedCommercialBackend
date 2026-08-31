@@ -1063,6 +1063,9 @@ class VerificationRead(BaseModel):
     bank_source: Literal["assets", "plaid", "upload", "none"] = "none"
     statement_months: list[str] = []
     missing_statement_months: list[str] = []
+    statement_target: int = 6
+    bank_exception_available: bool = False
+    bank_exception_active: bool = False
     credit_returned: bool = False
     unlocked: bool = False
     returned: int = 0
@@ -1881,9 +1884,15 @@ class BankEvidenceRead(BaseModel):
     statement_months: list[str] = Field(default_factory=list)
     missing_statement_months: list[str] = []
     statement_target: int = 6
+    bank_exception_available: bool = False
+    bank_exception_active: bool = False
     bucket_id: UUID | None = None
     upload_url: str | None = None
     passcode: str | None = None
+
+
+class BankEvidenceExceptionRequest(BaseModel):
+    acknowledged: Literal[True]
 
 
 class DocRequestPatch(BaseModel):

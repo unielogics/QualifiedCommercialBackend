@@ -197,6 +197,7 @@ from .schemas import (
     ClientRequestResult,
     ClientRequestSend,
     BankEvidenceRead,
+    BankEvidenceExceptionRequest,
     BankUploadRequestResult,
     SignatureRequestSend,
     AIThreadMessage,
@@ -1422,6 +1423,9 @@ async def bank_evidence(
         ),
         statement_months=ver.statement_months,
         missing_statement_months=ver.missing_statement_months,
+        statement_target=ver.statement_target,
+        bank_exception_available=ver.bank_exception_available,
+        bank_exception_active=ver.bank_exception_active,
         bucket_id=dealer.bucket_id,
         upload_url=room_url,
         passcode=passcode,
@@ -2916,6 +2920,93 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
     return row
 
 
+def _statement_window_complete(
+    months: set[str] | list[str], *, window: int, as_of: date | None = None
+) -> tuple[bool, list[str]]:
+    normalized = set(months)
+    freshness = recurrence.compute_freshness(
+        normalized, as_of or date.today(), window=window
+    )
+    missing = list(freshness.get("missing_months") or [])
+    return len(normalized) >= window and not missing, missing
+
+
+@router.post(
+    "/dealers/{dealer_id}/bank-evidence/three-month-exception",
+    response_model=BankEvidenceRead,
+)
+async def acknowledge_three_month_bank_exception(
+    dealer_id: UUID,
+    payload: BankEvidenceExceptionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BankEvidenceRead:
+    """Open the workflow after scoped staff acknowledge three fresh months.
+
+    Six months remains the standard evidence target. This acknowledgment opens
+    Step 3 but does not waive a program's final underwriting requirements.
+    """
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    months, missing_six, source = await _statement_month_coverage(db, dealer.id)
+    if len(months) >= 6 and not missing_six:
+        return await bank_evidence(dealer.id, user, db)
+    three_complete, missing_three = _statement_window_complete(months, window=3)
+    if not payload.acknowledged or not three_complete:
+        detail = (
+            f"Missing required bank months: {', '.join(missing_three)}"
+            if missing_three
+            else "Three latest completed bank months are required before using this exception."
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
+    if await _three_month_bank_exception_acknowledged(db, dealer.id, months):
+        return await bank_evidence(dealer.id, user, db)
+
+    now = datetime.now(timezone.utc)
+    row = DealerProgramRuleResolution(
+        dealer_id=dealer.id,
+        program_key="workflow",
+        rule_key="bank_evidence.three_month_exception",
+        kind="missing_evidence",
+        source=source,
+        current_value={
+            "statement_months": months,
+            "missing_standard_months": missing_six,
+            "standard_target": 6,
+            "accepted_target": 3,
+        },
+        recommended_action=(
+            "Collect the remaining standard bank months before final underwriting."
+        ),
+        status="acknowledged",
+        rep_note="Scoped staff acknowledged the three-month bank-evidence exception.",
+        requested_by_user_id=user.id,
+        requested_at=now,
+        resolved_by_user_id=user.id,
+        resolved_at=now,
+        resolution_note=(
+            "Workflow continuation approved with three latest completed bank months."
+        ),
+    )
+    db.add(row)
+    await db.flush()
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "bank_evidence.three_month_exception",
+        "program_rule_resolution",
+        entity_id=row.id,
+        after={
+            "statement_months": months,
+            "missing_standard_months": missing_six,
+            "source": source,
+        },
+    )
+    await db.commit()
+    return await bank_evidence(dealer.id, user, db)
+
+
 async def _statement_month_coverage(
     db: AsyncSession, dealer_id: UUID
 ) -> tuple[list[str], list[str], str]:
@@ -2965,7 +3056,7 @@ async def _statement_month_coverage(
             if _COVERAGE_MONTH_RE.match(key):
                 months.add(key)
 
-    freshness = recurrence.compute_freshness(months, date.today(), window=6)
+    _, missing_months = _statement_window_complete(months, window=6)
     source = (
         "assets"
         if has_plaid_assets
@@ -2975,7 +3066,36 @@ async def _statement_month_coverage(
         if months
         else "none"
     )
-    return sorted(months), list(freshness.get("missing_months") or []), source
+    return sorted(months), missing_months, source
+
+
+async def _three_month_bank_exception_acknowledged(
+    db: AsyncSession, dealer_id: UUID, statement_months: list[str]
+) -> bool:
+    resolution = (
+        await db.execute(
+            select(DealerProgramRuleResolution)
+            .where(
+                DealerProgramRuleResolution.dealer_id == dealer_id,
+                DealerProgramRuleResolution.program_key == "workflow",
+                DealerProgramRuleResolution.rule_key
+                == "bank_evidence.three_month_exception",
+                DealerProgramRuleResolution.status == "acknowledged",
+            )
+            .order_by(DealerProgramRuleResolution.resolved_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if resolution is None:
+        return False
+    accepted_months = set((resolution.current_value or {}).get("statement_months") or [])
+    required_months = set(
+        recurrence.compute_freshness(statement_months, date.today(), window=3).get(
+            "expected_months"
+        )
+        or []
+    )
+    return bool(required_months) and required_months.issubset(accepted_months)
 
 
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
@@ -2992,8 +3112,17 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
     statement_months, missing_statement_months, statement_source = await _statement_month_coverage(
         db, dealer.id
     )
-    bank_linked = len(statement_months) >= 6 and not missing_statement_months
-    bank_source = statement_source if bank_linked else "none"
+    standard_complete, _ = _statement_window_complete(statement_months, window=6)
+    three_month_complete, _ = _statement_window_complete(statement_months, window=3)
+    exception_available = three_month_complete and not standard_complete
+    exception_active = bool(
+        exception_available
+        and await _three_month_bank_exception_acknowledged(
+            db, dealer.id, statement_months
+        )
+    )
+    bank_linked = standard_complete or exception_active
+    bank_source = statement_source
     owner_state = await _owner_requirement_state(db, dealer.id)
     pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
     credit_returned = bool(
@@ -3007,6 +3136,9 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         bank_source=bank_source,
         statement_months=statement_months,
         missing_statement_months=missing_statement_months,
+        statement_target=3 if exception_active else 6,
+        bank_exception_available=exception_available,
+        bank_exception_active=exception_active,
         credit_returned=credit_returned,
         ownership_total=owner_state["ownership_total"],
         ownership_complete=owner_state["ownership_complete"],
@@ -12428,8 +12560,8 @@ async def plaid_refresh(
     accounts. Statements remains an optional additional PDF source when that
     separate Plaid product is enabled.
     """
-    require_super_admin(user)
-    dealer = await _load_visible_dealer(db, dealer_id, user)
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
     await _require_training_live_action(
         db,
         dealer=dealer,
