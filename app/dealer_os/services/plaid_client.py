@@ -47,7 +47,7 @@ STATEMENT_LOOKBACK_DAYS = 730
 
 # The auto-refresh cadence the user asked for.
 REFRESH_EVERY_DAYS = 30
-DEFAULT_CLIENT_NAME = "Qualified Commercial - Capital OS"
+DEFAULT_CLIENT_NAME = "Qualified Commercial"
 PLAID_CLIENT_NAME_MAX_LENGTH = 30
 _SUPPORTED_PRODUCTS = {"assets", "statements"}
 
@@ -127,21 +127,15 @@ def enabled() -> bool:
 
 
 def client_name() -> str:
-    return _env("DEALER_OS_PLAID_CLIENT_NAME") or DEFAULT_CLIENT_NAME
-
-
-def link_client_name(display_name: str | None = None) -> str:
-    """Plaid Link display name, capped before Plaid falls back to "This Application"."""
-    value = " ".join((display_name or "").split()).strip()
-    if not value:
-        value = client_name()
+    """Return the fixed platform identity shown inside every Plaid Link session."""
+    value = " ".join((_env("DEALER_OS_PLAID_CLIENT_NAME") or DEFAULT_CLIENT_NAME).split())
     if len(value) <= PLAID_CLIENT_NAME_MAX_LENGTH:
         return value
     clipped = value[:PLAID_CLIENT_NAME_MAX_LENGTH].rstrip()
     last_space = clipped.rfind(" ")
     if last_space >= 12:
         clipped = clipped[:last_space].rstrip()
-    return clipped or client_name()[:PLAID_CLIENT_NAME_MAX_LENGTH]
+    return clipped or DEFAULT_CLIENT_NAME
 
 
 def products() -> list[str]:
@@ -221,7 +215,8 @@ async def create_link_token(
     resp = await _post(
         "/link/token/create",
         {
-            "client_name": link_client_name(dealer_name),
+            # Plaid identifies the platform here, never the customer or file.
+            "client_name": client_name(),
             "user": {"client_user_id": dealer_id},
             "products": configured_products,
             **(
@@ -265,7 +260,7 @@ async def create_update_link_token(
 ) -> str:
     requested_products = [value for value in (add_products or []) if value in _SUPPORTED_PRODUCTS]
     payload: dict[str, Any] = {
-        "client_name": link_client_name(display_name),
+        "client_name": client_name(),
         "user": {"client_user_id": client_user_id},
         "access_token": access_token,
         "country_codes": ["US"],

@@ -13,12 +13,12 @@ def _plaid_environment(monkeypatch):
     monkeypatch.setenv("DEALER_OS_PLAID_SECRET", "secret")
     monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
     monkeypatch.setenv("DEALER_OS_PLAID_PRODUCTS", "statements,assets")
-    monkeypatch.setenv("DEALER_OS_PLAID_CLIENT_NAME", "Qualified Commercial - Capital OS")
+    monkeypatch.setenv("DEALER_OS_PLAID_CLIENT_NAME", "Qualified Commercial")
     monkeypatch.setenv("DEALER_OS_PLAID_WEBHOOK_URL", "https://api.example.test/plaid")
 
 
 @pytest.mark.asyncio
-async def test_initial_link_uses_company_name_and_selected_products(monkeypatch):
+async def test_initial_link_uses_fixed_platform_name_and_selected_products(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -32,7 +32,7 @@ async def test_initial_link_uses_company_name_and_selected_products(monkeypatch)
 
     assert token == "link-production"
     assert captured["path"] == "/link/token/create"
-    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
     assert captured["payload"]["products"] == ["assets", "statements"]
     assert captured["payload"]["webhook"] == "https://api.example.test/plaid"
 
@@ -59,7 +59,7 @@ async def test_assets_only_link_does_not_request_unentitled_statements(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkeypatch):
+async def test_initial_link_never_exposes_a_long_customer_name(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -72,8 +72,7 @@ async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkey
         dealer_name="Very Long Operating Company LLC",
     )
 
-    assert captured["payload"]["client_name"] == "Very Long Operating Company"
-    assert len(captured["payload"]["client_name"]) <= 30
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
 
 
 @pytest.mark.asyncio
@@ -95,7 +94,7 @@ async def test_update_link_can_request_new_account_selection(monkeypatch):
     assert token == "update-production"
     assert captured["path"] == "/link/token/create"
     assert captured["payload"]["access_token"] == "access-production"
-    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
     assert captured["payload"]["update"] == {"account_selection_enabled": True}
 
 
