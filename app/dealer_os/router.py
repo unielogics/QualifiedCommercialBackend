@@ -11530,13 +11530,14 @@ async def plaid_update_complete(
     dealer_id: UUID,
     item_pk: UUID,
     user: CurrentUser,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> DealerPlaidItem:
     require_dealer(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     item = await _dealer_plaid_item(db, dealer.id, item_pk)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -11551,6 +11552,7 @@ async def plaid_update_complete(
     )
     await db.commit()
     await db.refresh(item)
+    background.add_task(_background_plaid_first_sync, item.id)
     return item
 
 
@@ -12312,6 +12314,7 @@ async def public_room_update_complete(
     token: str,
     item_pk: UUID,
     payload: RoomPasscode,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> PublicPlaidItemRead:
     try:
@@ -12320,7 +12323,7 @@ async def public_room_update_complete(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     item = await _dealer_plaid_item(db, dealer.id, item_pk)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -12334,6 +12337,7 @@ async def public_room_update_complete(
         after={"via": "client_room", "link_id": str(link.id)},
     )
     await db.commit()
+    background.add_task(_background_plaid_first_sync, item.id)
     return next(row for row in await _safe_plaid_items(db, dealer.id) if row.id == item.id)
 
 

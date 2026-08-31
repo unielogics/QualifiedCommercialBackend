@@ -33,7 +33,7 @@ def decrypted_access_token(item: PlaidItem) -> str:
     return token
 
 
-async def complete_update(item: PlaidItem) -> None:
+async def complete_update(db: AsyncSession, item: PlaidItem) -> None:
     token = decrypted_access_token(item)
     state = await plaid_client.item_get(token)
     error = (state.get("item") or {}).get("error") or state.get("error")
@@ -55,6 +55,12 @@ async def complete_update(item: PlaidItem) -> None:
     item.update_mode_reason = None
     item.update_mode_account_selection = False
     item.next_refresh_at = _now()
+    # Update mode may add accounts without changing the Plaid Item id. Asset
+    # Report freshness is otherwise keyed by Item ids, so the prior report
+    # would incorrectly look current and omit the newly selected accounts.
+    # Retained normalized evidence stays on the file while the caller queues a
+    # fresh aggregate report across every active Item.
+    await remove_reports_for_item(db, item, strict=False)
 
 
 async def owner_asset_reports(

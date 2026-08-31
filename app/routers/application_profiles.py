@@ -110,6 +110,17 @@ from app.services.activity_log import log_activity, mark_loan_dirty
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 
+
+async def _sync_dealer_plaid_item_background(item_id: UUID) -> None:
+    from app.db import SessionLocal
+    from app.dealer_os.services.plaid_sync import sync_item
+
+    async with SessionLocal() as db:
+        item = await db.get(DealerPlaidItem, item_id)
+        if item is not None:
+            await sync_item(db, item)
+            await db.commit()
+
 _TRAINING_LIVE_ACTION_HEADER = "x-qc-training-live-action"
 
 
@@ -1974,12 +1985,13 @@ async def public_application_room_update_complete(
     item_id: UUID,
     payload: ApplicationRoomAccess,
     request: Request,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -1988,12 +2000,15 @@ async def public_application_room_update_complete(
         profile,
         None,
         "plaid.update_mode.completed.application_room",
-        "Client repaired the business bank connection",
+        "Client refreshed the business bank accounts",
         target_type="plaid_item",
         target_id=item.id,
         metadata={"upload_link_id": str(link.id)},
     )
     await db.commit()
+    from app.services.application_plaid_sync import sync_item_background
+
+    background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2156,12 +2171,13 @@ async def public_bank_verification_update_link_token(
 async def public_bank_verification_update_complete(
     token: str,
     item_id: UUID,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     invitation, profile = await _public_bank_invitation(db, token)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -2170,12 +2186,15 @@ async def public_bank_verification_update_complete(
         profile,
         None,
         "plaid.update_mode.completed.secure_room",
-        "Client repaired the business bank connection",
+        "Client refreshed the business bank accounts",
         target_type="plaid_item",
         target_id=item.id,
         metadata={"invitation_id": str(invitation.id)},
     )
     await db.commit()
+    from app.services.application_plaid_sync import sync_item_background
+
+    background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2527,13 +2546,14 @@ async def complete_application_plaid_update(
     profile_id: UUID,
     item_id: UUID,
     user: CurrentUser,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -2547,6 +2567,12 @@ async def complete_application_plaid_update(
         target_id=item.id,
     )
     await db.commit()
+    if profile.dealer_id:
+        background.add_task(_sync_dealer_plaid_item_background, item.id)
+    else:
+        from app.services.application_plaid_sync import sync_item_background
+
+        background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2649,16 +2675,7 @@ async def exchange_application_plaid_token(
     await db.commit()
     await db.refresh(item)
     if profile.dealer_id:
-        from app.db import SessionLocal
-        from app.dealer_os.services.plaid_sync import sync_item as sync_dealer_item
-
-        async def run_dealer_sync(item_id: UUID) -> None:
-            async with SessionLocal() as session:
-                target = await session.get(DealerPlaidItem, item_id)
-                if target:
-                    await sync_dealer_item(session, target)
-                    await session.commit()
-        background.add_task(run_dealer_sync, item.id)
+        background.add_task(_sync_dealer_plaid_item_background, item.id)
     else:
         from app.services.application_plaid_sync import sync_item_background
 
