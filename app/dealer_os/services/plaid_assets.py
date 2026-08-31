@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.models import (
@@ -195,7 +195,14 @@ async def ensure_asset_report(
             await db.execute(
                 select(DealerPlaidItem).where(
                     DealerPlaidItem.dealer_id == dealer_id,
-                    DealerPlaidItem.status == "active",
+                    or_(
+                        DealerPlaidItem.status == "active",
+                        and_(
+                            DealerPlaidItem.status == "error",
+                            DealerPlaidItem.update_mode_reason.is_(None),
+                            DealerPlaidItem.encrypted_access_token.is_not(None),
+                        ),
+                    ),
                     DealerPlaidItem.environment == plaid_client.environment(),
                 )
             )
@@ -203,6 +210,14 @@ async def ensure_asset_report(
     )
     if not items:
         raise plaid_client.PlaidUnavailable("Connect at least one healthy production bank first")
+    # A failed Statements pull (for example, an unentitled product) used to
+    # mark an otherwise valid Item `error`. Assets may safely retry those
+    # token-bearing Items. Login/revocation errors carry update_mode_reason or
+    # have no token and are deliberately excluded above.
+    for item in items:
+        if item.status == "error":
+            item.status = "active"
+            item.error = None
     source_ids = sorted(str(item.id) for item in items)
     latest = (
         await db.execute(

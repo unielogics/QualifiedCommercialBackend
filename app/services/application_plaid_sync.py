@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import boto3
 from botocore.config import Config
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -78,12 +78,23 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
                 await db.execute(
                     select(ApplicationPlaidItem).where(
                         ApplicationPlaidItem.profile_id == profile.id,
-                        ApplicationPlaidItem.status == "active",
+                        or_(
+                            ApplicationPlaidItem.status == "active",
+                            and_(
+                                ApplicationPlaidItem.status == "error",
+                                ApplicationPlaidItem.update_mode_reason.is_(None),
+                                ApplicationPlaidItem.encrypted_access_token.is_not(None),
+                            ),
+                        ),
                         ApplicationPlaidItem.environment == plaid_client.environment(),
                     )
                 )
             ).scalars().all()
         )
+        for asset_item in asset_items:
+            if asset_item.status == "error":
+                asset_item.status = "active"
+                asset_item.error = None
         latest = (
             await db.execute(
                 select(PlaidAssetReport)
