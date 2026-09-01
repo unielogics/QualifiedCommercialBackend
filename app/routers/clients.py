@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+# FastAPI dependencies intentionally use callable defaults. This legacy router
+# also keeps a late compatibility import until its property surface is split.
+# ruff: noqa: B008, E402
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -15,8 +18,8 @@ from app.enums import AITaskPriority, AITaskSource, AITaskStatus, Role
 from app.models.ai_task import AITask
 from app.models.client import Client
 from app.models.prequal_request import PrequalRequest
-from app.scoping import scope_client_query
 from app.schemas.client import ClientCreate, ClientRead, ClientSelfUpdate, ClientUpdate
+from app.scoping import scope_client_query
 from app.services.ai.client_summarizer import refresh_client_summary
 
 router = APIRouter(prefix="/clients", tags=["clients"])
@@ -285,7 +288,6 @@ async def get_client_workspace(
     from app.models.client_ai_plan import ClientAIPlan
     from app.models.deal import Deal
     from app.models.loan import Loan
-    from app.scoping import scope_client_query
     from app.schemas.deal import DealOut
     from app.schemas.workspace import (
         FundingFileSummary,
@@ -298,6 +300,7 @@ async def get_client_workspace(
         WorkspaceSelectedContext,
         WorkspaceTabCounts,
     )
+    from app.scoping import scope_client_query
 
     stmt = scope_client_query(
         user,
@@ -396,6 +399,7 @@ async def get_client_workspace(
     # Documents roll-up — count documents across this client's loans.
     # Cheap COUNT(*) queries rather than loading the rows.
     from sqlalchemy import func as sqlfunc
+
     from app.models.document import Document
 
     loan_ids = [loan.id for loan in loans]
@@ -591,7 +595,8 @@ async def update_client(
         `contacted_at` isn't already set, stamp it `now()`. Lets
         agents PATCH `{stage: 'contacted'}` without separately
         updating the timestamp the funnel reads."""
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+
     from app.enums import ClientStage as _CS
 
     if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
@@ -618,7 +623,7 @@ async def update_client(
         and payload.stage == _CS.CONTACTED
         and client.contacted_at is None
     ):
-        client.contacted_at = _dt.now(_tz.utc)
+        client.contacted_at = _dt.now(UTC)
     # Mobile-mode auto-flip — when a super_admin / loan_exec assigns a
     # broker to a previously-unassigned client AND the client has no
     # explicit experience mode set, default to "guided" with the same
@@ -1325,9 +1330,10 @@ async def send_intake_link(
 
     Role: BROKER (must own the client), SUPER_ADMIN, LOAN_EXEC.
     """
-    from datetime import datetime as _dt, timezone as _tz
-    from app.models.activity import Activity
+    from datetime import datetime as _dt
+
     from app.config import get_settings
+    from app.models.activity import Activity
     from app.services.email.user_mailer import send_as_user
 
     if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
@@ -1379,7 +1385,7 @@ async def send_intake_link(
         else:
             send_detail = f"Email send failed ({result.detail}) — share the link directly."
 
-    now = _dt.now(_tz.utc)
+    now = _dt.now(UTC)
     db.add(
         Activity(
             client_id=client_id,

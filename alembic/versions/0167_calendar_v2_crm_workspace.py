@@ -11,7 +11,6 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-
 revision = "0167_calendar_v2_crm_workspace"
 down_revision = "0166_calendar_appointment_crm"
 branch_labels = None

@@ -10,8 +10,8 @@ from sqlalchemy import text
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.dealer_os import router as dealer_os_router
 from app.dealer_os import crm_router as dealer_os_crm_router
+from app.dealer_os import router as dealer_os_router
 from app.routers import (
     admin as admin_router,
 )

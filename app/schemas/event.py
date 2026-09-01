@@ -100,7 +100,7 @@ class AppointmentOutcomeDefinitionBase(BaseModel):
     sort_order: int = Field(default=0, ge=0, le=999)
 
     @model_validator(mode="after")
-    def _normalize_effects(self) -> "AppointmentOutcomeDefinitionBase":
+    def _normalize_effects(self) -> AppointmentOutcomeDefinitionBase:
         self.name = " ".join(self.name.split())
         self.description = self.description.strip() if self.description else None
         self.effects = list(dict.fromkeys(["log_activity", *self.effects]))
@@ -121,7 +121,7 @@ class AppointmentOutcomeDefinitionPatch(BaseModel):
     sort_order: int | None = Field(default=None, ge=0, le=999)
 
     @model_validator(mode="after")
-    def _normalize_patch(self) -> "AppointmentOutcomeDefinitionPatch":
+    def _normalize_patch(self) -> AppointmentOutcomeDefinitionPatch:
         if self.name is not None:
             self.name = " ".join(self.name.split())
         if self.description is not None:

@@ -17,25 +17,28 @@ the audit log stays canonical.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+# FastAPI dependencies and query declarations intentionally use callable defaults.
+# ruff: noqa: B008
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import Select, false as sql_false, func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import status as http_status
+from sqlalchemy import Select, or_, select
+from sqlalchemy import false as sql_false
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.dealer_os.models import AppointmentOutcomeDefinition, DealerRepAppointment
 from app.deps import CurrentUser
 from app.enums import CalendarEventSource, CalendarEventStatus, Role
 from app.models.activity import Activity
+from app.models.booking_settings import BookingSettings
 from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.loan import Loan
 from app.models.user import User
-from app.models.booking_settings import BookingSettings
-from app.dealer_os.models import AppointmentOutcomeDefinition, DealerRepAppointment
-from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.schemas.event import (
     AppointmentOutcomeDefinitionCreate,
     AppointmentOutcomeDefinitionPatch,
@@ -50,6 +53,7 @@ from app.schemas.event import (
     CalendarWorkspaceMetrics,
     CalendarWorkspaceRead,
 )
+from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.services import calendar_v2
 from app.services.activity_log import filter_payload_for_audience, is_visible_to
 
@@ -171,7 +175,7 @@ async def list_events(
     from_: datetime | None = Query(default=None, alias="from"),
     to_: datetime | None = Query(default=None, alias="to"),
 ) -> list[CalendarEventRead]:
-    horizon = to_ or (datetime.now(timezone.utc) + timedelta(days=days))
+    horizon = to_ or (datetime.now(UTC) + timedelta(days=days))
     stmt = (
         select(CalendarEvent)
         .where(CalendarEvent.starts_at <= horizon)
@@ -220,7 +224,7 @@ async def get_calendar_workspace(
 
     events: list[CalendarWorkspaceEvent] = []
     type_counts = {key: 0 for key in APPOINTMENT_TYPE_KEYS}
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     outcome_logged = 0
     awaiting_outcome = 0
     files_created = 0
@@ -432,7 +436,7 @@ async def list_calendar_activity(
     to_: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=100, ge=1, le=250),
 ) -> list[CalendarActivityItem]:
-    horizon = to_ or datetime.now(timezone.utc)
+    horizon = to_ or datetime.now(UTC)
     start = from_ or (horizon - timedelta(days=days))
     stmt = (
         select(Activity)

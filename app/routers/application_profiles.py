@@ -40,7 +40,6 @@ from app.models.client import Client
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
-from app.services.user_access import is_audit_client, is_funding_client
 from app.routers.buckets import _hash_passcode, _verify_passcode
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
@@ -108,6 +107,7 @@ from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import plaid_lifecycle
 from app.services.activity_log import log_activity, mark_loan_dirty
+from app.services.user_access import is_audit_client, is_funding_client
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 

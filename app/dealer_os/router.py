@@ -35,7 +35,6 @@ from app.deps import CurrentUser
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
-from app.models.activity import Activity
 from app.models.client import Client
 from app.models.loan import Loan
 from app.models.application_profile import ApplicationProfile, ApplicationTaxonomyEntry, PlaidAssetReport
@@ -8029,7 +8028,7 @@ async def apply_rep_appointment_outcome(
     if definition is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Outcome not found.")
     key_hash = hashlib.sha256(
-        f"{appointment.id}:{payload.idempotency_key}".encode("utf-8")
+        f"{appointment.id}:{payload.idempotency_key}".encode()
     ).hexdigest()
     if appointment.workflow_outcome_idempotency_key == key_hash:
         stored = appointment.workflow_outcome_results or {}

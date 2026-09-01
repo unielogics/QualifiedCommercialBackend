@@ -5,7 +5,8 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.dealer_os.router import _booking_review_row, router as dealer_router
+from app.dealer_os.router import _booking_review_row
+from app.dealer_os.router import router as dealer_router
 from app.dealer_os.schemas import RepAppointmentApplyOutcome, RepAppointmentFileLinkPatch
 from app.enums import Role
 from app.routers.calendar import router as calendar_router

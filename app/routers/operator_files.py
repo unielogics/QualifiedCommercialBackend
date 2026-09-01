@@ -43,7 +43,6 @@ from app.models.loan import Loan
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
-from app.services.user_access import is_audit_client
 from app.schemas.operator_file import (
     BucketIntakeLinkOption,
     BucketIntakeLinkOptions,
@@ -78,6 +77,7 @@ from app.services.operator_file_links import (
     active_links_for_sources,
     queue_link_change_review,
 )
+from app.services.user_access import is_audit_client
 
 router = APIRouter(prefix="/operator-files", tags=["operator-files"])
 

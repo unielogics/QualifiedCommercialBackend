@@ -10,15 +10,14 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.deps import resolve_dealer_scope
-from app.services.user_access import is_audit_client
 from app.dealer_os.models import (
-    DealerRepAppointment,
-    DealerRepAppointmentActivity,
     DealerAuditLog,
     DealerBusiness,
     DealerDocument,
     DealerOwner,
     DealerPlaidItem,
+    DealerRepAppointment,
+    DealerRepAppointmentActivity,
 )
 from app.dealer_os.services import plaid_client
 from app.enums import Role
@@ -52,6 +51,7 @@ from app.schemas.application_profile import (
 )
 from app.scoping import scope_client_query, scope_loan_query
 from app.services.underwriting_intelligence import calculate_dscr
+from app.services.user_access import is_audit_client
 
 MAX_OWNERS = 5
 CREDIT_THRESHOLD = Decimal("20.00")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 # FastAPI dependency declarations intentionally use Depends in defaults.
 # ruff: noqa: B008
-
 from datetime import UTC, datetime
 from uuid import UUID
 
