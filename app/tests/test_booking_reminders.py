@@ -9,7 +9,13 @@ from app.models.booking_notification import BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
-from app.services.booking_availability import slot_overlaps_blocked_interval
+from app.services.booking_availability import (
+    booking_window_bounds,
+    daily_booking_windows,
+    slot_fits_daily_schedule,
+    slot_overlaps_blocked_interval,
+    slot_within_custom_booking_window,
+)
 from app.services.booking_reminders import register_booking
 
 
@@ -197,6 +203,119 @@ def test_booking_settings_validates_and_sorts_recurring_blocked_times() -> None:
 def test_booking_settings_rejects_invalid_blocked_times(blocked_intervals, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         UserBookingSettingsUpdate(blocked_intervals=blocked_intervals)
+
+
+def test_booking_settings_normalizes_split_weekly_schedule() -> None:
+    payload = UserBookingSettingsUpdate(
+        weekly_schedule=[
+            {
+                "weekday": 2,
+                "intervals": [
+                    {"start_time": "13:00", "end_time": "17:30"},
+                    {"start_time": "08:30", "end_time": "12:00"},
+                ],
+            },
+            {"weekday": 1, "intervals": []},
+        ],
+    )
+
+    assert payload.available_days == [2]
+    assert payload.start_time == "08:30"
+    assert payload.end_time == "17:30"
+    assert [item.start_time for item in payload.weekly_schedule[1].intervals] == [
+        "08:30",
+        "13:00",
+    ]
+
+
+def test_booking_settings_rejects_overlapping_schedule_ranges() -> None:
+    with pytest.raises(ValueError, match="cannot overlap"):
+        UserBookingSettingsUpdate(
+            weekly_schedule=[
+                {
+                    "weekday": 1,
+                    "intervals": [
+                        {"start_time": "09:00", "end_time": "12:00"},
+                        {"start_time": "11:30", "end_time": "15:00"},
+                    ],
+                }
+            ]
+        )
+
+
+def test_booking_settings_rejects_reversed_advance_window() -> None:
+    with pytest.raises(ValueError, match="Latest booking day"):
+        UserBookingSettingsUpdate(
+            advance_booking_window_enabled=True,
+            minimum_notice_days=6,
+            maximum_advance_days=5,
+        )
+
+
+def test_booking_window_uses_custom_days_only_when_enabled() -> None:
+    zone = ZoneInfo("America/New_York")
+    now = datetime(2026, 8, 31, 10, 15, tzinfo=zone)
+    custom = SimpleNamespace(
+        advance_booking_window_enabled=True,
+        minimum_notice_days=2,
+        maximum_advance_days=5,
+    )
+    earliest, latest = booking_window_bounds(custom, now)
+
+    assert earliest == datetime(2026, 9, 2, 10, 15, tzinfo=zone)
+    assert latest == datetime(2026, 9, 5, 23, 59, 59, 999999, tzinfo=zone)
+    assert not slot_within_custom_booking_window(
+        custom,
+        datetime(2026, 9, 2, 10, 0, tzinfo=zone),
+        now_local=now,
+    )
+    assert slot_within_custom_booking_window(
+        custom,
+        datetime(2026, 9, 2, 10, 15, tzinfo=zone),
+        now_local=now,
+    )
+
+    default = SimpleNamespace(advance_booking_window_enabled=False)
+    default_earliest, default_latest = booking_window_bounds(default, now)
+    assert default_earliest == datetime(2026, 8, 31, 12, 15, tzinfo=zone)
+    assert default_latest.date().isoformat() == "2026-09-15"
+
+
+def test_daily_booking_windows_supports_different_and_split_day_hours() -> None:
+    booking = SimpleNamespace(
+        weekly_schedule=[
+            {
+                "weekday": 1,
+                "intervals": [
+                    {"start_time": "09:00", "end_time": "12:00"},
+                    {"start_time": "14:00", "end_time": "18:00"},
+                ],
+            },
+            {
+                "weekday": 2,
+                "intervals": [{"start_time": "11:00", "end_time": "15:00"}],
+            },
+            {"weekday": 3, "intervals": []},
+        ]
+    )
+    zone = ZoneInfo("America/New_York")
+
+    assert daily_booking_windows(booking, datetime(2026, 8, 31).date()) == [
+        (540, 720),
+        (840, 1080),
+    ]
+    assert daily_booking_windows(booking, datetime(2026, 9, 1).date()) == [(660, 900)]
+    assert daily_booking_windows(booking, datetime(2026, 9, 2).date()) == []
+    assert slot_fits_daily_schedule(
+        booking,
+        datetime(2026, 8, 31, 14, 0, tzinfo=zone),
+        datetime(2026, 8, 31, 14, 30, tzinfo=zone),
+    )
+    assert not slot_fits_daily_schedule(
+        booking,
+        datetime(2026, 8, 31, 12, 0, tzinfo=zone),
+        datetime(2026, 8, 31, 14, 30, tzinfo=zone),
+    )
 
 
 def test_booking_block_preserves_the_full_break_including_buffers() -> None:

@@ -27,6 +27,24 @@ class BookingBlockedInterval(BaseModel):
         return self
 
 
+class BookingTimeRange(BaseModel):
+    start_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+    end_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> BookingTimeRange:
+        start = _time_minutes(self.start_time, "Schedule")
+        end = _time_minutes(self.end_time, "Schedule")
+        if end <= start:
+            raise ValueError("A schedule range must end after it starts")
+        return self
+
+
+class BookingDaySchedule(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    intervals: list[BookingTimeRange] = Field(default_factory=list, max_length=6)
+
+
 class UserBookingSettingsBase(BaseModel):
     enabled: bool = False
     slug: str | None = Field(default=None, min_length=3, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -48,6 +66,10 @@ class UserBookingSettingsBase(BaseModel):
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    weekly_schedule: list[BookingDaySchedule] = Field(default_factory=list, max_length=7)
+    advance_booking_window_enabled: bool = False
+    minimum_notice_days: int = Field(default=2, ge=0, le=365)
+    maximum_advance_days: int = Field(default=5, ge=1, le=365)
     blocked_intervals: list[BookingBlockedInterval] = Field(default_factory=list, max_length=56)
     booking_questions: dict[Literal["business_name", "phone", "requested_amount", "bank_statement"], bool] = Field(
         default_factory=lambda: {
@@ -67,6 +89,9 @@ class UserBookingSettingsBase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_booking_window(self) -> UserBookingSettingsBase:
+        if self.maximum_advance_days < self.minimum_notice_days:
+            raise ValueError("Latest booking day must be on or after the earliest booking day")
+
         for field_name in ("reminder_email_minutes", "reminder_sms_minutes"):
             values = getattr(self, field_name)
             if any(value < 15 or value > 10080 for value in values):
@@ -86,25 +111,74 @@ class UserBookingSettingsBase(BaseModel):
             raise ValueError("available_days must use 0=Sunday through 6=Saturday")
         self.available_days = days
 
-        start_h, start_m = [int(x) for x in self.start_time.split(":")]
-        end_h, end_m = [int(x) for x in self.end_time.split(":")]
-        start = start_h * 60 + start_m
-        end = end_h * 60 + end_m
-        if start_h > 23 or end_h > 23 or start_m > 59 or end_m > 59:
-            raise ValueError("start_time and end_time must be valid HH:MM values")
+        start = _time_minutes(self.start_time, "Booking")
+        end = _time_minutes(self.end_time, "Booking")
         if end - start < self.duration_min:
             raise ValueError("Booking end time must allow at least one meeting slot")
         if self.buffer_before_min + self.duration_min + self.buffer_after_min > 360:
             raise ValueError("Meeting length and buffers cannot exceed six hours")
 
+        schedules_by_day: dict[int, BookingDaySchedule] = {}
+        for schedule in self.weekly_schedule:
+            if schedule.weekday in schedules_by_day:
+                raise ValueError(f"Weekly schedule contains weekday {schedule.weekday} more than once")
+            intervals = sorted(schedule.intervals, key=lambda item: item.start_time)
+            for interval in intervals:
+                interval_start = _time_minutes(interval.start_time, "Schedule")
+                interval_end = _time_minutes(interval.end_time, "Schedule")
+                if interval_end - interval_start < self.duration_min:
+                    raise ValueError("Every schedule range must fit the default meeting duration")
+            for previous, current in zip(intervals, intervals[1:], strict=False):
+                if current.start_time < previous.end_time:
+                    raise ValueError(f"Schedule ranges cannot overlap for weekday {schedule.weekday}")
+            schedule.intervals = intervals
+            schedules_by_day[schedule.weekday] = schedule
+
+        if self.weekly_schedule:
+            self.weekly_schedule = [
+                schedules_by_day[weekday]
+                for weekday in sorted(schedules_by_day)
+            ]
+            active_ranges = [
+                interval
+                for schedule in self.weekly_schedule
+                for interval in schedule.intervals
+            ]
+            self.available_days = [
+                schedule.weekday
+                for schedule in self.weekly_schedule
+                if schedule.intervals
+            ]
+            if active_ranges:
+                self.start_time = min(item.start_time for item in active_ranges)
+                self.end_time = max(item.end_time for item in active_ranges)
+                start = _time_minutes(self.start_time, "Booking")
+                end = _time_minutes(self.end_time, "Booking")
+
         grouped: dict[str, list[BookingBlockedInterval]] = {}
         for interval in self.blocked_intervals:
-            interval_start_h, interval_start_m = [int(value) for value in interval.start_time.split(":")]
-            interval_end_h, interval_end_m = [int(value) for value in interval.end_time.split(":")]
-            interval_start = interval_start_h * 60 + interval_start_m
-            interval_end = interval_end_h * 60 + interval_end_m
-            if interval_start < start or interval_end > end:
-                raise ValueError("Blocked intervals must remain inside the daily booking start and end times")
+            interval_start = _time_minutes(interval.start_time, "Blocked")
+            interval_end = _time_minutes(interval.end_time, "Blocked")
+            weekday = (
+                interval.weekday
+                if interval.weekday is not None
+                else (interval.on_date.weekday() + 1) % 7
+            )
+            if self.weekly_schedule:
+                schedule = schedules_by_day.get(weekday)
+                schedule_intervals = schedule.intervals if schedule else []
+                if schedule_intervals:
+                    inside_schedule = any(
+                        interval_start >= _time_minutes(item.start_time, "Schedule")
+                        and interval_end <= _time_minutes(item.end_time, "Schedule")
+                        for item in schedule_intervals
+                    )
+                    if not inside_schedule:
+                        raise ValueError("Blocked intervals must remain inside one configured range for that day")
+            else:
+                schedule_start, schedule_end = start, end
+                if interval_start < schedule_start or interval_end > schedule_end:
+                    raise ValueError("Blocked intervals must remain inside the daily booking start and end times")
             group_key = (
                 f"weekday:{interval.weekday}"
                 if interval.weekday is not None
@@ -127,6 +201,13 @@ class UserBookingSettingsBase(BaseModel):
             ),
         )
         return self
+
+
+def _time_minutes(value: str, label: str) -> int:
+    hour, minute = [int(item) for item in value.split(":")]
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{label} times must be valid HH:MM values")
+    return hour * 60 + minute
 
 
 class UserBookingSettingsUpdate(UserBookingSettingsBase):

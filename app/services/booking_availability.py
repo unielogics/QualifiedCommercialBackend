@@ -1,7 +1,97 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
+
+DEFAULT_MINIMUM_NOTICE = timedelta(hours=2)
+DEFAULT_MAXIMUM_ADVANCE_DAYS = 15
+
+
+def booking_window_bounds(
+    booking: Any,
+    now_local: datetime,
+) -> tuple[datetime, datetime]:
+    """Return the rolling slot-list window in the booking timezone."""
+
+    if bool(getattr(booking, "advance_booking_window_enabled", False)):
+        minimum_days = max(0, int(getattr(booking, "minimum_notice_days", 2) or 0))
+        maximum_days = max(
+            minimum_days,
+            int(getattr(booking, "maximum_advance_days", 5) or 5),
+        )
+        earliest = now_local + timedelta(days=minimum_days)
+        latest = now_local + timedelta(days=maximum_days)
+    else:
+        earliest = now_local + DEFAULT_MINIMUM_NOTICE
+        latest = now_local + timedelta(days=DEFAULT_MAXIMUM_ADVANCE_DAYS)
+    return earliest, latest.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+
+def slot_within_custom_booking_window(
+    booking: Any,
+    slot_start: datetime,
+    *,
+    now_local: datetime,
+) -> bool:
+    """Apply the administrator's rolling window to manual calendar actions."""
+
+    if not bool(getattr(booking, "advance_booking_window_enabled", False)):
+        return True
+    earliest, latest = booking_window_bounds(booking, now_local)
+    return earliest <= slot_start <= latest
+
+
+def daily_booking_windows(
+    booking: Any,
+    day: date,
+) -> list[tuple[int, int]]:
+    """Return available minute ranges for one date, using legacy hours as fallback."""
+
+    weekday = (day.weekday() + 1) % 7
+    weekly_schedule = getattr(booking, "weekly_schedule", None) or []
+    if weekly_schedule:
+        for schedule in weekly_schedule:
+            schedule_weekday = _value(schedule, "weekday")
+            if schedule_weekday != weekday:
+                continue
+            windows: list[tuple[int, int]] = []
+            for interval in _value(schedule, "intervals") or []:
+                try:
+                    start = _parse_time_minutes(str(_value(interval, "start_time")))
+                    end = _parse_time_minutes(str(_value(interval, "end_time")))
+                except (TypeError, ValueError):
+                    continue
+                if end > start:
+                    windows.append((start, end))
+            return sorted(windows)
+        return []
+
+    available_days = getattr(booking, "available_days", None)
+    if available_days is None:
+        available_days = [1, 2, 3, 4, 5]
+    if weekday not in available_days:
+        return []
+    try:
+        start = _parse_time_minutes(str(getattr(booking, "start_time", "09:00") or "09:00"))
+        end = _parse_time_minutes(str(getattr(booking, "end_time", "17:00") or "17:00"))
+    except ValueError:
+        return []
+    return [(start, end)] if end > start else []
+
+
+def slot_fits_daily_schedule(
+    booking: Any,
+    slot_start: datetime,
+    slot_end: datetime,
+) -> bool:
+    if slot_start.date() != slot_end.date():
+        return False
+    start_minute = slot_start.hour * 60 + slot_start.minute
+    end_minute = slot_end.hour * 60 + slot_end.minute
+    return any(
+        start_minute >= window_start and end_minute <= window_end
+        for window_start, window_end in daily_booking_windows(booking, slot_start.date())
+    )
 
 
 def slot_overlaps_blocked_interval(
@@ -56,3 +146,14 @@ def _parse_time(value: str) -> tuple[int, int]:
     if hour > 23 or minute > 59:
         raise ValueError("Invalid time")
     return hour, minute
+
+
+def _parse_time_minutes(value: str) -> int:
+    hour, minute = _parse_time(value)
+    return hour * 60 + minute
+
+
+def _value(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)

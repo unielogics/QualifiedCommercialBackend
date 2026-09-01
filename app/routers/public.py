@@ -25,7 +25,6 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone, tzinfo
-from datetime import time as dt_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -43,7 +42,11 @@ from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
 from app.services import booking_notify, booking_reminders
 from app.services import fred as fred_service
-from app.services.booking_availability import slot_overlaps_blocked_interval
+from app.services.booking_availability import (
+    booking_window_bounds,
+    daily_booking_windows,
+    slot_overlaps_blocked_interval,
+)
 from app.services.google import calendar_sync
 from app.services.team_calendar import lock_calendar_owner
 
@@ -472,8 +475,8 @@ async def _available_booking_slots(
 ) -> list[PublicBookingSlot]:
     tz = _booking_tz(booking.timezone)
     now_local = datetime.now(tz)
-    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
-    window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    earliest_local, window_end_local = booking_window_bounds(booking, now_local)
+    earliest_local = _round_up_to_step(earliest_local, 5)
     live_google = await calendar_sync.busy_periods(
         db,
         user.id,
@@ -508,36 +511,34 @@ async def _available_booking_slots(
         for start, end in live_google.intervals
     )
 
-    start_min = _parse_hhmm(booking.start_time)
-    end_min = _parse_hhmm(booking.end_time)
     duration = timedelta(minutes=booking.duration_min)
     slots: list[PublicBookingSlot] = []
 
-    for offset in range(15):
-        day = now_local.date() + timedelta(days=offset)
-        if _js_weekday(day) not in booking.available_days:
-            continue
-        day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=tz)
-        day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=tz)
-        cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-        cursor = _round_up_to_step(cursor, 5)
-        while cursor + duration <= day_end:
-            slot_end = cursor + duration
-            if (
-                not slot_overlaps_blocked_interval(booking, cursor, slot_end)
-                and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
-            ):
-                starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
-                slots.append(
-                    PublicBookingSlot(
-                        starts_at=starts_utc,
-                        label=_slot_time_label(cursor),
-                        date_label=_slot_date_label(cursor),
+    day_count = (window_end_local.date() - earliest_local.date()).days + 1
+    for offset in range(max(0, day_count)):
+        day = earliest_local.date() + timedelta(days=offset)
+        for start_min, end_min in daily_booking_windows(booking, day):
+            day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz) + timedelta(minutes=start_min)
+            day_end = datetime.combine(day, datetime.min.time(), tzinfo=tz) + timedelta(minutes=end_min)
+            cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
+            cursor = _round_up_to_step(cursor, 5)
+            while cursor + duration <= day_end:
+                slot_end = cursor + duration
+                if (
+                    not slot_overlaps_blocked_interval(booking, cursor, slot_end)
+                    and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
+                ):
+                    starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                    slots.append(
+                        PublicBookingSlot(
+                            starts_at=starts_utc,
+                            label=_slot_time_label(cursor),
+                            date_label=_slot_date_label(cursor),
+                        )
                     )
-                )
-                if len(slots) >= 80:
-                    return slots
-            cursor += timedelta(minutes=5)
+                    if len(slots) >= 80:
+                        return slots
+                cursor += timedelta(minutes=5)
     return slots
 
 
@@ -549,15 +550,6 @@ def _booking_tz(name: str) -> tzinfo:
             return ZoneInfo("America/New_York")
         except ZoneInfoNotFoundError:
             return timezone.utc
-
-
-def _parse_hhmm(value: str) -> int:
-    hours, minutes = [int(part) for part in value.split(":")]
-    return hours * 60 + minutes
-
-
-def _js_weekday(day) -> int:
-    return (day.weekday() + 1) % 7
 
 
 def _round_up_to_step(value: datetime, step_min: int) -> datetime:

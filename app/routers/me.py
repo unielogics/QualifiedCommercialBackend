@@ -122,6 +122,17 @@ def _presigned_get_url(s3_key: str | None) -> str | None:
 
 
 def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
+    weekly_schedule = row.weekly_schedule or [
+        {
+            "weekday": weekday,
+            "intervals": (
+                [{"start_time": row.start_time, "end_time": row.end_time}]
+                if weekday in (row.available_days or [1, 2, 3, 4, 5])
+                else []
+            ),
+        }
+        for weekday in range(7)
+    ]
     return UserBookingSettingsRead(
         id=str(row.id),
         user_id=str(row.user_id),
@@ -145,6 +156,10 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
         google_meet_enabled=row.google_meet_enabled,
         timezone=row.timezone,
         available_days=row.available_days or [1, 2, 3, 4, 5],
+        weekly_schedule=weekly_schedule,
+        advance_booking_window_enabled=row.advance_booking_window_enabled,
+        minimum_notice_days=row.minimum_notice_days,
+        maximum_advance_days=row.maximum_advance_days,
         blocked_intervals=row.blocked_intervals or [],
         booking_questions=row.booking_questions or {
             "business_name": True,
@@ -328,6 +343,10 @@ async def put_booking_settings(
     row.google_meet_enabled = payload.google_meet_enabled
     row.timezone = payload.timezone
     row.available_days = payload.available_days
+    row.weekly_schedule = [schedule.model_dump() for schedule in payload.weekly_schedule]
+    row.advance_booking_window_enabled = payload.advance_booking_window_enabled
+    row.minimum_notice_days = payload.minimum_notice_days
+    row.maximum_advance_days = payload.maximum_advance_days
     row.blocked_intervals = [interval.model_dump() for interval in payload.blocked_intervals]
     row.booking_questions = dict(payload.booking_questions)
     row.no_show_follow_up_enabled = payload.no_show_follow_up_enabled

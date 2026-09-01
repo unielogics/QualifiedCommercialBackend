@@ -60,6 +60,30 @@ class BookingSettings(TimestampMixin, Base):
         default=lambda: [1, 2, 3, 4, 5],
         server_default="[1,2,3,4,5]",
     )
+    weekly_schedule: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    advance_booking_window_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    minimum_notice_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=2,
+        server_default="2",
+    )
+    maximum_advance_days: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=5,
+        server_default="5",
+    )
     blocked_intervals: Mapped[list[dict[str, object]]] = mapped_column(
         JSONB,
         nullable=False,

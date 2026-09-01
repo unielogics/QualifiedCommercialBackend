@@ -16,7 +16,7 @@ import re
 import secrets
 import zipfile
 from dataclasses import asdict
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -40,7 +40,13 @@ from app.models.loan import Loan
 from app.models.application_profile import ApplicationProfile, ApplicationTaxonomyEntry, PlaidAssetReport
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.booking_settings import BookingSettings
-from app.services.booking_availability import slot_overlaps_blocked_interval
+from app.services.booking_availability import (
+    booking_window_bounds,
+    daily_booking_windows,
+    slot_fits_daily_schedule,
+    slot_overlaps_blocked_interval,
+    slot_within_custom_booking_window,
+)
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.event import CalendarEvent
 from app.models.notification import Notification
@@ -5782,15 +5788,6 @@ def _to_utc_minute(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
-def _parse_hhmm(value: str) -> int:
-    hours, minutes = [int(part) for part in value.split(":")]
-    return hours * 60 + minutes
-
-
-def _js_weekday(day: date) -> int:
-    return (day.weekday() + 1) % 7
-
-
 def _round_up_to_step(value: datetime, step_min: int) -> datetime:
     value = value.replace(second=0, microsecond=0)
     remainder = value.minute % step_min
@@ -5850,8 +5847,8 @@ async def _booking_slots(
     zone = rep_workflows.tz(booking.timezone)
     duration = duration_min or booking.duration_min or 30
     now_local = datetime.now(zone)
-    earliest_local = _round_up_to_step(now_local + timedelta(hours=2), 5)
-    window_end_local = (now_local + timedelta(days=15)).replace(hour=23, minute=59, second=0, microsecond=0)
+    earliest_local, window_end_local = booking_window_bounds(booking, now_local)
+    earliest_local = _round_up_to_step(earliest_local, 5)
     live_google = await calendar_sync.busy_periods(
         db,
         host.id,
@@ -5907,41 +5904,39 @@ async def _booking_slots(
             start.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
             end.astimezone(zone) + timedelta(minutes=booking.buffer_after_min),
         ))
-    start_min = _parse_hhmm(booking.start_time or "09:00")
-    end_min = _parse_hhmm(booking.end_time or "17:00")
     slot_duration = timedelta(minutes=duration)
     slots: list[BookingAvailabilitySlot] = []
-    for offset in range(15):
-        day = now_local.date() + timedelta(days=offset)
-        if _js_weekday(day) not in (booking.available_days or [1, 2, 3, 4, 5]):
-            continue
-        day_start = datetime.combine(day, dt_time(start_min // 60, start_min % 60), tzinfo=zone)
-        day_end = datetime.combine(day, dt_time(end_min // 60, end_min % 60), tzinfo=zone)
-        cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-        cursor = _round_up_to_step(cursor, 5)
-        while cursor + slot_duration <= day_end:
-            slot_end = cursor + slot_duration
-            if (
-                not slot_overlaps_blocked_interval(booking, cursor, slot_end)
-                and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
-            ):
-                starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
-                slots.append(BookingAvailabilitySlot(
-                    starts_at=starts_utc,
-                    label=_time_label(cursor),
-                    date_label=_date_label(cursor),
-                ))
-                if len(slots) >= 80:
-                    return BookingAvailabilityRead(
-                        timezone=booking.timezone,
-                        duration_min=duration,
-                        buffer_before_min=booking.buffer_before_min,
-                        buffer_after_min=booking.buffer_after_min,
-                        host_name=host.name,
-                        calendar_sync_status=live_google.status,
-                        slots=slots,
-                    )
-            cursor += timedelta(minutes=5)
+    day_count = (window_end_local.date() - earliest_local.date()).days + 1
+    for offset in range(max(0, day_count)):
+        day = earliest_local.date() + timedelta(days=offset)
+        for start_min, end_min in daily_booking_windows(booking, day):
+            day_start = datetime.combine(day, datetime.min.time(), tzinfo=zone) + timedelta(minutes=start_min)
+            day_end = datetime.combine(day, datetime.min.time(), tzinfo=zone) + timedelta(minutes=end_min)
+            cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
+            cursor = _round_up_to_step(cursor, 5)
+            while cursor + slot_duration <= day_end:
+                slot_end = cursor + slot_duration
+                if (
+                    not slot_overlaps_blocked_interval(booking, cursor, slot_end)
+                    and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
+                ):
+                    starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
+                    slots.append(BookingAvailabilitySlot(
+                        starts_at=starts_utc,
+                        label=_time_label(cursor),
+                        date_label=_date_label(cursor),
+                    ))
+                    if len(slots) >= 80:
+                        return BookingAvailabilityRead(
+                            timezone=booking.timezone,
+                            duration_min=duration,
+                            buffer_before_min=booking.buffer_before_min,
+                            buffer_after_min=booking.buffer_after_min,
+                            host_name=host.name,
+                            calendar_sync_status=live_google.status,
+                            slots=slots,
+                        )
+                cursor += timedelta(minutes=5)
     return BookingAvailabilityRead(
         timezone=booking.timezone,
         duration_min=duration,
@@ -5969,15 +5964,14 @@ async def _appointment_slot_is_available(
     zone = rep_workflows.tz(booking.timezone)
     local_start = starts_at.astimezone(zone)
     local_end = local_start + timedelta(minutes=duration_min)
-    if local_start.date() != local_end.date():
+    now_local = datetime.now(zone)
+    if not slot_within_custom_booking_window(
+        booking,
+        local_start,
+        now_local=now_local,
+    ):
         return False
-    if _js_weekday(local_start.date()) not in (booking.available_days or [1, 2, 3, 4, 5]):
-        return False
-    start_min = _parse_hhmm(booking.start_time or "09:00")
-    end_min = _parse_hhmm(booking.end_time or "17:00")
-    local_start_min = local_start.hour * 60 + local_start.minute
-    local_end_min = local_end.hour * 60 + local_end.minute
-    if local_start_min < start_min or local_end_min > end_min:
+    if not slot_fits_daily_schedule(booking, local_start, local_end):
         return False
     if slot_overlaps_blocked_interval(booking, local_start, local_end):
         return False
