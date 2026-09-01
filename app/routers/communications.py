@@ -352,19 +352,23 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
     if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         stmt = stmt.where(SmsMessage.client_id.in_(scope_client_query(user, select(Client.id))))
     rows = list((await db.execute(stmt)).all())
+    # Keyed on the NUMBER, not the client. Texting is a conversation with a
+    # phone: an outbound send with no client link and the inbound reply that
+    # matched a client are the same thread to everyone except the database.
     grouped: dict[str, list[tuple[SmsMessage, Client | None]]] = {}
     for message, client in rows:
-        key = f"client:{client.id}" if client is not None else f"phone:{message.phone_e164}"
-        grouped.setdefault(key, []).append((message, client))
+        grouped.setdefault(message.phone_e164, []).append((message, client))
     result = []
     for key, members in grouped.items():
-        latest, client = members[-1]
+        latest, _ = members[-1]
+        # Any message on this number that resolved to a client names the thread.
+        client = next((c for _, c in reversed(members) if c is not None), None)
         # A blocked or failed send is worth surfacing in the preview — "why
         # didn't the text go out" should be visible from the inbox row.
         snippet = latest.body or latest.detail or latest.status
         result.append(
             UnifiedCommunicationThread(
-                id=f"sms:{key}",
+                id=f"sms:phone:{key}",
                 title=(client.name if client is not None else latest.phone_e164),
                 participant_name=client.name if client is not None else None,
                 participant_email=client.email if client is not None else None,
@@ -514,16 +518,44 @@ async def list_communication_contacts(
     """
     threads = await _all_threads(db, user)
 
-    def identity(row: UnifiedCommunicationThread) -> str:
+    # Identity by union rather than a single key. A person's outbound texts may
+    # carry only a phone while their inbound reply matched a client record and
+    # carries an email too — keyed on one field each, the same human split into
+    # two contacts. Threads are merged when they share ANY identifier.
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def keys_of(row: UnifiedCommunicationThread) -> list[str]:
+        out = []
         if row.participant_email:
-            return f"em:{row.participant_email.strip().lower()}"
+            out.append(f"em:{row.participant_email.strip().lower()}")
         if row.participant_phone:
-            return f"ph:{row.participant_phone}"
-        return f"src:{row.source_kind}:{row.source_id}"
+            out.append(f"ph:{row.participant_phone.strip()}")
+        if not out:
+            out.append(f"src:{row.source_kind}:{row.source_id}")
+        return out
+
+    thread_keys: list[tuple[UnifiedCommunicationThread, str]] = []
+    for row in threads:
+        ks = keys_of(row)
+        for k in ks[1:]:
+            union(ks[0], k)
+        thread_keys.append((row, ks[0]))
 
     grouped: dict[str, list[UnifiedCommunicationThread]] = {}
-    for row in threads:
-        grouped.setdefault(identity(row), []).append(row)
+    for row, k in thread_keys:
+        grouped.setdefault(find(k), []).append(row)
 
     contacts: list[UnifiedContactGroup] = []
     for key, rows in grouped.items():
@@ -632,7 +664,6 @@ async def compose_new_message(
         if client is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
         name, email, phone, client_id = client.name, client.email, client.phone, client.id
-        thread_id = f"sms:client:{client.id}"
     elif payload.recipient_kind == "intake":
         intake = next((i for i in await _visible_intakes(db, user) if str(i.id) == payload.recipient_id), None)
         if intake is None:
@@ -657,7 +688,7 @@ async def compose_new_message(
                 db, to_phone=phone, body=body, client_id=client_id, context="manual"
             )
             results.append(ComposeChannelResult(channel="sms", ok=sms_result.ok, detail=sms_result.detail))
-            if sms_result.ok and thread_id is None:
+            if sms_result.ok:
                 from app.dealer_os.services.consent_delivery import normalize_phone
 
                 normalized = normalize_phone(phone)
@@ -746,10 +777,8 @@ async def get_unified_communication_thread(
             ) for row in rows
         ]
     elif parts[0] == "sms":
-        if parts[1] == "client":
-            stmt = select(SmsMessage).where(SmsMessage.client_id == UUID(parts[2]))
-        else:
-            stmt = select(SmsMessage).where(SmsMessage.phone_e164 == parts[2], SmsMessage.client_id.is_(None))
+        # Every message on this number, client-linked or not — see _sms_threads.
+        stmt = select(SmsMessage).where(SmsMessage.phone_e164 == parts[2])
         rows = list((await db.execute(stmt.order_by(SmsMessage.created_at.asc()))).scalars().all())
         messages = [
             UnifiedCommunicationMessage(
@@ -835,17 +864,20 @@ async def reply_unified_communication_thread(
     elif parts[0] == "sms":
         from app.services import sms as sms_service
 
-        if parts[1] == "client":
-            client = await db.get(Client, UUID(parts[2]))
-            if client is None or not client.phone:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Client has no phone number")
-            result = await sms_service.send_sms_checked(
-                db, to_phone=client.phone, body=body, client_id=client.id, context="manual"
+        phone = parts[2]
+        # Keep the reply attached to whoever this number already resolved to,
+        # so the thread does not fork the moment we answer it.
+        linked = (
+            await db.execute(
+                select(SmsMessage.client_id)
+                .where(SmsMessage.phone_e164 == phone, SmsMessage.client_id.is_not(None))
+                .order_by(SmsMessage.created_at.desc())
+                .limit(1)
             )
-        else:
-            result = await sms_service.send_sms_checked(
-                db, to_phone=parts[2], body=body, context="manual"
-            )
+        ).scalar_one_or_none()
+        result = await sms_service.send_sms_checked(
+            db, to_phone=phone, body=body, client_id=linked, context="manual"
+        )
         await db.commit()
         if not result.ok:
             # The blocked/failed row is already in the ledger; the composer

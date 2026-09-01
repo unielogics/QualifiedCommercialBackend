@@ -130,6 +130,21 @@ async def gmail_push(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def _parse_occurred_at(value: object) -> datetime | None:
+    """When the handset actually got the message.
+
+    The inbox poller can surface a reply minutes after it landed, so dating a
+    row by ingest time would misorder the conversation for whoever reads it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        log.warning("sms webhook: unparseable occurredAt %r", value[:40])
+        return None
+
+
 async def _store_inbound_sms(
     *,
     provider: str,
@@ -137,6 +152,7 @@ async def _store_inbound_sms(
     from_phone: str,
     to_phone: str | None,
     body: str,
+    occurred_at: datetime | None = None,
 ) -> Response:
     async with SessionLocal() as db:
         if provider_id:
@@ -181,6 +197,7 @@ async def _store_inbound_sms(
             detail="opt-out" if is_stop else "",
             context="reply",
             client_id=ledger_client.id if ledger_client is not None else None,
+            occurred_at=occurred_at,
         )
 
         if is_stop:
@@ -703,6 +720,7 @@ async def sms_inbound(request: Request) -> Response:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     is_stop = optout.is_opt_out_keyword(message)
+    occurred_at = _parse_occurred_at((body or {}).get("occurredAt"))
     async with SessionLocal() as db:
         # Every reply becomes a ledger row, matched to a client when the number
         # is known — this is what puts inbound texts on the client's screen
@@ -718,6 +736,7 @@ async def sms_inbound(request: Request) -> Response:
             detail="opt-out" if is_stop else "",
             context="reply",
             client_id=client.id if client is not None else None,
+            occurred_at=occurred_at,
         )
         if is_stop:
             await optout.record_opt_out(

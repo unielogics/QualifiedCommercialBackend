@@ -32,7 +32,14 @@ async def record(
     detail: str = "",
     context: str = "",
     client_id=None,
+    occurred_at: datetime | None = None,
 ) -> SmsMessage | None:
+    """`occurred_at` is when the message actually happened on the wire.
+
+    Defaults to now. The inbox poller can surface a reply minutes after it
+    reached the handset, and dating the row by ingest time would misorder the
+    conversation for whoever reads it later.
+    """
     try:
         row = SmsMessage(
             direction=direction,
@@ -45,6 +52,8 @@ async def record(
             context=context[:32],
             client_id=client_id,
         )
+        if occurred_at is not None:
+            row.created_at = occurred_at
         db.add(row)
         await db.flush()
         return row
