@@ -49,7 +49,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.dealer_os.models import DealerRepContact, DealerRepInboxMessage, DealerRepInboxThread
 from app.dealer_os.services import consent_delivery, rep_workflows
-from app.dealer_os.services import sms_consent as sms_consent_svc
+from app.enums import Role
 from app.models.billing import (
     BillableExpense,
     ChargeAttempt,
@@ -57,6 +57,12 @@ from app.models.billing import (
     PaymentAuthorization,
 )
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
+from app.models.sms_message import SmsMessage
+from app.services.notifications import (
+    client_agent_user_ids,
+    notify_inbound_communication,
+    users_with_roles,
+)
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +171,16 @@ async def _store_inbound_sms(
                     )
                 )
             ).scalar_one_or_none()
+            if duplicate is None:
+                duplicate = (
+                    await db.execute(
+                        select(SmsMessage.id).where(
+                            SmsMessage.provider.in_(provider_names),
+                            SmsMessage.provider_message_id == provider_id[:64],
+                            SmsMessage.direction == "inbound",
+                        )
+                    )
+                ).scalar_one_or_none()
             if duplicate is not None:
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -186,7 +202,7 @@ async def _store_inbound_sms(
 
         is_stop = rep_workflows.is_stop_message(body)
         ledger_client = await sms_ledger.client_for_phone(db, from_phone)
-        await sms_ledger.record(
+        ledger_row = await sms_ledger.record(
             db,
             direction="inbound",
             phone_e164=from_phone,
@@ -200,6 +216,22 @@ async def _store_inbound_sms(
             occurred_at=occurred_at,
         )
 
+        recipient_ids = {contact.owner_user_id for contact in contacts if contact.owner_user_id}
+        if ledger_client is not None:
+            recipient_ids.update(await client_agent_user_ids(db, ledger_client))
+        if not recipient_ids:
+            recipient_ids.update(
+                user.id for user in await users_with_roles(db, Role.LOAN_EXEC, Role.SUPER_ADMIN)
+            )
+        sender_label = (
+            contacts[0].full_name
+            if contacts
+            else ledger_client.name
+            if ledger_client is not None
+            else from_phone
+        )
+        sms_thread_id = f"sms:phone:{from_phone}"
+
         if is_stop:
             # record_opt_out writes the suppression row (needed even when the
             # number never held a grant — revoke alone matches nothing then)
@@ -212,6 +244,15 @@ async def _store_inbound_sms(
             for contact in contacts:
                 contact.sms_opted_out_at = now
                 contact.last_activity_at = now
+            await notify_inbound_communication(
+                db,
+                recipient_ids=recipient_ids,
+                channel="sms",
+                sender_label=sender_label,
+                thread_id=sms_thread_id,
+                message_id=str(ledger_row.id) if ledger_row is not None else provider_id,
+                subject="Opt-out request received",
+            )
             await db.commit()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -219,6 +260,14 @@ async def _store_inbound_sms(
         if contact is None or contact.owner_user_id is None:
             log.warning("%s sms webhook: no rep contact for sender=%s", provider, from_phone)
             # No rep thread to file it under, but the ledger row above stands.
+            await notify_inbound_communication(
+                db,
+                recipient_ids=recipient_ids,
+                channel="sms",
+                sender_label=sender_label,
+                thread_id=sms_thread_id,
+                message_id=str(ledger_row.id) if ledger_row is not None else provider_id,
+            )
             await db.commit()
             return Response(status_code=status.HTTP_202_ACCEPTED)
 
@@ -251,26 +300,34 @@ async def _store_inbound_sms(
             )
             db.add(thread)
             await db.flush()
-        db.add(
-            DealerRepInboxMessage(
-                thread_id=thread.id,
-                owner_user_id=thread.owner_user_id,
-                contact_id=contact.id,
-                dealer_id=thread.dealer_id,
-                direction="inbound",
-                channel="sms",
-                subject=thread.subject,
-                body=body,
-                provider=provider,
-                provider_message_id=provider_id,
-                delivery_status="received",
-                sender=from_phone,
-                recipient=to_phone,
-            )
+        message_row = DealerRepInboxMessage(
+            thread_id=thread.id,
+            owner_user_id=thread.owner_user_id,
+            contact_id=contact.id,
+            dealer_id=thread.dealer_id,
+            direction="inbound",
+            channel="sms",
+            subject=thread.subject,
+            body=body,
+            provider=provider,
+            provider_message_id=provider_id,
+            delivery_status="received",
+            sender=from_phone,
+            recipient=to_phone,
         )
+        db.add(message_row)
         thread.last_message_at = now
         thread.unread_count = int(thread.unread_count or 0) + 1
         contact.last_activity_at = now
+        await db.flush()
+        await notify_inbound_communication(
+            db,
+            recipient_ids=recipient_ids,
+            channel="sms",
+            sender_label=sender_label,
+            thread_id=sms_thread_id,
+            message_id=str(message_row.id),
+        )
         await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -662,16 +719,9 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
 async def sms_inbound(request: Request) -> Response:
     """An inbound SMS reply, forwarded by QCRelay.
 
-    The only thing acted on here is an opt-out, and that is deliberate. STOP is
-    the one inbound message with a legal consequence, and it has to be honoured
-    whether or not the sender was ever a client, ever granted consent, or exists
-    in the database at all — which is exactly why the suppression list needs no
-    prior grant to write to.
-
-    Every reply is recorded to the sms_messages ledger and matched to a
-    client by number where possible, so inbound texts appear in the client's
-    SMS history. Carrier state events (sms:sent / sms:delivered) advance the
-    matching outbound row instead.
+    Every reply uses the same ingestion path as AWS and Twilio: record the SMS
+    ledger, update any rep thread, honour STOP, and create a durable notification
+    for the responsible user. Carrier state events only advance outbound rows.
 
     Acks 204 on anything it understands. The relay should not retry a message we
     have already recorded, and a retry storm on a malformed payload would be
@@ -692,7 +742,7 @@ async def sms_inbound(request: Request) -> Response:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     from app.dealer_os.services.consent_delivery import normalize_phone
-    from app.services.sms import ledger, optout
+    from app.services.sms import ledger
 
     event = (body or {}).get("event") or "sms:received"
 
@@ -719,36 +769,12 @@ async def sms_inbound(request: Request) -> Response:
         log.warning("sms webhook: inbound from an unusable number, ignored")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    is_stop = optout.is_opt_out_keyword(message)
     occurred_at = _parse_occurred_at((body or {}).get("occurredAt"))
-    async with SessionLocal() as db:
-        # Every reply becomes a ledger row, matched to a client when the number
-        # is known — this is what puts inbound texts on the client's screen
-        # instead of leaving them in a file on the relay.
-        client = await ledger.client_for_phone(db, phone)
-        await ledger.record(
-            db,
-            direction="inbound",
-            phone_e164=phone,
-            status="received",
-            body=message,
-            provider="android",
-            detail="opt-out" if is_stop else "",
-            context="reply",
-            client_id=client.id if client is not None else None,
-            occurred_at=occurred_at,
-        )
-        if is_stop:
-            await optout.record_opt_out(
-                db,
-                phone_e164=phone,
-                reason=message.strip()[:120] or "STOP",
-                source="sms_reply",
-                note="received via QCRelay",
-            )
-        await db.commit()
-    if is_stop:
-        log.info("sms webhook: opt-out honoured for %s", phone)
-    else:
-        log.info("sms webhook: reply recorded from %s client=%s", phone, bool(client))
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return await _store_inbound_sms(
+        provider="android",
+        provider_id=_first_str((body or {}).get("messageId")),
+        from_phone=phone,
+        to_phone=normalize_phone((body or {}).get("to") or ""),
+        body=message,
+        occurred_at=occurred_at,
+    )

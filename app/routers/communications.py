@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import false as sql_false, func, or_, select
+from sqlalchemy import false as sql_false
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -25,18 +26,19 @@ from app.models.client import Client
 from app.models.email_message import EmailMessage
 from app.models.loan import Loan
 from app.models.message import Message
+from app.models.notification import Notification
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
-from app.models.user import User
 from app.models.sms_message import SmsMessage
+from app.models.user import User
 from app.schemas.communication import (
+    ComposeChannelResult,
+    ComposeRecipient,
     UnifiedCommunicationCompose,
     UnifiedCommunicationMessage,
     UnifiedCommunicationSeen,
     UnifiedCommunicationThread,
     UnifiedCommunicationThreadDetail,
     UnifiedCommunicationThreadPage,
-    ComposeChannelResult,
-    ComposeRecipient,
     UnifiedComposeRequest,
     UnifiedComposeResult,
     UnifiedContactGroup,
@@ -1153,7 +1155,6 @@ async def mark_unified_communication_seen(
             for row in rows:
                 row.read_at = seen_at
             thread.unread_count = 0
-            await db.commit()
     elif parts[0] == "email":
         key = ":".join(parts[1:])
         from app.routers.inbox import _load_thread_rows
@@ -1161,5 +1162,15 @@ async def mark_unified_communication_seen(
         rows = await _load_thread_rows(db, owner_id=user.id, thread_id=key)
         for row in rows:
             row.is_read = True
-        await db.commit()
+    await db.execute(
+        update(Notification)
+        .where(
+            Notification.recipient_user_id == user.id,
+            Notification.target_type == "communication_thread",
+            Notification.target_id == thread_id,
+            Notification.read_at.is_(None),
+        )
+        .values(read_at=seen_at)
+    )
+    await db.commit()
     return UnifiedCommunicationSeen(thread_id=thread_id, seen_at=seen_at)

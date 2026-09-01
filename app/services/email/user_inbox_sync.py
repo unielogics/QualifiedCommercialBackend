@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 from sqlalchemy import func, select
@@ -29,8 +29,9 @@ from app.models.activity import Activity
 from app.models.email_message import EmailMessage
 from app.models.user import User
 from app.services.email import inbound_poller as _poller
-from app.services.email.gmail_client import gmail_config, get_gmail_service
+from app.services.email.gmail_client import get_gmail_service, gmail_config
 from app.services.email.inbox_matcher import match_inbound
+from app.services.notifications import notify_inbound_communication
 
 log = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def _received_at(headers: dict[str, str]) -> datetime | None:
     try:
         dt = parsedate_to_datetime(raw)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
     except Exception:  # noqa: BLE001
         return None
@@ -232,6 +233,17 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
         has_attachments=bool(attachments),
     )
     db.add(row)
+    await db.flush()
+    thread_key = row.gmail_thread_id or str(row.id)
+    await notify_inbound_communication(
+        db,
+        recipient_ids={owner_user_id},
+        channel="email",
+        sender_label=from_email,
+        thread_id=f"email:{thread_key}",
+        message_id=str(row.id),
+        subject=subject,
+    )
 
     # Body-less breadcrumbs on the SHARED loan/client feeds (isolation rule 2):
     # sender/subject/time only — the body lives solely in the owner's inbox.

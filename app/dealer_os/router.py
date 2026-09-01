@@ -55,7 +55,7 @@ from app.services import application_profiles as application_profile_service
 from app.services import calendar_v2
 from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders
-from app.services.notifications import notify_users
+from app.services.notifications import notify_inbound_communication, notify_users
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle
 from app.services.email import ses_client
@@ -7017,6 +7017,16 @@ async def _append_rep_inbox_message(
     if contact is not None:
         contact.last_activity_at = now
     await db.flush()
+    if direction == "inbound" and thread.owner_user_id is not None:
+        await notify_inbound_communication(
+            db,
+            recipient_ids={thread.owner_user_id},
+            channel=channel,
+            sender_label=(contact.full_name if contact is not None else sender),
+            thread_id=f"rep:{thread.id}",
+            message_id=str(msg.id),
+            subject=subject,
+        )
     return msg
 
 

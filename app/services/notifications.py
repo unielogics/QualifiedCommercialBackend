@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 from sqlalchemy import select
@@ -103,7 +104,7 @@ async def notify_users(
     if not recipients:
         return []
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     channels = ["in_app"]
     if push:
         channels.append("push")
@@ -177,6 +178,47 @@ async def notify_users(
             row.emailed_at = now
     await db.flush()
     return rows
+
+
+async def notify_inbound_communication(
+    db: AsyncSession,
+    *,
+    recipient_ids: set[UUID],
+    channel: str,
+    sender_label: str | None,
+    thread_id: str,
+    message_id: str | None = None,
+    subject: str | None = None,
+) -> list[Notification]:
+    """Create one durable in-app notification for one inbound communication.
+
+    These are intentionally not batched. Each received email or text remains
+    independently reviewable until the recipient opens its thread or clears
+    notifications. Message bodies stay out of this general-purpose table.
+    """
+    normalized_channel = "email" if channel == "email" else "SMS"
+    sender = (sender_label or "Unknown sender").strip() or "Unknown sender"
+    clean_subject = " ".join((subject or "").split())[:180]
+    body = clean_subject if clean_subject else "Open Inbox to review this message."
+    return await notify_users(
+        db,
+        recipient_ids=recipient_ids,
+        event_type=f"{channel}_received",
+        category="messages",
+        priority="high",
+        title=f"New {normalized_channel} from {sender}",
+        body=body,
+        target_type="communication_thread",
+        target_id=thread_id,
+        deep_link=f"/inbox?thread={quote(thread_id, safe='')}",
+        meta={
+            "channel": channel,
+            "thread_id": thread_id,
+            "message_id": message_id,
+        },
+        email=False,
+        push=True,
+    )
 
 
 async def _send_email_best_effort(to_email: str, *, subject: str, body: str) -> None:

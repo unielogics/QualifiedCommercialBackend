@@ -19,14 +19,21 @@ in `pending` for manual broker action.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.enums import AITaskPriority, AITaskSource, AITaskStatus, EmailDraftStatus, ParticipantRole
+from app.enums import (
+    AITaskPriority,
+    AITaskSource,
+    AITaskStatus,
+    EmailDraftStatus,
+    ParticipantRole,
+    Role,
+)
 from app.models.activity import Activity
 from app.models.ai_task import AITask
 from app.models.email_draft import EmailDraft
@@ -34,6 +41,11 @@ from app.models.loan import Loan
 from app.models.loan_participant import LoanParticipant
 from app.services.email.parser import inject_deal_id
 from app.services.email.pii_filter import RedactionContext, reframe_request_for_broker
+from app.services.notifications import (
+    loan_agent_user_ids,
+    notify_inbound_communication,
+    users_with_roles,
+)
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +147,20 @@ async def process_inbound(db: AsyncSession, email: InboundEmail) -> InboundResul
 
     participants = await _participants(db, loan.id)
     sender_role = _lookup_role(participants, email.sender)
+
+    recipients = await loan_agent_user_ids(db, loan)
+    if not recipients:
+        recipients.update(
+            user.id for user in await users_with_roles(db, Role.LOAN_EXEC, Role.SUPER_ADMIN)
+        )
+    await notify_inbound_communication(
+        db,
+        recipient_ids=recipients,
+        channel="email",
+        sender_label=email.sender,
+        thread_id=f"loan:{loan.id}",
+        subject=email.subject,
+    )
 
     db.add(
         Activity(
