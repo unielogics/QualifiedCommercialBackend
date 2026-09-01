@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -123,6 +124,67 @@ async def _processed_ids(db: AsyncSession, mailbox: str) -> set[str]:
         await db.execute(select(EmailMessage.gmail_message_id).where(EmailMessage.mailbox == mailbox))
     ).scalars().all()
     return set(rows)
+
+
+def _thread_subject_key(subject: str) -> str:
+    value = subject.strip().lower()
+    while re.match(r"^(re|fw|fwd)\s*:", value):
+        value = re.sub(r"^(re|fw|fwd)\s*:\s*", "", value)
+    return " ".join(value.split())[:200]
+
+
+async def _mirror_file_email_reply(
+    db: AsyncSession,
+    *,
+    from_email: str | None,
+    mailbox: str,
+    subject: str,
+    body: str | None,
+    gmail_id: str,
+) -> None:
+    """Attach an inbound Gmail reply to its provider-backed file thread.
+
+    Exact sender and normalized-subject matching keeps unrelated mailbox mail
+    out of a funding file while allowing the file and Inbox to share history.
+    """
+    if not from_email or not subject:
+        return
+    from app.dealer_os.models import DealerRepContact, DealerRepInboxThread
+    from app.dealer_os.router import _append_rep_inbox_message
+
+    subject_key = _thread_subject_key(subject)
+    row = (
+        await db.execute(
+            select(DealerRepInboxThread, DealerRepContact)
+            .join(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+            .where(
+                func.lower(DealerRepContact.email) == from_email.lower(),
+                DealerRepInboxThread.channel == "email",
+                DealerRepInboxThread.status == "open",
+                DealerRepInboxThread.subject_key == subject_key,
+                DealerRepInboxThread.dealer_id.is_not(None),
+            )
+            .order_by(DealerRepInboxThread.last_message_at.desc().nullslast())
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        return
+    thread, contact = row
+    await _append_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        direction="inbound",
+        channel="email",
+        subject=subject,
+        body=body or subject,
+        provider="gmail",
+        provider_message_id=gmail_id,
+        delivery_status="received",
+        sender=from_email,
+        recipient=mailbox,
+    )
 
 
 async def run_user_inbox_sync() -> dict[str, int]:
@@ -243,6 +305,14 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
         thread_id=f"email:{thread_key}",
         message_id=str(row.id),
         subject=subject,
+    )
+    await _mirror_file_email_reply(
+        db,
+        from_email=from_email,
+        mailbox=mailbox,
+        subject=subject,
+        body=body_text,
+        gmail_id=gmail_id,
     )
 
     # Body-less breadcrumbs on the SHARED loan/client feeds (isolation rule 2):

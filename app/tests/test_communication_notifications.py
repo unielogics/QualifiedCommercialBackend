@@ -7,6 +7,7 @@ from app.dealer_os import router as dealer_router
 from app.dealer_os.models import DealerRepContact, DealerRepInboxThread
 from app.routers import notifications as notification_router
 from app.services import notifications
+from app.services.email.user_inbox_sync import _thread_subject_key
 
 
 class _FakeSession:
@@ -102,3 +103,10 @@ async def test_rep_inbox_append_creates_notification_for_inbound_only(monkeypatc
     assert captured[0]["recipient_ids"] == {owner_id}
     assert captured[0]["thread_id"] == f"rep:{thread.id}"
     assert captured[0]["sender_label"] == "Client Name"
+
+
+def test_file_email_reply_subjects_match_reply_and_forward_prefixes() -> None:
+    expected = "qualified commercial | qc-2026-00008"
+    assert _thread_subject_key("Qualified Commercial | QC-2026-00008") == expected
+    assert _thread_subject_key("Re: Qualified Commercial | QC-2026-00008") == expected
+    assert _thread_subject_key("Fwd: Re: Qualified   Commercial | QC-2026-00008") == expected

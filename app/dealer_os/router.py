@@ -7125,6 +7125,33 @@ def _rep_inbox_access_filter(user: User):
     return DealerRepInboxThread.owner_user_id == user.id
 
 
+async def _load_file_inbox_thread(
+    db: AsyncSession,
+    *,
+    dealer: DealerBusiness,
+    thread_id: UUID,
+) -> tuple[DealerRepInboxThread, DealerRepContact | None]:
+    """Load one provider-backed thread through file authorization.
+
+    The global Inbox stays personal. Inside an application, every authorized
+    staff member needs the complete client communication record, including a
+    thread opened by another assigned operator.
+    """
+    row = (
+        await db.execute(
+            select(DealerRepInboxThread, DealerRepContact)
+            .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+            .where(
+                DealerRepInboxThread.id == thread_id,
+                DealerRepInboxThread.dealer_id == dealer.id,
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "File conversation not found.")
+    return row[0], row[1]
+
+
 def _rep_inbox_live_file_filter():
     """Ordinary inbox views never surface a training-linked conversation."""
     return or_(
@@ -11275,6 +11302,7 @@ async def create_rep_inbox_thread(
         )
         provider = None
         provider_id = None
+        provider_error = None
         delivery_status = "stored"
         sender = user.email
         recipient = email
@@ -11290,6 +11318,7 @@ async def create_rep_inbox_thread(
             provider = "ses"
             provider_id = res.message_id
             delivery_status = "sent" if res.ok else "failed"
+            provider_error = None if res.ok else res.detail
         else:
             recipient = phone
             res = await consent_delivery.send_sms_guarded(
@@ -11299,6 +11328,7 @@ async def create_rep_inbox_thread(
             provider = res.provider
             provider_id = res.provider_message_id if res.ok else None
             delivery_status = "sent" if res.ok else "failed"
+            provider_error = None if res.ok else res.detail
         msg = await _append_rep_inbox_message(
             db,
             thread=thread,
@@ -11309,6 +11339,7 @@ async def create_rep_inbox_thread(
             body=payload.body,
             provider=provider,
             provider_message_id=provider_id,
+            provider_error=provider_error,
             delivery_status=delivery_status,
             sender=sender,
             recipient=recipient,
@@ -11364,6 +11395,61 @@ async def list_rep_inbox_threads(
         q = q.where(DealerRepInboxThread.channel == channel)
     rows = (await db.execute(q)).all()
     return [_thread_read(thread, contact) for thread, contact in rows]
+
+
+@router.get("/dealers/{dealer_id}/inbox/threads", response_model=list[RepInboxThreadRead])
+async def list_file_inbox_threads(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[RepInboxThreadRead]:
+    """Provider-backed email/SMS history linked to one authorized file."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    rows = (
+        await db.execute(
+            select(DealerRepInboxThread, DealerRepContact)
+            .outerjoin(DealerRepContact, DealerRepContact.id == DealerRepInboxThread.contact_id)
+            .where(DealerRepInboxThread.dealer_id == dealer.id)
+            .order_by(
+                DealerRepInboxThread.last_message_at.desc().nullslast(),
+                DealerRepInboxThread.created_at.desc(),
+            )
+        )
+    ).all()
+    return [_thread_read(thread, contact) for thread, contact in rows]
+
+
+@router.get(
+    "/dealers/{dealer_id}/inbox/threads/{thread_id}/messages",
+    response_model=list[RepInboxMessageRead],
+)
+async def list_file_inbox_messages(
+    dealer_id: UUID,
+    thread_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[DealerRepInboxMessage]:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    thread, _ = await _load_file_inbox_thread(db, dealer=dealer, thread_id=thread_id)
+    rows = list(
+        (
+            await db.execute(
+                select(DealerRepInboxMessage)
+                .where(DealerRepInboxMessage.thread_id == thread.id)
+                .order_by(DealerRepInboxMessage.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    if thread.owner_user_id == user.id:
+        now = datetime.now(timezone.utc)
+        for message in rows:
+            if message.direction == "inbound" and message.read_at is None:
+                message.read_at = now
+        thread.unread_count = 0
+        await db.commit()
+    return rows
 
 
 @router.get("/inbox/threads/{thread_id}/messages", response_model=list[RepInboxMessageRead])
@@ -11429,8 +11515,29 @@ async def create_rep_inbox_message(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Thread not found.")
     thread, contact = row
-    if thread.dealer_id is not None:
-        dealer = await load_dealer(db, thread.dealer_id)
+    dealer = await load_dealer(db, thread.dealer_id) if thread.dealer_id is not None else None
+    return await _send_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        dealer=dealer,
+        payload=payload,
+        request=request,
+        user=user,
+    )
+
+
+async def _send_rep_inbox_message(
+    db: AsyncSession,
+    *,
+    thread: DealerRepInboxThread,
+    contact: DealerRepContact | None,
+    dealer: DealerBusiness | None,
+    payload: RepInboxMessageCreate,
+    request: Request,
+    user: User,
+) -> DealerRepInboxMessage:
+    if dealer is not None:
         await _require_training_live_action(
             db,
             dealer=dealer,
@@ -11496,10 +11603,7 @@ async def create_rep_inbox_message(
         sender=sender,
         recipient=recipient,
     )
-    if thread.dealer_id is not None:
-        # Thread ownership was checked above. The linked application remains a
-        # case activity target; it does not broaden mailbox visibility.
-        dealer = await load_dealer(db, thread.dealer_id)
+    if dealer is not None:
         db.add(
             DealerMessage(
                 dealer_id=dealer.id,
@@ -11513,6 +11617,34 @@ async def create_rep_inbox_message(
     await db.commit()
     await db.refresh(msg)
     return msg
+
+
+@router.post(
+    "/dealers/{dealer_id}/inbox/threads/{thread_id}/messages",
+    response_model=RepInboxMessageRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_file_inbox_message(
+    dealer_id: UUID,
+    thread_id: UUID,
+    payload: RepInboxMessageCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepInboxMessage:
+    """Reply from the file while preserving provider and delivery history."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    thread, contact = await _load_file_inbox_thread(db, dealer=dealer, thread_id=thread_id)
+    return await _send_rep_inbox_message(
+        db,
+        thread=thread,
+        contact=contact,
+        dealer=dealer,
+        payload=payload,
+        request=request,
+        user=user,
+    )
 
 
 # --- Stream 5: messaging, sessions, global alerts & lender package -----------
