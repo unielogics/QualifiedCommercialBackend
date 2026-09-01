@@ -72,6 +72,32 @@ def _phone_key(value: str | None) -> str | None:
     return digits
 
 
+async def _client_for_phone_scoped(db: AsyncSession, user: User, phone: str):
+    """A client on this number, within what the viewer may see."""
+    key = _phone_key(phone)
+    if not key:
+        return None
+    stmt = scope_client_query(user, select(Client)).where(
+        func.regexp_replace(func.coalesce(Client.phone, ""), r"\D", "", "g").like(f"%{key}")
+    ).order_by(Client.created_at.desc()).limit(1)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def _rep_contact_for_phone(db: AsyncSession, user: User, phone: str):
+    """A rep contact on this number, scoped to the rep who owns it."""
+    key = _phone_key(phone)
+    if not key:
+        return None
+    stmt = select(DealerRepContact).where(
+        func.regexp_replace(func.coalesce(DealerRepContact.phone_e164, ""), r"\D", "", "g").like(f"%{key}")
+    )
+    if user.role == Role.FIELD_REP:
+        stmt = stmt.where(DealerRepContact.owner_user_id == user.id)
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        return None
+    return (await db.execute(stmt.limit(1))).scalar_one_or_none()
+
+
 def _same_number(phone: str):
     """SQL predicate matching every stored spelling of one number.
 
@@ -623,6 +649,38 @@ async def _thread_summary(db: AsyncSession, user: User, thread_id: str) -> Unifi
                 transport="portal",
                 latest_at=intake.created_at,
                 href=f"/admin/ai-underwriter-leads?lead={intake.id}&channel={channel}",
+            )
+    if row is None and len(parts) == 3 and parts[0] == "sms" and parts[1] == "phone":
+        # A conversation with a person exists whether or not it has history —
+        # the first text to an appointment's client has to start somewhere, and
+        # _all_threads only lists numbers the ledger has already seen.
+        from app.dealer_os.services.consent_delivery import normalize_phone
+
+        phone = normalize_phone(parts[2])
+        if phone and user.role not in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER):
+            name = email = None
+            client = await _client_for_phone_scoped(db, user, phone)
+            if client is not None:
+                name, email = client.name, client.email
+            else:
+                contact = await _rep_contact_for_phone(db, user, phone)
+                if contact is not None:
+                    name, email = contact.full_name, contact.email
+            row = UnifiedCommunicationThread(
+                id=f"sms:phone:{phone}",
+                title=name or phone,
+                participant_name=name,
+                participant_email=email,
+                participant_phone=phone,
+                participant_type="client",
+                source_kind="sms",
+                source_id=phone,
+                source_label="Text messages",
+                channel="sms",
+                transport="sms",
+                message_count=0,
+                latest_at=datetime.now(UTC),
+                href="/inbox",
             )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")

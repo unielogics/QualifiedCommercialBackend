@@ -805,6 +805,9 @@ class RepAppointmentRead(ORM):
     rep_notification_status: str | None = None
     rep_reminder_status: str | None = None
     delivery_error: str | None = None
+    #: When that failure was recorded, so the UI can date it rather than
+    #: presenting a day-old error as a live one.
+    delivery_error_at: datetime | None = None
     notification_results: dict[str, str] | None = None
     created_at: datetime
     updated_at: datetime
@@ -826,7 +829,11 @@ class RepAppointmentCreate(BaseModel):
     timezone: str | None = Field(default=None, max_length=80)
     invitee_name: str = Field(min_length=1, max_length=160)
     company: str | None = Field(default=None, max_length=180)
-    invitee_email: str | None = Field(default=None, max_length=320)
+    # EmailStr, not str: a booking accepted "ap hollywod1998@yahoo.com" — with a
+    # space — and the confirmation email failed at send time with a generic
+    # provider error rather than at entry with a usable one. Read models stay
+    # permissive so rows already holding a bad address still load.
+    invitee_email: EmailStr | None = Field(default=None, max_length=320)
     invitee_phone: str | None = Field(default=None, max_length=32)
     join_url: str | None = Field(default=None, max_length=500)
     meeting_mode: Literal["video", "phone", "in_person"] = "video"
@@ -869,7 +876,11 @@ class RepAppointmentPatch(BaseModel):
     timezone: str | None = Field(default=None, max_length=80)
     duration_min: int | None = Field(default=None, ge=15, le=180)
     invitee_name: str | None = Field(default=None, min_length=1, max_length=160)
-    invitee_email: str | None = Field(default=None, max_length=320)
+    # EmailStr, not str: a booking accepted "ap hollywod1998@yahoo.com" — with a
+    # space — and the confirmation email failed at send time with a generic
+    # provider error rather than at entry with a usable one. Read models stay
+    # permissive so rows already holding a bad address still load.
+    invitee_email: EmailStr | None = Field(default=None, max_length=320)
     invitee_phone: str | None = Field(default=None, max_length=32)
     company: str | None = Field(default=None, max_length=180)
     program_key: str | None = Field(default=None, max_length=64)

@@ -6234,6 +6234,10 @@ async def _appointment_read_rows(
                 "email_reminder_status": notice.email_reminder_status,
                 "sms_reminder_status": notice.sms_reminder_status,
                 "delivery_error": notice.last_error,
+                # When the failure happened. Without it a stale error reads as a
+                # live fault: a provider swap can leave a row saying "SMS is
+                # disabled" long after it was re-enabled.
+                "delivery_error_at": notice.updated_at,
             })
             staff_rows = rep_reminders.get(notice.id, [])
             staff_statuses = {item.status for item in staff_rows}
