@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -8,6 +9,7 @@ from app.models.booking_notification import BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
+from app.services.booking_availability import slot_overlaps_blocked_interval
 from app.services.booking_reminders import register_booking
 
 
@@ -162,3 +164,63 @@ def test_booking_settings_accepts_independent_buffers_and_twenty_minute_meetings
 def test_booking_settings_rejects_duplicate_reminder_rows() -> None:
     with pytest.raises(ValueError, match="cannot contain duplicate"):
         UserBookingSettingsUpdate(reminder_email_minutes=[1440, 1440])
+
+
+def test_booking_settings_validates_and_sorts_recurring_blocked_times() -> None:
+    payload = UserBookingSettingsUpdate(
+        blocked_intervals=[
+            {"weekday": 3, "start_time": "14:00", "end_time": "16:00", "label": "Review"},
+            {"weekday": 1, "start_time": "14:00", "end_time": "16:00", "label": " Break "},
+        ],
+    )
+
+    assert [interval.weekday for interval in payload.blocked_intervals] == [1, 3]
+    assert payload.blocked_intervals[0].label == "Break"
+
+
+@pytest.mark.parametrize(
+    ("blocked_intervals", "message"),
+    [
+        (
+            [
+                {"weekday": 1, "start_time": "13:00", "end_time": "15:00"},
+                {"weekday": 1, "start_time": "14:00", "end_time": "16:00"},
+            ],
+            "cannot overlap",
+        ),
+        (
+            [{"weekday": 1, "start_time": "08:30", "end_time": "10:00"}],
+            "inside the daily booking",
+        ),
+    ],
+)
+def test_booking_settings_rejects_invalid_blocked_times(blocked_intervals, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        UserBookingSettingsUpdate(blocked_intervals=blocked_intervals)
+
+
+def test_booking_block_preserves_the_full_break_including_buffers() -> None:
+    booking = SimpleNamespace(
+        buffer_before_min=5,
+        buffer_after_min=5,
+        blocked_intervals=[
+            {"weekday": 1, "start_time": "14:00", "end_time": "16:00", "label": "Break"},
+        ],
+    )
+    zone = ZoneInfo("America/New_York")
+
+    assert slot_overlaps_blocked_interval(
+        booking,
+        datetime(2026, 8, 31, 13, 55, tzinfo=zone),
+        datetime(2026, 8, 31, 14, 15, tzinfo=zone),
+    )
+    assert slot_overlaps_blocked_interval(
+        booking,
+        datetime(2026, 8, 31, 16, 0, tzinfo=zone),
+        datetime(2026, 8, 31, 16, 20, tzinfo=zone),
+    )
+    assert not slot_overlaps_blocked_interval(
+        booking,
+        datetime(2026, 8, 31, 16, 5, tzinfo=zone),
+        datetime(2026, 8, 31, 16, 25, tzinfo=zone),
+    )

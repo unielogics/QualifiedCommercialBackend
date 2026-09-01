@@ -10,7 +10,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.deps import resolve_dealer_scope
+from app.services.user_access import is_audit_client
 from app.dealer_os.models import (
+    DealerRepAppointment,
+    DealerRepAppointmentActivity,
     DealerAuditLog,
     DealerBusiness,
     DealerDocument,
@@ -193,7 +196,7 @@ async def _profile_is_visible(
     if user.role == Role.VENDOR:
         return False
     if profile.dealer_id:
-        if user.role in (Role.DEALER, Role.FIELD_REP):
+        if is_audit_client(user) or user.role == Role.FIELD_REP:
             try:
                 await resolve_dealer_scope(db, user, profile.dealer_id)
                 return True
@@ -226,7 +229,7 @@ async def _profile_is_visible(
         ).scalar_one_or_none()
         if visible is not None:
             return True
-    if profile.intake_id and user.role == Role.DEALER_PARTNER:
+    if profile.intake_id and user.role in {Role.DEALER_PARTNER, Role.FIELD_REP}:
         owner = (
             await db.execute(
                 select(PublicUnderwritingIntake.broker_id).where(
@@ -272,7 +275,7 @@ async def _load_source(
         source = await db.get(PublicUnderwritingIntake, source_id)
         if source is not None and user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
             allowed = False
-            if user.role == Role.DEALER_PARTNER:
+            if user.role in {Role.DEALER_PARTNER, Role.FIELD_REP}:
                 allowed = source.broker_id == user.id
             elif source.client_id:
                 allowed = (
@@ -1060,6 +1063,45 @@ async def audit_events(
                 actor_name=row.actor_name,
                 source="dealer_os",
                 metadata={"before": row.before, "after": row.after},
+            )
+            for row in rows
+        )
+    appointment_filters = []
+    if profile.intake_id:
+        appointment_filters.append(
+            DealerRepAppointment.converted_intake_id == profile.intake_id
+        )
+    if profile.loan_id:
+        appointment_filters.append(DealerRepAppointment.linked_loan_id == profile.loan_id)
+    if appointment_filters:
+        rows = list(
+            (
+                await db.execute(
+                    select(DealerRepAppointmentActivity)
+                    .join(
+                        DealerRepAppointment,
+                        DealerRepAppointment.id
+                        == DealerRepAppointmentActivity.appointment_id,
+                    )
+                    .where(or_(*appointment_filters))
+                    .order_by(DealerRepAppointmentActivity.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+        )
+        events.extend(
+            UnifiedAuditEvent(
+                id=f"appointment:{row.id}",
+                occurred_at=row.created_at,
+                action=f"calendar.{row.event_type}",
+                summary=row.body or row.event_type.replace("_", " "),
+                actor_name=row.actor_name,
+                source="calendar",
+                metadata={
+                    "appointment_id": str(row.appointment_id),
+                    "before": row.before,
+                    "after": row.after,
+                },
             )
             for row in rows
         )

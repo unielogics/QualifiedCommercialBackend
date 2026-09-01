@@ -39,6 +39,7 @@ from app.models.loan import Loan
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.services.user_access import is_audit_client
 from app.schemas.operator_file import (
     BucketIntakeLinkOption,
     BucketIntakeLinkOptions,
@@ -804,7 +805,7 @@ async def _bucket_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
 
 
 async def _dealer_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
-    if user.role not in INTERNAL_ROLES and user.role != Role.FIELD_REP and user.role != Role.DEALER:
+    if user.role not in INTERNAL_ROLES and user.role != Role.FIELD_REP and not is_audit_client(user):
         return []
     stmt = (
         select(DealerBusiness, DealerRepLead, User)
@@ -814,7 +815,7 @@ async def _dealer_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
     )
     if user.role == Role.FIELD_REP:
         stmt = stmt.where(DealerBusiness.owner_user_id == user.id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
     pairs = list((await db.execute(stmt)).all())
     bucket_ids = {dealer.bucket_id for dealer, _rep, _owner in pairs if dealer.bucket_id}

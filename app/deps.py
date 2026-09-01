@@ -13,15 +13,16 @@ from typing import Annotated
 
 import httpx
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.db import get_db
-from app.enums import Role
+from app.enums import ProductAccountType, Role
 from app.models.user import User
+from app.services.user_access import ensure_legacy_product_access, has_product_access
 
 log = logging.getLogger(__name__)
 _jwks_cache: dict[str, object] | None = None
@@ -215,6 +216,7 @@ async def _recover_primary_super_admin_user(
     name: str | None,
     with_client,
     with_broker,
+    with_product_access,
 ) -> User | None:
     """Bind or restore the configured owner account without widening access.
 
@@ -229,7 +231,7 @@ async def _recover_primary_super_admin_user(
     user = (
         await db.execute(
             select(User)
-            .options(with_client, with_broker)
+            .options(with_client, with_broker, with_product_access)
             .where(func.lower(User.email) == normalized)
             .limit(1)
         )
@@ -273,12 +275,15 @@ async def _recover_primary_super_admin_user(
 
     return (
         await db.execute(
-            select(User).options(with_client, with_broker).where(User.id == user.id)
+            select(User)
+            .options(with_client, with_broker, with_product_access)
+            .where(User.id == user.id)
         )
     ).scalar_one()
 
 
 async def get_current_user(
+    request: Request,
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
     db: AsyncSession = Depends(get_db),  # noqa: B008
@@ -299,13 +304,19 @@ async def get_current_user(
     # touch anywhere downstream.
     _with_client = selectinload(User.client)
     _with_broker = selectinload(User.broker)
+    _with_product_access = selectinload(User.product_accesses)
 
     if not settings.clerk_secret_key:
         # Dev mode: short-circuit auth
         stmt = (
-            select(User).options(_with_client, _with_broker).where(User.email == x_dev_user)
+            select(User)
+            .options(_with_client, _with_broker, _with_product_access)
+            .where(User.email == x_dev_user)
             if x_dev_user
-            else select(User).options(_with_client, _with_broker).where(User.role == Role.SUPER_ADMIN).limit(1)
+            else select(User)
+            .options(_with_client, _with_broker, _with_product_access)
+            .where(User.role == Role.SUPER_ADMIN)
+            .limit(1)
         )
         user = (await db.execute(stmt)).scalar_one_or_none()
         if user is None:
@@ -313,6 +324,9 @@ async def get_current_user(
                 status.HTTP_401_UNAUTHORIZED,
                 "No dev user found. Run `python -m app.seed` first.",
             )
+        await ensure_legacy_product_access(db, user)
+        _enforce_account_active(user, request)
+        _enforce_external_product_boundary(user, request)
         return user
 
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -325,7 +339,9 @@ async def get_current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing subject")
     user = (
         await db.execute(
-            select(User).options(_with_client, _with_broker).where(User.clerk_id == clerk_id)
+            select(User)
+            .options(_with_client, _with_broker, _with_product_access)
+            .where(User.clerk_id == clerk_id)
         )
     ).scalar_one_or_none()
     if user is not None and _is_primary_super_admin_email(user.email) and (
@@ -338,6 +354,7 @@ async def get_current_user(
             name=user.name,
             with_client=_with_client,
             with_broker=_with_broker,
+            with_product_access=_with_product_access,
         )
     if user is None:
         # Auto-provision on first sign-in. Default Clerk JWTs only carry the
@@ -353,6 +370,7 @@ async def get_current_user(
             name=name,
             with_client=_with_client,
             with_broker=_with_broker,
+            with_product_access=_with_product_access,
         )
         if recovered_user is not None:
             from datetime import timedelta as _td
@@ -361,6 +379,9 @@ async def get_current_user(
             if recovered_user.last_seen_at is None or (now_dt - recovered_user.last_seen_at) >= _td(seconds=60):
                 recovered_user.last_seen_at = now_dt
                 await db.flush()
+            await ensure_legacy_product_access(db, recovered_user)
+            _enforce_account_active(recovered_user, request)
+            _enforce_external_product_boundary(recovered_user, request)
             return recovered_user
         # If a row was pre-created by a team invite (has email + role but no
         # clerk_id yet), bind it instead of creating a duplicate.
@@ -370,7 +391,7 @@ async def get_current_user(
         # duplicate CLIENT row, silently stripping the user's granted access.
         invited = (
             await db.execute(
-                select(User).options(_with_client, _with_broker).where(
+                select(User).options(_with_client, _with_broker, _with_product_access).where(
                     func.lower(User.email) == (email or "").lower(), User.clerk_id.is_(None)
                 )
             )
@@ -473,7 +494,9 @@ async def get_current_user(
             # to reflect the link.
             user = (
                 await db.execute(
-                    select(User).options(_with_client, _with_broker).where(User.id == user.id)
+                    select(User)
+                    .options(_with_client, _with_broker, _with_product_access)
+                    .where(User.id == user.id)
                 )
             ).scalar_one()
             log.info("Auto-provisioned user clerk_id=%s email=%s name=%s", clerk_id, email, name)
@@ -531,7 +554,7 @@ async def get_current_user(
         user = (
             await db.execute(
                 select(User)
-                .options(_with_client, _with_broker)
+                .options(_with_client, _with_broker, _with_product_access)
                 .where(User.id == user.id)
             )
         ).scalar_one()
@@ -549,7 +572,65 @@ async def get_current_user(
     if user.last_seen_at is None or (now_dt - user.last_seen_at) >= _td(seconds=60):
         user.last_seen_at = now_dt
         await db.flush()
+    await ensure_legacy_product_access(db, user)
+    _enforce_account_active(user, request)
+    _enforce_external_product_boundary(user, request)
     return user
+
+
+def _enforce_account_active(user: User, request: Request) -> None:
+    """Deny suspended accounts everywhere except the identity status read."""
+
+    if getattr(user, "account_status", "active") != "suspended":
+        return
+    if request.url.path.rstrip("/").endswith("/auth/me"):
+        return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "account_suspended",
+            "message": "This login is suspended. Contact your administrator.",
+        },
+    )
+
+
+_AUDIT_EXTERNAL_API_PREFIXES = (
+    "/api/v1/dealer-os",
+    "/api/v1/application-profiles",
+    "/api/v1/communications",
+    "/api/v1/property-intelligence/address",
+)
+
+
+def _enforce_external_product_boundary(user: User, request: Request) -> None:
+    """Keep Audit-only identities out of Funding/operator APIs.
+
+    Legacy Audit clients retain ``Role.DEALER`` during the compatibility
+    window. Older Funding routes do not all know that role, so an explicit
+    default-deny boundary is required before endpoint-specific scoping runs.
+    Dual-access identities retain Funding access and are then confined by the
+    existing Client/DealerBusiness ownership scopes.
+    """
+
+    if user.role not in {Role.CLIENT, Role.DEALER}:
+        return
+    path = request.url.path.rstrip("/") or "/"
+    if path.endswith("/auth/me"):
+        return
+    if has_product_access(user, ProductAccountType.FUNDING):
+        return
+    if has_product_access(user, ProductAccountType.AUDIT) and any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in _AUDIT_EXTERNAL_API_PREFIXES
+    ):
+        return
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "product_access_required",
+            "message": "This login is not enabled for the Funding platform.",
+        },
+    )
 
 
 def _looks_like_email_fallback_name(name: str | None, email: str | None) -> bool:
@@ -580,6 +661,26 @@ def require_role(*roles: Role):
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def require_funding_access(
+    user: User = Depends(get_current_user),  # noqa: B008
+) -> User:
+    if not has_product_access(user, ProductAccountType.FUNDING):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Funding access is not enabled")
+    return user
+
+
+async def require_audit_access(
+    user: User = Depends(get_current_user),  # noqa: B008
+) -> User:
+    if not has_product_access(user, ProductAccountType.AUDIT):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Audit access is not enabled")
+    return user
+
+
+FundingUser = Annotated[User, Depends(require_funding_access)]
+AuditUser = Annotated[User, Depends(require_audit_access)]
 
 
 async def require_valid_credit_pull(

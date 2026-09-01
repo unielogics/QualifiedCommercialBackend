@@ -13,6 +13,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -522,7 +523,58 @@ REP_APPOINTMENT_RSVP_STATUSES: tuple[str, ...] = (
     "unknown",
 )
 REP_APPOINTMENT_OUTCOMES: tuple[str, ...] = ("not_converted", "did_not_show", "converted")
-REP_APPOINTMENT_CONVERSION_TARGETS: tuple[str, ...] = ("field_desk", "ai_intake")
+REP_APPOINTMENT_CONVERSION_TARGETS: tuple[str, ...] = (
+    "field_desk",
+    "ai_intake",
+    "funding_loan",
+)
+REP_APPOINTMENT_CRM_STATUSES: tuple[str, ...] = (
+    "scheduled",
+    "confirmed",
+    "completed",
+    "follow_up",
+    "no_show",
+    "not_qualified",
+    "converted",
+    "cancelled",
+)
+
+
+class AppointmentOutcomeDefinition(TimestampMixin, Base):
+    """One staff member's reusable, constrained appointment outcome."""
+
+    __tablename__ = "appointment_outcome_definitions"
+    __table_args__ = (
+        Index(
+            "uq_appointment_outcome_owner_name",
+            "owner_user_id",
+            "normalized_name",
+            unique=True,
+        ),
+        Index(
+            "ix_appointment_outcome_owner_active",
+            "owner_user_id",
+            "active",
+            "sort_order",
+        ),
+        CheckConstraint(
+            "target_crm_status IN ('scheduled','confirmed','completed','follow_up','no_show','not_qualified','converted','cancelled')",
+            name="ck_appointment_outcome_definition_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500))
+    color: Mapped[str] = mapped_column(String(20), nullable=False, default="blue", server_default="blue")
+    target_crm_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    effects: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
 
 class DealerRepAppointment(TimestampMixin, Base):
@@ -533,6 +585,11 @@ class DealerRepAppointment(TimestampMixin, Base):
         Index("ix_dos_rep_appointments_dealer", "dealer_id", "starts_at"),
         Index("ix_dos_rep_appointments_owner", "owner_user_id", "starts_at"),
         Index("ix_dos_rep_appointments_event", "calendar_event_id"),
+        Index("ix_dos_rep_appointments_crm_status", "crm_status", "follow_up_at"),
+        CheckConstraint(
+            "crm_status IN ('scheduled','confirmed','completed','follow_up','no_show','not_qualified','converted','cancelled')",
+            name="ck_dos_rep_appointment_crm_status",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -562,6 +619,10 @@ class DealerRepAppointment(TimestampMixin, Base):
     requested_amount: Mapped[str | None] = mapped_column(String(40))
     full_address: Mapped[str | None] = mapped_column(String(500))
     join_url: Mapped[str | None] = mapped_column(String(500))
+    meeting_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="video", server_default="video"
+    )
+    location: Mapped[str | None] = mapped_column(String(500))
     notes: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     client_rsvp_status: Mapped[str] = mapped_column(
@@ -589,6 +650,58 @@ class DealerRepAppointment(TimestampMixin, Base):
     )
     converted_intake_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL")
+    )
+    linked_loan_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("loans.id", ondelete="SET NULL"), index=True
+    )
+    crm_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="scheduled", server_default="scheduled"
+    )
+    follow_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    crm_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    crm_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    workflow_outcome_definition_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("appointment_outcome_definitions.id", ondelete="SET NULL"),
+    )
+    workflow_outcome_label: Mapped[str | None] = mapped_column(String(120))
+    workflow_outcome_effects: Mapped[list[str] | None] = mapped_column(JSONB)
+    workflow_outcome_results: Mapped[dict | None] = mapped_column(JSONB)
+    workflow_outcome_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    workflow_outcome_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    workflow_outcome_idempotency_key: Mapped[str | None] = mapped_column(
+        String(80), unique=True
+    )
+
+
+class DealerRepAppointmentActivity(Base):
+    """Immutable internal CRM and delivery history for one appointment."""
+
+    __tablename__ = "dos_rep_appointment_activity"
+    __table_args__ = (
+        Index("ix_dos_rep_appointment_activity_created", "appointment_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    appointment_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_rep_appointments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    actor_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    before: Mapped[dict | None] = mapped_column(JSONB)
+    after: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 

@@ -145,6 +145,16 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
         google_meet_enabled=row.google_meet_enabled,
         timezone=row.timezone,
         available_days=row.available_days or [1, 2, 3, 4, 5],
+        blocked_intervals=row.blocked_intervals or [],
+        booking_questions=row.booking_questions or {
+            "business_name": True,
+            "phone": True,
+            "requested_amount": True,
+            "bank_statement": False,
+        },
+        no_show_follow_up_enabled=row.no_show_follow_up_enabled,
+        morning_digest_enabled=row.morning_digest_enabled,
+        missing_outcome_reminder_hours=row.missing_outcome_reminder_hours,
         start_time=row.start_time,
         end_time=row.end_time,
         logo_s3_key=row.logo_s3_key,
@@ -318,6 +328,11 @@ async def put_booking_settings(
     row.google_meet_enabled = payload.google_meet_enabled
     row.timezone = payload.timezone
     row.available_days = payload.available_days
+    row.blocked_intervals = [interval.model_dump() for interval in payload.blocked_intervals]
+    row.booking_questions = dict(payload.booking_questions)
+    row.no_show_follow_up_enabled = payload.no_show_follow_up_enabled
+    row.morning_digest_enabled = payload.morning_digest_enabled
+    row.missing_outcome_reminder_hours = payload.missing_outcome_reminder_hours
     row.start_time = payload.start_time
     row.end_time = payload.end_time
     row.logo_s3_key = payload.logo_s3_key

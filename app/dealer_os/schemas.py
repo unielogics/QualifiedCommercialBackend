@@ -737,6 +737,8 @@ class RepAppointmentRead(ORM):
     requested_amount: str | None = None
     full_address: str | None = None
     join_url: str | None = None
+    meeting_mode: Literal["video", "phone", "in_person"] = "video"
+    location: str | None = None
     notes: str | None = None
     status: str
     client_rsvp_status: Literal["needs_action", "accepted", "tentative", "declined", "unknown"] = "unknown"
@@ -750,9 +752,29 @@ class RepAppointmentRead(ORM):
     archived_at: datetime | None = None
     archived_by_user_id: UUID | None = None
     cancellation_reason: str | None = None
-    conversion_target: Literal["field_desk", "ai_intake"] | None = None
+    conversion_target: Literal["field_desk", "ai_intake", "funding_loan"] | None = None
     converted_dealer_id: UUID | None = None
     converted_intake_id: UUID | None = None
+    linked_loan_id: UUID | None = None
+    crm_status: Literal[
+        "scheduled",
+        "confirmed",
+        "completed",
+        "follow_up",
+        "no_show",
+        "not_qualified",
+        "converted",
+        "cancelled",
+    ] = "scheduled"
+    follow_up_at: datetime | None = None
+    crm_updated_at: datetime | None = None
+    crm_updated_by_user_id: UUID | None = None
+    workflow_outcome_definition_id: UUID | None = None
+    workflow_outcome_label: str | None = None
+    workflow_outcome_effects: list[str] | None = None
+    workflow_outcome_results: dict | None = None
+    workflow_outcome_applied_at: datetime | None = None
+    workflow_outcome_by_user_id: UUID | None = None
     confirmation_email_status: str | None = None
     confirmation_sms_status: str | None = None
     email_reminder_status: str | None = None
@@ -767,7 +789,15 @@ class RepAppointmentRead(ORM):
 
 
 class RepAppointmentCreate(BaseModel):
-    kind: Literal["callback", "program_intro", "underwriting_review"] = "callback"
+    kind: Literal[
+        "callback",
+        "program_intro",
+        "intro_call",
+        "underwriting_review",
+        "document_review",
+        "signing",
+        "lender_call",
+    ] = "callback"
     title: str | None = Field(default=None, max_length=200)
     starts_at: datetime
     duration_min: int | None = Field(default=None, ge=15, le=180)
@@ -777,6 +807,8 @@ class RepAppointmentCreate(BaseModel):
     invitee_email: str | None = Field(default=None, max_length=320)
     invitee_phone: str | None = Field(default=None, max_length=32)
     join_url: str | None = Field(default=None, max_length=500)
+    meeting_mode: Literal["video", "phone", "in_person"] = "video"
+    location: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
     program_key: str | None = Field(default=None, max_length=64)
     program_name: str | None = Field(default=None, max_length=180)
@@ -801,7 +833,15 @@ class RepAppointmentCreate(BaseModel):
 
 class RepAppointmentPatch(BaseModel):
     dealer_id: UUID | None = None
-    kind: Literal["callback", "program_intro", "underwriting_review"] | None = None
+    kind: Literal[
+        "callback",
+        "program_intro",
+        "intro_call",
+        "underwriting_review",
+        "document_review",
+        "signing",
+        "lender_call",
+    ] | None = None
     title: str | None = Field(default=None, min_length=1, max_length=200)
     starts_at: datetime | None = None
     timezone: str | None = Field(default=None, max_length=80)
@@ -816,28 +856,243 @@ class RepAppointmentPatch(BaseModel):
     full_address: str | None = Field(default=None, max_length=500)
     status: Literal["pending", "confirmed", "cancelled", "done"] | None = None
     join_url: str | None = Field(default=None, max_length=500)
+    meeting_mode: Literal["video", "phone", "in_person"] | None = None
+    location: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=4000)
     reopen_outcome: bool = False
 
 
 class RepAppointmentCancel(BaseModel):
-    reason: str | None = Field(default=None, max_length=1000)
+    reason: str = Field(min_length=1, max_length=1000)
 
 
 class RepAppointmentOutcomePatch(BaseModel):
     outcome: Literal["not_converted", "did_not_show", "converted"]
     note: str | None = Field(default=None, max_length=2000)
     conversion_target: Literal["field_desk", "ai_intake"] | None = None
-    ai_variant: Literal["dealer", "real_estate"] | None = None
+    ai_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
     notify_client: bool = False
+    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
 
     @model_validator(mode="after")
     def _conversion_requires_destination(self) -> "RepAppointmentOutcomePatch":
         if self.outcome == "converted" and self.conversion_target is None:
             raise ValueError("Choose a conversion destination.")
         if self.conversion_target == "ai_intake" and self.ai_variant is None:
-            raise ValueError("Choose Dealer or Real Estate AI intake.")
+            raise ValueError("Choose an AI intake type.")
+        if self.conversion_target == "ai_intake" and self.secure_room_pin is None:
+            raise ValueError("Create a six-digit secure room PIN.")
         return self
+
+
+AppointmentCrmStatus = Literal[
+    "scheduled",
+    "confirmed",
+    "completed",
+    "follow_up",
+    "no_show",
+    "not_qualified",
+    "converted",
+    "cancelled",
+]
+
+
+class RepAppointmentActivityRead(ORM):
+    id: UUID
+    appointment_id: UUID
+    event_type: str
+    body: str | None = None
+    actor_user_id: UUID | None = None
+    actor_name: str
+    before: dict | None = None
+    after: dict | None = None
+    created_at: datetime
+
+
+class RepAppointmentCapabilities(BaseModel):
+    can_edit: bool = False
+    can_add_notes: bool = False
+    can_manage_crm: bool = False
+    can_start_application: bool = False
+    can_retry_delivery: bool = False
+    can_manage_outcomes: bool = False
+    can_link_files: bool = False
+    can_create_funding_loan: bool = False
+
+
+class RepAppointmentApplicationSummary(BaseModel):
+    intake_id: UUID
+    profile_id: UUID | None = None
+    loan_id: UUID | None = None
+    vertical: str
+    underwriting_status: str
+    is_draft: bool = False
+    ready_for_step_2: bool = False
+    unlocked: bool = False
+    blockers: list[str] = Field(default_factory=list)
+
+
+class RepAppointmentFundingSummary(BaseModel):
+    loan_id: UUID
+    deal_id: str
+    client_id: UUID
+    stage: str
+    amount: float | None = None
+    entity_name: str | None = None
+    address: str | None = None
+
+
+class RepAppointmentApplicationCandidate(BaseModel):
+    intake_id: UUID
+    variant: str
+    business_name: str | None = None
+    full_name: str
+    email: str
+    status: str
+    created_at: datetime
+
+
+class RepAppointmentBookingDataReview(BaseModel):
+    field: str
+    label: str
+    current_value: str | None = None
+    proposed_value: str | None = None
+    status: Literal["matches", "missing_in_file", "conflict", "file_only", "empty", "unlinked"]
+    target_kind: Literal["intake", "loan"] | None = None
+
+
+class RepAppointmentWorkspaceRead(BaseModel):
+    appointment: RepAppointmentRead
+    activities: list[RepAppointmentActivityRead] = Field(default_factory=list)
+    application: RepAppointmentApplicationSummary | None = None
+    funding_file: RepAppointmentFundingSummary | None = None
+    application_candidates: list[RepAppointmentApplicationCandidate] = Field(default_factory=list)
+    booking_data_review: list[RepAppointmentBookingDataReview] = Field(default_factory=list)
+    capabilities: RepAppointmentCapabilities
+
+
+class RepAppointmentCrmPatch(BaseModel):
+    status: AppointmentCrmStatus
+    follow_up_at: datetime | None = None
+    reason: str | None = Field(default=None, max_length=2000)
+    confirm_terminal: bool = False
+
+    @model_validator(mode="after")
+    def _validate_crm_change(self) -> "RepAppointmentCrmPatch":
+        if self.status in {"not_qualified", "cancelled"}:
+            if not self.confirm_terminal or not (self.reason or "").strip():
+                raise ValueError("A confirmed reason is required for a terminal CRM status.")
+        if self.status == "follow_up" and self.follow_up_at is None:
+            raise ValueError("Choose a follow-up date and time.")
+        return self
+
+
+class RepAppointmentNoteCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class RepAppointmentStartApplication(BaseModel):
+    variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"]
+    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
+    notify_client: bool = False
+    existing_intake_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _require_pin_for_new_application(self) -> "RepAppointmentStartApplication":
+        if self.existing_intake_id is None and self.secure_room_pin is None:
+            raise ValueError("Create a six-digit secure room PIN.")
+        return self
+
+
+class RepAppointmentStartApplicationResult(BaseModel):
+    intake_id: UUID
+    profile_id: UUID
+    loan_id: UUID | None = None
+    created: bool
+    linked_existing: bool = False
+    href: str
+    room_delivery_status: str | None = None
+    room_delivery_detail: str | None = None
+
+
+class RepAppointmentDeliveryRetry(BaseModel):
+    action: Literal["email_confirmation", "sms_confirmation"]
+
+
+class RepAppointmentDeliveryRetryResult(BaseModel):
+    action: Literal["email_confirmation", "sms_confirmation"]
+    status: str
+    detail: str | None = None
+
+
+AppointmentFileKind = Literal["intake", "loan"]
+AppointmentFileAction = Literal[
+    "none",
+    "update_linked",
+    "link_existing",
+    "create_ai_intake",
+    "create_funding_loan",
+]
+
+
+class RepAppointmentFileOption(BaseModel):
+    kind: AppointmentFileKind
+    id: UUID
+    label: str
+    subtitle: str | None = None
+    status: str
+    href: str
+
+
+class RepAppointmentFileOptions(BaseModel):
+    items: list[RepAppointmentFileOption] = Field(default_factory=list)
+
+
+class RepAppointmentFileLinkPatch(BaseModel):
+    kind: AppointmentFileKind
+    file_id: UUID
+    confirm: bool = False
+
+
+class RepAppointmentFileLinkResult(BaseModel):
+    appointment_id: UUID
+    kind: AppointmentFileKind
+    file_id: UUID
+    href: str
+
+
+class RepAppointmentApplyOutcome(BaseModel):
+    outcome_definition_id: UUID
+    note: str | None = Field(default=None, max_length=5000)
+    follow_up_at: datetime | None = None
+    idempotency_key: str = Field(min_length=8, max_length=80)
+    confirm: bool = False
+    file_action: AppointmentFileAction = "none"
+    existing_file_kind: AppointmentFileKind | None = None
+    existing_file_id: UUID | None = None
+    variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
+    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
+    notify_client: bool = False
+    apply_booking_data: bool = False
+    requested_document_keys: list[str] = Field(default_factory=list, max_length=20)
+
+
+class RepAppointmentActionResult(BaseModel):
+    action: str
+    status: Literal["completed", "skipped", "failed", "pending"]
+    detail: str | None = None
+    href: str | None = None
+
+
+class RepAppointmentApplyOutcomeResult(BaseModel):
+    appointment_id: UUID
+    outcome_definition_id: UUID
+    outcome_label: str
+    crm_status: AppointmentCrmStatus
+    idempotent_replay: bool = False
+    actions: list[RepAppointmentActionResult] = Field(default_factory=list)
+    workspace: RepAppointmentWorkspaceRead
+    attempted_at: datetime
 
 
 class UnderwritingReviewPreferenceRead(ORM):
@@ -1828,6 +2083,8 @@ class ClientRequestSend(BaseModel):
     caller explicitly asks for nothing; "sms" means email AND text."""
 
     channel: Literal["email", "sms", "none"] = "email"
+    recipient_email: str | None = Field(default=None, max_length=320)
+    recipient_phone: str | None = Field(default=None, max_length=32)
 
 
 class SignatureRequestSend(ClientRequestSend):

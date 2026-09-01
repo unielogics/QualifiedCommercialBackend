@@ -21,7 +21,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import Select, false as sql_false, or_, select
+from sqlalchemy import Select, false as sql_false, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -32,16 +33,71 @@ from app.models.client import Client
 from app.models.event import CalendarEvent
 from app.models.loan import Loan
 from app.models.user import User
+from app.models.booking_settings import BookingSettings
+from app.dealer_os.models import AppointmentOutcomeDefinition, DealerRepAppointment
 from app.scoping import regional_manager_broker_ids_subquery, scope_loan_query
 from app.schemas.event import (
+    AppointmentOutcomeDefinitionCreate,
+    AppointmentOutcomeDefinitionPatch,
+    AppointmentOutcomeDefinitionRead,
     CalendarActivityItem,
+    CalendarAppointmentTypeCount,
     CalendarEventCreate,
     CalendarEventRead,
     CalendarEventUpdate,
+    CalendarWorkspaceCapabilities,
+    CalendarWorkspaceEvent,
+    CalendarWorkspaceMetrics,
+    CalendarWorkspaceRead,
 )
+from app.services import calendar_v2
 from app.services.activity_log import filter_payload_for_audience, is_visible_to
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
+
+APPOINTMENT_TYPE_LABELS = {
+    "callback": "Intro call",
+    "program_intro": "Intro call",
+    "intro_call": "Intro call",
+    "underwriting_review": "Underwriting review",
+    "document_review": "Document review",
+    "signing": "Signing",
+    "lender_call": "Lender call",
+}
+APPOINTMENT_TYPE_KEYS = (
+    "intro_call",
+    "underwriting_review",
+    "document_review",
+    "signing",
+    "lender_call",
+)
+
+
+def _require_calendar_v2(user: User) -> None:
+    if not calendar_v2.can_use_calendar_v2(user):
+        raise HTTPException(http_status.HTTP_403_FORBIDDEN, "Calendar CRM access required")
+
+
+def _workspace_kind(value: str) -> str:
+    if value in {"callback", "program_intro"}:
+        return "intro_call"
+    return value if value in APPOINTMENT_TYPE_KEYS else "intro_call"
+
+
+def _workspace_color(kind: str, crm_status: str | None) -> str:
+    if crm_status in {"cancelled", "not_qualified"}:
+        return "gray"
+    if crm_status == "converted":
+        return "green"
+    if crm_status in {"no_show", "follow_up"}:
+        return "amber" if crm_status == "follow_up" else "red"
+    return {
+        "intro_call": "blue",
+        "underwriting_review": "violet",
+        "document_review": "amber",
+        "signing": "green",
+        "lender_call": "gray",
+    }.get(kind, "blue")
 
 
 def _scope_calendar_for_audience(user: User, stmt: Select) -> Select:
@@ -128,6 +184,243 @@ async def list_events(
     stmt = _scope_calendar_for_audience(user, stmt)
     rows = (await db.execute(stmt)).scalars().all()
     return [CalendarEventRead.model_validate(r) for r in rows]
+
+
+@router.get("/workspace", response_model=CalendarWorkspaceRead)
+async def get_calendar_workspace(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    from_: datetime = Query(alias="from"),
+    to_: datetime = Query(alias="to"),
+    include_cancelled: bool = False,
+    include_internal: bool = False,
+) -> CalendarWorkspaceRead:
+    _require_calendar_v2(user)
+    if to_ <= from_:
+        raise HTTPException(http_status.HTTP_422_UNPROCESSABLE_ENTITY, "Calendar range must end after it starts")
+    if to_ - from_ > timedelta(days=370):
+        raise HTTPException(http_status.HTTP_422_UNPROCESSABLE_ENTITY, "Calendar range cannot exceed 370 days")
+
+    appointment_stmt = (
+        select(DealerRepAppointment)
+        .where(
+            DealerRepAppointment.starts_at >= from_,
+            DealerRepAppointment.starts_at < to_,
+        )
+        .order_by(DealerRepAppointment.starts_at)
+    )
+    if not include_cancelled:
+        appointment_stmt = appointment_stmt.where(
+            DealerRepAppointment.archived_at.is_(None),
+            DealerRepAppointment.status != "cancelled",
+        )
+    if user.role == Role.FIELD_REP:
+        appointment_stmt = appointment_stmt.where(DealerRepAppointment.booked_by_user_id == user.id)
+    appointments = list((await db.execute(appointment_stmt)).scalars().all())
+
+    events: list[CalendarWorkspaceEvent] = []
+    type_counts = {key: 0 for key in APPOINTMENT_TYPE_KEYS}
+    now = datetime.now(timezone.utc)
+    outcome_logged = 0
+    awaiting_outcome = 0
+    files_created = 0
+    for appointment in appointments:
+        kind = _workspace_kind(appointment.kind)
+        type_counts[kind] += 1
+        has_outcome = bool(
+            appointment.workflow_outcome_applied_at
+            or appointment.outcome_at
+            or appointment.outcome
+        )
+        if has_outcome:
+            outcome_logged += 1
+        ends_at = appointment.starts_at + timedelta(minutes=appointment.duration_min or 20)
+        if ends_at <= now and not has_outcome and appointment.crm_status not in {"cancelled", "converted"}:
+            awaiting_outcome += 1
+        if appointment.converted_intake_id or appointment.linked_loan_id:
+            files_created += 1
+        events.append(
+            CalendarWorkspaceEvent(
+                id=f"appointment:{appointment.id}",
+                event_type="appointment",
+                appointment_id=appointment.id,
+                calendar_event_id=appointment.calendar_event_id,
+                loan_id=appointment.linked_loan_id,
+                title=appointment.title,
+                kind=kind,
+                starts_at=appointment.starts_at,
+                ends_at=ends_at,
+                status=appointment.status,
+                crm_status=appointment.crm_status,
+                invitee_name=appointment.invitee_name,
+                company=appointment.company,
+                meeting_mode=appointment.meeting_mode,
+                join_url=appointment.join_url,
+                has_outcome=has_outcome,
+                color=_workspace_color(kind, appointment.crm_status),
+                can_edit=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+                or (user.role == Role.FIELD_REP and appointment.booked_by_user_id == user.id),
+            )
+        )
+
+    if include_internal:
+        internal_stmt = select(CalendarEvent).where(
+            CalendarEvent.starts_at >= from_,
+            CalendarEvent.starts_at < to_,
+            or_(
+                CalendarEvent.external_ref_kind.is_(None),
+                CalendarEvent.external_ref_kind != "dealer_rep_appointment",
+            ),
+        )
+        if not include_cancelled:
+            internal_stmt = internal_stmt.where(CalendarEvent.status != CalendarEventStatus.CANCELLED)
+        internal_stmt = _scope_calendar_for_audience(user, internal_stmt)
+        internal_rows = list((await db.execute(internal_stmt.order_by(CalendarEvent.starts_at))).scalars().all())
+        for event in internal_rows:
+            events.append(
+                CalendarWorkspaceEvent(
+                    id=f"internal:{event.id}",
+                    event_type="internal",
+                    calendar_event_id=event.id,
+                    loan_id=event.loan_id,
+                    title=event.title,
+                    kind=str(event.kind.value if hasattr(event.kind, "value") else event.kind),
+                    starts_at=event.starts_at,
+                    ends_at=event.starts_at + timedelta(minutes=event.duration_min or 30),
+                    status=str(event.status.value if hasattr(event.status, "value") else event.status),
+                    has_outcome=event.status == CalendarEventStatus.DONE,
+                    color="gray",
+                    can_edit=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
+                )
+            )
+    events.sort(key=lambda item: item.starts_at)
+
+    booking = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == user.id))
+    ).scalar_one_or_none()
+    return CalendarWorkspaceRead(
+        range_start=from_,
+        range_end=to_,
+        timezone=booking.timezone if booking else "America/New_York",
+        events=events,
+        metrics=CalendarWorkspaceMetrics(
+            appointments=len(appointments),
+            outcome_logged=outcome_logged,
+            awaiting_outcome=awaiting_outcome,
+            files_created=files_created,
+        ),
+        appointment_types=[
+            CalendarAppointmentTypeCount(key=key, label=APPOINTMENT_TYPE_LABELS[key], count=type_counts[key])
+            for key in APPOINTMENT_TYPE_KEYS
+        ],
+        capabilities=CalendarWorkspaceCapabilities(
+            can_create=True,
+            can_manage_all=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
+            can_drag=True,
+            can_create_funding_loan=calendar_v2.can_create_funding_file(user),
+        ),
+    )
+
+
+@router.get("/outcomes", response_model=list[AppointmentOutcomeDefinitionRead])
+async def list_calendar_outcomes(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    include_inactive: bool = False,
+) -> list[AppointmentOutcomeDefinitionRead]:
+    _require_calendar_v2(user)
+    await calendar_v2.ensure_default_outcomes(db, user)
+    await db.commit()
+    stmt = (
+        select(AppointmentOutcomeDefinition)
+        .where(AppointmentOutcomeDefinition.owner_user_id == user.id)
+        .order_by(AppointmentOutcomeDefinition.sort_order, AppointmentOutcomeDefinition.created_at)
+    )
+    if not include_inactive:
+        stmt = stmt.where(AppointmentOutcomeDefinition.active.is_(True))
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [AppointmentOutcomeDefinitionRead.model_validate(row) for row in rows]
+
+
+@router.post(
+    "/outcomes",
+    response_model=AppointmentOutcomeDefinitionRead,
+    status_code=http_status.HTTP_201_CREATED,
+)
+async def create_calendar_outcome(
+    payload: AppointmentOutcomeDefinitionCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AppointmentOutcomeDefinitionRead:
+    _require_calendar_v2(user)
+    row = AppointmentOutcomeDefinition(
+        owner_user_id=user.id,
+        normalized_name=calendar_v2.normalize_outcome_name(payload.name),
+        **payload.model_dump(),
+    )
+    db.add(row)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "You already have an outcome with this name") from exc
+    await db.refresh(row)
+    return AppointmentOutcomeDefinitionRead.model_validate(row)
+
+
+async def _load_owned_outcome(
+    db: AsyncSession,
+    outcome_id: UUID,
+    user: User,
+) -> AppointmentOutcomeDefinition:
+    row = (
+        await db.execute(
+            select(AppointmentOutcomeDefinition).where(
+                AppointmentOutcomeDefinition.id == outcome_id,
+                AppointmentOutcomeDefinition.owner_user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(http_status.HTTP_404_NOT_FOUND, "Outcome not found")
+    return row
+
+
+@router.patch("/outcomes/{outcome_id}", response_model=AppointmentOutcomeDefinitionRead)
+async def patch_calendar_outcome(
+    outcome_id: UUID,
+    payload: AppointmentOutcomeDefinitionPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> AppointmentOutcomeDefinitionRead:
+    _require_calendar_v2(user)
+    row = await _load_owned_outcome(db, outcome_id, user)
+    patch = payload.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(http_status.HTTP_400_BAD_REQUEST, "No outcome changes supplied")
+    if "name" in patch:
+        patch["normalized_name"] = calendar_v2.normalize_outcome_name(patch["name"])
+    for key, value in patch.items():
+        setattr(row, key, value)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "You already have an outcome with this name") from exc
+    await db.refresh(row)
+    return AppointmentOutcomeDefinitionRead.model_validate(row)
+
+
+@router.delete("/outcomes/{outcome_id}", status_code=http_status.HTTP_204_NO_CONTENT)
+async def disable_calendar_outcome(
+    outcome_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    _require_calendar_v2(user)
+    row = await _load_owned_outcome(db, outcome_id, user)
+    row.active = False
+    await db.commit()
 
 
 @router.get("/activity", response_model=list[CalendarActivityItem])

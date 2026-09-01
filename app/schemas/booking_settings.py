@@ -1,9 +1,30 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class BookingBlockedInterval(BaseModel):
+    weekday: int | None = Field(default=None, ge=0, le=6)
+    on_date: date | None = None
+    start_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+    end_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+    label: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def _validate_interval(self) -> BookingBlockedInterval:
+        if (self.weekday is None) == (self.on_date is None):
+            raise ValueError("Choose either a recurring weekday or one calendar date")
+        start_h, start_m = [int(value) for value in self.start_time.split(":")]
+        end_h, end_m = [int(value) for value in self.end_time.split(":")]
+        if start_h > 23 or end_h > 23 or start_m > 59 or end_m > 59:
+            raise ValueError("Blocked times must be valid HH:MM values")
+        if (end_h * 60 + end_m) <= (start_h * 60 + start_m):
+            raise ValueError("A blocked interval must end after it starts")
+        self.label = self.label.strip() if self.label else None
+        return self
 
 
 class UserBookingSettingsBase(BaseModel):
@@ -27,6 +48,18 @@ class UserBookingSettingsBase(BaseModel):
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
+    blocked_intervals: list[BookingBlockedInterval] = Field(default_factory=list, max_length=56)
+    booking_questions: dict[Literal["business_name", "phone", "requested_amount", "bank_statement"], bool] = Field(
+        default_factory=lambda: {
+            "business_name": True,
+            "phone": True,
+            "requested_amount": True,
+            "bank_statement": False,
+        }
+    )
+    no_show_follow_up_enabled: bool = True
+    morning_digest_enabled: bool = True
+    missing_outcome_reminder_hours: int = Field(default=48, ge=1, le=720)
     start_time: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
     end_time: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
     logo_s3_key: str | None = None
@@ -63,6 +96,36 @@ class UserBookingSettingsBase(BaseModel):
             raise ValueError("Booking end time must allow at least one meeting slot")
         if self.buffer_before_min + self.duration_min + self.buffer_after_min > 360:
             raise ValueError("Meeting length and buffers cannot exceed six hours")
+
+        grouped: dict[str, list[BookingBlockedInterval]] = {}
+        for interval in self.blocked_intervals:
+            interval_start_h, interval_start_m = [int(value) for value in interval.start_time.split(":")]
+            interval_end_h, interval_end_m = [int(value) for value in interval.end_time.split(":")]
+            interval_start = interval_start_h * 60 + interval_start_m
+            interval_end = interval_end_h * 60 + interval_end_m
+            if interval_start < start or interval_end > end:
+                raise ValueError("Blocked intervals must remain inside the daily booking start and end times")
+            group_key = (
+                f"weekday:{interval.weekday}"
+                if interval.weekday is not None
+                else f"date:{interval.on_date.isoformat()}"
+            )
+            grouped.setdefault(group_key, []).append(interval)
+
+        for group_key, intervals in grouped.items():
+            intervals.sort(key=lambda item: item.start_time)
+            for previous, current in zip(intervals, intervals[1:], strict=False):
+                if current.start_time < previous.end_time:
+                    raise ValueError(f"Blocked intervals cannot overlap for {group_key}")
+        self.blocked_intervals = sorted(
+            self.blocked_intervals,
+            key=lambda item: (
+                item.on_date.isoformat() if item.on_date else "",
+                item.weekday if item.weekday is not None else 8,
+                item.start_time,
+                item.end_time,
+            ),
+        )
         return self
 
 

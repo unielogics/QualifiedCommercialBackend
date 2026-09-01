@@ -43,6 +43,7 @@ from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
 from app.services import booking_notify, booking_reminders
 from app.services import fred as fred_service
+from app.services.booking_availability import slot_overlaps_blocked_interval
 from app.services.google import calendar_sync
 from app.services.team_calendar import lock_calendar_owner
 
@@ -522,7 +523,10 @@ async def _available_booking_slots(
         cursor = _round_up_to_step(cursor, 5)
         while cursor + duration <= day_end:
             slot_end = cursor + duration
-            if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
+            if (
+                not slot_overlaps_blocked_interval(booking, cursor, slot_end)
+                and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
+            ):
                 starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
                 slots.append(
                     PublicBookingSlot(

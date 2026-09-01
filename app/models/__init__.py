@@ -139,4 +139,5 @@ from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.referral_partner_company import ReferralPartnerCompany  # noqa: F401
 from app.models.regional_manager import RegionalManagerAgent  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.models.user_access import UserAccessEvent, UserProductAccess  # noqa: F401
 from app.models.vector_log import VectorLog  # noqa: F401

@@ -28,6 +28,18 @@ class Role(StrEnum):
     FIELD_REP = "field_rep"
 
 
+class ProductAccountType(StrEnum):
+    """Client-facing products enabled for one authenticated identity.
+
+    Product access is intentionally separate from ``Role``. Roles still
+    describe what a person is allowed to do inside a product; these values
+    describe which client products the login may enter.
+    """
+
+    FUNDING = "funding"
+    AUDIT = "audit"
+
+
 class Language(StrEnum):
     """Client-facing language preference for a public underwriting intake.
     Drives frontend copy + AI chat language for the CLIENT ('uploader')

@@ -40,6 +40,7 @@ from app.models.client import Client
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.services.user_access import is_audit_client, is_funding_client
 from app.routers.buckets import _hash_passcode, _verify_passcode
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
@@ -457,8 +458,8 @@ def _credit_tier(score: int | None) -> str | None:
 
 def _require_profile_bank_client(profile: ApplicationProfile, user: User) -> None:
     """A bank authorization can only be performed by the owning client."""
-    expected_role = Role.DEALER if profile.dealer_id else Role.CLIENT
-    if user.role != expected_role:
+    allowed = is_audit_client(user) if profile.dealer_id else is_funding_client(user)
+    if not allowed:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "The client must complete this bank action from their own account or secure link",

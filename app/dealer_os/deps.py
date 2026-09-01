@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import Role
 from app.models.user import User
+from app.services.user_access import is_audit_client
 
 from .models import DealerBusiness
 
@@ -44,14 +45,14 @@ def require_super_admin(user: User) -> None:
 
 def require_dealer(user: User) -> None:
     """Client-owned actions that staff must never perform on the client's behalf."""
-    if user.role != Role.DEALER:
+    if not is_audit_client(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Client role required for this action"
         )
 
 
 def require_team_or_dealer(user: User) -> None:
-    if user.role not in _TEAM_ROLES and user.role != Role.DEALER:
+    if user.role not in _TEAM_ROLES and not is_audit_client(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Team or client role required for Capital OS"
         )
@@ -70,7 +71,7 @@ def require_team_or_rep(user: User) -> None:
 def require_team_or_dealer_or_rep(user: User) -> None:
     """Every role with a legitimate view of a client file: the team, the
     client themselves, and the rep who owns it."""
-    if user.role not in _TEAM_ROLES and user.role not in (Role.DEALER, Role.FIELD_REP):
+    if user.role not in _TEAM_ROLES and user.role != Role.FIELD_REP and not is_audit_client(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "No access to Capital OS"
         )
@@ -102,7 +103,7 @@ async def resolve_dealer_scope(db: AsyncSession, user: User, dealer_id: UUID) ->
     gets 403 rather than falling through to unrestricted access, which is what
     the earlier shape did."""
     dealer = await load_dealer(db, dealer_id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         if dealer.dealer_user_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     elif user.role == Role.FIELD_REP:

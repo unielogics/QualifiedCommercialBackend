@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, FundingUser
 from app.enums import AITaskPriority, AITaskSource, AITaskStatus, Role
 from app.models.ai_task import AITask
 from app.models.client import Client
@@ -70,7 +70,7 @@ def _client_read_for_self(client: Client) -> ClientRead:
 
 
 @router.get("/me", response_model=ClientRead)
-async def get_my_client(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ClientRead:
+async def get_my_client(user: FundingUser, db: AsyncSession = Depends(get_db)) -> ClientRead:
     """Return the current user's linked Client record. Used by the desktop
     Profile page so it doesn't need to know its own client_id."""
     if not user.client:
@@ -83,7 +83,7 @@ async def get_my_client(user: CurrentUser, db: AsyncSession = Depends(get_db)) -
 @router.patch("/me", response_model=ClientRead)
 async def update_my_client(
     payload: ClientSelfUpdate,
-    user: CurrentUser,
+    user: FundingUser,
     db: AsyncSession = Depends(get_db),
 ) -> ClientRead:
     """Self-edit: a CLIENT-role user updates their own profile. Only the
@@ -103,7 +103,7 @@ async def update_my_client(
 
 @router.get("/me/living-profile", response_model=LivingProfileRead)
 async def get_my_living_profile(
-    user: CurrentUser,
+    user: FundingUser,
     db: AsyncSession = Depends(get_db),
 ) -> LivingProfileRead:
     """Borrower self-read of the account-wide AI profile. Returns the
@@ -123,7 +123,7 @@ async def get_my_living_profile(
 
 @router.post("/me/summary/refresh", response_model=LivingProfileRead)
 async def refresh_my_living_profile(
-    user: CurrentUser,
+    user: FundingUser,
     db: AsyncSession = Depends(get_db),
 ) -> LivingProfileRead:
     """Force-refresh the borrower's living profile. Synchronous — the

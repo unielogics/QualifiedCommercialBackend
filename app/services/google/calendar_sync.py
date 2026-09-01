@@ -30,7 +30,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dealer_os.models import DealerRepAppointment, DealerUnderwritingReviewPreference
+from app.dealer_os.models import (
+    DealerRepAppointment,
+    DealerRepAppointmentActivity,
+    DealerUnderwritingReviewPreference,
+)
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
 from app.models.event import CalendarEvent
 from app.models.google_account import GoogleAccount
@@ -120,6 +124,20 @@ async def _sync_rep_appointment_rsvp(
             else None
         )
     appointment.status = desired_status
+    if incoming == "accepted" and appointment.crm_status == "scheduled":
+        appointment.crm_status = "confirmed"
+        appointment.crm_updated_at = now
+        db.add(
+            DealerRepAppointmentActivity(
+                appointment_id=appointment.id,
+                event_type="crm_status_changed",
+                body="Client accepted the Google Calendar invitation.",
+                actor_user_id=None,
+                actor_name="Google Calendar",
+                before={"crm_status": "scheduled"},
+                after={"crm_status": "confirmed"},
+            )
+        )
 
     preference = (
         await db.execute(

@@ -397,7 +397,21 @@ class DealerEntityStructure(BaseModel):
         return None if value == "" else value
 
 
-class DealerIntakeStart(BaseModel):
+class PublicIntakeAttribution(BaseModel):
+    source: str | None = Field(default=None, max_length=64)
+    page: str | None = Field(default=None, max_length=300)
+    program: str | None = Field(default=None, max_length=120)
+    vertical: str | None = Field(default=None, max_length=64)
+    campaign: str | None = Field(default=None, max_length=120)
+    cta: str | None = Field(default=None, max_length=120)
+
+    @field_validator("source", "page", "program", "vertical", "campaign", "cta", mode="before")
+    @classmethod
+    def normalize_attribution(cls, value: object) -> object:
+        return str(value).strip() if value is not None and str(value).strip() else None
+
+
+class DealerIntakeStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
@@ -414,7 +428,7 @@ class DealerIntakeStart(BaseModel):
         return None if value == "" else value
 
 
-class FundingReviewStart(BaseModel):
+class FundingReviewStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
@@ -437,6 +451,19 @@ class FundingReviewStart(BaseModel):
         return None if value == "" else value
 
 
+def _public_intake_attribution(
+    payload: PublicIntakeAttribution,
+) -> dict[str, str] | None:
+    values = {
+        key: value
+        for key, value in payload.model_dump(
+            include={"source", "page", "program", "vertical", "campaign", "cta"}
+        ).items()
+        if value
+    }
+    return values or None
+
+
 class AdminLeadCreate(BaseModel):
     """Super-admin creates an AI-underwriter lead on behalf of a client. Mirrors the
     public start schemas but with no terms/throttle and an explicit variant selector.
@@ -449,6 +476,7 @@ class AdminLeadCreate(BaseModel):
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
     business_name: str | None = Field(default=None, max_length=180)
+    loan_purpose: str | None = Field(default=None, max_length=255)
     # Main Street: an operating business is defined by what it does and what it
     # wants, and the program screen cannot run without both. Optional so the
     # other three variants are unaffected; normalized (never rejected) so an
@@ -478,7 +506,7 @@ class AdminLeadCreate(BaseModel):
         return (str(value).strip().lower() if value else "dealer")
 
     @field_validator(
-        "phone", "business_name", "investor_name", "target_property_address",
+        "phone", "business_name", "loan_purpose", "investor_name", "target_property_address",
         "transaction_type", "estimated_credit_tier", mode="before",
     )
     @classmethod
@@ -3014,6 +3042,7 @@ async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake
 
 async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -> Client:
     email = _normalize_email(str(payload.email))
+    attribution = _public_intake_attribution(payload)
     # Email match is inherently fragile (same email can belong to more than one
     # client record). Harden the selection: among same-email candidates, prefer
     # one already originated from a dealer AI intake so a new intake reuses the
@@ -3045,6 +3074,7 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
             lead_intake={
                 "source": "dealer_ai_intake",
                 "business_name": payload.business_name,
+                **({"signup_attribution": attribution} if attribution else {}),
             },
         )
         db.add(client)
@@ -3065,6 +3095,8 @@ async def _find_or_create_client(db: AsyncSession, payload: DealerIntakeStart) -
         client.referral_source = "dealer_ai_intake"
     intake = dict(client.lead_intake or {})
     intake.update({"source": "dealer_ai_intake", "business_name": payload.business_name or intake.get("business_name")})
+    if attribution:
+        intake["signup_attribution"] = attribution
     client.lead_intake = intake
     await db.flush()
     return client
@@ -3074,6 +3106,7 @@ async def _find_or_create_funding_client(db: AsyncSession, payload: FundingRevie
     email = _normalize_email(str(payload.email))
     client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
     owner = await primary_super_admin(db)
+    attribution = _public_intake_attribution(payload)
     lead_payload = {
         "source": "funding_review",
         "investor_name": payload.investor_name,
@@ -3083,6 +3116,7 @@ async def _find_or_create_funding_client(db: AsyncSession, payload: FundingRevie
         "estimated_value_or_purchase_price": payload.estimated_value_or_purchase_price,
         "monthly_rent": payload.monthly_rent,
         "estimated_credit_tier": payload.estimated_credit_tier,
+        **({"signup_attribution": attribution} if attribution else {}),
     }
     if client is None:
         client = Client(
@@ -5382,6 +5416,7 @@ async def start_dealer_intake(
     client = await _find_or_create_client(db, payload)
     bucket, link = await _create_bucket_for_intake(db, client, payload, request)
     token = _new_public_token()
+    attribution = _public_intake_attribution(payload)
     intake = PublicUnderwritingIntake(
         client_id=client.id,
         bucket_id=bucket.id,
@@ -5391,10 +5426,12 @@ async def start_dealer_intake(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=payload.business_name,
+        referral_source=(attribution or {}).get("source") or "dealer_ai_intake",
         preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
             "source": "dealer_ai_intake",
+            **({"signup_attribution": attribution} if attribution else {}),
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,
                 "privacy_accepted": payload.privacy_accepted,
@@ -5614,6 +5651,20 @@ async def download_dealer_intelligence_pdf(
 
 
 def _require_super_admin(user: CurrentUser) -> None:
+    """Compatibility gate for the operator intake workspace.
+
+    The route family pre-dates the LOAN_EXEC workspace. Governance-only routes
+    use ``_require_governance_admin`` below.
+    """
+    _require_intake_operator(user)
+
+
+def _require_intake_operator(user: CurrentUser) -> None:
+    if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriter access required")
+
+
+def _require_governance_admin(user: CurrentUser) -> None:
     if user.role != Role.SUPER_ADMIN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin role required")
 
@@ -6409,7 +6460,7 @@ async def admin_request_lead_deletion(
     deletion" sets, needed here for admin-created/self-serve leads that have
     no broker to defer to. Destroys nothing; only gates the separate
     confirm-deletion endpoint open."""
-    _require_super_admin(user)
+    _require_governance_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.delete_requested_at = _now()
     intake.delete_requested_by_user_id = user.id
@@ -6431,7 +6482,7 @@ async def admin_cancel_lead_deletion(
 ) -> DealerIntakeResponse:
     """Admin retracts a pending deletion request (their own, or a broker's)
     without destroying anything — fully reversible."""
-    _require_super_admin(user)
+    _require_governance_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.delete_requested_at = None
     intake.delete_requested_by_user_id = None
@@ -6476,7 +6527,7 @@ async def admin_confirm_lead_deletion(
     definition, so this action is logged to the application logger instead
     of _log(...) — there is no durable admin-wide audit trail in this
     codebase to write a cross-bucket entry to."""
-    _require_super_admin(user)
+    _require_governance_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     # One-click super-admin delete: no prior request flag and no typed-name
     # required — the frontend danger dialog is the safeguard. (Brokers still
@@ -6604,7 +6655,7 @@ async def update_lead_contact(
     These fields belong to the intake. The linked Client record is not changed
     because one client can own multiple files with different entity contacts.
     """
-    _require_super_admin(user)
+    _require_governance_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     values = payload.model_dump(exclude_unset=True)
     if "full_name" in values and values["full_name"] is None:
@@ -6629,19 +6680,13 @@ async def update_lead_contact(
     return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
 
 
-@admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
-async def create_admin_ai_lead(
+async def _create_admin_ai_lead_core(
     payload: AdminLeadCreate,
     request: Request,
     user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession,
 ) -> DealerIntakeResponse:
-    """Super-admin creates an AI-underwriter lead ON BEHALF of a client and can
-    start underwriting immediately. The client can log in later with this email
-    exactly like a self-serve lead (email + code), since login keys off the email
-    and the intake carries client_id. Reuses the same creation helpers as the
-    public /start flows via lightweight adapter payloads. No terms/throttle."""
-    _require_super_admin(user)
+    """Create an operator-owned intake after the caller has authorized access."""
     if payload.variant not in _ADMIN_VARIANT_CONSTANTS:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -6649,6 +6694,7 @@ async def create_admin_ai_lead(
         )
     is_re = payload.variant == "real_estate"
     is_ms = payload.variant == "main_street"
+    is_mca = payload.variant == "mca_refinance"
     variant_const = _ADMIN_VARIANT_CONSTANTS[payload.variant]
 
     # Normalized here rather than at the edge so an unrecognized value becomes
@@ -6716,6 +6762,21 @@ async def create_admin_ai_lead(
             industry=ms_industry,
             room_pin=payload.secure_room_pin,
         )
+    elif is_mca:
+        adapter = McaRefiStart(
+            full_name=payload.full_name,
+            email=payload.email,
+            phone=payload.phone,
+            business_name=payload.business_name,
+        )
+        client = await _find_or_create_mca_client(db, adapter)
+        bucket, link = await _create_bucket_for_mca_refi(
+            db,
+            client,
+            adapter,
+            request,
+            room_pin=payload.secure_room_pin,
+        )
     else:
         adapter = DealerIntakeStart(
             full_name=payload.full_name,
@@ -6736,7 +6797,13 @@ async def create_admin_ai_lead(
     intake_state: dict[str, Any] = {
         "messages": [],
         "source": (
-            "funding_review" if is_re else "main_street_intake" if is_ms else "dealer_ai_intake"
+            "funding_review"
+            if is_re
+            else "main_street_intake"
+            if is_ms
+            else "mca_refinance"
+            if is_mca
+            else "dealer_ai_intake"
         ),
         "admin_provenance": provenance,
     }
@@ -6768,8 +6835,12 @@ async def create_admin_ai_lead(
         email=client.email or _normalize_email(str(payload.email)),
         phone=payload.phone,
         business_name=(payload.investor_name if is_re else payload.business_name),
-        loan_purpose=(payload.transaction_type if is_re else None),
-        requested_loan_amount=(payload.requested_amount if is_re else None),
+        loan_purpose=(
+            payload.transaction_type
+            if is_re
+            else payload.loan_purpose or ("MCA refinance" if is_mca else None)
+        ),
+        requested_loan_amount=payload.requested_amount,
         preferred_language=payload.preferred_language,
         asset_rows=(
             [
@@ -6794,7 +6865,7 @@ async def create_admin_ai_lead(
         "dealer_ai_lead_created_by_admin",
         request=request,
         user=user,
-        actor_role="super_admin",
+        actor_role="super_admin" if user.role == Role.SUPER_ADMIN else "underwriter",
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
         detail=f"Admin created {payload.variant} lead for {intake.email}",
@@ -6866,6 +6937,23 @@ async def create_admin_ai_lead(
         secure_room_pin=payload.secure_room_pin,
         room_delivery_status=delivery_status,
         room_delivery_detail=delivery_detail,
+    )
+
+
+@admin_router.post("", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
+async def create_admin_ai_lead(
+    payload: AdminLeadCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerIntakeResponse:
+    """Super-admin creates an AI-underwriter lead on behalf of a client."""
+    _require_governance_admin(user)
+    return await _create_admin_ai_lead_core(
+        payload,
+        request=request,
+        user=user,
+        db=db,
     )
 
 
@@ -9369,6 +9457,7 @@ async def start_funding_review(
     client = await _find_or_create_funding_client(db, payload)
     bucket, link = await _create_bucket_for_funding_review(db, client, payload, request)
     token = _new_public_token()
+    attribution = _public_intake_attribution(payload)
     basics = {
         "investor_name": payload.investor_name,
         "target_property_address": payload.target_property_address,
@@ -9390,6 +9479,7 @@ async def start_funding_review(
         business_name=payload.investor_name,
         loan_purpose=payload.transaction_type,
         requested_loan_amount=payload.requested_amount,
+        referral_source=(attribution or {}).get("source") or "funding_review",
         preferred_language=payload.preferred_language,
         asset_rows=[
             {
@@ -9403,6 +9493,7 @@ async def start_funding_review(
         intake_state={
             "messages": [],
             "source": "funding_review",
+            **({"signup_attribution": attribution} if attribution else {}),
             "funding_review_basics": basics,
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,
@@ -9877,7 +9968,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
     return intake, challenge, session_token
 
 
-class McaRefiStart(BaseModel):
+class McaRefiStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
     phone: str | None = Field(default=None, max_length=48)
@@ -10034,12 +10125,14 @@ async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) ->
     email = _normalize_email(str(payload.email))
     client = (await db.execute(select(Client).where(Client.email == email).order_by(Client.created_at.desc()))).scalars().first()
     owner = await primary_super_admin(db)
+    attribution = _public_intake_attribution(payload)
     lead_payload = {
         "source": "mca_refinance",
         "business_name": payload.business_name,
         "remaining_payback": payload.remaining_payback,
         "months_remaining": payload.months_remaining,
         "payment_frequency": payload.payment_frequency,
+        **({"signup_attribution": attribution} if attribution else {}),
     }
     if client is None:
         client = Client(
@@ -10075,7 +10168,14 @@ async def _find_or_create_mca_client(db: AsyncSession, payload: McaRefiStart) ->
     return client
 
 
-async def _create_bucket_for_mca_refi(db: AsyncSession, client: Client, payload: McaRefiStart, request: Request) -> tuple[Bucket, BucketUploadLink]:
+async def _create_bucket_for_mca_refi(
+    db: AsyncSession,
+    client: Client,
+    payload: McaRefiStart,
+    request: Request,
+    *,
+    room_pin: str | None = None,
+) -> tuple[Bucket, BucketUploadLink]:
     owner = await primary_super_admin(db)
     business = payload.business_name or payload.full_name
     bucket = Bucket(
@@ -10116,7 +10216,7 @@ async def _create_bucket_for_mca_refi(db: AsyncSession, client: Client, payload:
                 signature_kind=doc.get("signature_kind"),
             )
         )
-    passcode = _generate_passcode()
+    passcode = room_pin or _generate_passcode()
     link = BucketUploadLink(
         bucket_id=bucket.id,
         token=secrets.token_urlsafe(32),
@@ -10179,6 +10279,7 @@ async def start_mca_refinance(
     client = await _find_or_create_mca_client(db, payload)
     bucket, link = await _create_bucket_for_mca_refi(db, client, payload, request)
     token = _new_public_token()
+    attribution = _public_intake_attribution(payload)
     seeded: dict[str, Any] = {}
     if payload.remaining_payback is not None:
         seeded["remaining_payback"] = payload.remaining_payback
@@ -10197,10 +10298,12 @@ async def start_mca_refinance(
         phone=payload.phone,
         business_name=payload.business_name,
         loan_purpose="mca_refinance",
+        referral_source=(attribution or {}).get("source") or "mca_refinance",
         preferred_language=payload.preferred_language,
         intake_state={
             "messages": [],
             "source": "mca_refinance",
+            **({"signup_attribution": attribution} if attribution else {}),
             **({"mca_details": seeded} if seeded else {}),
             "legal_acceptance": {
                 "terms_accepted": payload.terms_accepted,

@@ -18,13 +18,13 @@ import zipfile
 from dataclasses import asdict
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, exists, func, not_, select, or_
+from sqlalchemy import String, and_, exists, func, not_, select, or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,11 +35,19 @@ from app.deps import CurrentUser
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
-from app.models.application_profile import ApplicationTaxonomyEntry, PlaidAssetReport
+from app.models.activity import Activity
+from app.models.client import Client
+from app.models.loan import Loan
+from app.models.application_profile import ApplicationProfile, ApplicationTaxonomyEntry, PlaidAssetReport
+from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.booking_settings import BookingSettings
+from app.services.booking_availability import slot_overlaps_blocked_interval
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.event import CalendarEvent
 from app.models.notification import Notification
+from app.services import application_profiles as application_profile_service
+from app.services import calendar_v2
+from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders
 from app.services.notifications import notify_users
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
@@ -47,7 +55,23 @@ from app.services import plaid_lifecycle
 from app.services.email import ses_client
 from app.services.google import calendar_sync
 from app.services import clerk as clerk_service
-from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus, Role
+from app.services.user_access import (
+    access_state,
+    assigned_product_values,
+    record_access_event,
+    set_product_access,
+    synchronize_external_compatibility_role,
+)
+from app.enums import (
+    CalendarEventKind,
+    CalendarEventSource,
+    CalendarEventStatus,
+    LoanPurpose,
+    LoanStage,
+    LoanType,
+    PropertyType,
+    Role,
+)
 
 # READ-ONLY reuse: bucket models are queried/appended, never altered; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
@@ -55,6 +79,7 @@ from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequ
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
+    is_audit_client,
     load_dealer,
     require_dealer,
     require_super_admin,
@@ -77,6 +102,8 @@ from .models import (
     DealerSmsConsent,
     DealerAIMessage,
     DealerRepAppointment,
+    DealerRepAppointmentActivity,
+    AppointmentOutcomeDefinition,
     DealerRepContact,
     DealerRepContactAssignment,
     DealerApplicationContact,
@@ -340,6 +367,26 @@ from .schemas import (
     RepAppointmentOutcomePatch,
     RepAppointmentPatch,
     RepAppointmentRead,
+    RepAppointmentActivityRead,
+    RepAppointmentApplicationCandidate,
+    RepAppointmentApplicationSummary,
+    RepAppointmentBookingDataReview,
+    RepAppointmentFundingSummary,
+    RepAppointmentCapabilities,
+    RepAppointmentCrmPatch,
+    RepAppointmentDeliveryRetry,
+    RepAppointmentDeliveryRetryResult,
+    RepAppointmentNoteCreate,
+    RepAppointmentStartApplication,
+    RepAppointmentStartApplicationResult,
+    RepAppointmentWorkspaceRead,
+    RepAppointmentActionResult,
+    RepAppointmentApplyOutcome,
+    RepAppointmentApplyOutcomeResult,
+    RepAppointmentFileLinkPatch,
+    RepAppointmentFileLinkResult,
+    RepAppointmentFileOption,
+    RepAppointmentFileOptions,
     RepInboxComposeResult,
     RepInboxMessageCreate,
     RepInboxMessageRead,
@@ -399,7 +446,7 @@ async def list_dealers(user: CurrentUser, db: AsyncSession = Depends(get_db)) ->
         .where(DealerBusiness.archived_at.is_(None))
         .order_by(DealerBusiness.created_at.desc())
     )
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
     elif user.role == Role.FIELD_REP:
         stmt = stmt.where(DealerBusiness.owner_user_id == user.id)
@@ -1217,6 +1264,9 @@ async def send_bank_connect_invite(
         path=room.url,
         channel=req.channel,
         action="client_request.bank_connect",
+        recipient_email=req.recipient_email,
+        recipient_phone=req.recipient_phone,
+        strict_recipient=bool(req.recipient_email or req.recipient_phone),
     )
     await db.commit()
     return ClientRequestResult(
@@ -1264,6 +1314,9 @@ async def send_bank_upload_request(
         path=room.url,
         channel=req.channel,
         action="client_request.bank_upload",
+        recipient_email=req.recipient_email,
+        recipient_phone=req.recipient_phone,
+        strict_recipient=bool(req.recipient_email or req.recipient_phone),
     )
     await db.commit()
     return BankUploadRequestResult(
@@ -2587,7 +2640,9 @@ async def convert_to_audit(
             email = owner_email or ""
         if email:
             try:
-                invite = await _invite_dealer_login_core(db, dealer, email, None)
+                invite = await _invite_dealer_login_core(
+                    db, dealer, email, None, actor=user
+                )
             except HTTPException as exc:
                 # The conversion itself must not fail because the email clashes
                 # with a staff account; report it and let the desk fix the email.
@@ -2852,7 +2907,7 @@ async def get_dealer(dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depe
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     r = await _dealer_read(db, dealer)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         r.notes = None  # internal advisor commentary is team-only
     return r
 
@@ -2875,7 +2930,7 @@ async def update_dealer(
     # book. resolve_dealer_scope returns anything for the team, so hoisting it
     # costs the desk nothing and closes it.
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         # A client may complete the always-required business-profile fields
         # on their OWN file — nothing else.
         changes = payload.model_dump(exclude_unset=True)
@@ -2967,23 +3022,27 @@ async def update_dealer(
 
 
 async def _invite_dealer_login_core(
-    db: AsyncSession, dealer: DealerBusiness, email: str, name: str | None
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    email: str,
+    name: str | None,
+    *,
+    actor: User | None,
 ) -> DealerInviteResult:
     """Create-or-link the client's Capital OS login and send the Clerk invite.
 
-    The invite ALWAYS lands on audit.qualifiedcommercial.com/sign-in and the
-    account is ALWAYS Role.DEALER. That pair is what keeps a client out of the
-    Field Desk: rep.qualifiedcommercial.com walls every non-rep, non-team role
-    before a single page renders, so the only door this login opens is their
-    own audit portal. Flushes; the caller commits."""
+    Funding clients keep their existing identity and receive an Audit product
+    entitlement. Audit-only identities retain the legacy DEALER role for
+    compatibility. File access still requires this DealerBusiness's explicit
+    ``dealer_user_id`` link. Flushes; the caller commits."""
     email = email.strip().lower()
     existing = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
     clerk_sent = False
     if existing is not None and existing.deleted_at is None:
-        if existing.role != Role.DEALER:
+        if existing.role not in (Role.CLIENT, Role.DEALER):
             raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"That email belongs to an existing {existing.role.value} account — use a different email.",
+                status.HTTP_409_CONFLICT,
+                f"That email belongs to an existing {existing.role.value} account and cannot be reused.",
             )
         target, result_status = existing, "linked"
     else:
@@ -2992,6 +3051,7 @@ async def _invite_dealer_login_core(
             existing.name = name or existing.name
             existing.role = Role.DEALER
             existing.clerk_id = None
+            existing.account_status = "active"
             target = existing
         else:
             target = User(
@@ -3003,14 +3063,50 @@ async def _invite_dealer_login_core(
             db.add(target)
         await db.flush()
         result_status = "invited"
+    before_access = access_state(target)
+    await set_product_access(
+        db,
+        user=target,
+        product="audit",
+        enabled=True,
+        actor_user_id=actor.id if actor else None,
+        reason="Audit client invitation",
+    )
+    synchronize_external_compatibility_role(target, assigned_product_values(target))
+    if result_status == "invited":
         sent = await clerk_service.invite_user(
             email=email,
             name=target.name or dealer.name,
-            role=Role.DEALER,
+            role=target.role,
             redirect_url="https://audit.qualifiedcommercial.com/sign-in",
+            account_types=sorted(assigned_product_values(target)),
+            account_status=target.account_status,
         )
         clerk_sent = sent is not None
+        target.last_invited_at = datetime.now(timezone.utc)
+        target.last_invite_status = "sent" if clerk_sent else "failed"
+        target.last_invite_error = None if clerk_sent else "Clerk invitation was not accepted"
+    elif target.clerk_id:
+        await clerk_service.update_user_access_metadata(
+            target.clerk_id,
+            role=target.role,
+            account_types=sorted(assigned_product_values(target)),
+            account_status=target.account_status,
+        )
     dealer.dealer_user_id = target.id
+    record_access_event(
+        db,
+        user_id=target.id,
+        actor_user_id=actor.id if actor else None,
+        action="client_access.audit_invited",
+        reason="Audit client invitation",
+        before_state=before_access,
+        after_state={
+            **access_state(target),
+            "audit_dealer_ids": [str(dealer.id)],
+        },
+        metadata={"source": "dealer_os_invite", "dealer_id": str(dealer.id)},
+    )
     await db.flush()
     return DealerInviteResult(status=result_status, email=email, user_id=target.id, clerk_sent=clerk_sent)
 
@@ -3025,7 +3121,9 @@ async def invite_dealer_login(
     sends a Clerk invitation email that lands on audit.qualifiedcommercial.com."""
     require_team(user)
     dealer = await load_dealer(db, dealer_id)
-    result = await _invite_dealer_login_core(db, dealer, payload.email, payload.name)
+    result = await _invite_dealer_login_core(
+        db, dealer, payload.email, payload.name, actor=user
+    )
     await db.commit()
     return result
 
@@ -3267,7 +3365,7 @@ async def mark_event_recurrence(
     categorized_by='admin', which the stamping engine skips, and the live
     recurring view overlays these marks on top of detection."""
     require_team(user)
-    is_dealer_actor = user.role == Role.DEALER
+    is_dealer_actor = is_audit_client(user)
     dealer = await load_dealer(db, dealer_id)
     event = (
         await db.execute(
@@ -3775,7 +3873,7 @@ async def upload_document(
     skips detection (admin choice wins)."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    is_dealer = user.role == Role.DEALER
+    is_dealer = is_audit_client(user)
     if kind not in _DOCUMENT_KINDS:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -3869,12 +3967,12 @@ async def list_documents(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         q = q.where(DealerDocument.status != "failed")
     rows = (
         (await db.execute(q.order_by(DealerDocument.created_at.desc()))).scalars().all()
     )
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         # Storage keys are an internal detail — previews go through /url.
         out = [DocumentRead.model_validate(r) for r in rows]
         for r in out:
@@ -3901,7 +3999,7 @@ async def document_url(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     doc = await _load_document(db, dealer.id, doc_id)
-    if user.role == Role.DEALER and doc.status == "failed":
+    if is_audit_client(user) and doc.status == "failed":
         # Parity with list_documents: failed rows are not dealer-facing.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found for this client")
     key = doc.s3_key
@@ -4746,7 +4844,7 @@ async def list_plan_actions(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerPlanAction).where(DealerPlanAction.dealer_id == dealer.id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         # Drafts and AI-accepted actions stay team-side until the advisor
         # publishes — publishing IS the share step.
         q = q.where(DealerPlanAction.published.is_(True))
@@ -4861,7 +4959,7 @@ async def respond_plan_action(
                 dealer_id=dealer.id,
                 action_id=action.id,
                 author_user_id=user.id,
-                author_role="dealer" if user.role == Role.DEALER else "team",
+                author_role="dealer" if is_audit_client(user) else "team",
                 author_name=(user.name or user.email or None),
                 body=payload.comment.strip(),
             )
@@ -4906,7 +5004,7 @@ async def list_plan_comments(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
-    if user.role == Role.DEALER and not action.published:
+    if is_audit_client(user) and not action.published:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
     return (
         (
@@ -4936,13 +5034,13 @@ async def create_plan_comment(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     action = await _load_plan_action(db, dealer.id, action_id)
-    if user.role == Role.DEALER and not action.published:
+    if is_audit_client(user) and not action.published:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
     comment = DealerPlanComment(
         dealer_id=dealer.id,
         action_id=action.id,
         author_user_id=user.id,
-        author_role="dealer" if user.role == Role.DEALER else "team",
+        author_role="dealer" if is_audit_client(user) else "team",
         author_name=(user.name or user.email or None),
         body=payload.body.strip(),
     )
@@ -5420,7 +5518,10 @@ async def _booking_slots(
         cursor = _round_up_to_step(cursor, 5)
         while cursor + slot_duration <= day_end:
             slot_end = cursor + slot_duration
-            if not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy):
+            if (
+                not slot_overlaps_blocked_interval(booking, cursor, slot_end)
+                and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
+            ):
                 starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
                 slots.append(BookingAvailabilitySlot(
                     starts_at=starts_utc,
@@ -5449,11 +5550,99 @@ async def _booking_slots(
     )
 
 
+async def _appointment_slot_is_available(
+    db: AsyncSession,
+    host: User,
+    booking: BookingSettings,
+    *,
+    starts_at: datetime,
+    duration_min: int,
+    exclude_event_id: UUID | None = None,
+) -> bool:
+    """Validate one arbitrary calendar slot without a rolling 15-day limit."""
+    starts_at = _to_utc_minute(starts_at)
+    if starts_at < datetime.now(timezone.utc).replace(second=0, microsecond=0):
+        return False
+    zone = rep_workflows.tz(booking.timezone)
+    local_start = starts_at.astimezone(zone)
+    local_end = local_start + timedelta(minutes=duration_min)
+    if local_start.date() != local_end.date():
+        return False
+    if _js_weekday(local_start.date()) not in (booking.available_days or [1, 2, 3, 4, 5]):
+        return False
+    start_min = _parse_hhmm(booking.start_time or "09:00")
+    end_min = _parse_hhmm(booking.end_time or "17:00")
+    local_start_min = local_start.hour * 60 + local_start.minute
+    local_end_min = local_end.hour * 60 + local_end.minute
+    if local_start_min < start_min or local_end_min > end_min:
+        return False
+    if slot_overlaps_blocked_interval(booking, local_start, local_end):
+        return False
+
+    proposed_busy_start = starts_at - timedelta(minutes=booking.buffer_before_min)
+    proposed_busy_end = starts_at + timedelta(
+        minutes=duration_min + booking.buffer_after_min
+    )
+    local_rows = list(
+        (
+            await db.execute(
+                select(CalendarEvent).where(
+                    CalendarEvent.owner_user_id == host.id,
+                    CalendarEvent.status != CalendarEventStatus.CANCELLED,
+                    CalendarEvent.starts_at
+                    >= starts_at - timedelta(days=1),
+                    CalendarEvent.starts_at
+                    <= starts_at + timedelta(days=1),
+                )
+            )
+        ).scalars().all()
+    )
+    for row in local_rows:
+        if row.id == exclude_event_id:
+            continue
+        busy_start = row.starts_at - timedelta(minutes=booking.buffer_before_min)
+        busy_end = row.starts_at + timedelta(
+            minutes=max(15, row.duration_min or duration_min) + booking.buffer_after_min
+        )
+        if proposed_busy_start < busy_end and proposed_busy_end > busy_start:
+            return False
+
+    google = await calendar_sync.busy_periods(
+        db,
+        host.id,
+        time_min=proposed_busy_start,
+        time_max=proposed_busy_end,
+    )
+    if google.status != "connected":
+        return False
+    excluded_event = await db.get(CalendarEvent, exclude_event_id) if exclude_event_id else None
+    for busy_start, busy_end in google.intervals:
+        if excluded_event is not None:
+            expected_start = excluded_event.starts_at.astimezone(timezone.utc)
+            expected_end = expected_start + timedelta(
+                minutes=excluded_event.duration_min or duration_min
+            )
+            if (
+                abs((busy_start - expected_start).total_seconds()) < 2
+                and abs((busy_end - expected_end).total_seconds()) < 2
+            ):
+                continue
+        buffered_start = busy_start - timedelta(minutes=booking.buffer_before_min)
+        buffered_end = busy_end + timedelta(minutes=booking.buffer_after_min)
+        if proposed_busy_start < buffered_end and proposed_busy_end > buffered_start:
+            return False
+    return True
+
+
 def _appointment_title(kind: str, invitee_name: str, dealer: DealerBusiness | None) -> str:
     labels = {
         "callback": "Callback",
         "program_intro": "Program intro",
+        "intro_call": "Intro call",
         "underwriting_review": "Underwriting review",
+        "document_review": "Document review",
+        "signing": "Signing",
+        "lender_call": "Lender call",
     }
     suffix = f" · {dealer.name}" if dealer else ""
     return f"{labels.get(kind, 'Appointment')}: {invitee_name}{suffix}"
@@ -5664,6 +5853,8 @@ def _appointment_payload(
         invitee_email=appt.invitee_email,
         invitee_phone=appt.invitee_phone,
         join_url=appt.join_url,
+        meeting_mode=appt.meeting_mode,
+        location=appt.location,
         notes=appt.notes,
         program_key=appt.program_key,
         program_name=appt.program_name,
@@ -5920,7 +6111,7 @@ async def _mirror_file_message_to_rep_inbox(
         return
     owner_user_id = dealer.owner_user_id
     if owner_user_id is None:
-        if user.role == Role.DEALER:
+        if is_audit_client(user):
             return
         owner_user_id = user.id
 
@@ -5947,7 +6138,7 @@ async def _mirror_file_message_to_rep_inbox(
         source="file_message",
         dealer_scoped=True,
     )
-    direction = "inbound" if user.role == Role.DEALER else "outbound"
+    direction = "inbound" if is_audit_client(user) else "outbound"
     await _append_rep_inbox_message(
         db,
         thread=thread,
@@ -6080,6 +6271,299 @@ async def patch_application_profile(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+def _can_manage_appointment_crm(user: User) -> bool:
+    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP}
+
+
+def _appointment_actor_name(user: User | None) -> str:
+    if user is None:
+        return "System"
+    return user.name or user.email or user.role.value.replace("_", " ").title()
+
+
+def _record_appointment_activity(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    *,
+    event_type: str,
+    user: User | None,
+    body: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+) -> DealerRepAppointmentActivity:
+    row = DealerRepAppointmentActivity(
+        appointment_id=appointment.id,
+        event_type=event_type,
+        body=(body or "").strip() or None,
+        actor_user_id=user.id if user else None,
+        actor_name=_appointment_actor_name(user),
+        before=jsonable_encoder(before) if before is not None else None,
+        after=jsonable_encoder(after) if after is not None else None,
+    )
+    db.add(row)
+    return row
+
+
+def _intake_vertical(variant: str | None) -> str:
+    value = (variant or "").lower()
+    if "real_estate" in value or "funding_review" in value:
+        return "real_estate"
+    if "main_street" in value:
+        return "main_street"
+    if "mca" in value:
+        return "mca"
+    return "dealer"
+
+
+async def _appointment_application_summary(
+    db: AsyncSession, appointment: DealerRepAppointment
+) -> RepAppointmentApplicationSummary | None:
+    if appointment.converted_intake_id is None:
+        return None
+    intake = await db.get(PublicUnderwritingIntake, appointment.converted_intake_id)
+    if intake is None:
+        return None
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(
+                ApplicationProfile.intake_id == appointment.converted_intake_id
+            )
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        return RepAppointmentApplicationSummary(
+            intake_id=intake.id,
+            profile_id=None,
+            loan_id=None,
+            vertical=_intake_vertical(intake.variant),
+            underwriting_status="submitted",
+            is_draft=True,
+            blockers=["Application profile has not been initialized"],
+        )
+    verification = await application_profile_service.verification_state(db, profile)
+    return RepAppointmentApplicationSummary(
+        intake_id=intake.id,
+        profile_id=profile.id,
+        loan_id=profile.loan_id,
+        vertical=profile.vertical,
+        underwriting_status=profile.underwriting_status,
+        is_draft=profile.is_draft,
+        ready_for_step_2=verification.ready_for_step_2,
+        unlocked=verification.unlocked,
+        blockers=verification.blockers,
+    )
+
+
+def _booking_review_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        value = value.value
+    if isinstance(value, Decimal):
+        value = format(value, "f").rstrip("0").rstrip(".")
+    result = str(value).strip()
+    return result or None
+
+
+def _booking_review_normalized(field: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if field == "requested_amount":
+        try:
+            return str(Decimal(re.sub(r"[^0-9.-]", "", value)).normalize())
+        except Exception:
+            pass
+    if field == "phone":
+        digits = re.sub(r"\D", "", value)
+        return digits[-10:] if digits else None
+    return " ".join(value.casefold().split())
+
+
+def _booking_review_row(
+    *,
+    field: str,
+    label: str,
+    current: object | None,
+    proposed: object | None,
+    target_kind: str | None,
+) -> RepAppointmentBookingDataReview:
+    current_text = _booking_review_text(current)
+    proposed_text = _booking_review_text(proposed)
+    if target_kind is None:
+        review_status = "unlinked"
+    elif current_text is None and proposed_text is None:
+        review_status = "empty"
+    elif current_text is None:
+        review_status = "missing_in_file"
+    elif proposed_text is None:
+        review_status = "file_only"
+    elif _booking_review_normalized(field, current_text) == _booking_review_normalized(field, proposed_text):
+        review_status = "matches"
+    else:
+        review_status = "conflict"
+    return RepAppointmentBookingDataReview(
+        field=field,
+        label=label,
+        current_value=current_text,
+        proposed_value=proposed_text,
+        status=review_status,
+        target_kind=target_kind,
+    )
+
+
+async def _appointment_booking_data_review(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    linked_loan: Loan | None,
+) -> list[RepAppointmentBookingDataReview]:
+    target_kind: str | None = None
+    current: dict[str, object | None] = {}
+    if linked_loan is not None:
+        target_kind = "loan"
+        client = await db.get(Client, linked_loan.client_id)
+        current = {
+            "contact": client.name if client else None,
+            "company": linked_loan.entity_name,
+            "email": client.email if client else None,
+            "phone": client.phone if client else None,
+            "requested_amount": linked_loan.amount,
+            "program": linked_loan.purpose,
+            "address": linked_loan.address,
+        }
+    elif appointment.converted_intake_id is not None:
+        intake = await db.get(PublicUnderwritingIntake, appointment.converted_intake_id)
+        if intake is not None:
+            target_kind = "intake"
+            intake_state = intake.intake_state if isinstance(intake.intake_state, dict) else {}
+            address = next(
+                (
+                    intake_state.get(key)
+                    for key in ("full_address", "business_address", "property_address", "address")
+                    if isinstance(intake_state.get(key), str) and intake_state.get(key).strip()
+                ),
+                None,
+            )
+            current = {
+                "contact": intake.full_name,
+                "company": intake.business_name,
+                "email": intake.email,
+                "phone": intake.phone,
+                "requested_amount": intake.requested_loan_amount,
+                "program": intake.loan_purpose,
+                "address": address,
+            }
+    proposed = {
+        "contact": appointment.invitee_name,
+        "company": appointment.company,
+        "email": appointment.invitee_email,
+        "phone": appointment.invitee_phone,
+        "requested_amount": appointment.requested_amount,
+        "program": appointment.program_name,
+        "address": appointment.full_address,
+    }
+    labels = {
+        "contact": "Contact",
+        "company": "Company",
+        "email": "Email",
+        "phone": "Phone",
+        "requested_amount": "Requested amount",
+        "program": "Program",
+        "address": "Address",
+    }
+    return [
+        _booking_review_row(
+            field=field,
+            label=label,
+            current=current.get(field),
+            proposed=proposed.get(field),
+            target_kind=target_kind,
+        )
+        for field, label in labels.items()
+    ]
+
+
+async def _appointment_workspace(
+    db: AsyncSession, appointment: DealerRepAppointment, user: User
+) -> RepAppointmentWorkspaceRead:
+    appointment_payload = (await _appointment_read_rows(db, [appointment]))[0]
+    activities = list(
+        (
+            await db.execute(
+                select(DealerRepAppointmentActivity)
+                .where(DealerRepAppointmentActivity.appointment_id == appointment.id)
+                .order_by(DealerRepAppointmentActivity.created_at.desc())
+                .limit(250)
+            )
+        ).scalars().all()
+    )
+    manages = _can_manage_appointment_crm(user)
+    application_candidates: list[RepAppointmentApplicationCandidate] = []
+    normalized_email = (appointment.invitee_email or "").strip().lower()
+    if manages and normalized_email:
+        candidate_query = select(PublicUnderwritingIntake).where(
+            func.lower(PublicUnderwritingIntake.email) == normalized_email
+        )
+        if user.role == Role.FIELD_REP:
+            candidate_query = candidate_query.where(PublicUnderwritingIntake.broker_id == user.id)
+        if appointment.converted_intake_id is not None:
+            candidate_query = candidate_query.where(
+                PublicUnderwritingIntake.id != appointment.converted_intake_id
+            )
+        candidate_rows = list(
+            (
+                await db.execute(
+                    candidate_query
+                    .order_by(PublicUnderwritingIntake.created_at.desc())
+                    .limit(8)
+                )
+            ).scalars().all()
+        )
+        application_candidates = [
+            RepAppointmentApplicationCandidate(
+                intake_id=row.id,
+                variant=row.variant,
+                business_name=row.business_name,
+                full_name=row.full_name,
+                email=row.email,
+                status=row.status,
+                created_at=row.created_at,
+            )
+            for row in candidate_rows
+        ]
+    linked_loan = await db.get(Loan, appointment.linked_loan_id) if appointment.linked_loan_id else None
+    funding_file = None
+    if linked_loan is not None:
+        funding_file = RepAppointmentFundingSummary(
+            loan_id=linked_loan.id,
+            deal_id=linked_loan.deal_id,
+            client_id=linked_loan.client_id,
+            stage=linked_loan.stage.value if hasattr(linked_loan.stage, "value") else str(linked_loan.stage),
+            amount=float(linked_loan.amount) if linked_loan.amount is not None else None,
+            entity_name=linked_loan.entity_name,
+            address=linked_loan.address,
+        )
+    return RepAppointmentWorkspaceRead(
+        appointment=RepAppointmentRead.model_validate(appointment_payload),
+        activities=[RepAppointmentActivityRead.model_validate(row) for row in activities],
+        application=await _appointment_application_summary(db, appointment),
+        funding_file=funding_file,
+        application_candidates=application_candidates,
+        booking_data_review=await _appointment_booking_data_review(db, appointment, linked_loan),
+        capabilities=RepAppointmentCapabilities(
+            can_edit=(manages or user.role == Role.FIELD_REP)
+            and appointment.status != "cancelled"
+            and appointment.archived_at is None,
+            can_add_notes=manages or user.role == Role.FIELD_REP,
+            can_manage_crm=manages,
+            can_start_application=manages,
+            can_retry_delivery=manages,
+            can_manage_outcomes=manages,
+            can_link_files=manages,
+            can_create_funding_loan=calendar_v2.can_create_funding_file(user),
+        ),
+    )
 
 
 @router.get(
@@ -6316,6 +6800,1090 @@ async def list_all_rep_appointments(
     return await _appointment_read_rows(db, rows)
 
 
+@router.get(
+    "/appointments/{appointment_id}/workspace",
+    response_model=RepAppointmentWorkspaceRead,
+)
+async def get_rep_appointment_workspace(
+    appointment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentWorkspaceRead:
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    return await _appointment_workspace(db, appointment, user)
+
+
+@router.patch(
+    "/appointments/{appointment_id}/crm",
+    response_model=RepAppointmentWorkspaceRead,
+)
+async def patch_rep_appointment_crm(
+    appointment_id: UUID,
+    payload: RepAppointmentCrmPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentWorkspaceRead:
+    if not _can_manage_appointment_crm(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Appointment CRM access required.")
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    current = appointment.crm_status or "scheduled"
+    if current == "converted" and payload.status != "converted":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A converted appointment keeps its application link and cannot be reopened.",
+        )
+    if current == "cancelled" and payload.status != "cancelled":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Create or reschedule a new appointment instead of reopening a cancelled meeting.",
+        )
+    if current == "not_qualified" and payload.status != current:
+        if not payload.confirm_terminal or not (payload.reason or "").strip():
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Confirm the reopen and provide a reason.",
+            )
+    if payload.status == "converted":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Use Start application to convert this appointment.",
+        )
+    if payload.status == "cancelled":
+        await _cancel_rep_appointment(
+            db,
+            appt=appointment,
+            user=user,
+            reason=(payload.reason or "").strip(),
+        )
+        appointment = await _load_owned_appointment(db, appointment_id, user)
+        return await _appointment_workspace(db, appointment, user)
+
+    before = {
+        "crm_status": current,
+        "follow_up_at": appointment.follow_up_at,
+    }
+    now = datetime.now(timezone.utc)
+    appointment.crm_status = payload.status
+    appointment.follow_up_at = payload.follow_up_at if payload.status == "follow_up" else None
+    appointment.crm_updated_at = now
+    appointment.crm_updated_by_user_id = user.id
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="crm_status_changed",
+        user=user,
+        body=(payload.reason or "").strip() or None,
+        before=before,
+        after={
+            "crm_status": appointment.crm_status,
+            "follow_up_at": appointment.follow_up_at,
+        },
+    )
+    await db.commit()
+    await db.refresh(appointment)
+    return await _appointment_workspace(db, appointment, user)
+
+
+@router.post(
+    "/appointments/{appointment_id}/notes",
+    response_model=RepAppointmentActivityRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rep_appointment_note(
+    appointment_id: UUID,
+    payload: RepAppointmentNoteCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DealerRepAppointmentActivity:
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    row = _record_appointment_activity(
+        db,
+        appointment,
+        event_type="note_added",
+        user=user,
+        body=payload.body,
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@router.post(
+    "/appointments/{appointment_id}/start-application",
+    response_model=RepAppointmentStartApplicationResult,
+)
+async def start_rep_appointment_application(
+    appointment_id: UUID,
+    payload: RepAppointmentStartApplication,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentStartApplicationResult:
+    if not calendar_v2.can_use_calendar_v2(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Calendar file access required.")
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    if appointment.status == "cancelled" or appointment.archived_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A cancelled appointment cannot start an application.")
+    if not appointment.invitee_email:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A client email is required.")
+
+    from app.routers import dealer_ai_intake as intake_api
+
+    created = False
+    linked_existing = False
+    delivery_status: str | None = None
+    delivery_detail: str | None = None
+    intake_id = appointment.converted_intake_id
+    if intake_id is None and payload.existing_intake_id is not None:
+        existing = await db.get(PublicUnderwritingIntake, payload.existing_intake_id)
+        if existing is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
+        if user.role == Role.FIELD_REP and existing.broker_id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
+        expected_variant = intake_api._ADMIN_VARIANT_CONSTANTS[payload.variant]
+        if existing.variant != expected_variant:
+            raise HTTPException(status.HTTP_409_CONFLICT, "The existing intake uses another vertical.")
+        if (existing.email or "").strip().lower() != appointment.invitee_email.strip().lower():
+            raise HTTPException(status.HTTP_409_CONFLICT, "The existing intake belongs to another email.")
+        intake_id = existing.id
+        linked_existing = True
+    elif intake_id is None:
+        result = await intake_api._create_admin_ai_lead_core(
+            intake_api.AdminLeadCreate(
+                variant=payload.variant,
+                full_name=appointment.invitee_name,
+                email=appointment.invitee_email,
+                phone=appointment.invitee_phone,
+                business_name=appointment.company,
+                loan_purpose=appointment.program_name,
+                investor_name=appointment.company if payload.variant == "real_estate" else None,
+                target_property_address=(
+                    appointment.full_address if payload.variant == "real_estate" else None
+                ),
+                transaction_type=(
+                    appointment.program_name if payload.variant == "real_estate" else None
+                ),
+                requested_amount=_appointment_amount(appointment.requested_amount),
+                notify_client=payload.notify_client,
+                secure_room_pin=payload.secure_room_pin,
+                force_new=True,
+            ),
+            request=request,
+            user=user,
+            db=db,
+        )
+        intake_id = result.intake.id
+        created = True
+        delivery_status = result.room_delivery_status
+        delivery_detail = result.room_delivery_detail
+
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    if appointment.converted_intake_id and appointment.converted_intake_id != intake_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This appointment already has another application.")
+    appointment.converted_intake_id = intake_id
+    appointment.conversion_target = "ai_intake"
+    appointment.outcome = "converted"
+    appointment.outcome_at = datetime.now(timezone.utc)
+    appointment.outcome_by_user_id = user.id
+    before_status = appointment.crm_status
+    appointment.crm_status = "converted"
+    appointment.follow_up_at = None
+    appointment.crm_updated_at = datetime.now(timezone.utc)
+    appointment.crm_updated_by_user_id = user.id
+
+    profile = await application_profile_service.resolve_profile(db, "intake", intake_id, user)
+    if profile.loan_id:
+        appointment.linked_loan_id = profile.loan_id
+        if appointment.calendar_event_id:
+            event = await db.get(CalendarEvent, appointment.calendar_event_id)
+            if event:
+                event.loan_id = profile.loan_id
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="application_started" if created else "application_linked",
+        user=user,
+        body=f"{payload.variant.replace('_', ' ').title()} application",
+        before={"crm_status": before_status},
+        after={
+            "crm_status": "converted",
+            "intake_id": str(intake_id),
+            "profile_id": str(profile.id),
+        },
+    )
+    await db.commit()
+    return RepAppointmentStartApplicationResult(
+        intake_id=intake_id,
+        profile_id=profile.id,
+        loan_id=profile.loan_id,
+        created=created,
+        linked_existing=linked_existing,
+        href=f"/admin/ai-underwriter-leads?lead={intake_id}&view=underwriting",
+        room_delivery_status=delivery_status,
+        room_delivery_detail=delivery_detail,
+    )
+
+
+def _appointment_intake_href(intake_id: UUID) -> str:
+    return f"/admin/ai-underwriter-leads?lead={intake_id}&view=underwriting"
+
+
+def _appointment_loan_href(loan_id: UUID) -> str:
+    return f"/loans/{loan_id}"
+
+
+async def _load_calendar_intake_file(
+    db: AsyncSession,
+    intake_id: UUID,
+    user: User,
+) -> PublicUnderwritingIntake:
+    intake = await db.get(PublicUnderwritingIntake, intake_id)
+    if intake is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
+    if user.role == Role.FIELD_REP and intake.broker_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "AI intake not found.")
+    return intake
+
+
+async def _load_calendar_loan_file(
+    db: AsyncSession,
+    loan_id: UUID,
+    user: User,
+) -> Loan:
+    if not calendar_v2.can_create_funding_file(user):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding file not found.")
+    loan = await db.get(Loan, loan_id)
+    if loan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding file not found.")
+    return loan
+
+
+async def _link_calendar_file(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    *,
+    kind: str,
+    file_id: UUID,
+    user: User,
+) -> RepAppointmentFileLinkResult:
+    before = {
+        "converted_intake_id": appointment.converted_intake_id,
+        "linked_loan_id": appointment.linked_loan_id,
+    }
+    if kind == "intake":
+        intake = await _load_calendar_intake_file(db, file_id, user)
+        appointment.converted_intake_id = intake.id
+        profile = await application_profile_service.resolve_profile(db, "intake", intake.id, user)
+        if profile.loan_id:
+            appointment.linked_loan_id = profile.loan_id
+        href = _appointment_intake_href(intake.id)
+    else:
+        loan = await _load_calendar_loan_file(db, file_id, user)
+        appointment.linked_loan_id = loan.id
+        href = _appointment_loan_href(loan.id)
+    if appointment.calendar_event_id and appointment.linked_loan_id:
+        event = await db.get(CalendarEvent, appointment.calendar_event_id)
+        if event:
+            event.loan_id = appointment.linked_loan_id
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="file_linked",
+        user=user,
+        body=f"Linked {kind.replace('_', ' ')} file",
+        before=before,
+        after={"kind": kind, "file_id": str(file_id), "href": href},
+    )
+    return RepAppointmentFileLinkResult(
+        appointment_id=appointment.id,
+        kind=kind,
+        file_id=file_id,
+        href=href,
+    )
+
+
+@router.get(
+    "/appointments/{appointment_id}/file-options",
+    response_model=RepAppointmentFileOptions,
+)
+async def list_rep_appointment_file_options(
+    appointment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str = Query(default="", max_length=160),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> RepAppointmentFileOptions:
+    await _load_owned_appointment(db, appointment_id, user)
+    needle = q.strip()
+    pattern = f"%{needle}%"
+    intake_stmt = select(PublicUnderwritingIntake)
+    if user.role == Role.FIELD_REP:
+        intake_stmt = intake_stmt.where(PublicUnderwritingIntake.broker_id == user.id)
+    if needle:
+        intake_stmt = intake_stmt.where(
+            or_(
+                PublicUnderwritingIntake.full_name.ilike(pattern),
+                PublicUnderwritingIntake.business_name.ilike(pattern),
+                PublicUnderwritingIntake.email.ilike(pattern),
+                PublicUnderwritingIntake.phone.ilike(pattern),
+                PublicUnderwritingIntake.id.cast(String).ilike(pattern),
+            )
+        )
+    intakes = list(
+        (
+            await db.execute(
+                intake_stmt.order_by(PublicUnderwritingIntake.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
+    )
+    items = [
+        RepAppointmentFileOption(
+            kind="intake",
+            id=row.id,
+            label=row.business_name or row.full_name,
+            subtitle=f"{row.full_name} · {row.email}",
+            status=row.status,
+            href=_appointment_intake_href(row.id),
+        )
+        for row in intakes
+    ]
+    if calendar_v2.can_create_funding_file(user) and len(items) < limit:
+        loan_stmt = select(Loan, Client).join(Client, Client.id == Loan.client_id)
+        if needle:
+            loan_stmt = loan_stmt.where(
+                or_(
+                    Loan.deal_id.ilike(pattern),
+                    Loan.entity_name.ilike(pattern),
+                    Loan.address.ilike(pattern),
+                    Client.name.ilike(pattern),
+                    Client.email.ilike(pattern),
+                    Client.phone.ilike(pattern),
+                )
+            )
+        loan_rows = list(
+            (
+                await db.execute(
+                    loan_stmt.order_by(Loan.created_at.desc()).limit(limit - len(items))
+                )
+            ).all()
+        )
+        items.extend(
+            RepAppointmentFileOption(
+                kind="loan",
+                id=loan.id,
+                label=loan.entity_name or client.name,
+                subtitle=f"{loan.deal_id} · {client.email or 'No email'}",
+                status=loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage),
+                href=_appointment_loan_href(loan.id),
+            )
+            for loan, client in loan_rows
+        )
+    return RepAppointmentFileOptions(items=items)
+
+
+@router.get("/calendar/file-options", response_model=RepAppointmentFileOptions)
+async def list_calendar_file_options(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str = Query(default="", max_length=160),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> RepAppointmentFileOptions:
+    require_team_or_rep(user)
+    needle = q.strip()
+    pattern = f"%{needle}%"
+    intake_stmt = select(PublicUnderwritingIntake)
+    if user.role == Role.FIELD_REP:
+        intake_stmt = intake_stmt.where(PublicUnderwritingIntake.broker_id == user.id)
+    if needle:
+        intake_stmt = intake_stmt.where(
+            or_(
+                PublicUnderwritingIntake.full_name.ilike(pattern),
+                PublicUnderwritingIntake.business_name.ilike(pattern),
+                PublicUnderwritingIntake.email.ilike(pattern),
+                PublicUnderwritingIntake.phone.ilike(pattern),
+                PublicUnderwritingIntake.id.cast(String).ilike(pattern),
+            )
+        )
+    intakes = list(
+        (
+            await db.execute(
+                intake_stmt.order_by(PublicUnderwritingIntake.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
+    )
+    items = [
+        RepAppointmentFileOption(
+            kind="intake",
+            id=row.id,
+            label=row.business_name or row.full_name,
+            subtitle=f"{row.full_name} · {row.email}",
+            status=row.status,
+            href=_appointment_intake_href(row.id),
+        )
+        for row in intakes
+    ]
+    if calendar_v2.can_create_funding_file(user) and len(items) < limit:
+        loan_stmt = select(Loan, Client).join(Client, Client.id == Loan.client_id)
+        if needle:
+            loan_stmt = loan_stmt.where(
+                or_(
+                    Loan.deal_id.ilike(pattern),
+                    Loan.entity_name.ilike(pattern),
+                    Loan.address.ilike(pattern),
+                    Client.name.ilike(pattern),
+                    Client.email.ilike(pattern),
+                    Client.phone.ilike(pattern),
+                )
+            )
+        rows = list(
+            (
+                await db.execute(
+                    loan_stmt.order_by(Loan.created_at.desc()).limit(limit - len(items))
+                )
+            ).all()
+        )
+        items.extend(
+            RepAppointmentFileOption(
+                kind="loan",
+                id=loan.id,
+                label=loan.entity_name or client.name,
+                subtitle=f"{loan.deal_id} · {client.email or 'No email'}",
+                status=loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage),
+                href=_appointment_loan_href(loan.id),
+            )
+            for loan, client in rows
+        )
+    return RepAppointmentFileOptions(items=items)
+
+
+@router.patch(
+    "/appointments/{appointment_id}/file-link",
+    response_model=RepAppointmentFileLinkResult,
+)
+async def patch_rep_appointment_file_link(
+    appointment_id: UUID,
+    payload: RepAppointmentFileLinkPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentFileLinkResult:
+    if not payload.confirm:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Confirm the explicit file link.")
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    result = await _link_calendar_file(
+        db,
+        appointment,
+        kind=payload.kind,
+        file_id=payload.file_id,
+        user=user,
+    )
+    await db.commit()
+    return result
+
+
+async def _create_calendar_funding_file(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    user: User,
+) -> tuple[Loan, ApplicationProfile]:
+    if not calendar_v2.can_create_funding_file(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Underwriters create canonical funding files.")
+    client = Client(
+        name=appointment.invitee_name,
+        email=(appointment.invitee_email or "").strip().lower() or None,
+        phone=appointment.invitee_phone,
+        address=appointment.full_address,
+        source_channel="calendar_v2",
+        referral_source="calendar",
+        client_experience_mode="guided",
+        client_experience_mode_reason="calendar_conversion",
+        client_experience_mode_locked_by="firm",
+    )
+    db.add(client)
+    await db.flush()
+    amount = _appointment_amount(appointment.requested_amount) or 0
+    loan = Loan(
+        id=uuid4(),
+        deal_id=f"C-{str(uuid4())[:8].upper()}",
+        client_id=client.id,
+        address=appointment.full_address or "Business address pending",
+        property_type=PropertyType.COMMERCIAL,
+        type=LoanType.BRIDGE,
+        purpose=LoanPurpose.CASH_OUT_REFI,
+        stage=LoanStage.PREQUALIFIED,
+        amount=amount,
+        entity_name=appointment.company,
+        funding_file_kind="business",
+        source_attribution="calendar",
+        assigned_owner_id=user.id,
+        handoff_summary=(appointment.notes or "Created from Calendar V2 appointment.")[:4000],
+    )
+    db.add(loan)
+    await db.flush()
+    profile = await application_profile_service.resolve_profile(db, "loan", loan.id, user)
+    appointment.linked_loan_id = loan.id
+    appointment.conversion_target = "funding_loan"
+    if appointment.calendar_event_id:
+        event = await db.get(CalendarEvent, appointment.calendar_event_id)
+        if event:
+            event.loan_id = loan.id
+    await log_activity(
+        db,
+        loan_id=loan.id,
+        actor_id=user.id,
+        actor_label=_appointment_actor_name(user),
+        kind="calendar.file_created",
+        summary=f"Funding file {loan.deal_id} created from appointment",
+        payload={"appointment_id": str(appointment.id), "profile_id": str(profile.id)},
+    )
+    return loan, profile
+
+
+async def _apply_calendar_booking_data(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    user: User,
+) -> RepAppointmentActionResult:
+    if appointment.converted_intake_id:
+        intake = await _load_calendar_intake_file(db, appointment.converted_intake_id, user)
+        intake.full_name = appointment.invitee_name
+        intake.email = (appointment.invitee_email or intake.email).strip().lower()
+        intake.phone = appointment.invitee_phone
+        intake.business_name = appointment.company
+        intake.loan_purpose = appointment.program_name
+        intake.requested_loan_amount = _appointment_amount(appointment.requested_amount)
+        return RepAppointmentActionResult(
+            action="apply_booking_data",
+            status="completed",
+            detail="Booking contact and request data applied to the linked AI Intake.",
+            href=_appointment_intake_href(intake.id),
+        )
+    if appointment.linked_loan_id:
+        loan = await _load_calendar_loan_file(db, appointment.linked_loan_id, user)
+        client = await db.get(Client, loan.client_id)
+        if client:
+            client.name = appointment.invitee_name
+            client.email = (appointment.invitee_email or "").strip().lower() or None
+            client.phone = appointment.invitee_phone
+            client.address = appointment.full_address
+        loan.entity_name = appointment.company
+        loan.address = appointment.full_address or loan.address
+        parsed_amount = _appointment_amount(appointment.requested_amount)
+        if parsed_amount is not None:
+            loan.amount = parsed_amount
+        return RepAppointmentActionResult(
+            action="apply_booking_data",
+            status="completed",
+            detail="Confirmed booking data applied to the linked funding file.",
+            href=_appointment_loan_href(loan.id),
+        )
+    return RepAppointmentActionResult(
+        action="apply_booking_data",
+        status="skipped",
+        detail="No file is linked to this appointment.",
+    )
+
+
+async def _create_calendar_follow_up(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    user: User,
+    starts_at: datetime,
+) -> RepAppointmentActionResult:
+    host = await db.get(User, appointment.owner_user_id) if appointment.owner_user_id else user
+    booking = await _booking_settings_for(db, host or user)
+    starts_at = _to_utc_minute(starts_at)
+    duration = appointment.duration_min or booking.duration_min or 20
+    if not await _appointment_slot_is_available(
+        db,
+        host or user,
+        booking,
+        starts_at=starts_at,
+        duration_min=duration,
+    ):
+        return RepAppointmentActionResult(
+            action="schedule_follow_up",
+            status="failed",
+            detail="The selected follow-up time is unavailable.",
+        )
+    event = CalendarEvent(
+        kind=CalendarEventKind.CALL,
+        title=f"Follow up: {appointment.invitee_name}",
+        description=f"Follow-up created from appointment {appointment.id}.",
+        who=appointment.invitee_name[:160],
+        starts_at=starts_at,
+        duration_min=duration,
+        status=CalendarEventStatus.PENDING,
+        source=CalendarEventSource.MANUAL,
+        owner_user_id=(host or user).id,
+        external_ref_kind="dealer_rep_appointment",
+        external_ref_id=secrets.token_urlsafe(12),
+        loan_id=appointment.linked_loan_id,
+    )
+    db.add(event)
+    await db.flush()
+    follow_up = DealerRepAppointment(
+        dealer_id=appointment.dealer_id,
+        owner_user_id=(host or user).id,
+        calendar_event_id=event.id,
+        contact_id=appointment.contact_id,
+        kind="intro_call",
+        title=f"Follow up: {appointment.invitee_name}",
+        starts_at=starts_at,
+        duration_min=duration,
+        timezone=appointment.timezone,
+        invitee_name=appointment.invitee_name,
+        invitee_email=appointment.invitee_email,
+        invitee_phone=appointment.invitee_phone,
+        company=appointment.company,
+        program_key=appointment.program_key,
+        program_name=appointment.program_name,
+        requested_amount=appointment.requested_amount,
+        full_address=appointment.full_address,
+        join_url=appointment.join_url,
+        meeting_mode=appointment.meeting_mode,
+        location=appointment.location,
+        notes=f"Follow-up from {appointment.title}",
+        status="pending",
+        crm_status="scheduled",
+        booked_by_user_id=user.id,
+        converted_intake_id=appointment.converted_intake_id,
+        linked_loan_id=appointment.linked_loan_id,
+    )
+    db.add(follow_up)
+    await db.flush()
+    event.external_ref_id = str(follow_up.id)
+    _record_appointment_activity(
+        db,
+        follow_up,
+        event_type="follow_up_created",
+        user=user,
+        body=f"Created from {appointment.title}",
+    )
+    return RepAppointmentActionResult(
+        action="schedule_follow_up",
+        status="completed",
+        detail=f"Follow-up scheduled for {starts_at.isoformat()}.",
+        href=f"/calendar-v2?appointment={follow_up.id}",
+    )
+
+
+async def _create_calendar_document_requests(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    user: User,
+    keys: list[str],
+) -> RepAppointmentActionResult:
+    if not appointment.converted_intake_id:
+        return RepAppointmentActionResult(
+            action="request_documents",
+            status="failed",
+            detail="Link or create an AI Intake before requesting room documents.",
+        )
+    profile = await application_profile_service.resolve_profile(
+        db, "intake", appointment.converted_intake_id, user
+    )
+    if not profile.primary_bucket_id:
+        return RepAppointmentActionResult(
+            action="request_documents",
+            status="failed",
+            detail="The linked application does not have a document room.",
+        )
+    labels = {
+        "tax_returns": "Business tax returns",
+        "profit_and_loss": "Current year profit and loss statement",
+        "bank_statements": "Recent business bank statements",
+        "debt_schedule": "Current business debt schedule",
+        "entity_documents": "Business entity documents",
+    }
+    requested = list(dict.fromkeys(keys))
+    if not requested:
+        return RepAppointmentActionResult(
+            action="request_documents",
+            status="failed",
+            detail="Select at least one document request.",
+        )
+    created = 0
+    for key in requested:
+        name = labels.get(key, key.replace("_", " ").title())[:180]
+        existing = (
+            await db.execute(
+                select(BucketRequestedDocument.id).where(
+                    BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                    func.lower(BucketRequestedDocument.name) == name.casefold(),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            continue
+        db.add(
+            BucketRequestedDocument(
+                bucket_id=profile.primary_bucket_id,
+                name=name,
+                category="calendar_follow_up",
+                description="Requested from the Calendar V2 appointment outcome.",
+                required=True,
+                allow_multiple_files=True,
+                is_custom=True,
+            )
+        )
+        created += 1
+    return RepAppointmentActionResult(
+        action="request_documents",
+        status="completed",
+        detail=f"{created} new request(s) added to the application room.",
+        href=_appointment_intake_href(appointment.converted_intake_id),
+    )
+
+
+async def _send_calendar_rebooking(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    user: User,
+) -> RepAppointmentActionResult:
+    if not appointment.invitee_email:
+        return RepAppointmentActionResult(
+            action="send_no_show_rebooking",
+            status="failed",
+            detail="The appointment does not have a client email.",
+        )
+    host = await db.get(User, appointment.owner_user_id) if appointment.owner_user_id else user
+    booking = await _booking_settings_for(db, host or user)
+    settings = get_settings()
+    base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
+    if settings.app_env.lower() == "production" and (not base or "localhost" in base):
+        base = "https://app.qualifiedcommercial.com"
+    booking_url = f"{base}/book/{booking.slug}" if base and booking.enabled and booking.slug else None
+    if not booking_url:
+        return RepAppointmentActionResult(
+            action="send_no_show_rebooking",
+            status="failed",
+            detail="Enable the public booking link before sending a rebooking message.",
+        )
+    from app.services.email.user_mailer import send_as_user
+
+    result = await send_as_user(
+        db,
+        (host or user).id,
+        to_emails=[appointment.invitee_email],
+        subject="Let's reschedule your Qualified Commercial appointment",
+        body_text=(
+            f"Hi {appointment.invitee_name},\n\n"
+            "We missed you at the scheduled appointment. Choose a new time here:\n"
+            f"{booking_url}"
+        ),
+    )
+    return RepAppointmentActionResult(
+        action="send_no_show_rebooking",
+        status="completed" if result.ok else "failed",
+        detail=result.detail or ("Rebooking email accepted by the provider." if result.ok else "Email failed."),
+        href=booking_url,
+    )
+
+
+@router.post(
+    "/appointments/{appointment_id}/apply-outcome",
+    response_model=RepAppointmentApplyOutcomeResult,
+)
+async def apply_rep_appointment_outcome(
+    appointment_id: UUID,
+    payload: RepAppointmentApplyOutcome,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentApplyOutcomeResult:
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    definition = (
+        await db.execute(
+            select(AppointmentOutcomeDefinition).where(
+                AppointmentOutcomeDefinition.id == payload.outcome_definition_id,
+                AppointmentOutcomeDefinition.owner_user_id == user.id,
+                AppointmentOutcomeDefinition.active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if definition is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Outcome not found.")
+    key_hash = hashlib.sha256(
+        f"{appointment.id}:{payload.idempotency_key}".encode("utf-8")
+    ).hexdigest()
+    if appointment.workflow_outcome_idempotency_key == key_hash:
+        stored = appointment.workflow_outcome_results or {}
+        actions = [RepAppointmentActionResult(**item) for item in stored.get("actions", [])]
+        return RepAppointmentApplyOutcomeResult(
+            appointment_id=appointment.id,
+            outcome_definition_id=definition.id,
+            outcome_label=appointment.workflow_outcome_label or definition.name,
+            crm_status=appointment.crm_status,
+            idempotent_replay=True,
+            actions=actions,
+            workspace=await _appointment_workspace(db, appointment, user),
+            attempted_at=appointment.workflow_outcome_applied_at or datetime.now(timezone.utc),
+        )
+    effects = [effect for effect in definition.effects if effect in calendar_v2.ALLOWED_OUTCOME_EFFECTS]
+    requires_note = "file_action" in effects or "close_enquiry" in effects
+    if requires_note and not (payload.note or "").strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Add meeting notes before creating, updating, or closing a file.",
+        )
+    if requires_note and not payload.confirm:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Review and confirm this outcome.")
+    if "schedule_follow_up" in effects and payload.follow_up_at is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a follow-up time.")
+    if "file_action" in effects and payload.file_action == "none":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose what to do with the client file.")
+
+    actions: list[RepAppointmentActionResult] = []
+    if "file_action" in effects:
+        if payload.file_action == "create_ai_intake":
+            if payload.variant is None or payload.secure_room_pin is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Choose an AI Intake type and six-digit room PIN.",
+                )
+            result = await start_rep_appointment_application(
+                appointment.id,
+                RepAppointmentStartApplication(
+                    variant=payload.variant,
+                    secure_room_pin=payload.secure_room_pin,
+                    notify_client=payload.notify_client,
+                ),
+                request,
+                user,
+                db,
+            )
+            actions.append(
+                RepAppointmentActionResult(
+                    action="create_ai_intake",
+                    status="completed",
+                    detail="AI Intake created and linked.",
+                    href=result.href,
+                )
+            )
+            appointment = await _load_owned_appointment(db, appointment.id, user)
+        elif payload.file_action == "create_funding_loan":
+            loan, _ = await _create_calendar_funding_file(db, appointment, user)
+            actions.append(
+                RepAppointmentActionResult(
+                    action="create_funding_loan",
+                    status="completed",
+                    detail=f"Funding file {loan.deal_id} created and linked.",
+                    href=_appointment_loan_href(loan.id),
+                )
+            )
+        elif payload.file_action == "link_existing":
+            if payload.existing_file_kind is None or payload.existing_file_id is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose an existing file.")
+            link = await _link_calendar_file(
+                db,
+                appointment,
+                kind=payload.existing_file_kind,
+                file_id=payload.existing_file_id,
+                user=user,
+            )
+            actions.append(
+                RepAppointmentActionResult(
+                    action="link_existing",
+                    status="completed",
+                    detail="Existing file linked explicitly.",
+                    href=link.href,
+                )
+            )
+        elif payload.file_action == "update_linked":
+            if not appointment.converted_intake_id and not appointment.linked_loan_id:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Link a file before updating it.")
+            actions.append(
+                RepAppointmentActionResult(
+                    action="update_linked",
+                    status="completed",
+                    detail="The linked file remains the outcome destination.",
+                    href=(
+                        _appointment_intake_href(appointment.converted_intake_id)
+                        if appointment.converted_intake_id
+                        else _appointment_loan_href(appointment.linked_loan_id)
+                    ),
+                )
+            )
+        if payload.apply_booking_data:
+            actions.append(await _apply_calendar_booking_data(db, appointment, user))
+
+    if "schedule_follow_up" in effects and payload.follow_up_at:
+        actions.append(await _create_calendar_follow_up(db, appointment, user, payload.follow_up_at))
+    if "request_documents" in effects:
+        actions.append(
+            await _create_calendar_document_requests(
+                db, appointment, user, payload.requested_document_keys
+            )
+        )
+    if "send_no_show_rebooking" in effects:
+        actions.append(await _send_calendar_rebooking(db, appointment, user))
+    if "close_enquiry" in effects:
+        actions.append(
+            RepAppointmentActionResult(
+                action="close_enquiry",
+                status="completed",
+                detail="Enquiry closed; appointment and file history were retained.",
+            )
+        )
+    if "log_activity" in effects:
+        actions.append(
+            RepAppointmentActionResult(
+                action="log_activity",
+                status="completed",
+                detail="Outcome recorded in the appointment timeline.",
+            )
+        )
+
+    attempted_at = datetime.now(timezone.utc)
+    previous_status = appointment.crm_status
+    appointment.crm_status = definition.target_crm_status
+    appointment.follow_up_at = payload.follow_up_at if definition.target_crm_status == "follow_up" else None
+    appointment.crm_updated_at = attempted_at
+    appointment.crm_updated_by_user_id = user.id
+    appointment.workflow_outcome_definition_id = definition.id
+    appointment.workflow_outcome_label = definition.name
+    appointment.workflow_outcome_effects = effects
+    appointment.workflow_outcome_results = {
+        "actions": [item.model_dump(mode="json") for item in actions]
+    }
+    appointment.workflow_outcome_applied_at = attempted_at
+    appointment.workflow_outcome_by_user_id = user.id
+    appointment.workflow_outcome_idempotency_key = key_hash
+    if definition.target_crm_status == "converted":
+        appointment.outcome = "converted"
+        appointment.outcome_at = attempted_at
+        appointment.outcome_by_user_id = user.id
+    elif definition.target_crm_status == "no_show":
+        appointment.outcome = "did_not_show"
+        appointment.outcome_at = attempted_at
+        appointment.outcome_by_user_id = user.id
+    elif definition.target_crm_status == "not_qualified":
+        appointment.outcome = "not_converted"
+        appointment.outcome_at = attempted_at
+        appointment.outcome_by_user_id = user.id
+    appointment.outcome_note = (payload.note or "").strip() or None
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="outcome_applied",
+        user=user,
+        body=appointment.outcome_note,
+        before={"crm_status": previous_status},
+        after={
+            "crm_status": appointment.crm_status,
+            "outcome": definition.name,
+            "effects": effects,
+            "actions": [item.model_dump(mode="json") for item in actions],
+        },
+    )
+    if appointment.linked_loan_id:
+        await log_activity(
+            db,
+            loan_id=appointment.linked_loan_id,
+            actor_id=user.id,
+            actor_label=_appointment_actor_name(user),
+            kind="calendar.outcome_applied",
+            summary=f"Appointment outcome: {definition.name}",
+            payload={
+                "appointment_id": str(appointment.id),
+                "effects": effects,
+            },
+        )
+    await db.commit()
+    await db.refresh(appointment)
+    return RepAppointmentApplyOutcomeResult(
+        appointment_id=appointment.id,
+        outcome_definition_id=definition.id,
+        outcome_label=definition.name,
+        crm_status=appointment.crm_status,
+        actions=actions,
+        workspace=await _appointment_workspace(db, appointment, user),
+        attempted_at=attempted_at,
+    )
+
+
+@router.post(
+    "/appointments/{appointment_id}/delivery/retry",
+    response_model=RepAppointmentDeliveryRetryResult,
+)
+async def retry_rep_appointment_delivery(
+    appointment_id: UUID,
+    payload: RepAppointmentDeliveryRetry,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentDeliveryRetryResult:
+    if not _can_manage_appointment_crm(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Appointment CRM access required.")
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    if appointment.calendar_event_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This appointment has no calendar event.")
+    event = await db.get(CalendarEvent, appointment.calendar_event_id)
+    notice = (
+        await db.execute(
+            select(BookingNotification).where(
+                BookingNotification.event_id == appointment.calendar_event_id
+            )
+        )
+    ).scalar_one_or_none()
+    if event is None or notice is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Delivery state is unavailable.")
+    host = await _rep_host_for(db, None, user)
+    booking = await _booking_settings_for(db, host)
+    attempted_at = datetime.now(timezone.utc)
+    detail: str | None = None
+    if payload.action == "email_confirmation":
+        if not appointment.invitee_email:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no email address.")
+        result = booking_notify.send_invitee_invite(
+            host,
+            booking,
+            event,
+            appointment.starts_at,
+            invitee_name=appointment.invitee_name,
+            invitee_email=appointment.invitee_email,
+            join_url=appointment.join_url,
+            sequence=int(attempted_at.timestamp()),
+        )
+        retry_status = "sent" if result and result.ok else "failed"
+        detail = result.detail if result else "Email provider unavailable"
+        notice.confirmation_email_status = retry_status
+    else:
+        if not notice.invitee_phone:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no phone number.")
+        if not notice.sms_consent:
+            retry_status = "blocked_no_consent"
+            detail = "Transactional SMS consent is required for this phone number."
+            notice.confirmation_sms_status = retry_status
+        else:
+            notice.confirmation_sms_status = "pending"
+            await db.flush()
+            await booking_reminders.send_confirmation_sms(
+                db,
+                notice,
+                event,
+                timezone_name=appointment.timezone,
+            )
+            retry_status = notice.confirmation_sms_status
+            detail = notice.last_error if retry_status == "failed" else None
+    if retry_status == "failed" and detail:
+        notice.last_error = detail[:1000]
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="delivery_retried",
+        user=user,
+        body=detail,
+        after={"action": payload.action, "status": retry_status},
+    )
+    await db.commit()
+    return RepAppointmentDeliveryRetryResult(
+        action=payload.action,
+        status=retry_status,
+        detail=detail,
+        attempted_at=attempted_at,
+    )
+
+
 async def _prepare_underwriting_review_room(
     db: AsyncSession,
     *,
@@ -6455,9 +8023,10 @@ async def create_standalone_rep_appointment(
     booking = await _booking_settings_for(db, host)
     await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
-    duration = booking.duration_min or 20
-    slots = await _booking_slots(db, host, booking, duration_min=duration)
-    if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
+    duration = payload.duration_min or booking.duration_min or 20
+    if not await _appointment_slot_is_available(
+        db, host, booking, starts_at=starts_at, duration_min=duration
+    ):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
     program_key, program_name = await _resolve_appointment_program(
         db,
@@ -6506,6 +8075,8 @@ async def create_standalone_rep_appointment(
         requested_amount=requested_amount,
         full_address=full_address,
         join_url=payload.join_url,
+        meeting_mode=payload.meeting_mode,
+        location=payload.location,
         notes=payload.notes,
         status="pending",
         client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
@@ -6513,6 +8084,14 @@ async def create_standalone_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    _record_appointment_activity(
+        db,
+        appt,
+        event_type="appointment_created",
+        user=user,
+        body=appt.title,
+        after={"crm_status": appt.crm_status},
+    )
     ev.external_ref_id = str(appt.id)
     notice = await booking_reminders.register_booking(
         db,
@@ -6679,9 +8258,10 @@ async def create_rep_appointment(
     booking = await _booking_settings_for(db, host)
     await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
-    duration = booking.duration_min or 20
-    slots = await _booking_slots(db, host, booking, duration_min=duration)
-    if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots.slots):
+    duration = payload.duration_min or booking.duration_min or 20
+    if not await _appointment_slot_is_available(
+        db, host, booking, starts_at=starts_at, duration_min=duration
+    ):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
     program_key, program_name = await _resolve_appointment_program(
         db,
@@ -6730,6 +8310,8 @@ async def create_rep_appointment(
         requested_amount=requested_amount,
         full_address=full_address,
         join_url=payload.join_url,
+        meeting_mode=payload.meeting_mode,
+        location=payload.location,
         notes=payload.notes,
         status="pending",
         client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
@@ -6737,6 +8319,14 @@ async def create_rep_appointment(
     )
     db.add(appt)
     await db.flush()
+    _record_appointment_activity(
+        db,
+        appt,
+        event_type="appointment_created",
+        user=user,
+        body=appt.title,
+        after={"crm_status": appt.crm_status},
+    )
     ev.external_ref_id = str(appt.id)
     notice = await booking_reminders.register_booking(
         db,
@@ -6879,8 +8469,14 @@ async def _cancel_rep_appointment(
     *,
     appt: DealerRepAppointment,
     user: User,
-    reason: str | None,
+    reason: str,
 ) -> dict:
+    cancellation_reason = reason.strip()
+    if not cancellation_reason:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A cancellation reason is required.",
+        )
     now = datetime.now(timezone.utc)
     if appt.archived_at is not None and appt.status == "cancelled":
         return (await _appointment_read_rows(db, [appt]))[0]
@@ -6895,7 +8491,21 @@ async def _cancel_rep_appointment(
     appt.status = "cancelled"
     appt.archived_at = now
     appt.archived_by_user_id = user.id
-    appt.cancellation_reason = (reason or "").strip() or None
+    appt.cancellation_reason = cancellation_reason
+    previous_crm_status = appt.crm_status or "scheduled"
+    appt.crm_status = "cancelled"
+    appt.follow_up_at = None
+    appt.crm_updated_at = now
+    appt.crm_updated_by_user_id = user.id
+    _record_appointment_activity(
+        db,
+        appt,
+        event_type="appointment_cancelled",
+        user=user,
+        body=appt.cancellation_reason,
+        before={"crm_status": previous_crm_status},
+        after={"crm_status": "cancelled"},
+    )
     if event:
         event.status = CalendarEventStatus.CANCELLED
     if notice:
@@ -6991,7 +8601,10 @@ async def patch_rep_appointment(
 ) -> dict:
     appt = await _load_owned_appointment(db, appointment_id, user)
     if payload.status == "cancelled":
-        return await _cancel_rep_appointment(db, appt=appt, user=user, reason=None)
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Use the cancellation action and provide a reason.",
+        )
     event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
     host = await db.get(User, appt.owner_user_id) if appt.owner_user_id else user
     rep = await db.get(User, appt.booked_by_user_id) if appt.booked_by_user_id else user
@@ -7015,14 +8628,14 @@ async def patch_rep_appointment(
     rescheduled = proposed_start != appt.starts_at or proposed_duration != appt.duration_min
     if rescheduled:
         await lock_calendar_owner(db, (host or user).id)
-        availability = await _booking_slots(
+        if not await _appointment_slot_is_available(
             db,
             host or user,
             booking,
+            starts_at=proposed_start,
             duration_min=proposed_duration,
             exclude_event_id=event.id if event else None,
-        )
-        if not any(abs((slot.starts_at - proposed_start).total_seconds()) < 1 for slot in availability.slots):
+        ):
             raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available on the shared calendar.")
         appt.starts_at = proposed_start
         appt.duration_min = proposed_duration
@@ -7036,6 +8649,26 @@ async def patch_rep_appointment(
             appt.outcome_note = None
             appt.outcome_at = None
             appt.outcome_by_user_id = None
+        if appt.crm_status in {"no_show", "not_qualified"}:
+            if not payload.reopen_outcome:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Confirm that rescheduling should reopen the CRM outcome.",
+                )
+            previous_crm_status = appt.crm_status
+            appt.crm_status = "scheduled"
+            appt.follow_up_at = None
+            appt.crm_updated_at = datetime.now(timezone.utc)
+            appt.crm_updated_by_user_id = user.id
+            _record_appointment_activity(
+                db,
+                appt,
+                event_type="crm_status_reopened",
+                user=user,
+                body="Appointment rescheduled",
+                before={"crm_status": previous_crm_status},
+                after={"crm_status": "scheduled"},
+            )
 
     if "program_key" in payload.model_fields_set or "program_name" in payload.model_fields_set:
         program_key, program_name = await _resolve_appointment_program(
@@ -7049,7 +8682,7 @@ async def patch_rep_appointment(
 
     for field in (
         "kind", "title", "timezone", "invitee_name", "company",
-        "requested_amount", "full_address", "join_url", "notes",
+        "requested_amount", "full_address", "join_url", "meeting_mode", "location", "notes",
     ):
         value = getattr(payload, field)
         if field in payload.model_fields_set:
@@ -7143,6 +8776,14 @@ async def patch_rep_appointment(
             email=True,
             push=True,
         )
+    _record_appointment_activity(
+        db,
+        appt,
+        event_type="appointment_rescheduled" if rescheduled else "appointment_updated",
+        user=user,
+        before=before,
+        after=payload.model_dump(exclude_unset=True, mode="json"),
+    )
     await db.commit()
 
     results: dict[str, str] = {"rep": "queued" if rep else "unavailable"}
@@ -7288,6 +8929,7 @@ async def _convert_appointment_to_ai_intake(
     request: Request,
     variant: str,
     notify_client: bool,
+    secure_room_pin: str,
 ) -> UUID:
     if appt.converted_intake_id:
         return appt.converted_intake_id
@@ -7296,15 +8938,9 @@ async def _convert_appointment_to_ai_intake(
     # identical to an intake created from the lead-management screen.
     from app.routers import dealer_ai_intake as intake_api
 
-    variant_const = intake_api.FUNDING_VARIANT if variant == "real_estate" else intake_api.DEALER_VARIANT
-    existing = await intake_api._latest_active_intake_by_email(
-        db, appt.invitee_email or "", variant=variant_const
-    ) if appt.invitee_email else None
-    if existing:
-        return existing.id
     if not appt.invitee_email:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "An email is required to create an AI intake.")
-    result = await intake_api.create_admin_ai_lead(
+    result = await intake_api._create_admin_ai_lead_core(
         intake_api.AdminLeadCreate(
             variant=variant,
             full_name=appt.invitee_name,
@@ -7316,11 +8952,12 @@ async def _convert_appointment_to_ai_intake(
             transaction_type=appt.program_name if variant == "real_estate" else None,
             requested_amount=_appointment_amount(appt.requested_amount),
             notify_client=notify_client,
-            secure_room_pin=f"{secrets.randbelow(1_000_000):06d}",
+            secure_room_pin=secure_room_pin,
+            force_new=True,
         ),
-        request,
-        user,
-        db,
+        request=request,
+        user=user,
+        db=db,
     )
     return result.intake.id
 
@@ -7363,6 +9000,7 @@ async def set_rep_appointment_outcome(
                 request=request,
                 variant=payload.ai_variant or "dealer",
                 notify_client=payload.notify_client,
+                secure_room_pin=payload.secure_room_pin or "",
             )
             # The admin-intake helper commits. Re-lock before finalizing the
             # appointment so a retried request cannot create another target.
@@ -7381,12 +9019,34 @@ async def set_rep_appointment_outcome(
     appt.outcome_note = (payload.note or "").strip() or None
     appt.outcome_at = now
     appt.outcome_by_user_id = user.id
+    previous_crm_status = appt.crm_status or "scheduled"
+    appt.crm_status = {
+        "converted": "converted",
+        "did_not_show": "no_show",
+        "not_converted": "not_qualified",
+    }[payload.outcome]
+    appt.follow_up_at = None
+    appt.crm_updated_at = now
+    appt.crm_updated_by_user_id = user.id
     if payload.outcome == "converted":
         appt.conversion_target = payload.conversion_target
         appt.converted_dealer_id = converted_dealer.id if converted_dealer else appt.converted_dealer_id
         appt.converted_intake_id = converted_intake_id or appt.converted_intake_id
         if converted_dealer:
             appt.dealer_id = converted_dealer.id
+    _record_appointment_activity(
+        db,
+        appt,
+        event_type="appointment_outcome_changed",
+        user=user,
+        body=appt.outcome_note,
+        before={"crm_status": previous_crm_status},
+        after={
+            "crm_status": appt.crm_status,
+            "outcome": payload.outcome,
+            "conversion_target": appt.conversion_target,
+        },
+    )
     event = await db.get(CalendarEvent, appt.calendar_event_id) if appt.calendar_event_id else None
     if appt.dealer_id:
         await log_action(
@@ -7718,6 +9378,14 @@ async def book_underwriting_review_preference(
     )
     db.add(appointment)
     await db.flush()
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type="appointment_created",
+        user=user,
+        body=appointment.title,
+        after={"crm_status": appointment.crm_status},
+    )
     event.external_ref_id = str(appointment.id)
     preference.selected_slot_at = starts_at
     preference.selected_by_user_id = user.id
@@ -8637,7 +10305,7 @@ async def messages_unread_count(
         DealerMessage.dealer_id == dealer.id,
         DealerMessage.author_user_id != user.id,
     )
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         q = q.where(DealerMessage.internal.is_(False))
     if seen is not None:
         q = q.where(DealerMessage.created_at > seen)
@@ -8680,7 +10348,7 @@ async def list_messages(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerMessage).where(DealerMessage.dealer_id == dealer.id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         # Belt and braces: filter on the channel allowlist AND on the legacy
         # boolean. Either alone would be enough today; together, a row that
         # somehow disagrees with itself stays hidden rather than leaking.
@@ -8715,7 +10383,7 @@ async def create_message(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
 
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         # A client writes to the client thread and nowhere else, whatever the
         # payload claims. This is the one rule in the file that must not have
         # an escape hatch.
@@ -8963,7 +10631,7 @@ async def unread_summary(
     visible = select(DealerBusiness.id)
     if user.role == Role.FIELD_REP:
         visible = visible.where(DealerBusiness.owner_user_id == user.id)
-    elif user.role == Role.DEALER:
+    elif is_audit_client(user):
         visible = visible.where(DealerBusiness.dealer_user_id == user.id)
 
     seen_at = select(
@@ -8981,7 +10649,7 @@ async def unread_summary(
         )
         .group_by(DealerMessage.dealer_id)
     )
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         q = q.where(DealerMessage.internal.is_(False))
 
     rows = (await db.execute(q)).all()
@@ -12039,7 +13707,7 @@ async def plaid_patch(
 ) -> DealerPlaidItem:
     """Client primary-bank choice or super-admin refresh recovery settings."""
     require_team_or_dealer(user)
-    if payload.is_primary_operating is not None and user.role != Role.DEALER:
+    if payload.is_primary_operating is not None and not is_audit_client(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only the client may select the main operating bank",
@@ -12089,7 +13757,7 @@ async def plaid_remove(
     dealer_id: UUID, item_pk: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> None:
     """Disconnect at the owning client's request or as super-admin recovery."""
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         dealer = await resolve_dealer_scope(db, user, dealer_id)
         action = "plaid.disconnect.client"
     elif user.role == Role.SUPER_ADMIN:
@@ -12135,7 +13803,7 @@ async def plaid_remove(
         entity_id=item.id,
         after={
             "retained_statement_evidence": True,
-            "via": "authenticated_client" if user.role == Role.DEALER else "super_admin",
+            "via": "authenticated_client" if is_audit_client(user) else "super_admin",
         },
     )
     await db.commit()
@@ -13597,7 +15265,7 @@ async def patch_owner(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this client")
     patch = body.model_dump(exclude_unset=True)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         violation = _dealer_owner_patch_violation(set(patch))
         if violation is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, violation)
@@ -13895,7 +15563,7 @@ async def owner_soft_pull(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Credit is not required for an owner below 20% ownership",
         )
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         blocked = _dealer_self_pull_violation(owner.is_primary, owner.credit_pulled_at)
         if blocked is not None:
             raise HTTPException(blocked[0], blocked[1])
@@ -15181,7 +16849,7 @@ async def list_payment_shifts(
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     q = select(DealerPaymentShift).where(DealerPaymentShift.dealer_id == dealer.id)
-    if user.role == Role.DEALER:
+    if is_audit_client(user):
         q = q.where(DealerPaymentShift.status != "draft")
     return (
         (await db.execute(q.order_by(DealerPaymentShift.created_at.desc()))).scalars().all()

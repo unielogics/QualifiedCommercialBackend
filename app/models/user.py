@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,10 +16,17 @@ if TYPE_CHECKING:
     from app.models.broker import Broker
     from app.models.client import Client
     from app.models.referral_partner_company import ReferralPartnerCompany
+    from app.models.user_access import UserProductAccess
 
 
 class User(TimestampMixin, Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "account_status IN ('active', 'suspended')",
+            name="ck_users_account_status",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable: an invited team member exists in our DB before they complete
@@ -35,6 +42,19 @@ class User(TimestampMixin, Base):
     # Presence (alembic 0046). Bumped automatically by deps.get_current_user
     # on every authed request. Drives the "online" dot in the loan header.
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Product access is independent from the operator/client role. ``active``
+    # accounts may enter only products represented by enabled access rows;
+    # ``suspended`` accounts retain their records but cannot use either app.
+    account_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="active", server_default="active"
+    )
+    last_invited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_invite_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    last_invite_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suspended_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     # Set for Role.DEALER_PARTNER users at invite time (typed company name,
     # find-or-create against ReferralPartnerCompany). Whether that COMPANY
     # has a signed Referral Protection Agreement on file is a separate,
@@ -53,4 +73,10 @@ class User(TimestampMixin, Base):
     )
     referral_partner_company: Mapped[ReferralPartnerCompany | None] = relationship(
         foreign_keys=[referral_partner_company_id]
+    )
+    product_accesses: Mapped[list[UserProductAccess]] = relationship(
+        "UserProductAccess",
+        foreign_keys="UserProductAccess.user_id",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )

@@ -60,6 +60,32 @@ class BookingSettings(TimestampMixin, Base):
         default=lambda: [1, 2, 3, 4, 5],
         server_default="[1,2,3,4,5]",
     )
+    blocked_intervals: Mapped[list[dict[str, object]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    booking_questions: Mapped[dict[str, bool]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: {
+            "business_name": True,
+            "phone": True,
+            "requested_amount": True,
+            "bank_statement": False,
+        },
+        server_default='{"business_name": true, "phone": true, "requested_amount": true, "bank_statement": false}',
+    )
+    no_show_follow_up_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    morning_digest_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    missing_outcome_reminder_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=48, server_default="48"
+    )
     start_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     end_time: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
     logo_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)

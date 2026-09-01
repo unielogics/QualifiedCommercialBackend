@@ -36,6 +36,7 @@ from app.schemas.communication import (
     UnifiedCommunicationThreadPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services.user_access import is_audit_client
 
 router = APIRouter(prefix="/communications", tags=["communications"])
 SCAN_LIMIT = 750
@@ -70,7 +71,7 @@ async def _visible_dealers(db: AsyncSession, user: User) -> list[DealerBusiness]
     stmt = select(DealerBusiness).limit(SCAN_LIMIT)
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         pass
-    elif user.role == Role.DEALER:
+    elif is_audit_client(user):
         stmt = stmt.where(DealerBusiness.dealer_user_id == user.id)
     elif user.role == Role.FIELD_REP:
         stmt = stmt.where(DealerBusiness.owner_user_id == user.id)
@@ -226,7 +227,7 @@ async def _dealer_threads(db: AsyncSession, user: User) -> list[UnifiedCommunica
     grouped: dict[tuple[UUID, str], list[DealerMessage]] = {}
     for message in messages:
         channel = "client" if message.channel == "client" else "desk"
-        if user.role == Role.DEALER and channel != "client":
+        if is_audit_client(user) and channel != "client":
             continue
         grouped.setdefault((message.dealer_id, channel), []).append(message)
     return [
