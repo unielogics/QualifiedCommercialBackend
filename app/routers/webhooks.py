@@ -1,6 +1,6 @@
 """Inbound webhooks.
 
-Two receivers, secured differently because their senders differ:
+Several receivers, secured differently because their senders differ:
 
 POST /webhooks/plaid
   Plaid item + statement events. Plaid signs every webhook with an ES256 JWT,
@@ -15,6 +15,13 @@ POST /webhooks/gmail?token=<secret>
   Activity log and isolates per-message failures). The poll is the
   same code path the 60s scheduler uses, so push just removes the
   latency.
+
+POST /webhooks/sms/inbound
+  A reply someone sent back to one of our texts, forwarded by QCRelay from the
+  handset. This is how STOP actually stops things: the relay is a transport and
+  holds no consent state, so the opt-out has to land here to take effect. Shared
+  secret in the X-Relay-Secret header, matched against settings.sms_webhook_token.
+  Fails closed.
 
 Unauthenticated by nature — Pub/Sub can't present a Clerk session —
 so the endpoint is guarded by a shared secret in the URL
@@ -352,3 +359,63 @@ async def plaid_webhook(request: Request) -> Response:
         outcome,
     )
     return Response(status_code=status.HTTP_200_OK)
+
+
+@router.post("/sms/inbound")
+async def sms_inbound(request: Request) -> Response:
+    """An inbound SMS reply, forwarded by QCRelay.
+
+    The only thing acted on here is an opt-out, and that is deliberate. STOP is
+    the one inbound message with a legal consequence, and it has to be honoured
+    whether or not the sender was ever a client, ever granted consent, or exists
+    in the database at all — which is exactly why the suppression list needs no
+    prior grant to write to.
+
+    Everything else is logged and dropped. Threading real replies into
+    conversations is a separate piece of work and pretending to do it here would
+    make it look done.
+
+    Acks 204 on anything it understands. The relay should not retry a message we
+    have already recorded, and a retry storm on a malformed payload would be
+    worse than dropping one line we could not parse.
+    """
+    settings = get_settings()
+    expected = settings.sms_webhook_token
+    presented = request.headers.get("x-relay-secret", "")
+    # Fail closed — this endpoint can suppress a phone number.
+    if not expected or not hmac.compare_digest(presented, expected):
+        log.warning("sms webhook: rejected inbound (bad/missing secret)")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        log.warning("sms webhook: unparseable body")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    from app.dealer_os.services.consent_delivery import normalize_phone
+    from app.services.sms import optout
+
+    raw_from = (body or {}).get("from") or ""
+    message = (body or {}).get("message") or ""
+    phone = normalize_phone(raw_from)
+
+    if not phone:
+        log.warning("sms webhook: inbound from an unusable number, ignored")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    if not optout.is_opt_out_keyword(message):
+        log.info("sms webhook: inbound reply from %s (not an opt-out)", phone)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async with SessionLocal() as db:
+        await optout.record_opt_out(
+            db,
+            phone_e164=phone,
+            reason=message.strip()[:120] or "STOP",
+            source="sms_reply",
+            note="received via QCRelay",
+        )
+        await db.commit()
+    log.info("sms webhook: opt-out honoured for %s", phone)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

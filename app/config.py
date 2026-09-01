@@ -208,6 +208,12 @@ class Settings(BaseSettings):
     # still runs and still records the composed draft for review.
     reengagement_autosend_sms: bool = False
 
+    # Shared secret the SMS relay presents when forwarding an inbound reply to
+    # /webhooks/sms/inbound. Already present in the environment; it was
+    # discarded until now because no receiver existed. Fails closed: unset means
+    # every inbound POST is rejected.
+    sms_webhook_token: str = ""
+
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""
