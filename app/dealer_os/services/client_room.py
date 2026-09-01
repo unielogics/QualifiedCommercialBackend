@@ -37,6 +37,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.bucket import BucketRequestedDocument, BucketUploadLink
+from app.services.provider_secrets import (
+    _decrypt_fernet,
+    _decrypt_kms,
+    _encrypt_fernet,
+    _encrypt_kms,
+)
 
 from ..models import DealerBusiness
 from . import buckets_link
@@ -48,6 +54,7 @@ __all__ = [
     "ensure_room",
     "get_room",
     "initialize_room",
+    "read_passcode",
     "request_document",
     "room_url",
     "resolve_room",
@@ -69,6 +76,37 @@ def _hash_passcode(passcode: str) -> str:
 
 def _generate_passcode() -> str:
     return f"{secrets.randbelow(900000) + 100000}"
+
+
+def _store_passcode(link: BucketUploadLink, passcode: str) -> None:
+    """Replace the room credential and retain only encrypted recoverable text.
+
+    The PBKDF2 hash remains the authentication source. The encrypted copy is
+    used only by authenticated, file-scoped staff views.
+    """
+    settings = get_settings()
+    link.passcode_hash = _hash_passcode(passcode)
+    if settings.provider_secrets_kms_key_id:
+        link.encrypted_passcode = _encrypt_kms(passcode)
+        link.passcode_encryption_provider = "aws_kms"
+    else:
+        link.encrypted_passcode = _encrypt_fernet(passcode)
+        link.passcode_encryption_provider = "fernet"
+
+
+def read_passcode(link: BucketUploadLink) -> str | None:
+    """Decrypt the current PIN for an already-authorized staff request."""
+    if not link.encrypted_passcode:
+        return None
+    try:
+        if link.passcode_encryption_provider == "aws_kms":
+            value = _decrypt_kms(link.encrypted_passcode)
+        else:
+            value = _decrypt_fernet(link.encrypted_passcode)
+    except Exception:
+        logger.exception("dealer-os: could not decrypt client-room PIN for link %s", link.id)
+        return None
+    return value if len(value) == 6 and value.isascii() and value.isdigit() else None
 
 
 def room_url(token: str) -> str:
@@ -139,14 +177,14 @@ async def initialize_room(
             token=secrets.token_urlsafe(32),
             recipient_name=(dealer.name or "Business owner")[:180],
             recipient_email=(dealer.email or None),
-            passcode_hash=_hash_passcode(passcode),
             expires_at=None,
         )
+        _store_passcode(link, passcode)
         db.add(link)
     else:
         # A newly opened file can adopt a pre-existing intake bucket. Initial
         # setup deliberately replaces that old room credential exactly once.
-        link.passcode_hash = _hash_passcode(passcode)
+        _store_passcode(link, passcode)
         link.expires_at = None
         link.recipient_name = (dealer.name or link.recipient_name)[:180]
         link.recipient_email = dealer.email or link.recipient_email
@@ -169,9 +207,9 @@ async def ensure_room(db: AsyncSession, dealer: DealerBusiness) -> ClientRoom:
         token=secrets.token_urlsafe(32),
         recipient_name=(dealer.name or "Business owner")[:180],
         recipient_email=(dealer.email or None),
-        passcode_hash=_hash_passcode(passcode),
         expires_at=None,
     )
+    _store_passcode(link, passcode)
     db.add(link)
     await db.flush()
     logger.info("dealer-os: opened client room %s for dealer %s", link.id, dealer.id)
@@ -252,7 +290,7 @@ async def rotate_passcode(db: AsyncSession, dealer: DealerBusiness) -> ClientRoo
     """
     room = await ensure_room(db, dealer)
     passcode = _generate_passcode()
-    room.link.passcode_hash = _hash_passcode(passcode)
+    _store_passcode(room.link, passcode)
     room.link.expires_at = None
     await db.flush()
     logger.info("dealer-os: room passcode rotated for dealer %s", dealer.id)

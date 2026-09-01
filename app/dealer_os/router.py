@@ -3165,16 +3165,38 @@ async def convert_to_audit(
     )
 
 
+@router.get("/dealers/{dealer_id}/room/access-code", response_model=ClientRequestResult)
+async def read_room_access_code(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ClientRequestResult:
+    """Show the current room PIN to authorized staff without rotating it."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    room = await client_room.get_room(db, dealer)
+    if room is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "This legacy file does not have a client room yet. Create a new PIN to open it.",
+        )
+    passcode = client_room.read_passcode(room.link)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "room.passcode_viewed" if passcode else "room.passcode_unavailable",
+        "dealer",
+        entity_id=dealer.id,
+        after={"link_id": str(room.link.id), "recoverable": bool(passcode)},
+    )
+    await db.commit()
+    return ClientRequestResult(url=room.url, passcode=passcode, delivered=False)
+
+
 @router.post("/dealers/{dealer_id}/room/access-code", response_model=ClientRequestResult)
 async def rotate_room_access_code(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ClientRequestResult:
-    """A fresh access code, displayed to the rep to read out.
-
-    Rotation rather than retrieval: the stored code is a hash and cannot be
-    shown again, so "show me the code" always means "make a new one". The old
-    code stops working the moment this returns, which is also the recovery
-    path when a code has leaked."""
+    """Generate a fresh PIN and invalidate the previous room credential."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     room = await client_room.rotate_passcode(db, dealer)

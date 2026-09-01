@@ -7,11 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.dealer_os.schemas import DealerCreate
-from app.dealer_os.services import consent_delivery
+from app.dealer_os.services import client_room, consent_delivery
 from app.dealer_os.services.client_room import _generate_passcode as _generate_field_room_passcode
 from app.dealer_os.services.client_room import _hash_passcode as _hash_field_room_passcode
 from app.dealer_os.services.client_room import verify_passcode as verify_field_room_passcode
 from app.models.application_profile import ApplicationRoomDelivery
+from app.models.bucket import BucketUploadLink
 from app.routers.application_profiles import _delivery_overall, _masked_recipient
 from app.routers.buckets import (
     _PASSCODE_ATTEMPTS,
@@ -54,6 +55,39 @@ def test_generated_replacement_pin_invalidates_the_initial_pin() -> None:
     assert re.fullmatch(r"\d{6}", replacement_pin)
     assert not verify_field_room_passcode(initial_pin, replacement_hash)
     assert verify_field_room_passcode(replacement_pin, replacement_hash)
+
+
+def test_current_room_pin_is_recoverable_only_from_encrypted_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        client_room,
+        "get_settings",
+        lambda: SimpleNamespace(provider_secrets_kms_key_id=""),
+    )
+    monkeypatch.setattr(client_room, "_encrypt_fernet", lambda value: f"sealed:{value[::-1]}")
+    monkeypatch.setattr(client_room, "_decrypt_fernet", lambda value: value.removeprefix("sealed:")[::-1])
+    link = SimpleNamespace(
+        id="room-link",
+        passcode_hash=None,
+        encrypted_passcode=None,
+        passcode_encryption_provider=None,
+    )
+
+    client_room._store_passcode(link, "000014")
+
+    assert link.passcode_hash != "000014"
+    assert link.encrypted_passcode == "sealed:410000"
+    assert link.passcode_encryption_provider == "fernet"
+    assert client_room.read_passcode(link) == "000014"
+
+
+def test_bucket_room_schema_has_no_plaintext_pin_column() -> None:
+    columns = set(BucketUploadLink.__table__.columns.keys())
+    assert "encrypted_passcode" in columns
+    assert "passcode_encryption_provider" in columns
+    assert "passcode" not in columns
+    assert "pin" not in columns
 
 
 def test_legacy_room_passcodes_remain_compatible() -> None:

@@ -2257,8 +2257,8 @@ class SignatureRequestSend(ClientRequestSend):
 
 class ClientRequestResult(BaseModel):
     url: str
-    # Plaintext is returned only for a newly generated replacement PIN. The
-    # initial PIN was chosen during file creation and only its hash is stored.
+    # Returned only to authenticated, file-scoped staff. Authentication still
+    # uses the independent PBKDF2 hash; this value comes from encrypted storage.
     passcode: str | None = None
     delivered: bool = False
     emailed: bool = False

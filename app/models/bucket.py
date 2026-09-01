@@ -164,6 +164,8 @@ class BucketUploadLink(TimestampMixin, Base):
     can_use_ai_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     can_view_ai_tasks: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     passcode_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    encrypted_passcode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    passcode_encryption_provider: Mapped[str | None] = mapped_column(String(24), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
