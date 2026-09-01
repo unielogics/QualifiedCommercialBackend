@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -51,6 +51,37 @@ SCAN_LIMIT = 750
 
 def _at(value: datetime | None) -> datetime:
     return value or datetime.min.replace(tzinfo=UTC)
+
+
+def _phone_key(value: str | None) -> str | None:
+    """A phone reduced to what makes two numbers the SAME person.
+
+    "+1 (862) 384-1951", "8623841951" and "18623841951" are one human, and
+    keying identity on the raw string split them into separate contacts. Last
+    ten digits for NANP; the full digit string otherwise, so international
+    numbers are not collapsed by their tail.
+    """
+    digits = "".join(ch for ch in (value or "") if ch.isdigit())
+    if not digits:
+        return None
+    # NANP only: 11 digits beginning with the country code collapse to 10.
+    # Anything else keeps every digit — truncating an international number to
+    # its last ten could alias it onto an unrelated US number.
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits[1:]
+    return digits
+
+
+def _same_number(phone: str):
+    """SQL predicate matching every stored spelling of one number.
+
+    Rows are normalized on write, but a thread is addressed by whichever
+    spelling the newest message used, and an exact string match would drop
+    every message stored in another format.
+    """
+    key = _phone_key(phone) or ""
+    digits = func.regexp_replace(SmsMessage.phone_e164, r"\D", "", "g")
+    return digits.like(f"%{key}") if key else SmsMessage.phone_e164 == phone
 
 
 def _snippet(value: str | None) -> str | None:
@@ -357,10 +388,14 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
     # matched a client are the same thread to everyone except the database.
     grouped: dict[str, list[tuple[SmsMessage, Client | None]]] = {}
     for message, client in rows:
-        grouped.setdefault(message.phone_e164, []).append((message, client))
+        grouped.setdefault(_phone_key(message.phone_e164) or message.phone_e164, []).append(
+            (message, client)
+        )
     result = []
-    for key, members in grouped.items():
+    for _key, members in grouped.items():
         latest, _ = members[-1]
+        # Address the thread by a real number, not the identity key.
+        key = latest.phone_e164
         # Any message on this number that resolved to a client names the thread.
         client = next((c for _, c in reversed(members) if c is not None), None)
         # A blocked or failed send is worth surfacing in the preview — "why
@@ -540,8 +575,9 @@ async def list_communication_contacts(
         out = []
         if row.participant_email:
             out.append(f"em:{row.participant_email.strip().lower()}")
-        if row.participant_phone:
-            out.append(f"ph:{row.participant_phone.strip()}")
+        phone_key = _phone_key(row.participant_phone)
+        if phone_key:
+            out.append(f"ph:{phone_key}")
         if not out:
             out.append(f"src:{row.source_kind}:{row.source_id}")
         return out
@@ -777,8 +813,9 @@ async def get_unified_communication_thread(
             ) for row in rows
         ]
     elif parts[0] == "sms":
-        # Every message on this number, client-linked or not — see _sms_threads.
-        stmt = select(SmsMessage).where(SmsMessage.phone_e164 == parts[2])
+        # Every message on this number, client-linked or not, in whatever
+        # format it was stored — see _sms_threads.
+        stmt = select(SmsMessage).where(_same_number(parts[2]))
         rows = list((await db.execute(stmt.order_by(SmsMessage.created_at.asc()))).scalars().all())
         messages = [
             UnifiedCommunicationMessage(
@@ -870,7 +907,7 @@ async def reply_unified_communication_thread(
         linked = (
             await db.execute(
                 select(SmsMessage.client_id)
-                .where(SmsMessage.phone_e164 == phone, SmsMessage.client_id.is_not(None))
+                .where(_same_number(phone), SmsMessage.client_id.is_not(None))
                 .order_by(SmsMessage.created_at.desc())
                 .limit(1)
             )
