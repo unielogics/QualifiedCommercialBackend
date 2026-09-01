@@ -552,7 +552,11 @@ def fill_pdf(
 
 
 async def generate(
-    db: AsyncSession, dealer: DealerBusiness, key: str
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    key: str,
+    *,
+    routing_result: dict | None = None,
 ) -> tuple[ContractDocument, FillResult, list[str]]:
     """Produce (or refresh) the case's prepopulated copy of one agreement.
 
@@ -597,11 +601,19 @@ async def generate(
             raise ValueError(f"No generated renderer is registered for {key!r}.")
         if key == qc_master_application.SUMMARY_TEMPLATE_KEY:
             context, readiness, pdf, sha256, source_sha256, missing_data = (
-                await qc_master_application.build_summary(db, dealer)
+                await qc_master_application.build_summary(
+                    db,
+                    dealer,
+                    routing_result=routing_result,
+                )
             )
         else:
             context, readiness, pdf, sha256, missing_data = (
-                await qc_master_application.build_application(db, dealer)
+                await qc_master_application.build_application(
+                    db,
+                    dealer,
+                    routing_result=routing_result,
+                )
             )
             source_sha256 = qc_master_application.summary_source_hash(context)
         result = FillResult(

@@ -368,11 +368,16 @@ async def generate_envelope(
     actor: User,
     override_confirmations: dict[str, str | None] | None = None,
     override_reason: str | None = None,
+    routing_result: dict[str, Any] | None = None,
 ) -> ContractEnvelope:
     selected_programs = ordered_program_keys(program_keys)
     confirmations = override_confirmations or {}
     await ensure_defaults(db, actor.id)
-    context = await qc_master_application.build_context(db, dealer)
+    context = await qc_master_application.build_context(
+        db,
+        dealer,
+        routing_result=routing_result,
+    )
     routing = context.get("routing") or {}
     rules_version = routing.get("rules_version") or context.get("rules_version")
     now = datetime.now(UTC)

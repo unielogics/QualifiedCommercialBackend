@@ -1937,6 +1937,7 @@ async def generate_case_contract_envelope(
 ) -> ContractEnvelopeRead:
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    pre_screen = await _application_pre_screen_state(db, dealer)
     try:
         envelope = await contract_packages.generate_envelope(
             db,
@@ -1947,6 +1948,7 @@ async def generate_case_contract_envelope(
                 item.program_key: item.note for item in payload.overrides
             },
             override_reason=payload.override_reason,
+            routing_result=pre_screen.get("routing_result"),
         )
     except PermissionError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
@@ -2110,17 +2112,21 @@ async def generate_case_contract(
     legal document must be a decision, not an accident."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    pre_screen, current_context = await _current_qc_context(db, dealer)
     if key == qc_master_application.MASTER_TEMPLATE_KEY:
-        readiness = qc_master_application.build_readiness(
-            await qc_master_application.build_context(db, dealer)
-        )
+        readiness = qc_master_application.build_readiness(current_context)
         if not readiness["package_ready"]:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Complete the Step 4 underwriting package before generating the QC application.",
             )
     try:
-        doc, result, missing = await contract_fill.generate(db, dealer, key)
+        doc, result, missing = await contract_fill.generate(
+            db,
+            dealer,
+            key,
+            routing_result=pre_screen.get("routing_result"),
+        )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except RuntimeError as exc:
@@ -2150,7 +2156,7 @@ async def _underwriting_summary_state(
     *,
     action: str = "unchanged",
 ) -> UnderwritingSummaryRead:
-    context = await qc_master_application.build_context(db, dealer)
+    _, context = await _current_qc_context(db, dealer)
     current_source_sha256 = qc_master_application.summary_source_hash(context)
     document = (
         await db.execute(
@@ -2227,11 +2233,13 @@ async def generate_underwriting_summary(
     if before.id is not None:
         previous_document = await db.get(ContractDocument, before.id)
         previous_values = dict(previous_document.field_values or {}) if previous_document else {}
+    pre_screen = await _application_pre_screen_state(db, dealer)
     try:
         doc, result, missing = await contract_fill.generate(
             db,
             dealer,
             qc_master_application.SUMMARY_TEMPLATE_KEY,
+            routing_result=pre_screen.get("routing_result"),
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -2444,9 +2452,8 @@ async def send_contract_for_signature(
     if doc.status == "executed":
         raise HTTPException(status.HTTP_409_CONFLICT, "This document is already signed.")
     if key == qc_master_application.MASTER_TEMPLATE_KEY:
-        readiness = qc_master_application.build_readiness(
-            await qc_master_application.build_context(db, dealer)
-        )
+        _, current_context = await _current_qc_context(db, dealer)
+        readiness = qc_master_application.build_readiness(current_context)
         if not readiness["package_ready"]:
             open_items = [
                 row["requirement"]
@@ -7569,7 +7576,7 @@ async def get_submission_readiness(
     """Source-by-source release gate for the QC master application."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    context = await qc_master_application.build_context(db, dealer)
+    _, context = await _current_qc_context(db, dealer)
     return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
 
 
@@ -7586,7 +7593,7 @@ async def patch_submission_human_review(
     """Record the authorized desk decision that controls signature release."""
     require_super_admin(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    review_context = await qc_master_application.build_context(db, dealer)
+    _, review_context = await _current_qc_context(db, dealer)
     current_readiness = qc_master_application.build_readiness(review_context)
     if payload.status == "fundable" and not current_readiness["package_ready"]:
         blockers = [
@@ -7646,7 +7653,7 @@ async def patch_submission_human_review(
         after={"status": row.human_review_status, "note": row.human_review_note},
     )
     await db.commit()
-    context = await qc_master_application.build_context(db, dealer)
+    _, context = await _current_qc_context(db, dealer)
     return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
 
 
@@ -16081,6 +16088,20 @@ async def _application_pre_screen_state(
     }
 
 
+async def _current_qc_context(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+) -> tuple[dict, dict]:
+    """Build document/readiness data from the same live route shown in the UI."""
+    state = await _application_pre_screen_state(db, dealer)
+    context = await qc_master_application.build_context(
+        db,
+        dealer,
+        routing_result=state.get("routing_result"),
+    )
+    return state, context
+
+
 def _pre_screen_read(state: dict) -> ApplicationPreScreenRead:
     return ApplicationPreScreenRead(
         rules_version=state["rules_version"],
@@ -16269,23 +16290,69 @@ async def _program_selection_state(
             .limit(1)
         )
     ).scalar_one_or_none()
-    selected = by_key.get(manual.program_key) if manual is not None else system
-    actor = await db.get(User, manual.requested_by_user_id) if manual and manual.requested_by_user_id else None
+    package_overrides = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution)
+                .where(
+                    DealerProgramRuleResolution.dealer_id == dealer.id,
+                    DealerProgramRuleResolution.rule_key
+                    == "program_package.selection_override",
+                    DealerProgramRuleResolution.status == "active",
+                )
+                .order_by(DealerProgramRuleResolution.created_at.desc())
+            )
+        ).scalars().all()
+    )
+    package_selection: list[str] = []
+    if package_overrides:
+        raw_selection = list(
+            (package_overrides[0].current_value or {}).get(
+                "selected_package_programs"
+            )
+            or []
+        )
+        package_selection = [
+            key
+            for key in contract_packages.PROGRAM_ORDER
+            if key in raw_selection and key in by_key
+        ]
+    system_key = str((system or {}).get("program_key") or "")
+    package_override = None
+    if manual is None and package_selection and system_key not in package_selection:
+        selected_key = package_selection[0]
+        package_override = next(
+            (row for row in package_overrides if row.program_key == selected_key),
+            package_overrides[0],
+        )
+    selection_record = manual or package_override
+    selected = (
+        by_key.get(manual.program_key)
+        if manual is not None
+        else by_key.get(package_override.program_key)
+        if package_override is not None
+        else system
+    )
+    actor = (
+        await db.get(User, selection_record.requested_by_user_id)
+        if selection_record and selection_record.requested_by_user_id
+        else None
+    )
     blockers = list((selected or {}).get("borrower_safe_reasons") or [])
     blockers.extend(
         item for item in list((selected or {}).get("unresolved") or []) if item not in blockers
     )
-    current_value = dict(manual.current_value or {}) if manual else {}
+    current_value = dict(selection_record.current_value or {}) if selection_record else {}
     return {
         "system_program_key": system.get("program_key") if system else None,
         "system_program_status": system.get("status") if system else None,
-        "effective_program_key": manual.program_key if manual else (system.get("program_key") if system else None),
+        "effective_program_key": selection_record.program_key if selection_record else (system.get("program_key") if system else None),
         "effective_program_status": (selected or {}).get("status"),
-        "manually_selected": manual is not None,
-        "selected_by_user_id": manual.requested_by_user_id if manual else None,
+        "manually_selected": selection_record is not None,
+        "selected_by_user_id": selection_record.requested_by_user_id if selection_record else None,
         "selected_by_name": (actor.name or actor.email) if actor else None,
-        "selected_at": manual.requested_at if manual else None,
-        "note": manual.rep_note if manual else None,
+        "selected_at": selection_record.requested_at if selection_record else None,
+        "note": selection_record.rep_note if selection_record else None,
         "rules_version": current_value.get("rules_version")
         or (routing_result or {}).get("rules_version"),
         "system_blockers": blockers,

@@ -144,7 +144,12 @@ def _status(
     }
 
 
-async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, Any]:
+async def build_context(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    routing_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     profile = (
         await db.execute(
             select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
@@ -225,7 +230,14 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
         if len(taxonomy_rows) == 3
         else "unclassified"
     )
-    routing = dict(pre_screen.routing_result or {}) if pre_screen else {}
+    # The persisted pre-screen result is an immutable audit snapshot. Runtime
+    # evidence can change after that checkpoint, so execution surfaces pass the
+    # freshly evaluated result instead of silently falling back to stale facts.
+    routing = (
+        dict(routing_result)
+        if routing_result is not None
+        else dict(pre_screen.routing_result or {}) if pre_screen else {}
+    )
     manual_selection = next(
         (
             row
@@ -868,9 +880,12 @@ def render_pdf(
 
 
 async def build_application(
-    db: AsyncSession, dealer: DealerBusiness
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    routing_result: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, str, list[str]]:
-    context = await build_context(db, dealer)
+    context = await build_context(db, dealer, routing_result=routing_result)
     readiness = build_readiness(context)
     pdf, sha256 = render_pdf(context, readiness)
     missing = [
@@ -883,9 +898,12 @@ async def build_application(
 
 
 async def build_summary(
-    db: AsyncSession, dealer: DealerBusiness
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    routing_result: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, str, str, list[str]]:
-    context = await build_context(db, dealer)
+    context = await build_context(db, dealer, routing_result=routing_result)
     readiness = build_readiness(context)
     source_sha256 = summary_source_hash(context)
     pdf, sha256 = render_pdf(context, readiness, summary=True)

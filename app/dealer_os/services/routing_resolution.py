@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -13,7 +12,6 @@ from ..models import (
     DealerApplicationRecommendation,
     DealerBusiness,
 )
-
 
 PROGRAM_RANGES: dict[str, tuple[float, float]] = {
     "term_loan_3_5_year": (25_000.0, 500_000.0),
@@ -40,6 +38,46 @@ def classify_rule(rule_id: str, explanation: str, *, unresolved: bool = False) -
     return "conflicting_information"
 
 
+def correction_target(rule_id: str, explanation: str) -> dict[str, Any]:
+    """Point an operator to the canonical field behind a routing condition."""
+    text = f"{rule_id} {explanation}".lower()
+    if any(value in text for value in ("statement", "bank month", "month-end", "plaid", "nsf", "negative-balance")):
+        return {
+            "correction_step": 2,
+            "correction_anchor": "bank-evidence",
+            "correction_label": "Review bank evidence",
+        }
+    if any(value in text for value in ("credit", "isofpull", "bureau", "score")):
+        return {
+            "correction_step": 2,
+            "correction_anchor": "credit-authorization",
+            "correction_label": "Review credit authorization",
+        }
+    if any(value in text for value in ("question", "tax lien", "tax_lien", "judgment", "legal action", "restricted")):
+        return {
+            "correction_step": 2,
+            "correction_anchor": "business-underwriting",
+            "correction_label": "Review business answers",
+        }
+    if any(value in text for value in ("dscr", "cash flow", "debt", "payment", "annual revenue", "annualized sales")):
+        return {
+            "correction_step": 3,
+            "correction_anchor": "financial-confirmation",
+            "correction_label": "Review financial profile",
+        }
+    if any(value in text for value in ("amount", "funding", "use of funds", "purpose")):
+        return {
+            "correction_step": 1,
+            "correction_anchor": "funding-request",
+            "correction_label": "Review funding request",
+        }
+    return {
+        "correction_step": 1,
+        "correction_anchor": "business-profile",
+        "correction_label": "Review application facts",
+    }
+
+
 def blockers(routing_result: dict[str, Any] | None) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for program in (routing_result or {}).get("programs") or []:
@@ -57,6 +95,7 @@ def blockers(routing_result: dict[str, Any] | None) -> list[dict[str, Any]]:
                 "explanation": explanation,
                 "corrective_action": "Correct the source fact or request a documented super-admin exception." if classify_rule(rule_id, explanation) == "hard_restriction" else "Review the current fact and apply a supported structure.",
                 "hard": classify_rule(rule_id, explanation) == "hard_restriction",
+                **correction_target(rule_id, explanation),
             })
         for index, explanation_value in enumerate(program.get("unresolved") or []):
             explanation = str(explanation_value)
@@ -69,6 +108,7 @@ def blockers(routing_result: dict[str, Any] | None) -> list[dict[str, Any]]:
                 "explanation": explanation,
                 "corrective_action": "Answer the question, confirm the extracted value, or upload the named evidence.",
                 "hard": False,
+                **correction_target(f"{key}.unresolved.{index}", explanation),
             })
     return result
 
