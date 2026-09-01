@@ -27,6 +27,7 @@ from app.models.loan import Loan
 from app.models.message import Message
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.models.sms_message import SmsMessage
 from app.schemas.communication import (
     UnifiedCommunicationCompose,
     UnifiedCommunicationMessage,
@@ -34,6 +35,8 @@ from app.schemas.communication import (
     UnifiedCommunicationThread,
     UnifiedCommunicationThreadDetail,
     UnifiedCommunicationThreadPage,
+    UnifiedContactGroup,
+    UnifiedContactPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
 from app.services.user_access import is_audit_client
@@ -327,14 +330,79 @@ async def _email_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicat
     return result
 
 
-async def _all_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicationThread]:
+async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicationThread]:
+    """The sms_messages ledger as an inbox source — one thread per person.
+
+    Grouped by client where the number matched one, by bare number where it
+    did not. Visibility follows the client book; unattributed numbers stay
+    admin-only, same as the /sms router.
+    """
+    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP):
+        return []
+    stmt = (
+        select(SmsMessage, Client)
+        .outerjoin(Client, Client.id == SmsMessage.client_id)
+        .order_by(SmsMessage.created_at.asc())
+        .limit(SCAN_LIMIT)
+    )
+    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        stmt = stmt.where(SmsMessage.client_id.in_(scope_client_query(user, select(Client.id))))
+    rows = list((await db.execute(stmt)).all())
+    grouped: dict[str, list[tuple[SmsMessage, Client | None]]] = {}
+    for message, client in rows:
+        key = f"client:{client.id}" if client is not None else f"phone:{message.phone_e164}"
+        grouped.setdefault(key, []).append((message, client))
+    result = []
+    for key, members in grouped.items():
+        latest, client = members[-1]
+        # A blocked or failed send is worth surfacing in the preview — "why
+        # didn't the text go out" should be visible from the inbox row.
+        snippet = latest.body or latest.detail or latest.status
+        result.append(
+            UnifiedCommunicationThread(
+                id=f"sms:{key}",
+                title=(client.name if client is not None else latest.phone_e164),
+                participant_name=client.name if client is not None else None,
+                participant_email=client.email if client is not None else None,
+                participant_phone=latest.phone_e164,
+                participant_type="client",
+                source_kind="sms",
+                source_id=str(client.id) if client is not None else latest.phone_e164,
+                source_ref=None,
+                source_label="Text messages",
+                channel="sms",
+                transport="sms",
+                unread_count=0,
+                message_count=len(members),
+                latest_snippet=_snippet(snippet),
+                latest_at=latest.created_at,
+                href=(f"/clients/{client.id}" if client is not None else "/messages"),
+            )
+        )
+    return result
+
+
+async def _all_threads(
+    db: AsyncSession, user: User, *, include_intake: bool = False
+) -> list[UnifiedCommunicationThread]:
+    """Every human conversation, one list.
+
+    AI intake threads — the client's conversation with the underwriter AI and
+    the AI's own channel — are deliberately NOT part of the inbox: they are a
+    workflow surface with their own screen (/admin/ai-underwriter-leads), and
+    mixing machine dialogue into the message inbox buried the messages that
+    need a human. They are still resolvable by direct thread id (deep links
+    from the AI-leads screen), which is what `include_intake` is for.
+    """
     parts = [
         await _loan_threads(db, user),
-        await _intake_threads(db, user),
         await _dealer_threads(db, user),
         await _rep_threads(db, user),
         await _email_threads(db, user),
+        await _sms_threads(db, user),
     ]
+    if include_intake:
+        parts.append(await _intake_threads(db, user))
     rows = [row for part in parts for row in part]
     rows.sort(key=lambda row: row.latest_at, reverse=True)
     return rows
@@ -377,7 +445,10 @@ async def list_unified_communication_threads(
 
 
 async def _thread_summary(db: AsyncSession, user: User, thread_id: str) -> UnifiedCommunicationThread:
-    row = next((thread for thread in await _all_threads(db, user) if thread.id == thread_id), None)
+    row = next(
+        (thread for thread in await _all_threads(db, user, include_intake=True) if thread.id == thread_id),
+        None,
+    )
     parts = thread_id.split(":")
     if row is None and len(parts) == 3 and parts[0] == "intake" and parts[2] in _intake_allowed_channels(user):
         try:
@@ -418,6 +489,77 @@ def _message_direction(user: User, sender_type: str) -> str:
     if user.role == Role.CLIENT:
         own.add("client")
     return "outbound" if sender_type in own else "inbound"
+
+
+@router.get("/contacts", response_model=UnifiedContactPage)
+async def list_communication_contacts(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str | None = Query(None, max_length=160),
+    channel: str | None = None,
+    unread_only: bool = False,
+    limit: int = Query(80, ge=1, le=200),
+) -> UnifiedContactPage:
+    """The inbox grouped by PERSON rather than by thread.
+
+    One row per contact, newest conversation first; expanding a contact shows
+    every thread they appear in — portal chat, email, SMS — so an operator can
+    refresh their memory of the whole relationship in one place. Identity is
+    email where known, else phone, else the source record, and a client-matched
+    SMS thread carries the client's email so the same person's channels merge.
+    """
+    threads = await _all_threads(db, user)
+
+    def identity(row: UnifiedCommunicationThread) -> str:
+        if row.participant_email:
+            return f"em:{row.participant_email.strip().lower()}"
+        if row.participant_phone:
+            return f"ph:{row.participant_phone}"
+        return f"src:{row.source_kind}:{row.source_id}"
+
+    grouped: dict[str, list[UnifiedCommunicationThread]] = {}
+    for row in threads:
+        grouped.setdefault(identity(row), []).append(row)
+
+    contacts: list[UnifiedContactGroup] = []
+    for key, rows in grouped.items():
+        rows.sort(key=lambda row: row.latest_at, reverse=True)
+        latest = rows[0]
+        name = next((r.participant_name for r in rows if r.participant_name), None) or latest.title
+        contacts.append(
+            UnifiedContactGroup(
+                key=key,
+                name=name,
+                email=next((r.participant_email for r in rows if r.participant_email), None),
+                phone=next((r.participant_phone for r in rows if r.participant_phone), None),
+                channels=sorted({r.channel for r in rows}),
+                sources=sorted({r.source_kind for r in rows}),
+                unread_total=sum(r.unread_count for r in rows),
+                message_total=sum(r.message_count for r in rows),
+                latest_thread_id=latest.id,
+                latest_snippet=latest.latest_snippet,
+                latest_channel=latest.channel,
+                latest_at=latest.latest_at,
+                threads=rows,
+            )
+        )
+
+    term = (q or "").strip().lower()
+    if term:
+        contacts = [
+            c for c in contacts
+            if term in " ".join(filter(None, (c.name, c.email, c.phone, c.latest_snippet, *(r.title for r in c.threads)))).lower()
+        ]
+    if channel:
+        contacts = [c for c in contacts if channel in c.channels]
+    if unread_only:
+        contacts = [c for c in contacts if c.unread_total > 0]
+    contacts.sort(key=lambda c: c.latest_at, reverse=True)
+    return UnifiedContactPage(
+        items=contacts[:limit],
+        total=len(contacts),
+        unread_total=sum(c.unread_total for c in contacts),
+    )
 
 
 @router.get("/threads/{thread_id:path}", response_model=UnifiedCommunicationThreadDetail)
@@ -481,6 +623,25 @@ async def get_unified_communication_thread(
                 sender_type="rep" if row.direction == "outbound" else "rep_lead", direction=row.direction,
                 channel=row.channel, transport=row.channel, created_at=row.created_at, seen=row.read_at is not None,
                 delivery_status=row.delivery_status,
+            ) for row in rows
+        ]
+    elif parts[0] == "sms":
+        if parts[1] == "client":
+            stmt = select(SmsMessage).where(SmsMessage.client_id == UUID(parts[2]))
+        else:
+            stmt = select(SmsMessage).where(SmsMessage.phone_e164 == parts[2], SmsMessage.client_id.is_(None))
+        rows = list((await db.execute(stmt.order_by(SmsMessage.created_at.asc()))).scalars().all())
+        messages = [
+            UnifiedCommunicationMessage(
+                id=str(row.id), thread_id=thread_id,
+                # A send that never left has no body worth faking — show why.
+                body=row.body or row.detail or row.status,
+                sender_name=None if row.direction == "inbound" else "Qualified Commercial",
+                sender_type="client" if row.direction == "inbound" else "operator",
+                direction="inbound" if row.direction == "inbound" else "outbound",
+                channel="sms", transport=f"sms:{row.provider}" if row.provider else "sms",
+                created_at=row.created_at,
+                delivery_status=row.status if row.direction == "outbound" else None,
             ) for row in rows
         ]
     elif parts[0] == "email":
@@ -551,6 +712,25 @@ async def reply_unified_communication_thread(
         from app.dealer_os.schemas import RepInboxMessageCreate
 
         await create_rep_inbox_message(UUID(parts[1]), RepInboxMessageCreate(body=body), user, db)
+    elif parts[0] == "sms":
+        from app.services import sms as sms_service
+
+        if parts[1] == "client":
+            client = await db.get(Client, UUID(parts[2]))
+            if client is None or not client.phone:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Client has no phone number")
+            result = await sms_service.send_sms_checked(
+                db, to_phone=client.phone, body=body, client_id=client.id, context="manual"
+            )
+        else:
+            result = await sms_service.send_sms_checked(
+                db, to_phone=parts[2], body=body, context="manual"
+            )
+        await db.commit()
+        if not result.ok:
+            # The blocked/failed row is already in the ledger; the composer
+            # still deserves the honest reason instead of a silent refresh.
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, result.detail or "Text could not be sent")
     elif parts[0] == "email":
         from app.routers.inbox import reply_to_thread
         from app.schemas.inbox import InboxReplyRequest

@@ -21,6 +21,9 @@ class UnifiedCommunicationThread(BaseModel):
     title: str
     participant_name: str | None = None
     participant_email: str | None = None
+    #: E.164 where the thread is phone-addressed (SMS); lets the contact
+    #: grouping merge a person's SMS with their portal and email threads.
+    participant_phone: str | None = None
     participant_type: str
     source_kind: str
     source_id: str
@@ -73,3 +76,28 @@ class UnifiedCommunicationCompose(BaseModel):
 class UnifiedCommunicationSeen(BaseModel):
     thread_id: str
     seen_at: datetime
+
+
+class UnifiedContactGroup(BaseModel):
+    """One person, every channel. The inbox row the operator actually wants:
+    who spoke last, through what, with the full history one click away."""
+
+    key: str
+    name: str
+    email: str | None = None
+    phone: str | None = None
+    channels: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    unread_total: int = 0
+    message_total: int = 0
+    latest_thread_id: str
+    latest_snippet: str | None = None
+    latest_channel: str
+    latest_at: datetime
+    threads: list[UnifiedCommunicationThread] = Field(default_factory=list)
+
+
+class UnifiedContactPage(BaseModel):
+    items: list[UnifiedContactGroup] = Field(default_factory=list)
+    total: int = 0
+    unread_total: int = 0
