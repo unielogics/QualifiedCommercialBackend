@@ -121,6 +121,12 @@ def _sample_context() -> dict:
             "monthly_debt_payments": 20000.0,
             "dscr": 1.42,
             "dscr_source": "verified cash flow and debt schedule",
+            "avg_daily_balance": 24500.0,
+            "negative_balance_days_90": 2,
+            "returned_items": 1,
+            "average_monthly_deposits": 100000.0,
+            "annualized_deposits": 1200000.0,
+            "sources": {},
             "statement_months": [
                 "2026-03",
                 "2026-04",
@@ -242,6 +248,12 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     assert "123-45-6789" not in rendered
     assert "Quidity" not in rendered
     assert "raw credit score" in rendered
+    assert "Average daily balance" in rendered
+    assert "$24,500" in rendered
+    assert "Annualized deposits" in rendered
+    assert "$1,200,000" in rendered
+    assert "Negative-balance days / 90" in rendered
+    assert "Returned items" in rendered
 
 
 def test_underwriting_summary_is_a_persistent_pdf_without_signature_block() -> None:

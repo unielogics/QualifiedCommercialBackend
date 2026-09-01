@@ -149,6 +149,7 @@ async def build_context(
     dealer: DealerBusiness,
     *,
     routing_result: dict[str, Any] | None = None,
+    financial_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     profile = (
         await db.execute(
@@ -455,6 +456,7 @@ async def build_context(
         None,
     )
     metrics = dict(routing.get("calculated_metrics") or {})
+    snapshot = dict(financial_snapshot or {})
 
     return {
         "generated_at": datetime.now(UTC),
@@ -496,11 +498,17 @@ async def build_context(
             "collateral": profile.collateral_description if profile and profile.collateral_description else "Awaiting evidence",
         },
         "financial": {
-            "annual_sales": float(profile.annual_sales) if profile and profile.annual_sales is not None else None,
-            "annual_cash_flow_available_for_debt": float(profile.annual_cash_flow_available_for_debt) if profile and profile.annual_cash_flow_available_for_debt is not None else None,
-            "monthly_debt_payments": float(profile.monthly_debt_payments) if profile and profile.monthly_debt_payments is not None else None,
-            "dscr": metrics.get("dscr"),
-            "dscr_source": metrics.get("dscr_source") or "unavailable",
+            "annual_sales": float(profile.annual_sales) if profile and profile.annual_sales is not None else snapshot.get("annual_sales"),
+            "annual_cash_flow_available_for_debt": float(profile.annual_cash_flow_available_for_debt) if profile and profile.annual_cash_flow_available_for_debt is not None else snapshot.get("annual_cash_flow_available_for_debt"),
+            "monthly_debt_payments": float(profile.monthly_debt_payments) if profile and profile.monthly_debt_payments is not None else snapshot.get("monthly_debt_payments"),
+            "dscr": snapshot.get("dscr") if snapshot.get("dscr") is not None else metrics.get("dscr"),
+            "dscr_source": ((snapshot.get("sources") or {}).get("dscr") or {}).get("label") or metrics.get("dscr_source") or "unavailable",
+            "avg_daily_balance": snapshot.get("avg_daily_balance"),
+            "negative_balance_days_90": snapshot.get("negative_balance_days_90"),
+            "returned_items": snapshot.get("returned_items"),
+            "average_monthly_deposits": snapshot.get("average_monthly_deposits"),
+            "annualized_deposits": snapshot.get("annualized_deposits"),
+            "sources": snapshot.get("sources") or {},
             "statement_months": statement_months,
             "missing_statement_months": missing_statement_months,
             "standard_statement_target": STATEMENT_MONTH_TARGET,
@@ -850,7 +858,7 @@ table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:5px 0 
 <div class="callout"><b>Detailed use of funds</b><br>{html.escape(_text(request['use_of_funds']))}</div>{line_items}
 
 <h2>5. Financial, Banking, and Debt Summary</h2>
-<div class="grid"><div class="field"><span class="label">Annual sales</span>{_money(financial['annual_sales'])}</div><div class="field"><span class="label">Annual cash flow available for debt</span>{_money(financial['annual_cash_flow_available_for_debt'])}</div><div class="field"><span class="label">Monthly debt payments</span>{_money(financial['monthly_debt_payments'])}</div><div class="field"><span class="label">Calculated DSCR</span>{html.escape(_text(financial['dscr']) or 'Awaiting evidence')} ({html.escape(_text(financial['dscr_source']))})</div><div class="field"><span class="label">Qualifying bank months</span>{html.escape(', '.join(financial['statement_months']) or 'Awaiting evidence')}</div><div class="field"><span class="label">Open bank months</span>{html.escape(', '.join(financial['missing_statement_months']) or 'None')}</div></div>
+<div class="grid"><div class="field"><span class="label">Annual sales</span>{_money(financial['annual_sales'])}</div><div class="field"><span class="label">Annual cash flow available for debt</span>{_money(financial['annual_cash_flow_available_for_debt'])}</div><div class="field"><span class="label">Monthly debt payments</span>{_money(financial['monthly_debt_payments'])}</div><div class="field"><span class="label">Calculated DSCR</span>{html.escape(_text(financial['dscr']) or 'Awaiting evidence')} ({html.escape(_text(financial['dscr_source']))})</div><div class="field"><span class="label">Average daily balance</span>{_money(financial.get('avg_daily_balance'))}</div><div class="field"><span class="label">Annualized deposits</span>{_money(financial.get('annualized_deposits'))}</div><div class="field"><span class="label">Negative-balance days / 90</span>{html.escape(_text(financial.get('negative_balance_days_90')) or 'Awaiting daily balances')}</div><div class="field"><span class="label">Returned items</span>{html.escape(_text(financial.get('returned_items')) or 'Awaiting statement activity')}</div><div class="field"><span class="label">Qualifying bank months</span>{html.escape(', '.join(financial['statement_months']) or 'Awaiting evidence')}</div><div class="field"><span class="label">Open bank months</span>{html.escape(', '.join(financial['missing_statement_months']) or 'None')}</div></div>
 <h3>Debt, MCA/SBA, and UCC schedule</h3>{debts}
 
 <h2>6. Documents Reviewed and Source Readiness</h2>{evidence}{readiness_table}
@@ -884,8 +892,14 @@ async def build_application(
     dealer: DealerBusiness,
     *,
     routing_result: dict[str, Any] | None = None,
+    financial_snapshot: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, str, list[str]]:
-    context = await build_context(db, dealer, routing_result=routing_result)
+    context = await build_context(
+        db,
+        dealer,
+        routing_result=routing_result,
+        financial_snapshot=financial_snapshot,
+    )
     readiness = build_readiness(context)
     pdf, sha256 = render_pdf(context, readiness)
     missing = [
@@ -902,8 +916,14 @@ async def build_summary(
     dealer: DealerBusiness,
     *,
     routing_result: dict[str, Any] | None = None,
+    financial_snapshot: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, str, str, list[str]]:
-    context = await build_context(db, dealer, routing_result=routing_result)
+    context = await build_context(
+        db,
+        dealer,
+        routing_result=routing_result,
+        financial_snapshot=financial_snapshot,
+    )
     readiness = build_readiness(context)
     source_sha256 = summary_source_hash(context)
     pdf, sha256 = render_pdf(context, readiness, summary=True)

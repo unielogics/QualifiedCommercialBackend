@@ -413,7 +413,7 @@ from .schemas import (
     UnderwritingReviewPreferenceBook,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, credit_quality, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage, workflow_readiness
+from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, credit_quality, financial_snapshot as financial_snapshot_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage, workflow_readiness
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -1949,6 +1949,7 @@ async def generate_case_contract_envelope(
             },
             override_reason=payload.override_reason,
             routing_result=pre_screen.get("routing_result"),
+            financial_snapshot=pre_screen.get("financial_snapshot"),
         )
     except PermissionError as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
@@ -2126,6 +2127,7 @@ async def generate_case_contract(
             dealer,
             key,
             routing_result=pre_screen.get("routing_result"),
+            financial_snapshot=pre_screen.get("financial_snapshot"),
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -2240,6 +2242,7 @@ async def generate_underwriting_summary(
             dealer,
             qc_master_application.SUMMARY_TEMPLATE_KEY,
             routing_result=pre_screen.get("routing_result"),
+            financial_snapshot=pre_screen.get("financial_snapshot"),
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
@@ -3716,15 +3719,17 @@ async def dealer_decision(
         for row in ((pre_screen.get("routing_result") or {}).get("programs") or [])
     ]
 
-    try:
-        metrics = await _latest_snapshot_metrics(db, dealer.id)
-    except HTTPException:
-        d = decision.decide({"verdict": "no_data"}, None, ver)
-        return DecisionRead(**asdict(d), programs=direct_programs, workflow=workflow)
-
+    # `_application_pre_screen_state` computes the metric tree from the live
+    # period/debt rows.  Reading the latest persisted snapshot here produced a
+    # stale sidebar while the PDF used current routing facts.
+    metrics = dict(pre_screen.get("metric_tree") or {})
     targets = await _effective_targets(db, dealer.id)
     settings = await _global_program_settings(db)
-    tree = {**metrics, "deposits_monthly_avg": await _monthly_deposits_avg(db, dealer.id)}
+    financial = dict(pre_screen.get("financial_snapshot") or {})
+    tree = {
+        **metrics,
+        "deposits_monthly_avg": financial.get("average_monthly_deposits"),
+    }
     paths = compute_paths(tree, targets, settings=settings)
 
     goal = float(dealer.funding_goal) if dealer.funding_goal is not None else None
@@ -3766,7 +3771,13 @@ async def dealer_decision(
     )
 
     out = decision.decide(fundability, health, ver)
-    return DecisionRead(**asdict(out), programs=direct_programs, workflow=workflow)
+    financial = financial_snapshot_svc.add_capacity(financial, out.best_path)
+    return DecisionRead(
+        **asdict(out),
+        programs=direct_programs,
+        workflow=workflow,
+        financial=financial,
+    )
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
@@ -15846,6 +15857,17 @@ async def _application_pre_screen_state(
             )
         )
     ).scalar_one_or_none()
+    latest_business_tax_filing = (
+        await db.execute(
+            select(DealerTaxFiling)
+            .where(
+                DealerTaxFiling.dealer_id == dealer.id,
+                DealerTaxFiling.revenue_reported.is_not(None),
+            )
+            .order_by(DealerTaxFiling.year.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     years_in_business = None
     if dealer.started_on:
         years_in_business = max((date.today() - dealer.started_on).days / 365.2425, 0)
@@ -15913,16 +15935,22 @@ async def _application_pre_screen_state(
         ).scalars().all()
     )
     official_statements_complete = len(statement_months) >= 6 and not missing_statement_months
+    deposit_period_rows = [row for row in period_rows if row.get("deposits") is not None]
+    estimated_annualized_bank_sales = None
+    if len(deposit_period_rows) >= 3:
+        estimated_annualized_bank_sales = round(
+            sum(float(row["deposits"]) for row in deposit_period_rows)
+            / len(deposit_period_rows)
+            * 12,
+            2,
+        )
     annualized_bank_sales = None
     if (
         official_statements_complete
         and len(period_rows) >= 6
         and all(row.get("deposits") is not None for row in period_rows)
     ):
-        annualized_bank_sales = round(
-            sum(float(row["deposits"]) for row in period_rows) / len(period_rows) * 12,
-            2,
-        )
+        annualized_bank_sales = estimated_annualized_bank_sales
     metric_tree = compute_metrics(
         metric_inputs.periods,
         metric_inputs.addbacks_annual_verified,
@@ -15942,12 +15970,17 @@ async def _application_pre_screen_state(
         ).scalars().all()
     )
     negative_dates: set[str] = set()
+    negative_dates_90: set[str] = set()
     negative_balance_evidence_seen = False
+    nsf_evidence_seen = False
+    negative_window_start = date.today() - timedelta(days=89)
     for document in statement_documents:
         extracted = document.extracted if isinstance(document.extracted, dict) else {}
         for month in extracted.get("months") or []:
             if not isinstance(month, dict) or str(month.get("month") or "") not in statement_month_set:
                 continue
+            if month.get("nsf_count") is not None:
+                nsf_evidence_seen = True
             raw_negative_dates = month.get("negative_balance_dates")
             if isinstance(raw_negative_dates, list):
                 negative_balance_evidence_seen = True
@@ -15955,6 +15988,12 @@ async def _application_pre_screen_state(
                 value = str(raw_date or "").strip()
                 if value:
                     negative_dates.add(value)
+                    try:
+                        observed_on = date.fromisoformat(value[:10])
+                    except ValueError:
+                        continue
+                    if negative_window_start <= observed_on <= date.today():
+                        negative_dates_90.add(observed_on.isoformat())
 
     def _counts_mca_or_sba(debt: DealerDebt) -> bool:
         evidence = debt.evidence if isinstance(debt.evidence, dict) else {}
@@ -15996,7 +16035,15 @@ async def _application_pre_screen_state(
     confirmations = set((profile.field_confirmations or {}).keys()) if profile else set()
     financial_suggestions: dict[str, dict] = {}
 
-    def _suggest(field: str, value, source: str, evidence: str) -> None:
+    def _suggest(
+        field: str,
+        value,
+        source: str,
+        evidence: str,
+        *,
+        status: str = "estimated",
+        label: str = "Extracted estimate",
+    ) -> None:
         if value is None or field in confirmations:
             return
         if profile is not None and getattr(profile, field, None) is not None:
@@ -16010,29 +16057,79 @@ async def _application_pre_screen_state(
         financial_suggestions[field] = {
             "value": normalized,
             "source": source,
-            "label": "Extracted",
+            "status": status,
+            "label": label,
             "evidence": evidence,
         }
 
     ebitda_metrics = metric_tree.get("ebitda") or {}
     dscr_metrics = metric_tree.get("dscr") or {}
-    _suggest(
-        "annual_sales",
-        annualized_bank_sales,
-        "verified_bank_evidence",
-        f"Annualized from {len(period_rows)} qualifying bank-evidence months.",
-    )
+    if latest_business_tax_filing is not None:
+        _suggest(
+            "annual_sales",
+            latest_business_tax_filing.revenue_reported,
+            "business_tax_return",
+            f"Reported gross receipts from the {latest_business_tax_filing.year} business tax return.",
+            status="verified",
+            label="Business tax return",
+        )
+    else:
+        _suggest(
+            "annual_sales",
+            estimated_annualized_bank_sales,
+            "annualized_bank_deposits_proxy",
+            (
+                f"Annualized gross deposits from {len(deposit_period_rows)} qualifying bank-evidence "
+                "months. Confirm against a P&L or business tax return because transfers and financing "
+                "inflows may not be sales."
+            ),
+            status="estimated",
+            label="Bank deposits proxy",
+        )
+    cash_flow_suggestion = ebitda_metrics.get("bankable")
+    cash_flow_source = "verified_financial_metrics"
+    cash_flow_evidence = "Bankable annual cash flow calculated from extracted financial evidence."
+    cash_flow_status = "verified"
+    if cash_flow_suggestion is None and dscr_metrics.get("net_cash_flow_monthly") is not None:
+        monthly_service = (
+            dscr_metrics.get("monthly_debt_service")
+            if dscr_metrics.get("monthly_debt_service") is not None
+            else dscr_metrics.get("draft_monthly_ds")
+        )
+        cash_flow_suggestion = max(
+            0.0,
+            (
+                float(dscr_metrics["net_cash_flow_monthly"])
+                + float(monthly_service or 0)
+            )
+            * 12,
+        )
+        cash_flow_source = "bank_cash_flow_estimate"
+        cash_flow_evidence = (
+            f"Annualized from observed net bank cash flow across {len(period_rows)} month(s), "
+            "with identified debt service added back."
+        )
+        cash_flow_status = "estimated"
     _suggest(
         "annual_cash_flow_available_for_debt",
-        ebitda_metrics.get("bankable"),
-        "verified_financial_metrics",
-        "Bankable annual cash flow calculated from extracted financial evidence.",
+        cash_flow_suggestion,
+        cash_flow_source,
+        cash_flow_evidence,
+        status=cash_flow_status,
+        label="Verified financial evidence" if cash_flow_status == "verified" else "Evidence-backed estimate",
+    )
+    monthly_debt_suggestion = (
+        dscr_metrics.get("monthly_debt_service")
+        if dscr_metrics.get("monthly_debt_service") is not None
+        else dscr_metrics.get("draft_monthly_ds")
     )
     _suggest(
         "monthly_debt_payments",
-        dscr_metrics.get("monthly_debt_service"),
+        monthly_debt_suggestion,
         "debt_schedule_and_bank_activity",
         "Monthly debt service calculated from active obligations and observed payments.",
+        status="verified" if dscr_metrics.get("monthly_debt_service") is not None else "estimated",
+        label="Verified debt service" if dscr_metrics.get("monthly_debt_service") is not None else "Identified debt estimate",
     )
     mca_balances = [
         float(debt.payoff_amount or debt.balance)
@@ -16068,6 +16165,23 @@ async def _application_pre_screen_state(
             "debt_schedule_evidence",
             f"{ucc_count} active obligation(s) include UCC evidence.",
         )
+
+    financial_snapshot = financial_snapshot_svc.build(
+        profile=profile,
+        required_owners=owner_state["required"],
+        metric_tree=metric_tree,
+        period_rows=period_rows,
+        statement_months=statement_months,
+        suggestions=financial_suggestions,
+        negative_balance_days_90=(
+            len(negative_dates_90) if negative_balance_evidence_seen else None
+        ),
+        nsf_count=(
+            sum(int(row.get("nsf_count") or 0) for row in period_rows)
+            if nsf_evidence_seen
+            else None
+        ),
+    )
 
     application_facts.update(
         {
@@ -16136,6 +16250,8 @@ async def _application_pre_screen_state(
         "business_questions_complete": not business_question_blockers,
         "business_question_blockers": business_question_blockers,
         "financial_suggestions": financial_suggestions,
+        "financial_snapshot": financial_snapshot,
+        "metric_tree": metric_tree,
     }
 
 
@@ -16149,6 +16265,7 @@ async def _current_qc_context(
         db,
         dealer,
         routing_result=state.get("routing_result"),
+        financial_snapshot=state.get("financial_snapshot"),
     )
     return state, context
 
@@ -16684,6 +16801,7 @@ async def get_underwriting_resolution(
         business_questions_complete=state.get("business_questions_complete", False),
         business_question_blockers=state.get("business_question_blockers", []),
         financial_suggestions=state.get("financial_suggestions", {}),
+        financial=state.get("financial_snapshot", {}),
         exception_requests=[ProgramRuleResolutionRead.model_validate(row) for row in exceptions],
         direct_program_viable=direct_viable,
         signing_mode="program_package" if effective_program else "qc_summary_booking",

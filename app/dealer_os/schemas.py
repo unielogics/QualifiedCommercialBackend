@@ -1494,6 +1494,37 @@ class ApplicationWorkflowRead(BaseModel):
     program_selection: ProgramSelectionRead = Field(default_factory=ProgramSelectionRead)
 
 
+class FinancialMetricSourceRead(BaseModel):
+    status: str = "unavailable"
+    source: str = "unavailable"
+    label: str = "Unavailable"
+    evidence: str | None = None
+
+
+class FinancialSnapshotRead(BaseModel):
+    """One normalized financial view shared by the application and PDFs."""
+
+    credit_quality_tier: str | None = None
+    credit_score_band: str | None = None
+    credit_status: str = "unavailable"
+    credit_completed_owners: int = 0
+    credit_required_owners: int = 0
+    annual_sales: float | None = None
+    annual_cash_flow_available_for_debt: float | None = None
+    monthly_debt_payments: float | None = None
+    dscr: float | None = None
+    avg_daily_balance: float | None = None
+    negative_balance_days_90: int | None = None
+    returned_items: int | None = None
+    average_monthly_deposits: float | None = None
+    annualized_deposits: float | None = None
+    indicative_capacity: float | None = None
+    capacity_path: str | None = None
+    periods_used: int = 0
+    statement_months: list[str] = Field(default_factory=list)
+    sources: dict[str, FinancialMetricSourceRead] = Field(default_factory=dict)
+
+
 class UnderwritingResolutionRead(BaseModel):
     rules_version: str
     original_amount: float | None = None
@@ -1507,6 +1538,7 @@ class UnderwritingResolutionRead(BaseModel):
     business_questions_complete: bool = False
     business_question_blockers: list[str] = Field(default_factory=list)
     financial_suggestions: dict[str, dict] = Field(default_factory=dict)
+    financial: FinancialSnapshotRead = Field(default_factory=FinancialSnapshotRead)
     exception_requests: list[ProgramRuleResolutionRead] = Field(default_factory=list)
     direct_program_viable: bool = False
     signing_mode: Literal["program_package", "qc_summary_booking"] = "qc_summary_booking"
@@ -1530,6 +1562,7 @@ class DecisionRead(BaseModel):
     # The real catalogue, easiest-reachable first. Empty when the file has no
     # lending question to answer, which the catalogue decides rather than us.
     programs: list[dict] = []
+    financial: FinancialSnapshotRead = Field(default_factory=FinancialSnapshotRead)
     # The gate. Steps 3-5 of the application read `unlocked` from here rather
     # than deciding for themselves.
     verification: VerificationRead = Field(default_factory=VerificationRead)

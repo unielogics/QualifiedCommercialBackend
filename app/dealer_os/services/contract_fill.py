@@ -35,6 +35,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,7 +117,10 @@ _PROGRAM_FOR_PURPOSE = {
 
 
 async def build_values(
-    db: AsyncSession, dealer: DealerBusiness
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    financial_fallbacks: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Everything the case knows, shaped for the two documents. Missing values
     are named, not defaulted: a blank on a legal document must be a decision."""
@@ -140,6 +144,22 @@ async def build_values(
     ).scalar_one_or_none()
 
     now = datetime.now(UTC)
+    financial_fallbacks = financial_fallbacks or {}
+    annual_sales_value = (
+        float(profile.annual_sales)
+        if profile and profile.annual_sales is not None
+        else financial_fallbacks.get("annual_sales")
+    )
+    dscr_value = financial_fallbacks.get("dscr")
+    if (
+        profile
+        and profile.annual_cash_flow_available_for_debt is not None
+        and profile.monthly_debt_payments
+        and float(profile.monthly_debt_payments) > 0
+    ):
+        dscr_value = float(profile.annual_cash_flow_available_for_debt) / (
+            float(profile.monthly_debt_payments) * 12
+        )
     full_addr = ", ".join(
         x for x in (dealer.address, dealer.city, f"{dealer.state or ''} {dealer.zip or ''}".strip()) if x
     )
@@ -202,7 +222,7 @@ async def build_values(
             profile.mailing_state,
             profile.mailing_zip,
         )) else "no",
-        "annual_sales": _fmt_money(float(profile.annual_sales)) if profile and profile.annual_sales is not None else "",
+        "annual_sales": _fmt_money(annual_sales_value) if annual_sales_value is not None else "",
         "amount_requested": _fmt_money(
             float(dealer.funding_goal) if dealer.funding_goal is not None else None
         ),
@@ -211,14 +231,7 @@ async def build_values(
         # The rep explicitly enters zero when the business has no such balance.
         "mca_balance": _fmt_money(float(profile.existing_mca_balance)) if profile and profile.existing_mca_balance is not None else "",
         "sba_balance": _fmt_money(float(profile.existing_sba_balance)) if profile and profile.existing_sba_balance is not None else "",
-        "business_dscr": (
-            f"{(float(profile.annual_cash_flow_available_for_debt) / (float(profile.monthly_debt_payments) * 12)):.2f}x"
-            if profile
-            and profile.annual_cash_flow_available_for_debt is not None
-            and profile.monthly_debt_payments
-            and float(profile.monthly_debt_payments) > 0
-            else "N/A"
-        ),
+        "business_dscr": f"{float(dscr_value):.2f}x" if dscr_value is not None else "N/A",
         "owner_count": "",  # populated below from the complete ownership schedule
         "ucc_filings": str(profile.active_ucc_filings) if profile and profile.active_ucc_filings is not None else "N/A",
         "affiliates": "Yes" if profile and profile.affiliate_businesses is True else "No" if profile and profile.affiliate_businesses is False else "N/A",
@@ -557,6 +570,7 @@ async def generate(
     key: str,
     *,
     routing_result: dict | None = None,
+    financial_snapshot: dict[str, Any] | None = None,
 ) -> tuple[ContractDocument, FillResult, list[str]]:
     """Produce (or refresh) the case's prepopulated copy of one agreement.
 
@@ -605,6 +619,7 @@ async def generate(
                     db,
                     dealer,
                     routing_result=routing_result,
+                    financial_snapshot=financial_snapshot,
                 )
             )
         else:
@@ -613,6 +628,7 @@ async def generate(
                     db,
                     dealer,
                     routing_result=routing_result,
+                    financial_snapshot=financial_snapshot,
                 )
             )
             source_sha256 = qc_master_application.summary_source_hash(context)
@@ -635,7 +651,11 @@ async def generate(
         raw = storage.get_bytes(tpl.s3_key)
         if raw is None:
             raise RuntimeError("The template PDF could not be read from storage.")
-        values, missing_data = await build_values(db, dealer)
+        values, missing_data = await build_values(
+            db,
+            dealer,
+            financial_fallbacks=financial_snapshot,
+        )
         result = fill_pdf(key, raw, values)
         ready = not missing_data
 

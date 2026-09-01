@@ -369,6 +369,7 @@ async def generate_envelope(
     override_confirmations: dict[str, str | None] | None = None,
     override_reason: str | None = None,
     routing_result: dict[str, Any] | None = None,
+    financial_snapshot: dict[str, Any] | None = None,
 ) -> ContractEnvelope:
     selected_programs = ordered_program_keys(program_keys)
     confirmations = override_confirmations or {}
@@ -377,6 +378,7 @@ async def generate_envelope(
         db,
         dealer,
         routing_result=routing_result,
+        financial_snapshot=financial_snapshot,
     )
     routing = context.get("routing") or {}
     rules_version = routing.get("rules_version") or context.get("rules_version")
@@ -613,7 +615,11 @@ async def generate_envelope(
     if len(selected_programs) == 1 or profile.selected_program not in selected_programs:
         profile.selected_program = selected_programs[0]
     profile.updated_by_user_id = actor.id
-    base_values, base_missing = await contract_fill.build_values(db, dealer)
+    base_values, base_missing = await contract_fill.build_values(
+        db,
+        dealer,
+        financial_fallbacks=context.get("financial"),
+    )
     package_snapshot = [
         {
             "program_key": key,
@@ -634,6 +640,16 @@ async def generate_envelope(
         ),
         "monthly_debt_payments": context["financial"].get("monthly_debt_payments"),
         "dscr": context["financial"].get("dscr"),
+        "avg_daily_balance": context["financial"].get("avg_daily_balance"),
+        "negative_balance_days_90": context["financial"].get(
+            "negative_balance_days_90"
+        ),
+        "returned_items": context["financial"].get("returned_items"),
+        "average_monthly_deposits": context["financial"].get(
+            "average_monthly_deposits"
+        ),
+        "annualized_deposits": context["financial"].get("annualized_deposits"),
+        "financial_sources": context["financial"].get("sources") or {},
         "verified_bank_months": context["financial"].get("statement_months") or [],
         "bank_evidence_target": context["financial"].get("accepted_statement_target", 6),
         "credit": [
@@ -656,6 +672,27 @@ async def generate_envelope(
         "package_programs": package_snapshot,
     }
     values_by_program: dict[str, dict[str, Any]] = {}
+    field_confirmations = dict(profile.field_confirmations or {})
+    financial_confirmation_missing = {
+        label
+        for field, label in (
+            ("annual_sales", "annual sales confirmation"),
+            (
+                "annual_cash_flow_available_for_debt",
+                "annual cash flow confirmation",
+            ),
+            ("monthly_debt_payments", "monthly debt payment confirmation"),
+        )
+        if field not in field_confirmations
+    }
+    debt_confirmation = dict(field_confirmations.get("debt_schedule") or {})
+    if debt_confirmation.get("status") not in {
+        "schedule_confirmed",
+        "no_business_debt",
+    }:
+        financial_confirmation_missing.add(
+            "confirmed debt schedule or no-business-debt acknowledgment"
+        )
     for program_key in selected_programs:
         values = dict(base_values)
         values["selected_program"] = program_key
@@ -665,7 +702,10 @@ async def generate_envelope(
             "program_key": program_key,
             "system_status": _program_result(context, program_key).get("status"),
         }
-        missing = _missing_for_program(values, base_missing, program_key)
+        missing = sorted(
+            set(_missing_for_program(values, base_missing, program_key))
+            | financial_confirmation_missing
+        )
         values["_missing_data"] = missing
         values["_override_reason"] = resolved_override_reasons.get(program_key)
         values_by_program[program_key] = values

@@ -234,8 +234,10 @@ def compute_metrics(
 
     # --- ADB (fall back to avg ending balance when no ADB observed) --------
     adb = _avg(p.get("avg_daily_balance") for p in periods)
+    adb_source = "average_daily_balance"
     if adb is None:
         adb = _avg(p.get("ending_balance") for p in periods)
+        adb_source = "ending_balance_proxy" if adb is not None else "none"
     adb = _round2(adb)
 
     # --- Liquidity: latest observed ending balance -------------------------
@@ -339,6 +341,7 @@ def compute_metrics(
             "gap": _gap(dscr_target, dscr),
         },
         "adb": {
+            "source": adb_source,
             "current": adb,
             "target": adb_target,
             "floor": adb_floor,
