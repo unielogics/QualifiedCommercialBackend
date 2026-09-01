@@ -167,6 +167,40 @@ class Settings(BaseSettings):
     sms_origination_number: str = ""
     sms_production: bool = False
 
+    # Which transport actually carries a text. Three coexist:
+    #   aws      the block above — dormant until out of the SMS sandbox
+    #   twilio   credentials below — paused until A2P 10DLC clears
+    #   android  a physical handset over Tailscale, via QCRelay
+    # Defaults to aws so nothing changes for anything not explicitly switched.
+    # The android path is deliberately NOT gated on sms_production: that flag
+    # means "AWS granted production access" and is forced false on every service
+    # start by the A2P pause drop-in, which would strand the tablet for an
+    # unrelated reason.
+    sms_provider: str = "aws"
+
+    # Twilio. These have been present in the environment for a while but were
+    # silently discarded — model_config sets extra="ignore" — because no adapter
+    # existed. app/services/sms/twilio.py is that adapter.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_from_number: str = ""
+    twilio_messaging_service_sid: str = ""
+    # NOT DECLARED ON PURPOSE: twilio_validate_signatures.
+    # Secrets Manager (qcbackend/prod) currently holds
+    #   TWILIO_VALIDATE_SIGNATURES=<a 32-char secret>
+    # in what the name says is a boolean. While the field is undeclared,
+    # extra="ignore" discards it harmlessly. Declaring it as `bool` makes the
+    # API fail to start outright — pydantic raises bool_parsing on that value,
+    # and qcbackend-refresh-env rewrites /etc/qcbackend.env from Secrets Manager
+    # on every start, so editing the file locally does not help. Fix the secret
+    # first, then declare the field.
+
+    # QCRelay — the SMS + WhatsApp relay on this box (/home/ubuntu/QCRelay).
+    # Tailnet-only; it holds no consent state and decides nothing about who may
+    # be contacted. Prefer a MagicDNS name over a raw 100.x address.
+    relay_sms_url: str = ""
+    relay_auth_token: str = ""
+
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""

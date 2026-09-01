@@ -15,10 +15,13 @@ substitute: asking for a text sends both. That way a request is never lost
 because texting is switched off or the number was wrong.
 
   email  works today, through the SES identity verified for this domain.
-  sms    built and inert until AWS End User Messaging is out of sandbox and the
-         toll-free number finishes verification. It degrades to a clear, honest
-         failure rather than silently reporting success, because a rep who
-         thinks the text went out will stand there waiting for it.
+  sms    carried by whichever transport SMS_PROVIDER selects — AWS End User
+         Messaging, Twilio, or a physical handset over Tailscale. The first two
+         are inert until the sandbox and A2P 10DLC clear respectively; the
+         handset works today and is the testing path. Whichever is selected, an
+         unavailable transport degrades to a clear, honest failure rather than
+         silently reporting success, because a rep who thinks the text went out
+         will stand there waiting for it.
 
 The link itself is never logged. Tokens ride in the URL fragment, which browsers
 do not send to servers, and the delivery record stores only which channel was
@@ -82,39 +85,39 @@ def normalize_phone(raw: str | None) -> str | None:
 def sms_available() -> bool:
     """Whether an SMS send can actually reach a stranger's phone.
 
-    Requires an origination number AND production access. In the AWS sandbox
-    only pre-verified destinations receive anything, which for this use case is
-    the same as not working.
+    Answered by whichever transport `SMS_PROVIDER` selects, because the three
+    are blocked for different reasons: AWS by the sandbox, Twilio by A2P 10DLC,
+    the tablet relay only by not being configured.
     """
-    from app.config import get_settings
+    from app.services import sms as sms_service
 
-    s = get_settings()
-    return bool(getattr(s, "sms_origination_number", "") and getattr(s, "sms_production", False))
+    return sms_service.sms_available()
 
 
 def _send_sms(to_phone: str, body: str) -> DeliveryResult:
+    """Hand the text to the selected transport.
+
+    The AWS path that used to live inline is now app/services/sms/aws.py,
+    unchanged. What is new is that it is one of three.
+    """
+    from app.services import sms as sms_service
+
     if not sms_available():
         return DeliveryResult(
             False,
             "sms",
             "Texting is not switched on yet. Send it by email, or read the link to them.",
         )
-    try:
-        import boto3
-        from app.config import get_settings
-
-        s = get_settings()
-        client = boto3.client("pinpoint-sms-voice-v2", region_name=s.ses_region or "us-east-1")
-        resp = client.send_text_message(
-            DestinationPhoneNumber=to_phone,
-            OriginationIdentity=s.sms_origination_number,
-            MessageBody=body,
-            MessageType="TRANSACTIONAL",
+    result = sms_service.send_sms(to_phone, body)
+    if not result.ok:
+        log.warning(
+            "consent delivery: sms failed via=%s to=%s: %s",
+            result.provider,
+            to_phone,
+            result.detail,
         )
-        return DeliveryResult(True, "sms", resp.get("MessageId", "sent"))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("consent delivery: sms failed to=%s: %s", to_phone, exc)
-        return DeliveryResult(False, "sms", f"Text could not be sent: {exc}")
+        return DeliveryResult(False, "sms", result.detail)
+    return DeliveryResult(True, "sms", result.message_id or "sent")
 
 
 def _send_email(to_email: str, subject: str, body: str) -> DeliveryResult:
