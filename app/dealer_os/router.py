@@ -1623,6 +1623,7 @@ async def _contract_envelope_read(
                 id=link.id,
                 contract_document_id=document.id,
                 template_key=document.template_key,
+                program_key=values.get("_program_key"),
                 title=link.title_snapshot,
                 sort_order=link.sort_order,
                 required=link.required,
@@ -1649,6 +1650,7 @@ async def _contract_envelope_read(
         package_key=envelope.package_key,
         package_version=envelope.package_version,
         program_key=envelope.program_key,
+        program_keys=contract_packages.envelope_program_keys(envelope),
         title=envelope.title,
         status=envelope.status,
         signer_name=envelope.signer_name,
@@ -1939,8 +1941,11 @@ async def generate_case_contract_envelope(
         envelope = await contract_packages.generate_envelope(
             db,
             dealer,
-            program_key=payload.program_key,
+            program_keys=payload.program_keys,
             actor=user,
+            override_confirmations={
+                item.program_key: item.note for item in payload.overrides
+            },
             override_reason=payload.override_reason,
         )
     except PermissionError as exc:
@@ -1957,10 +1962,14 @@ async def generate_case_contract_envelope(
         "contract_envelope",
         entity_id=envelope.id,
         after={
-            "program_key": payload.program_key,
+            "program_keys": payload.program_keys,
             "package_version": envelope.package_version,
             "status": envelope.status,
-            "override_reason": payload.override_reason,
+            "overrides": [
+                {"program_key": item.program_key, "note": item.note}
+                for item in payload.overrides
+            ],
+            "legacy_override_reason": payload.override_reason,
         },
     )
     await db.commit()
@@ -3568,16 +3577,20 @@ async def _application_workflow_state(
             "A staff-selected submission path is active; system eligibility and blockers remain unchanged."
         )
     if effective_program:
-        executed = (
-            await db.execute(
-                select(ContractEnvelope.id).where(
-                    ContractEnvelope.dealer_id == dealer.id,
-                    ContractEnvelope.program_key == effective_program,
-                    ContractEnvelope.status == "executed",
-                ).limit(1)
-            )
-        ).scalar_one_or_none()
-        if executed is None:
+        executed_envelopes = list(
+            (
+                await db.execute(
+                    select(ContractEnvelope).where(
+                        ContractEnvelope.dealer_id == dealer.id,
+                        ContractEnvelope.status == "executed",
+                    )
+                )
+            ).scalars().all()
+        )
+        if not any(
+            effective_program in contract_packages.envelope_program_keys(envelope)
+            for envelope in executed_envelopes
+        ):
             step_4_blockers.append("Generate, review, deliver, and execute the selected program package.")
     else:
         summary = (
@@ -14339,7 +14352,7 @@ async def public_room_sign_contract_envelope(
             "contract_envelope",
             entity_id=envelope.id,
             after={
-                "program_key": envelope.program_key,
+                "program_keys": contract_packages.envelope_program_keys(envelope),
                 "signer": payload.typed_name.strip(),
                 "bundle_sha256": bundle_sha[:16],
                 "via": "client_room",
@@ -16288,7 +16301,11 @@ async def _prepare_program_change(
             )
         ).scalars().all()
     )
-    changing = [row for row in envelopes if row.program_key != target_program]
+    changing = [
+        row
+        for row in envelopes
+        if target_program not in contract_packages.envelope_program_keys(row)
+    ]
     if any(row.status == "executed" for row in changing):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

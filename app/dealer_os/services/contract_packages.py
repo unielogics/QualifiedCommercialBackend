@@ -42,6 +42,11 @@ PROGRAM_APPLICATION_TITLE = "Business Loan Application"
 EZ_PROGRAM_KEY = "term_loan_3_5_year"
 MICRO_PROGRAM_KEY = "term_loan_10_year"
 SUPPORTED_PROGRAMS = frozenset({EZ_PROGRAM_KEY, MICRO_PROGRAM_KEY})
+PROGRAM_ORDER = (EZ_PROGRAM_KEY, MICRO_PROGRAM_KEY)
+PROGRAM_LABELS = {
+    EZ_PROGRAM_KEY: "EZ Term",
+    MICRO_PROGRAM_KEY: "MicroCap",
+}
 SOURCE_ASSET = Path(__file__).resolve().parents[1] / "templates" / "qc-program-application-v1.pdf"
 
 # Normalized locations are retained with the immutable template version.  The
@@ -270,6 +275,52 @@ def _program_viable(context: dict[str, Any], program_key: str) -> bool:
     return bool(row and row.get("status") in {"recommended", "potential"})
 
 
+def ordered_program_keys(program_keys: list[str]) -> list[str]:
+    selected = set(program_keys)
+    if not selected or not selected.issubset(SUPPORTED_PROGRAMS):
+        raise ValueError("Choose EZ Term, MicroCap, or both.")
+    return [key for key in PROGRAM_ORDER if key in selected]
+
+
+def envelope_program_keys(envelope: ContractEnvelope) -> list[str]:
+    selected = [
+        key
+        for key in list(getattr(envelope, "program_keys", None) or [])
+        if key in SUPPORTED_PROGRAMS
+    ]
+    return ordered_program_keys(selected or [envelope.program_key])
+
+
+def envelope_document_key(template_key: str, program_key: str, *, multiple: bool) -> str:
+    """Keep same-template program forms distinct inside one envelope.
+
+    The legacy schema uniquely keys an envelope document by template key. A
+    short program suffix preserves that invariant without changing historical
+    rows or the immutable template-version reference.
+    """
+    if not multiple:
+        return template_key
+    suffix = "ez" if program_key == EZ_PROGRAM_KEY else "micro"
+    return f"{template_key[: 48 - len(suffix) - 2]}__{suffix}"
+
+
+def _program_result(context: dict[str, Any], program_key: str) -> dict[str, Any]:
+    programs = (context.get("routing") or {}).get("programs") or []
+    return next(
+        (item for item in programs if item.get("program_key") == program_key),
+        {},
+    )
+
+
+def _program_conditions(context: dict[str, Any], program_key: str) -> list[str]:
+    row = _program_result(context, program_key)
+    conditions = list(row.get("borrower_safe_reasons") or [])
+    conditions.extend(
+        item for item in list(row.get("unresolved") or []) if item not in conditions
+    )
+    return conditions
+
+
 def _missing_for_program(values: dict[str, str], base_missing: list[str], program_key: str) -> list[str]:
     required = {
         "principal name": "owner_full",
@@ -313,60 +364,165 @@ async def generate_envelope(
     db: AsyncSession,
     dealer: DealerBusiness,
     *,
-    program_key: str,
+    program_keys: list[str],
     actor: User,
+    override_confirmations: dict[str, str | None] | None = None,
     override_reason: str | None = None,
 ) -> ContractEnvelope:
-    if program_key not in SUPPORTED_PROGRAMS:
-        raise ValueError("Choose EZ Term or MicroCap.")
+    selected_programs = ordered_program_keys(program_keys)
+    confirmations = override_confirmations or {}
     await ensure_defaults(db, actor.id)
     context = await qc_master_application.build_context(db, dealer)
-    viable = _program_viable(context, program_key)
-    manual_selection = (
-        await db.execute(
-            select(DealerProgramRuleResolution)
-            .where(
-                DealerProgramRuleResolution.dealer_id == dealer.id,
-                DealerProgramRuleResolution.program_key == program_key,
-                DealerProgramRuleResolution.rule_key == "program_selection.manual",
-                DealerProgramRuleResolution.status == "active",
-            )
-            .order_by(DealerProgramRuleResolution.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if not viable:
-        if manual_selection is not None:
-            override_reason = (
-                manual_selection.rep_note
-                or "Authorized staff selected this submission path with system blockers preserved."
-            )
-        elif actor.role != Role.SUPER_ADMIN:
-            raise PermissionError("That program is blocked by the current routing result.")
-        elif not (override_reason or "").strip():
-            raise ValueError("A documented super-admin override reason is required.")
+    routing = context.get("routing") or {}
+    rules_version = routing.get("rules_version") or context.get("rules_version")
+    now = datetime.now(UTC)
 
-    package = (
-        await db.execute(
-            select(ContractPackage)
-            .where(ContractPackage.program_key == program_key, ContractPackage.active.is_(True))
-            .order_by(ContractPackage.version.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if package is None:
-        raise ValueError("No active forms package is configured for that program.")
-    items = list(
+    manual_rows = list(
         (
             await db.execute(
-                select(ContractPackageItem)
-                .where(ContractPackageItem.package_id == package.id)
-                .order_by(ContractPackageItem.sort_order)
+                select(DealerProgramRuleResolution).where(
+                    DealerProgramRuleResolution.dealer_id == dealer.id,
+                    DealerProgramRuleResolution.rule_key == "program_selection.manual",
+                    DealerProgramRuleResolution.status == "active",
+                )
             )
         ).scalars().all()
     )
-    if not items:
-        raise ValueError("The selected package has no documents.")
+    manual_by_program = {row.program_key: row for row in manual_rows}
+    package_override_rows = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution).where(
+                    DealerProgramRuleResolution.dealer_id == dealer.id,
+                    DealerProgramRuleResolution.rule_key
+                    == "program_package.selection_override",
+                    DealerProgramRuleResolution.status == "active",
+                )
+            )
+        ).scalars().all()
+    )
+    package_override_by_program = {
+        row.program_key: row for row in package_override_rows
+    }
+    resolved_override_reasons: dict[str, str] = {}
+
+    for row in package_override_rows:
+        if row.program_key not in selected_programs or _program_viable(
+            context, row.program_key
+        ):
+            row.status = "cleared"
+            row.resolved_by_user_id = actor.id
+            row.resolved_at = now
+            row.resolution_note = (
+                "Program was removed from the package selection."
+                if row.program_key not in selected_programs
+                else "The current routing result no longer requires an override."
+            )
+
+    for program_key in selected_programs:
+        if _program_viable(context, program_key):
+            continue
+        reason = (confirmations.get(program_key) or "").strip()
+        manual = manual_by_program.get(program_key)
+        existing_override = package_override_by_program.get(program_key)
+        legacy_super_admin_reason = (
+            (override_reason or "").strip()
+            if len(selected_programs) == 1 and actor.role == Role.SUPER_ADMIN
+            else ""
+        )
+        if reason:
+            if existing_override is not None and existing_override.status == "active":
+                existing_override.status = "superseded"
+                existing_override.resolved_by_user_id = actor.id
+                existing_override.resolved_at = now
+                existing_override.resolution_note = (
+                    "Reconfirmed while regenerating the selected package."
+                )
+            result = _program_result(context, program_key)
+            row = DealerProgramRuleResolution(
+                dealer_id=dealer.id,
+                program_key=program_key,
+                rule_key="program_package.selection_override",
+                kind="alternative_program",
+                source="Field Desk Step 4 package selection",
+                current_value={
+                    "system_status": result.get("status") or "blocked",
+                    "system_blockers": _program_conditions(context, program_key),
+                    "selected_program_key": program_key,
+                    "selected_package_programs": selected_programs,
+                    "rules_version": rules_version,
+                },
+                recommended_action=(
+                    "Generate the staff-selected application form while preserving "
+                    "all system conditions for underwriting."
+                ),
+                status="active",
+                rep_note=reason,
+                requested_by_user_id=actor.id,
+                requested_at=now,
+            )
+            db.add(row)
+            resolved_override_reasons[program_key] = reason
+        elif manual is not None:
+            resolved_override_reasons[program_key] = (
+                manual.rep_note
+                or "Authorized staff selected this submission path with system blockers preserved."
+            )
+        elif existing_override is not None and existing_override.status == "active":
+            resolved_override_reasons[program_key] = (
+                existing_override.rep_note
+                or "Authorized staff confirmed this blocked package selection."
+            )
+        elif legacy_super_admin_reason:
+            resolved_override_reasons[program_key] = legacy_super_admin_reason
+        else:
+            label = PROGRAM_LABELS[program_key]
+            raise ValueError(
+                f"{label} is blocked. Hold its program card for three seconds "
+                "and confirm the documented override before generating forms."
+            )
+
+    package_rows = list(
+        (
+            await db.execute(
+                select(ContractPackage)
+                .where(
+                    ContractPackage.program_key.in_(selected_programs),
+                    ContractPackage.active.is_(True),
+                )
+                .order_by(ContractPackage.version.desc())
+            )
+        ).scalars().all()
+    )
+    packages_by_program: dict[str, ContractPackage] = {}
+    for package in package_rows:
+        packages_by_program.setdefault(package.program_key, package)
+    missing_packages = [
+        PROGRAM_LABELS[key]
+        for key in selected_programs
+        if key not in packages_by_program
+    ]
+    if missing_packages:
+        raise ValueError(
+            f"No active forms package is configured for {', '.join(missing_packages)}."
+        )
+    items_by_program: dict[str, list[ContractPackageItem]] = {}
+    for program_key in selected_programs:
+        package = packages_by_program[program_key]
+        items = list(
+            (
+                await db.execute(
+                    select(ContractPackageItem)
+                    .where(ContractPackageItem.package_id == package.id)
+                    .order_by(ContractPackageItem.sort_order)
+                )
+            ).scalars().all()
+        )
+        if not items:
+            raise ValueError(
+                f"The {PROGRAM_LABELS[program_key]} package has no documents."
+            )
+        items_by_program[program_key] = items
 
     active = (
         await db.execute(
@@ -377,16 +533,11 @@ async def generate_envelope(
             )
             .order_by(ContractEnvelope.created_at.desc())
             .limit(1)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if active and active.status == "out_for_signature":
         raise ValueError("Void the sent package before changing or regenerating it.")
-    if active and active.program_key != program_key:
-        active.status = "void"
-        active.voided_at = datetime.now(UTC)
-        active.voided_by_user_id = actor.id
-        active.void_reason = "Replaced before delivery by a different program package."
-        active = None
 
     primary = (
         await db.execute(
@@ -399,13 +550,31 @@ async def generate_envelope(
     if primary is None:
         raise ValueError("Add a designated primary owner before generating forms.")
 
+    primary_package = packages_by_program[selected_programs[0]]
+    combined_package_key = "__".join(
+        packages_by_program[key].key for key in selected_programs
+    )
+    package_key = (
+        combined_package_key
+        if len(combined_package_key) <= 80
+        else f"combined-{_sha(combined_package_key.encode())[:16]}"
+    )
+    package_title = (
+        primary_package.title
+        if len(selected_programs) == 1
+        else " + ".join(PROGRAM_LABELS[key] for key in selected_programs)
+        + " Application Package"
+    )
     envelope = active or ContractEnvelope(
         dealer_id=dealer.id,
-        package_id=package.id,
-        package_key=package.key,
-        package_version=package.version,
-        program_key=program_key,
-        title=package.title,
+        package_id=primary_package.id,
+        package_key=package_key,
+        package_version=max(
+            packages_by_program[key].version for key in selected_programs
+        ),
+        program_key=selected_programs[0],
+        program_keys=selected_programs,
+        title=package_title,
         recipient_owner_id=primary.id,
         created_by_user_id=actor.id,
         delivery_history=[],
@@ -422,19 +591,37 @@ async def generate_envelope(
         ))
         await db.flush()
 
+    envelope.package_id = primary_package.id
+    envelope.package_key = package_key
+    envelope.package_version = max(
+        packages_by_program[key].version for key in selected_programs
+    )
+    envelope.program_key = selected_programs[0]
+    envelope.program_keys = selected_programs
+    envelope.title = package_title
+    envelope.recipient_owner_id = primary.id
+
     profile = context.get("profile")
     if profile is None:
         profile = DealerApplicationProfile(dealer_id=dealer.id)
         db.add(profile)
-    profile.selected_program = program_key
+    if len(selected_programs) == 1 or profile.selected_program not in selected_programs:
+        profile.selected_program = selected_programs[0]
     profile.updated_by_user_id = actor.id
-    values, base_missing = await contract_fill.build_values(db, dealer)
-    values["selected_program"] = program_key
-    values["signer_title"] = profile.signer_title or ""
-    values["_funding_profile"] = {
+    base_values, base_missing = await contract_fill.build_values(db, dealer)
+    package_snapshot = [
+        {
+            "program_key": key,
+            "package_key": packages_by_program[key].key,
+            "package_version": packages_by_program[key].version,
+        }
+        for key in selected_programs
+    ]
+    funding_profile = {
         "original_requested_amount": context["request"].get("original_amount"),
         "working_funding_goal": context["request"].get("amount"),
-        "program_key": program_key,
+        "program_key": selected_programs[0],
+        "program_keys": selected_programs,
         "system_status": context.get("route_status"),
         "annual_sales": context["financial"].get("annual_sales"),
         "annual_cash_flow_available_for_debt": context["financial"].get(
@@ -454,16 +641,70 @@ async def generate_envelope(
             if owner.get("credit_required")
         ],
         "debt_count": len(context.get("debts") or []),
-        "unresolved_conditions": list(context.get("route_unresolved") or []),
+        "unresolved_conditions": list(
+            dict.fromkeys(
+                condition
+                for key in selected_programs
+                for condition in _program_conditions(context, key)
+            )
+        ),
+        "package_programs": package_snapshot,
     }
-    missing = _missing_for_program(values, base_missing, program_key)
-    values["_missing_data"] = missing
-    values["_override_reason"] = (override_reason or "").strip() or None
-    envelope.source_sha256 = _sha(json.dumps(values, sort_keys=True, default=str).encode())
-    envelope.status = "draft" if missing else "ready"
-    envelope_missing = set(missing)
+    values_by_program: dict[str, dict[str, Any]] = {}
+    for program_key in selected_programs:
+        values = dict(base_values)
+        values["selected_program"] = program_key
+        values["signer_title"] = profile.signer_title or ""
+        values["_funding_profile"] = {
+            **funding_profile,
+            "program_key": program_key,
+            "system_status": _program_result(context, program_key).get("status"),
+        }
+        missing = _missing_for_program(values, base_missing, program_key)
+        values["_missing_data"] = missing
+        values["_override_reason"] = resolved_override_reasons.get(program_key)
+        values_by_program[program_key] = values
 
-    for item in items:
+    envelope.source_sha256 = _sha(
+        json.dumps(
+            {
+                "programs": selected_programs,
+                "packages": package_snapshot,
+                "values": values_by_program,
+                "overrides": resolved_override_reasons,
+            },
+            sort_keys=True,
+            default=str,
+        ).encode()
+    )
+    envelope_missing: set[str] = set()
+    document_specs: list[dict[str, Any]] = []
+    seen_supporting: dict[tuple[str, str], int] = {}
+    for program_key in selected_programs:
+        for item in items_by_program[program_key]:
+            if item.template_key != PROGRAM_APPLICATION_KEY:
+                identity = (item.template_key, str(item.template_version_id or ""))
+                existing_index = seen_supporting.get(identity)
+                if existing_index is not None:
+                    document_specs[existing_index]["required"] = bool(
+                        document_specs[existing_index]["required"] or item.required
+                    )
+                    continue
+                seen_supporting[identity] = len(document_specs)
+            document_specs.append(
+                {
+                    "program_key": program_key,
+                    "item": item,
+                    "required": item.required,
+                }
+            )
+
+    multiple = len(selected_programs) > 1
+    for sort_order, spec in enumerate(document_specs):
+        program_key = spec["program_key"]
+        item = spec["item"]
+        values = values_by_program[program_key]
+        missing = list(values["_missing_data"])
         version = await db.get(ContractTemplateVersion, item.template_version_id) if item.template_version_id else None
         if version is None or not version.active:
             raise ValueError(f"{item.title_snapshot} has no active immutable template version.")
@@ -476,17 +717,23 @@ async def generate_envelope(
             values,
             overlay_map=version.overlay_map,
         )
+        document_template_key = envelope_document_key(
+            item.template_key,
+            program_key,
+            multiple=multiple,
+        )
         document_key = (
             f"contract-fills/{dealer.id}/envelopes/{envelope.id}/"
-            f"{item.sort_order:02d}-{item.template_key}-{result.sha256[:16]}.pdf"
+            f"{sort_order:02d}-{document_template_key}-{result.sha256[:16]}.pdf"
         )
         if not storage.put_bytes(document_key, result.pdf, "application/pdf"):
             raise RuntimeError(f"The populated {item.title_snapshot} could not be stored.")
         document_missing = sorted(set(missing) | set(result.missing))
-        envelope_missing.update(document_missing)
+        if spec["required"]:
+            envelope_missing.update(document_missing)
         doc = ContractDocument(
             dealer_id=dealer.id,
-            template_key=item.template_key,
+            template_key=document_template_key,
             envelope_id=envelope.id,
             template_version_id=version.id,
             template_revision=version.revision,
@@ -494,22 +741,27 @@ async def generate_envelope(
             field_values={
                 **result.placed,
                 "signer_title": profile.signer_title or "",
-                "_funding_profile": values["_funding_profile"],
+                "_funding_profile": funding_profile,
                 "_missing_data": document_missing,
                 "_overlay_problems": result.missing,
                 "_signature_spots": signature_spots(version.overlay_map),
+                "_base_template_key": item.template_key,
+                "_program_key": program_key,
             },
             filled_s3_key=document_key,
             filled_sha256=result.sha256,
         )
         db.add(doc)
         await db.flush()
+        title = item.title_snapshot
+        if multiple and item.template_key == PROGRAM_APPLICATION_KEY:
+            title = f"{PROGRAM_LABELS[program_key]} {item.title_snapshot}"
         db.add(ContractEnvelopeDocument(
             envelope_id=envelope.id,
             contract_document_id=doc.id,
-            title_snapshot=item.title_snapshot,
-            sort_order=item.sort_order,
-            required=item.required,
+            title_snapshot=title,
+            sort_order=sort_order,
+            required=bool(spec["required"]),
         ))
     envelope.status = "draft" if envelope_missing else "ready"
     await db.flush()
@@ -584,7 +836,7 @@ async def execute_envelope(
       </style></head><body><h1>Package Certificate of Completion</h1>
       <p><b>{html.escape(envelope.title)}</b><br>Case: {html.escape(dealer.case_ref or str(dealer.id))}<br>
       Signer: {html.escape(typed_name)}<br>Signed: {now.isoformat()}<br>
-      Program: {html.escape(envelope.program_key)}<br>
+      Programs: {html.escape(', '.join(PROGRAM_LABELS[key] for key in envelope_program_keys(envelope)))}<br>
       Package version: {envelope.package_version}<br>
       Source SHA-256: {html.escape(envelope.source_sha256 or '')}<br>
       Signature SHA-256: {html.escape(signature_sha256)}<br>

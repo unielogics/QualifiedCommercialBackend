@@ -2016,6 +2016,9 @@ class ContractEnvelope(TimestampMixin, Base):
     package_key: Mapped[str] = mapped_column(String(80), nullable=False)
     package_version: Mapped[int] = mapped_column(Integer, nullable=False)
     program_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    program_keys: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     title: Mapped[str] = mapped_column(String(180), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
     source_sha256: Mapped[str | None] = mapped_column(String(64))

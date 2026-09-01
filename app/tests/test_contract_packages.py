@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import fitz
+import pytest
+from pydantic import ValidationError
 
+from app.dealer_os.schemas import ContractEnvelopeGenerateRequest
 from app.dealer_os.services import contract_fill, contract_packages, contract_sign
 
 
@@ -147,3 +150,63 @@ def test_missing_debt_disclosures_are_not_invented_as_zero() -> None:
 
     assert "existing MCA balance (enter zero when none)" in missing
     assert "existing SBA balance (enter zero when none)" in missing
+
+
+def test_multi_program_generation_request_preserves_explicit_overrides() -> None:
+    payload = ContractEnvelopeGenerateRequest(
+        program_keys=[
+            contract_packages.EZ_PROGRAM_KEY,
+            contract_packages.MICRO_PROGRAM_KEY,
+        ],
+        overrides=[
+            {
+                "program_key": contract_packages.MICRO_PROGRAM_KEY,
+                "acknowledged": True,
+                "note": "Client and rep confirmed the blocked submission path.",
+            }
+        ],
+    )
+
+    assert payload.program_key == contract_packages.EZ_PROGRAM_KEY
+    assert payload.program_keys == [
+        contract_packages.EZ_PROGRAM_KEY,
+        contract_packages.MICRO_PROGRAM_KEY,
+    ]
+    assert payload.overrides[0].acknowledged is True
+
+
+def test_generation_request_rejects_duplicate_programs_and_unselected_overrides() -> None:
+    with pytest.raises(ValidationError, match="Each program may be selected only once"):
+        ContractEnvelopeGenerateRequest(
+            program_keys=[
+                contract_packages.EZ_PROGRAM_KEY,
+                contract_packages.EZ_PROGRAM_KEY,
+            ]
+        )
+
+    with pytest.raises(ValidationError, match="must belong to a selected program"):
+        ContractEnvelopeGenerateRequest(
+            program_keys=[contract_packages.EZ_PROGRAM_KEY],
+            overrides=[
+                {
+                    "program_key": contract_packages.MICRO_PROGRAM_KEY,
+                    "acknowledged": True,
+                }
+            ],
+        )
+
+
+def test_combined_envelope_uses_stable_order_and_distinct_template_keys() -> None:
+    assert contract_packages.ordered_program_keys(
+        [contract_packages.MICRO_PROGRAM_KEY, contract_packages.EZ_PROGRAM_KEY]
+    ) == [contract_packages.EZ_PROGRAM_KEY, contract_packages.MICRO_PROGRAM_KEY]
+    assert contract_packages.envelope_document_key(
+        contract_packages.PROGRAM_APPLICATION_KEY,
+        contract_packages.EZ_PROGRAM_KEY,
+        multiple=True,
+    ) == "qc_program_application__ez"
+    assert contract_packages.envelope_document_key(
+        contract_packages.PROGRAM_APPLICATION_KEY,
+        contract_packages.MICRO_PROGRAM_KEY,
+        multiple=True,
+    ) == "qc_program_application__micro"

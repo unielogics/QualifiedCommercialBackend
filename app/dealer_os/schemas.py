@@ -2122,6 +2122,7 @@ class ContractEnvelopeDocumentRead(BaseModel):
     id: UUID
     contract_document_id: UUID
     template_key: str
+    program_key: str | None = None
     title: str
     sort_order: int
     required: bool
@@ -2141,6 +2142,7 @@ class ContractEnvelopeRead(BaseModel):
     package_key: str
     package_version: int
     program_key: str
+    program_keys: list[str] = Field(default_factory=list)
     title: str
     status: str
     signer_name: str | None = None
@@ -2156,9 +2158,45 @@ class ContractEnvelopeRead(BaseModel):
     documents: list[ContractEnvelopeDocumentRead] = Field(default_factory=list)
 
 
-class ContractEnvelopeGenerateRequest(BaseModel):
+class ContractProgramOverrideConfirmation(BaseModel):
     program_key: Literal["term_loan_3_5_year", "term_loan_10_year"]
+    acknowledged: Literal[True]
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ContractEnvelopeGenerateRequest(BaseModel):
+    # `program_key` remains for older deployed clients. New clients submit the
+    # complete card selection through `program_keys`.
+    program_key: Literal["term_loan_3_5_year", "term_loan_10_year"] | None = None
+    program_keys: list[Literal["term_loan_3_5_year", "term_loan_10_year"]] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+    overrides: list[ContractProgramOverrideConfirmation] = Field(
+        default_factory=list,
+        max_length=2,
+    )
     override_reason: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_program_selection(self) -> "ContractEnvelopeGenerateRequest":
+        selected = list(self.program_keys)
+        if self.program_key and not selected:
+            selected = [self.program_key]
+        elif self.program_key and selected and self.program_key != selected[0]:
+            raise ValueError("The legacy program key must match the first selected program.")
+        if not selected:
+            raise ValueError("Select at least one program package.")
+        if len(set(selected)) != len(selected):
+            raise ValueError("Each program may be selected only once.")
+        override_keys = [item.program_key for item in self.overrides]
+        if len(set(override_keys)) != len(override_keys):
+            raise ValueError("Each blocked-program override may be confirmed only once.")
+        if any(key not in selected for key in override_keys):
+            raise ValueError("An override confirmation must belong to a selected program.")
+        self.program_keys = selected
+        self.program_key = selected[0]
+        return self
 
 
 class ContractEnvelopeVoidRequest(BaseModel):
