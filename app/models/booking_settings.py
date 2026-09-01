@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -46,6 +46,14 @@ class BookingSettings(TimestampMixin, Base):
     )
     reminder_sms_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     reminder_sms_minutes_before: Mapped[int] = mapped_column(Integer, nullable=False, default=120, server_default="120")
+    #: What each SMS reminder says, keyed by its minutes-before as a string —
+    #: {"1440": "See you tomorrow...", "60": "Starting in an hour..."}. Missing
+    #: or blank falls back to the default wording, so an operator writes only
+    #: the ones they care about. Keyed rather than index-aligned with
+    #: reminder_sms_minutes: parallel lists drift when a reminder is removed.
+    reminder_sms_messages: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     reminder_sms_minutes: Mapped[list[int]] = mapped_column(
         JSONB,
         nullable=False,

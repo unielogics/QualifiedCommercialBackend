@@ -153,6 +153,7 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
         reminder_sms_enabled=row.reminder_sms_enabled,
         reminder_sms_minutes_before=row.reminder_sms_minutes_before,
         reminder_sms_minutes=row.reminder_sms_minutes or [row.reminder_sms_minutes_before],
+        reminder_sms_messages=row.reminder_sms_messages or {},
         google_meet_enabled=row.google_meet_enabled,
         timezone=row.timezone,
         available_days=row.available_days or [1, 2, 3, 4, 5],
@@ -339,6 +340,7 @@ async def put_booking_settings(
     row.reminder_email_minutes_before = payload.reminder_email_minutes[0] if payload.reminder_email_minutes else payload.reminder_email_minutes_before
     row.reminder_sms_enabled = payload.reminder_sms_enabled
     row.reminder_sms_minutes = payload.reminder_sms_minutes
+    row.reminder_sms_messages = payload.reminder_sms_messages
     row.reminder_sms_minutes_before = payload.reminder_sms_minutes[0] if payload.reminder_sms_minutes else payload.reminder_sms_minutes_before
     row.google_meet_enabled = payload.google_meet_enabled
     row.timezone = payload.timezone

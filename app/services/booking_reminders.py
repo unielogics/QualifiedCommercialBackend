@@ -203,6 +203,53 @@ async def send_confirmation_sms(
     await db.commit()
 
 
+#: Placeholders an operator can put in a reminder message. Kept small and
+#: obvious on purpose: everything here is already known at send time, so a
+#: reminder can never fail to render for want of data.
+REMINDER_PLACEHOLDERS = ("{time}", "{name}", "{rep}", "{join_link}")
+
+#: Carriers expect opt-out language on automated recurring messages, so this is
+#: appended to every reminder rather than left to whoever wrote the text. A
+#: custom message must not be able to drop it by accident.
+STOP_NOTICE = "Reply STOP to opt out."
+
+
+def render_reminder_sms(
+    template: str | None,
+    *,
+    event_title: str,
+    when: str,
+    invitee_name: str | None,
+    rep_name: str | None,
+    join_url: str | None,
+) -> str:
+    """The text of one SMS reminder.
+
+    An empty template falls back to the wording every reminder used before this
+    was configurable, so an operator only writes the messages they care about.
+    Unknown placeholders are left alone rather than raising: a typo in settings
+    should send a slightly odd reminder, not silently send nothing.
+    """
+    values = {
+        "{time}": when,
+        "{name}": (invitee_name or "").strip() or "there",
+        "{rep}": (rep_name or "").strip() or "Qualified Commercial",
+        # Renders as nothing for an in-person meeting, and the surrounding text
+        # still reads, which is why it is not "Join: <url>" here.
+        "{join_link}": (join_url or "").strip(),
+    }
+    body = (template or "").strip()
+    if not body:
+        body = f"Qualified Commercial reminder: {event_title}, {when}."
+        if join_url:
+            body = f"{body} Join: {join_url}"
+    else:
+        for token, value in values.items():
+            body = body.replace(token, value)
+        body = " ".join(body.split())
+    return f"{body} {STOP_NOTICE}".strip()
+
+
 async def dispatch_due_reminders() -> int:
     from app.db import SessionLocal
     from app.dealer_os.models import DealerBusiness, DealerRepAppointment
@@ -235,7 +282,14 @@ async def dispatch_due_reminders() -> int:
                     BookingNotificationReminder.status == "pending",
                     BookingNotificationReminder.due_at <= now,
                 )
-                .with_for_update(skip_locked=True)
+                # Lock ONLY the reminder row. with_for_update locks every table
+                # in the select, and Postgres refuses to lock the nullable side
+                # of an outer join — "FOR UPDATE cannot be applied to the
+                # nullable side of an outer join" — so this raised on every run
+                # and no reminder had been dispatched since the dealer joins
+                # were added. The lock exists to stop two workers claiming the
+                # same reminder; the joined rows are read-only context.
+                .with_for_update(skip_locked=True, of=BookingNotificationReminder)
                 .limit(100)
             )
         ).all()
@@ -270,9 +324,16 @@ async def dispatch_due_reminders() -> int:
                     notice.last_error = result.detail[:1000]
                 sent += int(result.ok)
             elif reminder.channel == "sms":
-                body = (
-                    f"Qualified Commercial reminder: {event.title}, {when}. "
-                    f"{'Join: ' + notice.join_url + ' ' if notice.join_url else ''}Reply STOP to opt out."
+                # Resolved at send time, not at booking time, so editing a
+                # message in settings reaches meetings that are already booked.
+                template = (booking.reminder_sms_messages or {}).get(str(reminder.minutes_before))
+                body = render_reminder_sms(
+                    template,
+                    event_title=event.title,
+                    when=when,
+                    invitee_name=notice.invitee_name,
+                    rep_name=host.name or host.email,
+                    join_url=notice.join_url,
                 )
                 try:
                     result = await consent_delivery.send_sms_guarded(

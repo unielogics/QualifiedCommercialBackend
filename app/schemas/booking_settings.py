@@ -63,6 +63,11 @@ class UserBookingSettingsBase(BaseModel):
     reminder_sms_enabled: bool = True
     reminder_sms_minutes_before: int = Field(default=120, ge=15, le=10080)
     reminder_sms_minutes: list[int] = Field(default_factory=lambda: [120], max_length=5)
+    #: What each SMS reminder says, keyed by its minutes-before as a string.
+    #: Blank or absent means the default wording. Placeholders: {time}, {name},
+    #: {rep}, {join_link}. The opt-out notice is appended by the sender and is
+    #: deliberately not authorable here.
+    reminder_sms_messages: dict[str, str] = Field(default_factory=dict)
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
@@ -105,6 +110,23 @@ class UserBookingSettingsBase(BaseModel):
             raise ValueError("At least one email reminder time is required when email reminders are enabled")
         if self.reminder_sms_enabled and not self.reminder_sms_minutes:
             raise ValueError("At least one SMS reminder time is required when SMS reminders are enabled")
+
+        # Drop messages whose reminder no longer exists, so removing a reminder
+        # from the middle of the schedule cannot leave text that silently
+        # reappears if that timing is added back later.
+        scheduled = {str(value) for value in self.reminder_sms_minutes}
+        cleaned: dict[str, str] = {}
+        for key, message in (self.reminder_sms_messages or {}).items():
+            if key not in scheduled:
+                continue
+            body = (message or "").strip()
+            if not body:
+                continue
+            # One segment of headroom for the appended opt-out notice.
+            if len(body) > 400:
+                raise ValueError("A reminder message must be 400 characters or fewer")
+            cleaned[key] = body
+        self.reminder_sms_messages = cleaned
 
         days = sorted(set(self.available_days))
         if any(day < 0 or day > 6 for day in days):
