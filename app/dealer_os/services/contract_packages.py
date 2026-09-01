@@ -33,6 +33,7 @@ from ..models import (
     DealerApplicationProfile,
     DealerBusiness,
     DealerOwner,
+    DealerProgramRuleResolution,
 )
 from . import contract_fill, contract_sign, qc_master_application, storage
 
@@ -321,10 +322,28 @@ async def generate_envelope(
     await ensure_defaults(db, actor.id)
     context = await qc_master_application.build_context(db, dealer)
     viable = _program_viable(context, program_key)
+    manual_selection = (
+        await db.execute(
+            select(DealerProgramRuleResolution)
+            .where(
+                DealerProgramRuleResolution.dealer_id == dealer.id,
+                DealerProgramRuleResolution.program_key == program_key,
+                DealerProgramRuleResolution.rule_key == "program_selection.manual",
+                DealerProgramRuleResolution.status == "active",
+            )
+            .order_by(DealerProgramRuleResolution.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     if not viable:
-        if actor.role != Role.SUPER_ADMIN:
+        if manual_selection is not None:
+            override_reason = (
+                manual_selection.rep_note
+                or "Authorized staff selected this submission path with system blockers preserved."
+            )
+        elif actor.role != Role.SUPER_ADMIN:
             raise PermissionError("That program is blocked by the current routing result.")
-        if not (override_reason or "").strip():
+        elif not (override_reason or "").strip():
             raise ValueError("A documented super-admin override reason is required.")
 
     package = (
@@ -412,6 +431,31 @@ async def generate_envelope(
     values, base_missing = await contract_fill.build_values(db, dealer)
     values["selected_program"] = program_key
     values["signer_title"] = profile.signer_title or ""
+    values["_funding_profile"] = {
+        "original_requested_amount": context["request"].get("original_amount"),
+        "working_funding_goal": context["request"].get("amount"),
+        "program_key": program_key,
+        "system_status": context.get("route_status"),
+        "annual_sales": context["financial"].get("annual_sales"),
+        "annual_cash_flow_available_for_debt": context["financial"].get(
+            "annual_cash_flow_available_for_debt"
+        ),
+        "monthly_debt_payments": context["financial"].get("monthly_debt_payments"),
+        "dscr": context["financial"].get("dscr"),
+        "verified_bank_months": context["financial"].get("statement_months") or [],
+        "bank_evidence_target": context["financial"].get("accepted_statement_target", 6),
+        "credit": [
+            {
+                "owner": owner.get("name"),
+                "status": owner.get("credit_status"),
+                "quality": owner.get("credit_quality"),
+            }
+            for owner in context.get("owners") or []
+            if owner.get("credit_required")
+        ],
+        "debt_count": len(context.get("debts") or []),
+        "unresolved_conditions": list(context.get("route_unresolved") or []),
+    }
     missing = _missing_for_program(values, base_missing, program_key)
     values["_missing_data"] = missing
     values["_override_reason"] = (override_reason or "").strip() or None
@@ -450,6 +494,7 @@ async def generate_envelope(
             field_values={
                 **result.placed,
                 "signer_title": profile.signer_title or "",
+                "_funding_profile": values["_funding_profile"],
                 "_missing_data": document_missing,
                 "_overlay_problems": result.missing,
                 "_signature_spots": signature_spots(version.overlay_map),

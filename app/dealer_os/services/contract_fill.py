@@ -577,6 +577,7 @@ async def generate(
             select(ContractDocument).where(
                 ContractDocument.dealer_id == dealer.id,
                 ContractDocument.template_key == key,
+                ContractDocument.envelope_id.is_(None),
             )
         )
     ).scalar_one_or_none()
@@ -587,11 +588,20 @@ async def generate(
         )
 
     if tpl.render_kind == "generated_html":
-        if key != qc_master_application.MASTER_TEMPLATE_KEY:
+        if key not in {
+            qc_master_application.MASTER_TEMPLATE_KEY,
+            qc_master_application.SUMMARY_TEMPLATE_KEY,
+        }:
             raise ValueError(f"No generated renderer is registered for {key!r}.")
-        context, readiness, pdf, sha256, missing_data = (
-            await qc_master_application.build_application(db, dealer)
-        )
+        if key == qc_master_application.SUMMARY_TEMPLATE_KEY:
+            context, readiness, pdf, sha256, source_sha256, missing_data = (
+                await qc_master_application.build_summary(db, dealer)
+            )
+        else:
+            context, readiness, pdf, sha256, missing_data = (
+                await qc_master_application.build_application(db, dealer)
+            )
+            source_sha256 = qc_master_application.summary_source_hash(context)
         result = FillResult(
             pdf=pdf,
             sha256=sha256,
@@ -603,9 +613,10 @@ async def generate(
                 "route": context["route_label"],
                 "rules_version": context["rules_version"],
                 "package_ready_for_signature": "yes" if readiness["package_ready"] else "no",
+                "_source_sha256": source_sha256,
             },
         )
-        ready = readiness["package_ready"]
+        ready = True if key == qc_master_application.SUMMARY_TEMPLATE_KEY else readiness["package_ready"]
     else:
         raw = storage.get_bytes(tpl.s3_key)
         if raw is None:

@@ -1457,6 +1457,42 @@ class ProgramExceptionDecision(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
 
 
+class ProgramSelectionRequest(BaseModel):
+    program_key: Literal["term_loan_3_5_year", "term_loan_10_year"]
+    acknowledged: Literal[True]
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ProgramSelectionRead(BaseModel):
+    system_program_key: str | None = None
+    system_program_status: str | None = None
+    effective_program_key: str | None = None
+    effective_program_status: str | None = None
+    manually_selected: bool = False
+    selected_by_user_id: UUID | None = None
+    selected_by_name: str | None = None
+    selected_at: datetime | None = None
+    note: str | None = None
+    rules_version: str | None = None
+    system_blockers: list[str] = Field(default_factory=list)
+
+
+class WorkflowStepRead(BaseModel):
+    available: bool = False
+    complete: bool = False
+    blockers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ApplicationWorkflowRead(BaseModel):
+    workflow_ungated: bool = False
+    step_1: WorkflowStepRead = Field(default_factory=WorkflowStepRead)
+    step_2: WorkflowStepRead = Field(default_factory=WorkflowStepRead)
+    step_3: WorkflowStepRead = Field(default_factory=WorkflowStepRead)
+    step_4: WorkflowStepRead = Field(default_factory=WorkflowStepRead)
+    program_selection: ProgramSelectionRead = Field(default_factory=ProgramSelectionRead)
+
+
 class UnderwritingResolutionRead(BaseModel):
     rules_version: str
     original_amount: float | None = None
@@ -1473,6 +1509,7 @@ class UnderwritingResolutionRead(BaseModel):
     exception_requests: list[ProgramRuleResolutionRead] = Field(default_factory=list)
     direct_program_viable: bool = False
     signing_mode: Literal["program_package", "qc_summary_booking"] = "qc_summary_booking"
+    program_selection: ProgramSelectionRead = Field(default_factory=ProgramSelectionRead)
 
 
 class DecisionRead(BaseModel):
@@ -1495,6 +1532,46 @@ class DecisionRead(BaseModel):
     # The gate. Steps 3-5 of the application read `unlocked` from here rather
     # than deciding for themselves.
     verification: VerificationRead = Field(default_factory=VerificationRead)
+    workflow: ApplicationWorkflowRead = Field(default_factory=ApplicationWorkflowRead)
+
+
+class UnderwritingSummaryRead(BaseModel):
+    id: UUID | None = None
+    exists: bool = False
+    status: str = "not_generated"
+    revision: int = 0
+    generated_at: datetime | None = None
+    generated_by_user_id: UUID | None = None
+    sha256: str | None = None
+    source_sha256: str | None = None
+    stale: bool = False
+    missing_data: list[str] = Field(default_factory=list)
+    pdf_url: str | None = None
+    email_prompt: bool = False
+    action: Literal["created", "updated", "unchanged", "not_generated"] = "not_generated"
+
+
+class UnderwritingSummaryEmailRequest(BaseModel):
+    recipient_mode: Literal["application", "owner", "manual"] = "application"
+    owner_id: UUID | None = None
+    recipient_email: EmailStr | None = None
+
+    @model_validator(mode="after")
+    def _recipient_matches_mode(self) -> "UnderwritingSummaryEmailRequest":
+        if self.recipient_mode == "owner" and self.owner_id is None:
+            raise ValueError("Choose an owner recipient")
+        if self.recipient_mode == "manual" and self.recipient_email is None:
+            raise ValueError("Enter the recipient email")
+        return self
+
+
+class UnderwritingSummaryEmailResult(BaseModel):
+    sent: bool = False
+    recipient_email: EmailStr
+    revision: int
+    sha256: str
+    message_id: str | None = None
+    detail: str | None = None
 
 
 class ContractTemplateRead(ORM):
@@ -2075,6 +2152,7 @@ class ContractEnvelopeRead(BaseModel):
     bundle_sha256: str | None = None
     bundle_download_url: str | None = None
     delivery_history: list = Field(default_factory=list)
+    funding_profile: dict = Field(default_factory=dict)
     documents: list[ContractEnvelopeDocumentRead] = Field(default_factory=list)
 
 
@@ -2170,6 +2248,21 @@ class BankEvidenceRead(BaseModel):
 
 class BankEvidenceExceptionRequest(BaseModel):
     acknowledged: Literal[True]
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class DebtScheduleConfirmationRequest(BaseModel):
+    status: Literal["schedule_confirmed", "no_business_debt"]
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class DebtScheduleConfirmationRead(BaseModel):
+    status: Literal["schedule_confirmed", "no_business_debt"] | None = None
+    confirmed: bool = False
+    stale: bool = False
+    confirmed_at: datetime | None = None
+    confirmed_by_user_id: UUID | None = None
+    note: str | None = None
 
 
 class DocRequestPatch(BaseModel):
@@ -2801,7 +2894,7 @@ class PublicConsentResult(BaseModel):
     the exact score never renders on an unauthenticated page."""
 
     credit_tier: str | None = None
-    credit_score_band: str | None = None  # e.g. "700–749"
+    credit_score_band: str | None = None  # e.g. "720–759"
     completed: bool = True
 
 

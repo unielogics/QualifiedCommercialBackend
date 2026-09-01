@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -18,16 +19,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_profile import ApplicationTaxonomyEntry
+from app.models.user import User
 
 from ..models import (
     DealerApplicationPreScreen,
     DealerApplicationProfile,
+    DealerApplicationRecommendation,
     DealerBusiness,
     DealerDebt,
     DealerDocument,
     DealerOwner,
+    DealerProgramRuleResolution,
 )
-from . import application_prescreen, recurrence
+from . import application_prescreen, credit_quality, recurrence, workflow_readiness
 from .lender_neutral_routing import (
     RULES_VERSION,
     TERM_DISPLAY_NAME,
@@ -39,6 +43,9 @@ from .lender_neutral_routing import (
 MASTER_TEMPLATE_KEY = "qc_business_financing_application"
 MASTER_TITLE = "Qualified Commercial Business Financing Application and Certifications"
 MASTER_VERSION = "2026-08-25-1"
+SUMMARY_TEMPLATE_KEY = "qc_underwriting_summary"
+SUMMARY_TITLE = "Qualified Commercial Underwriting Summary"
+SUMMARY_VERSION = "2026-09-01-1"
 STATEMENT_MONTH_TARGET = 6
 
 
@@ -75,10 +82,16 @@ def _official_statement_months(documents: list[DealerDocument]) -> tuple[list[st
     for document in documents:
         if document.status != "extracted" or _effective_doc_kind(document) != "bank_statement":
             continue
+        metadata = document.doc_meta if isinstance(document.doc_meta, dict) else {}
+        extracted = document.extracted if isinstance(document.extracted, dict) else {}
+        is_plaid_assets = (
+            metadata.get("source") == "plaid_assets"
+            or extracted.get("source") == "plaid_assets"
+        )
         is_pdf = _text(document.content_type).lower() == "application/pdf"
-        if not (is_pdf or document.plaid_item_id is not None):
+        if not (is_pdf or document.plaid_item_id is not None or is_plaid_assets):
             continue
-        for row in (document.extracted or {}).get("months") or []:
+        for row in extracted.get("months") or []:
             month = _text(row.get("month") if isinstance(row, dict) else "")
             if len(month) == 7 and month[4] == "-" and month.replace("-", "").isdigit():
                 months.add(month)
@@ -86,7 +99,12 @@ def _official_statement_months(documents: list[DealerDocument]) -> tuple[list[st
     return sorted(months), list(freshness.get("missing_months") or [])
 
 
-def _route_from(routing: dict[str, Any] | None, selected: str | None) -> tuple[str | None, str]:
+def _route_from(
+    routing: dict[str, Any] | None,
+    selected: str | None,
+    *,
+    allow_blocked_selection: bool = False,
+) -> tuple[str | None, str]:
     programs = (routing or {}).get("programs") or []
     by_key = {str(row.get("program_key") or ""): row for row in programs}
     selected_key = _text(selected).lower()
@@ -95,7 +113,10 @@ def _route_from(routing: dict[str, Any] | None, selected: str | None) -> tuple[s
         requested_key = TERM_PROGRAM_KEY
     elif selected_key in {WORKING_CAPITAL_PROGRAM_KEY, WORKING_CAPITAL_DISPLAY_NAME.lower()} or "10-year" in selected_key:
         requested_key = WORKING_CAPITAL_PROGRAM_KEY
-    if requested_key and by_key.get(requested_key, {}).get("status") in {"recommended", "potential"}:
+    if requested_key and (
+        allow_blocked_selection
+        or by_key.get(requested_key, {}).get("status") in {"recommended", "potential"}
+    ):
         row = by_key[requested_key]
         return requested_key, _text(row.get("name")) or (
             TERM_DISPLAY_NAME if requested_key == TERM_PROGRAM_KEY else WORKING_CAPITAL_DISPLAY_NAME
@@ -163,6 +184,24 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
             )
         )
     ).scalar_one_or_none()
+    resolutions = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution)
+                .where(DealerProgramRuleResolution.dealer_id == dealer.id)
+                .order_by(DealerProgramRuleResolution.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    recommendations = list(
+        (
+            await db.execute(
+                select(DealerApplicationRecommendation)
+                .where(DealerApplicationRecommendation.dealer_id == dealer.id)
+                .order_by(DealerApplicationRecommendation.created_at.asc())
+            )
+        ).scalars().all()
+    )
     taxonomy_rows = []
     taxonomy_ids = [
         value
@@ -187,14 +226,145 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
         else "unclassified"
     )
     routing = dict(pre_screen.routing_result or {}) if pre_screen else {}
-    route_key, route_label = _route_from(routing, profile.selected_program if profile else None)
+    manual_selection = next(
+        (
+            row
+            for row in reversed(resolutions)
+            if row.rule_key == "program_selection.manual" and row.status == "active"
+        ),
+        None,
+    )
+    route_key, route_label = _route_from(
+        routing,
+        manual_selection.program_key
+        if manual_selection is not None
+        else profile.selected_program if profile else None,
+        allow_blocked_selection=manual_selection is not None,
+    )
     statement_months, missing_statement_months = _official_statement_months(documents)
+    bank_exception = next(
+        (
+            row
+            for row in reversed(resolutions)
+            if row.rule_key == "bank_evidence.three_month_exception"
+            and row.status == "acknowledged"
+        ),
+        None,
+    )
+    accepted_statement_target = STATEMENT_MONTH_TARGET
+    bank_exception_active = False
+    if bank_exception is not None:
+        accepted_statement_target = int(
+            (bank_exception.current_value or {}).get("accepted_target") or 3
+        )
+        accepted_months = set(
+            (bank_exception.current_value or {}).get("statement_months") or []
+        )
+        expected = set(
+            recurrence.compute_freshness(
+                statement_months,
+                date.today(),
+                window=accepted_statement_target,
+            ).get("expected_months")
+            or []
+        )
+        bank_exception_active = bool(
+            3 <= accepted_statement_target <= 5
+            and expected
+            and expected.issubset(accepted_months)
+        )
+    if not bank_exception_active:
+        accepted_statement_target = STATEMENT_MONTH_TARGET
     primary = next((owner for owner in owners if owner.is_primary), owners[0] if owners else None)
+
+    actor_ids = {
+        value
+        for row in resolutions
+        for value in (row.requested_by_user_id, row.resolved_by_user_id)
+        if value is not None
+    }
+    actor_ids.update(
+        value
+        for row in recommendations
+        for value in (row.created_by_user_id, row.responded_by_user_id)
+        if value is not None
+    )
+    actors = {
+        user.id: user
+        for user in list(
+            (
+                await db.execute(select(User).where(User.id.in_(actor_ids)))
+            ).scalars().all()
+        )
+    } if actor_ids else {}
+
+    adjustments: list[dict[str, Any]] = []
+    for row in resolutions:
+        if row.rule_key not in {
+            "program_selection.manual",
+            "bank_evidence.three_month_exception",
+        }:
+            continue
+        values = dict(row.current_value or {})
+        actor = actors.get(row.requested_by_user_id)
+        if row.rule_key == "program_selection.manual":
+            original = values.get("system_program_key") or "No system-selected direct program"
+            overridden = values.get("selected_program_key") or row.program_key
+            label = "Submission program"
+        else:
+            original = f"{values.get('standard_target', 6)} verified current months"
+            overridden = f"{values.get('accepted_target', 3)} verified current months accepted"
+            label = "Bank-evidence standard"
+        adjustments.append(
+            {
+                "label": label,
+                "original": original,
+                "overridden": overridden,
+                "actor": (actor.name or actor.email) if actor else "System or unavailable actor",
+                "timestamp": row.requested_at or row.created_at,
+                "note": row.rep_note or row.resolution_note or "No staff note entered.",
+                "rules_version": values.get("rules_version")
+                or routing.get("rules_version")
+                or (pre_screen.rules_version if pre_screen else RULES_VERSION),
+                "status": row.status,
+            }
+        )
+    for row in recommendations:
+        if row.responded_at is None:
+            continue
+        actor = actors.get(row.responded_by_user_id)
+        adjustments.append(
+            {
+                "label": "Working funding structure",
+                "original": f"{_money(row.current_amount)} / {_text(row.current_program) or 'No program'}",
+                "overridden": f"{_money(row.response_amount or row.recommended_amount)} / {_text(row.response_program or row.recommended_program) or 'No program'}",
+                "actor": (actor.name or actor.email) if actor else "System or unavailable actor",
+                "timestamp": row.responded_at,
+                "note": row.response_note or "Recommendation acknowledged without a note.",
+                "rules_version": row.rules_version,
+                "status": row.status,
+            }
+        )
 
     owner_rows: list[dict[str, Any]] = []
     owner_answers = dict(pre_screen.owner_answers or {}) if pre_screen else {}
     for owner in owners:
         answer = dict(owner_answers.get(str(owner.id)) or {})
+        credit_summary = dict(owner.credit_summary or {})
+        current_quality = credit_quality.summary(owner.credit_score)
+        credit_band = (
+            current_quality.get("score_band")
+            if current_quality
+            else credit_summary.get("score_band")
+        )
+        credit_tier = (
+            current_quality.get("quality_tier")
+            if current_quality
+            else credit_summary.get("quality_tier") or owner.credit_tier
+        )
+        credit_quality = " · ".join(
+            part for part in (credit_tier, credit_band) if part
+        ) or ("Verified result" if owner.credit_pulled_at else "Pending")
         threshold = answer.get("credit_660_or_higher")
         if owner.credit_pulled_at:
             threshold = (owner.credit_score or 0) >= 660 if owner.credit_score is not None else None
@@ -219,6 +389,7 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
                     else "Not required"
                 ),
                 "credit_reference": str(owner.credit_pull_id) if owner.credit_pull_id else None,
+                "credit_quality": credit_quality,
                 "residency": answer.get("residency_status") or "Awaiting disclosure",
                 "bankruptcy": answer.get("bankruptcy_timing") or "Awaiting disclosure",
                 "foreclosure": answer.get("foreclosure_within_3_years"),
@@ -234,10 +405,24 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
             "name": document.filename,
             "classification": _effective_doc_kind(document).replace("_", " ").title(),
             "status": document.status,
-            "source": "Plaid" if document.plaid_item_id else "Uploaded",
+            "source": (
+                "Plaid Assets"
+                if (
+                    (document.doc_meta or {}).get("source") == "plaid_assets"
+                    or (document.extracted or {}).get("source") == "plaid_assets"
+                )
+                else "Plaid"
+                if document.plaid_item_id
+                else "Uploaded"
+            ),
             "official_statement": bool(
                 _effective_doc_kind(document) == "bank_statement"
-                and (document.plaid_item_id or _text(document.content_type).lower() == "application/pdf")
+                and (
+                    document.plaid_item_id
+                    or _text(document.content_type).lower() == "application/pdf"
+                    or (document.doc_meta or {}).get("source") == "plaid_assets"
+                    or (document.extracted or {}).get("source") == "plaid_assets"
+                )
             ),
         }
         for document in documents
@@ -306,6 +491,9 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
             "dscr_source": metrics.get("dscr_source") or "unavailable",
             "statement_months": statement_months,
             "missing_statement_months": missing_statement_months,
+            "standard_statement_target": STATEMENT_MONTH_TARGET,
+            "accepted_statement_target": accepted_statement_target,
+            "bank_exception_active": bank_exception_active,
         },
         "owners": owner_rows,
         "primary_signer": {
@@ -314,6 +502,7 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
             "email": primary.email if primary and primary.email else "Awaiting evidence",
         },
         "debts": debt_rows,
+        "debt_source_sha256": workflow_readiness.debt_source_hash(debts),
         "documents": docs_reviewed,
         "routing": routing,
         "route_key": route_key,
@@ -321,6 +510,9 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
         "route_status": selected_program.get("status") if selected_program else "review",
         "route_reasons": (selected_program or {}).get("borrower_safe_reasons") or [],
         "route_unresolved": (selected_program or {}).get("unresolved") or [],
+        "system_route_key": (_route_from(routing, None)[0]),
+        "manual_program_selection": manual_selection is not None,
+        "adjustments": adjustments,
         "profile": profile,
         "pre_screen": pre_screen,
     }
@@ -351,6 +543,18 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         dict(pre_screen.file_answers or {}) if pre_screen else {},
     )
     business_questions_complete = not business_question_blockers
+    source_fields_complete = bool(
+        profile
+        and getattr(profile, "guaranty_type", None)
+        and _text(getattr(profile, "office_space", None))
+        and getattr(profile, "business_stage", None)
+        and _text(getattr(profile, "signer_title", None))
+        and getattr(profile, "existing_mca_balance", None) is not None
+        and getattr(profile, "existing_sba_balance", None) is not None
+        and getattr(profile, "active_ucc_filings", None) is not None
+        and getattr(profile, "affiliate_businesses", None) is not None
+        and getattr(profile, "send_welcome_email", None) is not None
+    )
     app_complete = all(
         [
             _text(business.get("legal_name")),
@@ -361,21 +565,42 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
             _text(business.get("mailing_address")) != "Awaiting evidence",
             _text(primary.get("name")) != "Awaiting evidence",
             _text(primary.get("title")) != "Awaiting evidence",
-            financial.get("annual_sales") is not None,
             float(request.get("amount") or 0) > 0,
             _text(request.get("use_of_funds")) != "Awaiting evidence",
             ownership_total == 100.0,
             bool(pre_screen and pre_screen.completed_at),
+            source_fields_complete,
         ]
     )
-    statement_complete = len(financial.get("statement_months") or []) >= STATEMENT_MONTH_TARGET and not financial.get("missing_statement_months")
+    accepted_target = int(financial.get("accepted_statement_target") or STATEMENT_MONTH_TARGET)
+    accepted_freshness = recurrence.compute_freshness(
+        financial.get("statement_months") or [],
+        date.today(),
+        window=accepted_target,
+    )
+    statement_complete = bool(
+        len(financial.get("statement_months") or []) >= accepted_target
+        and not accepted_freshness.get("missing_months")
+    )
     has_tax = any(row["classification"].lower() == "tax return" and row["status"] == "extracted" for row in documents)
-    has_debt_schedule = any(row["classification"].lower() == "debt schedule" and row["status"] == "extracted" for row in documents)
+    debt_confirmation = dict((getattr(profile, "field_confirmations", None) or {}).get("debt_schedule") or {})
+    has_debt_schedule = bool(
+        debt_confirmation.get("source_sha256") == context.get("debt_source_sha256")
+        and (
+            debt_confirmation.get("status") == "schedule_confirmed" and bool(context.get("debts"))
+            or debt_confirmation.get("status") == "no_business_debt" and not context.get("debts")
+        )
+    )
     has_supplemental_bank = any(
         row["classification"].lower() == "bank statement" and not row["official_statement"]
         for row in documents
     )
     human_status = _text(getattr(profile, "human_review_status", "pending")) or "pending"
+    financial_confirmations = dict(getattr(profile, "field_confirmations", None) or {})
+    financial_confirmed = all(
+        financial.get(field) is not None and field in financial_confirmations
+        for field in workflow_readiness.FINANCIAL_CONFIRMATION_FIELDS
+    )
 
     items = [
         _status("Complete applicant and ownership data", "complete" if app_complete else "missing", f"Ownership allocated: {ownership_total:.2f}%", source="Application"),
@@ -384,14 +609,29 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
         _status(
             "Six current verified bank-evidence months",
             "complete" if statement_complete else "supplemental" if has_supplemental_bank else "missing",
-            ", ".join(financial.get("statement_months") or []) or "No qualifying bank months",
+            (
+                f"Exception accepted at {accepted_target} current months; "
+                f"six-month standard remains open. Verified: {', '.join(financial.get('statement_months') or [])}"
+                if financial.get("bank_exception_active")
+                else ", ".join(financial.get("statement_months") or []) or "No qualifying bank months"
+            ),
             source="Plaid Assets or uploaded bank PDF",
         ),
         _status("Detailed written use of funds", "complete" if request["use_of_funds"] != "Awaiting evidence" else "missing", request["use_of_funds"], source="Application"),
         _status(
+            "Confirmed cash flow and monthly debt service",
+            "complete" if financial_confirmed else "missing",
+            (
+                "Annual sales, available cash flow, and monthly debt service confirmed"
+                if financial_confirmed
+                else "Confirm all three Step 3 financial fields"
+            ),
+            source="Step 3",
+        ),
+        _status(
             "Debt schedule for refinance",
             "not_applicable" if route_key != TERM_PROGRAM_KEY or not refinance else "complete" if has_debt_schedule else "missing",
-            "Debt refinance disclosed" if refinance else "No debt-refinance use disclosed",
+            "Confirmed row-based debt schedule" if has_debt_schedule else "Debt schedule confirmation is incomplete",
             route=TERM_PROGRAM_KEY,
             source="Documents",
         ),
@@ -404,7 +644,7 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
                 if business_questions_complete
                 else "; ".join(business_question_blockers[:4])
             ),
-            source="Step 4",
+            source="Step 2",
         ),
         _status("Human-reviewed fundable path", "complete" if human_status == "fundable" else "missing", getattr(profile, "human_review_note", None) or human_status.replace("_", " ").title(), source="Qualified Commercial desk"),
     ]
@@ -450,7 +690,41 @@ def _table(headers: list[str], rows: list[list[Any]], widths: list[str] | None =
     return f"<table>{colgroup}<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def render_html(context: dict[str, Any], readiness: dict[str, Any]) -> str:
+def summary_source_hash(context: dict[str, Any]) -> str:
+    payload = {
+        key: context.get(key)
+        for key in (
+            "case_ref",
+            "rules_version",
+            "business",
+            "taxonomy",
+            "request",
+            "financial",
+            "owners",
+            "debts",
+            "documents",
+            "routing",
+            "route_key",
+            "route_label",
+            "route_status",
+            "route_reasons",
+            "route_unresolved",
+            "system_route_key",
+            "manual_program_selection",
+            "adjustments",
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def render_html(
+    context: dict[str, Any],
+    readiness: dict[str, Any],
+    *,
+    summary: bool = False,
+) -> str:
     business = context["business"]
     taxonomy = context["taxonomy"]
     request = context["request"]
@@ -463,7 +737,8 @@ def render_html(context: dict[str, Any], readiness: dict[str, Any]) -> str:
                 row["name"],
                 f"{row['ownership_pct']:.2f}%",
                 f"{row['email']} | {row['phone']}",
-                f"{row['credit_status']}" + (f" | Ref {row['credit_reference']}" if row["credit_reference"] else ""),
+                f"{row['credit_status']} | {row['credit_quality']}"
+                + (f" | Ref {row['credit_reference']}" if row["credit_reference"] else ""),
                 f"Residency: {row['residency']}; bankruptcy: {row['bankruptcy']}; foreclosure <3y: {row['foreclosure']}; felony: {row['felony']}; misdemeanor <5y: {row['misdemeanor']}; legal charges: {row['active_legal_charges']}; sanctions disclosure: {row['ofac_match']}",
             ]
             for row in context["owners"]
@@ -496,9 +771,39 @@ def render_html(context: dict[str, Any], readiness: dict[str, Any]) -> str:
         ["Use", "Amount"],
         [[row.get("description") or row.get("label") or "Use of funds", _money(row.get("amount"))] for row in request.get("line_items") or []],
     )
+    adjustment_rows = list(context.get("adjustments") or [])
+    adjustments = _table(
+        ["Change", "Original", "Working / overridden", "Actor and timestamp", "Note / rules"],
+        [
+            [
+                row.get("label"),
+                row.get("original"),
+                row.get("overridden"),
+                f"{row.get('actor')} | {_date(row.get('timestamp'))}",
+                f"{row.get('note')} | {row.get('rules_version')}",
+            ]
+            for row in adjustment_rows
+        ],
+        ["16%", "17%", "19%", "22%", "26%"],
+    )
+    document_title = SUMMARY_TITLE if summary else MASTER_TITLE
+    document_version = SUMMARY_VERSION if summary else MASTER_VERSION
+    footer_label = "Underwriting summary" if summary else "Preliminary lender-ready application"
+    adjustment_section = (
+        f"<h2>8. Override and Acknowledgment History</h2>{adjustments}"
+        if adjustment_rows or not summary
+        else '<p class="certificate-note"><b>Override history:</b> No staff overrides or acknowledged working-structure changes are recorded.</p>'
+    )
+    closing_section = "" if summary else f"""
+<h2>9. Applicant Certifications and Authorization</h2>
+<p>I certify that the business, ownership schedule, financing request, financial information, debt schedule, eligibility disclosures, and supporting documents in this application are true and complete to the best of my knowledge. I am authorized to submit this application on behalf of the business. I authorize Qualified Commercial to use this application and its supporting evidence to evaluate and present commercial-financing opportunities. I understand that this document is not an approval, commitment, SBA form, or downstream lender application, and that additional forms and evidence may be required.</p>
+<p>I acknowledge that each owner at 20% or more completed or must complete a separate credit authorization. This application does not contain or authorize storage of a Social Security number, and it does not display a raw credit score.</p>
+
+<div class="signature"><b>SIGNATURE OF AUTHORIZED REPRESENTATIVE</b><div class="signature-line">Electronic signature</div><div class="grid" style="margin-top:12px"><div><span class="label">Typed legal name</span>{html.escape(_text(signer['name']))}</div><div><span class="label">Title</span>{html.escape(_text(signer['title']))}</div><div><span class="label">Date</span>Signed electronically after review</div><div><span class="label">Document hash</span>See completion certificate</div></div></div>
+"""
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>
-@page {{ size: Letter; margin: 0.55in 0.55in 0.58in; @bottom-left {{ content: "Qualified Commercial | Preliminary lender-ready application"; color:#667085; font-size:8px; }} @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color:#667085; font-size:8px; }} }}
+@page {{ size: Letter; margin: 0.55in 0.55in 0.58in; @bottom-left {{ content: "Qualified Commercial | {footer_label}"; color:#667085; font-size:8px; }} @bottom-right {{ content: "Page " counter(page) " of " counter(pages); color:#667085; font-size:8px; }} }}
 * {{ box-sizing:border-box; }} body {{ font-family: Arial, sans-serif; color:#101828; font-size:9.2px; line-height:1.38; margin:0; }}
 h1 {{ font-size:21px; margin:0 0 3px; }} h2 {{ font-size:13px; margin:16px 0 7px; padding-bottom:4px; border-bottom:2px solid #204ea1; color:#173b7a; }}
 h3 {{ font-size:10px; margin:10px 0 4px; }} p {{ margin:3px 0; }} .brand {{ display:flex; justify-content:space-between; gap:20px; border-bottom:4px solid #204ea1; padding-bottom:12px; margin-bottom:12px; }}
@@ -508,8 +813,8 @@ table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:5px 0 
 .signature {{ page-break-inside:avoid; margin-top:18px; border:1px solid #aeb8ca; padding:14px; min-height:150px; }} .signature-line {{ margin-top:40px; width:62%; border-top:1px solid #101828; padding-top:4px; }}
 .certificate-note {{ font-size:8px; color:#475467; }} .nowrap {{ white-space:nowrap; }}
 </style></head><body>
-<div class="brand"><div><h1>{html.escape(MASTER_TITLE)}</h1><p>Qualified Commercial LLC</p></div><div><b>Case {html.escape(context['case_ref'])}</b><br>Version {MASTER_VERSION}<br>Generated {_date(context['generated_at'])}</div></div>
-<div class="callout warning"><b>Preliminary submission record, not a commitment or approval.</b> This QC-branded application consolidates applicant disclosures and reviewed evidence for commercial-financing evaluation. Final eligibility, pricing, documentation, and approval remain subject to underwriting.</div>
+<div class="brand"><div><h1>{html.escape(document_title)}</h1><p>Qualified Commercial LLC</p></div><div><b>Case {html.escape(context['case_ref'])}</b><br>Version {document_version}<br>Generated {_date(context['generated_at'])}</div></div>
+<div class="callout warning"><b>Underwriting record, not a commitment or approval.</b> This document consolidates applicant disclosures, verified evidence, the system route, staff-selected submission path, and unresolved conditions. Final eligibility, pricing, documentation, and approval remain subject to underwriting.</div>
 
 <h2>1. Business and Applicant Identity</h2>
 <div class="grid">
@@ -530,7 +835,7 @@ table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:5px 0 
 <p class="certificate-note">No Social Security number or raw credit score is included. Credit references identify only the completed provider workflow and threshold/tier result.</p>
 
 <h2>4. Financing Request and Use of Funds</h2>
-<div class="grid"><div class="field"><span class="label">Requested amount</span>{_money(request['amount'])}</div><div class="field"><span class="label">Requested term</span>{html.escape(_text(request['term_months']) or 'Awaiting evidence')} months</div><div class="field"><span class="label">Purpose</span>{html.escape(_text(request['purpose']))}</div><div class="field"><span class="label">Recommended path</span>{html.escape(_text(context['route_label']))}</div></div>
+<div class="grid"><div class="field"><span class="label">Original requested amount</span>{_money(request['original_amount'])}</div><div class="field"><span class="label">Working funding goal</span>{_money(request['amount'])}</div><div class="field"><span class="label">Requested term</span>{html.escape(_text(request['term_months']) or 'Awaiting evidence')} months</div><div class="field"><span class="label">Purpose</span>{html.escape(_text(request['purpose']))}</div><div class="field"><span class="label">Effective submission path</span>{html.escape(_text(context['route_label']))}</div><div class="field"><span class="label">Selection source</span>{'Staff selected override' if context.get('manual_program_selection') else 'System route'}</div></div>
 <div class="callout"><b>Detailed use of funds</b><br>{html.escape(_text(request['use_of_funds']))}</div>{line_items}
 
 <h2>5. Financial, Banking, and Debt Summary</h2>
@@ -540,22 +845,24 @@ table {{ width:100%; border-collapse:collapse; table-layout:fixed; margin:5px 0 
 <h2>6. Documents Reviewed and Source Readiness</h2>{evidence}{readiness_table}
 
 <h2>7. Routing Result, Conditions, and Matched Rules</h2>
-<div class="grid"><div class="field"><span class="label">Funding path</span>{html.escape(_text(context['route_label']))}</div><div class="field"><span class="label">Current route status</span>{html.escape(_text(context['route_status']).replace('_',' ').title())}</div><div class="field"><span class="label">Rules version</span>{html.escape(_text(context['rules_version']))}</div><div class="field"><span class="label">Human review</span>{html.escape(_text(readiness['human_review_status']).replace('_',' ').title())}</div></div>
+<div class="grid"><div class="field"><span class="label">Effective funding path</span>{html.escape(_text(context['route_label']))}</div><div class="field"><span class="label">System route</span>{html.escape(_text(context.get('system_route_key')) or 'No direct system selection')}</div><div class="field"><span class="label">System status for effective path</span>{html.escape(_text(context['route_status']).replace('_',' ').title())}</div><div class="field"><span class="label">Rules version</span>{html.escape(_text(context['rules_version']))}</div><div class="field"><span class="label">Human review</span>{html.escape(_text(readiness['human_review_status']).replace('_',' ').title())}</div></div>
 {matched_table}
 <h3>Remaining conditions</h3><ul>{''.join(f'<li>{html.escape(_text(item))}</li>' for item in context['route_unresolved']) or '<li>None identified by the current preliminary route.</li>'}</ul>
 
-<h2>8. Applicant Certifications and Authorization</h2>
-<p>I certify that the business, ownership schedule, financing request, financial information, debt schedule, eligibility disclosures, and supporting documents in this application are true and complete to the best of my knowledge. I am authorized to submit this application on behalf of the business. I authorize Qualified Commercial to use this application and its supporting evidence to evaluate and present commercial-financing opportunities. I understand that this document is not an approval, commitment, SBA form, or downstream lender application, and that additional forms and evidence may be required.</p>
-<p>I acknowledge that each owner at 20% or more completed or must complete a separate credit authorization. This application does not contain or authorize storage of a Social Security number, and it does not display a raw credit score.</p>
-
-<div class="signature"><b>SIGNATURE OF AUTHORIZED REPRESENTATIVE</b><div class="signature-line">Electronic signature</div><div class="grid" style="margin-top:12px"><div><span class="label">Typed legal name</span>{html.escape(_text(signer['name']))}</div><div><span class="label">Title</span>{html.escape(_text(signer['title']))}</div><div><span class="label">Date</span>Signed electronically after review</div><div><span class="label">Document hash</span>See completion certificate</div></div></div>
+{adjustment_section}
+{closing_section}
 </body></html>"""
 
 
-def render_pdf(context: dict[str, Any], readiness: dict[str, Any]) -> tuple[bytes, str]:
+def render_pdf(
+    context: dict[str, Any],
+    readiness: dict[str, Any],
+    *,
+    summary: bool = False,
+) -> tuple[bytes, str]:
     from weasyprint import HTML
 
-    pdf = HTML(string=render_html(context, readiness)).write_pdf()
+    pdf = HTML(string=render_html(context, readiness, summary=summary)).write_pdf()
     if not pdf:
         raise RuntimeError("The QC master application could not be rendered.")
     return pdf, hashlib.sha256(pdf).hexdigest()
@@ -574,3 +881,20 @@ async def build_application(
         and row["status"] in {"missing", "supplemental"}
     ]
     return context, readiness, pdf, sha256, missing
+
+
+async def build_summary(
+    db: AsyncSession, dealer: DealerBusiness
+) -> tuple[dict[str, Any], dict[str, Any], bytes, str, str, list[str]]:
+    context = await build_context(db, dealer)
+    readiness = build_readiness(context)
+    source_sha256 = summary_source_hash(context)
+    pdf, sha256 = render_pdf(context, readiness, summary=True)
+    if not pdf.startswith(b"%PDF-"):
+        raise RuntimeError("The underwriting summary renderer did not produce a valid PDF.")
+    missing = [
+        row["requirement"]
+        for row in readiness["items"]
+        if row["status"] in {"missing", "supplemental"}
+    ]
+    return context, readiness, pdf, sha256, source_sha256, missing

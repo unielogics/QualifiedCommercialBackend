@@ -181,13 +181,32 @@ def put_private_s3_object(*, key: str, body: bytes, content_type: str) -> None:
     settings = get_settings()
     if not settings.s3_bucket:
         raise RuntimeError("S3 bucket is not configured")
-    boto3.client("s3", region_name=settings.aws_region).put_object(
-        Bucket=settings.s3_bucket,
-        Key=key,
-        Body=body,
-        ContentType=content_type,
-        ServerSideEncryption="AES256",
-    )
+    params = {
+        "Bucket": settings.s3_bucket,
+        "Key": key,
+        "Body": body,
+        "ContentType": content_type,
+    }
+    if settings.buckets_kms_key_id:
+        params["ServerSideEncryption"] = "aws:kms"
+        params["SSEKMSKeyId"] = settings.buckets_kms_key_id
+    else:
+        params["ServerSideEncryption"] = "AES256"
+    _private_s3_client().put_object(**params)
+
+
+def _private_s3_client():
+    from botocore.config import Config
+
+    settings = get_settings()
+    kwargs = {
+        "region_name": settings.aws_region,
+        "config": Config(signature_version="s3v4"),
+    }
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        kwargs["aws_access_key_id"] = settings.aws_access_key_id
+        kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
+    return boto3.client("s3", **kwargs)
 
 
 def presign_private_s3_object(
@@ -206,7 +225,7 @@ def presign_private_s3_object(
         if download_filename:
             safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", download_filename).strip("._") or "document.pdf"
             params["ResponseContentDisposition"] = f'attachment; filename="{safe_filename}"'
-        return boto3.client("s3", region_name=settings.aws_region).generate_presigned_url(
+        return _private_s3_client().generate_presigned_url(
             "get_object",
             Params=params,
             ExpiresIn=ttl_seconds,

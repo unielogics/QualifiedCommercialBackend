@@ -51,7 +51,7 @@ BANKRUPTCY_VALUES = {"none", "within_3_years", "4_to_7_years", "more_than_7_year
 FELONY_VALUES = {"none", "within_10_years", "more_than_10_years"}
 RESIDENCY_VALUES = {"citizen", "legal_permanent_resident", "other"}
 
-# Business questions live in Step 4. Keeping their presentation metadata next
+# Business questions live in Step 2. Keeping their presentation metadata next
 # to the routing fields prevents the UI from drifting from the rule engine.
 BUSINESS_QUESTION_GROUPS: tuple[dict[str, Any], ...] = (
     {

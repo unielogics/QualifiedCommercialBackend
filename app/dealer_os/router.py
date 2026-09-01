@@ -37,6 +37,7 @@ from app.config import get_settings
 from app.models.user import User
 from app.models.client import Client
 from app.models.loan import Loan
+from app.models.credit_pull import CreditPull
 from app.models.application_profile import ApplicationProfile, ApplicationTaxonomyEntry, PlaidAssetReport
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.booking_settings import BookingSettings
@@ -167,8 +168,13 @@ from .schemas import (
     ApplicationRecommendationResponse,
     ProgramExceptionRequest,
     ProgramExceptionDecision,
+    ProgramSelectionRequest,
+    ProgramSelectionRead,
     ProgramRuleResolutionRead,
     UnderwritingResolutionRead,
+    UnderwritingSummaryRead,
+    UnderwritingSummaryEmailRequest,
+    UnderwritingSummaryEmailResult,
     AuditRead,
     BucketFileItem,
     BucketSearchItem,
@@ -278,6 +284,8 @@ from .schemas import (
     RefiProgramRead,
     DebtPatch,
     DebtRead,
+    DebtScheduleConfirmationRequest,
+    DebtScheduleConfirmationRead,
     DocRequestCreate,
     DocRequestPatch,
     DocRequestRead,
@@ -405,7 +413,7 @@ from .schemas import (
     UnderwritingReviewPreferenceBook,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage
+from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, credit_quality, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage, workflow_readiness
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -1590,6 +1598,7 @@ async def _contract_envelope_read(
         ).all()
     )
     documents = []
+    funding_profile: dict = {}
     for link, document in rows:
         source_key = (
             document.executed_s3_key
@@ -1607,6 +1616,8 @@ async def _contract_envelope_read(
                     download_filename=f"{document.template_key}-executed.pdf",
                 )
         values = document.field_values or {}
+        if not funding_profile and isinstance(values.get("_funding_profile"), dict):
+            funding_profile = dict(values["_funding_profile"])
         documents.append(
             ContractEnvelopeDocumentRead(
                 id=link.id,
@@ -1649,6 +1660,7 @@ async def _contract_envelope_read(
         bundle_sha256=envelope.bundle_sha256,
         bundle_download_url=bundle_url,
         delivery_history=list(envelope.delivery_history or []),
+        funding_profile=funding_profile,
         documents=documents,
     )
 
@@ -2115,56 +2127,258 @@ async def generate_case_contract(
     )
 
 
+async def _underwriting_summary_state(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    action: str = "unchanged",
+) -> UnderwritingSummaryRead:
+    context = await qc_master_application.build_context(db, dealer)
+    current_source_sha256 = qc_master_application.summary_source_hash(context)
+    document = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.dealer_id == dealer.id,
+                ContractDocument.template_key == qc_master_application.SUMMARY_TEMPLATE_KEY,
+                ContractDocument.envelope_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if document is None or not document.filled_s3_key:
+        return UnderwritingSummaryRead(
+            source_sha256=current_source_sha256,
+            action="not_generated",
+        )
+    values = dict(document.field_values or {})
+    saved_source_sha256 = values.get("_source_sha256")
+    return UnderwritingSummaryRead(
+        id=document.id,
+        exists=True,
+        status=document.status,
+        revision=int(values.get("_summary_revision") or 1),
+        generated_at=values.get("_generated_at") or document.updated_at,
+        generated_by_user_id=values.get("_generated_by_user_id"),
+        sha256=document.filled_sha256,
+        source_sha256=saved_source_sha256,
+        stale=saved_source_sha256 != current_source_sha256,
+        missing_data=list(values.get("_missing_data") or []),
+        pdf_url=f"/dealer-os/dealers/{dealer.id}/underwriting-summary/pdf",
+        email_prompt=action in {"created", "updated"},
+        action=action,
+    )
+
+
+@router.get(
+    "/dealers/{dealer_id}/underwriting-summary",
+    response_model=UnderwritingSummaryRead,
+)
+async def get_underwriting_summary(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnderwritingSummaryRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return await _underwriting_summary_state(db, dealer)
+
+
 @router.post(
     "/dealers/{dealer_id}/underwriting-summary",
-    response_model=ContractGenerateResult,
+    response_model=UnderwritingSummaryRead,
 )
 async def generate_underwriting_summary(
     dealer_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> ContractGenerateResult:
-    """Generate a review-only QC application and evidence summary.
-
-    This may be rendered while the file is incomplete. It names every missing
-    condition and is not eligible for signature through this endpoint.
-    """
-
+) -> UnderwritingSummaryRead:
+    """Create or explicitly refresh the file's one persistent summary."""
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
+    # Serialize first-generation and explicit-refresh requests for this file.
+    # The standalone-document unique index remains the final database guard.
+    await db.execute(
+        select(DealerBusiness.id)
+        .where(DealerBusiness.id == dealer.id)
+        .with_for_update()
+    )
+    before = await _underwriting_summary_state(db, dealer)
+    if before.exists and not before.stale:
+        before.action = "unchanged"
+        before.email_prompt = False
+        return before
+    previous_values: dict = {}
+    if before.id is not None:
+        previous_document = await db.get(ContractDocument, before.id)
+        previous_values = dict(previous_document.field_values or {}) if previous_document else {}
     try:
         doc, result, missing = await contract_fill.generate(
             db,
             dealer,
-            qc_master_application.MASTER_TEMPLATE_KEY,
+            qc_master_application.SUMMARY_TEMPLATE_KEY,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    if not result.pdf.startswith(b"%PDF-"):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The generated summary is not a valid PDF.")
+    values = dict(doc.field_values or {})
+    action = "updated" if before.exists else "created"
+    values.update(
+        {
+            "_summary_revision": (before.revision or 0) + 1,
+            "_generated_at": datetime.now(timezone.utc).isoformat(),
+            "_generated_by_user_id": str(user.id),
+            "_source_sha256": result.placed.get("_source_sha256"),
+            "_missing_data": missing,
+            "_email_history": list(previous_values.get("_email_history") or []),
+        }
+    )
+    doc.field_values = values
+    doc.status = "ready"
     await log_action(
         db,
         dealer.id,
         user,
-        "underwriting_summary.generated",
+        f"underwriting_summary.{action}",
         "contract_document",
         entity_id=doc.id,
-        after={"sha256": result.sha256[:16], "missing": missing},
+        before={"revision": before.revision, "sha256": before.sha256},
+        after={
+            "revision": values["_summary_revision"],
+            "sha256": result.sha256,
+            "source_sha256": values["_source_sha256"],
+            "missing": missing,
+        },
     )
     await db.commit()
-    from app.services.payment_authorization import presign_private_s3_object
+    return await _underwriting_summary_state(db, dealer, action=action)
 
-    return ContractGenerateResult(
-        status=doc.status,
-        placed=result.placed,
-        missing_data=missing,
-        overlay_problems=result.missing,
-        sha256=result.sha256,
-        download_url=presign_private_s3_object(
-            doc.filled_s3_key,
-            ttl_seconds=900,
-            download_filename=f"{dealer.case_ref or 'QC'}-underwriting-summary.pdf",
+
+@router.get("/dealers/{dealer_id}/underwriting-summary/pdf")
+async def get_underwriting_summary_pdf(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    download: bool = Query(default=False),
+) -> StreamingResponse:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    document = (
+        await db.execute(
+            select(ContractDocument).where(
+                ContractDocument.dealer_id == dealer.id,
+                ContractDocument.template_key == qc_master_application.SUMMARY_TEMPLATE_KEY,
+                ContractDocument.envelope_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if document is None or not document.filled_s3_key:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Generate the underwriting summary first.")
+    raw = await run_in_threadpool(storage.get_bytes, document.filled_s3_key)
+    if not raw or not raw.startswith(b"%PDF-"):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The stored underwriting summary is unavailable or invalid.")
+    disposition = "attachment" if download else "inline"
+    filename = f"{dealer.case_ref or 'QC'}-underwriting-summary.pdf"
+    return StreamingResponse(
+        io.BytesIO(raw),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+@router.post(
+    "/dealers/{dealer_id}/underwriting-summary/email",
+    response_model=UnderwritingSummaryEmailResult,
+)
+async def email_underwriting_summary(
+    dealer_id: UUID,
+    payload: UnderwritingSummaryEmailRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnderwritingSummaryEmailResult:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    state = await _underwriting_summary_state(db, dealer)
+    if not state.exists:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Generate the summary before emailing it.")
+    if state.stale:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Update the saved summary before emailing it.")
+    if payload.recipient_mode == "application":
+        recipient = (dealer.email or "").strip()
+    elif payload.recipient_mode == "owner":
+        owner = await db.get(DealerOwner, payload.owner_id)
+        if owner is None or owner.dealer_id != dealer.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found for this application.")
+        recipient = (owner.email or "").strip()
+    else:
+        recipient = str(payload.recipient_email or "").strip()
+    if not recipient or "@" not in recipient:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The selected recipient needs a valid email address.")
+    await _require_training_live_action(
+        db,
+        dealer=dealer,
+        user=user,
+        request=request,
+        action="Email underwriting summary",
+        provider="AWS SES",
+        recipient=recipient,
+        effect=f"Email revision {state.revision} of the saved QC underwriting summary.",
+    )
+    document = await db.get(ContractDocument, state.id)
+    raw = await run_in_threadpool(storage.get_bytes, document.filled_s3_key) if document and document.filled_s3_key else None
+    if not raw or not raw.startswith(b"%PDF-"):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The saved PDF could not be attached.")
+    filename = f"{dealer.case_ref or 'QC'}-underwriting-summary-r{state.revision}.pdf"
+    result = await run_in_threadpool(
+        ses_client.send_raw_email,
+        to_emails=[recipient],
+        subject=f"Qualified Commercial underwriting summary - {dealer.name}",
+        body_text=(
+            f"Attached is revision {state.revision} of the Qualified Commercial underwriting "
+            "summary reviewed for your business. This is not a financing approval or commitment."
         ),
+        attachments=[(filename, raw, "application/pdf")],
+    )
+    now = datetime.now(timezone.utc)
+    values = dict(document.field_values or {})
+    history = list(values.get("_email_history") or [])
+    history.append(
+        {
+            "recipient": recipient,
+            "revision": state.revision,
+            "sha256": state.sha256,
+            "sent_at": now.isoformat(),
+            "actor_user_id": str(user.id),
+            "ok": result.ok,
+            "message_id": result.message_id,
+            "detail": result.detail,
+        }
+    )
+    values["_email_history"] = history[-50:]
+    document.field_values = values
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "underwriting_summary.email_succeeded" if result.ok else "underwriting_summary.email_failed",
+        "contract_document",
+        entity_id=document.id,
+        after=history[-1],
+    )
+    await db.commit()
+    return UnderwritingSummaryEmailResult(
+        sent=result.ok,
+        recipient_email=recipient,
+        revision=state.revision,
+        sha256=state.sha256 or "",
+        message_id=result.message_id,
+        detail=result.detail,
     )
 
 
@@ -2986,6 +3200,18 @@ def _statement_window_complete(
     return len(normalized) >= window and not missing, missing
 
 
+def _bank_exception_window(months: set[str] | list[str]) -> tuple[int | None, list[str]]:
+    """Return the largest qualifying current window below the six-month standard."""
+    last_missing: list[str] = []
+    for window in range(min(5, len(set(months))), 2, -1):
+        complete, missing = _statement_window_complete(months, window=window)
+        if complete:
+            return window, []
+        last_missing = missing
+    _, missing_three = _statement_window_complete(months, window=3)
+    return None, missing_three or last_missing
+
+
 @router.post(
     "/dealers/{dealer_id}/bank-evidence/three-month-exception",
     response_model=BankEvidenceRead,
@@ -3006,11 +3232,11 @@ async def acknowledge_three_month_bank_exception(
     months, missing_six, source = await _statement_month_coverage(db, dealer.id)
     if len(months) >= 6 and not missing_six:
         return await bank_evidence(dealer.id, user, db)
-    three_complete, missing_three = _statement_window_complete(months, window=3)
-    if not payload.acknowledged or not three_complete:
+    accepted_target, exception_missing = _bank_exception_window(months)
+    if not payload.acknowledged or accepted_target is None:
         detail = (
-            f"Missing required bank months: {', '.join(missing_three)}"
-            if missing_three
+            f"Missing required bank months: {', '.join(exception_missing)}"
+            if exception_missing
             else "Three latest completed bank months are required before using this exception."
         )
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
@@ -3028,19 +3254,20 @@ async def acknowledge_three_month_bank_exception(
             "statement_months": months,
             "missing_standard_months": missing_six,
             "standard_target": 6,
-            "accepted_target": 3,
+            "accepted_target": accepted_target,
         },
         recommended_action=(
             "Collect the remaining standard bank months before final underwriting."
         ),
         status="acknowledged",
-        rep_note="Scoped staff acknowledged the three-month bank-evidence exception.",
+        rep_note=(payload.note or "").strip()
+        or f"Scoped staff acknowledged the {accepted_target}-month bank-evidence exception.",
         requested_by_user_id=user.id,
         requested_at=now,
         resolved_by_user_id=user.id,
         resolved_at=now,
         resolution_note=(
-            "Workflow continuation approved with three latest completed bank months."
+            f"Workflow continuation approved with {accepted_target} latest completed bank months."
         ),
     )
     db.add(row)
@@ -3056,6 +3283,8 @@ async def acknowledge_three_month_bank_exception(
             "statement_months": months,
             "missing_standard_months": missing_six,
             "source": source,
+            "accepted_target": accepted_target,
+            "note": (payload.note or "").strip() or None,
         },
     )
     await db.commit()
@@ -3127,6 +3356,12 @@ async def _statement_month_coverage(
 async def _three_month_bank_exception_acknowledged(
     db: AsyncSession, dealer_id: UUID, statement_months: list[str]
 ) -> bool:
+    return await _active_bank_exception_target(db, dealer_id, statement_months) is not None
+
+
+async def _active_bank_exception_target(
+    db: AsyncSession, dealer_id: UUID, statement_months: list[str]
+) -> int | None:
     resolution = (
         await db.execute(
             select(DealerProgramRuleResolution)
@@ -3142,15 +3377,18 @@ async def _three_month_bank_exception_acknowledged(
         )
     ).scalar_one_or_none()
     if resolution is None:
-        return False
+        return None
+    target = int((resolution.current_value or {}).get("accepted_target") or 3)
+    if target < 3 or target > 5:
+        return None
     accepted_months = set((resolution.current_value or {}).get("statement_months") or [])
     required_months = set(
-        recurrence.compute_freshness(statement_months, date.today(), window=3).get(
+        recurrence.compute_freshness(statement_months, date.today(), window=target).get(
             "expected_months"
         )
         or []
     )
-    return bool(required_months) and required_months.issubset(accepted_months)
+    return target if required_months and required_months.issubset(accepted_months) else None
 
 
 async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
@@ -3168,14 +3406,14 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         db, dealer.id
     )
     standard_complete, _ = _statement_window_complete(statement_months, window=6)
-    three_month_complete, _ = _statement_window_complete(statement_months, window=3)
-    exception_available = three_month_complete and not standard_complete
-    exception_active = bool(
-        exception_available
-        and await _three_month_bank_exception_acknowledged(
-            db, dealer.id, statement_months
-        )
+    exception_target, _ = _bank_exception_window(statement_months)
+    exception_available = exception_target is not None and not standard_complete
+    active_exception_target = (
+        await _active_bank_exception_target(db, dealer.id, statement_months)
+        if exception_available
+        else None
     )
+    exception_active = active_exception_target is not None
     bank_linked = standard_complete or exception_active
     bank_source = statement_source
     owner_state = await _owner_requirement_state(db, dealer.id)
@@ -3191,7 +3429,7 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         bank_source=bank_source,
         statement_months=statement_months,
         missing_statement_months=missing_statement_months,
-        statement_target=3 if exception_active else 6,
+        statement_target=active_exception_target or 6,
         bank_exception_available=exception_available,
         bank_exception_active=exception_active,
         credit_returned=credit_returned,
@@ -3205,6 +3443,159 @@ async def _assess_verification(db: AsyncSession, dealer: DealerBusiness):
         pre_screen_complete=pre_screen["complete"],
         pre_screen_blockers=pre_screen["blockers"],
         preliminary_program_fit=pre_screen["routing_result"],
+    )
+
+
+async def _application_workflow_state(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    verification=None,
+    pre_screen: dict | None = None,
+) -> dict:
+    verification = verification or await _assess_verification(db, dealer)
+    pre_screen = pre_screen or await _application_pre_screen_state(db, dealer)
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    selection = await _program_selection_state(db, dealer, pre_screen.get("routing_result"))
+
+    step_1_blockers: list[str] = []
+    identity_checks = (
+        (dealer.name or dealer.legal_name, "Enter the legal business name."),
+        (dealer.entity_type, "Select the entity type."),
+        (dealer.started_on, "Enter the business start date."),
+        (dealer.address, "Enter the physical street address."),
+        (dealer.city, "Enter the physical city."),
+        (dealer.state, "Select the physical state."),
+        (dealer.zip, "Enter the physical ZIP code."),
+        (dealer.email, "Enter the application email."),
+        (dealer.phone, "Enter the application mobile number."),
+        (dealer.industry_entry_id, "Choose the NAICS category."),
+        (dealer.subindustry_entry_id, "Choose the NAICS subcategory."),
+        (dealer.activity_entry_id, "Confirm the six-digit NAICS activity."),
+        (dealer.naics_code and len(str(dealer.naics_code)) == 6, "Confirm a canonical six-digit NAICS code."),
+        (dealer.funding_goal and float(dealer.funding_goal) > 0, "Enter the requested amount."),
+        (dealer.funding_purpose, "Select the funding purpose."),
+        ((dealer.use_of_proceeds_note or "").strip(), "Describe the use of funds in writing."),
+    )
+    step_1_blockers.extend(message for value, message in identity_checks if not value)
+    if not owner_state["ownership_complete"]:
+        step_1_blockers.append("Allocate exactly 100% of business ownership.")
+    if not owner_state["contact_complete"]:
+        step_1_blockers.append("Add personal email and mobile details for every 20%+ owner.")
+    if not owner_state["required"]:
+        step_1_blockers.append("Add at least one owner who requires verification.")
+    if not pre_screen.get("complete"):
+        step_1_blockers.extend(list(pre_screen.get("blockers") or []))
+
+    profile_requirements = (
+        ("state_of_formation", "Enter the state of formation."),
+        ("location_type", "Select the business location type."),
+        ("mailing_address", "Enter the mailing street address."),
+        ("mailing_city", "Enter the mailing city."),
+        ("mailing_state", "Select the mailing state."),
+        ("mailing_zip", "Enter the mailing ZIP code."),
+        ("guaranty_type", "Select the guaranty type."),
+        ("office_space", "Describe the office or operating space, or enter N/A."),
+        ("business_stage", "Select the business stage."),
+        ("signer_title", "Enter the authorized signer title."),
+        ("existing_mca_balance", "Enter the MCA balance, including zero when none."),
+        ("existing_sba_balance", "Enter the SBA balance, including zero when none."),
+        ("active_ucc_filings", "Enter the active UCC count, including zero when none."),
+        ("affiliate_businesses", "Answer whether the business has affiliates."),
+        ("send_welcome_email", "Choose whether to send the program welcome email."),
+    )
+    for field, message in profile_requirements:
+        value = getattr(profile, field, None) if profile else None
+        if value is None or (isinstance(value, str) and not value.strip()):
+            step_1_blockers.append(message)
+
+    step_2_blockers: list[str] = []
+    if not pre_screen.get("business_questions_complete"):
+        step_2_blockers.extend(list(pre_screen.get("business_question_blockers") or []))
+    if not verification.bank_linked:
+        step_2_blockers.append("Provide six current bank months or acknowledge a qualifying three-to-five-month exception.")
+    if not verification.credit_returned:
+        step_2_blockers.append("Complete iSoftPull for every required 20%+ owner.")
+    step_2_warnings: list[str] = []
+    if verification.bank_exception_active:
+        step_2_warnings.append(
+            "Bank evidence exception accepted; the six-month standard remains an underwriting condition."
+        )
+
+    step_3_blockers = workflow_readiness.financial_confirmation_blockers(profile)
+    debt_confirmation, debts, debt_sha256 = await _debt_schedule_confirmation(db, dealer)
+    debt_confirmed = bool(
+        debt_confirmation
+        and debt_confirmation.get("source_sha256") == debt_sha256
+        and (
+            debt_confirmation.get("status") == "schedule_confirmed" and bool(debts)
+            or debt_confirmation.get("status") == "no_business_debt" and not debts
+        )
+    )
+    if not debt_confirmed:
+        step_3_blockers.append("Confirm the current debt schedule or explicitly confirm no business debt.")
+    preference = (
+        await db.execute(
+            select(DealerUnderwritingReviewPreference)
+            .where(
+                DealerUnderwritingReviewPreference.dealer_id == dealer.id,
+                DealerUnderwritingReviewPreference.status.in_(["pending", "selected", "booked"]),
+            )
+            .order_by(DealerUnderwritingReviewPreference.submitted_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if preference is None or len(list(preference.slots or [])) != 3:
+        step_3_blockers.append("Select three client review windows before routing and execution.")
+
+    effective_program = selection.get("effective_program_key")
+    step_4_blockers: list[str] = []
+    step_4_warnings: list[str] = []
+    if selection.get("manually_selected"):
+        step_4_warnings.append(
+            "A staff-selected submission path is active; system eligibility and blockers remain unchanged."
+        )
+    if effective_program:
+        executed = (
+            await db.execute(
+                select(ContractEnvelope.id).where(
+                    ContractEnvelope.dealer_id == dealer.id,
+                    ContractEnvelope.program_key == effective_program,
+                    ContractEnvelope.status == "executed",
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if executed is None:
+            step_4_blockers.append("Generate, review, deliver, and execute the selected program package.")
+    else:
+        summary = (
+            await db.execute(
+                select(ContractDocument).where(
+                    ContractDocument.dealer_id == dealer.id,
+                    ContractDocument.template_key == qc_master_application.SUMMARY_TEMPLATE_KEY,
+                    ContractDocument.envelope_id.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if summary is None or not summary.filled_s3_key:
+            step_4_blockers.append("Generate the persistent QC underwriting summary.")
+        if preference is None or preference.status != "booked":
+            step_4_blockers.append("Book the required underwriting review.")
+
+    return workflow_readiness.build_workflow(
+        workflow_ungated=bool(dealer.workflow_ungated),
+        step_1_blockers=list(dict.fromkeys(step_1_blockers)),
+        step_2_blockers=list(dict.fromkeys(step_2_blockers)),
+        step_3_blockers=list(dict.fromkeys(step_3_blockers)),
+        step_4_blockers=list(dict.fromkeys(step_4_blockers)),
+        step_2_warnings=step_2_warnings,
+        step_4_warnings=step_4_warnings,
+        program_selection=selection,
     )
 
 
@@ -3227,10 +3618,17 @@ async def dealer_decision(
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     ver = await _assess_verification(db, dealer)
     pre_screen = await _application_pre_screen_state(db, dealer)
+    workflow = await _application_workflow_state(
+        db,
+        dealer,
+        verification=ver,
+        pre_screen=pre_screen,
+    )
     direct_programs = [
         {
             "key": row.get("program_key"),
             "label": row.get("name"),
+            "status": row.get("status"),
             "eligible": row.get("status") != "blocked",
             "needs": list(row.get("unresolved") or []),
             "blocked_by": list(row.get("borrower_safe_reasons") or []),
@@ -3244,7 +3642,7 @@ async def dealer_decision(
         metrics = await _latest_snapshot_metrics(db, dealer.id)
     except HTTPException:
         d = decision.decide({"verdict": "no_data"}, None, ver)
-        return DecisionRead(**asdict(d), programs=direct_programs)
+        return DecisionRead(**asdict(d), programs=direct_programs, workflow=workflow)
 
     targets = await _effective_targets(db, dealer.id)
     settings = await _global_program_settings(db)
@@ -3290,7 +3688,7 @@ async def dealer_decision(
     )
 
     out = decision.decide(fundability, health, ver)
-    return DecisionRead(**asdict(out), programs=direct_programs)
+    return DecisionRead(**asdict(out), programs=direct_programs, workflow=workflow)
 
 
 @router.get("/dealers/{dealer_id}", response_model=DealerRead)
@@ -6631,6 +7029,11 @@ async def patch_application_profile(
         row = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
         db.add(row)
     patch = payload.model_dump(exclude_unset=True)
+    if "selected_program" in patch:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Use the audited program-selection endpoint to change the submission path.",
+        )
     confirm_fields = set(patch.pop("confirm_fields", None) or [])
     editable_fields = set(ApplicationProfilePatch.model_fields) - {"confirm_fields"}
     unknown_confirmations = sorted(confirm_fields - editable_fields)
@@ -12660,6 +13063,123 @@ async def list_debts(
     )
 
 
+async def _debt_schedule_confirmation(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+) -> tuple[dict | None, list[DealerDebt], str]:
+    rows = list(
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.dealer_id == dealer.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.created_at.asc())
+            )
+        ).scalars().all()
+    )
+    source_sha256 = workflow_readiness.debt_source_hash(rows)
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    confirmation = dict((profile.field_confirmations or {}).get("debt_schedule") or {}) if profile else None
+    return confirmation, rows, source_sha256
+
+
+@router.get(
+    "/dealers/{dealer_id}/debts/confirmation",
+    response_model=DebtScheduleConfirmationRead,
+)
+async def get_debt_schedule_confirmation(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DebtScheduleConfirmationRead:
+    require_team_or_dealer_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    confirmation, rows, source_sha256 = await _debt_schedule_confirmation(db, dealer)
+    if not confirmation:
+        return DebtScheduleConfirmationRead()
+    stale = confirmation.get("source_sha256") != source_sha256
+    valid_status = confirmation.get("status") in {"schedule_confirmed", "no_business_debt"}
+    logically_valid = not (
+        confirmation.get("status") == "no_business_debt" and rows
+    )
+    return DebtScheduleConfirmationRead(
+        status=confirmation.get("status") if valid_status else None,
+        confirmed=bool(valid_status and logically_valid and not stale),
+        stale=bool(stale or not logically_valid),
+        confirmed_at=confirmation.get("confirmed_at"),
+        confirmed_by_user_id=confirmation.get("confirmed_by_user_id"),
+        note=confirmation.get("note"),
+    )
+
+
+@router.put(
+    "/dealers/{dealer_id}/debts/confirmation",
+    response_model=DebtScheduleConfirmationRead,
+)
+async def put_debt_schedule_confirmation(
+    dealer_id: UUID,
+    payload: DebtScheduleConfirmationRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> DebtScheduleConfirmationRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    previous, rows, source_sha256 = await _debt_schedule_confirmation(db, dealer)
+    if payload.status == "no_business_debt" and rows:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Remove or dismiss every active debt row before confirming no business debt.",
+        )
+    if payload.status == "schedule_confirmed" and not rows:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Add at least one debt row, or confirm that the business has no debt.",
+        )
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        profile = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
+        db.add(profile)
+        await db.flush()
+    now = datetime.now(timezone.utc)
+    confirmation = {
+        "status": payload.status,
+        "source_sha256": source_sha256,
+        "confirmed_at": now.isoformat(),
+        "confirmed_by_user_id": str(user.id),
+        "note": (payload.note or "").strip() or None,
+    }
+    all_confirmations = dict(profile.field_confirmations or {})
+    all_confirmations["debt_schedule"] = confirmation
+    profile.field_confirmations = all_confirmations
+    profile.updated_by_user_id = user.id
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "debt_schedule.confirmed",
+        "application_profile",
+        entity_id=profile.id,
+        before=previous,
+        after=confirmation,
+    )
+    await db.commit()
+    return DebtScheduleConfirmationRead(
+        status=payload.status,
+        confirmed=True,
+        stale=False,
+        confirmed_at=now,
+        confirmed_by_user_id=user.id,
+        note=confirmation["note"],
+    )
+
+
 @router.post("/dealers/{dealer_id}/debts/draft", response_model=DebtDraftResult)
 async def draft_debt_schedule(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -15591,6 +16111,253 @@ async def patch_application_pre_screen(
     return _pre_screen_read(state)
 
 
+def _system_program_result(routing_result: dict | None) -> dict | None:
+    programs = list((routing_result or {}).get("programs") or [])
+    for target in ("recommended", "potential"):
+        row = next((item for item in programs if item.get("status") == target), None)
+        if row is not None:
+            return row
+    return None
+
+
+async def _program_selection_state(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    routing_result: dict | None,
+) -> dict:
+    programs = list((routing_result or {}).get("programs") or [])
+    by_key = {str(row.get("program_key") or ""): row for row in programs}
+    system = _system_program_result(routing_result)
+    manual = (
+        await db.execute(
+            select(DealerProgramRuleResolution)
+            .where(
+                DealerProgramRuleResolution.dealer_id == dealer.id,
+                DealerProgramRuleResolution.rule_key == "program_selection.manual",
+                DealerProgramRuleResolution.status == "active",
+            )
+            .order_by(DealerProgramRuleResolution.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    selected = by_key.get(manual.program_key) if manual is not None else system
+    actor = await db.get(User, manual.requested_by_user_id) if manual and manual.requested_by_user_id else None
+    blockers = list((selected or {}).get("borrower_safe_reasons") or [])
+    blockers.extend(
+        item for item in list((selected or {}).get("unresolved") or []) if item not in blockers
+    )
+    current_value = dict(manual.current_value or {}) if manual else {}
+    return {
+        "system_program_key": system.get("program_key") if system else None,
+        "system_program_status": system.get("status") if system else None,
+        "effective_program_key": manual.program_key if manual else (system.get("program_key") if system else None),
+        "effective_program_status": (selected or {}).get("status"),
+        "manually_selected": manual is not None,
+        "selected_by_user_id": manual.requested_by_user_id if manual else None,
+        "selected_by_name": (actor.name or actor.email) if actor else None,
+        "selected_at": manual.requested_at if manual else None,
+        "note": manual.rep_note if manual else None,
+        "rules_version": current_value.get("rules_version")
+        or (routing_result or {}).get("rules_version"),
+        "system_blockers": blockers,
+    }
+
+
+async def _prepare_program_change(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    *,
+    target_program: str | None,
+    user: User,
+) -> None:
+    envelopes = list(
+        (
+            await db.execute(
+                select(ContractEnvelope)
+                .where(
+                    ContractEnvelope.dealer_id == dealer.id,
+                    ContractEnvelope.status != "void",
+                )
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    changing = [row for row in envelopes if row.program_key != target_program]
+    if any(row.status == "executed" for row in changing):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "An executed package is immutable. Keep its program selection in the historical record.",
+        )
+    if any(row.status == "out_for_signature" for row in changing):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Void the sent package before changing the selected program.",
+        )
+    now = datetime.now(timezone.utc)
+    for envelope in changing:
+        if envelope.status in {"draft", "ready", "failed"}:
+            envelope.status = "void"
+            envelope.voided_at = now
+            envelope.voided_by_user_id = user.id
+            envelope.void_reason = "Replaced after an audited program-selection change."
+            await db.execute(
+                sa_update(ContractDocument)
+                .where(ContractDocument.envelope_id == envelope.id)
+                .values(status="void")
+            )
+
+
+@router.put(
+    "/dealers/{dealer_id}/program-selection",
+    response_model=ProgramSelectionRead,
+)
+async def put_program_selection(
+    dealer_id: UUID,
+    payload: ProgramSelectionRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProgramSelectionRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    state = await _application_pre_screen_state(db, dealer)
+    routing = state.get("routing_result") or {}
+    programs = {
+        str(row.get("program_key") or ""): row
+        for row in list(routing.get("programs") or [])
+    }
+    selected = programs.get(payload.program_key)
+    if selected is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "That program is not configured for this application.")
+    before = await _program_selection_state(db, dealer, routing)
+    if before["effective_program_key"] != payload.program_key:
+        await _prepare_program_change(db, dealer, target_program=payload.program_key, user=user)
+    now = datetime.now(timezone.utc)
+    active_rows = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution).where(
+                    DealerProgramRuleResolution.dealer_id == dealer.id,
+                    DealerProgramRuleResolution.rule_key == "program_selection.manual",
+                    DealerProgramRuleResolution.status == "active",
+                )
+            )
+        ).scalars().all()
+    )
+    for active in active_rows:
+        active.status = "superseded"
+        active.resolved_by_user_id = user.id
+        active.resolved_at = now
+        active.resolution_note = "Replaced by a newer manual program selection."
+    row = DealerProgramRuleResolution(
+        dealer_id=dealer.id,
+        program_key=payload.program_key,
+        rule_key="program_selection.manual",
+        kind="alternative_program",
+        source="Field Desk Step 4",
+        current_value={
+            "system_program_key": before.get("system_program_key"),
+            "system_program_status": before.get("system_program_status"),
+            "selected_program_key": payload.program_key,
+            "selected_program_status": selected.get("status"),
+            "selected_program_blockers": list(selected.get("borrower_safe_reasons") or []),
+            "rules_version": routing.get("rules_version") or state.get("rules_version"),
+        },
+        recommended_action="Submit through the staff-selected program while preserving every system condition.",
+        status="active",
+        rep_note=(payload.note or "").strip() or None,
+        requested_by_user_id=user.id,
+        requested_at=now,
+    )
+    db.add(row)
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        profile = DealerApplicationProfile(dealer_id=dealer.id, updated_by_user_id=user.id)
+        db.add(profile)
+    profile.selected_program = payload.program_key
+    profile.updated_by_user_id = user.id
+    await db.flush()
+    after = await _program_selection_state(db, dealer, routing)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.program_selection_overridden",
+        "program_rule_resolution",
+        entity_id=row.id,
+        before=before,
+        after=after,
+    )
+    await db.commit()
+    return ProgramSelectionRead(**after)
+
+
+@router.delete(
+    "/dealers/{dealer_id}/program-selection",
+    response_model=ProgramSelectionRead,
+)
+async def delete_program_selection(
+    dealer_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProgramSelectionRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    state = await _application_pre_screen_state(db, dealer)
+    routing = state.get("routing_result") or {}
+    before = await _program_selection_state(db, dealer, routing)
+    if not before["manually_selected"]:
+        return ProgramSelectionRead(**before)
+    await _prepare_program_change(
+        db,
+        dealer,
+        target_program=before.get("system_program_key"),
+        user=user,
+    )
+    rows = list(
+        (
+            await db.execute(
+                select(DealerProgramRuleResolution).where(
+                    DealerProgramRuleResolution.dealer_id == dealer.id,
+                    DealerProgramRuleResolution.rule_key == "program_selection.manual",
+                    DealerProgramRuleResolution.status == "active",
+                )
+            )
+        ).scalars().all()
+    )
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        row.status = "cleared"
+        row.resolved_by_user_id = user.id
+        row.resolved_at = now
+        row.resolution_note = "Returned to the current system selection."
+    profile = (
+        await db.execute(
+            select(DealerApplicationProfile).where(DealerApplicationProfile.dealer_id == dealer.id)
+        )
+    ).scalar_one_or_none()
+    if profile is not None:
+        profile.selected_program = before.get("system_program_key")
+        profile.updated_by_user_id = user.id
+    await db.flush()
+    after = await _program_selection_state(db, dealer, routing)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "application.program_selection_cleared",
+        "dealer",
+        entity_id=dealer.id,
+        before=before,
+        after=after,
+    )
+    await db.commit()
+    return ProgramSelectionRead(**after)
+
+
 @router.get(
     "/dealers/{dealer_id}/underwriting-resolution",
     response_model=UnderwritingResolutionRead,
@@ -15651,6 +16418,8 @@ async def get_underwriting_resolution(
     await db.commit()
     programs = list((state.get("routing_result") or {}).get("programs") or [])
     direct_viable = any(row.get("status") in {"recommended", "potential"} for row in programs)
+    selection = await _program_selection_state(db, dealer, state.get("routing_result"))
+    effective_program = selection.get("effective_program_key")
     return UnderwritingResolutionRead(
         rules_version=state["rules_version"],
         original_amount=float(dealer.client_requested_amount or dealer.funding_goal) if (dealer.client_requested_amount or dealer.funding_goal) is not None else None,
@@ -15666,7 +16435,8 @@ async def get_underwriting_resolution(
         financial_suggestions=state.get("financial_suggestions", {}),
         exception_requests=[ProgramRuleResolutionRead.model_validate(row) for row in exceptions],
         direct_program_viable=direct_viable,
-        signing_mode="program_package" if direct_viable else "qc_summary_booking",
+        signing_mode="program_package" if effective_program else "qc_summary_booking",
+        program_selection=ProgramSelectionRead(**selection),
     )
 
 
@@ -15861,7 +16631,7 @@ async def list_owners(
 ) -> list[DealerOwner]:
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    return list(
+    owners = list(
         (
             await db.execute(
                 select(DealerOwner)
@@ -15872,6 +16642,89 @@ async def list_owners(
         .scalars()
         .all()
     )
+    # Repair historical rows written before the owner echo used CreditPull's
+    # actual `fico` column. The governed pull remains the source of truth; the
+    # owner row stores only the display-safe tier and band summary.
+    missing_owners = [
+        owner
+        for owner in owners
+        if owner.credit_pulled_at is not None and owner.credit_score is None
+    ]
+    missing_pull_ids = [
+        owner.credit_pull_id
+        for owner in missing_owners
+        if owner.credit_pull_id is not None
+    ]
+    changed = False
+    if missing_owners:
+        pulls = {
+            pull.id: pull
+            for pull in list(
+                (
+                    await db.execute(
+                        select(CreditPull).where(CreditPull.id.in_(missing_pull_ids))
+                    )
+                ).scalars().all()
+            )
+        } if missing_pull_ids else {}
+        missing_emails = {
+            (owner.email or "").strip().lower()
+            for owner in missing_owners
+            if owner.email
+        }
+        email_pulls = list(
+            (
+                await db.execute(
+                    select(CreditPull)
+                    .where(
+                        func.lower(CreditPull.email).in_(missing_emails),
+                        CreditPull.fico.is_not(None),
+                    )
+                    .order_by(CreditPull.created_at.desc())
+                )
+            ).scalars().all()
+        ) if missing_emails else []
+        pulls_by_identity: dict[tuple[str, str, str], CreditPull] = {}
+        for pull in email_pulls:
+            identity = (
+                (pull.email or "").strip().lower(),
+                (pull.legal_first_name or "").strip().lower(),
+                (pull.legal_last_name or "").strip().lower(),
+            )
+            pulls_by_identity.setdefault(identity, pull)
+        for owner in missing_owners:
+            pull = pulls.get(owner.credit_pull_id)
+            if pull is None and owner.email:
+                pull = pulls_by_identity.get(
+                    (
+                        owner.email.strip().lower(),
+                        owner.first_name.strip().lower(),
+                        owner.last_name.strip().lower(),
+                    )
+                )
+            if pull is None or pull.fico is None:
+                continue
+            owner.credit_pull_id = pull.id
+            owner.credit_score = int(pull.fico)
+            changed = True
+    # Reclassify every completed historical result onto the current QC scale.
+    # This upgrades old Tier 1/2/3 rows as soon as the file is opened.
+    for owner in owners:
+        quality = credit_quality.summary(owner.credit_score)
+        if owner.credit_pulled_at is None or quality is None:
+            continue
+        expected_summary = {
+            **quality,
+            "provider_status": "completed",
+            "score_source": "verified_soft_pull",
+        }
+        if owner.credit_tier != quality["quality_tier"] or dict(owner.credit_summary or {}) != expected_summary:
+            owner.credit_tier = quality["quality_tier"]
+            owner.credit_summary = expected_summary
+            changed = True
+    if changed:
+        await db.commit()
+    return owners
 
 
 def _primary_owner_conflict(requested_primary: bool, dealer_has_primary: bool) -> bool:
@@ -16198,8 +17051,16 @@ async def _run_owner_soft_pull(
         logger.exception("dealer-os: soft pull failed for owner %s", owner_pk)
         return await _record_provider_failure("failed", type(exc).__name__, f"Credit pull failed: {exc}")
 
-    owner.credit_score = getattr(pull, "score", None)
-    owner.credit_tier = _credit_tier(getattr(pull, "score", None))
+    # CreditPull stores the normalized provider result in `fico`. Looking up a
+    # nonexistent `score` attribute made successful pulls appear pending.
+    owner.credit_score = getattr(pull, "fico", None)
+    owner.credit_tier = _credit_tier(owner.credit_score)
+    owner.credit_summary = {
+        "score_band": _credit_score_band(owner.credit_score),
+        "quality_tier": owner.credit_tier,
+        "provider_status": "completed",
+        "score_source": "verified_soft_pull",
+    }
     owner.credit_pulled_at = datetime.now(timezone.utc)
     owner.credit_pull_id = pull.id
     owner.credit_workflow_status = "completed"
@@ -16211,7 +17072,7 @@ async def _run_owner_soft_pull(
         db, dealer.id, actor, "owner.soft_pull", "owner",
         entity_id=owner.id,
         after={
-            "score": owner.credit_score,
+            "score_band": _credit_score_band(owner.credit_score),
             "tier": owner.credit_tier,
             "consent_recorded_by": consent_recorded_by,
         },
@@ -16304,14 +17165,8 @@ async def owner_soft_pull(
 
 
 def _credit_tier(score: int | None) -> str | None:
-    """Tier 1 / Tier 2 as the capital-path rules read them."""
-    if score is None:
-        return None
-    if score >= 720:
-        return "Tier 1"
-    if score >= 660:
-        return "Tier 2"
-    return "Tier 3"
+    """Borrower-safe QC quality classification; never the exact score."""
+    return credit_quality.classification(score)
 
 
 async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
@@ -16895,12 +17750,8 @@ def _hash_invite_token(token: str) -> str:
 
 
 def _credit_score_band(score: int | None) -> str | None:
-    """Pure: 50-point band for the public page — e.g. 712 -> "700–749".
-    The exact score never renders on an unauthenticated page."""
-    if score is None:
-        return None
-    lo = (int(score) // 50) * 50
-    return f"{lo}–{lo + 49}"
+    """Borrower-safe QC range; never the exact score."""
+    return credit_quality.score_range(score)
 
 
 async def _resolve_consent_owner(db: AsyncSession, token: str) -> DealerOwner:

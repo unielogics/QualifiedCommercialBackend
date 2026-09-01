@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import fitz
+import pytest
 
 from app.dealer_os.services import contract_sign, qc_master_application
 from app.dealer_os.services.lender_neutral_routing import (
@@ -20,6 +21,21 @@ def _sample_context() -> dict:
     profile = SimpleNamespace(
         human_review_status="fundable",
         human_review_note="Cash flow, ownership, and direct-program eligibility reviewed.",
+        guaranty_type="personal",
+        office_space="leased",
+        business_stage="existing",
+        signer_title="Managing Member",
+        existing_mca_balance=0,
+        existing_sba_balance=0,
+        active_ucc_filings=1,
+        affiliate_businesses=False,
+        send_welcome_email=True,
+        field_confirmations={
+            "annual_sales": {"value": 1850000},
+            "annual_cash_flow_available_for_debt": {"value": 340000},
+            "monthly_debt_payments": {"value": 20000},
+            "debt_schedule": {"status": "schedule_confirmed", "source_sha256": "sample-debt-hash"},
+        },
     )
     pre_screen = SimpleNamespace(
         file_answers={
@@ -106,12 +122,12 @@ def _sample_context() -> dict:
             "dscr": 1.42,
             "dscr_source": "verified cash flow and debt schedule",
             "statement_months": [
-                "2026-02",
                 "2026-03",
                 "2026-04",
                 "2026-05",
                 "2026-06",
                 "2026-07",
+                "2026-08",
             ],
             "missing_statement_months": [],
         },
@@ -125,6 +141,7 @@ def _sample_context() -> dict:
                 "primary": True,
                 "credit_required": True,
                 "credit_status": "Completed - threshold met",
+                "credit_quality": "Good · 720–759",
                 "credit_reference": "credit-workflow-sample",
                 "residency": "us_citizen",
                 "bankruptcy": "none",
@@ -150,6 +167,7 @@ def _sample_context() -> dict:
                 "ucc": True,
             }
         ],
+        "debt_source_sha256": "sample-debt-hash",
         "documents": [
             {
                 "name": "May 2026 Statement.pdf",
@@ -226,6 +244,54 @@ def test_qc_master_application_readiness_and_pdf_security() -> None:
     assert "raw credit score" in rendered
 
 
+def test_underwriting_summary_is_a_persistent_pdf_without_signature_block() -> None:
+    context = _sample_context()
+    context["manual_program_selection"] = {
+        "program_key": TERM_PROGRAM_KEY,
+        "actor": "QC Rep",
+        "timestamp": datetime(2026, 8, 26, 10, 0, tzinfo=UTC),
+        "note": "Client acknowledged the selected submission path.",
+    }
+    context["adjustments"] = [
+        {
+            "kind": "program selection",
+            "original": "System route",
+            "overridden": TERM_DISPLAY_NAME,
+            "actor": "QC Rep",
+            "timestamp": datetime(2026, 8, 26, 10, 0, tzinfo=UTC),
+            "note": "Client acknowledged the selected submission path.",
+            "rules_version": RULES_VERSION,
+            "status": "active",
+        }
+    ]
+    readiness = qc_master_application.build_readiness(context)
+    rendered = qc_master_application.render_html(context, readiness, summary=True)
+    assert "Qualified Commercial Underwriting Summary" in rendered
+    assert "Good · 720–759" in rendered
+    assert "SIGNATURE OF AUTHORIZED REPRESENTATIVE" not in rendered
+    try:
+        pdf, digest = qc_master_application.render_pdf(context, readiness, summary=True)
+    except OSError as exc:
+        pytest.skip(f"Local WeasyPrint native libraries are unavailable: {exc}")
+    document = fitz.open(stream=pdf, filetype="pdf")
+    text = "\n".join(page.get_text() for page in document)
+
+    assert pdf.startswith(b"%PDF-")
+    assert digest == hashlib.sha256(pdf).hexdigest()
+    assert "QUALIFIED COMMERCIAL UNDERWRITING SUMMARY" in text.upper()
+    assert "Good" in text
+    assert "SIGNATURE OF AUTHORIZED REPRESENTATIVE" not in text
+
+
+def test_summary_without_overrides_does_not_force_an_empty_history_page() -> None:
+    context = _sample_context()
+    readiness = qc_master_application.build_readiness(context)
+    rendered = qc_master_application.render_html(context, readiness, summary=True)
+
+    assert "Override history:" in rendered
+    assert "<h2>8. Override and Acknowledgment History</h2>" not in rendered
+
+
 def test_package_reaches_signature_checkpoint_before_human_decision() -> None:
     context = _sample_context()
     context["profile"] = SimpleNamespace(
@@ -233,6 +299,21 @@ def test_package_reaches_signature_checkpoint_before_human_decision() -> None:
         human_review_note=None,
         human_reviewed_at=None,
         human_reviewed_by_user_id=None,
+        guaranty_type="personal",
+        office_space="leased",
+        business_stage="existing",
+        signer_title="Managing Member",
+        existing_mca_balance=0,
+        existing_sba_balance=0,
+        active_ucc_filings=1,
+        affiliate_businesses=False,
+        send_welcome_email=True,
+        field_confirmations={
+            "annual_sales": {"value": 1850000},
+            "annual_cash_flow_available_for_debt": {"value": 340000},
+            "monthly_debt_payments": {"value": 20000},
+            "debt_schedule": {"status": "schedule_confirmed", "source_sha256": "sample-debt-hash"},
+        },
     )
 
     readiness = qc_master_application.build_readiness(context)
