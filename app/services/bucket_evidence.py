@@ -107,9 +107,14 @@ _MONTHS = {
     "december": 12,
 }
 
+_UUID_SUFFIX = re.compile(
+    r"[-_. ]+[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
 
 def statement_months_from_filename(file_name: str) -> set[str]:
-    value = Path(file_name).stem.casefold()
+    value = _UUID_SUFFIX.sub("", Path(file_name).stem.casefold())
     result: set[str] = set()
     for match in re.finditer(r"(?<!\d)(20\d{2})[-_. /](0?[1-9]|1[0-2])(?:[-_. /](?:0?[1-9]|[12]\d|3[01]))?(?!\d)", value):
         result.add(f"{match.group(1)}-{int(match.group(2)):02d}")

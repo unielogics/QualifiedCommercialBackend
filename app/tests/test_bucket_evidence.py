@@ -6,10 +6,22 @@ from app.services.bucket_evidence import (
 
 
 def test_good_warranty_statement_names_are_recognized_with_months() -> None:
-    name = "Good Warranty Soluti-STATEMENT-02-06-2026-bf5f935c.pdf"
+    name = (
+        "Good Warranty Soluti-STATEMENT-02-06-2026-"
+        "bf5f935c-2098-4ce6-a21e-7c28455e27e5.pdf"
+    )
 
     assert filename_evidence_classification(name) == "bank_statement"
     assert statement_months_from_filename(name) == {"2026-02"}
+
+
+def test_upload_uuid_does_not_add_a_second_statement_month() -> None:
+    name = (
+        "Good Warranty Soluti-STATEMENT-03-06-2026-"
+        "07b0ef3b-524c-42e6-b9c1-4884906a4130.pdf"
+    )
+
+    assert statement_months_from_filename(name) == {"2026-03"}
 
 
 def test_common_e_statement_names_support_iso_dates() -> None:
