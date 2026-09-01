@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from app.dealer_os.schemas import DealerCreate
 from app.dealer_os.services import consent_delivery
+from app.dealer_os.services.client_room import _generate_passcode as _generate_field_room_passcode
+from app.dealer_os.services.client_room import _hash_passcode as _hash_field_room_passcode
+from app.dealer_os.services.client_room import verify_passcode as verify_field_room_passcode
 from app.models.application_profile import ApplicationRoomDelivery
 from app.routers.application_profiles import _delivery_overall, _masked_recipient
 from app.routers.buckets import (
@@ -22,6 +26,34 @@ from app.schemas.application_profile import RoomPinRotateRequest
 
 def test_new_room_passcodes_are_six_numeric_digits() -> None:
     assert re.fullmatch(r"\d{6}", _generate_passcode())
+
+
+def test_field_desk_file_requires_one_six_digit_initial_room_pin() -> None:
+    data = {
+        "name": "Example LLC",
+        "entity_type": "Limited liability company",
+        "funding_goal": 250_000,
+        "funding_purpose": "working_capital",
+        "use_of_proceeds_note": "Purchase inventory.",
+    }
+    with pytest.raises(ValidationError):
+        DealerCreate.model_validate(data)
+    for invalid in ("12345", "1234567", "12A456", "١٢٣٤٥٦"):
+        with pytest.raises(ValidationError):
+            DealerCreate.model_validate({**data, "secure_room_pin": invalid})
+    assert DealerCreate.model_validate({**data, "secure_room_pin": "000014"}).secure_room_pin == "000014"
+
+
+def test_generated_replacement_pin_invalidates_the_initial_pin() -> None:
+    initial_pin = "000014"
+    initial_hash = _hash_field_room_passcode(initial_pin)
+    assert verify_field_room_passcode(initial_pin, initial_hash)
+
+    replacement_pin = _generate_field_room_passcode()
+    replacement_hash = _hash_field_room_passcode(replacement_pin)
+    assert re.fullmatch(r"\d{6}", replacement_pin)
+    assert not verify_field_room_passcode(initial_pin, replacement_hash)
+    assert verify_field_room_passcode(replacement_pin, replacement_hash)
 
 
 def test_legacy_room_passcodes_remain_compatible() -> None:

@@ -52,6 +52,7 @@ class DealerCreate(BaseModel):
     funding_goal: float = Field(gt=0, le=999_999_999_999.99)
     funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
     use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
     # Accepted only for a super-admin by the route. Keeping this out of the
     # general update schema prevents a rep from changing file classification.
@@ -2256,8 +2257,8 @@ class SignatureRequestSend(ClientRequestSend):
 
 class ClientRequestResult(BaseModel):
     url: str
-    # Plaintext only when this call opened the room. None means the client
-    # already has their access code from an earlier link.
+    # Plaintext is returned only for a newly generated replacement PIN. The
+    # initial PIN was chosen during file creation and only its hash is stored.
     passcode: str | None = None
     delivered: bool = False
     emailed: bool = False

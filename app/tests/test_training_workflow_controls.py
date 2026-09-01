@@ -72,6 +72,7 @@ def test_new_files_default_to_live_and_gated() -> None:
         funding_goal=100_000,
         funding_purpose="working_capital",
         use_of_proceeds_note="Purchase inventory and support payroll.",
+        secure_room_pin="104293",
     )
 
     assert payload.is_training is False

@@ -67,6 +67,7 @@ def test_new_application_requires_request_but_not_ein_address_or_trading_since()
         funding_goal=250_000,
         funding_purpose="working_capital",
         use_of_proceeds_note="Purchase equipment and retain operating liquidity.",
+        secure_room_pin="104293",
     )
 
     assert payload.ein is None
@@ -81,6 +82,7 @@ def test_new_application_rejects_missing_required_request_fields(field: str) -> 
         "funding_goal": 250_000,
         "funding_purpose": "working_capital",
         "use_of_proceeds_note": "Working capital for payroll and inventory.",
+        "secure_room_pin": "104293",
     }
     data.pop(field)
     with pytest.raises(ValidationError):

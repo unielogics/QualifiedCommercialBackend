@@ -2715,7 +2715,7 @@ async def create_dealer(
         await _require_group(db, payload.group_id)
     # sms_consent is captured alongside the file but is not a column on it: it
     # becomes its own evidence row below.
-    fields = payload.model_dump(exclude={"sms_consent"})
+    fields = payload.model_dump(exclude={"sms_consent", "secure_room_pin"})
     taxonomy = await application_taxonomy.canonicalize_selection(db, fields, required=False)
     fields.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
     if fields.get("is_training"):
@@ -2728,13 +2728,26 @@ async def create_dealer(
     # AI-proposed targets, so the cockpit is never empty.
     db.add(DealerSourceConnection(dealer_id=dealer.id, kind="uploads", status="active"))
     await propose_targets(db, dealer)
-    # Best-effort: a bucket failure must not cost the rep the file they just
-    # typed in front of a client. The file is still usable and
-    # POST /dealers/{id}/bucket/create recovers it.
+    # The room PIN is chosen exactly once at file creation. Keep room setup in
+    # this transaction so a file can never be committed without its durable
+    # client credential.
     try:
-        await buckets_link.ensure_bucket(db, dealer)
-    except Exception:
-        logger.exception("dealer-os: bucket creation failed for new dealer %s", dealer.id)
+        room = await client_room.initialize_room(db, dealer, payload.secure_room_pin)
+    except Exception as exc:
+        logger.exception("dealer-os: client room creation failed for new dealer %s", dealer.id)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "The secure client room could not be created. Try creating the file again.",
+        ) from exc
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "room.passcode_initialized",
+        "dealer",
+        entity_id=dealer.id,
+        after={"link_id": str(room.link.id), "expires": False},
+    )
     # A rep's file carries a pipeline row from the moment it exists, so it shows
     # up in production reporting immediately rather than only once it advances.
     # Team-created files deliberately get none: they are not field work and
@@ -3171,6 +3184,22 @@ async def rotate_room_access_code(
     )
     await db.commit()
     return ClientRequestResult(url=room.url, passcode=room.passcode, delivered=False)
+
+
+@router.get("/dealers/{dealer_id}/room", response_model=ClientRequestResult)
+async def get_client_room(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ClientRequestResult:
+    """Return the durable room link without revealing or rotating its PIN."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    room = await client_room.get_room(db, dealer)
+    if room is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "This legacy file does not have a client room yet. Generate a new PIN to create it.",
+        )
+    return ClientRequestResult(url=room.url, passcode=None, delivered=False)
 
 
 async def _room_code_hash_by_token(db: AsyncSession, token: str) -> str | None:
