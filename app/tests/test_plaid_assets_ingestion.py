@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from app.dealer_os.services.plaid_assets import normalize_asset_report
+from app.dealer_os.services.plaid_assets import (
+    _merge_document_evidence_month,
+    normalize_asset_report,
+)
 
 
 def test_asset_report_normalizes_balances_transactions_and_months():
@@ -114,3 +117,23 @@ def test_asset_report_keeps_accounts_separate():
 
     assert [row["account"]["mask"] for row in rows] == ["1111", "2222"]
     assert [row["months"][0]["ending_balance"] for row in rows] == [100.0, 900.0]
+
+
+def test_asset_report_document_month_keeps_risk_evidence_from_every_account():
+    first = {
+        "month": "2026-07",
+        "nsf_count": 1,
+        "negative_balance_dates": ["2026-07-08"],
+    }
+    second = {
+        "month": "2026-07",
+        "nsf_count": 2,
+        "negative_balance_dates": ["2026-07-19", "2026-07-08"],
+    }
+
+    merged = _merge_document_evidence_month(first, second)
+
+    assert merged["nsf_count"] == 3
+    assert merged["negative_balance_dates"] == ["2026-07-08", "2026-07-19"]
+    assert merged["negative_balance_days"] == 2
+    assert first["nsf_count"] == 1

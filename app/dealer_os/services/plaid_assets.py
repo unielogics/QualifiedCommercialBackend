@@ -64,6 +64,52 @@ def _day(value: Any) -> date | None:
         return None
 
 
+def _merge_document_evidence_month(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge account-level risk evidence into the retained Asset Report month.
+
+    Account periods remain separate and are combined by the metric engine. The
+    document summary only needs to retain every observed NSF and negative-day
+    marker so later audit/readiness reads do not stop at the first account.
+    """
+    if current is None:
+        return dict(incoming)
+
+    merged = dict(current)
+    nsf_values = [
+        int(float(value))
+        for value in (current.get("nsf_count"), incoming.get("nsf_count"))
+        if value is not None
+    ]
+    merged["nsf_count"] = sum(nsf_values) if nsf_values else None
+
+    date_lists = [
+        value
+        for value in (
+            current.get("negative_balance_dates"),
+            incoming.get("negative_balance_dates"),
+        )
+        if isinstance(value, list)
+    ]
+    if date_lists:
+        merged_dates = sorted(
+            {
+                str(value).strip()
+                for values in date_lists
+                for value in values
+                if str(value).strip()
+            }
+        )
+        merged["negative_balance_dates"] = merged_dates
+        merged["negative_balance_days"] = len(merged_dates)
+    else:
+        merged["negative_balance_dates"] = None
+        merged["negative_balance_days"] = None
+    return merged
+
+
 def normalize_asset_report(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert Plaid Asset Report JSON to per-account canonical extractions.
 
@@ -333,7 +379,9 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
         for month in plan["months"]:
             key = str(month.get("month") or "")
             if key:
-                all_months.setdefault(key, month)
+                all_months[key] = _merge_document_evidence_month(
+                    all_months.get(key), month
+                )
 
     doc.account_id = None
     doc.extracted = {
