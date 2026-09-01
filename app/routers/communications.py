@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import false as sql_false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1045,6 +1045,7 @@ async def get_unified_communication_thread(
 async def reply_unified_communication_thread(
     thread_id: str,
     payload: UnifiedCommunicationCompose,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> UnifiedCommunicationThreadDetail:
@@ -1092,7 +1093,15 @@ async def reply_unified_communication_thread(
         from app.dealer_os.router import create_rep_inbox_message
         from app.dealer_os.schemas import RepInboxMessageCreate
 
-        await create_rep_inbox_message(UUID(parts[1]), RepInboxMessageCreate(body=body), user, db)
+        # request is threaded through because create_rep_inbox_message uses it
+        # for the training-dealer live-send guard, which must not be bypassed.
+        await create_rep_inbox_message(
+            thread_id=UUID(parts[1]),
+            payload=RepInboxMessageCreate(body=body),
+            request=request,
+            user=user,
+            db=db,
+        )
     elif parts[0] == "sms":
         from app.services import sms as sms_service
 
@@ -1119,10 +1128,15 @@ async def reply_unified_communication_thread(
         from app.routers.inbox import reply_to_thread
         from app.schemas.inbox import InboxReplyRequest
 
-        result = await reply_to_thread(":".join(parts[1:]), InboxReplyRequest(body=body), user, db)
+        result = await reply_to_thread(
+            thread_id=":".join(parts[1:]),
+            payload=InboxReplyRequest(body=body),
+            user=user,
+            db=db,
+        )
         if not result.ok:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, result.detail or "Email could not be sent")
-    return await get_unified_communication_thread(thread_id, user, db)
+    return await get_unified_communication_thread(thread_id=thread_id, user=user, db=db)
 
 
 @router.post("/threads/{thread_id:path}/seen", response_model=UnifiedCommunicationSeen)
