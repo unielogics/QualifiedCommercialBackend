@@ -203,6 +203,7 @@ async def send_confirmation_sms(
 
 async def dispatch_due_reminders() -> int:
     from app.db import SessionLocal
+    from app.dealer_os.models import DealerBusiness, DealerRepAppointment
 
     sent = 0
     async with SessionLocal() as db:
@@ -214,9 +215,21 @@ async def dispatch_due_reminders() -> int:
                 .join(CalendarEvent, CalendarEvent.id == BookingNotification.event_id)
                 .join(User, User.id == CalendarEvent.owner_user_id)
                 .join(BookingSettings, BookingSettings.user_id == User.id)
+                .outerjoin(
+                    DealerRepAppointment,
+                    DealerRepAppointment.calendar_event_id == CalendarEvent.id,
+                )
+                .outerjoin(
+                    DealerBusiness,
+                    DealerBusiness.id == DealerRepAppointment.dealer_id,
+                )
                 .where(
                     CalendarEvent.status != CalendarEventStatus.CANCELLED,
                     CalendarEvent.starts_at > now,
+                    (
+                        DealerRepAppointment.dealer_id.is_(None)
+                        | DealerBusiness.is_training.is_(False)
+                    ),
                     BookingNotificationReminder.status == "pending",
                     BookingNotificationReminder.due_at <= now,
                 )

@@ -1,7 +1,7 @@
 """Calendar appointment CRM state and immutable activity.
 
-Revision ID: 0163_calendar_appointment_crm
-Revises: 0162_unified_client_access
+Revision ID: 0166_calendar_appointment_crm
+Revises: 0165_unified_client_access
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0163_calendar_appointment_crm"
-down_revision = "0162_unified_client_access"
+revision = "0166_calendar_appointment_crm"
+down_revision = "0165_unified_client_access"
 branch_labels = None
 depends_on = None
 

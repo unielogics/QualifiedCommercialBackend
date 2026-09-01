@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,6 +37,11 @@ class User(TimestampMixin, Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(160), nullable=False, default="")
     role: Mapped[Role] = mapped_column(String(32), nullable=False, default=Role.CLIENT)
+    # Additional console entry points for operator identities. ``role`` remains
+    # the primary permission profile; these values add narrowly scoped access.
+    account_access_types: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
     # Soft-delete: super-admin revoke sets this rather than physically deleting,
     # so historical FK references (loans.broker_id → brokers.user_id, etc.) survive.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

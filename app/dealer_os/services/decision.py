@@ -57,6 +57,9 @@ class Verification:
     """plaid | upload | none — why the bank side of the gate is satisfied."""
     statement_months: list[str] = field(default_factory=list)
     missing_statement_months: list[str] = field(default_factory=list)
+    statement_target: int = 6
+    bank_exception_available: bool = False
+    bank_exception_active: bool = False
     credit_returned: bool = False
     unlocked: bool = False
     returned: int = 0
@@ -107,6 +110,9 @@ def assess_verification(
     bank_source: str | None = None,
     statement_months: list[str] | None = None,
     missing_statement_months: list[str] | None = None,
+    statement_target: int = 6,
+    bank_exception_available: bool = False,
+    bank_exception_active: bool = False,
     ownership_total: float = 0.0,
     ownership_complete: bool = False,
     owner_contact_complete: bool = False,
@@ -137,7 +143,11 @@ def assess_verification(
             f"{completed_credit_owner_count} of {required_credit_owner_count} required owners completed"
         )
     elif unlocked:
-        reason = "Bank + all required owner credit returned"
+        reason = (
+            "Bank (3-month exception) + all required owner credit returned"
+            if bank_exception_active
+            else "Bank + all required owner credit returned"
+        )
     elif returned == 1:
         reason = "1 of 2 authorizations returned"
     else:
@@ -147,6 +157,9 @@ def assess_verification(
         bank_source=bank_source or ("plaid" if bank_linked else "none"),
         statement_months=list(statement_months or []),
         missing_statement_months=list(missing_statement_months or []),
+        statement_target=statement_target,
+        bank_exception_available=bank_exception_available,
+        bank_exception_active=bank_exception_active,
         credit_returned=credit_returned,
         unlocked=unlocked,
         returned=returned,

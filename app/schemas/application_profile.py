@@ -277,7 +277,7 @@ class ApplicationPlaidUpdateLinkRequest(BaseModel):
 
 
 class PlaidAssetReportCreate(BaseModel):
-    days_requested: int = Field(default=60, ge=0, le=731)
+    days_requested: int = Field(default=210, ge=0, le=731)
 
 
 class ApplicationPlaidExchange(BaseModel):

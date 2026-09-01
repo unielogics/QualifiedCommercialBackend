@@ -445,9 +445,13 @@ class PlaidAssetReport(TimestampMixin, Base):
         String(16), nullable=False, default="pending", server_default="pending"
     )
     error: Mapped[str | None] = mapped_column(Text)
-    days_requested: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    days_requested: Mapped[int] = mapped_column(Integer, nullable=False, default=210)
     source_item_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ingested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
+    )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 

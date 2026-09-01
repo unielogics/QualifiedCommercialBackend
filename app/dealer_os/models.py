@@ -97,6 +97,16 @@ class DealerBusiness(TimestampMixin, Base):
     application_lifecycle: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"
     )
+    # Training is a data classification: those files remain available to the
+    # super-admin for demonstrations but never enter live reporting. Workflow
+    # gating is deliberately separate because a live file may be temporarily
+    # opened for staff review without becoming training data.
+    is_training: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    workflow_ungated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
     industry_label: Mapped[str | None] = mapped_column(String(180))

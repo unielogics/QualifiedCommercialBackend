@@ -1,7 +1,7 @@
 """Calendar V2 outcomes, file links, and booking controls.
 
-Revision ID: 0164_calendar_v2_crm_workspace
-Revises: 0163_calendar_appointment_crm
+Revision ID: 0167_calendar_v2_crm_workspace
+Revises: 0166_calendar_appointment_crm
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 
-revision = "0164_calendar_v2_crm_workspace"
-down_revision = "0163_calendar_appointment_crm"
+revision = "0167_calendar_v2_crm_workspace"
+down_revision = "0166_calendar_appointment_crm"
 branch_labels = None
 depends_on = None
 

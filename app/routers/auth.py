@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ProductAccountType, Role
+from app.routers.users import _account_types
 from app.schemas.common import ORMModel
 from app.services.user_access import account_types, has_product_access
 
@@ -42,7 +43,7 @@ class MeResponse(ORMModel):
     # since AppShell's gate needs BOTH the individual Platform Access
     # Agreement AND the company's Referral Protection Agreement status.
     referral_partner_company_id: UUID | None = None
-    account_types: list[ProductAccountType]
+    account_types: list[str]
     account_status: str
     can_access_funding: bool
     can_access_audit: bool
@@ -51,6 +52,9 @@ class MeResponse(ORMModel):
 @router.get("/me", response_model=MeResponse)
 async def me(user: CurrentUser) -> MeResponse:
     products = account_types(user)
+    effective_account_types = sorted(
+        {*_account_types(user), *(product.value for product in products)}
+    )
     return MeResponse(
         id=str(user.id),
         clerk_id=user.clerk_id,
@@ -58,7 +62,7 @@ async def me(user: CurrentUser) -> MeResponse:
         name=user.name,
         role=user.role,
         referral_partner_company_id=user.referral_partner_company_id,
-        account_types=products,
+        account_types=effective_account_types,
         account_status=user.account_status,
         can_access_funding=has_product_access(user, ProductAccountType.FUNDING),
         can_access_audit=has_product_access(user, ProductAccountType.AUDIT),

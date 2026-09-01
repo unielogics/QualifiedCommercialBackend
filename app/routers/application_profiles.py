@@ -56,8 +56,6 @@ from app.schemas.application_profile import (
     ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
-    ApplicationUnderwritingPatch,
-    ApplicationUnderwritingRead,
     ApplicationRoomAccess,
     ApplicationRoomConsentGrant,
     ApplicationRoomPlaidExchange,
@@ -67,6 +65,8 @@ from app.schemas.application_profile import (
     ApplicationRoomSignRequest,
     ApplicationRoomSignResult,
     ApplicationRoomState,
+    ApplicationUnderwritingPatch,
+    ApplicationUnderwritingRead,
     ClassificationConfirm,
     ClassificationPatch,
     ClassificationPreview,
@@ -105,11 +105,68 @@ from app.schemas.application_profile import (
     VerificationInvitationRead,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
-from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services import application_profiles as profiles
 from app.services import plaid_lifecycle
+from app.services.activity_log import log_activity, mark_loan_dirty
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
+
+
+async def _sync_dealer_plaid_item_background(item_id: UUID) -> None:
+    from app.db import SessionLocal
+    from app.dealer_os.services.plaid_sync import sync_item
+
+    async with SessionLocal() as db:
+        item = await db.get(DealerPlaidItem, item_id)
+        if item is not None:
+            await sync_item(db, item)
+            await db.commit()
+
+_TRAINING_LIVE_ACTION_HEADER = "x-qc-training-live-action"
+
+
+async def _require_training_live_action(
+    db: AsyncSession,
+    *,
+    profile: ApplicationProfile,
+    user: User,
+    request: Request,
+    action: str,
+    provider: str,
+    recipient: str | None,
+    effect: str,
+) -> None:
+    if profile.dealer_id is None:
+        return
+    dealer = await db.get(DealerBusiness, profile.dealer_id)
+    if dealer is None or not dealer.is_training:
+        return
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Application file not found")
+    if request.headers.get(_TRAINING_LIVE_ACTION_HEADER, "").strip().lower() != "confirmed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "training_live_action_confirmation_required",
+                "action": action,
+                "provider": provider,
+                "recipient": recipient,
+                "effect": effect,
+            },
+        )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "training.live_action_confirmed",
+        f"Confirmed live Training action: {action}",
+        metadata={
+            "action": action,
+            "provider": provider,
+            "recipient": recipient,
+            "effect": effect,
+        },
+    )
 
 UNDERWRITING_TO_LOAN_STAGE: dict[str, LoanStage] = {
     "submitted": LoanStage.PREQUALIFIED,
@@ -919,6 +976,7 @@ async def rotate_application_room_pin(
 async def create_application_room_request(
     profile_id: UUID,
     payload: RoomRequestCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RoomRequestResult:
@@ -926,6 +984,23 @@ async def create_application_room_request(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may create room requests")
     link = await _profile_room_link(db, profile)
+    email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
+    phone = profiles.normalized_phone(payload.recipient_phone)
+    channels = ", ".join(
+        channel
+        for channel, enabled in (("email", payload.email_room_link), ("SMS", payload.sms_reminder))
+        if enabled
+    ) or "secure room only"
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Create document-room request",
+        provider=channels,
+        recipient=email or phone,
+        effect=f"Request {payload.name.strip()} from the client",
+    )
     requested = BucketRequestedDocument(
         bucket_id=profile.primary_bucket_id,
         name=payload.name.strip(),
@@ -938,8 +1013,6 @@ async def create_application_room_request(
     )
     db.add(requested)
     await db.flush()
-    email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
-    phone = profiles.normalized_phone(payload.recipient_phone)
     rows = await _deliver_room_request(
         db,
         profile=profile,
@@ -978,6 +1051,7 @@ async def create_application_room_request(
 async def send_application_room_reminder(
     profile_id: UUID,
     payload: RoomReminderCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RoomRequestResult:
@@ -993,6 +1067,21 @@ async def send_application_room_reminder(
     )
     email = profiles.normalized_email(str(payload.recipient_email) if payload.recipient_email else link.recipient_email)
     phone = profiles.normalized_phone(payload.recipient_phone)
+    channels = ", ".join(
+        channel
+        for channel, enabled in (("email", payload.email_room_link), ("SMS", payload.sms_reminder))
+        if enabled
+    ) or "secure room only"
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Send application-room reminder",
+        provider=channels,
+        recipient=email or phone,
+        effect=purpose.capitalize(),
+    )
     rows = await _deliver_room_request(
         db,
         profile=profile,
@@ -1135,6 +1224,7 @@ async def get_application_intelligence(
 async def create_bank_verification_invitation(
     profile_id: UUID,
     payload: VerificationInvitationCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> VerificationInvitationRead:
@@ -1149,6 +1239,16 @@ async def create_bank_verification_invitation(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A client email is required")
     if payload.channel == "sms" and not phone:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A consented client phone is required")
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Create bank-verification invitation",
+        provider=payload.channel,
+        recipient=email if payload.channel == "email" else phone,
+        effect="Issue a live secure-bank verification request",
+    )
     token = f"bank.{secrets.token_urlsafe(32)}"
     expires_at = datetime.now(UTC) + timedelta(days=7)
     row = ApplicationVerificationInvitation(
@@ -1282,6 +1382,7 @@ async def _mint_credit_invite(
     owner: ApplicationOwner | DealerOwner,
     user: CurrentUser,
     channel: str,
+    request: Request,
 ) -> FileCreditInviteRead:
     verification = await profiles.verification_state(db, profile)
     if not verification.ownership_complete:
@@ -1290,6 +1391,16 @@ async def _mint_credit_invite(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Credit authorization is required only for owners with 20% or more ownership")
     if not profiles.normalized_email(owner.email) or not profiles.normalized_phone(owner.phone):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This owner needs a personal email and valid phone before credit authorization can be sent")
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Create owner credit invitation",
+        provider=channel,
+        recipient=owner.email if channel == "email" else owner.phone,
+        effect=f"Issue a live credit-authorization link for {owner.full_name}",
+    )
     if profile.dealer_id:
         from app.dealer_os.services import client_room
 
@@ -1332,18 +1443,20 @@ async def create_owner_credit_invite(
     profile_id: UUID,
     owner_id: UUID,
     payload: FileCreditInviteRequest,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> FileCreditInviteRead:
     profile = await profiles.load_profile(db, profile_id, user)
     owner = await _owner_for_profile(db, profile, owner_id)
-    return await _mint_credit_invite(db, profile, owner, user, payload.channel)
+    return await _mint_credit_invite(db, profile, owner, user, payload.channel, request)
 
 
 @router.post("/{profile_id}/owners/credit-invites", response_model=FileCreditInviteBatch)
 async def create_pending_owner_credit_invites(
     profile_id: UUID,
     payload: FileCreditInviteRequest,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> FileCreditInviteBatch:
@@ -1355,7 +1468,7 @@ async def create_pending_owner_credit_invites(
     items = []
     for owner in owners:
         if owner.credit_required and not owner.credit_complete:
-            items.append(await _mint_credit_invite(db, profile, owner, user, payload.channel))
+            items.append(await _mint_credit_invite(db, profile, owner, user, payload.channel, request))
     return FileCreditInviteBatch(items=items)
 
 
@@ -1873,12 +1986,13 @@ async def public_application_room_update_complete(
     item_id: UUID,
     payload: ApplicationRoomAccess,
     request: Request,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -1887,12 +2001,15 @@ async def public_application_room_update_complete(
         profile,
         None,
         "plaid.update_mode.completed.application_room",
-        "Client repaired the business bank connection",
+        "Client refreshed the business bank accounts",
         target_type="plaid_item",
         target_id=item.id,
         metadata={"upload_link_id": str(link.id)},
     )
     await db.commit()
+    from app.services.application_plaid_sync import sync_item_background
+
+    background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2055,12 +2172,13 @@ async def public_bank_verification_update_link_token(
 async def public_bank_verification_update_complete(
     token: str,
     item_id: UUID,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     invitation, profile = await _public_bank_invitation(db, token)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -2069,12 +2187,15 @@ async def public_bank_verification_update_complete(
         profile,
         None,
         "plaid.update_mode.completed.secure_room",
-        "Client repaired the business bank connection",
+        "Client refreshed the business bank accounts",
         target_type="plaid_item",
         target_id=item.id,
         metadata={"invitation_id": str(invitation.id)},
     )
     await db.commit()
+    from app.services.application_plaid_sync import sync_item_background
+
+    background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2426,13 +2547,14 @@ async def complete_application_plaid_update(
     profile_id: UUID,
     item_id: UUID,
     user: CurrentUser,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
     item = await _profile_plaid_item(db, profile, item_id)
     try:
-        await plaid_lifecycle.complete_update(item)
+        await plaid_lifecycle.complete_update(db, item)
     except plaid_client.PlaidUnavailable as exc:
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -2446,6 +2568,12 @@ async def complete_application_plaid_update(
         target_id=item.id,
     )
     await db.commit()
+    if profile.dealer_id:
+        background.add_task(_sync_dealer_plaid_item_background, item.id)
+    else:
+        from app.services.application_plaid_sync import sync_item_background
+
+        background.add_task(sync_item_background, item.id)
     return next(row for row in await profiles.bank_rows(db, profile) if row.id == item.id)
 
 
@@ -2548,16 +2676,7 @@ async def exchange_application_plaid_token(
     await db.commit()
     await db.refresh(item)
     if profile.dealer_id:
-        from app.db import SessionLocal
-        from app.dealer_os.services.plaid_sync import sync_item as sync_dealer_item
-
-        async def run_dealer_sync(item_id: UUID) -> None:
-            async with SessionLocal() as session:
-                target = await session.get(DealerPlaidItem, item_id)
-                if target:
-                    await sync_dealer_item(session, target)
-                    await session.commit()
-        background.add_task(run_dealer_sync, item.id)
+        background.add_task(_sync_dealer_plaid_item_background, item.id)
     else:
         from app.services.application_plaid_sync import sync_item_background
 
@@ -2600,6 +2719,7 @@ async def update_application_bank(
 async def refresh_application_bank(
     profile_id: UUID,
     item_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationPlaidRefreshRead:
@@ -2607,6 +2727,16 @@ async def refresh_application_bank(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may retry statement synchronization")
     profile = await profiles.load_profile(db, profile_id, user)
     item = await _profile_plaid_item(db, profile, item_id)
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Refresh bank statements",
+        provider="Plaid",
+        recipient=item.institution_name,
+        effect="Run a live provider synchronization for this bank connection",
+    )
     if profile.dealer_id:
         from app.dealer_os.services.plaid_sync import sync_item
     else:
@@ -2621,6 +2751,7 @@ async def refresh_application_bank(
 async def disconnect_application_bank(
     profile_id: UUID,
     item_id: UUID,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
@@ -2628,6 +2759,16 @@ async def disconnect_application_bank(
     if user.role != Role.SUPER_ADMIN:
         _require_profile_bank_client(profile, user)
     item = await _profile_plaid_item(db, profile, item_id)
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Disconnect bank connection",
+        provider="Plaid",
+        recipient=item.institution_name,
+        effect="Revoke the live provider connection while retaining collected statements",
+    )
     was_primary = item.is_primary_operating
     try:
         await plaid_lifecycle.disconnect_item(db, item)
@@ -2680,6 +2821,7 @@ async def _profile_asset_report(
 async def create_application_asset_report(
     profile_id: UUID,
     payload: PlaidAssetReportCreate,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PlaidAssetReport:
@@ -2692,6 +2834,16 @@ async def create_application_asset_report(
     )
     if not consent:
         raise HTTPException(status.HTTP_409_CONFLICT, "The client must accept the current bank disclosure first")
+    await _require_training_live_action(
+        db,
+        profile=profile,
+        user=user,
+        request=request,
+        action="Create Plaid Asset Report",
+        provider="Plaid",
+        recipient=None,
+        effect=f"Request a live {payload.days_requested}-day lender-ready Asset Report",
+    )
     try:
         report = await plaid_lifecycle.create_asset_report(
             db,

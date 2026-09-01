@@ -53,6 +53,9 @@ class DealerCreate(BaseModel):
     funding_purpose: str = Field(pattern=_FUNDING_PURPOSES)
     use_of_proceeds_note: str = Field(min_length=1, max_length=4000)
     group_id: UUID | None = None  # 0120: client file this LLC belongs to
+    # Accepted only for a super-admin by the route. Keeping this out of the
+    # general update schema prevents a rep from changing file classification.
+    is_training: bool = False
     # Consent captured in the same moment as the file. Optional, because a rep
     # may have only an email, or the owner may decline: a file must still open.
     sms_consent: "SmsConsentIn | None" = None
@@ -144,6 +147,19 @@ class DealerUpdate(BaseModel):
     use_of_proceeds_note: str | None = Field(default=None, max_length=4000)
 
 
+class DealerWorkflowSettingsPatch(BaseModel):
+    """Super-admin-only classification and workflow presentation controls."""
+
+    is_training: bool | None = None
+    workflow_ungated: bool | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_change(self) -> "DealerWorkflowSettingsPatch":
+        if self.is_training is None and self.workflow_ungated is None:
+            raise ValueError("Provide is_training or workflow_ungated")
+        return self
+
+
 class DealerRead(ORM):
     id: UUID
     name: str
@@ -190,6 +206,8 @@ class DealerRead(ORM):
     client_requested_amount: float | None = None
     client_requested_program: str | None = None
     application_lifecycle: str = "active"
+    is_training: bool = False
+    workflow_ungated: bool = False
     funding_purpose: str | None = None
     group_id: UUID | None = None
 
@@ -247,6 +265,8 @@ class DealerListItem(ORM):
     funding_purpose: str | None = None
     client_requested_amount: float | None = None
     application_lifecycle: str = "active"
+    is_training: bool = False
+    workflow_ungated: bool = False
 
 
 class PortfolioOwnerSummary(BaseModel):
@@ -1295,9 +1315,12 @@ class DeliveryRowRead(BaseModel):
 
 class VerificationRead(BaseModel):
     bank_linked: bool = False
-    bank_source: Literal["plaid", "upload", "none"] = "none"
+    bank_source: Literal["assets", "plaid", "upload", "none"] = "none"
     statement_months: list[str] = []
     missing_statement_months: list[str] = []
+    statement_target: int = 6
+    bank_exception_available: bool = False
+    bank_exception_active: bool = False
     credit_returned: bool = False
     unlocked: bool = False
     returned: int = 0
@@ -2112,13 +2135,19 @@ class BankUploadRequestResult(ClientRequestResult):
 
 class BankEvidenceRead(BaseModel):
     bank_linked: bool = False
-    bank_source: Literal["plaid", "upload", "none"] = "none"
+    bank_source: Literal["assets", "plaid", "upload", "none"] = "none"
     statement_months: list[str] = Field(default_factory=list)
     missing_statement_months: list[str] = []
-    statement_target: int = 3
+    statement_target: int = 6
+    bank_exception_available: bool = False
+    bank_exception_active: bool = False
     bucket_id: UUID | None = None
     upload_url: str | None = None
     passcode: str | None = None
+
+
+class BankEvidenceExceptionRequest(BaseModel):
+    acknowledged: Literal[True]
 
 
 class DocRequestPatch(BaseModel):
@@ -2487,11 +2516,13 @@ class PlaidAssetReportRead(ORM):
     days_requested: int
     error: str | None = None
     ready_at: datetime | None = None
+    ingested_at: datetime | None = None
+    document_id: UUID | None = None
     created_at: datetime
 
 
 class PlaidAssetReportCreate(BaseModel):
-    days_requested: int = Field(default=60, ge=0, le=731)
+    days_requested: int = Field(default=210, ge=0, le=731)
 
 
 class PlaidExchange(BaseModel):

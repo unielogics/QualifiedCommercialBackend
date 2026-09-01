@@ -291,19 +291,19 @@ def evaluate_direct_programs(facts: dict[str, Any]) -> dict[str, Any]:
 
     positive = _number(facts, "positive_month_end_count")
     if positive is None:
-        term_open.append("Confirm three positive month-end balances from official statements.")
-        working_open.append("Confirm three positive month-end balances from official statements.")
+        term_open.append("Confirm three positive month-end balances from verified bank evidence.")
+        working_open.append("Confirm three positive month-end balances from verified bank evidence.")
     elif positive < 3:
         block(term_blocks, f"{TERM_PROGRAM_KEY}.positive_months", positive, "Three positive month-end balances are required.")
         block(working_blocks, f"{WORKING_CAPITAL_PROGRAM_KEY}.positive_months", positive, "Three positive month-end balances are required.")
 
     official = _bool(facts, "official_bank_statements")
     if official is None:
-        term_open.append("Confirm six current bank-produced statement months.")
-        working_open.append("Confirm six current bank-produced statement months.")
+        term_open.append("Confirm six current months through Plaid Assets or bank-produced PDF statements.")
+        working_open.append("Confirm six current months through Plaid Assets or bank-produced PDF statements.")
     elif official is False:
-        term_open.append("Six current bank-produced statements are still required; CSVs and screenshots are supplemental.")
-        working_open.append("Six current bank-produced statements are still required; CSVs and screenshots are supplemental.")
+        term_open.append("Six current verified bank months are still required; use Plaid Assets or bank-produced PDF statements. CSVs and screenshots are supplemental.")
+        working_open.append("Six current verified bank months are still required; use Plaid Assets or bank-produced PDF statements. CSVs and screenshots are supplemental.")
 
     nsfs = _number(facts, "nsf_count")
     if nsfs is None:
@@ -394,7 +394,7 @@ def evaluate_direct_programs(facts: dict[str, Any]) -> dict[str, Any]:
     annualized_bank_sales = _number(facts, "annualized_bank_sales")
     working_cap = 50_000.0
     if annualized_bank_sales is None:
-        working_open.append("Calculate annualized sales from the six current bank statements to confirm the 10-year amount cap.")
+        working_open.append("Calculate annualized sales from six current verified bank months to confirm the 10-year amount cap.")
     else:
         working_cap = min(working_cap, round(max(annualized_bank_sales, 0.0) * 0.50, 2))
         if working_cap < 15_000:

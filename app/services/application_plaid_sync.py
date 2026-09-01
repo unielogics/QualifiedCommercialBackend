@@ -8,13 +8,18 @@ from uuid import uuid4
 
 import boto3
 from botocore.config import Config
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.dealer_os.services import plaid_client
-from app.models.application_profile import ApplicationPlaidItem, ApplicationProfile
+from app.models.application_profile import (
+    ApplicationPlaidItem,
+    ApplicationProfile,
+    PlaidAssetReport,
+)
 from app.models.bucket import BucketFile
+from app.services import plaid_lifecycle
 from app.services.application_profiles import log_profile_action
 
 logger = logging.getLogger(__name__)
@@ -64,6 +69,88 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
     if profile is None or profile.primary_bucket_id is None:
         item.status = "error"
         item.error = "This application does not have an evidence bucket"
+        await db.flush()
+        return {"pulled": 0, "skipped": 0, "failed": 1}
+
+    if plaid_client.assets_enabled():
+        asset_items = list(
+            (
+                await db.execute(
+                    select(ApplicationPlaidItem).where(
+                        ApplicationPlaidItem.profile_id == profile.id,
+                        or_(
+                            ApplicationPlaidItem.status == "active",
+                            and_(
+                                ApplicationPlaidItem.status == "error",
+                                ApplicationPlaidItem.update_mode_reason.is_(None),
+                                ApplicationPlaidItem.encrypted_access_token.is_not(None),
+                            ),
+                        ),
+                        ApplicationPlaidItem.environment == plaid_client.environment(),
+                    )
+                )
+            ).scalars().all()
+        )
+        for asset_item in asset_items:
+            if asset_item.status == "error":
+                asset_item.status = "active"
+                asset_item.error = None
+        latest = (
+            await db.execute(
+                select(PlaidAssetReport)
+                .where(
+                    PlaidAssetReport.profile_id == profile.id,
+                    PlaidAssetReport.environment == plaid_client.environment(),
+                    PlaidAssetReport.removed_at.is_(None),
+                )
+                .order_by(PlaidAssetReport.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        source_ids = sorted(str(source.id) for source in asset_items)
+        current = bool(
+            latest is not None
+            and sorted(latest.source_item_ids or []) == source_ids
+            and latest.status in {"pending", "ready"}
+            and _now() - latest.created_at < timedelta(days=plaid_client.REFRESH_EVERY_DAYS)
+        )
+        try:
+            if not current:
+                latest = await plaid_lifecycle.create_asset_report(
+                    db,
+                    items=asset_items,
+                    profile_id=profile.id,
+                    days_requested=210,
+                )
+                await db.commit()
+        except plaid_client.PlaidUnavailable as exc:
+            if not plaid_client.statements_enabled():
+                item.status = "error"
+                item.error = str(exc)[:500]
+                item.last_pulled_at = _now()
+                item.next_refresh_at = _now() + timedelta(days=1)
+                await db.flush()
+                return {"pulled": 0, "skipped": 0, "failed": 1}
+        else:
+            if not plaid_client.statements_enabled():
+                item.status = "active"
+                item.error = None
+                item.last_pulled_at = _now()
+                item.next_refresh_at = _now() + timedelta(
+                    days=plaid_client.REFRESH_EVERY_DAYS
+                )
+                await db.flush()
+                return {
+                    "pulled": 0 if current else 1,
+                    "skipped": 1 if current else 0,
+                    "failed": 0,
+                }
+
+    if not plaid_client.statements_enabled():
+        item.status = "error"
+        item.error = "No supported Plaid bank-evidence product is enabled"
+        item.last_pulled_at = _now()
+        item.next_refresh_at = _now() + timedelta(days=1)
         await db.flush()
         return {"pulled": 0, "skipped": 0, "failed": 1}
     token = plaid_client.decrypt_token(item.encrypted_access_token)

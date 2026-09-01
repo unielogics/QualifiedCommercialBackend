@@ -1,17 +1,19 @@
 """Users router — operator-team listing + invite/edit/revoke."""
 
+# ruff: noqa: B008
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.deps import get_current_user, require_role
+from app.deps import require_role
 from app.enums import ContractSubjectType, ContractType, Role
 from app.models.contract_agreement import ContractAgreement
 from app.models.referral_partner_company import ReferralPartnerCompany
@@ -19,6 +21,19 @@ from app.models.user import User
 from app.services import clerk as clerk_service
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+_ACCOUNT_ACCESS_TYPES = {"funding", "field_desk", "audit"}
+
+
+def _account_types(user: User) -> list[str]:
+    values = set(user.account_access_types or [])
+    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
+        values.update(_ACCOUNT_ACCESS_TYPES)
+    elif user.role in {Role.BROKER, Role.REGIONAL_MANAGER}:
+        values.add("funding")
+    elif user.role == Role.FIELD_REP:
+        values.add("field_desk")
+    return sorted(values)
 
 
 class UserRead(BaseModel):
@@ -33,6 +48,7 @@ class UserRead(BaseModel):
     # have a contract in place" visibility the business owner asked for.
     # None when the user has no linked company (not a DEALER_PARTNER).
     company_agreement_signed: bool | None = None
+    account_types: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
@@ -49,6 +65,8 @@ class UserInvite(BaseModel):
     # the same company invited more than once links to the same row rather
     # than creating duplicates.
     company_name: str | None = None
+    referral_partner_company_id: UUID | None = None
+    account_types: list[str] | None = None
 
 
 class UserPatch(BaseModel):
@@ -61,6 +79,60 @@ class UserPatch(BaseModel):
     # locking that user out of _require_dealer_partner's company-agreement
     # check). Find-or-create by name, same as invite_user.
     company_name: str | None = None
+    referral_partner_company_id: UUID | None = None
+    account_types: list[str] | None = None
+
+
+class SignedCompanyRead(BaseModel):
+    id: UUID
+    name: str
+
+
+async def _signed_company(
+    db: AsyncSession, company_id: UUID
+) -> ReferralPartnerCompany:
+    company = await db.get(ReferralPartnerCompany, company_id)
+    if company is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
+    signed = (
+        await db.execute(
+            select(ContractAgreement.id).where(
+                ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
+                ContractAgreement.subject_type == ContractSubjectType.COMPANY,
+                ContractAgreement.subject_id == company_id,
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if signed is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The selected company does not have a signed Referral Protection Agreement.",
+        )
+    return company
+
+
+@router.get(
+    "/referral-companies/signed",
+    response_model=list[SignedCompanyRead],
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def list_signed_referral_companies(
+    db: AsyncSession = Depends(get_db),
+) -> list[SignedCompanyRead]:
+    rows = (
+        await db.execute(
+            select(ReferralPartnerCompany)
+            .join(
+                ContractAgreement,
+                (ContractAgreement.subject_id == ReferralPartnerCompany.id)
+                & (ContractAgreement.subject_type == ContractSubjectType.COMPANY)
+                & (ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION),
+            )
+            .distinct()
+            .order_by(ReferralPartnerCompany.name)
+        )
+    ).scalars().all()
+    return [SignedCompanyRead(id=row.id, name=row.name) for row in rows]
 
 
 @router.get(
@@ -104,6 +176,7 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
     results = []
     for r in rows:
         user_read = UserRead.model_validate(r)
+        user_read.account_types = _account_types(r)
         if r.referral_partner_company_id is not None:
             company = companies.get(r.referral_partner_company_id)
             user_read.referral_partner_company_name = company.name if company else None
@@ -149,22 +222,29 @@ async def invite_user(
             "VENDOR role belongs to bucket vendor access — use /buckets/admin/vendors.",
         )
     company_name = (body.company_name or "").strip()
-    if body.role == Role.DEALER_PARTNER and not company_name:
+    requested_access = set(body.account_types or [])
+    if not requested_access.issubset(_ACCOUNT_ACCESS_TYPES):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown account access type")
+    if body.role == Role.DEALER_PARTNER and not company_name and body.referral_partner_company_id is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Company name is required for Dealer Partner invites — their company must always have a "
             "signed Referral Protection Agreement on file.",
         )
 
-    referral_partner_company_id = None
-    if company_name:
+    referral_partner_company_id = body.referral_partner_company_id
+    if referral_partner_company_id is not None:
+        await _signed_company(db, referral_partner_company_id)
+    elif company_name:
         company = (
             await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
         ).scalar_one_or_none()
         if company is None:
-            company = ReferralPartnerCompany(name=company_name)
-            db.add(company)
-            await db.flush()
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "No company with that name and a signed agreement was found.",
+            )
+        await _signed_company(db, company.id)
         referral_partner_company_id = company.id
 
     existing = (
@@ -179,6 +259,7 @@ async def invite_user(
         existing.role = body.role
         existing.clerk_id = None  # force re-bind on next sign-in
         existing.referral_partner_company_id = referral_partner_company_id
+        existing.account_access_types = sorted(requested_access)
         user = existing
     else:
         user = User(
@@ -187,6 +268,7 @@ async def invite_user(
             role=body.role,
             clerk_id=None,  # bound on first sign-in via JIT provision
             referral_partner_company_id=referral_partner_company_id,
+            account_access_types=sorted(requested_access),
         )
         db.add(user)
 
@@ -204,7 +286,13 @@ async def invite_user(
         redirect_url=_INVITE_LANDING.get(body.role),
     )
 
-    return UserRead.model_validate(user)
+    result = UserRead.model_validate(user)
+    result.account_types = _account_types(user)
+    if referral_partner_company_id is not None:
+        company = await db.get(ReferralPartnerCompany, referral_partner_company_id)
+        result.referral_partner_company_name = company.name if company else None
+        result.company_agreement_signed = True
+    return result
 
 
 @router.patch(
@@ -217,7 +305,12 @@ async def update_user(
     body: UserPatch,
     db: AsyncSession = Depends(get_db),
 ) -> UserRead:
-    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.id == user_id)
+        )
+    ).scalar_one_or_none()
     if user is None or user.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
     if body.role is not None:
@@ -232,27 +325,54 @@ async def update_user(
         # link at all can never pass that check. Require one here, same as
         # invite_user, rather than silently leaving the role unusable.
         if body.role == Role.DEALER_PARTNER and user.referral_partner_company_id is None:
-            company_name = (body.company_name or "").strip()
-            if not company_name:
-                raise HTTPException(
-                    status.HTTP_400_BAD_REQUEST,
-                    "Company name is required to set the Dealer Partner role — their company must have a "
-                    "signed Referral Protection Agreement on file.",
-                )
-            company = (
-                await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
-            ).scalar_one_or_none()
-            if company is None:
-                company = ReferralPartnerCompany(name=company_name)
-                db.add(company)
-                await db.flush()
-            user.referral_partner_company_id = company.id
+            if body.referral_partner_company_id is not None:
+                await _signed_company(db, body.referral_partner_company_id)
+                user.referral_partner_company_id = body.referral_partner_company_id
+                user.role = body.role
+            else:
+                company_name = (body.company_name or "").strip()
+                if not company_name:
+                    raise HTTPException(
+                        status.HTTP_400_BAD_REQUEST,
+                        "Company name is required to set the Dealer Partner role — their company must have a "
+                        "signed Referral Protection Agreement on file.",
+                    )
+                company = (
+                    await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
+                ).scalar_one_or_none()
+                if company is None:
+                    raise HTTPException(
+                        status.HTTP_404_NOT_FOUND,
+                        "No company with that name and a signed agreement was found.",
+                    )
+                await _signed_company(db, company.id)
+                user.referral_partner_company_id = company.id
         user.role = body.role
     if body.name is not None:
         user.name = body.name
+    if "referral_partner_company_id" in body.model_fields_set:
+        if body.referral_partner_company_id is None and (body.role or user.role) == Role.DEALER_PARTNER:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Dealer Partner access requires a company with a signed agreement.",
+            )
+        if body.referral_partner_company_id is not None:
+            await _signed_company(db, body.referral_partner_company_id)
+        user.referral_partner_company_id = body.referral_partner_company_id
+    if body.account_types is not None:
+        requested_access = set(body.account_types)
+        if not requested_access.issubset(_ACCOUNT_ACCESS_TYPES):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown account access type")
+        user.account_access_types = sorted(requested_access)
     await db.flush()
     await db.refresh(user)
-    return UserRead.model_validate(user)
+    result = UserRead.model_validate(user)
+    result.account_types = _account_types(user)
+    if user.referral_partner_company_id is not None:
+        company = await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
+        result.referral_partner_company_name = company.name if company else None
+        result.company_agreement_signed = True
+    return result
 
 
 @router.delete(
@@ -272,7 +392,7 @@ async def revoke_user(
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if user is None or user.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
-    user.deleted_at = datetime.now(timezone.utc)
+    user.deleted_at = datetime.now(UTC)
     await db.flush()
     # Best-effort revoke in Clerk so the invited user can't sign in afterward.
     if user.clerk_id:

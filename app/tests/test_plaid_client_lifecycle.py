@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.dealer_os.services import plaid_client
+from app.services import plaid_lifecycle
 
 
 @pytest.fixture(autouse=True)
@@ -13,12 +14,12 @@ def _plaid_environment(monkeypatch):
     monkeypatch.setenv("DEALER_OS_PLAID_SECRET", "secret")
     monkeypatch.setenv("DEALER_OS_PLAID_ENV", "production")
     monkeypatch.setenv("DEALER_OS_PLAID_PRODUCTS", "statements,assets")
-    monkeypatch.setenv("DEALER_OS_PLAID_CLIENT_NAME", "Qualified Commercial - Capital OS")
+    monkeypatch.setenv("DEALER_OS_PLAID_CLIENT_NAME", "Qualified Commercial")
     monkeypatch.setenv("DEALER_OS_PLAID_WEBHOOK_URL", "https://api.example.test/plaid")
 
 
 @pytest.mark.asyncio
-async def test_initial_link_uses_company_name_and_selected_products(monkeypatch):
+async def test_initial_link_uses_fixed_platform_name_and_selected_products(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -32,13 +33,34 @@ async def test_initial_link_uses_company_name_and_selected_products(monkeypatch)
 
     assert token == "link-production"
     assert captured["path"] == "/link/token/create"
-    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
     assert captured["payload"]["products"] == ["assets", "statements"]
     assert captured["payload"]["webhook"] == "https://api.example.test/plaid"
 
 
 @pytest.mark.asyncio
-async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkeypatch):
+async def test_assets_only_link_does_not_request_unentitled_statements(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("DEALER_OS_PLAID_PRODUCTS", "assets")
+
+    async def fake_post(path, payload, **_kwargs):
+        captured.update(path=path, payload=payload)
+        return SimpleNamespace(json=lambda: {"link_token": "link-assets"})
+
+    monkeypatch.setattr(plaid_client, "_post", fake_post)
+    token = await plaid_client.create_link_token(
+        dealer_id="file-1", dealer_name="Northstar Holdings LLC"
+    )
+
+    assert token == "link-assets"
+    assert captured["payload"]["products"] == ["assets"]
+    assert "statements" not in captured["payload"]
+    assert plaid_client.assets_enabled() is True
+    assert plaid_client.statements_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_initial_link_never_exposes_a_long_customer_name(monkeypatch):
     captured = {}
 
     async def fake_post(path, payload, **_kwargs):
@@ -51,8 +73,7 @@ async def test_initial_link_trims_long_company_name_before_plaid_fallback(monkey
         dealer_name="Very Long Operating Company LLC",
     )
 
-    assert captured["payload"]["client_name"] == "Very Long Operating Company"
-    assert len(captured["payload"]["client_name"]) <= 30
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
 
 
 @pytest.mark.asyncio
@@ -74,8 +95,51 @@ async def test_update_link_can_request_new_account_selection(monkeypatch):
     assert token == "update-production"
     assert captured["path"] == "/link/token/create"
     assert captured["payload"]["access_token"] == "access-production"
-    assert captured["payload"]["client_name"] == "Northstar Holdings LLC"
+    assert captured["payload"]["client_name"] == "Qualified Commercial"
     assert captured["payload"]["update"] == {"account_selection_enabled": True}
+
+
+@pytest.mark.asyncio
+async def test_completed_update_invalidates_cached_asset_report(monkeypatch):
+    invalidated = {}
+    item = SimpleNamespace(
+        environment="production",
+        encrypted_access_token="encrypted-token",
+        accounts_label="Old operating account",
+        status="error",
+        error="reauthentication required",
+        update_mode_reason="new_accounts_available",
+        update_mode_account_selection=True,
+        next_refresh_at=None,
+    )
+    db = object()
+
+    monkeypatch.setattr(plaid_lifecycle, "decrypted_access_token", lambda _item: "access-token")
+
+    async def fake_item_get(_token):
+        return {"item": {"error": None}}
+
+    async def fake_accounts_get(_token):
+        return [
+            {"name": "Operating", "mask": "4812"},
+            {"name": "Payroll", "mask": "9021"},
+        ]
+
+    async def fake_remove_reports(target_db, target_item, *, strict):
+        invalidated.update(db=target_db, item=target_item, strict=strict)
+
+    monkeypatch.setattr(plaid_client, "item_get", fake_item_get)
+    monkeypatch.setattr(plaid_client, "accounts_get", fake_accounts_get)
+    monkeypatch.setattr(plaid_lifecycle, "remove_reports_for_item", fake_remove_reports)
+
+    await plaid_lifecycle.complete_update(db, item)
+
+    assert item.accounts_label == "Operating ··4812 · Payroll ··9021"
+    assert item.status == "active"
+    assert item.update_mode_reason is None
+    assert item.update_mode_account_selection is False
+    assert item.next_refresh_at is not None
+    assert invalidated == {"db": db, "item": item, "strict": False}
 
 
 @pytest.mark.asyncio

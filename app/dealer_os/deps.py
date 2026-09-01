@@ -62,7 +62,7 @@ def require_team_or_rep(user: User) -> None:
     """Field reps and the team. A rep is confined to their own book by
     resolve_dealer_scope and by the one list filter; this only decides who may
     knock."""
-    if user.role not in _TEAM_ROLES and user.role != Role.FIELD_REP:
+    if user.role not in _TEAM_ROLES and not is_rep(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Rep or team role required for Capital OS"
         )
@@ -71,19 +71,26 @@ def require_team_or_rep(user: User) -> None:
 def require_team_or_dealer_or_rep(user: User) -> None:
     """Every role with a legitimate view of a client file: the team, the
     client themselves, and the rep who owns it."""
-    if user.role not in _TEAM_ROLES and user.role != Role.FIELD_REP and not is_audit_client(user):
+    if (
+        user.role not in _TEAM_ROLES
+        and not is_rep(user)
+        and not is_audit_client(user)
+    ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "No access to Capital OS"
         )
 
 
 def require_field_rep(user: User) -> None:
-    if user.role != Role.FIELD_REP:
+    if not is_rep(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Field-rep role required")
 
 
 def is_rep(user: User) -> bool:
-    return user.role == Role.FIELD_REP
+    return user.role == Role.FIELD_REP or (
+        user.role == Role.BROKER
+        and "field_desk" in (getattr(user, "account_access_types", None) or [])
+    )
 
 
 async def load_dealer(db: AsyncSession, dealer_id: UUID) -> DealerBusiness:
@@ -103,10 +110,15 @@ async def resolve_dealer_scope(db: AsyncSession, user: User, dealer_id: UUID) ->
     gets 403 rather than falling through to unrestricted access, which is what
     the earlier shape did."""
     dealer = await load_dealer(db, dealer_id)
+    # Training files are intentionally absent from every ordinary staff view.
+    # Return the same 404 as an unknown id so the classification cannot be
+    # discovered by probing a URL.
+    if getattr(dealer, "is_training", False) and user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     if is_audit_client(user):
         if dealer.dealer_user_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
-    elif user.role == Role.FIELD_REP:
+    elif is_rep(user):
         if dealer.owner_user_id != user.id or dealer.archived_at is not None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     elif user.role not in _TEAM_ROLES:

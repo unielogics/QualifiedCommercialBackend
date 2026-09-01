@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -12,6 +12,7 @@ from app.dealer_os.models import DealerOwner
 from app.dealer_os.router import (
     _assert_owner_email_unique,
     _normalized_owner_email,
+    _statement_window_complete,
     grant_bank_consent,
     plaid_exchange,
     plaid_link_token,
@@ -24,15 +25,15 @@ from app.dealer_os.schemas import (
     DealerCreate,
     PlaidExchange,
     PlaidItemPatch,
-    PublicPlaidItemRead,
     PublicConsentSubmit,
+    PublicPlaidItemRead,
     RoomFeaturesRead,
     VerificationRead,
 )
-from app.schemas.application_profile import PublicFileOwnerConsentSubmit
 from app.dealer_os.services import plaid_client
 from app.dealer_os.services.decision import assess_verification
 from app.enums import Role
+from app.schemas.application_profile import PublicFileOwnerConsentSubmit
 
 
 class _ScalarResult:
@@ -180,6 +181,39 @@ def test_verification_requires_complete_ownership_and_all_required_credit() -> N
     assert missing_screen.unlocked is False
     assert missing_screen.stage == "verification"
     assert "eligibility checkpoint" in missing_screen.reason
+
+
+def test_three_month_bank_exception_uses_latest_completed_months() -> None:
+    months = {"2026-05", "2026-06", "2026-07", "2026-08"}
+    three_complete, missing_three = _statement_window_complete(
+        months, window=3, as_of=date(2026, 8, 31)
+    )
+    six_complete, missing_six = _statement_window_complete(
+        months, window=6, as_of=date(2026, 8, 31)
+    )
+
+    assert three_complete is True
+    assert missing_three == []
+    assert six_complete is False
+    assert missing_six == ["2026-02", "2026-03", "2026-04"]
+
+    result = assess_verification(
+        bank_linked=True,
+        credit_returned=True,
+        ownership_total=100,
+        ownership_complete=True,
+        owner_contact_complete=True,
+        required_credit_owner_count=1,
+        completed_credit_owner_count=1,
+        pre_screen_complete=True,
+        statement_target=3,
+        bank_exception_available=True,
+        bank_exception_active=True,
+    )
+    assert result.unlocked is True
+    assert result.statement_target == 3
+    assert result.bank_exception_active is True
+    assert "3-month exception" in result.reason
 
 
 def test_verification_blocks_missing_required_owner_contact() -> None:

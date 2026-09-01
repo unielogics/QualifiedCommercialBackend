@@ -1,7 +1,7 @@
 """Unified client product access and access audit.
 
-Revision ID: 0162_unified_client_access
-Revises: 0161_field_desk_routing_resolution
+Revision ID: 0165_unified_client_access
+Revises: 0164_plaid_assets_ingestion
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0162_unified_client_access"
-down_revision = "0161_field_desk_routing_resolution"
+revision = "0165_unified_client_access"
+down_revision = "0164_plaid_assets_ingestion"
 branch_labels = None
 depends_on = None
 

@@ -68,7 +68,7 @@ async def _visible_intakes(db: AsyncSession, user: User) -> list[PublicUnderwrit
 
 
 async def _visible_dealers(db: AsyncSession, user: User) -> list[DealerBusiness]:
-    stmt = select(DealerBusiness).limit(SCAN_LIMIT)
+    stmt = select(DealerBusiness).where(DealerBusiness.is_training.is_(False)).limit(SCAN_LIMIT)
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         pass
     elif is_audit_client(user):

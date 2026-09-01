@@ -548,7 +548,7 @@ async def stripe_webhook(request: Request) -> dict[str, bool]:
 
 
 @router.post("/plaid")
-async def plaid_webhook(request: Request) -> Response:
+async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> Response:
     """Plaid item and statement events.
 
     Verified by signature, not by a URL secret. The body carries an item_id and
@@ -587,6 +587,13 @@ async def plaid_webhook(request: Request) -> Response:
     async with SessionLocal() as db:
         outcome = await plaid_webhook.handle(db, payload)
         await db.commit()
+
+    if outcome == "asset report ready" and payload.get("asset_report_id"):
+        from app.dealer_os.services.plaid_assets import ingest_asset_report_background
+
+        background_tasks.add_task(
+            ingest_asset_report_background, str(payload["asset_report_id"])
+        )
 
     log.info(
         "plaid webhook: %s/%s -> %s",

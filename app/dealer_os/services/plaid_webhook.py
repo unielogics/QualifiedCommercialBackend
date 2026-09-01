@@ -92,6 +92,8 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         if report is None:
             return "ignored: unknown asset report"
         if code == "PRODUCT_READY":
+            if report.ingested_at is not None:
+                return "asset report already ingested"
             report.status = "ready"
             report.error = None
             report.ready_at = _now()
