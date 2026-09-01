@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import hashlib
 import html
 import io
@@ -14,7 +16,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -64,6 +66,7 @@ from .services.product_finder import QUESTIONS, screen_products
 from .services.targets import propose_targets
 
 router = APIRouter(prefix="/dealer-os", tags=["dealer-os-crm"])
+log = logging.getLogger(__name__)
 
 _CATALOG_SUMMARIES = {
     "term_loan_3_5_year": {"en": "Structured working capital or debt refinance with predictable monthly payments.", "es": "Capital de trabajo o refinanciamiento de deuda con pagos mensuales predecibles."},
@@ -1426,6 +1429,16 @@ def _artifact_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _sms_sender() -> str | None:
+    """The number/service the selected SMS provider sends from, for the record."""
+    from app.dealer_os.services.sms_provider import provider_sender
+
+    try:
+        return provider_sender()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @router.post("/product-presentations", status_code=status.HTTP_201_CREATED)
 async def present_products(payload: ProductPresentationIn, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict:
     require_team_or_rep(user)
@@ -1502,16 +1515,27 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
         db.add(artifact)
         await db.flush()
         base = get_settings().public_api_url.rstrip("/")
-        secure_url = f"{base}/api/v1/dealer-os/public/product-presentations/{token}"
+        # The page, not the PDF: it opens in a phone browser, and carries a
+        # download link for anyone who wants the document itself.
+        secure_url = f"{base}/api/v1/dealer-os/public/product-presentations/{token}/view"
         sms_body = payload.message or (
             f"Qualified Commercial funding options: {secure_url} Link expires in 7 days."
             if payload.locale == "en"
             else f"Opciones de financiamiento de Qualified Commercial: {secure_url} El enlace vence en 7 dias."
         )
-        sms_result = await run_in_threadpool(
-            consent_delivery._send_sms,  # noqa: SLF001 - shared production SMS adapter.
-            contact.phone_e164,
-            sms_body,
+        # Through the guarded seam, not the raw transport. The direct
+        # _send_sms call this replaces skipped the opt-out suppression list and
+        # never reached the sms_messages ledger, so a program link could be
+        # texted to someone who had replied STOP and would appear in no inbox.
+        # The affirmative-consent check above still applies: it answers "did
+        # they opt in", which is a different question from "did they opt out".
+        from app.services import sms as sms_service
+
+        sms_result = await sms_service.send_sms_checked(
+            db,
+            to_phone=contact.phone_e164,
+            body=sms_body,
+            context="program_presentation",
         )
         delivery = "sent" if sms_result.ok else "failed"
         provider_detail = sms_result.detail
@@ -1531,7 +1555,9 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
             delivery_status=delivery,
             provider=sms_result.provider if sms_result is not None else "ses",
             provider_message_id=(
-                sms_result.provider_message_id
+                # SmsResult names it message_id; the old DeliveryResult said
+                # provider_message_id.
+                (sms_result.message_id or None)
                 if sms_result is not None
                 else provider_detail[:160] or None
             ),
@@ -1540,7 +1566,8 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
                 if sms_result is not None and not sms_result.ok
                 else None
             ),
-            sender=sms_result.sender if sms_result is not None else user.email,
+            # SmsResult carries no sender; the selected provider knows it.
+            sender=(_sms_sender() if sms_result is not None else user.email),
             recipient=contact.email if payload.channel == "email" else contact.phone_e164,
             read_at=datetime.now(timezone.utc),
         ))
@@ -1555,6 +1582,192 @@ async def present_products(payload: ProductPresentationIn, user: CurrentUser, db
         "secure_url": secure_url,
         "thread_id": str(thread.id) if thread else None,
     }
+
+
+def _render_catalog_page(
+    rows: list[DealerProductCatalog],
+    locale: str,
+    requested_amount: float | None,
+    pdf_url: str,
+) -> str:
+    """The same programs as the PDF, as a page a phone can actually read.
+
+    The link we text lands here rather than on a PDF download: on a handset a
+    PDF is a file to fetch and pinch-zoom, and the recipient is standing in
+    their shop. Same content, same disclosures, same catalog rows — the PDF is
+    still one tap away for anyone who wants the document.
+
+    Server-rendered with no scripts or external assets, because it has to open
+    over any connection and in whatever browser a text message hands it to.
+    """
+    es = locale == "es"
+
+    def esc(value: object) -> str:
+        return html.escape(str(value if value is not None else ""))
+
+    def bullets(title: str, items: list) -> str:
+        if not items:
+            return ""
+        lis = "".join(f"<li>{esc(i)}</li>" for i in items)
+        return f"<h3>{esc(title)}</h3><ul>{lis}</ul>"
+
+    cards = ""
+    for row in rows:
+        item = _catalog_item(row, locale, requested_amount)
+        details = item["details"]
+        amount_min, amount_max = item.get("amount_min"), item.get("amount_max")
+        if amount_min or amount_max:
+            span = f"${float(amount_min or 0):,.0f} – ${float(amount_max or 0):,.0f}"
+        else:
+            span = "Amount determined after review" if not es else "Monto definido tras revision"
+        terms = ""
+        if item.get("term_min_months") or item.get("term_max_months"):
+            lo, hi = item.get("term_min_months") or 0, item.get("term_max_months") or 0
+            terms = f"<div class='row'><span>{'Plazo' if es else 'Term'}</span><b>{lo}–{hi} {'meses' if es else 'months'}</b></div>"
+
+        scenarios = ""
+        for sc in item.get("term_scenarios") or []:
+            heading = f"{int(sc['term_months'])} {'meses' if es else 'months'}"
+            if not sc.get("calculation_available"):
+                scenarios += f"<div class='sc'><b>{esc(heading)}</b><span>{esc(sc.get('unavailable_reason') or ('Terms determined after review' if not es else 'Terminos definidos tras revision'))}</span></div>"
+                continue
+            best = sc["best"]
+            scenarios += (
+                f"<div class='sc'><b>{esc(heading)}</b>"
+                f"<div class='row'><span>{'Tasa' if es else 'Rate'}</span><b>{float(best['annual_rate']) * 100:.2f}%</b></div>"
+                f"<div class='row'><span>{'Pago mensual' if es else 'Monthly payment'}</span><b>${float(best['monthly_payment']):,.2f}</b></div>"
+                f"<div class='row'><span>{'Pagos totales' if es else 'Total payments'}</span><b>${float(best['total_payments']):,.2f}</b></div>"
+                "</div>"
+            )
+
+        sections = (
+            bullets("Usos" if es else "Uses", details.get("uses") or [])
+            + bullets("Mejor perfil" if es else "Best fit", details.get("best_fit") or [])
+            + bullets("Requisitos minimos" if es else "Minimum requirements", details.get("minimum_requirements") or [])
+            + bullets("Documentos esperados" if es else "Expected documents", details.get("documents") or [])
+            + bullets("Limitaciones" if es else "Limitations", details.get("exclusions") or [])
+        )
+        cards += (
+            f"<article><h2>{esc(item['name'])}</h2>"
+            f"<p class='sum'>{esc(item.get('summary') or '')}</p>"
+            f"<div class='amt'>{esc(span)}</div>"
+            f"<div class='row'><span>{'Precio' if es else 'Pricing'}</span><b>{esc(item.get('pricing') or ('Sujeto a revision' if es else 'Subject to review'))}</b></div>"
+            f"{terms}"
+            + (f"<p class='when'>{esc(details.get('closing_timeline'))}</p>" if details.get("closing_timeline") else "")
+            + scenarios + sections
+            + (f"<p class='disc'>{esc(item.get('disclosure'))}</p>" if item.get("disclosure") else "")
+            + "</article>"
+        )
+
+    title = "Opciones de financiamiento" if es else "Your funding options"
+    footer = (
+        "Evaluacion preliminar; no es un compromiso de prestamo."
+        if es else "Preliminary fit only; not a commitment to lend."
+    )
+    return (
+        "<!doctype html><html lang='" + ("es" if es else "en") + "'><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta name='robots' content='noindex,nofollow'>"
+        f"<title>{esc(title)} · Qualified Commercial</title>"
+        "<style>"
+        ":root{--ink:#101828;--muted:#667085;--line:#e4e9f0;--surface:#fff;--bg:#f6f8fb;--accent:#174b84}"
+        "*{box-sizing:border-box}"
+        "body{margin:0;background:var(--bg);color:var(--ink);"
+        "font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+        "-webkit-text-size-adjust:100%}"
+        ".wrap{max-width:640px;margin:0 auto;padding:20px 16px 56px}"
+        "header{padding:8px 0 18px}"
+        "h1{font-size:24px;line-height:1.2;margin:0 0 6px}"
+        ".lede{color:var(--muted);margin:0}"
+        "article{background:var(--surface);border:1px solid var(--line);border-radius:14px;"
+        "padding:18px;margin:14px 0}"
+        "h2{font-size:19px;margin:0 0 6px}"
+        ".sum{color:var(--muted);margin:0 0 12px}"
+        ".amt{font-size:20px;font-weight:700;color:var(--accent);padding:10px 0;"
+        "border-top:1px solid var(--line);border-bottom:1px solid var(--line)}"
+        ".row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)}"
+        ".row span{color:var(--muted)}.row b{text-align:right}"
+        ".when{margin:12px 0 0;font-weight:600}"
+        ".sc{background:var(--bg);border-radius:10px;padding:12px;margin:12px 0}"
+        ".sc>b{display:block;margin-bottom:4px}"
+        ".sc .row:last-child{border-bottom:0}"
+        "h3{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:16px 0 4px}"
+        "ul{margin:0;padding-left:20px}li{margin:4px 0}"
+        ".disc{color:var(--muted);font-size:13px;margin:16px 0 0}"
+        # 44px minimum target: this is tapped with a thumb, outdoors.
+        ".pdf{display:block;text-align:center;background:var(--accent);color:#fff;"
+        "text-decoration:none;font-weight:600;padding:15px;border-radius:12px;margin:22px 0 10px}"
+        "footer{color:var(--muted);font-size:13px;text-align:center;margin-top:18px}"
+        "@media(prefers-color-scheme:dark){"
+        ":root{--ink:#e8edf4;--muted:#98a4b5;--line:#26303d;--surface:#161c24;--bg:#0f141a;--accent:#7fb0ea}"
+        ".pdf{color:#0f141a}}"
+        "</style></head><body><div class='wrap'>"
+        f"<header><h1>{esc(title)}</h1>"
+        f"<p class='lede'>{'Preparado por Qualified Commercial' if es else 'Prepared for you by Qualified Commercial'}</p></header>"
+        f"{cards}"
+        f"<a class='pdf' href='{esc(pdf_url)}'>{'Descargar PDF' if es else 'Download the PDF'}</a>"
+        f"<footer>{esc(footer)}</footer>"
+        "</div></body></html>"
+    )
+
+
+@router.get("/public/product-presentations/{token}/view", include_in_schema=False)
+async def public_product_presentation_page(
+    token: str, db: AsyncSession = Depends(get_db)
+) -> HTMLResponse:
+    """The presented programs as a mobile page. Same token, same expiry.
+
+    Pinned to what was actually presented: program_keys and catalog_versions
+    are read off the presentation row, so a recipient opening the link next
+    week sees the offer they were given, not whatever the catalog says today.
+    """
+    artifact = (
+        await db.execute(
+            select(DealerProductPresentationArtifact).where(
+                DealerProductPresentationArtifact.token_hash == _artifact_token_hash(token)
+            )
+        )
+    ).scalar_one_or_none()
+    if artifact is None or artifact.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This presentation link is no longer available")
+
+    presentation = await db.get(DealerProductPresentation, artifact.presentation_id)
+    if presentation is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This presentation link is no longer available")
+
+    keys = list(presentation.program_keys or [])
+    rows = list(
+        (
+            await db.execute(
+                select(DealerProductCatalog)
+                .where(DealerProductCatalog.program_key.in_(keys))
+                .order_by(DealerProductCatalog.sort_order)
+            )
+        ).scalars().all()
+    )
+    # Honour the versions recorded at presentation time where they still exist;
+    # a row that has since moved on is shown rather than dropped, because an
+    # empty page helps nobody standing in a shop.
+    pinned = presentation.catalog_versions or {}
+    rows.sort(key=lambda r: keys.index(r.program_key) if r.program_key in keys else len(keys))
+    stale = [r.program_key for r in rows if pinned.get(r.program_key) not in (None, r.version)]
+    if stale:
+        log.info("presentation %s rendering %d program(s) newer than presented", presentation.id, len(stale))
+
+    illustration_amount = None
+    if presentation.session_id:
+        finder = await db.get(DealerProductFinderSession, presentation.session_id)
+        if finder is not None:
+            illustration_amount = float(finder.client_requested_amount or 0) or None
+
+    base = get_settings().public_api_url.rstrip("/")
+    pdf_url = f"{base}/api/v1/dealer-os/public/product-presentations/{token}"
+    page = await run_in_threadpool(
+        _render_catalog_page, rows, presentation.locale, illustration_amount, pdf_url
+    )
+    # Not cached: the link is revocable, and a cached copy would outlive that.
+    return HTMLResponse(page, headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex"})
 
 
 @router.get("/public/product-presentations/{token}", include_in_schema=False)

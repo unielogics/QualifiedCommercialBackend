@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import false as sql_false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -299,6 +299,43 @@ async def _rep_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
     if user.role == Role.FIELD_REP:
         stmt = stmt.where(DealerRepInboxThread.owner_user_id == user.id)
     rows = list((await db.execute(stmt.order_by(DealerRepInboxThread.last_message_at.desc().nullslast()).limit(SCAN_LIMIT))).all())
+    if not rows:
+        return []
+
+    # Previews and counts. Without these every rep row in the contact accordion
+    # renders blank, which is what a rep sees most of — their book is rep leads.
+    thread_ids = [thread.id for thread, _ in rows]
+    counts: dict[UUID, int] = {}
+    latest_body: dict[UUID, str] = {}
+    for tid, n in (
+        await db.execute(
+            select(DealerRepInboxMessage.thread_id, func.count())
+            .where(DealerRepInboxMessage.thread_id.in_(thread_ids))
+            .group_by(DealerRepInboxMessage.thread_id)
+        )
+    ).all():
+        counts[tid] = n
+    # One row per thread: the newest message, via a window rather than a query
+    # per thread — a rep with a full book would otherwise fan out badly.
+    ranked = (
+        select(
+            DealerRepInboxMessage.thread_id,
+            DealerRepInboxMessage.body,
+            func.row_number()
+            .over(
+                partition_by=DealerRepInboxMessage.thread_id,
+                order_by=DealerRepInboxMessage.created_at.desc(),
+            )
+            .label("rn"),
+        )
+        .where(DealerRepInboxMessage.thread_id.in_(thread_ids))
+        .subquery()
+    )
+    for tid, body in (
+        await db.execute(select(ranked.c.thread_id, ranked.c.body).where(ranked.c.rn == 1))
+    ).all():
+        latest_body[tid] = body
+
     return [
         UnifiedCommunicationThread(
             id=f"rep:{thread.id}",
@@ -313,8 +350,9 @@ async def _rep_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
             channel=thread.channel,
             transport=thread.channel,
             unread_count=thread.unread_count,
-            message_count=0,
-            latest_snippet=None,
+            message_count=counts.get(thread.id, 0),
+            latest_snippet=_snippet(latest_body.get(thread.id)),
+            participant_phone=contact.phone_e164 if contact else None,
             latest_at=thread.last_message_at or thread.created_at,
             assigned_desk=str(thread.owner_user_id) if thread.owner_user_id else None,
             href=f"/admin/dealer-messages?rep_thread={thread.id}",
@@ -368,11 +406,13 @@ async def _email_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicat
 async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicationThread]:
     """The sms_messages ledger as an inbox source — one thread per person.
 
-    Grouped by client where the number matched one, by bare number where it
-    did not. Visibility follows the client book; unattributed numbers stay
-    admin-only, same as the /sms router.
+    Grouped by the number. Visibility follows the book the role actually has:
+    operators see everything, brokers see their clients, and a field rep sees
+    the numbers belonging to rep contacts they own — which is the only book a
+    rep has, since rep leads are not clients. Unattributed numbers stay
+    admin-only either way.
     """
-    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP):
+    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER):
         return []
     stmt = (
         select(SmsMessage, Client)
@@ -380,9 +420,43 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
         .order_by(SmsMessage.created_at.asc())
         .limit(SCAN_LIMIT)
     )
-    if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+    if user.role == Role.FIELD_REP:
+        # A rep's book is their contacts' phone numbers. Compared on normalized
+        # digits so a contact stored "(862) 384-1951" still matches ledger rows
+        # written as "+18623841951".
+        owned = list(
+            (
+                await db.execute(
+                    select(DealerRepContact.phone_e164).where(
+                        DealerRepContact.owner_user_id == user.id,
+                        DealerRepContact.phone_e164.is_not(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        keys = {k for k in (_phone_key(p) for p in owned) if k}
+        if not keys:
+            return []
+        digits = func.regexp_replace(SmsMessage.phone_e164, r"\D", "", "g")
+        stmt = stmt.where(or_(*[digits.like(f"%{k}") for k in keys]))
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         stmt = stmt.where(SmsMessage.client_id.in_(scope_client_query(user, select(Client.id))))
     rows = list((await db.execute(stmt)).all())
+
+    # Rep leads are not clients, so a number that belongs to one would render as
+    # a bare phone number. Resolve those names too, scoped to what the viewer
+    # may see, keyed on normalized digits like everything else.
+    contact_stmt = select(DealerRepContact).where(DealerRepContact.phone_e164.is_not(None))
+    if user.role == Role.FIELD_REP:
+        contact_stmt = contact_stmt.where(DealerRepContact.owner_user_id == user.id)
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        contact_stmt = contact_stmt.where(sql_false())
+    rep_by_key: dict[str, DealerRepContact] = {}
+    for contact in (await db.execute(contact_stmt.limit(SCAN_LIMIT))).scalars():
+        key = _phone_key(contact.phone_e164)
+        if key:
+            rep_by_key.setdefault(key, contact)
+
     # Keyed on the NUMBER, not the client. Texting is a conversation with a
     # phone: an outbound send with no client link and the inbound reply that
     # matched a client are the same thread to everyone except the database.
@@ -396,23 +470,51 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
         latest, _ = members[-1]
         # Address the thread by a real number, not the identity key.
         key = latest.phone_e164
-        # Any message on this number that resolved to a client names the thread.
+        # Any message on this number that resolved to a client names the thread;
+        # failing that, a rep contact on the same number does.
         client = next((c for _, c in reversed(members) if c is not None), None)
+        rep_contact = None if client is not None else rep_by_key.get(_key)
         # A blocked or failed send is worth surfacing in the preview — "why
         # didn't the text go out" should be visible from the inbox row.
         snippet = latest.body or latest.detail or latest.status
         result.append(
             UnifiedCommunicationThread(
                 id=f"sms:phone:{key}",
-                title=(client.name if client is not None else latest.phone_e164),
-                participant_name=client.name if client is not None else None,
-                participant_email=client.email if client is not None else None,
+                title=(
+                    client.name
+                    if client is not None
+                    else rep_contact.full_name
+                    if rep_contact is not None
+                    else latest.phone_e164
+                ),
+                participant_name=(
+                    client.name
+                    if client is not None
+                    else rep_contact.full_name
+                    if rep_contact is not None
+                    else None
+                ),
+                participant_email=(
+                    client.email
+                    if client is not None
+                    else rep_contact.email
+                    if rep_contact is not None
+                    else None
+                ),
                 participant_phone=latest.phone_e164,
-                participant_type="client",
+                participant_type="client" if client is not None else "rep_lead" if rep_contact is not None else "client",
                 source_kind="sms",
-                source_id=str(client.id) if client is not None else latest.phone_e164,
+                source_id=(
+                    str(client.id)
+                    if client is not None
+                    else str(rep_contact.id)
+                    if rep_contact is not None
+                    else latest.phone_e164
+                ),
                 source_ref=None,
-                source_label="Text messages",
+                source_label=(
+                    rep_contact.company if rep_contact is not None and rep_contact.company else "Text messages"
+                ),
                 channel="sms",
                 transport="sms",
                 unread_count=0,
@@ -634,7 +736,22 @@ async def list_communication_contacts(
     )
 
 
-_OPERATOR_DENY = (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP)
+#: Roles with no one to start a conversation with from this inbox. FIELD_REP is
+#: deliberately absent: a rep composes to the contacts they own, resolved below.
+_OPERATOR_DENY = (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER)
+
+
+async def _own_rep_contacts(db: AsyncSession, user: User) -> list[DealerRepContact]:
+    """Rep contacts this user may message. Empty for roles with no rep book."""
+    stmt = select(DealerRepContact).order_by(
+        DealerRepContact.last_activity_at.desc().nullslast(),
+        DealerRepContact.updated_at.desc(),
+    )
+    if user.role == Role.FIELD_REP:
+        stmt = stmt.where(DealerRepContact.owner_user_id == user.id)
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        return []
+    return list((await db.execute(stmt.limit(SCAN_LIMIT))).scalars().all())
 
 
 @router.get("/recipients", response_model=list[ComposeRecipient])
@@ -657,6 +774,19 @@ async def search_compose_recipients(
         return not term or term in " ".join(f for f in fields if f).lower()
 
     out: list[ComposeRecipient] = []
+
+    for contact in await _own_rep_contacts(db, user):
+        if matches(contact.full_name, contact.company, contact.email, contact.phone_e164):
+            out.append(ComposeRecipient(
+                kind="rep_contact", id=str(contact.id), name=contact.full_name,
+                label=contact.company or "Field contact",
+                email=contact.email, phone=contact.phone_e164,
+            ))
+
+    if user.role == Role.FIELD_REP:
+        # A rep's book is their contacts. Clients, intake leads and audit files
+        # belong to the funding desk and are not theirs to open a thread with.
+        return out[:limit]
 
     client_stmt = scope_client_query(user, select(Client)).order_by(Client.created_at.desc()).limit(SCAN_LIMIT)
     for client in (await db.execute(client_stmt)).scalars():
@@ -705,6 +835,13 @@ async def compose_new_message(
         if intake is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Intake lead not found")
         name, email, phone = intake.full_name, intake.email, intake.phone
+    elif payload.recipient_kind == "rep_contact":
+        contact = next(
+            (c for c in await _own_rep_contacts(db, user) if str(c.id) == payload.recipient_id), None
+        )
+        if contact is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Contact not found")
+        name, email, phone = contact.full_name, contact.email, contact.phone_e164
     else:
         dealer = next((d for d in await _visible_dealers(db, user) if str(d.id) == payload.recipient_id), None)
         if dealer is None:

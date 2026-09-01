@@ -106,7 +106,7 @@ class UnifiedContactPage(BaseModel):
 class ComposeRecipient(BaseModel):
     """One row in the new-message recipient picker."""
 
-    kind: Literal["client", "intake", "dealer"]
+    kind: Literal["client", "intake", "dealer", "rep_contact"]
     id: str
     name: str
     label: str | None = None
@@ -115,7 +115,7 @@ class ComposeRecipient(BaseModel):
 
 
 class UnifiedComposeRequest(BaseModel):
-    recipient_kind: Literal["client", "intake", "dealer"]
+    recipient_kind: Literal["client", "intake", "dealer", "rep_contact"]
     recipient_id: str
     channels: list[Literal["sms", "email"]] = Field(min_length=1)
     subject: str | None = Field(None, max_length=300)
