@@ -35,6 +35,10 @@ from app.schemas.communication import (
     UnifiedCommunicationThread,
     UnifiedCommunicationThreadDetail,
     UnifiedCommunicationThreadPage,
+    ComposeChannelResult,
+    ComposeRecipient,
+    UnifiedComposeRequest,
+    UnifiedComposeResult,
     UnifiedContactGroup,
     UnifiedContactPage,
 )
@@ -560,6 +564,122 @@ async def list_communication_contacts(
         total=len(contacts),
         unread_total=sum(c.unread_total for c in contacts),
     )
+
+
+_OPERATOR_DENY = (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP)
+
+
+@router.get("/recipients", response_model=list[ComposeRecipient])
+async def search_compose_recipients(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str | None = Query(None, max_length=120),
+    limit: int = Query(15, ge=1, le=40),
+) -> list[ComposeRecipient]:
+    """Who a new message can go to: clients, AI-intake leads, audit files.
+
+    One search across all three, each row carrying what the composer needs to
+    decide which channels are even possible — no phone, no SMS checkbox.
+    """
+    if user.role in _OPERATOR_DENY:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
+    term = (q or "").strip().lower()
+
+    def matches(*fields: str | None) -> bool:
+        return not term or term in " ".join(f for f in fields if f).lower()
+
+    out: list[ComposeRecipient] = []
+
+    client_stmt = scope_client_query(user, select(Client)).order_by(Client.created_at.desc()).limit(SCAN_LIMIT)
+    for client in (await db.execute(client_stmt)).scalars():
+        if matches(client.name, client.email, client.phone):
+            out.append(ComposeRecipient(kind="client", id=str(client.id), name=client.name, label="Client", email=client.email, phone=client.phone))
+
+    for intake in await _visible_intakes(db, user):
+        if matches(intake.full_name, intake.business_name, intake.email, intake.phone):
+            out.append(ComposeRecipient(kind="intake", id=str(intake.id), name=intake.full_name, label=f"AI intake · {intake.business_name or 'lead'}", email=intake.email, phone=intake.phone))
+
+    for dealer in await _visible_dealers(db, user):
+        if matches(dealer.name, dealer.legal_name, dealer.email, dealer.phone):
+            out.append(ComposeRecipient(kind="dealer", id=str(dealer.id), name=dealer.legal_name or dealer.name, label="Audit file", email=dealer.email, phone=dealer.phone))
+
+    return out[:limit]
+
+
+@router.post("/compose", response_model=UnifiedComposeResult)
+async def compose_new_message(
+    payload: UnifiedComposeRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnifiedComposeResult:
+    """Start a conversation from the inbox — SMS, email, or both.
+
+    Each channel reports its own outcome; "the text failed but the email went"
+    is a different situation from "nothing went", and the composer shows both
+    honestly. SMS rides the guarded path (suppression list, ledger row either
+    way); email goes out as the operator (connected Gmail, SES fallback).
+    """
+    if user.role in _OPERATOR_DENY:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only action")
+
+    name = email = phone = None
+    client_id = None
+    thread_id: str | None = None
+    if payload.recipient_kind == "client":
+        client = (
+            await db.execute(scope_client_query(user, select(Client)).where(Client.id == UUID(payload.recipient_id)))
+        ).scalar_one_or_none()
+        if client is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
+        name, email, phone, client_id = client.name, client.email, client.phone, client.id
+        thread_id = f"sms:client:{client.id}"
+    elif payload.recipient_kind == "intake":
+        intake = next((i for i in await _visible_intakes(db, user) if str(i.id) == payload.recipient_id), None)
+        if intake is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Intake lead not found")
+        name, email, phone = intake.full_name, intake.email, intake.phone
+    else:
+        dealer = next((d for d in await _visible_dealers(db, user) if str(d.id) == payload.recipient_id), None)
+        if dealer is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Audit file not found")
+        name, email, phone = dealer.legal_name or dealer.name, dealer.email, dealer.phone
+
+    results: list[ComposeChannelResult] = []
+    body = payload.body.strip()
+
+    if "sms" in payload.channels:
+        if not phone:
+            results.append(ComposeChannelResult(channel="sms", ok=False, detail=f"{name} has no phone number on file."))
+        else:
+            from app.services import sms as sms_service
+
+            sms_result = await sms_service.send_sms_checked(
+                db, to_phone=phone, body=body, client_id=client_id, context="manual"
+            )
+            results.append(ComposeChannelResult(channel="sms", ok=sms_result.ok, detail=sms_result.detail))
+            if sms_result.ok and thread_id is None:
+                from app.dealer_os.services.consent_delivery import normalize_phone
+
+                normalized = normalize_phone(phone)
+                if normalized:
+                    thread_id = f"sms:phone:{normalized}"
+
+    if "email" in payload.channels:
+        if not email:
+            results.append(ComposeChannelResult(channel="email", ok=False, detail=f"{name} has no email on file."))
+        else:
+            from app.services.email.user_mailer import send_as_user
+
+            mail = await send_as_user(
+                db, user.id,
+                to_emails=[email],
+                subject=(payload.subject or "").strip() or f"Message from {user.name or 'Qualified Commercial'}",
+                body_text=body,
+            )
+            results.append(ComposeChannelResult(channel="email", ok=mail.ok, detail=mail.detail or ""))
+
+    await db.commit()
+    return UnifiedComposeResult(ok=any(r.ok for r in results), results=results, thread_id=thread_id)
 
 
 @router.get("/threads/{thread_id:path}", response_model=UnifiedCommunicationThreadDetail)

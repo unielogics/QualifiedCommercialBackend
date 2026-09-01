@@ -101,3 +101,35 @@ class UnifiedContactPage(BaseModel):
     items: list[UnifiedContactGroup] = Field(default_factory=list)
     total: int = 0
     unread_total: int = 0
+
+
+class ComposeRecipient(BaseModel):
+    """One row in the new-message recipient picker."""
+
+    kind: Literal["client", "intake", "dealer"]
+    id: str
+    name: str
+    label: str | None = None
+    email: str | None = None
+    phone: str | None = None
+
+
+class UnifiedComposeRequest(BaseModel):
+    recipient_kind: Literal["client", "intake", "dealer"]
+    recipient_id: str
+    channels: list[Literal["sms", "email"]] = Field(min_length=1)
+    subject: str | None = Field(None, max_length=300)
+    body: str = Field(min_length=1, max_length=20_000)
+
+
+class ComposeChannelResult(BaseModel):
+    channel: str
+    ok: bool
+    detail: str = ""
+
+
+class UnifiedComposeResult(BaseModel):
+    ok: bool
+    results: list[ComposeChannelResult] = Field(default_factory=list)
+    #: Thread the inbox should open after a successful send.
+    thread_id: str | None = None
