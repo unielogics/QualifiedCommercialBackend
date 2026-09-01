@@ -238,6 +238,7 @@ async def push_to_google(
     rep_name: str | None = None,
     want_meet: bool = True,
     color_id: str | None = None,
+    send_updates: str | None = "all",
 ) -> str | None:
     """Mirror the booking to the host's Google Calendar with the invitee on it.
 
@@ -258,7 +259,7 @@ async def push_to_google(
             event,
             attendees=attendees or None,
             want_conference=want_meet,
-            send_updates="all",
+            send_updates=send_updates,
             color_id=color_id,
         )
     except Exception:  # noqa: BLE001

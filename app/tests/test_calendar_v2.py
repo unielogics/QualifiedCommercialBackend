@@ -40,14 +40,17 @@ def test_calendar_v2_routes_are_registered() -> None:
     assert ("/dealer-os/calendar/file-options", "GET") in dealer_routes
 
 
-def test_calendar_v2_permissions_keep_funding_creation_operator_only() -> None:
+def test_calendar_v2_permissions_are_limited_to_privileged_operators() -> None:
     assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.SUPER_ADMIN))
     assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.LOAN_EXEC))
-    assert calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.FIELD_REP))
+    assert not calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.FIELD_REP))
     assert not calendar_v2.can_use_calendar_v2(SimpleNamespace(role=Role.CLIENT))
     assert calendar_v2.can_create_funding_file(SimpleNamespace(role=Role.SUPER_ADMIN))
     assert calendar_v2.can_create_funding_file(SimpleNamespace(role=Role.LOAN_EXEC))
     assert not calendar_v2.can_create_funding_file(SimpleNamespace(role=Role.FIELD_REP))
+    assert calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.SUPER_ADMIN))
+    assert not calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.LOAN_EXEC))
+    assert not calendar_v2.can_manage_outcome_catalog(SimpleNamespace(role=Role.FIELD_REP))
 
 
 def test_default_outcomes_cover_the_review_workflow() -> None:

@@ -381,6 +381,7 @@ from .schemas import (
     RepAppointmentBookingDataReview,
     RepAppointmentFundingSummary,
     RepAppointmentCapabilities,
+    RepCalendarCapabilities,
     RepAppointmentCrmPatch,
     RepAppointmentDeliveryRetry,
     RepAppointmentDeliveryRetryResult,
@@ -6167,6 +6168,20 @@ async def _appointment_read_rows(
     events = {}
     rep_reminders: dict[UUID, list[BookingNotificationReminder]] = {}
     rep_notifications: dict[str, Notification] = {}
+    user_ids = {
+        user_id
+        for row in rows
+        for user_id in (row.owner_user_id, row.booked_by_user_id)
+        if user_id is not None
+    }
+    users = {
+        item.id: item
+        for item in (
+            (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
+            if user_ids
+            else []
+        )
+    }
     if event_ids:
         notice_rows = (
             await db.execute(select(BookingNotification).where(BookingNotification.event_id.in_(event_ids)))
@@ -6206,6 +6221,10 @@ async def _appointment_read_rows(
     payloads: list[dict] = []
     for row in rows:
         data = RepAppointmentRead.model_validate(row).model_dump()
+        owner = users.get(row.owner_user_id)
+        booked_by = users.get(row.booked_by_user_id)
+        data["owner_name"] = (owner.name or owner.email) if owner else None
+        data["booked_by_name"] = (booked_by.name or booked_by.email) if booked_by else None
         notice = notices.get(row.calendar_event_id)
         event = events.get(row.calendar_event_id)
         if notice:
@@ -6268,6 +6287,17 @@ def _appointment_payload(
 def _appointment_google_color(outcome: str | None) -> str | None:
     # Google Calendar event palette: tomato, banana, basil.
     return {"not_converted": "11", "did_not_show": "5", "converted": "10"}.get(outcome or "")
+
+
+def _appointment_workflow_google_color(color: str | None) -> str | None:
+    return {
+        "blue": "9",
+        "green": "10",
+        "amber": "5",
+        "red": "11",
+        "violet": "3",
+        "gray": "8",
+    }.get(color or "")
 
 
 def _appointment_local_time(starts_at: datetime, timezone_name: str | None) -> str:
@@ -6685,7 +6715,22 @@ async def patch_application_profile(
 
 
 def _can_manage_appointment_crm(user: User) -> bool:
-    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP}
+    return user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+
+
+def _require_appointment_crm(user: User) -> None:
+    if not _can_manage_appointment_crm(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Appointment CRM access required.")
+
+
+def _rep_calendar_capabilities(user: User) -> RepCalendarCapabilities:
+    manages = _can_manage_appointment_crm(user)
+    return RepCalendarCapabilities(
+        can_manage_all=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
+        can_manage_appointment_crm=manages,
+        can_apply_outcomes=manages,
+        can_manage_outcome_catalog=calendar_v2.can_manage_outcome_catalog(user),
+    )
 
 
 def _appointment_actor_name(user: User | None) -> str:
@@ -6963,14 +7008,15 @@ async def _appointment_workspace(
         application_candidates=application_candidates,
         booking_data_review=await _appointment_booking_data_review(db, appointment, linked_loan),
         capabilities=RepAppointmentCapabilities(
-            can_edit=(manages or user.role == Role.FIELD_REP)
+            can_edit=manages
             and appointment.status != "cancelled"
             and appointment.archived_at is None,
-            can_add_notes=manages or user.role == Role.FIELD_REP,
+            can_add_notes=manages,
             can_manage_crm=manages,
             can_start_application=manages,
             can_retry_delivery=manages,
             can_manage_outcomes=manages,
+            can_manage_outcome_catalog=calendar_v2.can_manage_outcome_catalog(user),
             can_link_files=manages,
             can_create_funding_loan=calendar_v2.can_create_funding_file(user),
         ),
@@ -7218,6 +7264,12 @@ async def list_all_rep_appointments(
     return await _appointment_read_rows(db, rows)
 
 
+@router.get("/calendar/capabilities", response_model=RepCalendarCapabilities)
+async def get_rep_calendar_capabilities(user: CurrentUser) -> RepCalendarCapabilities:
+    require_team_or_rep(user)
+    return _rep_calendar_capabilities(user)
+
+
 @router.get(
     "/appointments/{appointment_id}/workspace",
     response_model=RepAppointmentWorkspaceRead,
@@ -7227,6 +7279,7 @@ async def get_rep_appointment_workspace(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentWorkspaceRead:
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     return await _appointment_workspace(db, appointment, user)
 
@@ -7241,8 +7294,7 @@ async def patch_rep_appointment_crm(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentWorkspaceRead:
-    if not _can_manage_appointment_crm(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Appointment CRM access required.")
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     current = appointment.crm_status or "scheduled"
     if current == "converted" and payload.status != "converted":
@@ -7313,6 +7365,7 @@ async def create_rep_appointment_note(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> DealerRepAppointmentActivity:
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     row = _record_appointment_activity(
         db,
@@ -7337,8 +7390,7 @@ async def start_rep_appointment_application(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentStartApplicationResult:
-    if not calendar_v2.can_use_calendar_v2(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Calendar file access required.")
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     if appointment.status == "cancelled" or appointment.archived_at is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "A cancelled appointment cannot start an application.")
@@ -7621,6 +7673,7 @@ async def list_rep_appointment_file_options(
     q: str = Query(default="", max_length=160),
     limit: int = Query(default=200, ge=1, le=500),
 ) -> RepAppointmentFileOptions:
+    _require_appointment_crm(user)
     await _load_owned_appointment(db, appointment_id, user)
     return await _list_calendar_file_options(db, user, q=q, limit=limit)
 
@@ -7632,7 +7685,7 @@ async def list_calendar_file_options(
     q: str = Query(default="", max_length=160),
     limit: int = Query(default=200, ge=1, le=500),
 ) -> RepAppointmentFileOptions:
-    require_team_or_rep(user)
+    _require_appointment_crm(user)
     return await _list_calendar_file_options(db, user, q=q, limit=limit)
 
 
@@ -7646,6 +7699,7 @@ async def patch_rep_appointment_file_link(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentFileLinkResult:
+    _require_appointment_crm(user)
     if not payload.confirm:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Confirm the explicit file link.")
     appointment = await _load_owned_appointment(db, appointment_id, user)
@@ -7971,13 +8025,13 @@ async def apply_rep_appointment_outcome(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentApplyOutcomeResult:
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     definition = (
         await db.execute(
             select(AppointmentOutcomeDefinition).where(
                 AppointmentOutcomeDefinition.id == payload.outcome_definition_id,
-                AppointmentOutcomeDefinition.owner_user_id == user.id,
-                AppointmentOutcomeDefinition.active.is_(True),
+                AppointmentOutcomeDefinition.scope == calendar_v2.SHARED_OUTCOME_SCOPE,
             )
         )
     ).scalar_one_or_none()
@@ -7999,6 +8053,8 @@ async def apply_rep_appointment_outcome(
             workspace=await _appointment_workspace(db, appointment, user),
             attempted_at=appointment.workflow_outcome_applied_at or datetime.now(timezone.utc),
         )
+    if not definition.active:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This appointment outcome has been retired.")
     effects = [effect for effect in definition.effects if effect in calendar_v2.ALLOWED_OUTCOME_EFFECTS]
     requires_note = "file_action" in effects or "close_enquiry" in effects
     if requires_note and not (payload.note or "").strip():
@@ -8114,6 +8170,31 @@ async def apply_rep_appointment_outcome(
             )
         )
 
+    rep_id = appointment.booked_by_user_id or appointment.owner_user_id
+    rep = await db.get(User, rep_id) if rep_id else None
+    if rep is not None and rep.id != user.id:
+        await notify_users(
+            db,
+            recipient_ids={rep.id},
+            event_type="appointment_outcome_changed",
+            category="calendar",
+            priority="medium",
+            title=f"Appointment outcome: {appointment.invitee_name}",
+            body=definition.name,
+            target_type="dealer_rep_appointment",
+            target_id=str(appointment.id),
+            deep_link=f"/calendar?appointment={appointment.id}",
+            email=False,
+            push=True,
+        )
+        actions.append(
+            RepAppointmentActionResult(
+                action="notify_rep",
+                status="completed",
+                detail=f"{rep.name or rep.email} was notified.",
+            )
+        )
+
     attempted_at = datetime.now(timezone.utc)
     previous_status = appointment.crm_status
     appointment.crm_status = definition.target_crm_status
@@ -8124,7 +8205,8 @@ async def apply_rep_appointment_outcome(
     appointment.workflow_outcome_label = definition.name
     appointment.workflow_outcome_effects = effects
     appointment.workflow_outcome_results = {
-        "actions": [item.model_dump(mode="json") for item in actions]
+        "color": definition.color,
+        "actions": [item.model_dump(mode="json") for item in actions],
     }
     appointment.workflow_outcome_applied_at = attempted_at
     appointment.workflow_outcome_by_user_id = user.id
@@ -8171,6 +8253,47 @@ async def apply_rep_appointment_outcome(
         )
     await db.commit()
     await db.refresh(appointment)
+
+    event = await db.get(CalendarEvent, appointment.calendar_event_id) if appointment.calendar_event_id else None
+    if event is None:
+        actions.append(
+            RepAppointmentActionResult(
+                action="sync_google_color",
+                status="skipped",
+                detail="This appointment has no linked Google Calendar event.",
+            )
+        )
+    else:
+        previous_synced_at = event.synced_at
+        await booking_notify.push_to_google(
+            db,
+            event,
+            invitee_email=appointment.invitee_email,
+            invitee_name=appointment.invitee_name,
+            rep_email=rep.email if rep else None,
+            rep_name=rep.name if rep else None,
+            want_meet=False,
+            color_id=_appointment_workflow_google_color(definition.color),
+            send_updates="none",
+        )
+        google_updated = event.synced_at is not None and event.synced_at != previous_synced_at
+        actions.append(
+            RepAppointmentActionResult(
+                action="sync_google_color",
+                status="completed" if google_updated else "failed",
+                detail=(
+                    "Google Calendar color updated."
+                    if google_updated
+                    else "Google Calendar was not updated. The outcome is saved; retry delivery when the connection is available."
+                ),
+            )
+        )
+    appointment.workflow_outcome_results = {
+        "color": definition.color,
+        "actions": [item.model_dump(mode="json") for item in actions],
+    }
+    await db.commit()
+    await db.refresh(appointment)
     return RepAppointmentApplyOutcomeResult(
         appointment_id=appointment.id,
         outcome_definition_id=definition.id,
@@ -8192,12 +8315,13 @@ async def retry_rep_appointment_delivery(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentDeliveryRetryResult:
-    if not _can_manage_appointment_crm(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Appointment CRM access required.")
+    _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     if appointment.calendar_event_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This appointment has no calendar event.")
     event = await db.get(CalendarEvent, appointment.calendar_event_id)
+    if event is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Delivery state is unavailable.")
     notice = (
         await db.execute(
             select(BookingNotification).where(
@@ -8205,13 +8329,36 @@ async def retry_rep_appointment_delivery(
             )
         )
     ).scalar_one_or_none()
-    if event is None or notice is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Delivery state is unavailable.")
-    host = await _rep_host_for(db, None, user)
+    host = await db.get(User, event.owner_user_id) if event.owner_user_id else None
+    host = host or user
     booking = await _booking_settings_for(db, host)
     attempted_at = datetime.now(timezone.utc)
     detail: str | None = None
-    if payload.action == "email_confirmation":
+    if payload.action == "google_sync":
+        rep_id = appointment.booked_by_user_id or appointment.owner_user_id
+        rep = await db.get(User, rep_id) if rep_id else None
+        previous_synced_at = event.synced_at
+        workflow_color = (appointment.workflow_outcome_results or {}).get("color")
+        await booking_notify.push_to_google(
+            db,
+            event,
+            invitee_email=appointment.invitee_email,
+            invitee_name=appointment.invitee_name,
+            rep_email=rep.email if rep else None,
+            rep_name=rep.name if rep else None,
+            want_meet=False,
+            color_id=(
+                _appointment_workflow_google_color(str(workflow_color))
+                or _appointment_google_color(appointment.outcome)
+            ),
+            send_updates="none",
+        )
+        google_updated = event.synced_at is not None and event.synced_at != previous_synced_at
+        retry_status = "sent" if google_updated else "failed"
+        detail = None if google_updated else "Google Calendar connection is unavailable or rejected the update."
+    elif payload.action == "email_confirmation":
+        if notice is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Email delivery state is unavailable.")
         if not appointment.invitee_email:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no email address.")
         result = booking_notify.send_invitee_invite(
@@ -8228,6 +8375,8 @@ async def retry_rep_appointment_delivery(
         detail = result.detail if result else "Email provider unavailable"
         notice.confirmation_email_status = retry_status
     else:
+        if notice is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "SMS delivery state is unavailable.")
         if not notice.invitee_phone:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no phone number.")
         if not notice.sms_consent:
@@ -8245,7 +8394,7 @@ async def retry_rep_appointment_delivery(
             )
             retry_status = notice.confirmation_sms_status
             detail = notice.last_error if retry_status == "failed" else None
-    if retry_status == "failed" and detail:
+    if notice is not None and retry_status == "failed" and detail:
         notice.last_error = detail[:1000]
     _record_appointment_activity(
         db,

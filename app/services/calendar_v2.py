@@ -3,14 +3,16 @@ from __future__ import annotations
 import re
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.models import AppointmentOutcomeDefinition
 from app.enums import Role
 from app.models.user import User
 
-CALENDAR_V2_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP}
+CALENDAR_V2_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
 FUNDING_FILE_ROLES = {Role.SUPER_ADMIN, Role.LOAN_EXEC}
+SHARED_OUTCOME_SCOPE = "shared"
 ALLOWED_OUTCOME_EFFECTS = {
     "log_activity",
     "file_action",
@@ -71,15 +73,18 @@ def can_create_funding_file(user: User) -> bool:
     return user.role in FUNDING_FILE_ROLES
 
 
+def can_manage_outcome_catalog(user: User) -> bool:
+    return user.role == Role.SUPER_ADMIN
+
+
 async def ensure_default_outcomes(
     db: AsyncSession,
-    user: User,
 ) -> list[AppointmentOutcomeDefinition]:
     rows = list(
         (
             await db.execute(
                 select(AppointmentOutcomeDefinition)
-                .where(AppointmentOutcomeDefinition.owner_user_id == user.id)
+                .where(AppointmentOutcomeDefinition.scope == SHARED_OUTCOME_SCOPE)
                 .order_by(
                     AppointmentOutcomeDefinition.sort_order,
                     AppointmentOutcomeDefinition.created_at,
@@ -90,14 +95,32 @@ async def ensure_default_outcomes(
     if rows:
         return rows
 
-    for index, definition in enumerate(DEFAULT_OUTCOMES):
-        row = AppointmentOutcomeDefinition(
-            owner_user_id=user.id,
-            normalized_name=normalize_outcome_name(definition["name"]),
-            sort_order=index,
-            **definition,
-        )
-        db.add(row)
-        rows.append(row)
-    await db.flush()
-    return rows
+    savepoint = await db.begin_nested()
+    try:
+        for index, definition in enumerate(DEFAULT_OUTCOMES):
+            db.add(
+                AppointmentOutcomeDefinition(
+                    owner_user_id=None,
+                    scope=SHARED_OUTCOME_SCOPE,
+                    normalized_name=normalize_outcome_name(definition["name"]),
+                    sort_order=index,
+                    **definition,
+                )
+            )
+        await db.flush()
+        await savepoint.commit()
+    except IntegrityError:
+        await savepoint.rollback()
+
+    return list(
+        (
+            await db.execute(
+                select(AppointmentOutcomeDefinition)
+                .where(AppointmentOutcomeDefinition.scope == SHARED_OUTCOME_SCOPE)
+                .order_by(
+                    AppointmentOutcomeDefinition.sort_order,
+                    AppointmentOutcomeDefinition.created_at,
+                )
+            )
+        ).scalars().all()
+    )

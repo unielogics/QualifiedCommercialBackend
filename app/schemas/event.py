@@ -135,7 +135,8 @@ class AppointmentOutcomeDefinitionRead(AppointmentOutcomeDefinitionBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    owner_user_id: UUID
+    owner_user_id: UUID | None = None
+    scope: Literal["personal", "shared"] = "personal"
     created_at: datetime
     updated_at: datetime
 
@@ -179,6 +180,9 @@ class CalendarWorkspaceCapabilities(BaseModel):
     can_manage_all: bool = False
     can_drag: bool = False
     can_create_funding_loan: bool = False
+    can_manage_appointment_crm: bool = False
+    can_apply_outcomes: bool = False
+    can_manage_outcome_catalog: bool = False
 
 
 class CalendarWorkspaceRead(BaseModel):

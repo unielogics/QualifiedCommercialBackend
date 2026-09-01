@@ -551,21 +551,38 @@ REP_APPOINTMENT_CRM_STATUSES: tuple[str, ...] = (
 
 
 class AppointmentOutcomeDefinition(TimestampMixin, Base):
-    """One staff member's reusable, constrained appointment outcome."""
+    """Reusable, constrained appointment outcome with preserved legacy ownership."""
 
     __tablename__ = "appointment_outcome_definitions"
     __table_args__ = (
         Index(
-            "uq_appointment_outcome_owner_name",
+            "uq_appointment_outcome_personal_name",
             "owner_user_id",
             "normalized_name",
             unique=True,
+            postgresql_where=text("scope = 'personal'"),
         ),
         Index(
-            "ix_appointment_outcome_owner_active",
+            "uq_appointment_outcome_shared_name",
+            "normalized_name",
+            unique=True,
+            postgresql_where=text("scope = 'shared' AND active = true"),
+        ),
+        Index(
+            "ix_appointment_outcome_scope_active",
+            "scope",
             "owner_user_id",
             "active",
             "sort_order",
+        ),
+        CheckConstraint(
+            "scope IN ('personal','shared')",
+            name="ck_appointment_outcome_definition_scope",
+        ),
+        CheckConstraint(
+            "(scope = 'personal' AND owner_user_id IS NOT NULL) OR "
+            "(scope = 'shared' AND owner_user_id IS NULL)",
+            name="ck_appointment_outcome_definition_owner_scope",
         ),
         CheckConstraint(
             "target_crm_status IN ('scheduled','confirmed','completed','follow_up','no_show','not_qualified','converted','cancelled')",
@@ -574,8 +591,11 @@ class AppointmentOutcomeDefinition(TimestampMixin, Base):
     )
 
     id: Mapped[uuid.UUID] = _pk()
-    owner_user_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="personal", server_default="personal"
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     normalized_name: Mapped[str] = mapped_column(String(120), nullable=False)

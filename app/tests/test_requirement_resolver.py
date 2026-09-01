@@ -28,7 +28,6 @@ from app.services.ai.requirement_resolver import (
     resolve_requirements,
 )
 
-
 # ── Fake row builders ──────────────────────────────────────────────
 
 
@@ -71,7 +70,7 @@ class _FakeResult:
     def __init__(self, rows: list[Any]) -> None:
         self._rows = rows
 
-    def scalars(self) -> "_FakeResult":
+    def scalars(self) -> _FakeResult:
         return self
 
     def all(self) -> list[Any]:
@@ -161,7 +160,7 @@ class FakeSession:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _new_uuid() -> uuid.UUID:

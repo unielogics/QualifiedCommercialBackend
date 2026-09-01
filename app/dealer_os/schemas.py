@@ -741,6 +741,7 @@ class RepAppointmentRead(ORM):
     id: UUID
     dealer_id: UUID | None = None
     owner_user_id: UUID | None = None
+    owner_name: str | None = None
     calendar_event_id: UUID | None = None
     contact_id: UUID | None = None
     kind: str
@@ -765,6 +766,7 @@ class RepAppointmentRead(ORM):
     client_rsvp_at: datetime | None = None
     rsvp_checked_at: datetime | None = None
     booked_by_user_id: UUID | None = None
+    booked_by_name: str | None = None
     outcome: Literal["not_converted", "did_not_show", "converted"] | None = None
     outcome_note: str | None = None
     outcome_at: datetime | None = None
@@ -936,8 +938,16 @@ class RepAppointmentCapabilities(BaseModel):
     can_start_application: bool = False
     can_retry_delivery: bool = False
     can_manage_outcomes: bool = False
+    can_manage_outcome_catalog: bool = False
     can_link_files: bool = False
     can_create_funding_loan: bool = False
+
+
+class RepCalendarCapabilities(BaseModel):
+    can_manage_all: bool = False
+    can_manage_appointment_crm: bool = False
+    can_apply_outcomes: bool = False
+    can_manage_outcome_catalog: bool = False
 
 
 class RepAppointmentApplicationSummary(BaseModel):
@@ -1036,13 +1046,14 @@ class RepAppointmentStartApplicationResult(BaseModel):
 
 
 class RepAppointmentDeliveryRetry(BaseModel):
-    action: Literal["email_confirmation", "sms_confirmation"]
+    action: Literal["google_sync", "email_confirmation", "sms_confirmation"]
 
 
 class RepAppointmentDeliveryRetryResult(BaseModel):
-    action: Literal["email_confirmation", "sms_confirmation"]
+    action: Literal["google_sync", "email_confirmation", "sms_confirmation"]
     status: str
     detail: str | None = None
+    attempted_at: datetime
 
 
 AppointmentFileKind = Literal["intake", "loan"]

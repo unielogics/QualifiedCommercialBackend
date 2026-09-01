@@ -82,6 +82,14 @@ def _require_calendar_v2(user: User) -> None:
         raise HTTPException(http_status.HTTP_403_FORBIDDEN, "Calendar CRM access required")
 
 
+def _require_outcome_catalog_admin(user: User) -> None:
+    if not calendar_v2.can_manage_outcome_catalog(user):
+        raise HTTPException(
+            http_status.HTTP_403_FORBIDDEN,
+            "Super-admin access is required to configure appointment outcomes",
+        )
+
+
 def _workspace_kind(value: str) -> str:
     if value in {"callback", "program_intro"}:
         return "intro_call"
@@ -322,6 +330,9 @@ async def get_calendar_workspace(
             can_manage_all=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
             can_drag=True,
             can_create_funding_loan=calendar_v2.can_create_funding_file(user),
+            can_manage_appointment_crm=calendar_v2.can_use_calendar_v2(user),
+            can_apply_outcomes=calendar_v2.can_use_calendar_v2(user),
+            can_manage_outcome_catalog=calendar_v2.can_manage_outcome_catalog(user),
         ),
     )
 
@@ -333,11 +344,16 @@ async def list_calendar_outcomes(
     include_inactive: bool = False,
 ) -> list[AppointmentOutcomeDefinitionRead]:
     _require_calendar_v2(user)
-    await calendar_v2.ensure_default_outcomes(db, user)
+    if include_inactive and not calendar_v2.can_manage_outcome_catalog(user):
+        raise HTTPException(
+            http_status.HTTP_403_FORBIDDEN,
+            "Super-admin access is required to view retired appointment outcomes",
+        )
+    await calendar_v2.ensure_default_outcomes(db)
     await db.commit()
     stmt = (
         select(AppointmentOutcomeDefinition)
-        .where(AppointmentOutcomeDefinition.owner_user_id == user.id)
+        .where(AppointmentOutcomeDefinition.scope == calendar_v2.SHARED_OUTCOME_SCOPE)
         .order_by(AppointmentOutcomeDefinition.sort_order, AppointmentOutcomeDefinition.created_at)
     )
     if not include_inactive:
@@ -356,9 +372,10 @@ async def create_calendar_outcome(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AppointmentOutcomeDefinitionRead:
-    _require_calendar_v2(user)
+    _require_outcome_catalog_admin(user)
     row = AppointmentOutcomeDefinition(
-        owner_user_id=user.id,
+        owner_user_id=None,
+        scope=calendar_v2.SHARED_OUTCOME_SCOPE,
         normalized_name=calendar_v2.normalize_outcome_name(payload.name),
         **payload.model_dump(),
     )
@@ -367,21 +384,20 @@ async def create_calendar_outcome(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(http_status.HTTP_409_CONFLICT, "You already have an outcome with this name") from exc
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "A shared outcome already uses this name") from exc
     await db.refresh(row)
     return AppointmentOutcomeDefinitionRead.model_validate(row)
 
 
-async def _load_owned_outcome(
+async def _load_shared_outcome(
     db: AsyncSession,
     outcome_id: UUID,
-    user: User,
 ) -> AppointmentOutcomeDefinition:
     row = (
         await db.execute(
             select(AppointmentOutcomeDefinition).where(
                 AppointmentOutcomeDefinition.id == outcome_id,
-                AppointmentOutcomeDefinition.owner_user_id == user.id,
+                AppointmentOutcomeDefinition.scope == calendar_v2.SHARED_OUTCOME_SCOPE,
             )
         )
     ).scalar_one_or_none()
@@ -397,8 +413,8 @@ async def patch_calendar_outcome(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AppointmentOutcomeDefinitionRead:
-    _require_calendar_v2(user)
-    row = await _load_owned_outcome(db, outcome_id, user)
+    _require_outcome_catalog_admin(user)
+    row = await _load_shared_outcome(db, outcome_id)
     patch = payload.model_dump(exclude_unset=True)
     if not patch:
         raise HTTPException(http_status.HTTP_400_BAD_REQUEST, "No outcome changes supplied")
@@ -410,7 +426,7 @@ async def patch_calendar_outcome(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(http_status.HTTP_409_CONFLICT, "You already have an outcome with this name") from exc
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "A shared outcome already uses this name") from exc
     await db.refresh(row)
     return AppointmentOutcomeDefinitionRead.model_validate(row)
 
@@ -421,8 +437,8 @@ async def disable_calendar_outcome(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    _require_calendar_v2(user)
-    row = await _load_owned_outcome(db, outcome_id, user)
+    _require_outcome_catalog_admin(user)
+    row = await _load_shared_outcome(db, outcome_id)
     row.active = False
     await db.commit()
 
