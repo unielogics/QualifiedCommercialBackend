@@ -1987,6 +1987,14 @@ async def send_case_contract_envelope(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Package not found.")
     if envelope.status not in {"ready", "out_for_signature"}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Complete every required source field before sending.")
+    verification = await _assess_verification(db, dealer)
+    if not verification.bank_linked:
+        detail = (
+            "Acknowledge the available three-to-five-month bank-evidence exception before sending this package."
+            if verification.bank_exception_available
+            else "At least three current contiguous bank months are required before this package can be sent."
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
     owner = await db.get(DealerOwner, envelope.recipient_owner_id) if envelope.recipient_owner_id else None
     if owner is None or not owner.email:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The primary signer needs a personal email address.")
@@ -3500,7 +3508,6 @@ async def _application_workflow_state(
         ("mailing_state", "Select the mailing state."),
         ("mailing_zip", "Enter the mailing ZIP code."),
         ("guaranty_type", "Select the guaranty type."),
-        ("office_space", "Describe the office or operating space, or enter N/A."),
         ("business_stage", "Select the business stage."),
         ("signer_title", "Enter the authorized signer title."),
         ("existing_mca_balance", "Enter the MCA balance, including zero when none."),
@@ -6235,6 +6242,126 @@ async def _booking_settings_for(db: AsyncSession, host: User) -> BookingSettings
     )
 
 
+def _appointment_blocks_shared_calendar(appointment: DealerRepAppointment) -> bool:
+    """Treat the CRM appointment lifecycle as authoritative for local bookings."""
+    return bool(
+        appointment.archived_at is None
+        and appointment.status != "cancelled"
+        and appointment.crm_status != "cancelled"
+    )
+
+
+def _local_calendar_busy_intervals(
+    *,
+    booking: BookingSettings,
+    calendar_rows: list[CalendarEvent],
+    appointment_rows: list[DealerRepAppointment],
+    zone: ZoneInfo,
+    fallback_duration: int,
+    time_min: datetime,
+    time_max: datetime,
+    exclude_event_id: UUID | None = None,
+) -> list[tuple[datetime, datetime]]:
+    """Merge Funding calendar events and Field Desk CRM appointments.
+
+    A DealerRepAppointment is the source of truth for a linked event after a
+    cancel, reschedule, or archive operation. Unlinked CalendarEvent rows still
+    reserve the shared calendar, and appointments without a mirror do too.
+    """
+    linked_event_ids = {
+        row.calendar_event_id
+        for row in appointment_rows
+        if row.calendar_event_id is not None
+    }
+    busy: list[tuple[datetime, datetime]] = []
+
+    def append(starts_at: datetime, duration_min: int | None) -> None:
+        start = starts_at.astimezone(zone) - timedelta(
+            minutes=booking.buffer_before_min
+        )
+        end = starts_at.astimezone(zone) + timedelta(
+            minutes=max(15, duration_min or fallback_duration)
+            + booking.buffer_after_min
+        )
+        if start < time_max.astimezone(zone) and end > time_min.astimezone(zone):
+            busy.append((start, end))
+
+    for appointment in appointment_rows:
+        if (
+            appointment.calendar_event_id == exclude_event_id
+            or not _appointment_blocks_shared_calendar(appointment)
+        ):
+            continue
+        append(appointment.starts_at, appointment.duration_min)
+
+    for event in calendar_rows:
+        if event.id == exclude_event_id or event.id in linked_event_ids:
+            continue
+        if event.status == CalendarEventStatus.CANCELLED:
+            continue
+        append(event.starts_at, event.duration_min)
+    return busy
+
+
+async def _shared_calendar_local_busy(
+    db: AsyncSession,
+    host: User,
+    booking: BookingSettings,
+    *,
+    time_min: datetime,
+    time_max: datetime,
+    fallback_duration: int,
+    exclude_event_id: UUID | None = None,
+) -> tuple[list[tuple[datetime, datetime]], CalendarEvent | None]:
+    # Look behind the requested range so a long meeting that starts earlier
+    # still blocks an opening near its end.
+    query_min = time_min.astimezone(timezone.utc) - timedelta(days=1)
+    query_max = time_max.astimezone(timezone.utc) + timedelta(
+        minutes=booking.buffer_after_min
+    )
+    calendar_rows = list(
+        (
+            await db.execute(
+                select(CalendarEvent).where(
+                    CalendarEvent.owner_user_id == host.id,
+                    CalendarEvent.starts_at >= query_min,
+                    CalendarEvent.starts_at <= query_max,
+                )
+            )
+        ).scalars().all()
+    )
+    # Every Field Desk appointment is booked against the same team calendar.
+    # Do not rely on its mirror or historical owner id being present: imports
+    # and partial provider failures can leave either one absent.
+    appointment_rows = list(
+        (
+            await db.execute(
+                select(DealerRepAppointment).where(
+                    DealerRepAppointment.starts_at >= query_min,
+                    DealerRepAppointment.starts_at <= query_max,
+                )
+            )
+        ).scalars().all()
+    )
+    excluded_event = next(
+        (event for event in calendar_rows if event.id == exclude_event_id),
+        None,
+    )
+    return (
+        _local_calendar_busy_intervals(
+            booking=booking,
+            calendar_rows=calendar_rows,
+            appointment_rows=appointment_rows,
+            zone=rep_workflows.tz(booking.timezone),
+            fallback_duration=fallback_duration,
+            time_min=time_min,
+            time_max=time_max,
+            exclude_event_id=exclude_event_id,
+        ),
+        excluded_event,
+    )
+
+
 async def _booking_slots(
     db: AsyncSession,
     host: User,
@@ -6267,29 +6394,15 @@ async def _booking_slots(
             calendar_sync_status=live_google.status,
             slots=[],
         )
-    busy_rows = (
-        await db.execute(
-            select(CalendarEvent)
-            .where(
-                CalendarEvent.owner_user_id == host.id,
-                CalendarEvent.status != CalendarEventStatus.CANCELLED,
-                CalendarEvent.starts_at >= now_local.astimezone(timezone.utc),
-                CalendarEvent.starts_at <= window_end_local.astimezone(timezone.utc),
-            )
-            .order_by(CalendarEvent.starts_at)
-        )
-    ).scalars().all()
-    excluded_event = next((ev for ev in busy_rows if ev.id == exclude_event_id), None)
-    if exclude_event_id:
-        busy_rows = [ev for ev in busy_rows if ev.id != exclude_event_id]
-    busy = [
-        (
-            ev.starts_at.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
-            ev.starts_at.astimezone(zone)
-            + timedelta(minutes=max(15, ev.duration_min or duration) + booking.buffer_after_min),
-        )
-        for ev in busy_rows
-    ]
+    busy, excluded_event = await _shared_calendar_local_busy(
+        db,
+        host,
+        booking,
+        time_min=now_local,
+        time_max=window_end_local,
+        fallback_duration=duration,
+        exclude_event_id=exclude_event_id,
+    )
     for start, end in live_google.intervals:
         # FreeBusy does not return event ids. Ignore only the exact mirrored
         # interval of the appointment being rescheduled; merged/overlapping
@@ -6315,9 +6428,14 @@ async def _booking_slots(
             cursor = _round_up_to_step(cursor, 5)
             while cursor + slot_duration <= day_end:
                 slot_end = cursor + slot_duration
+                candidate_start = cursor - timedelta(minutes=booking.buffer_before_min)
+                candidate_end = slot_end + timedelta(minutes=booking.buffer_after_min)
                 if (
                     not slot_overlaps_blocked_interval(booking, cursor, slot_end)
-                    and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
+                    and not any(
+                        candidate_start < busy_end and candidate_end > busy_start
+                        for busy_start, busy_end in busy
+                    )
                 ):
                     starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
                     slots.append(BookingAvailabilitySlot(
@@ -6379,27 +6497,16 @@ async def _appointment_slot_is_available(
     proposed_busy_end = starts_at + timedelta(
         minutes=duration_min + booking.buffer_after_min
     )
-    local_rows = list(
-        (
-            await db.execute(
-                select(CalendarEvent).where(
-                    CalendarEvent.owner_user_id == host.id,
-                    CalendarEvent.status != CalendarEventStatus.CANCELLED,
-                    CalendarEvent.starts_at
-                    >= starts_at - timedelta(days=1),
-                    CalendarEvent.starts_at
-                    <= starts_at + timedelta(days=1),
-                )
-            )
-        ).scalars().all()
+    local_busy, excluded_event = await _shared_calendar_local_busy(
+        db,
+        host,
+        booking,
+        time_min=proposed_busy_start,
+        time_max=proposed_busy_end,
+        fallback_duration=duration_min,
+        exclude_event_id=exclude_event_id,
     )
-    for row in local_rows:
-        if row.id == exclude_event_id:
-            continue
-        busy_start = row.starts_at - timedelta(minutes=booking.buffer_before_min)
-        busy_end = row.starts_at + timedelta(
-            minutes=max(15, row.duration_min or duration_min) + booking.buffer_after_min
-        )
+    for busy_start, busy_end in local_busy:
         if proposed_busy_start < busy_end and proposed_busy_end > busy_start:
             return False
 
@@ -6411,7 +6518,6 @@ async def _appointment_slot_is_available(
     )
     if google.status != "connected":
         return False
-    excluded_event = await db.get(CalendarEvent, exclude_event_id) if exclude_event_id else None
     for busy_start, busy_end in google.intervals:
         if excluded_event is not None:
             expected_start = excluded_event.starts_at.astimezone(timezone.utc)
@@ -7101,7 +7207,7 @@ async def patch_application_profile(
             "to": "decision_ready",
             "by": str(user.id),
             "by_name": user.name,
-            "note": "step 4 profile saved",
+            "note": "application profile saved",
         })
         lead.status = "decision_ready"
         lead.status_history = history[-50:]
@@ -15647,7 +15753,7 @@ async def _application_pre_screen_state(
     if incomplete_ids:
         blockers.append(f"Complete eligibility for {len(incomplete_ids)} required owner(s).")
     # Step 1.5 is personal eligibility only. Business questions are collected
-    # in Step 4 and remain unresolved routing facts until answered there.
+    # in Step 2 and remain unresolved routing facts until answered there.
     complete = not blockers and bool(required_ids)
     verified_scores = {
         str(owner.id): owner.credit_score for owner in owner_state["required"]

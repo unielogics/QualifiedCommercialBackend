@@ -300,7 +300,7 @@ def test_package_reaches_signature_checkpoint_before_human_decision() -> None:
         human_reviewed_at=None,
         human_reviewed_by_user_id=None,
         guaranty_type="personal",
-        office_space="leased",
+        location_type="leased",
         business_stage="existing",
         signer_title="Managing Member",
         existing_mca_balance=0,

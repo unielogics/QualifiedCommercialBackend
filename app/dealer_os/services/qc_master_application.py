@@ -362,7 +362,7 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
             if current_quality
             else credit_summary.get("quality_tier") or owner.credit_tier
         )
-        credit_quality = " · ".join(
+        credit_quality_label = " · ".join(
             part for part in (credit_tier, credit_band) if part
         ) or ("Verified result" if owner.credit_pulled_at else "Pending")
         threshold = answer.get("credit_660_or_higher")
@@ -389,7 +389,7 @@ async def build_context(db: AsyncSession, dealer: DealerBusiness) -> dict[str, A
                     else "Not required"
                 ),
                 "credit_reference": str(owner.credit_pull_id) if owner.credit_pull_id else None,
-                "credit_quality": credit_quality,
+                "credit_quality": credit_quality_label,
                 "residency": answer.get("residency_status") or "Awaiting disclosure",
                 "bankruptcy": answer.get("bankruptcy_timing") or "Awaiting disclosure",
                 "foreclosure": answer.get("foreclosure_within_3_years"),
@@ -546,7 +546,6 @@ def build_readiness(context: dict[str, Any]) -> dict[str, Any]:
     source_fields_complete = bool(
         profile
         and getattr(profile, "guaranty_type", None)
-        and _text(getattr(profile, "office_space", None))
         and getattr(profile, "business_stage", None)
         and _text(getattr(profile, "signer_title", None))
         and getattr(profile, "existing_mca_balance", None) is not None

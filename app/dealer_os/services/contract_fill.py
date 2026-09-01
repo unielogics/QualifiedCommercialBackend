@@ -180,7 +180,9 @@ async def build_values(
         "biz_dba": dealer.name if dealer.legal_name and dealer.legal_name != dealer.name else "",
         "biz_industry": _INDUSTRY_LABELS.get(dealer.industry or "", dealer.industry or ""),
         "biz_entity": dealer.entity_type or "",
-        "biz_office_space": (profile.office_space if profile else None) or "N/A",
+        # Location type is the canonical Step 1 answer. Legacy templates still
+        # expose an OFFICE SPACE anchor, so populate both anchors from it.
+        "biz_office_space": (profile.location_type if profile else None) or "N/A",
         "biz_location_type": (profile.location_type if profile else None) or "N/A",
         "biz_formation_state": (profile.state_of_formation if profile else None) or dealer.state or "",
         "biz_start": dealer.started_on.strftime("%m/%Y") if dealer.started_on else "",

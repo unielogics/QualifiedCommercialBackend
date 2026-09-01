@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from app.dealer_os import router
 from app.dealer_os.services import recurrence, workflow_readiness
@@ -73,6 +74,62 @@ def test_bank_exception_accepts_three_to_five_current_months_only() -> None:
     accepted, missing = router._bank_exception_window(noncontiguous)
     assert accepted is None
     assert current_five[2] in missing
+
+
+def test_shared_calendar_busy_intervals_follow_appointment_operations() -> None:
+    now = datetime(2026, 9, 2, 13, tzinfo=UTC)
+    booking = SimpleNamespace(buffer_before_min=5, buffer_after_min=5)
+    active = SimpleNamespace(
+        calendar_event_id="active-event",
+        starts_at=now + timedelta(hours=1),
+        duration_min=20,
+        status="pending",
+        crm_status="scheduled",
+        archived_at=None,
+    )
+    cancelled = SimpleNamespace(
+        calendar_event_id="cancelled-event",
+        starts_at=now + timedelta(hours=2),
+        duration_min=20,
+        status="cancelled",
+        crm_status="cancelled",
+        archived_at=now,
+    )
+    calendar_rows = [
+        SimpleNamespace(
+            id="active-event",
+            starts_at=active.starts_at,
+            duration_min=20,
+            status="pending",
+        ),
+        # A cancelled CRM operation wins over a stale local event mirror.
+        SimpleNamespace(
+            id="cancelled-event",
+            starts_at=cancelled.starts_at,
+            duration_min=20,
+            status="pending",
+        ),
+        SimpleNamespace(
+            id="funding-calendar-event",
+            starts_at=now + timedelta(hours=3),
+            duration_min=30,
+            status="pending",
+        ),
+    ]
+
+    busy = router._local_calendar_busy_intervals(
+        booking=booking,
+        calendar_rows=calendar_rows,
+        appointment_rows=[active, cancelled],
+        zone=ZoneInfo("America/New_York"),
+        fallback_duration=20,
+        time_min=now,
+        time_max=now + timedelta(hours=5),
+    )
+
+    assert len(busy) == 2
+    assert any(start == active.starts_at.astimezone(ZoneInfo("America/New_York")) - timedelta(minutes=5) for start, _ in busy)
+    assert not any(start == cancelled.starts_at.astimezone(ZoneInfo("America/New_York")) - timedelta(minutes=5) for start, _ in busy)
 
 
 def test_credit_quality_uses_safe_tier_and_range() -> None:
