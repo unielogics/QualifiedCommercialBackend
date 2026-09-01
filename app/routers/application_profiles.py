@@ -1691,6 +1691,7 @@ async def _application_bank_state(
     db: AsyncSession, profile: ApplicationProfile
 ) -> ApplicationBankState:
     disclosure = dealer_bank_consent.disclosure()
+    manual_evidence = await profiles.manual_statement_evidence(db, profile)
     return ApplicationBankState(
         enabled=plaid_client.enabled(),
         environment=plaid_client.environment(),
@@ -1700,7 +1701,9 @@ async def _application_bank_state(
         items=await profiles.bank_rows(db, profile),
         manual_override=profile.bank_verification_override_at is not None,
         manual_override_reason=profile.bank_verification_override_reason,
-        manual_statement_months=await profiles.manual_statement_months(db, profile),
+        manual_statement_months=manual_evidence.months,
+        manual_statement_file_count=manual_evidence.file_count,
+        manual_statement_pending_count=manual_evidence.pending_analysis_count,
         assets_enabled=plaid_client.assets_enabled(),
         asset_reports=[
             PlaidAssetReportRead.model_validate(row)
@@ -2086,12 +2089,15 @@ async def public_bank_verification(
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     disclosure = dealer_bank_consent.disclosure()
+    manual_evidence = await profiles.manual_statement_evidence(db, profile)
     return PublicBankVerificationRead(
         business_name=_business_label(profile, intake, client),
         disclosure_version=disclosure["version"], disclosure_text=disclosure["text"],
         consent_granted=await _application_consent_granted(db, profile.id),
         items=await profiles.bank_rows(db, profile),
-        manual_statement_months=await profiles.manual_statement_months(db, profile),
+        manual_statement_months=manual_evidence.months,
+        manual_statement_file_count=manual_evidence.file_count,
+        manual_statement_pending_count=manual_evidence.pending_analysis_count,
         assets_enabled=plaid_client.assets_enabled(),
         asset_reports=[
             PlaidAssetReportRead.model_validate(row)
@@ -2400,7 +2406,7 @@ async def get_application_banks(
         consent = await dealer_bank_consent.has_consent(db, profile.dealer_id)
     else:
         consent = await _application_consent_granted(db, profile.id)
-    manual_months = await profiles.manual_statement_months(db, profile)
+    manual_evidence = await profiles.manual_statement_evidence(db, profile)
     return ApplicationBankState(
         enabled=plaid_client.enabled(),
         environment=plaid_client.environment(),
@@ -2410,7 +2416,9 @@ async def get_application_banks(
         items=await profiles.bank_rows(db, profile),
         manual_override=bool(profile.bank_verification_override_at),
         manual_override_reason=profile.bank_verification_override_reason,
-        manual_statement_months=manual_months,
+        manual_statement_months=manual_evidence.months,
+        manual_statement_file_count=manual_evidence.file_count,
+        manual_statement_pending_count=manual_evidence.pending_analysis_count,
         assets_enabled=plaid_client.assets_enabled(),
         asset_reports=[
             PlaidAssetReportRead.model_validate(row)
@@ -2433,15 +2441,22 @@ async def approve_manual_bank_evidence(
     profile = await profiles.load_profile(db, profile_id, user)
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may approve manual bank evidence")
-    months = await profiles.manual_statement_months(db, profile)
-    if not months:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Upload and extract at least one business bank statement before overriding Plaid")
+    manual_evidence = await profiles.manual_statement_evidence(db, profile)
+    if not manual_evidence.file_count:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Upload at least one recognized business bank statement before overriding Plaid",
+        )
     profile.bank_verification_override_at = datetime.now(UTC)
     profile.bank_verification_override_by_user_id = user.id
     profile.bank_verification_override_reason = payload.reason.strip()
     await profiles.log_profile_action(
         db, profile, user, "bank.manual_override", "Approved uploaded bank statements in place of Plaid",
-        metadata={"statement_months": months, "reason": payload.reason.strip()},
+        metadata={
+            "statement_months": manual_evidence.months,
+            "statement_file_count": manual_evidence.file_count,
+            "reason": payload.reason.strip(),
+        },
     )
     await db.commit()
     return await get_application_banks(profile_id, user, db)

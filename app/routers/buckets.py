@@ -1844,7 +1844,9 @@ async def admin_upload_complete(
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", bucket_id, file.id)
     try:
         from app.services.bucket_ai import enqueue_file_analysis
+        from app.services.bucket_evidence import reconcile_uploaded_file
 
+        await reconcile_uploaded_file(db, file)
         await enqueue_file_analysis(db, file)
     except Exception:  # noqa: BLE001
         import logging
@@ -2405,6 +2407,20 @@ async def request_upload_complete(
         import logging
 
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", link.bucket_id, file.id)
+    try:
+        from app.services.bucket_ai import enqueue_file_analysis
+        from app.services.bucket_evidence import reconcile_uploaded_file
+
+        await reconcile_uploaded_file(db, file)
+        await enqueue_file_analysis(db, file)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "enqueue public bucket file analysis failed bucket=%s file=%s",
+            link.bucket_id,
+            file.id,
+        )
     await db.commit()
     await db.refresh(file)
     background.add_task(auto_ingest_bucket_files_for_bucket, link.bucket_id)

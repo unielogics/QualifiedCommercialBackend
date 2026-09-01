@@ -5034,6 +5034,7 @@ async def _complete_upload(
     # analysis so the review composes from a warm per-file cache.
     try:
         from app.services.bucket_ai import enqueue_file_analysis
+        from app.services.bucket_evidence import reconcile_uploaded_file
 
         await db.flush()
         children = (
@@ -5046,6 +5047,7 @@ async def _complete_upload(
             )
         ).scalars().all()
         for target in [file, *children]:
+            await reconcile_uploaded_file(db, target)
             await enqueue_file_analysis(db, target)
     except Exception:  # noqa: BLE001
         log.exception("enqueue file analysis failed intake=%s file=%s", intake.id, file.id)

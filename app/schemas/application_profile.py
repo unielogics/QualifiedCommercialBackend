@@ -254,6 +254,8 @@ class ApplicationBankState(BaseModel):
     manual_override: bool = False
     manual_override_reason: str | None = None
     manual_statement_months: list[str] = Field(default_factory=list)
+    manual_statement_file_count: int = 0
+    manual_statement_pending_count: int = 0
     assets_enabled: bool = False
     asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
 
@@ -544,6 +546,8 @@ class PublicBankVerificationRead(BaseModel):
     consent_granted: bool = False
     items: list[ApplicationBankConnectionRead] = Field(default_factory=list)
     manual_statement_months: list[str] = Field(default_factory=list)
+    manual_statement_file_count: int = 0
+    manual_statement_pending_count: int = 0
     assets_enabled: bool = False
     asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
     statement_upload_enabled: bool = False

@@ -16,7 +16,7 @@ import boto3
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
-from sqlalchemy import case, or_, select
+from sqlalchemy import case, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -39,6 +39,7 @@ from app.models.bucket import (
 from app.models.user import User
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
+from app.services.bucket_evidence import classifications_for_requested_doc, reconcile_uploaded_file
 
 # The user and assistant rows of one chat turn are flushed together and share
 # a single created_at, so timestamp-only ordering can render an answer above
@@ -914,59 +915,6 @@ def _ensure_review_result_shape(result: dict[str, Any]) -> dict[str, Any]:
     return shaped
 
 
-# Maps a requested-document checklist item to the per-file `ai_classification`
-# values that satisfy it. Used to reconcile the analyzed evidence against the
-# baseline package so satisfied categories stop showing as "missing".
-_CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
-    "bank statement": {"bank_statement"},
-    "tax return": {"tax_return"},
-    "p&l": {"current_p_and_l"},
-    "profit and loss": {"current_p_and_l"},
-    "profit & loss": {"current_p_and_l"},
-    "lease": {"lease_or_rent", "commercial_lease"},
-    "rent": {"lease_or_rent"},
-    "rent roll": {"lease_or_rent"},
-    "purchase contract": {"purchase_contract"},
-    "payoff": {"payoff_or_mortgage_statement"},
-    "mortgage statement": {"payoff_or_mortgage_statement"},
-    "insurance": {"insurance"},
-    "hoa": {"hoa"},
-    "entity": {"entity_or_vesting"},
-    "vesting": {"entity_or_vesting"},
-    "identity": {"identity"},
-    "id": {"identity"},
-    "floorplan": {"floorplan_mca_inventory"},
-    "mca": {"floorplan_mca_inventory"},
-    "inventory": {"floorplan_mca_inventory"},
-    "debt schedule": {"debt_schedule"},
-    "personal financial statement": {"personal_financial_statement"},
-    "pfs": {"personal_financial_statement"},
-    # Main Street conditional documents. Keyed on substrings that appear in the
-    # document names seeded by app/services/main_street_programs.py.
-    "merchant processing": {"merchant_processing_statement"},
-    "vendor quote": {"equipment_quote_or_invoice"},
-    "equipment schedule": {"equipment_quote_or_invoice"},
-    "fleet schedule": {"fleet_or_vehicle_schedule"},
-    "operating authority": {"transportation_authority"},
-    "ifta": {"transportation_authority"},
-    "license": {"business_license_or_permit"},
-    "permit": {"business_license_or_permit"},
-    "franchise": {"franchise_agreement"},
-    "receivable": {"accounts_receivable_aging"},
-    "purchase ledger": {"inventory_or_purchase_ledger"},
-    "payroll": {"payroll_report"},
-}
-
-
-def _classifications_for_requested_doc(name: str, category: str | None) -> set[str]:
-    text = f"{name} {category or ''}".lower()
-    matched: set[str] = set()
-    for keyword, classes in _CATEGORY_CLASSIFICATIONS.items():
-        if keyword in text:
-            matched |= classes
-    return matched
-
-
 def _merge_per_file_analyses(
     result: dict[str, Any],
     per_file_analyses: list[dict[str, Any]],
@@ -1010,7 +958,7 @@ def _merge_per_file_analyses(
         for doc in requested_documents:
             name = str(doc.get("name") or "")
             category = doc.get("category")
-            wanted = _classifications_for_requested_doc(name, category)
+            wanted = classifications_for_requested_doc(name, category)
             evidence_files = [fn for cls in wanted for fn in present_classes.get(cls, [])]
             coverage.append(
                 {
@@ -2098,6 +2046,9 @@ async def analyze_bucket_file(
     review_type picks the per-file persona (dealer vs real-estate). Returns None
     only if the file bytes cannot be fetched from storage.
     """
+    # High-signal filenames can satisfy the matching checklist slot and expose
+    # statement coverage immediately, while the durable content analysis runs.
+    await reconcile_uploaded_file(db, file)
     fetched = _fetch_file(file)
     if fetched is None:
         return None
@@ -2111,6 +2062,7 @@ async def analyze_bucket_file(
     if not force:
         cached = await _cached_file_analysis(db, file, content_hash)
         if cached is not None:
+            await reconcile_uploaded_file(db, file, cached)
             return cached
 
     row = await _get_or_create_analysis_row(db, file, content_hash)
@@ -2200,6 +2152,7 @@ async def analyze_bucket_file(
         row.output_tokens = output_tokens
         row.error = None
         row.analyzed_at = _now()
+        await reconcile_uploaded_file(db, file, row)
         from app.services.application_profiles import capture_extracted_profile_facts
 
         await capture_extracted_profile_facts(db, file=file, analysis=row)
@@ -2412,7 +2365,7 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         for doc in bucket.requested_documents:
             if doc.status == "uploaded":
                 continue
-            wanted = _classifications_for_requested_doc(doc.name, doc.category)
+            wanted = classifications_for_requested_doc(doc.name, doc.category)
             if wanted & present_classes:
                 doc.status = "uploaded"
         # Deterministically fill numeric key_metrics from the cached bank/tax facts
@@ -2519,7 +2472,9 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
         )
     ).scalars().all()
     processed = 0
+    attempted = 0
     for placeholder in rows:
+        attempted += 1
         file = placeholder.file
         # Drop the placeholder; analyze_bucket_file upserts the real hashed row.
         await db.delete(placeholder)
@@ -2535,6 +2490,44 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
         except Exception:
             await db.rollback()
             log.exception("drain_file_analyses: failed file=%s", file.id)
+    # Legacy/public-room uploads could predate analysis queuing. Backfill a
+    # bounded number on every drain so existing evidence converges without a
+    # one-off migration or an unbounded model-spend spike.
+    remaining = max(0, limit - attempted)
+    if remaining:
+        current_analysis = exists(
+            select(BucketFileAnalysis.id).where(
+                BucketFileAnalysis.bucket_file_id == BucketFile.id,
+                BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
+            )
+        )
+        missing_files = list(
+            (
+                await db.execute(
+                    select(BucketFile)
+                    .where(
+                        BucketFile.status == "uploaded",
+                        BucketFile.deleted_at.is_(None),
+                        ~current_analysis,
+                    )
+                    .order_by(BucketFile.created_at.desc())
+                    .limit(remaining)
+                    .options(selectinload(BucketFile.bucket))
+                )
+            ).scalars().all()
+        )
+        for file in missing_files:
+            try:
+                await analyze_bucket_file(
+                    db,
+                    file,
+                    review_type=(file.bucket.ai_context or {}).get("review_type") if file.bucket else None,
+                )
+                await db.commit()
+                processed += 1
+            except Exception:
+                await db.rollback()
+                log.exception("drain_file_analyses: legacy backfill failed file=%s", file.id)
     return processed
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -29,7 +30,13 @@ from app.models.application_profile import (
     ApplicationProfile,
     ApplicationTaxonomyEntry,
 )
-from app.models.bucket import Bucket, BucketActivityLog, BucketFile, BucketFileAnalysis
+from app.models.bucket import (
+    Bucket,
+    BucketActivityLog,
+    BucketFile,
+    BucketFileAnalysis,
+    BucketRequestedDocument,
+)
 from app.models.client import Client
 from app.models.deal import Deal
 from app.models.loan import Loan
@@ -50,11 +57,24 @@ from app.schemas.application_profile import (
     UnifiedAuditEvent,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services.bucket_evidence import (
+    classifications_for_requested_doc,
+    effective_file_classification,
+    statement_months_from_analysis,
+    statement_months_from_filename,
+)
 from app.services.underwriting_intelligence import calculate_dscr
 from app.services.user_access import is_audit_client
 
 MAX_OWNERS = 5
 CREDIT_THRESHOLD = Decimal("20.00")
+
+
+@dataclass(frozen=True)
+class ManualStatementEvidence:
+    months: list[str]
+    file_count: int
+    pending_analysis_count: int
 
 
 def now() -> datetime:
@@ -547,7 +567,8 @@ async def verification_state(
     pending = [owner for owner in required if not owner.credit_complete]
     banks = await bank_rows(db, profile)
     months = sorted({month for bank in banks for month in bank.statement_months})
-    manual_months = await manual_statement_months(db, profile)
+    manual_evidence = await manual_statement_evidence(db, profile)
+    manual_months = manual_evidence.months
     ownership_blockers: list[str] = []
     if not owners:
         ownership_blockers.append("Add at least one owner")
@@ -560,9 +581,15 @@ async def verification_state(
     if pending:
         credit_blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
     banking_blockers: list[str] = []
-    banking_complete = bool(banks) or bool(profile.bank_verification_override_at and manual_months)
+    banking_complete = bool(banks) or bool(
+        profile.bank_verification_override_at and manual_evidence.file_count
+    )
     if not banking_complete:
-        banking_blockers.append("Connect an LLC business bank or approve uploaded statement evidence")
+        banking_blockers.append(
+            "Review and approve uploaded statement evidence"
+            if manual_evidence.file_count
+            else "Connect an LLC business bank or upload statement evidence"
+        )
     evidence = await evidence_state(db, profile)
     blockers = ownership_blockers + credit_blockers + banking_blockers + evidence.blockers
     return FileOwnerRequirementState(
@@ -590,33 +617,104 @@ async def verification_state(
     )
 
 
-async def manual_statement_months(db: AsyncSession, profile: ApplicationProfile) -> list[str]:
-    if profile.primary_bucket_id is None:
-        return []
+async def _profile_evidence_file_ids(
+    db: AsyncSession, profile: ApplicationProfile
+) -> set[UUID]:
+    file_ids: set[UUID] = set()
+    if profile.primary_bucket_id:
+        file_ids.update(
+            (
+                await db.execute(
+                    select(BucketFile.id).where(
+                        BucketFile.bucket_id == profile.primary_bucket_id,
+                        BucketFile.status == "uploaded",
+                        BucketFile.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+    if profile.intake_id:
+        file_ids.update(
+            (
+                await db.execute(
+                    select(BucketFile.id)
+                    .join(BucketIntakeLinkFile, BucketIntakeLinkFile.bucket_file_id == BucketFile.id)
+                    .join(BucketIntakeLink, BucketIntakeLink.id == BucketIntakeLinkFile.link_id)
+                    .where(
+                        BucketIntakeLink.intake_id == profile.intake_id,
+                        BucketIntakeLink.unlinked_at.is_(None),
+                        BucketIntakeLinkFile.removed_at.is_(None),
+                        BucketFile.status == "uploaded",
+                        BucketFile.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+    return file_ids
+
+
+async def manual_statement_evidence(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ManualStatementEvidence:
+    file_ids = await _profile_evidence_file_ids(db, profile)
+    if not file_ids:
+        return ManualStatementEvidence(months=[], file_count=0, pending_analysis_count=0)
     rows = list(
         (
             await db.execute(
-                select(BucketFile.statement_period, BucketFileAnalysis.analysis)
+                select(BucketFile, BucketRequestedDocument, BucketFileAnalysis)
+                .outerjoin(
+                    BucketRequestedDocument,
+                    BucketRequestedDocument.id == BucketFile.requested_document_id,
+                )
                 .outerjoin(
                     BucketFileAnalysis,
                     (BucketFileAnalysis.bucket_file_id == BucketFile.id)
                     & (BucketFileAnalysis.status == "completed"),
                 )
                 .where(
-                    BucketFile.bucket_id == profile.primary_bucket_id,
-                    BucketFile.status == "uploaded",
-                    BucketFile.deleted_at.is_(None),
+                    BucketFile.id.in_(file_ids),
                     BucketFile.application_plaid_item_id.is_(None),
+                )
+                .order_by(
+                    BucketFile.id,
+                    BucketFileAnalysis.analysis_version.desc().nullslast(),
+                    BucketFileAnalysis.analyzed_at.desc().nullslast(),
                 )
             )
         ).all()
     )
+    latest: dict[UUID, tuple[BucketFile, BucketRequestedDocument | None, BucketFileAnalysis | None]] = {}
+    for file, requested, analysis in rows:
+        latest.setdefault(file.id, (file, requested, analysis))
     months: set[str] = set()
-    for statement_period, analysis in rows:
-        if statement_period:
-            months.add(str(statement_period))
-        months.update(_statement_months_from_analysis(analysis))
-    return sorted(months)
+    statement_file_ids: set[UUID] = set()
+    pending_analysis_ids: set[UUID] = set()
+    for file, requested, analysis in latest.values():
+        requested_is_bank = bool(
+            requested
+            and "bank_statement"
+            in classifications_for_requested_doc(requested.name, requested.category)
+        )
+        classification = effective_file_classification(file.file_name, analysis)
+        if classification != "bank_statement" and not requested_is_bank:
+            continue
+        statement_file_ids.add(file.id)
+        if analysis is None:
+            pending_analysis_ids.add(file.id)
+        if file.statement_period:
+            months.add(str(file.statement_period))
+        months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
+        months.update(statement_months_from_filename(file.file_name))
+    return ManualStatementEvidence(
+        months=sorted(months),
+        file_count=len(statement_file_ids),
+        pending_analysis_count=len(pending_analysis_ids),
+    )
+
+
+async def manual_statement_months(db: AsyncSession, profile: ApplicationProfile) -> list[str]:
+    return (await manual_statement_evidence(db, profile)).months
 
 
 async def draft_analysis_status(
@@ -680,26 +778,7 @@ async def draft_analysis_status(
 
 def _statement_months_from_analysis(analysis: dict | None) -> set[str]:
     """Return every explicit statement month without inferring missing periods."""
-    if not isinstance(analysis, dict):
-        return set()
-    key_facts = analysis.get("key_facts")
-    if not isinstance(key_facts, dict):
-        return set()
-    values: list[object] = [key_facts.get("statement_period")]
-    for row in key_facts.get("months") or []:
-        if isinstance(row, dict):
-            values.extend(
-                row.get(key)
-                for key in ("month", "statement_period", "period", "start_date")
-            )
-        else:
-            values.append(row)
-    result: set[str] = set()
-    for value in values:
-        match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", str(value or ""))
-        if match:
-            result.add(f"{match.group(1)}-{match.group(2)}")
-    return result
+    return statement_months_from_analysis(analysis)
 
 
 def _metric_number(data: dict, *keys: str) -> float | None:
