@@ -15,10 +15,10 @@ substitute: asking for a text sends both. That way a request is never lost
 because texting is switched off or the number was wrong.
 
   email  works today, through the SES identity verified for this domain.
-  sms    uses the explicitly selected AWS or Twilio provider. It remains inert
-         until that provider is production-ready and degrades to a clear,
-         honest failure rather than silently reporting success or switching to
-         the other provider.
+  sms    uses the explicitly selected provider — AWS End User Messaging,
+         Twilio, or the Android handset relay. It remains inert until that
+         provider is ready and degrades to a clear, honest failure rather than
+         silently reporting success or switching to another provider.
 
 The link itself is never logged. Tokens ride in the URL fragment, which browsers
 do not send to servers, and the delivery record stores only which channel was
@@ -281,6 +281,8 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
     governs marketing email separately through unsubscribe rather than prior
     opt-in.
     """
+    from app.services.sms.optout import is_opted_out
+
     from . import sms_consent as sms_consent_svc
 
     ok = False
@@ -290,8 +292,37 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
             grant = await sms_consent_svc.consent_for(
                 db, phone_e164=phone, kind="transactional"
             )
-            ok = grant is not None
+            # The grant lifecycle and the suppression list are separate records
+            # and both can veto. A number can hold a live grant from one file
+            # and still have said STOP through some other channel.
+            ok = grant is not None and not await is_opted_out(db, phone)
 
     import asyncio
 
-    return await asyncio.to_thread(deliver_link, sms_consent_ok=ok, **kwargs)
+    result = await asyncio.to_thread(deliver_link, sms_consent_ok=ok, **kwargs)
+
+    # Ledger row for the SMS leg. This path does not go through
+    # send_sms_checked (the transport runs sync inside deliver_link), so the
+    # write happens here. Body deliberately absent: consent links are tokened
+    # pages and the module contract is that the link is never logged.
+    if kwargs.get("channel") == "sms":
+        phone = normalize_phone(kwargs.get("to_phone"))
+        if phone:
+            from app.services.sms import ledger
+
+            from .sms_provider import selected_provider
+
+            if result.sms_ok:
+                status, detail = "sent", ""
+            elif not ok:
+                status, detail = "blocked", "No transactional consent, or number opted out."
+            else:
+                status, detail = "failed", result.detail
+            await ledger.record(
+                db, direction="outbound", phone_e164=phone, status=status,
+                provider=getattr(result, "provider", None) or selected_provider(),
+                provider_message_id=getattr(result, "provider_message_id", None) or "",
+                detail=detail, context="consent_link",
+            )
+
+    return result

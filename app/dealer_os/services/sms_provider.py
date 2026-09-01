@@ -1,8 +1,15 @@
 """Explicit transactional SMS provider adapter.
 
-AWS End User Messaging and Twilio remain independently configurable. The
-selected provider never falls back silently: a provider outage or incomplete
-configuration is reported against the provider the operator chose.
+AWS End User Messaging, Twilio, and the Android relay remain independently
+configurable. The selected provider never falls back silently: a provider
+outage or incomplete configuration is reported against the provider the
+operator chose.
+
+The android transport is a physical handset reached over Tailscale via QCRelay
+(/home/ubuntu/QCRelay on the API box). It exists because both carrier paths are
+blocked by external verification (AWS sandbox, A2P 10DLC) and is scoped as the
+testing path: Android caps outgoing SMS at roughly 30 per 30 minutes per app,
+and P2P routes carrying application traffic are what carriers filter for.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ class SmsSendResult:
 
 def selected_provider(settings: Settings | None = None) -> str:
     value = str((settings or get_settings()).sms_provider or "aws").strip().lower()
-    return value if value in {"aws", "twilio"} else "invalid"
+    return value if value in {"aws", "twilio", "android"} else "invalid"
 
 
 def _twilio_auth(settings: Settings) -> tuple[str, str] | None:
@@ -93,17 +100,38 @@ def provider_readiness(settings: Settings | None = None) -> dict[str, object]:
             "sender": provider_sender(settings),
             "detail": detail,
         }
+    if provider == "android":
+        configured = bool(settings.relay_sms_url and settings.relay_auth_token)
+        return {
+            "provider": provider,
+            "configured": configured,
+            # Honest: this reflects sms_production, which the android path does
+            # not require — see sms_available below.
+            "production": bool(settings.sms_production),
+            "sender": None,
+            "detail": (
+                "Ready — physical handset via QCRelay (testing path)"
+                if configured
+                else "Relay URL and auth token are not configured"
+            ),
+        }
     return {
         "provider": provider,
         "configured": False,
         "production": False,
         "sender": None,
-        "detail": "SMS_PROVIDER must be aws or twilio",
+        "detail": "SMS_PROVIDER must be aws, twilio, or android",
     }
 
 
 def sms_available(settings: Settings | None = None) -> bool:
     status = provider_readiness(settings)
+    if status["provider"] == "android":
+        # Deliberately not gated on sms_production: that flag means "AWS granted
+        # production access" and is forced false on every service start by the
+        # A2P pause drop-in, which would strand the handset for an unrelated
+        # reason. What matters here is whether the relay is configured.
+        return bool(status["configured"])
     return bool(status["configured"] and status["production"])
 
 
@@ -207,6 +235,44 @@ def _send_twilio(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
         return _safe_twilio_failure(exc)
 
 
+def _send_android(to_phone: str, body: str, settings: Settings) -> SmsSendResult:
+    url = f"{settings.relay_sms_url.rstrip('/')}/send-sms"
+    try:
+        # Read timeout covers the relay's own send pacing (it serializes to
+        # stay under Android's per-app ceiling), not just the HTTP round trip.
+        with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=45.0, write=5.0, pool=5.0)) as client:
+            response = client.post(
+                url,
+                json={"to": to_phone, "message": body},
+                headers={"Authorization": f"Bearer {settings.relay_auth_token}"},
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("android SMS send failed category=%s", type(exc).__name__)
+        return SmsSendResult(
+            ok=False,
+            provider="android",
+            detail=(
+                "The SMS relay is unreachable. Check the relay container and "
+                "that the tablet is awake and on the tailnet."
+            ),
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if response.status_code >= 400 or not payload.get("ok"):
+        detail = str(payload.get("detail") or payload.get("error") or f"http_{response.status_code}")
+        log.warning("android SMS send rejected category=%s", detail[:80])
+        return SmsSendResult(ok=False, provider="android", detail=detail[:500])
+    return SmsSendResult(
+        ok=True,
+        provider="android",
+        detail="Sent through the handset relay.",
+        message_id=str(payload.get("messageId") or "") or None,
+        status=str(payload.get("detail") or "accepted"),
+    )
+
+
 def send_sms(to_phone: str, body: str) -> SmsSendResult:
     settings = get_settings()
     readiness = provider_readiness(settings)
@@ -222,6 +288,8 @@ def send_sms(to_phone: str, body: str) -> SmsSendResult:
         return _send_twilio(to_phone, body, settings)
     if provider == "aws":
         return _send_aws(to_phone, body, settings)
+    if provider == "android":
+        return _send_android(to_phone, body, settings)
     return SmsSendResult(False, provider, "SMS provider selection is invalid.")
 
 

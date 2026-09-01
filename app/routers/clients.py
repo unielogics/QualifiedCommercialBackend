@@ -1319,10 +1319,13 @@ async def send_intake_link(
 ) -> SendIntakeLinkResponse:
     """Generate a sign-up link for this client and actually send it.
 
-    Channel resolution: explicit > phone (sms) > email > portal. There is
-    no SMS transport in this codebase yet (no Twilio/similar adapter) — an
-    "sms" resolution falls back to "portal" rather than silently pretending
-    to text the client. The "email" branch sends via send_as_user (the
+    Channel resolution: explicit > phone (sms) > email > portal. The "sms"
+    branch goes through sms_service.send_sms_checked, which resolves the
+    suppression list from the database before sending — a number that replied
+    STOP anywhere is unreachable everywhere. On any failure, including an
+    unconfigured transport, sent_via falls back to "portal" rather than
+    silently pretending to text the client. The "email" branch sends via
+    send_as_user (the
     broker's connected Gmail, SES fallback) — sent_via only reports "email"
     when that send genuinely succeeds; otherwise it reports "portal" so the
     broker isn't told a message went out when it didn't. Every outcome logs
@@ -1365,7 +1368,26 @@ async def send_intake_link(
     sent_via = "portal"
     send_detail = "No email on file — share the link directly."
     if requested_via == "sms":
-        send_detail = "SMS requested but no SMS transport is configured — share the link directly."
+        from app.services import sms as sms_service
+
+        sms_result = await sms_service.send_sms_checked(
+            db,
+            to_phone=client.phone,
+            body=(
+                f"{user.name or user.email} has invited you to your secure "
+                f"Qualified Commercial file. Sign up here: {url}\n\n"
+                "Reply STOP to opt out."
+            ),
+            client_id=client.id,
+            context="intake_link",
+        )
+        if sms_result.ok:
+            sent_via = "sms"
+            send_detail = f"Texted to {client.phone}."
+        else:
+            # Stays "portal" on failure. The broker is told what happened rather
+            # than being left to assume a text went out.
+            send_detail = f"Text send failed ({sms_result.detail}) — share the link directly."
     elif requested_via == "email" and client.email:
         result = await send_as_user(
             db,

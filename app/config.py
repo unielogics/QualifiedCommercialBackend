@@ -190,6 +190,24 @@ class Settings(BaseSettings):
     twilio_from_number: str = ""
     twilio_validate_signatures: bool = True
 
+    # QCRelay — the SMS + WhatsApp relay on this box (/home/ubuntu/QCRelay).
+    # Tailnet-only; it holds no consent state and decides nothing about who may
+    # be contacted. Prefer a MagicDNS name over a raw 100.x address. When set,
+    # SMS_PROVIDER may also be "android": the message leaves a physical
+    # handset's SIM over Tailscale. That path is deliberately NOT gated on
+    # sms_production — that flag means "AWS granted production access" and is
+    # forced false on every service start by the A2P pause drop-in, which would
+    # strand the tablet for an unrelated reason.
+    relay_sms_url: str = ""
+    relay_auth_token: str = ""
+
+    # AI re-engagement auto-send, per channel. OFF by default and meant to stay
+    # that way until someone deliberately turns it on: this is the one path that
+    # texts a borrower with no human in the loop, so shipping it enabled would
+    # start messaging people the moment it deployed. With it off, the engine
+    # still runs and still records the composed draft for review.
+    reengagement_autosend_sms: bool = False
+
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""

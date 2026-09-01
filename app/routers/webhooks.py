@@ -1,6 +1,6 @@
 """Inbound webhooks.
 
-Two receivers, secured differently because their senders differ:
+Several receivers, secured differently because their senders differ:
 
 POST /webhooks/plaid
   Plaid item + statement events. Plaid signs every webhook with an ES256 JWT,
@@ -15,6 +15,13 @@ POST /webhooks/gmail?token=<secret>
   Activity log and isolates per-message failures). The poll is the
   same code path the 60s scheduler uses, so push just removes the
   latency.
+
+POST /webhooks/sms/inbound
+  A reply someone sent back to one of our texts, forwarded by QCRelay from the
+  handset. This is how STOP actually stops things: the relay is a transport and
+  holds no consent state, so the opt-out has to land here to take effect. Shared
+  secret in the X-Relay-Secret header, matched against settings.sms_webhook_token.
+  Fails closed.
 
 Unauthenticated by nature — Pub/Sub can't present a Clerk session —
 so the endpoint is guarded by a shared secret in the URL
@@ -154,8 +161,36 @@ async def _store_inbound_sms(
                 )
             ).scalars().all()
         )
-        if rep_workflows.is_stop_message(body):
-            await sms_consent_svc.revoke(db, phone_e164=from_phone, reason="STOP")
+
+        # Every inbound text becomes a ledger row FIRST, before any early
+        # return below can skip it — the compliance record must not depend on
+        # whether a rep contact or client match exists.
+        from app.services.sms import ledger as sms_ledger
+        from app.services.sms import optout as sms_optout
+
+        is_stop = rep_workflows.is_stop_message(body)
+        ledger_client = await sms_ledger.client_for_phone(db, from_phone)
+        await sms_ledger.record(
+            db,
+            direction="inbound",
+            phone_e164=from_phone,
+            status="received",
+            body=body,
+            provider=provider,
+            provider_message_id=provider_id or "",
+            detail="opt-out" if is_stop else "",
+            context="reply",
+            client_id=ledger_client.id if ledger_client is not None else None,
+        )
+
+        if is_stop:
+            # record_opt_out writes the suppression row (needed even when the
+            # number never held a grant — revoke alone matches nothing then)
+            # AND revokes any dealer consent grants, inside a savepoint.
+            await sms_optout.record_opt_out(
+                db, phone_e164=from_phone, reason="STOP", source="sms_reply",
+                note=f"received via {provider} webhook",
+            )
             now = datetime.now(UTC)
             for contact in contacts:
                 contact.sms_opted_out_at = now
@@ -166,6 +201,8 @@ async def _store_inbound_sms(
         contact = contacts[0] if contacts else None
         if contact is None or contact.owner_user_id is None:
             log.warning("%s sms webhook: no rep contact for sender=%s", provider, from_phone)
+            # No rep thread to file it under, but the ledger row above stands.
+            await db.commit()
             return Response(status_code=status.HTTP_202_ACCEPTED)
 
         now = datetime.now(UTC)
@@ -602,3 +639,97 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         outcome,
     )
     return Response(status_code=status.HTTP_200_OK)
+
+
+@router.post("/sms/inbound")
+async def sms_inbound(request: Request) -> Response:
+    """An inbound SMS reply, forwarded by QCRelay.
+
+    The only thing acted on here is an opt-out, and that is deliberate. STOP is
+    the one inbound message with a legal consequence, and it has to be honoured
+    whether or not the sender was ever a client, ever granted consent, or exists
+    in the database at all — which is exactly why the suppression list needs no
+    prior grant to write to.
+
+    Every reply is recorded to the sms_messages ledger and matched to a
+    client by number where possible, so inbound texts appear in the client's
+    SMS history. Carrier state events (sms:sent / sms:delivered) advance the
+    matching outbound row instead.
+
+    Acks 204 on anything it understands. The relay should not retry a message we
+    have already recorded, and a retry storm on a malformed payload would be
+    worse than dropping one line we could not parse.
+    """
+    settings = get_settings()
+    expected = settings.sms_webhook_token
+    presented = request.headers.get("x-relay-secret", "")
+    # Fail closed — this endpoint can suppress a phone number.
+    if not expected or not hmac.compare_digest(presented, expected):
+        log.warning("sms webhook: rejected inbound (bad/missing secret)")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        log.warning("sms webhook: unparseable body")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    from app.dealer_os.services.consent_delivery import normalize_phone
+    from app.services.sms import ledger, optout
+
+    event = (body or {}).get("event") or "sms:received"
+
+    # Carrier state events — the relay forwards the gateway's sms:sent /
+    # sms:delivered webhooks so the ledger's outbound rows advance to what the
+    # carrier actually confirmed, matched on the provider message id.
+    if event in ("sms:sent", "sms:delivered"):
+        message_id = (body or {}).get("messageId") or ""
+        async with SessionLocal() as db:
+            moved = await ledger.mark_delivery(
+                db,
+                provider_message_id=message_id,
+                status="delivered" if event == "sms:delivered" else "sent",
+            )
+            await db.commit()
+        log.info("sms webhook: %s for id=%s matched=%s", event, message_id, moved)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    raw_from = (body or {}).get("from") or ""
+    message = (body or {}).get("message") or ""
+    phone = normalize_phone(raw_from)
+
+    if not phone:
+        log.warning("sms webhook: inbound from an unusable number, ignored")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    is_stop = optout.is_opt_out_keyword(message)
+    async with SessionLocal() as db:
+        # Every reply becomes a ledger row, matched to a client when the number
+        # is known — this is what puts inbound texts on the client's screen
+        # instead of leaving them in a file on the relay.
+        client = await ledger.client_for_phone(db, phone)
+        await ledger.record(
+            db,
+            direction="inbound",
+            phone_e164=phone,
+            status="received",
+            body=message,
+            provider="android",
+            detail="opt-out" if is_stop else "",
+            context="reply",
+            client_id=client.id if client is not None else None,
+        )
+        if is_stop:
+            await optout.record_opt_out(
+                db,
+                phone_e164=phone,
+                reason=message.strip()[:120] or "STOP",
+                source="sms_reply",
+                note="received via QCRelay",
+            )
+        await db.commit()
+    if is_stop:
+        log.info("sms webhook: opt-out honoured for %s", phone)
+    else:
+        log.info("sms webhook: reply recorded from %s client=%s", phone, bool(client))
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

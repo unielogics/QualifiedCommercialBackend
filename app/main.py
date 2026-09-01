@@ -58,6 +58,7 @@ from app.routers import (
     loan_workspace,
     loans,
     me,
+    sms as sms_router,
     messages,
     meta,
     notifications,
@@ -225,6 +226,7 @@ for r in [
     fix_flip.router,
     pipeline_router.router,
     public_router.router,
+    sms_router.router,
     webhooks_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)
