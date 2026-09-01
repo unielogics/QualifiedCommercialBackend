@@ -1,13 +1,17 @@
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from app.dealer_os.router import _booking_review_row
+from app.dealer_os.router import _booking_review_row, _sort_calendar_file_options
 from app.dealer_os.router import router as dealer_router
-from app.dealer_os.schemas import RepAppointmentApplyOutcome, RepAppointmentFileLinkPatch
+from app.dealer_os.schemas import (
+    RepAppointmentApplyOutcome,
+    RepAppointmentFileLinkPatch,
+    RepAppointmentFileOption,
+)
 from app.enums import Role
 from app.routers.calendar import router as calendar_router
 from app.schemas.booking_settings import UserBookingSettingsUpdate
@@ -82,6 +86,35 @@ def test_calendar_outcome_payload_carries_one_retry_key_and_exact_file() -> None
     assert payload.idempotency_key == "attempt-12345678"
     assert payload.existing_file_id == file_id
     assert RepAppointmentFileLinkPatch(kind="intake", file_id=file_id, confirm=True).confirm
+
+
+def test_file_options_merge_ai_intakes_and_funding_loans_by_recency() -> None:
+    intake = RepAppointmentFileOption(
+        kind="intake",
+        id=uuid4(),
+        label="Example AI Intake",
+        subtitle="Owner · intake@example.com",
+        status="submitted",
+        href="/admin/ai-underwriter-leads?lead=example",
+    )
+    loan = RepAppointmentFileOption(
+        kind="loan",
+        id=uuid4(),
+        label="Example Funding Loan",
+        subtitle="QC-100 · loan@example.com",
+        status="underwriting",
+        href="/loans/example",
+    )
+
+    items = _sort_calendar_file_options(
+        [
+            (datetime(2026, 8, 30, tzinfo=UTC), intake),
+            (datetime(2026, 8, 31, tzinfo=UTC), loan),
+        ],
+        limit=200,
+    )
+
+    assert [item.kind for item in items] == ["loan", "intake"]
 
 
 def test_booking_data_review_distinguishes_matches_missing_and_conflicts() -> None:

@@ -7526,18 +7526,23 @@ async def _link_calendar_file(
     )
 
 
-@router.get(
-    "/appointments/{appointment_id}/file-options",
-    response_model=RepAppointmentFileOptions,
-)
-async def list_rep_appointment_file_options(
-    appointment_id: UUID,
-    user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
-    q: str = Query(default="", max_length=160),
-    limit: int = Query(default=20, ge=1, le=50),
+def _sort_calendar_file_options(
+    ranked: list[tuple[datetime | None, RepAppointmentFileOption]],
+    limit: int,
+) -> list[RepAppointmentFileOption]:
+    def created_timestamp(item: tuple[datetime | None, RepAppointmentFileOption]) -> float:
+        return item[0].timestamp() if item[0] else float("-inf")
+
+    return [item for _, item in sorted(ranked, key=created_timestamp, reverse=True)[:limit]]
+
+
+async def _list_calendar_file_options(
+    db: AsyncSession,
+    user: User,
+    *,
+    q: str,
+    limit: int,
 ) -> RepAppointmentFileOptions:
-    await _load_owned_appointment(db, appointment_id, user)
     needle = q.strip()
     pattern = f"%{needle}%"
     intake_stmt = select(PublicUnderwritingIntake)
@@ -7560,18 +7565,21 @@ async def list_rep_appointment_file_options(
             )
         ).scalars().all()
     )
-    items = [
-        RepAppointmentFileOption(
-            kind="intake",
-            id=row.id,
-            label=row.business_name or row.full_name,
-            subtitle=f"{row.full_name} · {row.email}",
-            status=row.status,
-            href=_appointment_intake_href(row.id),
+    ranked: list[tuple[datetime | None, RepAppointmentFileOption]] = [
+        (
+            row.created_at,
+            RepAppointmentFileOption(
+                kind="intake",
+                id=row.id,
+                label=row.business_name or row.full_name,
+                subtitle=f"{row.full_name} · {row.email or 'No email'}",
+                status=row.status,
+                href=_appointment_intake_href(row.id),
+            ),
         )
         for row in intakes
     ]
-    if calendar_v2.can_create_funding_file(user) and len(items) < limit:
+    if calendar_v2.can_create_funding_file(user):
         loan_stmt = select(Loan, Client).join(Client, Client.id == Loan.client_id)
         if needle:
             loan_stmt = loan_stmt.where(
@@ -7587,22 +7595,40 @@ async def list_rep_appointment_file_options(
         loan_rows = list(
             (
                 await db.execute(
-                    loan_stmt.order_by(Loan.created_at.desc()).limit(limit - len(items))
+                    loan_stmt.order_by(Loan.created_at.desc()).limit(limit)
                 )
             ).all()
         )
-        items.extend(
-            RepAppointmentFileOption(
-                kind="loan",
-                id=loan.id,
-                label=loan.entity_name or client.name,
-                subtitle=f"{loan.deal_id} · {client.email or 'No email'}",
-                status=loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage),
-                href=_appointment_loan_href(loan.id),
+        ranked.extend(
+            (
+                loan.created_at,
+                RepAppointmentFileOption(
+                    kind="loan",
+                    id=loan.id,
+                    label=loan.entity_name or client.name,
+                    subtitle=f"{loan.deal_id} · {client.email or 'No email'}",
+                    status=loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage),
+                    href=_appointment_loan_href(loan.id),
+                ),
             )
             for loan, client in loan_rows
         )
-    return RepAppointmentFileOptions(items=items)
+    return RepAppointmentFileOptions(items=_sort_calendar_file_options(ranked, limit))
+
+
+@router.get(
+    "/appointments/{appointment_id}/file-options",
+    response_model=RepAppointmentFileOptions,
+)
+async def list_rep_appointment_file_options(
+    appointment_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    q: str = Query(default="", max_length=160),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> RepAppointmentFileOptions:
+    await _load_owned_appointment(db, appointment_id, user)
+    return await _list_calendar_file_options(db, user, q=q, limit=limit)
 
 
 @router.get("/calendar/file-options", response_model=RepAppointmentFileOptions)
@@ -7610,74 +7636,10 @@ async def list_calendar_file_options(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     q: str = Query(default="", max_length=160),
-    limit: int = Query(default=20, ge=1, le=50),
+    limit: int = Query(default=200, ge=1, le=500),
 ) -> RepAppointmentFileOptions:
     require_team_or_rep(user)
-    needle = q.strip()
-    pattern = f"%{needle}%"
-    intake_stmt = select(PublicUnderwritingIntake)
-    if user.role == Role.FIELD_REP:
-        intake_stmt = intake_stmt.where(PublicUnderwritingIntake.broker_id == user.id)
-    if needle:
-        intake_stmt = intake_stmt.where(
-            or_(
-                PublicUnderwritingIntake.full_name.ilike(pattern),
-                PublicUnderwritingIntake.business_name.ilike(pattern),
-                PublicUnderwritingIntake.email.ilike(pattern),
-                PublicUnderwritingIntake.phone.ilike(pattern),
-                PublicUnderwritingIntake.id.cast(String).ilike(pattern),
-            )
-        )
-    intakes = list(
-        (
-            await db.execute(
-                intake_stmt.order_by(PublicUnderwritingIntake.created_at.desc()).limit(limit)
-            )
-        ).scalars().all()
-    )
-    items = [
-        RepAppointmentFileOption(
-            kind="intake",
-            id=row.id,
-            label=row.business_name or row.full_name,
-            subtitle=f"{row.full_name} · {row.email}",
-            status=row.status,
-            href=_appointment_intake_href(row.id),
-        )
-        for row in intakes
-    ]
-    if calendar_v2.can_create_funding_file(user) and len(items) < limit:
-        loan_stmt = select(Loan, Client).join(Client, Client.id == Loan.client_id)
-        if needle:
-            loan_stmt = loan_stmt.where(
-                or_(
-                    Loan.deal_id.ilike(pattern),
-                    Loan.entity_name.ilike(pattern),
-                    Loan.address.ilike(pattern),
-                    Client.name.ilike(pattern),
-                    Client.email.ilike(pattern),
-                    Client.phone.ilike(pattern),
-                )
-            )
-        rows = list(
-            (
-                await db.execute(
-                    loan_stmt.order_by(Loan.created_at.desc()).limit(limit - len(items))
-                )
-            ).all()
-        )
-        items.extend(
-            RepAppointmentFileOption(
-                kind="loan",
-                id=loan.id,
-                label=loan.entity_name or client.name,
-                subtitle=f"{loan.deal_id} · {client.email or 'No email'}",
-                status=loan.stage.value if hasattr(loan.stage, "value") else str(loan.stage),
-                href=_appointment_loan_href(loan.id),
-            )
-            for loan, client in rows
-        )
-    return RepAppointmentFileOptions(items=items)
+    return await _list_calendar_file_options(db, user, q=q, limit=limit)
 
 
 @router.patch(
