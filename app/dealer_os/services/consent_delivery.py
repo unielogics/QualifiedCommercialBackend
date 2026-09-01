@@ -239,6 +239,8 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
     governs marketing email separately through unsubscribe rather than prior
     opt-in.
     """
+    from app.services.sms.optout import is_opted_out
+
     from . import sms_consent as sms_consent_svc
 
     ok = False
@@ -248,7 +250,10 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
             grant = await sms_consent_svc.consent_for(
                 db, phone_e164=phone, kind="transactional"
             )
-            ok = grant is not None
+            # The grant lifecycle and the suppression list are separate records
+            # and both can veto. A number can hold a live grant from one file
+            # and still have said STOP through some other channel.
+            ok = grant is not None and not await is_opted_out(db, phone)
 
     import asyncio
 

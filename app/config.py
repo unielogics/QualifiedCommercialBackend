@@ -201,6 +201,13 @@ class Settings(BaseSettings):
     relay_sms_url: str = ""
     relay_auth_token: str = ""
 
+    # AI re-engagement auto-send, per channel. OFF by default and meant to stay
+    # that way until someone deliberately turns it on: this is the one path that
+    # texts a borrower with no human in the loop, so shipping it enabled would
+    # start messaging people the moment it deployed. With it off, the engine
+    # still runs and still records the composed draft for review.
+    reengagement_autosend_sms: bool = False
+
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""

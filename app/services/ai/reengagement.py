@@ -11,7 +11,8 @@ active loan:
   * the file has an open time-sensitive item (an outstanding required
     document, or a close date approaching),
 then composes a channel-appropriate message and either auto-sends it
-(email, via SES) or records a draft (SMS / WhatsApp — dormant until a
+(email via SES; SMS when reengagement_autosend_sms is on) or records a
+draft (WhatsApp, and SMS while auto-send stays off — dormant until a
 Twilio adapter + the per-channel auto-send toggle land).
 
 Every attempt is logged as `Activity(kind="ai.reengagement")` — that
@@ -296,10 +297,34 @@ async def _dispatch_rung(
             )
             status = "sent" if res.ok else "failed"
             detail = res.detail
+    elif channel == "sms":
+        # Draft-first remains the DEFAULT. This is the only path that texts a
+        # borrower with no human in the loop, so it sends only when someone has
+        # deliberately switched reengagement_autosend_sms on. Off, the composed
+        # draft is still recorded for audit and review, exactly as before.
+        from app.config import get_settings
+        from app.services import sms as sms_service
+
+        if not get_settings().reengagement_autosend_sms:
+            status, detail = "drafted", "sms auto-send is off (reengagement_autosend_sms)"
+        elif not client.phone:
+            status, detail = "skipped", "no borrower phone"
+        else:
+            # Marketing-grade consent: a nurture nudge is not a transactional
+            # message, and the two are separate permissions that cannot be
+            # bundled. send_sms_checked also vetoes on the suppression list.
+            res = await sms_service.send_sms_checked(
+                db,
+                to_phone=client.phone,
+                body=composed["body"],
+                require_consent_kind="marketing",
+            )
+            status = "sent" if res.ok else "failed"
+            detail = res.detail or res.provider
     else:
-        # SMS / WhatsApp — draft-first. The Twilio adapter + the
-        # per-channel auto-send toggle are a follow-up; until then the
-        # composed draft is recorded for audit + future review.
+        # WhatsApp — still draft-first. The relay can carry it, but a nurture
+        # message over an unofficial WhatsApp client risks the number, so this
+        # stays a deliberate follow-up rather than riding in on the SMS work.
         status, detail = "drafted", "channel adapter not yet provisioned"
 
     db.add(
