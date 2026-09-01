@@ -1372,6 +1372,8 @@ async def send_intake_link(
                 f"Qualified Commercial file. Sign up here: {url}\n\n"
                 "Reply STOP to opt out."
             ),
+            client_id=client.id,
+            context="intake_link",
         )
         if sms_result.ok:
             sent_via = "sms"

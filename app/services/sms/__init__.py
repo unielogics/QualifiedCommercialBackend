@@ -101,6 +101,9 @@ async def send_sms_checked(
     to_phone: str | None,
     body: str,
     require_consent_kind: str | None = None,
+    client_id=None,
+    context: str = "",
+    ledger_body: str | None = None,
 ) -> SmsResult:
     """The entry point every call site should use. Guarded, and async.
 
@@ -127,17 +130,28 @@ async def send_sms_checked(
     # having two would be worse than importing across.
     from app.dealer_os.services.consent_delivery import normalize_phone
 
+    from . import ledger
+
+    provider_name = active_provider().name
+    recorded_body = ledger_body if ledger_body is not None else body
+
+    async def _blocked(detail: str, phone_for_row: str) -> SmsResult:
+        # A refused send is a ledger row, not an absence — "why didn't the
+        # text go out" must be answerable from a record.
+        await ledger.record(
+            db, direction="outbound", phone_e164=phone_for_row, status="blocked",
+            body=recorded_body, provider=provider_name, detail=detail,
+            context=context, client_id=client_id,
+        )
+        return SmsResult(False, provider_name, detail=detail)
+
     phone = normalize_phone(to_phone)
     if not phone:
-        return SmsResult(False, active_provider().name, detail="No usable phone number.")
+        return await _blocked("No usable phone number.", (to_phone or "")[:20])
 
     if await is_opted_out(db, phone):
         log.info("sms suppressed: %s has opted out", phone)
-        return SmsResult(
-            False,
-            active_provider().name,
-            detail="This number has opted out of text messages.",
-        )
+        return await _blocked("This number has opted out of text messages.", phone)
 
     if require_consent_kind:
         from app.dealer_os.services import sms_consent as sms_consent_svc
@@ -146,10 +160,16 @@ async def send_sms_checked(
             db, phone_e164=phone, kind=require_consent_kind
         )
         if grant is None:
-            return SmsResult(
-                False,
-                active_provider().name,
-                detail=f"No {require_consent_kind} SMS consent on file for this number.",
+            return await _blocked(
+                f"No {require_consent_kind} SMS consent on file for this number.", phone
             )
 
-    return await asyncio.to_thread(send_sms, phone, body)
+    result = await asyncio.to_thread(send_sms, phone, body)
+    await ledger.record(
+        db, direction="outbound", phone_e164=phone,
+        status="sent" if result.ok else "failed",
+        body=recorded_body, provider=result.provider,
+        provider_message_id=result.message_id, detail=result.detail,
+        context=context, client_id=client_id,
+    )
+    return result

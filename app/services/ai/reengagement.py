@@ -318,6 +318,8 @@ async def _dispatch_rung(
                 to_phone=client.phone,
                 body=composed["body"],
                 require_consent_kind="marketing",
+                client_id=client.id,
+                context="reengagement",
             )
             status = "sent" if res.ok else "failed"
             detail = res.detail or res.provider

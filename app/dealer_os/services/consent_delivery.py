@@ -257,4 +257,27 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
 
     import asyncio
 
-    return await asyncio.to_thread(deliver_link, sms_consent_ok=ok, **kwargs)
+    result = await asyncio.to_thread(deliver_link, sms_consent_ok=ok, **kwargs)
+
+    # Ledger row for the SMS leg. This path does not go through
+    # send_sms_checked (the transport runs sync inside deliver_link), so the
+    # write happens here. Body deliberately absent: consent links are tokened
+    # pages and the module contract is that the link is never logged.
+    if kwargs.get("channel") == "sms":
+        phone = normalize_phone(kwargs.get("to_phone"))
+        if phone:
+            from app.services.sms import active_provider, ledger
+
+            if result.sms_ok:
+                status, detail = "sent", ""
+            elif not ok:
+                status, detail = "blocked", "No transactional consent, or number opted out."
+            else:
+                status, detail = "failed", result.detail
+            await ledger.record(
+                db, direction="outbound", phone_e164=phone, status=status,
+                provider=active_provider().name,
+                detail=detail, context="consent_link",
+            )
+
+    return result

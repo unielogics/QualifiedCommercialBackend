@@ -371,9 +371,10 @@ async def sms_inbound(request: Request) -> Response:
     in the database at all — which is exactly why the suppression list needs no
     prior grant to write to.
 
-    Everything else is logged and dropped. Threading real replies into
-    conversations is a separate piece of work and pretending to do it here would
-    make it look done.
+    Every reply is recorded to the sms_messages ledger and matched to a
+    client by number where possible, so inbound texts appear in the client's
+    SMS history. Carrier state events (sms:sent / sms:delivered) advance the
+    matching outbound row instead.
 
     Acks 204 on anything it understands. The relay should not retry a message we
     have already recorded, and a retry storm on a malformed payload would be
@@ -394,7 +395,24 @@ async def sms_inbound(request: Request) -> Response:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     from app.dealer_os.services.consent_delivery import normalize_phone
-    from app.services.sms import optout
+    from app.services.sms import ledger, optout
+
+    event = (body or {}).get("event") or "sms:received"
+
+    # Carrier state events — the relay forwards the gateway's sms:sent /
+    # sms:delivered webhooks so the ledger's outbound rows advance to what the
+    # carrier actually confirmed, matched on the provider message id.
+    if event in ("sms:sent", "sms:delivered"):
+        message_id = (body or {}).get("messageId") or ""
+        async with SessionLocal() as db:
+            moved = await ledger.mark_delivery(
+                db,
+                provider_message_id=message_id,
+                status="delivered" if event == "sms:delivered" else "sent",
+            )
+            await db.commit()
+        log.info("sms webhook: %s for id=%s matched=%s", event, message_id, moved)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     raw_from = (body or {}).get("from") or ""
     message = (body or {}).get("message") or ""
@@ -404,18 +422,34 @@ async def sms_inbound(request: Request) -> Response:
         log.warning("sms webhook: inbound from an unusable number, ignored")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    if not optout.is_opt_out_keyword(message):
-        log.info("sms webhook: inbound reply from %s (not an opt-out)", phone)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
+    is_stop = optout.is_opt_out_keyword(message)
     async with SessionLocal() as db:
-        await optout.record_opt_out(
+        # Every reply becomes a ledger row, matched to a client when the number
+        # is known — this is what puts inbound texts on the client's screen
+        # instead of leaving them in a file on the relay.
+        client = await ledger.client_for_phone(db, phone)
+        await ledger.record(
             db,
+            direction="inbound",
             phone_e164=phone,
-            reason=message.strip()[:120] or "STOP",
-            source="sms_reply",
-            note="received via QCRelay",
+            status="received",
+            body=message,
+            provider="android",
+            detail="opt-out" if is_stop else "",
+            context="reply",
+            client_id=client.id if client is not None else None,
         )
+        if is_stop:
+            await optout.record_opt_out(
+                db,
+                phone_e164=phone,
+                reason=message.strip()[:120] or "STOP",
+                source="sms_reply",
+                note="received via QCRelay",
+            )
         await db.commit()
-    log.info("sms webhook: opt-out honoured for %s", phone)
+    if is_stop:
+        log.info("sms webhook: opt-out honoured for %s", phone)
+    else:
+        log.info("sms webhook: reply recorded from %s client=%s", phone, bool(client))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
