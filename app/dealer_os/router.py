@@ -9117,7 +9117,9 @@ async def _cancel_rep_appointment(
     if notice and notice.invitee_phone and notice.sms_consent:
         sms_body = f"Qualified Commercial: your appointment on {_appointment_local_time(appt.starts_at, appt.timezone)} was cancelled."
         try:
-            sms_result = await asyncio.to_thread(consent_delivery._send_sms, notice.invitee_phone, sms_body)  # noqa: SLF001
+            sms_result = await consent_delivery.send_sms_guarded(
+                db, notice.invitee_phone, sms_body, context="booking_cancellation"
+            )
             results["client_sms"] = "sent" if sms_result.ok else "failed"
             if not sms_result.ok:
                 notice.last_error = sms_result.detail[:1000]
@@ -10289,7 +10291,9 @@ async def create_contact_share(
         elif not sms_allowed:
             share.sms_status = "blocked_no_consent"
         else:
-            sms_res = await asyncio.to_thread(consent_delivery._send_sms, phone, copy.sms_body)  # noqa: SLF001
+            sms_res = await consent_delivery.send_sms_guarded(
+                db, phone, copy.sms_body, context="contact_share"
+            )
             share.sms_status = "sent" if sms_res.ok else "failed"
             if sms_res.ok:
                 refs["sms_message_id"] = sms_res.provider_message_id
@@ -10683,7 +10687,9 @@ async def create_rep_inbox_thread(
             delivery_status = "sent" if res.ok else "failed"
         else:
             recipient = phone
-            res = await asyncio.to_thread(consent_delivery._send_sms, phone, payload.body)  # noqa: SLF001
+            res = await consent_delivery.send_sms_guarded(
+                db, phone, payload.body, context="rep_inbox"
+            )
             sender = res.sender
             provider = res.provider
             provider_id = res.provider_message_id if res.ok else None
@@ -10862,7 +10868,9 @@ async def create_rep_inbox_message(
         allowed = bool(contact and (contact.sms_transactional_consented_at or contact.sms_marketing_consented_at))
         if not allowed:
             raise HTTPException(status.HTTP_409_CONFLICT, "This contact has not granted SMS consent.")
-        res = await asyncio.to_thread(consent_delivery._send_sms, recipient, payload.body)  # noqa: SLF001
+        res = await consent_delivery.send_sms_guarded(
+            db, recipient, payload.body, context="rep_inbox"
+        )
         provider = res.provider
         provider_id = res.provider_message_id if res.ok else None
         delivery_status = "sent" if res.ok else "failed"

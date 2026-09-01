@@ -129,6 +129,45 @@ def _send_sms(to_phone: str, body: str) -> DeliveryResult:
     )
 
 
+async def send_sms_guarded(
+    db,
+    to_phone: str,
+    body: str,
+    *,
+    context: str = "",
+    client_id=None,
+) -> DeliveryResult:
+    """`_send_sms` with the gates that need a database session applied.
+
+    `_send_sms` is the raw transport: it asks the selected provider to put a
+    message on the wire and nothing else. Two things it cannot do without a
+    session are the two that matter most —
+
+      * the opt-out suppression list, so a number that replied STOP anywhere
+        stays unreachable everywhere, and
+      * the sms_messages ledger, so the send appears in the contact inbox and
+        can be answered for later.
+
+    Every path that texts a person should call this rather than `_send_sms`.
+    Returns the same DeliveryResult shape, so callers keep their field access.
+    """
+    from app.services import sms as sms_service
+
+    result = await sms_service.send_sms_checked(
+        db, to_phone=to_phone, body=body, context=context, client_id=client_id
+    )
+    return DeliveryResult(
+        result.ok,
+        "sms",
+        result.detail,
+        sms_ok=result.ok,
+        provider=result.provider,
+        provider_message_id=result.message_id or None,
+        sender=sms_sender(),
+        delivery_status="sent" if result.ok else "failed",
+    )
+
+
 def _send_email(to_email: str, subject: str, body: str) -> DeliveryResult:
     result = ses_client.send_email(to_email=to_email, subject=subject, body_text=body)
     if result.ok:

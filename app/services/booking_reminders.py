@@ -188,7 +188,9 @@ async def send_confirmation_sms(
         f"{'Join: ' + row.join_url + ' ' if row.join_url else ''}Reply STOP to opt out."
     )
     try:
-        result = await asyncio.to_thread(consent_delivery._send_sms, row.invitee_phone, body)  # noqa: SLF001
+        result = await consent_delivery.send_sms_guarded(
+            db, row.invitee_phone, body, context="booking_confirmation"
+        )
     except Exception:  # noqa: BLE001
         log.exception("booking confirmation SMS raised notification=%s", row.id)
         row.confirmation_sms_status = "failed"
@@ -273,8 +275,8 @@ async def dispatch_due_reminders() -> int:
                     f"{'Join: ' + notice.join_url + ' ' if notice.join_url else ''}Reply STOP to opt out."
                 )
                 try:
-                    result = await asyncio.to_thread(
-                        consent_delivery._send_sms, notice.invitee_phone or "", body  # noqa: SLF001
+                    result = await consent_delivery.send_sms_guarded(
+                        db, notice.invitee_phone or "", body, context="booking_reminder"
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("booking reminder SMS raised notification=%s", notice.id)
