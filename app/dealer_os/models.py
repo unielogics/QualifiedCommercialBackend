@@ -94,6 +94,9 @@ class DealerBusiness(TimestampMixin, Base):
     # working route lives on the application profile and may change only after
     # an audited recommendation response.
     client_requested_program: Mapped[str | None] = mapped_column(String(80))
+    # booking | product_finder — where a draft came from. Null for files that
+    # were opened as active applications.
+    draft_source: Mapped[str | None] = mapped_column(String(24))
     application_lifecycle: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"
     )

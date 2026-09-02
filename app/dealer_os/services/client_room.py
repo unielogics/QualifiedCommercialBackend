@@ -54,10 +54,13 @@ __all__ = [
     "ensure_room",
     "get_room",
     "initialize_room",
+    "passcode_problem",
     "read_passcode",
     "request_document",
-    "room_url",
     "resolve_room",
+    "room_url",
+    "rotate_passcode",
+    "set_passcode",
     "verify_passcode",
 ]
 
@@ -193,9 +196,11 @@ async def initialize_room(
     return ClientRoom(link, room_url(link.token), passcode)
 
 
-async def ensure_room(db: AsyncSession, dealer: DealerBusiness) -> ClientRoom:
+async def ensure_room(
+    db: AsyncSession, dealer: DealerBusiness, *, adopt_intake: bool = True
+) -> ClientRoom:
     """The file's client room, created if it does not exist yet. Flushes, never commits."""
-    bucket = await buckets_link.ensure_bucket(db, dealer)
+    bucket = await buckets_link.ensure_bucket(db, dealer, adopt_intake=adopt_intake)
 
     link = await _active_link(db, bucket.id)
     if link is not None:
@@ -292,9 +297,47 @@ async def rotate_passcode(db: AsyncSession, dealer: DealerBusiness) -> ClientRoo
     passcode = _generate_passcode()
     _store_passcode(room.link, passcode)
     room.link.expires_at = None
+    # A rep-issued code is a generated one again: the room offers the client
+    # the chance to choose their own on the next entry.
+    room.link.passcode_set_by_client_at = None
     await db.flush()
     logger.info("dealer-os: room passcode rotated for dealer %s", dealer.id)
     return ClientRoom(room.link, room.url, passcode)
+
+
+#: Codes nobody should be allowed to choose. Six digits is a small space
+#: already; these are the ones a guesser tries first.
+_TRIVIAL_PASSCODES = frozenset(
+    {f"{d}{d}{d}{d}{d}{d}" for d in "0123456789"}
+    | {"123456", "654321", "012345", "543210", "123123", "112233", "121212", "111222"}
+)
+
+
+def passcode_problem(new_passcode: str, current_passcode: str | None = None) -> str | None:
+    """Why a client-chosen PIN is not acceptable, or None when it is."""
+    code = (new_passcode or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        return "Choose a 6-digit PIN."
+    if code in _TRIVIAL_PASSCODES:
+        return "That PIN is too easy to guess. Choose six digits that are not all the same or in a row."
+    if current_passcode is not None and code == current_passcode.strip():
+        return "Choose a PIN that is different from the one we sent you."
+    return None
+
+
+async def set_passcode(db: AsyncSession, link: BucketUploadLink, new_passcode: str) -> None:
+    """The client replaces the generated PIN with one they will remember.
+
+    Stored exactly like a generated code (hash + recoverable encrypted copy),
+    so nothing downstream can tell the difference; the stamp only tells the
+    room to stop offering the change. Flushes, never commits.
+    """
+    from datetime import datetime
+
+    _store_passcode(link, new_passcode.strip())
+    link.passcode_set_by_client_at = datetime.now(UTC)
+    await db.flush()
+    logger.info("dealer-os: room passcode chosen by client link=%s", link.id)
 
 
 # --- opening the room from the client's side ---------------------------------

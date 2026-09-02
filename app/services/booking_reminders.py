@@ -15,6 +15,7 @@ from app.models.booking_notification import BookingNotification, BookingNotifica
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.models.user import User
+from app.services import message_render
 from app.services.email import ses_client
 from app.services.notifications import notify_users
 
@@ -132,6 +133,9 @@ async def reschedule_pending(
             select(BookingNotificationReminder).where(
                 BookingNotificationReminder.booking_notification_id == notice.id,
                 BookingNotificationReminder.status == "pending",
+                # Pre-call rows are anchored to the booking, not the call; they
+                # are re-derived below rather than shifted by minutes_before.
+                BookingNotificationReminder.kind == "reminder",
             )
         )
     ).scalars().all()
@@ -141,6 +145,19 @@ async def reschedule_pending(
     sms_rows = [row for row in reminders if row.channel == "sms"]
     notice.email_reminder_due_at = min((row.due_at for row in email_rows), default=None)
     notice.sms_reminder_due_at = min((row.due_at for row in sms_rows), default=None)
+    if notice.precall_dealer_id:
+        from app.dealer_os.models import DealerBusiness
+        from app.dealer_os.services import precall
+
+        event = await db.get(CalendarEvent, notice.event_id)
+        booking = (
+            await db.execute(select(BookingSettings).where(BookingSettings.user_id == event.owner_user_id))
+        ).scalar_one_or_none() if event is not None else None
+        if booking is not None:
+            dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+            await precall.retime_after_reschedule(
+                db, notice=notice, booking=booking, starts_at=starts_at, dealer=dealer
+            )
 
 
 async def cancel_pending(db: AsyncSession, notice: BookingNotification) -> None:
@@ -154,11 +171,14 @@ async def cancel_pending(db: AsyncSession, notice: BookingNotification) -> None:
     ).scalars().all()
     for reminder in reminders:
         reminder.status = "cancelled"
-        reminder.error = None
+        reminder.error = "cancelled" if reminder.kind == "precall" else None
     if notice.email_reminder_status == "pending":
         notice.email_reminder_status = "cancelled"
     if notice.sms_reminder_status == "pending":
         notice.sms_reminder_status = "cancelled"
+    if notice.precall_dealer_id and notice.precall_stopped_at is None and notice.precall_completed_at is None:
+        notice.precall_stopped_at = datetime.now(UTC)
+        notice.precall_stop_reason = "cancelled"
 
 
 def _detail_lines(row: BookingNotification) -> list[str]:
@@ -178,15 +198,28 @@ async def send_confirmation_sms(
     event: CalendarEvent,
     *,
     timezone_name: str | None = None,
+    template: str | None = None,
+    values: dict[str, str] | None = None,
 ) -> None:
+    """The booking confirmation text.
+
+    ``template``/``values`` come from the host's booking settings and the
+    pre-call kit (room link and PIN). Without them the wording is the original
+    confirmation, so a booking with no draft file reads exactly as before.
+    """
     if row.confirmation_sms_status != "pending" or not row.invitee_phone or not row.sms_consent:
         return
     local_start = event.starts_at.astimezone(_timezone(timezone_name))
-    body = (
+    default = (
         f"Qualified Commercial: your meeting is confirmed for "
         f"{local_start.strftime('%b %d at %I:%M %p %Z')}. "
-        f"{'Join: ' + row.join_url + ' ' if row.join_url else ''}Reply STOP to opt out."
+        f"{'Join: ' + row.join_url + ' ' if row.join_url else ''}"
     )
+    if values and values.get("{room_link}"):
+        body = message_render.render(template, values, fallback=default)
+    else:
+        body = default
+    body = message_render.with_stop_notice(body)
     try:
         result = await consent_delivery.send_sms_guarded(
             db, row.invitee_phone, body, context="booking_confirmation"
@@ -206,12 +239,12 @@ async def send_confirmation_sms(
 #: Placeholders an operator can put in a reminder message. Kept small and
 #: obvious on purpose: everything here is already known at send time, so a
 #: reminder can never fail to render for want of data.
-REMINDER_PLACEHOLDERS = ("{time}", "{name}", "{rep}", "{join_link}")
+REMINDER_PLACEHOLDERS = ("{time}", "{name}", "{rep}", "{join_link}", "{room_link}", "{precall}", "{date}", "{business}", "{first}")
 
 #: Carriers expect opt-out language on automated recurring messages, so this is
 #: appended to every reminder rather than left to whoever wrote the text. A
 #: custom message must not be able to drop it by accident.
-STOP_NOTICE = "Reply STOP to opt out."
+STOP_NOTICE = message_render.STOP_NOTICE
 
 
 def render_reminder_sms(
@@ -222,6 +255,7 @@ def render_reminder_sms(
     invitee_name: str | None,
     rep_name: str | None,
     join_url: str | None,
+    extra: dict[str, str] | None = None,
 ) -> str:
     """The text of one SMS reminder.
 
@@ -238,16 +272,105 @@ def render_reminder_sms(
         # still reads, which is why it is not "Join: <url>" here.
         "{join_link}": (join_url or "").strip(),
     }
+    values.update(extra or {})
+    precall_line = (values.get("{precall}") or "").strip()
     body = (template or "").strip()
     if not body:
         body = f"Qualified Commercial reminder: {event_title}, {when}."
         if join_url:
             body = f"{body} Join: {join_url}"
+        # The default wording tells the client what is still open before the
+        # call; a custom message places {precall} where it wants it, or omits
+        # it deliberately.
+        if precall_line:
+            body = f"{body} {precall_line}"
     else:
         for token, value in values.items():
             body = body.replace(token, value)
         body = " ".join(body.split())
-    return f"{body} {STOP_NOTICE}".strip()
+    return message_render.with_stop_notice(body)
+
+
+def render_reminder_email(
+    template: dict | None,
+    *,
+    host_name: str,
+    event_title: str,
+    when: str,
+    duration_min: int,
+    details: list[str],
+    join_url: str | None,
+    values: dict[str, str],
+) -> tuple[str, str]:
+    """(subject, body) of one email reminder; host template or the original wording."""
+    custom_body = ((template or {}).get("body") or "").strip()
+    custom_subject = ((template or {}).get("subject") or "").strip()
+    if custom_body:
+        subject = message_render.render(custom_subject, values) or f"Reminder: {event_title}"
+        return subject, message_render.render_lines(custom_body, values)
+    precall_line = (values.get("{precall}") or "").strip()
+    body = "\n".join([
+        f"Reminder: your meeting with {host_name} is coming up.",
+        "",
+        f"When: {when}",
+        f"Duration: {duration_min} minutes",
+        *(details or []),
+        *([f"Join: {join_url}"] if join_url else []),
+        *(["", precall_line] if precall_line else []),
+        "",
+        "Qualified Commercial",
+    ])
+    return f"Reminder: {event_title}", body
+
+
+async def _precall_values(db, precall, *, notice, event, booking, host) -> dict[str, str]:
+    """Placeholder values for a reminder, including the pre-call state of the
+    draft file when the booking has one. Never raises: a broken file yields
+    plain placeholders and the reminder still goes out."""
+    tz = _timezone(booking.timezone)
+    local = event.starts_at.astimezone(tz)
+    name = (notice.invitee_name or "").strip() or "there"
+    base = {
+        "{date}": local.strftime("%A, %B %d"),
+        "{business}": "",
+        "{first}": name.split()[0] if name != "there" else "there",
+        "{room_link}": "",
+        "{precall}": "",
+        "{missing}": "",
+        "{done}": "",
+        "{pin}": "",
+    }
+    if not notice.precall_dealer_id or not booking.precall_enabled:
+        return base
+    try:
+        from app.dealer_os.models import DealerBusiness
+        from app.dealer_os.services import client_room
+
+        dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+        if dealer is None or dealer.archived_at is not None:
+            return base
+        ready = await precall.readiness(db, dealer)
+        room = await client_room.ensure_room(db, dealer, adopt_intake=False)
+        values = precall.template_values(
+            notice=notice, event=event, booking=booking, host=host, dealer=dealer,
+            room_link=room.url, ready=ready, timezone_name=booking.timezone,
+        )
+        base.update({k: v for k, v in values.items() if k in base})
+        base["{ready_summary}"] = (
+            f"Ownership {'✓' if ready.ownership_step_complete else '—'} · "
+            f"Bank {'✓' if ready.bank_complete else '—'} · "
+            f"Credit {ready.credit_done}/{ready.credit_required or '?'}"
+        )
+        if notice.precall_stopped_at is not None or ready.complete:
+            base["{precall}"] = ""
+    except Exception:  # noqa: BLE001
+        log.exception("reminder: pre-call values failed notification=%s", notice.id)
+    return base
+
+
+def _rep_readiness_line(extra: dict[str, str]) -> str:
+    summary = (extra or {}).get("{ready_summary}")
+    return f" Pre-call: {summary}." if summary else ""
 
 
 async def dispatch_due_reminders() -> int:
@@ -293,25 +416,45 @@ async def dispatch_due_reminders() -> int:
                 .limit(100)
             )
         ).all()
+        from app.dealer_os.services import precall
+
         for reminder, notice, event, booking, host in rows:
+            if reminder.kind == "precall":
+                try:
+                    sent += int(
+                        await precall.dispatch_row(
+                            db, reminder=reminder, notice=notice, event=event, booking=booking, host=host, now=now
+                        )
+                    )
+                except Exception:  # noqa: BLE001 — one bad row must not stall the tick
+                    log.exception("precall step raised reminder=%s", reminder.id)
+                    reminder.status = "failed"
+                    reminder.sent_at = now
+                    reminder.error = "precall_exception"
+                continue
             local = event.starts_at.astimezone(_timezone(booking.timezone))
             when = local.strftime("%A, %B %d at %I:%M %p %Z")
             details = _detail_lines(notice)
+            # Placeholders shared with the pre-call sequence. {precall} renders
+            # what is still open on the draft file, or nothing when the client
+            # has finished (or there is no draft), so the reminder reads as it
+            # always did for bookings without one.
+            extra = await _precall_values(db, precall, notice=notice, event=event, booking=booking, host=host)
             if reminder.channel == "email":
-                body = "\n".join([
-                    f"Reminder: your meeting with {host.name or 'Qualified Commercial'} is coming up.",
-                    "",
-                    f"When: {when}",
-                    f"Duration: {event.duration_min or booking.duration_min} minutes",
-                    *(details or []),
-                    *( [f"Join: {notice.join_url}"] if notice.join_url else [] ),
-                    "",
-                    "Qualified Commercial",
-                ])
+                subject, body = render_reminder_email(
+                    (booking.reminder_email_messages or {}).get(str(reminder.minutes_before)),
+                    host_name=host.name or "Qualified Commercial",
+                    event_title=event.title,
+                    when=when,
+                    duration_min=event.duration_min or booking.duration_min,
+                    details=details,
+                    join_url=notice.join_url,
+                    values=extra,
+                )
                 result = await asyncio.to_thread(
                     ses_client.send_email,
                     to_email=notice.invitee_email or "",
-                    subject=f"Reminder: {event.title}",
+                    subject=subject,
                     body_text=body,
                 )
                 reminder.status = "sent" if result.ok else "failed"
@@ -334,6 +477,7 @@ async def dispatch_due_reminders() -> int:
                     invitee_name=notice.invitee_name,
                     rep_name=host.name or host.email,
                     join_url=notice.join_url,
+                    extra=extra,
                 )
                 try:
                     result = await consent_delivery.send_sms_guarded(
@@ -371,7 +515,7 @@ async def dispatch_due_reminders() -> int:
                     category="calendar",
                     priority="high",
                     title=f"Upcoming appointment: {event.title}",
-                    body=f"Your appointment starts {when}.",
+                    body=f"Your appointment starts {when}.{_rep_readiness_line(extra)}",
                     target_type="dealer_rep_appointment",
                     target_id=str(event.external_ref_id or event.id),
                     deep_link=f"/calendar?appointment={event.external_ref_id}" if event.external_ref_id else "/calendar",

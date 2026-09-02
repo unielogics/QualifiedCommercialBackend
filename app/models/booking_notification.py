@@ -46,6 +46,18 @@ class BookingNotification(TimestampMixin, Base):
     email_reminder_status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
     sms_reminder_status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
     last_error: Mapped[str | None] = mapped_column(Text)
+    # Pre-call prep. Every booking opens a draft dealer file; the sequence that
+    # nudges the client to finish ownership / bank / credit hangs off it here,
+    # on the booking, because a public booking has no appointment row.
+    precall_dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    precall_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    precall_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # completed|call_started|cancelled|sms_stop|email_stop|superseded|host_disabled
+    precall_stop_reason: Mapped[str | None] = mapped_column(String(32))
+    # sms|email|rep — how the first PIN reached the client.
+    precall_pin_delivered_via: Mapped[str | None] = mapped_column(String(12))
 
     __table_args__ = (
         Index("ix_booking_notifications_email_due", "email_reminder_due_at", "email_reminder_sent_at"),
@@ -65,12 +77,18 @@ class BookingNotificationReminder(TimestampMixin, Base):
         nullable=False,
     )
     channel: Mapped[str] = mapped_column(String(12), nullable=False)
+    # reminder = minutes before the call, re-timed on reschedule.
+    # precall  = a pre-call prep step anchored to the booking, absolute due_at.
+    kind: Mapped[str] = mapped_column(String(12), nullable=False, default="reminder", server_default="reminder")
+    step_key: Mapped[str | None] = mapped_column(String(24))
     minutes_before: Mapped[int] = mapped_column(Integer, nullable=False)
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     provider_message_id: Mapped[str | None] = mapped_column(String(300))
     error: Mapped[str | None] = mapped_column(Text)
+    # What was actually sent, so the rep's timeline shows the real text.
+    rendered_body: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint(

@@ -178,6 +178,19 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+    # Booking drafts nobody touched (call cancelled or long past, no owners /
+    # bank / credit / documents) are tombstoned after 30 days so the portfolio
+    # does not fill with empty files. Reversible; nothing is deleted.
+    scheduler.add_job(
+        _wrap(job_archive_stale_booking_drafts),
+        "cron",
+        hour=4,
+        minute=20,
+        id="archive_stale_booking_drafts",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.add_job(
         _wrap(job_application_plaid_refresh),
         "cron",
@@ -468,6 +481,17 @@ async def job_booking_reminders() -> None:
     sent = await dispatch_due_reminders()
     if sent:
         log.info("booking_reminders sent=%d", sent)
+
+
+async def job_archive_stale_booking_drafts() -> None:
+    from app.db import SessionLocal
+    from app.dealer_os.services import precall
+
+    async with SessionLocal() as db:
+        archived = await precall.archive_stale_drafts(db)
+        await db.commit()
+    if archived:
+        log.info("archive_stale_booking_drafts: archived %s draft(s)", archived)
 
 
 async def job_account_summary_refresh() -> None:

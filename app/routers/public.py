@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
@@ -314,6 +315,10 @@ class PublicBookingProfile(BaseModel):
     logo_url: str | None = None
     profile_photo_url: str | None = None
     slots: list[PublicBookingSlot]
+    #: The exact consent sentence stored as proof when the box is ticked. The
+    #: page must render this, not its own paraphrase.
+    sms_disclosure_text: str = ""
+    precall_enabled: bool = False
 
 
 class PublicBookingCreate(BaseModel):
@@ -328,6 +333,9 @@ class PublicBookingCreate(BaseModel):
 class PublicBookingCreateResult(BaseModel):
     ok: bool
     event_id: str
+    #: The client's secure room, when the booking opened a draft file.
+    room_url: str | None = None
+    pin_delivered_via: str | None = None
 
 
 @router.get("/booking/{slug}", response_model=PublicBookingProfile)
@@ -352,6 +360,8 @@ async def public_booking_profile(
         logo_url=_booking_asset_get_url(booking.logo_s3_key),
         profile_photo_url=_booking_asset_get_url(booking.profile_photo_s3_key),
         slots=slots,
+        sms_disclosure_text=sms_consent_service.text_for("transactional"),
+        precall_enabled=bool(booking.precall_enabled),
     )
 
 
@@ -419,6 +429,7 @@ async def public_booking_create(
         sms_consent_ip=ip,
         sms_consent_user_agent=request.headers.get("user-agent"),
     )
+    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user)
 
     db.add(
         Activity(
@@ -444,8 +455,38 @@ async def public_booking_create(
     await db.commit()
     await db.refresh(ev)
 
-    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice)
-    return PublicBookingCreateResult(ok=True, event_id=str(ev.id))
+    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice, draft=draft)
+    return PublicBookingCreateResult(
+        ok=True,
+        event_id=str(ev.id),
+        room_url=draft.room.url if draft is not None else None,
+        pin_delivered_via=notice.precall_pin_delivered_via,
+    )
+
+
+async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User):
+    """Every public booking opens a draft dealer file owned by the host, with
+    its secure room, and schedules the pre-call nudges. Flushes only."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.dealer_os.services import precall
+
+    if not booking.precall_enabled:
+        return None
+    try:
+        result = await precall.create_draft_for_booking(
+            db, notice=notice, event=event, booking=booking, host=host,
+            notes="Booked from the public booking page.",
+        )
+        ready = await precall.readiness(db, result.dealer)
+        if not ready.complete:
+            await precall.schedule(db, notice=notice, booking=booking, event=event, dealer=result.dealer)
+        return result
+    except SQLAlchemyError:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("public-booking: could not open the draft file for %s", notice.id)
+        return None
 
 
 async def _load_public_booking(
@@ -583,6 +624,7 @@ async def _deliver_booking(
     booking: BookingSettings,
     ev: CalendarEvent,
     notice,
+    draft=None,
 ) -> None:
     """Everything that happens after the booking row is safely committed.
 
@@ -622,6 +664,26 @@ async def _deliver_booking(
         notes=payload.notes,
         join_url=join_url,
     )
+    kit = None
+    if draft is not None:
+        from app.dealer_os.services import precall
+
+        try:
+            ready = await precall.readiness(db, draft.dealer)
+            values = precall.template_values(
+                notice=notice, event=ev, booking=booking, host=user, dealer=draft.dealer,
+                room_link=draft.room.url, ready=ready, pin=draft.room.passcode,
+                stop_link=precall.stop_url(notice), timezone_name=booking.timezone,
+            )
+            cm = booking.confirmation_messages or {}
+            kit = {
+                "block": precall.precall_block(booking, values),
+                "email_template": {"subject": cm.get("email_subject"), "body": cm.get("email_body")},
+                "sms_template": precall.message_text(booking, "confirmation_sms"),
+                "values": values,
+            }
+        except Exception:  # noqa: BLE001
+            log.exception("public-booking: could not build the room kit for %s", notice.id)
     if booking.confirmation_email_enabled:
         email_result = await asyncio.to_thread(
             booking_notify.send_invitee_invite,
@@ -632,6 +694,9 @@ async def _deliver_booking(
             invitee_name=payload.full_name,
             invitee_email=payload.email,
             join_url=join_url,
+            precall_block=kit["block"] if kit else None,
+            template=kit["email_template"] if kit else None,
+            template_values=kit["values"] if kit else None,
         )
         notice.confirmation_email_status = (
             "sent" if email_result and email_result.ok else "failed"
@@ -640,8 +705,82 @@ async def _deliver_booking(
             notice.last_error = email_result.detail[:1000]
     await db.commit()
     await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone
+        db, notice, ev, timezone_name=booking.timezone,
+        template=kit["sms_template"] if kit else None, values=kit["values"] if kit else None,
     )
+    if kit and draft is not None and draft.room.passcode:
+        from app.dealer_os.services import precall
+
+        if notice.sms_consent and notice.invitee_phone and notice.confirmation_sms_status == "sent":
+            notice.precall_pin_delivered_via = "sms"
+        else:
+            try:
+                await precall.deliver_pin(db, notice=notice, booking=booking, values=kit["values"])
+            except Exception:  # noqa: BLE001
+                log.exception("public-booking: PIN delivery raised for %s", notice.id)
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Pre-call prep: signed links in the client's emails
+
+
+class PrepLinkState(BaseModel):
+    ok: bool
+    invitee_first: str = ""
+    host_name: str = ""
+    starts_at: datetime | None = None
+    stopped: bool = False
+    completed: bool = False
+
+
+def _prep_notice_or_404(notice, signature: str, notice_id: str) -> None:
+    from app.dealer_os.services import precall
+
+    if notice is None or not precall.link_valid(notice_id, "stop", signature):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer valid.")
+
+
+@router.get("/prep/{notice_id}/{signature}", response_model=PrepLinkState)
+async def public_prep_state(notice_id: uuid.UUID, signature: str, db: AsyncSession = Depends(get_db)) -> PrepLinkState:
+    """PUBLIC. What the one-tap stop page shows before the client confirms."""
+    from app.models.booking_notification import BookingNotification
+
+    notice = await db.get(BookingNotification, notice_id)
+    _prep_notice_or_404(notice, signature, str(notice_id))
+    event = await db.get(CalendarEvent, notice.event_id)
+    host = await db.get(User, event.owner_user_id) if event is not None else None
+    name = (notice.invitee_name or "").strip()
+    return PrepLinkState(
+        ok=True,
+        invitee_first=name.split()[0] if name else "",
+        host_name=(host.name if host is not None else "") or "Qualified Commercial",
+        starts_at=event.starts_at if event is not None else None,
+        stopped=notice.precall_stopped_at is not None,
+        completed=notice.precall_completed_at is not None,
+    )
+
+
+@router.post("/prep/{notice_id}/{signature}/stop", response_model=PrepLinkState)
+async def public_prep_stop(notice_id: uuid.UUID, signature: str, db: AsyncSession = Depends(get_db)) -> PrepLinkState:
+    """PUBLIC. The client stops the pre-call emails and texts for this booking.
+    Meeting confirmations and reminders are unaffected; only the prep nudges
+    halt."""
+    from app.dealer_os.services import precall
+    from app.dealer_os.services.audit import log_action
+    from app.models.booking_notification import BookingNotification
+
+    notice = await db.get(BookingNotification, notice_id)
+    _prep_notice_or_404(notice, signature, str(notice_id))
+    if notice.precall_stopped_at is None:
+        await precall.stop_sequence(db, notice, reason="email_stop")
+        if notice.precall_dealer_id:
+            await log_action(
+                db, notice.precall_dealer_id, None, "precall.stopped", "dealer",
+                entity_id=notice.precall_dealer_id, after={"via": "email_stop_link"},
+            )
+        await db.commit()
+    return await public_prep_state(notice_id, signature, db)
 
 
 # ---------------------------------------------------------------------------

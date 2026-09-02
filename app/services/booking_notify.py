@@ -124,8 +124,18 @@ def send_invitee_invite(
     cancel: bool = False,
     sequence: int = 0,
     staff: bool = False,
+    precall_block: str | None = None,
+    template: dict | None = None,
+    template_values: dict | None = None,
 ) -> SesSendResult | None:
-    """Send the person who booked a genuine calendar invitation. Never raises."""
+    """Send the person who booked a genuine calendar invitation. Never raises.
+
+    ``precall_block`` is the "Before your call" section appended to the
+    default wording. ``template`` ({"subject", "body"}) is the host's own
+    confirmation text from booking settings; when its body is set it replaces
+    the default body entirely (placeholders substituted from
+    ``template_values``), and the ICS still rides along.
+    """
     to = (invitee_email or "").strip()
     if not to or "@" not in to:
         return None
@@ -153,6 +163,8 @@ def send_invitee_invite(
         )
         if join_url:
             detail += ["", f"Join here: {join_url}"]
+        if precall_block and not staff and not cancel:
+            detail += ["", precall_block.strip()]
         detail += [
             "",
             "Accept the invitation to add this to your calendar.",
@@ -161,6 +173,15 @@ def send_invitee_invite(
             "Qualified Commercial",
         ]
         body = "\n".join(detail)
+        custom_subject: str | None = None
+        custom_body = ((template or {}).get("body") or "").strip() if not staff and not cancel and not sequence else ""
+        if custom_body:
+            from app.services import message_render
+
+            body = message_render.render_lines(custom_body, template_values or {})
+            custom_subject = message_render.render(
+                (template or {}).get("subject"), template_values or {}
+            ) or None
 
         ics = build_invite(
             # The event UUID is the calendar identity. Reusing it on any future
@@ -187,7 +208,8 @@ def send_invitee_invite(
                 if cancel
                 else f"Updated: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
                 if sequence
-                else f"Invitation: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
+                else custom_subject
+                or f"Invitation: {title}, {starts_at.astimezone(tz).strftime('%b %-d')}"
             ),
             body_text=body,
             attachments=[("invite.ics", ics, ICS_CONTENT_TYPE)],

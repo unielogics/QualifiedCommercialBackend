@@ -207,6 +207,8 @@ class DealerRead(ORM):
     client_requested_amount: float | None = None
     client_requested_program: str | None = None
     application_lifecycle: str = "active"
+    #: booking | product_finder — how a draft was opened; null for files opened as applications.
+    draft_source: str | None = None
     is_training: bool = False
     workflow_ungated: bool = False
     funding_purpose: str | None = None
@@ -810,8 +812,88 @@ class RepAppointmentRead(ORM):
     #: presenting a day-old error as a live one.
     delivery_error_at: datetime | None = None
     notification_results: dict[str, str] | None = None
+    #: Pre-call prep on the draft file this booking opened. None when the
+    #: booking predates the feature or the host has it disabled.
+    precall: "RepAppointmentPrecallRead | None" = None
+    #: The client's room link, and its PIN in plaintext ONLY on the create
+    #: response that minted it (a rep booking in person reads it out).
+    room_url: str | None = None
+    room_passcode: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class PrecallReadinessRead(BaseModel):
+    ownership_complete: bool = False
+    ownership_total: float = 0.0
+    contact_complete: bool = False
+    bank_complete: bool = False
+    bank_detail: str = ""
+    credit_complete: bool = False
+    credit_required: int = 0
+    credit_done: int = 0
+    complete: bool = False
+    done_count: int = 0
+    missing: list[str] = Field(default_factory=list)
+
+
+class PrecallStepRead(BaseModel):
+    id: str
+    step_key: str | None = None
+    channel: str
+    due_at: datetime
+    status: str
+    sent_at: datetime | None = None
+    detail: str | None = None
+    rendered_body: str | None = None
+
+
+class RepAppointmentPrecallRead(BaseModel):
+    #: in_progress | complete | stopped | disabled
+    status: str
+    dealer_id: UUID | None = None
+    case_ref: str | None = None
+    lifecycle: str | None = None
+    room_url: str | None = None
+    pin_delivered_via: str | None = None
+    completed_at: datetime | None = None
+    stopped_at: datetime | None = None
+    stop_reason: str | None = None
+    next_step_at: datetime | None = None
+    readiness: PrecallReadinessRead | None = None
+    steps: list[PrecallStepRead] = Field(default_factory=list)
+
+
+class RepAppointmentDraftFileSummary(BaseModel):
+    dealer_id: UUID
+    case_ref: str | None = None
+    name: str
+    lifecycle: str
+    status: str
+    draft_source: str | None = None
+    href: str
+
+
+class RepAppointmentPrecallAction(BaseModel):
+    """Rep-side control of a booking's pre-call prep."""
+
+    action: Literal["resend", "rotate_pin", "stop", "resume"]
+    #: For resend: which channel(s) to use. Defaults to both.
+    channel: Literal["email", "sms", "both"] = "both"
+
+
+class RepAppointmentPrecallResult(BaseModel):
+    ok: bool
+    detail: str
+    #: Plaintext only when rotate_pin minted a new code.
+    room_passcode: str | None = None
+    room_url: str | None = None
+    precall: RepAppointmentPrecallRead | None = None
+
+
+# RepAppointmentRead names RepAppointmentPrecallRead before it is defined;
+# resolve the forward reference now rather than on first validation.
+RepAppointmentRead.model_rebuild()
 
 
 class RepAppointmentCreate(BaseModel):
@@ -953,6 +1035,7 @@ class RepAppointmentCapabilities(BaseModel):
     can_manage_outcome_catalog: bool = False
     can_link_files: bool = False
     can_create_funding_loan: bool = False
+    can_manage_precall: bool = False
 
 
 class RepCalendarCapabilities(BaseModel):
@@ -1010,6 +1093,8 @@ class RepAppointmentWorkspaceRead(BaseModel):
     funding_file: RepAppointmentFundingSummary | None = None
     application_candidates: list[RepAppointmentApplicationCandidate] = Field(default_factory=list)
     booking_data_review: list[RepAppointmentBookingDataReview] = Field(default_factory=list)
+    #: The draft dealer file the booking opened, when there is one.
+    draft_file: RepAppointmentDraftFileSummary | None = None
     capabilities: RepAppointmentCapabilities
 
 
@@ -1068,13 +1153,16 @@ class RepAppointmentDeliveryRetryResult(BaseModel):
     attempted_at: datetime
 
 
-AppointmentFileKind = Literal["intake", "loan"]
+AppointmentFileKind = Literal["intake", "loan", "dealer"]
 AppointmentFileAction = Literal[
     "none",
     "update_linked",
     "link_existing",
     "create_ai_intake",
     "create_funding_loan",
+    # The booking already opened a draft dealer file; the outcome promotes it
+    # in place rather than creating anything.
+    "promote_draft",
 ]
 
 
@@ -2070,8 +2158,82 @@ class RoomSignableRead(BaseModel):
     document_text: str = ""
 
 
+class RoomOwnerRead(BaseModel):
+    """What the room may show about an owner: enough to edit the schedule and
+    see whether their credit step is done. Never scores, never other owners'
+    contact details."""
+
+    id: UUID
+    first_name: str
+    last_name: str
+    ownership_pct: float | None = None
+    is_primary: bool = False
+    required: bool = False
+    has_email: bool = False
+    has_phone: bool = False
+    #: not_required | todo | sent | done | declined | failed
+    credit_status: str = "not_required"
+    editable: bool = True
+
+
+class RoomPrecallRead(BaseModel):
+    enabled: bool = False
+    starts_at: datetime | None = None
+    host_name: str | None = None
+    business_name: str | None = None
+    #: The generated PIN has not been replaced yet: offer "choose your PIN".
+    passcode_needs_setup: bool = False
+    ownership_complete: bool = False
+    ownership_total: float = 0.0
+    contact_complete: bool = False
+    owners: list[RoomOwnerRead] = Field(default_factory=list)
+    max_owners: int = 5
+    credit_threshold_pct: float = 20.0
+    bank_complete: bool = False
+    bank_detail: str = ""
+    credit_complete: bool = False
+    credit_required: int = 0
+    credit_done: int = 0
+    complete: bool = False
+    done_count: int = 0
+    completed_at: datetime | None = None
+
+
+class RoomOwnerCreate(RoomPasscode):
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    ownership_pct: float | None = Field(default=None, ge=0, le=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=48)
+    is_primary: bool = False
+
+
+class RoomOwnerPatch(RoomPasscode):
+    first_name: str | None = Field(default=None, min_length=1, max_length=80)
+    last_name: str | None = Field(default=None, min_length=1, max_length=80)
+    ownership_pct: float | None = Field(default=None, ge=0, le=100)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=48)
+    is_primary: bool | None = None
+
+
+class RoomCreditLinkResult(BaseModel):
+    #: self: the person in the room authorizes now (path to open on audit.*)
+    #: sent: another owner's own link was delivered to their email/phone
+    mode: Literal["self", "sent"]
+    path: str | None = None
+    delivered: bool = False
+    detail: str = ""
+
+
+class RoomPasscodeChange(RoomPasscode):
+    new_passcode: str = Field(min_length=6, max_length=6)
+
+
 class RoomFeaturesRead(BaseModel):
     business_name: str
+    #: Pre-call prep state when this room belongs to a booked call.
+    precall: RoomPrecallRead | None = None
     bank_connect_available: bool = False
     plaid_environment: str = ""
     # The room needs the authorization wording BEFORE the connect button does
@@ -2950,10 +3112,13 @@ class PublicConsentSubmit(BaseModel):
     access_code: str | None = Field(default=None, max_length=64)
 
     fcra_consent: bool = False
-    first_name: str = Field(min_length=1, max_length=80)
-    last_name: str = Field(min_length=1, max_length=80)
-    email: EmailStr
-    phone: str = Field(min_length=8, max_length=48)
+    # Optional: the consent page confirms these from the owner row and only
+    # sends corrections. Requiring them broke the public submit (the page
+    # never posted them), so the server now defaults from the owner.
+    first_name: str | None = Field(default=None, max_length=80)
+    last_name: str | None = Field(default=None, max_length=80)
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=48)
     dob: date | None = None
     street: str | None = Field(default=None, max_length=240)
     city: str | None = Field(default=None, max_length=120)

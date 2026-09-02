@@ -166,6 +166,9 @@ class BucketUploadLink(TimestampMixin, Base):
     passcode_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     encrypted_passcode: Mapped[str | None] = mapped_column(Text, nullable=True)
     passcode_encryption_provider: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # Set when the client replaced the generated PIN with one of their own.
+    # Null means the room should still offer that on entry.
+    passcode_set_by_client_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active", server_default="active")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

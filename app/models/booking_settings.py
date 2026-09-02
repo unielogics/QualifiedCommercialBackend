@@ -60,6 +60,21 @@ class BookingSettings(TimestampMixin, Base):
         default=lambda: [120],
         server_default="[120]",
     )
+    #: Email reminder text, keyed like reminder_sms_messages by minutes-before,
+    #: each value {"subject": ..., "body": ...}. Missing means the default.
+    reminder_email_messages: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    #: Confirmation templates: {"email_subject", "email_body", "sms", "pin_email_subject", "pin_email_body"}.
+    confirmation_messages: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    #: Pre-call prep: whether bookings open a draft file + room and run the
+    #: nudge sequence, and the host's overrides for each step's text/timing.
+    precall_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    precall_messages: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     google_meet_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York")
     available_days: Mapped[list[int]] = mapped_column(

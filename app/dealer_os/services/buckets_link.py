@@ -50,8 +50,16 @@ def audit_bucket_name(dealer: DealerBusiness) -> str:
     return (f"{base} — {loc}" if loc else base)[:180]
 
 
-async def ensure_bucket(db: AsyncSession, dealer: DealerBusiness) -> Bucket:
-    """Resolve (and persist) the dealer's linked Bucket. Flushes, never commits."""
+async def ensure_bucket(
+    db: AsyncSession, dealer: DealerBusiness, *, adopt_intake: bool = True
+) -> Bucket:
+    """Resolve (and persist) the dealer's linked Bucket. Flushes, never commits.
+
+    ``adopt_intake=False`` always creates a fresh bucket. Files opened from a
+    booking use it: adoption matches on email alone, so a public booking whose
+    email collides with an unrelated AI intake would otherwise inherit that
+    stranger's room, files and PIN.
+    """
     if dealer.bucket_id is not None:
         bucket = await db.get(Bucket, dealer.bucket_id)
         if bucket is not None:
@@ -60,7 +68,7 @@ async def ensure_bucket(db: AsyncSession, dealer: DealerBusiness) -> Bucket:
         dealer.bucket_id = None
 
     # Adopt the newest AI-underwriter intake bucket matched by email.
-    if dealer.email:
+    if adopt_intake and dealer.email:
         intake = (
             await db.execute(
                 select(PublicUnderwritingIntake)

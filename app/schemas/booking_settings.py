@@ -68,6 +68,17 @@ class UserBookingSettingsBase(BaseModel):
     #: {rep}, {join_link}. The opt-out notice is appended by the sender and is
     #: deliberately not authorable here.
     reminder_sms_messages: dict[str, str] = Field(default_factory=dict)
+    #: Email reminder text, keyed the same way; each value {"subject", "body"}.
+    reminder_email_messages: dict[str, dict[str, str]] = Field(default_factory=dict)
+    #: Confirmation wording: email_subject, email_body, sms, pin_email_subject,
+    #: pin_email_body. Blank means the default.
+    confirmation_messages: dict[str, str] = Field(default_factory=dict)
+    #: Pre-call prep: draft file + secure room on every booking, and the nudge
+    #: sequence. precall_messages holds precall_block plus per-step overrides
+    #: {"nudge_1": {after_hours, channel, email_subject, email_body, sms},
+    #:  "nudge_2": {before_hours, channel, email_subject, email_body, sms}}.
+    precall_enabled: bool = True
+    precall_messages: dict[str, object] = Field(default_factory=dict)
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
@@ -91,6 +102,81 @@ class UserBookingSettingsBase(BaseModel):
     end_time: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
     logo_s3_key: str | None = None
     profile_photo_s3_key: str | None = None
+
+    def _clean_message_templates(self, scheduled_sms: set[str]) -> None:
+        """Trim, drop blanks, cap lengths and refuse {pin} outside the two
+        messages that deliver it. Runs inside the main validator."""
+        from app.services import message_render
+
+        email_keys = {str(value) for value in self.reminder_email_minutes}
+        emails: dict[str, dict[str, str]] = {}
+        for key, item in (self.reminder_email_messages or {}).items():
+            if key not in email_keys or not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject") or "").strip()
+            body = str(item.get("body") or "").strip()
+            if not subject and not body:
+                continue
+            if len(subject) > 160 or len(body) > 4000:
+                raise ValueError("An email reminder is limited to a 160-character subject and 4000-character body")
+            for text_ in (subject, body):
+                if message_render.disallowed_placeholders(text_):
+                    raise ValueError("{pin} may only be used in the confirmation SMS and the PIN email")
+            emails[key] = {"subject": subject, "body": body}
+        self.reminder_email_messages = emails
+
+        allowed_pin = {"sms", "pin_email_subject", "pin_email_body"}
+        confirmation: dict[str, str] = {}
+        for key in ("email_subject", "email_body", "sms", "pin_email_subject", "pin_email_body"):
+            value = str((self.confirmation_messages or {}).get(key) or "").strip()
+            if not value:
+                continue
+            limit = 400 if key == "sms" else 160 if key.endswith("subject") else 4000
+            if len(value) > limit:
+                raise ValueError(f"confirmation_messages.{key} must be {limit} characters or fewer")
+            if message_render.disallowed_placeholders(value, allow_pin=key in allowed_pin):
+                raise ValueError("{pin} may only be used in the confirmation SMS and the PIN email")
+            confirmation[key] = value
+        self.confirmation_messages = confirmation
+
+        precall: dict[str, object] = {}
+        raw = self.precall_messages or {}
+        block = str(raw.get("precall_block") or "").strip()
+        if block:
+            if len(block) > 2000 or message_render.disallowed_placeholders(block):
+                raise ValueError("precall_block must be 2000 characters or fewer and may not contain {pin}")
+            precall["precall_block"] = block
+        line = str(raw.get("reminder_precall_line") or "").strip()
+        if line:
+            if len(line) > 300 or message_render.disallowed_placeholders(line):
+                raise ValueError("reminder_precall_line must be 300 characters or fewer and may not contain {pin}")
+            precall["reminder_precall_line"] = line
+        for step in ("nudge_1", "nudge_2"):
+            item = raw.get(step)
+            if not isinstance(item, dict):
+                continue
+            cleaned_step: dict[str, object] = {}
+            for hours_key, lo, hi in (("after_hours", 1, 240), ("before_hours", 2, 240), ("fallback_before_hours", 1, 48)):
+                if item.get(hours_key) not in (None, ""):
+                    hours = float(item[hours_key])
+                    if hours < lo or hours > hi:
+                        raise ValueError(f"{step}.{hours_key} must be between {lo} and {hi} hours")
+                    cleaned_step[hours_key] = hours
+            channel = str(item.get("channel") or "").strip().lower()
+            if channel:
+                if channel not in {"email", "sms", "both"}:
+                    raise ValueError(f"{step}.channel must be email, sms or both")
+                cleaned_step["channel"] = channel
+            for text_key, limit in (("email_subject", 160), ("email_body", 4000), ("sms", 400)):
+                value = str(item.get(text_key) or "").strip()
+                if not value:
+                    continue
+                if len(value) > limit or message_render.disallowed_placeholders(value):
+                    raise ValueError(f"{step}.{text_key} must be {limit} characters or fewer and may not contain {{pin}}")
+                cleaned_step[text_key] = value
+            if cleaned_step:
+                precall[step] = cleaned_step
+        self.precall_messages = precall
 
     @model_validator(mode="after")
     def _validate_booking_window(self) -> UserBookingSettingsBase:
@@ -127,6 +213,7 @@ class UserBookingSettingsBase(BaseModel):
                 raise ValueError("A reminder message must be 400 characters or fewer")
             cleaned[key] = body
         self.reminder_sms_messages = cleaned
+        self._clean_message_templates(scheduled)
 
         days = sorted(set(self.available_days))
         if any(day < 0 or day > 6 for day in days):

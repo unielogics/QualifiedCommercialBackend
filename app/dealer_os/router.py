@@ -155,6 +155,16 @@ from .models import (
     DealerTaxFiling,
 )
 from .schemas import (
+    RoomPrecallRead,
+    RoomOwnerRead,
+    RoomOwnerCreate,
+    RoomOwnerPatch,
+    RoomCreditLinkResult,
+    RoomPasscodeChange,
+    RepAppointmentDraftFileSummary,
+    RepAppointmentPrecallRead,
+    RepAppointmentPrecallAction,
+    RepAppointmentPrecallResult,
     AccountPatch,
     AccountRead,
     AddbackPatch,
@@ -441,7 +451,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_assets, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import bank_consent, balance_health, client_room, consent_delivery, precall, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_assets, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -6768,11 +6778,18 @@ async def _appointment_read_rows(
             else []
         )
     }
+    drafts: dict[UUID, DealerBusiness] = {}
     if event_ids:
         notice_rows = (
             await db.execute(select(BookingNotification).where(BookingNotification.event_id.in_(event_ids)))
         ).scalars().all()
         notices = {row.event_id: row for row in notice_rows}
+        draft_ids = [row.precall_dealer_id for row in notice_rows if row.precall_dealer_id]
+        if draft_ids:
+            drafts = {
+                d.id: d
+                for d in (await db.execute(select(DealerBusiness).where(DealerBusiness.id.in_(draft_ids)))).scalars().all()
+            }
         notice_ids = [row.id for row in notice_rows]
         if notice_ids:
             reminder_rows = (
@@ -6844,6 +6861,9 @@ async def _appointment_read_rows(
             "connected" if event and event.google_event_id
             else "pending" if event and event.owner_user_id
             else "unavailable"
+        )
+        data["precall"] = _appointment_precall_summary(
+            notice, drafts.get(notice.precall_dealer_id) if notice and notice.precall_dealer_id else None
         )
         payloads.append(data)
     return payloads
@@ -7576,6 +7596,20 @@ async def _appointment_workspace(
     db: AsyncSession, appointment: DealerRepAppointment, user: User
 ) -> RepAppointmentWorkspaceRead:
     appointment_payload = (await _appointment_read_rows(db, [appointment]))[0]
+    appointment_payload["precall"] = await _appointment_precall_read(db, appointment)
+    draft_file = None
+    if appointment.dealer_id:
+        draft_dealer = await db.get(DealerBusiness, appointment.dealer_id)
+        if draft_dealer is not None and draft_dealer.archived_at is None:
+            draft_file = RepAppointmentDraftFileSummary(
+                dealer_id=draft_dealer.id,
+                case_ref=draft_dealer.case_ref,
+                name=draft_dealer.name,
+                lifecycle=draft_dealer.application_lifecycle,
+                status=draft_dealer.status,
+                draft_source=draft_dealer.draft_source,
+                href=_appointment_dealer_href(draft_dealer.id),
+            )
     activities = list(
         (
             await db.execute(
@@ -7639,6 +7673,7 @@ async def _appointment_workspace(
         funding_file=funding_file,
         application_candidates=application_candidates,
         booking_data_review=await _appointment_booking_data_review(db, appointment, linked_loan),
+        draft_file=draft_file,
         capabilities=RepAppointmentCapabilities(
             can_edit=manages
             and appointment.status != "cancelled"
@@ -7651,7 +7686,100 @@ async def _appointment_workspace(
             can_manage_outcome_catalog=calendar_v2.can_manage_outcome_catalog(user),
             can_link_files=manages,
             can_create_funding_loan=calendar_v2.can_create_funding_file(user),
+            can_manage_precall=(manages or user.role == Role.FIELD_REP) and appointment.status != "cancelled",
         ),
+    )
+
+
+@router.get("/appointments/{appointment_id}/precall", response_model=RepAppointmentPrecallRead | None)
+async def get_rep_appointment_precall(
+    appointment_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+):
+    """Readiness, room link and the step timeline for a booking's pre-call prep."""
+    require_team_or_rep(user)
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    return await _appointment_precall_read(db, appointment)
+
+
+@router.post("/appointments/{appointment_id}/precall", response_model=RepAppointmentPrecallResult)
+async def act_on_rep_appointment_precall(
+    appointment_id: UUID,
+    payload: RepAppointmentPrecallAction,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentPrecallResult:
+    """Rep-side control: resend the room kit, rotate the PIN (read it out),
+    stop or resume the nudges. Every action is audited on the dealer file."""
+    require_team_or_rep(user)
+    appointment = await _load_owned_appointment(db, appointment_id, user)
+    if not appointment.calendar_event_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This appointment has no booking record.")
+    notice = (
+        await db.execute(select(BookingNotification).where(BookingNotification.event_id == appointment.calendar_event_id))
+    ).scalar_one_or_none()
+    if notice is None or not notice.precall_dealer_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This booking has no draft file; pre-call prep was not opened for it.")
+    dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+    event = await db.get(CalendarEvent, notice.event_id)
+    if dealer is None or event is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The draft file for this booking is gone.")
+    host = await db.get(User, event.owner_user_id)
+    booking = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == event.owner_user_id))
+    ).scalar_one_or_none()
+    if host is None or booking is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Booking settings for the host are missing.")
+    if payload.action in {"resend", "rotate_pin"}:
+        await _require_training_live_action(
+            db, dealer=dealer, user=user, request=request,
+            action="Pre-call prep", provider="SES / SMS", recipient=notice.invitee_email or notice.invitee_phone,
+            effect="Send the client their secure room kit.",
+        )
+
+    passcode: str | None = None
+    if payload.action == "stop":
+        await precall.stop_sequence(db, notice, reason="host_disabled")
+        await log_action(db, dealer.id, user, "precall.stopped", "dealer", entity_id=dealer.id)
+        await db.commit()
+        detail = "Pre-call nudges stopped for this booking."
+    elif payload.action == "resume":
+        restored = await precall.resume_sequence(db, notice=notice, event=event)
+        await log_action(db, dealer.id, user, "precall.resumed", "dealer", entity_id=dealer.id, after={"restored": restored})
+        await db.commit()
+        detail = f"Resumed; {restored} pending step{'s' if restored != 1 else ''} restored." if restored else "Resumed; no future steps were left to restore."
+    else:
+        if payload.action == "rotate_pin":
+            room = await client_room.rotate_passcode(db, dealer)
+            passcode = room.passcode
+            await log_action(db, dealer.id, user, "room.passcode_rotated", "dealer", entity_id=dealer.id, after={"via": "precall"})
+        channels = ("email", "sms") if payload.channel == "both" else (payload.channel,)
+        await db.commit()
+        sent = await precall.send_kit(
+            db, notice=notice, event=event, booking=booking, host=host, dealer=dealer,
+            channels=channels, pin=passcode,
+        )
+        if passcode and not sent["sms"] and notice.sms_consent:
+            notice.precall_pin_delivered_via = "rep"
+        elif passcode and sent["sms"]:
+            notice.precall_pin_delivered_via = "sms"
+        await db.commit()
+        went = [name for name, ok in sent.items() if ok]
+        detail = (
+            f"Sent by {' and '.join(went)}." if went else "Nothing could be sent — check the client's email and SMS consent."
+        )
+        if passcode and not sent["sms"]:
+            detail = f"{detail} Read the new PIN to the client."
+    await db.refresh(appointment)
+    room_url = client_room.room_url(
+        (await client_room.ensure_room(db, dealer, adopt_intake=False)).link.token
+    )
+    return RepAppointmentPrecallResult(
+        ok=True,
+        detail=detail,
+        room_passcode=passcode,
+        room_url=room_url,
+        precall=await _appointment_precall_read(db, appointment),
     )
 
 
@@ -8172,7 +8300,11 @@ async def _link_calendar_file(
         "converted_intake_id": appointment.converted_intake_id,
         "linked_loan_id": appointment.linked_loan_id,
     }
-    if kind == "intake":
+    if kind == "dealer":
+        dealer = await resolve_dealer_scope(db, user, file_id)
+        appointment.dealer_id = dealer.id
+        href = _appointment_dealer_href(dealer.id)
+    elif kind == "intake":
         intake = await _load_calendar_intake_file(db, file_id, user)
         appointment.converted_intake_id = intake.id
         profile = await application_profile_service.resolve_profile(db, "intake", intake.id, user)
@@ -8409,6 +8541,14 @@ async def _apply_calendar_booking_data(
     appointment: DealerRepAppointment,
     user: User,
 ) -> RepAppointmentActionResult:
+    if appointment.dealer_id and not appointment.converted_intake_id and not appointment.linked_loan_id:
+        # The draft dealer file was seeded from this booking when it was made.
+        return RepAppointmentActionResult(
+            action="apply_booking_data",
+            status="completed",
+            detail="The draft file already carries this booking's contact and request data.",
+            href=_appointment_dealer_href(appointment.dealer_id),
+        )
     if appointment.converted_intake_id:
         intake = await _load_calendar_intake_file(db, appointment.converted_intake_id, user)
         intake.full_name = appointment.invitee_name
@@ -8703,7 +8843,29 @@ async def apply_rep_appointment_outcome(
 
     actions: list[RepAppointmentActionResult] = []
     if "file_action" in effects:
-        if payload.file_action == "create_ai_intake":
+        if payload.file_action in {"create_ai_intake", "create_funding_loan"}:
+            await _supersede_booking_draft(db, appointment, user)
+        if payload.file_action == "promote_draft":
+            if not appointment.dealer_id:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This booking has no draft file to promote.")
+            draft_dealer = await db.get(DealerBusiness, appointment.dealer_id)
+            if draft_dealer is None or draft_dealer.archived_at is not None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The draft file for this booking is gone.")
+            promoted = await precall.promote_draft(db, draft_dealer, user, source="calendar_outcome")
+            appointment.conversion_target = "field_desk"
+            appointment.converted_dealer_id = draft_dealer.id
+            actions.append(
+                RepAppointmentActionResult(
+                    action="promote_draft",
+                    status="completed",
+                    detail=(
+                        f"Draft file {draft_dealer.case_ref or ''} promoted to an active application."
+                        if promoted else f"File {draft_dealer.case_ref or ''} is already active."
+                    ).strip(),
+                    href=_appointment_dealer_href(draft_dealer.id),
+                )
+            )
+        elif payload.file_action == "create_ai_intake":
             if payload.variant is None or payload.secure_room_pin is None:
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -9297,6 +9459,10 @@ async def create_standalone_rep_appointment(
         marketing=False,
         method="in_person_device",
     )
+    draft = await _open_booking_draft(
+        db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
+        booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind,
+    )
     thread = await _ensure_rep_thread(
         db,
         owner_user_id=user.id,
@@ -9351,6 +9517,9 @@ async def create_standalone_rep_appointment(
         ev.description = f"{description}\n\nJoin: {join}"
         await db.commit()
         await db.refresh(appt)
+    kit = await _booking_kit(
+        db, notice=notice, event=ev, booking=booking, host=host, draft=draft, timezone_name=appt.timezone
+    )
     booking_notify.notify_host(
         host,
         booking,
@@ -9371,6 +9540,9 @@ async def create_standalone_rep_appointment(
                 invitee_name=payload.invitee_name,
                 invitee_email=payload.invitee_email,
                 join_url=appt.join_url,
+                precall_block=kit.block if kit else None,
+                template=kit.email_template if kit else None,
+                template_values=kit.values if kit else None,
             )
             notice.confirmation_email_status = (
                 "sent" if email_result and email_result.ok else "failed"
@@ -9380,9 +9552,34 @@ async def create_standalone_rep_appointment(
         await db.commit()
     booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone
+        db, notice, ev, timezone_name=booking.timezone,
+        template=kit.sms_template if kit else None, values=kit.values if kit else None,
     )
-    return (await _appointment_read_rows(db, [appt]))[0]
+    await _deliver_booking_pin(db, notice=notice, booking=booking, kit=kit)
+    result = (await _appointment_read_rows(db, [appt]))[0]
+    if kit is not None:
+        result["room_url"] = kit.room_url
+        result["room_passcode"] = kit.pin
+    return result
+
+
+@router.post("/dealers/{dealer_id}/promote-draft", response_model=DealerRead)
+async def promote_dealer_draft(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DealerBusiness:
+    """A draft opened by a booking becomes an active application, in place.
+
+    The appointment outcome does this for rep-booked calls; public-page
+    bookings have no appointment, so the file itself offers it.
+    """
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    if dealer.archived_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Restore the file before promoting it.")
+    await precall.promote_draft(db, dealer, user, source="file")
+    await db.commit()
+    await db.refresh(dealer)
+    return dealer
 
 
 @router.get("/dealers/{dealer_id}/appointments", response_model=list[RepAppointmentRead])
@@ -9518,6 +9715,10 @@ async def create_rep_appointment(
     if dealer.is_training:
         await booking_reminders.cancel_pending(db, notice)
         notice.last_error = "Training file: unattended reminders are suppressed."
+    draft = await _open_booking_draft(
+        db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=None,
+        dealer=dealer, booked_by=user, company=payload.company or dealer.name, notes=payload.notes, kind=payload.kind,
+    )
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
@@ -9598,6 +9799,9 @@ async def create_rep_appointment(
         ev.description = f"{description}\n\nJoin: {join}"
         await db.commit()
         await db.refresh(appt)
+    kit = await _booking_kit(
+        db, notice=notice, event=ev, booking=booking, host=host, draft=draft, timezone_name=appt.timezone
+    )
     booking_notify.notify_host(
         host,
         booking,
@@ -9618,6 +9822,9 @@ async def create_rep_appointment(
                 invitee_name=payload.invitee_name,
                 invitee_email=payload.invitee_email,
                 join_url=appt.join_url,
+                precall_block=kit.block if kit else None,
+                template=kit.email_template if kit else None,
+                template_values=kit.values if kit else None,
             )
             notice.confirmation_email_status = (
                 "sent" if email_result and email_result.ok else "failed"
@@ -9627,9 +9834,14 @@ async def create_rep_appointment(
         await db.commit()
     booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone
+        db, notice, ev, timezone_name=booking.timezone,
+        template=kit.sms_template if kit else None, values=kit.values if kit else None,
     )
+    await _deliver_booking_pin(db, notice=notice, booking=booking, kit=kit)
     result = (await _appointment_read_rows(db, [appt]))[0]
+    if kit is not None:
+        result["room_url"] = kit.room_url
+        result["room_passcode"] = kit.pin
     if room_results:
         result["notification_results"] = {
             **(result.get("notification_results") or {}),
@@ -10061,6 +10273,205 @@ def _appointment_amount(value: str | None) -> float | None:
         return None
 
 
+def _appointment_dealer_href(dealer_id: UUID) -> str:
+    return f"/applications/{dealer_id}"
+
+
+_PRECALL_SKIP_KINDS = frozenset(precall.SKIP_KINDS | {"underwriting_review"})
+
+
+async def _open_booking_draft(
+    db: AsyncSession,
+    *,
+    notice,
+    event: CalendarEvent,
+    booking,
+    host: User,
+    appointment: DealerRepAppointment | None,
+    contact: DealerRepContact | None,
+    dealer: DealerBusiness | None = None,
+    booked_by: User | None,
+    company: str | None,
+    notes: str | None,
+    kind: str,
+):
+    """Every booking opens (or attaches) the draft dealer file and its room,
+    and starts the pre-call sequence when the checklist is still open.
+
+    Flushes only — it rides in the booking transaction. A non-database error
+    is logged and the booking still goes through; a database error has
+    already poisoned the transaction and is re-raised.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    if not booking.precall_enabled or kind in _PRECALL_SKIP_KINDS:
+        return None
+    try:
+        result = await precall.create_draft_for_booking(
+            db, notice=notice, event=event, booking=booking, host=host, appointment=appointment,
+            contact=contact, dealer=dealer, booked_by=booked_by, company=company, notes=notes,
+        )
+        ready = await precall.readiness(db, result.dealer)
+        if not ready.complete:
+            await precall.schedule(
+                db, notice=notice, booking=booking, event=event, dealer=result.dealer,
+                timezone_name=appointment.timezone if appointment is not None else None,
+            )
+        return result
+    except SQLAlchemyError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("precall: could not open the draft file for booking %s", notice.id)
+        return None
+
+
+class _BookingKit:
+    """Everything the confirmation messages need from the draft file."""
+
+    def __init__(self, *, room_url, pin, block, email_template, sms_template, values):
+        self.room_url = room_url
+        self.pin = pin
+        self.block = block
+        self.email_template = email_template
+        self.sms_template = sms_template
+        self.values = values
+
+
+async def _booking_kit(db: AsyncSession, *, notice, event, booking, host, draft, timezone_name):
+    if draft is None:
+        return None
+    ready = await precall.readiness(db, draft.dealer)
+    values = precall.template_values(
+        notice=notice, event=event, booking=booking, host=host, dealer=draft.dealer,
+        room_link=draft.room.url, ready=ready, pin=draft.room.passcode,
+        stop_link=precall.stop_url(notice), timezone_name=timezone_name,
+    )
+    cm = booking.confirmation_messages or {}
+    return _BookingKit(
+        room_url=draft.room.url,
+        pin=draft.room.passcode,
+        block=precall.precall_block(booking, values),
+        email_template={"subject": cm.get("email_subject"), "body": cm.get("email_body")},
+        sms_template=precall.message_text(booking, "confirmation_sms"),
+        values=values,
+    )
+
+
+async def _deliver_booking_pin(db: AsyncSession, *, notice, booking, kit) -> None:
+    """The PIN reaches the client on its own channel: inside the confirmation
+    SMS when they consented and it went out, otherwise its own email."""
+    if kit is None or not kit.pin:
+        return
+    if notice.sms_consent and notice.invitee_phone and notice.confirmation_sms_status == "sent":
+        notice.precall_pin_delivered_via = "sms"
+        await db.commit()
+        return
+    try:
+        await precall.deliver_pin(db, notice=notice, booking=booking, values=kit.values)
+    except Exception:  # noqa: BLE001
+        logger.exception("precall: PIN delivery raised notification=%s", notice.id)
+    await db.commit()
+
+
+async def _precall_progress(db: AsyncSession, dealer: DealerBusiness) -> None:
+    """After the client finishes something in the room. Never raises."""
+    try:
+        await precall.on_progress(db, dealer)
+    except Exception:  # noqa: BLE001
+        logger.exception("precall: progress check failed dealer=%s", dealer.id)
+
+
+async def _supersede_booking_draft(db: AsyncSession, appt: DealerRepAppointment, user: User) -> None:
+    """The rep chose an AI intake or a funding loan instead of the draft.
+
+    An untouched draft is archived so it does not linger; a draft the client
+    already put data on (bank connection, credit authorization, documents)
+    is refused — that data belongs on the file, so the draft is promoted
+    instead.
+    """
+    if not appt.dealer_id:
+        return
+    dealer = await db.get(DealerBusiness, appt.dealer_id)
+    if dealer is None or dealer.archived_at is not None or dealer.draft_source != "booking":
+        return
+    if dealer.application_lifecycle != "draft":
+        return
+    ready = await precall.readiness(db, dealer)
+    has_credit = any(o.credit_status == "done" for o in ready.owners)
+    if ready.bank_complete or has_credit:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This booking's draft file already holds client data (bank connection, credit "
+            "authorization or documents). Promote the draft file instead.",
+        )
+    dealer.archived_at = datetime.now(timezone.utc)
+    dealer.archived_by_user_id = user.id
+    await precall.stop_sequences_for_dealer(db, dealer, reason="superseded")
+    await log_action(db, dealer.id, user, "draft.archived", "dealer", entity_id=dealer.id, after={"reason": "superseded_by_outcome", "appointment_id": str(appt.id)})
+    await db.flush()
+
+
+def _appointment_precall_summary(notice, dealer: DealerBusiness | None) -> dict | None:
+    """The cheap, list-safe view: status and where the file is. Readiness and
+    the step timeline are loaded only for the workspace and the precall route."""
+    if notice is None or not notice.precall_dealer_id or dealer is None:
+        return None
+    return {
+        "status": precall.status_for(notice, None, True),
+        "dealer_id": dealer.id,
+        "case_ref": dealer.case_ref,
+        "lifecycle": dealer.application_lifecycle,
+        "pin_delivered_via": notice.precall_pin_delivered_via,
+        "completed_at": notice.precall_completed_at,
+        "stopped_at": notice.precall_stopped_at,
+        "stop_reason": notice.precall_stop_reason,
+    }
+
+
+async def _appointment_precall_read(db: AsyncSession, appointment: DealerRepAppointment) -> dict | None:
+    """The full view for one appointment: readiness, room link, step timeline."""
+    if not appointment.calendar_event_id:
+        return None
+    notice = (
+        await db.execute(select(BookingNotification).where(BookingNotification.event_id == appointment.calendar_event_id))
+    ).scalar_one_or_none()
+    if notice is None or not notice.precall_dealer_id:
+        return None
+    dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+    if dealer is None:
+        return None
+    ready = await precall.readiness(db, dealer)
+    room = await client_room.ensure_room(db, dealer, adopt_intake=False)
+    steps = await precall.steps_for(db, notice)
+    pending = [s for s in steps if s["status"] == "pending"]
+    return {
+        "status": precall.status_for(notice, ready, True),
+        "dealer_id": dealer.id,
+        "case_ref": dealer.case_ref,
+        "lifecycle": dealer.application_lifecycle,
+        "room_url": room.url,
+        "pin_delivered_via": notice.precall_pin_delivered_via,
+        "completed_at": notice.precall_completed_at,
+        "stopped_at": notice.precall_stopped_at,
+        "stop_reason": notice.precall_stop_reason,
+        "next_step_at": min((s["due_at"] for s in pending), default=None),
+        "readiness": {
+            "ownership_complete": ready.ownership_complete,
+            "ownership_total": ready.ownership_total,
+            "contact_complete": ready.contact_complete,
+            "bank_complete": ready.bank_complete,
+            "bank_detail": ready.bank_detail,
+            "credit_complete": ready.credit_complete,
+            "credit_required": ready.credit_required,
+            "credit_done": ready.credit_done,
+            "complete": ready.complete,
+            "done_count": ready.done_count,
+            "missing": ready.missing,
+        },
+        "steps": steps,
+    }
+
+
 async def _convert_appointment_to_field_desk(
     db: AsyncSession, appt: DealerRepAppointment, user: User
 ) -> DealerBusiness:
@@ -10070,7 +10481,11 @@ async def _convert_appointment_to_field_desk(
             return existing
     if appt.dealer_id:
         existing = await db.get(DealerBusiness, appt.dealer_id)
-        if existing:
+        if existing is not None and existing.archived_at is None:
+            # The booking opened this file as a draft. Converting promotes it
+            # in place: owners, bank consent, Plaid items, credit pulls and
+            # uploads are already on the row, so nothing is copied.
+            await precall.promote_draft(db, existing, user, source="appointment_conversion")
             return existing
     owner_id = appt.booked_by_user_id or user.id
     dealer = DealerBusiness(
@@ -10135,6 +10550,7 @@ async def _convert_appointment_to_ai_intake(
 ) -> UUID:
     if appt.converted_intake_id:
         return appt.converted_intake_id
+    await _supersede_booking_draft(db, appt, user)
     # Reuse the production admin-intake path so bucket setup, access controls,
     # requested documents, client ownership, and notification behavior stay
     # identical to an intake created from the lead-management screen.
@@ -14452,6 +14868,7 @@ async def public_room_features(
         await db.commit()
 
     return RoomFeaturesRead(
+        precall=await _room_precall_state(db, link, dealer),
         business_name=dealer.name,
         bank_connect_available=plaid_client.enabled(),
         plaid_environment=plaid_client.environment(),
@@ -14818,6 +15235,261 @@ async def public_room_sign(
     )
 
 
+async def _room_precall_state(db: AsyncSession, link, dealer: DealerBusiness):
+    """The 'Before your call' state for a room, or None for rooms that were
+    not opened by a booking."""
+    notice = await precall.notice_for_dealer(db, dealer.id)
+    if notice is None:
+        return None
+    event = await db.get(CalendarEvent, notice.event_id)
+    host = await db.get(User, event.owner_user_id) if event is not None else None
+    ready = await precall.readiness(db, dealer)
+    return RoomPrecallRead(
+        enabled=True,
+        starts_at=event.starts_at if event is not None else None,
+        host_name=(host.name or host.email) if host is not None else None,
+        business_name=dealer.name,
+        passcode_needs_setup=link.passcode_set_by_client_at is None,
+        ownership_complete=ready.ownership_complete,
+        ownership_total=ready.ownership_total,
+        contact_complete=ready.contact_complete,
+        owners=[RoomOwnerRead(**o.__dict__) for o in ready.owners],
+        max_owners=precall.MAX_OWNERS,
+        credit_threshold_pct=precall.OWNER_CREDIT_THRESHOLD,
+        bank_complete=ready.bank_complete,
+        bank_detail=ready.bank_detail,
+        credit_complete=ready.credit_complete,
+        credit_required=ready.credit_required,
+        credit_done=ready.credit_done,
+        complete=ready.complete,
+        done_count=ready.done_count,
+        completed_at=notice.precall_completed_at,
+    )
+
+
+async def _room_owner_read(db: AsyncSession, dealer: DealerBusiness, owner_id: UUID) -> RoomOwnerRead:
+    ready = await precall.readiness(db, dealer)
+    for o in ready.owners:
+        if o.id == owner_id:
+            return RoomOwnerRead(**o.__dict__)
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found")
+
+
+async def _room_owner(db: AsyncSession, dealer: DealerBusiness, owner_id: UUID) -> DealerOwner:
+    owner = (
+        await db.execute(select(DealerOwner).where(DealerOwner.id == owner_id, DealerOwner.dealer_id == dealer.id))
+    ).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Owner not found")
+    return owner
+
+
+def _room_owner_locked(owner: DealerOwner) -> bool:
+    return owner.credit_pulled_at is not None or bool(owner.invite_token_hash)
+
+
+@router.post("/public/room/{token}/owners", response_model=RoomOwnerRead, status_code=status.HTTP_201_CREATED)
+async def public_room_create_owner(
+    token: str, payload: RoomOwnerCreate, db: AsyncSession = Depends(get_db)
+) -> RoomOwnerRead:
+    """PUBLIC. The client lists who owns the business from their own room.
+
+    Same rules as the desk's create_owner (at most five, one primary, unique
+    email) so the room can never produce a schedule the credit gates reject.
+    """
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    await _lock_dealer_related_writes(db, dealer.id)
+    owner_count = int(
+        (await db.execute(select(func.count()).select_from(DealerOwner).where(DealerOwner.dealer_id == dealer.id))).scalar_one()
+    )
+    if owner_count >= _MAX_OWNERS_PER_FILE:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A file may list at most five owners")
+    email = _normalized_owner_email(str(payload.email)) if payload.email else None
+    await _assert_owner_email_unique(db, dealer.id, email)
+    phone = consent_delivery.normalize_phone(payload.phone) if payload.phone else None
+    if payload.phone and phone is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter a valid mobile number")
+    if payload.is_primary:
+        existing_primary = (
+            await db.execute(
+                select(DealerOwner.id).where(DealerOwner.dealer_id == dealer.id, DealerOwner.is_primary.is_(True)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_primary is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only one owner can be marked as you")
+    row = DealerOwner(
+        dealer_id=dealer.id,
+        first_name=payload.first_name.strip(),
+        last_name=payload.last_name.strip(),
+        email=email,
+        phone=phone,
+        ownership_pct=payload.ownership_pct,
+        is_primary=payload.is_primary,
+    )
+    db.add(row)
+    await log_action(
+        db, dealer.id, None, "owner.create", "owner",
+        after={"via": "client_room", "first_name": row.first_name, "ownership_pct": row.ownership_pct},
+    )
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only one owner can be marked as you") from None
+    await db.refresh(row)
+    return await _room_owner_read(db, dealer, row.id)
+
+
+@router.patch("/public/room/{token}/owners/{owner_id}", response_model=RoomOwnerRead)
+async def public_room_patch_owner(
+    token: str, owner_id: UUID, payload: RoomOwnerPatch, db: AsyncSession = Depends(get_db)
+) -> RoomOwnerRead:
+    """PUBLIC. Edit an owner the client added or that was seeded from the
+    booking — only while no credit link is out and no pull has run."""
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    await _lock_dealer_related_writes(db, dealer.id)
+    owner = await _room_owner(db, dealer, owner_id)
+    if _room_owner_locked(owner):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This owner's credit authorization is in progress; ask your representative to change it")
+    changes = payload.model_dump(exclude_unset=True, exclude={"passcode"})
+    if "email" in changes:
+        email = _normalized_owner_email(str(changes["email"])) if changes["email"] else None
+        await _assert_owner_email_unique(db, dealer.id, email, exclude_owner_id=owner.id)
+        owner.email = email
+    if "phone" in changes:
+        phone = consent_delivery.normalize_phone(changes["phone"]) if changes["phone"] else None
+        if changes["phone"] and phone is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter a valid mobile number")
+        owner.phone = phone
+    if changes.get("first_name"):
+        owner.first_name = changes["first_name"].strip()
+    if changes.get("last_name"):
+        owner.last_name = changes["last_name"].strip()
+    if "ownership_pct" in changes:
+        owner.ownership_pct = changes["ownership_pct"]
+    if changes.get("is_primary") is True and not owner.is_primary:
+        others = (
+            await db.execute(
+                select(DealerOwner).where(DealerOwner.dealer_id == dealer.id, DealerOwner.is_primary.is_(True), DealerOwner.id != owner.id)
+            )
+        ).scalars().all()
+        for other in others:
+            if _room_owner_locked(other):
+                raise HTTPException(status.HTTP_409_CONFLICT, "The current primary owner's credit authorization is in progress")
+            other.is_primary = False
+        owner.is_primary = True
+    await log_action(db, dealer.id, None, "owner.update", "owner", entity_id=owner.id, after={"via": "client_room", **{k: (str(v) if v is not None else None) for k, v in changes.items()}})
+    await db.commit()
+    return await _room_owner_read(db, dealer, owner.id)
+
+
+@router.delete("/public/room/{token}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def public_room_delete_owner(
+    token: str, owner_id: UUID, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
+) -> None:
+    """PUBLIC. Remove a non-primary owner with no credit history."""
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    await _lock_dealer_related_writes(db, dealer.id)
+    owner = await _room_owner(db, dealer, owner_id)
+    if owner.is_primary:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The primary owner cannot be removed")
+    if _room_owner_locked(owner) or owner.invite_sent_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This owner's credit authorization is in progress; ask your representative")
+    await log_action(db, dealer.id, None, "owner.delete", "owner", entity_id=owner.id, before={"first_name": owner.first_name, "via": "client_room"})
+    await db.delete(owner)
+    await db.commit()
+
+
+@router.post("/public/room/{token}/owners/{owner_id}/credit-link", response_model=RoomCreditLinkResult)
+async def public_room_owner_credit_link(
+    token: str, owner_id: UUID, payload: RoomPasscode, db: AsyncSession = Depends(get_db)
+) -> RoomCreditLinkResult:
+    """PUBLIC. Start an owner's soft-credit authorization from the room.
+
+    The person in the room (the primary owner) gets the consent path to open
+    themself; any other owner at or above 20% gets their own one-time link
+    delivered to their own email/phone — their token never appears here.
+    Gated on the same ownership rule as the desk. The desk's Step 1.5
+    eligibility pre-screen is deliberately not required: FCRA authorization
+    is the consumer's own, and the point is having credit before the call.
+    """
+    try:
+        _link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if dealer.is_training:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Training files cannot run live credit checks")
+    owner = await _room_owner(db, dealer, owner_id)
+    ready = await precall.readiness(db, dealer)
+    if not ready.ownership_complete:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Ownership must total 100.00% before credit authorizations; the total is {ready.ownership_total:.2f}%",
+        )
+    if not ready.contact_complete:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Every owner with 20% or more needs an email and mobile number first")
+    if not owner.credit_required:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Credit authorization is only needed for owners with 20% or more")
+    if owner.credit_pulled_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This owner's credit check is already complete")
+    if owner.invite_sent_at is not None and (datetime.now(timezone.utc) - owner.invite_sent_at) < timedelta(minutes=10):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "A link was created a few minutes ago. Please use it, or try again in 10 minutes.")
+    token_plain = await _mint_owner_credit_token(db, dealer, owner, user=None, require_prescreen=False, via="client_room")
+    path = f"/credit-consent#t={token_plain}"
+    if owner.is_primary:
+        await db.commit()
+        return RoomCreditLinkResult(mode="self", path=path, delivered=False, detail="Open the authorization form to continue.")
+    host = await db.get(User, dealer.owner_user_id) if dealer.owner_user_id else None
+    await db.commit()
+    delivery = await consent_delivery.deliver_link_checked(
+        db,
+        channel="sms",
+        to_email=owner.email,
+        to_phone=owner.phone,
+        business_name=dealer.name,
+        purpose="authorise a soft credit check",
+        path=path,
+        rep_name=(host.name if host is not None else None) or "Qualified Commercial",
+    )
+    await log_action(
+        db, dealer.id, None, "owner.credit_invite_delivery", "owner", entity_id=owner.id,
+        after={"delivered": delivery.ok, "channel": delivery.channel, "via": "client_room"},
+    )
+    await db.commit()
+    return RoomCreditLinkResult(
+        mode="sent",
+        delivered=bool(delivery.ok),
+        detail=(f"Sent to {owner.first_name}." if delivery.ok else (delivery.detail or "Could not deliver the link.")),
+    )
+
+
+@router.post("/public/room/{token}/passcode")
+async def public_room_change_passcode(
+    token: str, payload: RoomPasscodeChange, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """PUBLIC. The client replaces the generated PIN with one they will remember."""
+    try:
+        link, dealer = await client_room.resolve_room(db, token, payload.passcode)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    problem = client_room.passcode_problem(payload.new_passcode, payload.passcode)
+    if problem:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problem)
+    await client_room.set_passcode(db, link, payload.new_passcode)
+    await log_action(db, dealer.id, None, "room.passcode_changed", "dealer", entity_id=dealer.id, after={"via": "client_room", "link_id": str(link.id)})
+    await db.commit()
+    return {"ok": True}
+
+
 @router.post("/public/room/{token}/bank-consent", response_model=BankConsentState)
 async def public_room_bank_consent(
     token: str,
@@ -15082,6 +15754,7 @@ async def public_room_plaid_exchange(
     )
     await db.commit()
     background.add_task(_background_plaid_first_sync, item.id)
+    await _precall_progress(db, dealer)
     return PublicPlaidResult(
         connected=True,
         institution_name=item.institution_name,
@@ -18270,6 +18943,64 @@ async def _resolve_consent_owner(db: AsyncSession, token: str) -> DealerOwner:
     return owner
 
 
+async def _mint_owner_credit_token(
+    db: AsyncSession,
+    dealer: DealerBusiness,
+    owner: DealerOwner,
+    *,
+    user: User | None,
+    require_prescreen: bool,
+    via: str,
+) -> str:
+    """Mint an owner's one-time credit-consent token. Returns the plaintext;
+    only its sha256 is stored, and re-minting kills the previous link.
+
+    Shared by the desk's credit invite (pre-screen required) and the client
+    room (pre-screen not required — the consumer's own FCRA authorization is
+    the gate there). Flushes, never commits.
+    """
+    owner_state = await _owner_requirement_state(db, dealer.id)
+    if not owner_state["ownership_complete"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
+        )
+    if require_prescreen:
+        pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
+        if not pre_screen["complete"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Complete the Step 1 eligibility checkpoint before sending credit authorizations",
+            )
+    if not owner.credit_required:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Credit authorization is required only for owners with 20% or more ownership",
+        )
+    if not _normalized_owner_email(owner.email):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This owner needs an email before a credit authorization can be sent",
+        )
+    if not consent_delivery.normalize_phone(owner.phone):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This owner needs a valid personal phone before a credit authorization can be sent",
+        )
+    token = secrets.token_urlsafe(32)
+    owner.invite_token_hash = _hash_invite_token(token)
+    owner.invite_sent_at = datetime.now(timezone.utc)
+    owner.invite_opened_at = None  # a fresh link has not been opened yet
+    owner.credit_workflow_status = "link_created"
+    owner.credit_delivery_detail = None
+    await log_action(
+        db, dealer.id, user, "owner.credit_invite", "owner",
+        entity_id=owner.id, after={"invite_sent_at": owner.invite_sent_at.isoformat(), "via": via},
+    )
+    await db.flush()
+    return token
+
+
 @router.post(
     "/dealers/{dealer_id}/owners/{owner_id}/credit-invite", response_model=CreditInviteResult
 )
@@ -18310,43 +19041,7 @@ async def owner_credit_invite(
         recipient=owner.email or owner.phone,
         effect="Create and optionally deliver a live credit-consent link.",
     )
-    owner_state = await _owner_requirement_state(db, dealer.id)
-    if not owner_state["ownership_complete"]:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Ownership must total 100.00% before credit links are sent; current total is {owner_state['ownership_total']:.2f}%",
-        )
-    pre_screen = await _application_pre_screen_state(db, dealer, owner_state)
-    if not pre_screen["complete"]:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Complete the Step 1 eligibility checkpoint before sending credit authorizations",
-        )
-    if not owner.credit_required:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "Credit authorization is required only for owners with 20% or more ownership",
-        )
-    if not _normalized_owner_email(owner.email):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "This owner needs an email before a credit authorization can be sent",
-        )
-    if not consent_delivery.normalize_phone(owner.phone):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "This owner needs a valid personal phone before a credit authorization can be sent",
-        )
-    token = secrets.token_urlsafe(32)
-    owner.invite_token_hash = _hash_invite_token(token)
-    owner.invite_sent_at = datetime.now(timezone.utc)
-    owner.invite_opened_at = None  # a fresh link has not been opened yet
-    owner.credit_workflow_status = "link_created"
-    owner.credit_delivery_detail = None
-    await log_action(
-        db, dealer.id, user, "owner.credit_invite", "owner",
-        entity_id=owner.id, after={"invite_sent_at": owner.invite_sent_at.isoformat()},
-    )
+    token = await _mint_owner_credit_token(db, dealer, owner, user=user, require_prescreen=True, via="desk")
     await db.commit()
 
     path = f"/credit-consent#t={token}"
@@ -18558,10 +19253,12 @@ async def public_credit_consent_submit(
             status.HTTP_409_CONFLICT,
             "This owner no longer requires a credit authorization for this file.",
         )
-    first_name = body.first_name.strip()
-    last_name = body.last_name.strip()
-    email = _normalized_owner_email(str(body.email))
-    phone = consent_delivery.normalize_phone(body.phone)
+    # The consent page confirms identity from the owner row and only posts
+    # corrections, so anything missing here defaults to what the file holds.
+    first_name = (body.first_name or owner.first_name or "").strip()
+    last_name = (body.last_name or owner.last_name or "").strip()
+    email = _normalized_owner_email(str(body.email) if body.email else (owner.email or ""))
+    phone = consent_delivery.normalize_phone(body.phone or owner.phone)
     if not first_name or not last_name or email is None or phone is None:
         await _release_token()
         raise HTTPException(
@@ -18604,6 +19301,7 @@ async def public_credit_consent_submit(
         )
     await db.commit()
     await db.refresh(owner)
+    await _precall_progress(db, dealer)
     return PublicConsentResult(
         credit_tier=owner.credit_tier,
         credit_score_band=_credit_score_band(owner.credit_score),
