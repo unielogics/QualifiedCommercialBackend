@@ -738,7 +738,7 @@ async def _attach_bucket_file_links(
             ),
         )
 
-    changed = False
+    changed_buckets: list[Bucket] = []
     bucket_by_id = {bucket.id: bucket for bucket in buckets}
     for bucket_id, linked_dealers in dealers_by_bucket.items():
         if len(linked_dealers) != 1:
@@ -749,12 +749,18 @@ async def _attach_bucket_file_links(
         if bucket.name != expected or bucket.client_name != expected:
             bucket.name = expected
             bucket.client_name = expected
-            changed = True
+            changed_buckets.append(bucket)
     for bucket in buckets:
         bucket.linked_files = links[bucket.id]
-    if changed:
+    if changed_buckets:
         await db.flush()
-    return changed
+        # TimestampMixin uses a database-side ON UPDATE expression. SQLAlchemy
+        # expires that column after the flush, so load it while async IO is
+        # still legal instead of letting response validation trigger a lazy
+        # read outside greenlet_spawn.
+        for bucket in changed_buckets:
+            await db.refresh(bucket, attribute_names=["updated_at"])
+    return bool(changed_buckets)
 
 
 async def _uploaded_bucket_files(db: AsyncSession, bucket_id: UUID, file_ids: list[UUID]) -> list[BucketFile]:
