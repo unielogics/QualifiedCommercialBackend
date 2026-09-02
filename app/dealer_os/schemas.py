@@ -778,6 +778,8 @@ class RepAppointmentRead(ORM):
     archived_by_user_id: UUID | None = None
     cancellation_reason: str | None = None
     conversion_target: Literal["field_desk", "ai_intake", "funding_loan"] | None = None
+    #: field_desk | calendar | public | intake — null for rows that predate origins.
+    origin: str | None = None
     converted_dealer_id: UUID | None = None
     converted_intake_id: UUID | None = None
     linked_loan_id: UUID | None = None
@@ -927,6 +929,9 @@ class RepAppointmentCreate(BaseModel):
     requested_amount: str | None = Field(default=None, max_length=40)
     full_address: str | None = Field(default=None, max_length=500)
     transactional_sms_consent: bool = False
+    #: Which surface booked this. The rep app sends field_desk, the operator
+    #: calendar sends calendar; absent, the booker's role decides.
+    origin: Literal["field_desk", "calendar"] | None = None
     requested_document_keys: list[
         Literal[
             "ytd_profit_and_loss",

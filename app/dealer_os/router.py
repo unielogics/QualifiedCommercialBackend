@@ -8682,6 +8682,7 @@ async def _create_calendar_follow_up(
     await db.flush()
     follow_up = DealerRepAppointment(
         dealer_id=appointment.dealer_id,
+        origin=appointment.origin,
         owner_user_id=(host or user).id,
         calendar_event_id=event.id,
         contact_id=appointment.contact_id,
@@ -9512,9 +9513,10 @@ async def create_standalone_rep_appointment(
         marketing=False,
         method="in_person_device",
     )
+    appt.origin = precall.origin_for(payload.origin, getattr(user.role, "value", str(user.role)))
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
-        booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind,
+        booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind, origin=appt.origin,
     )
     thread = await _ensure_rep_thread(
         db,
@@ -9768,9 +9770,11 @@ async def create_rep_appointment(
     if dealer.is_training:
         await booking_reminders.cancel_pending(db, notice)
         notice.last_error = "Training file: unattended reminders are suppressed."
+    appt.origin = "field_desk"
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=None,
         dealer=dealer, booked_by=user, company=payload.company or dealer.name, notes=payload.notes, kind=payload.kind,
+        origin=appt.origin,
     )
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
@@ -10347,9 +10351,12 @@ async def _open_booking_draft(
     company: str | None,
     notes: str | None,
     kind: str,
+    origin: str | None,
 ):
-    """Every booking opens (or attaches) the draft dealer file and its room,
-    and starts the pre-call sequence when the checklist is still open.
+    """A field-desk booking opens (or attaches) the draft dealer file and its
+    room, and starts the pre-call sequence when the checklist is still open.
+    Any other origin opens nothing here: the calendar outcome decides which
+    file it becomes.
 
     Flushes only — it rides in the booking transaction. A non-database error
     is logged and the booking still goes through; a database error has
@@ -10357,7 +10364,7 @@ async def _open_booking_draft(
     """
     from sqlalchemy.exc import SQLAlchemyError
 
-    if not booking.precall_enabled or kind in _PRECALL_SKIP_KINDS:
+    if not booking.precall_enabled or kind in _PRECALL_SKIP_KINDS or not precall.opens_draft(origin):
         return None
     try:
         result = await precall.create_draft_for_booking(
@@ -11037,6 +11044,7 @@ async def book_underwriting_review_preference(
     await db.flush()
     appointment = DealerRepAppointment(
         dealer_id=dealer.id,
+        origin="field_desk",
         owner_user_id=host.id,
         calendar_event_id=event.id,
         kind="underwriting_review",

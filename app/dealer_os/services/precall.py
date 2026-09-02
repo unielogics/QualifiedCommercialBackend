@@ -84,6 +84,29 @@ STEP_MARKERS = {"nudge_1": -1, "nudge_2": -2}
 #: Appointment kinds that are not funding conversations.
 SKIP_KINDS = frozenset({"signing", "lender_call"})
 
+#: Where a booking came from. Only field-desk bookings open the Capital OS
+#: draft at booking time; every other origin gets its file from the calendar
+#: outcome (AI intake, funding loan, link existing) — "the right file based on
+#: origin".
+ORIGINS = ("field_desk", "calendar", "public", "intake")
+DRAFT_ORIGINS = frozenset({"field_desk"})
+
+
+def origin_for(explicit: str | None, role: str | None) -> str:
+    """The origin of a rep-appointment booking.
+
+    The surface says so when it can (the rep app sends field_desk, the
+    operator calendar sends calendar). Without that, a field rep is booking
+    for the field desk and anyone else is booking from the calendar.
+    """
+    if explicit in ORIGINS:
+        return explicit
+    return "field_desk" if (role or "").lower().endswith("field_rep") else "calendar"
+
+
+def opens_draft(origin: str | None) -> bool:
+    return origin in DRAFT_ORIGINS
+
 #: Reasons a sequence stops. Stored on booking_notifications.precall_stop_reason.
 STOP_REASONS = (
     "completed", "call_started", "cancelled", "sms_stop", "email_stop",

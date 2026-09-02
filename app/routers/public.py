@@ -429,7 +429,10 @@ async def public_booking_create(
         sms_consent_ip=ip,
         sms_consent_user_agent=request.headers.get("user-agent"),
     )
-    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user)
+    # A public-page booking opens no file: the calendar outcome decides which
+    # file it becomes (intake, funding loan, or a dealer file). The draft file
+    # at booking is a field-desk thing — see precall.
+    draft = None
 
     db.add(
         Activity(
@@ -462,31 +465,6 @@ async def public_booking_create(
         room_url=draft.room.url if draft is not None else None,
         pin_delivered_via=notice.precall_pin_delivered_via,
     )
-
-
-async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User):
-    """Every public booking opens a draft dealer file owned by the host, with
-    its secure room, and schedules the pre-call nudges. Flushes only."""
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from app.dealer_os.services import precall
-
-    if not booking.precall_enabled:
-        return None
-    try:
-        result = await precall.create_draft_for_booking(
-            db, notice=notice, event=event, booking=booking, host=host,
-            notes="Booked from the public booking page.",
-        )
-        ready = await precall.readiness(db, result.dealer)
-        if not ready.complete:
-            await precall.schedule(db, notice=notice, booking=booking, event=event, dealer=result.dealer)
-        return result
-    except SQLAlchemyError:
-        raise
-    except Exception:  # noqa: BLE001
-        log.exception("public-booking: could not open the draft file for %s", notice.id)
-        return None
 
 
 async def _load_public_booking(

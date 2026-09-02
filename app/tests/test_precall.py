@@ -186,3 +186,23 @@ def test_settings_reject_pin_outside_the_pin_messages_and_clean_templates() -> N
     assert ok.reminder_email_messages == {"1440": {"subject": "Tomorrow", "body": "See you {time}"}}
     with pytest.raises(ValueError):
         UserBookingSettingsUpdate(precall_messages={"nudge_1": {"channel": "carrier pigeon"}})
+
+
+# --- origin → file rule --------------------------------------------------------------
+
+
+def test_origin_is_explicit_when_the_surface_says_and_role_based_otherwise() -> None:
+    assert precall.origin_for("field_desk", "super_admin") == "field_desk"
+    assert precall.origin_for("calendar", "field_rep") == "calendar"
+    assert precall.origin_for(None, "field_rep") == "field_desk"
+    assert precall.origin_for(None, "Role.FIELD_REP".lower()) == "field_desk"
+    assert precall.origin_for(None, "super_admin") == "calendar"
+    assert precall.origin_for("bogus", "loan_exec") == "calendar"
+
+
+def test_only_field_desk_bookings_open_the_draft() -> None:
+    assert precall.opens_draft("field_desk")
+    assert not precall.opens_draft("calendar")
+    assert not precall.opens_draft("public")
+    assert not precall.opens_draft("intake")
+    assert not precall.opens_draft(None)

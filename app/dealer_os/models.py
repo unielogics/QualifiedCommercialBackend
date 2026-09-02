@@ -663,6 +663,10 @@ class DealerRepAppointment(TimestampMixin, Base):
     )
     client_rsvp_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rsvp_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Where the booking came from — decides which file the calendar opens for it.
+    # field_desk (rep drawer / a booking on a dealer file) | calendar (operator
+    # console) | public (public booking page) | intake (AI-intake booking).
+    origin: Mapped[str | None] = mapped_column(String(24), index=True)
     booked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
