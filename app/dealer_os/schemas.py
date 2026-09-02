@@ -211,6 +211,10 @@ class DealerRead(ORM):
     draft_source: str | None = None
     is_training: bool = False
     workflow_ungated: bool = False
+    plaid_assets_enabled: bool = True
+    plaid_statements_enabled: bool = False
+    plaid_policy_updated_at: datetime | None = None
+    plaid_policy_updated_by_user_id: UUID | None = None
     funding_purpose: str | None = None
     group_id: UUID | None = None
 
@@ -270,6 +274,8 @@ class DealerListItem(ORM):
     application_lifecycle: str = "active"
     is_training: bool = False
     workflow_ungated: bool = False
+    plaid_assets_enabled: bool = True
+    plaid_statements_enabled: bool = False
 
 
 class PortfolioOwnerSummary(BaseModel):
@@ -2175,6 +2181,10 @@ class PublicPlaidItemRead(BaseModel):
     is_primary_operating: bool = False
     last_pulled_at: datetime | None = None
     statement_months: list[str] = Field(default_factory=list)
+    products: list[str] = Field(default_factory=list)
+    unavailable_products: list[str] = Field(default_factory=list)
+    pending_products: list[str] = Field(default_factory=list)
+    authorization_state: str = "checking"
 
 
 class RoomSignableRead(BaseModel):
@@ -2274,6 +2284,9 @@ class RoomFeaturesRead(BaseModel):
     bank_consent_disclosure: str = ""
     bank_connections: list[PublicPlaidItemRead] = Field(default_factory=list)
     plaid_assets_enabled: bool = False
+    plaid_statements_enabled: bool = False
+    plaid_selected_products: list[str] = Field(default_factory=list)
+    plaid_available_products: list[str] = Field(default_factory=list)
     signable: list[RoomSignableRead] = []
     contracts: list["RoomContractRead"] = Field(default_factory=list)
     envelopes: list["ContractEnvelopeRead"] = Field(default_factory=list)
@@ -2836,6 +2849,13 @@ class PlaidItemRead(ORM):
     created_at: datetime
     is_primary_operating: bool = False
     statement_months: list[str] = []
+    products: list[str] = []
+    consented_products: list[str] = []
+    billed_products: list[str] = []
+    unavailable_products: list[str] = []
+    pending_products: list[str] = []
+    authorization_state: str = "checking"
+    products_checked_at: datetime | None = None
 
 
 class PlaidItemPatch(BaseModel):
@@ -2854,6 +2874,7 @@ class BankConsentState(BaseModel):
     # sends back only the fact of agreement, never the text.
     disclosure_version: str = ""
     disclosure_text: str = ""
+    product_scope: list[str] = []
 
 
 class BankConsentGrant(BaseModel):
@@ -2875,10 +2896,29 @@ class RoomBankConsentGrant(BankConsentGrant):
 class PlaidStateRead(BaseModel):
     enabled: bool = False
     environment: str = "sandbox"
-    items: list[PlaidItemRead] = []
-    consent: BankConsentState = BankConsentState()
+    items: list[PlaidItemRead] = Field(default_factory=list)
+    consent: BankConsentState = Field(default_factory=BankConsentState)
     assets_enabled: bool = False
-    asset_reports: list["PlaidAssetReportRead"] = []
+    statements_enabled: bool = False
+    selected_products: list[str] = Field(default_factory=list)
+    available_products: list[str] = Field(default_factory=list)
+    connections_requiring_client_authorization: int = 0
+    plaid_policy_updated_at: datetime | None = None
+    plaid_policy_updated_by_user_id: UUID | None = None
+    asset_reports: list["PlaidAssetReportRead"] = Field(default_factory=list)
+
+
+class PlaidSettingsPatch(BaseModel):
+    assets_enabled: bool
+    statements_enabled: bool
+    acknowledged: Literal[True]
+    note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _one_product_required(self) -> "PlaidSettingsPatch":
+        if not self.assets_enabled and not self.statements_enabled:
+            raise ValueError("At least one Plaid product must remain enabled")
+        return self
 
 
 class PlaidLinkTokenRead(BaseModel):

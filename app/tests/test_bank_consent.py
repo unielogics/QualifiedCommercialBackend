@@ -44,6 +44,7 @@ async def test_assets_require_consent_to_the_current_disclosure():
         disclosure_version="statements-only-v1",
         created_at=None,
         consenter_name="Client",
+        product_scope=["assets"],
     )
     assert await bank_consent.has_consent(_DB(row), uuid.uuid4()) is False
 
@@ -58,6 +59,26 @@ async def test_the_stored_text_is_the_served_text():
     assert row.disclosure_text == d["text"]
     assert row.disclosure_hash == d["hash"]
     assert row.ip_address == "1.2.3.4"
+    assert row.product_scope == ["assets"]
+
+
+@pytest.mark.asyncio
+async def test_expanding_to_statements_requires_new_consent():
+    from types import SimpleNamespace
+
+    row = SimpleNamespace(
+        granted=True,
+        revoked_at=None,
+        disclosure_version=bank_consent.BANK_DISCLOSURE_VERSION,
+        created_at=None,
+        consenter_name="Client",
+        product_scope=["assets"],
+    )
+    db = _DB(row)
+    assert await bank_consent.has_consent(db, uuid.uuid4(), ["assets"]) is True
+    assert await bank_consent.has_consent(
+        db, uuid.uuid4(), ["assets", "statements"]
+    ) is False
 
 
 @pytest.mark.asyncio

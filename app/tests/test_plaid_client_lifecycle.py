@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.dealer_os.services import plaid_client
-from app.services import plaid_lifecycle
+from app.services import plaid_lifecycle, plaid_policy
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,9 @@ async def test_initial_link_uses_fixed_platform_name_and_selected_products(monke
     assert token == "link-production"
     assert captured["path"] == "/link/token/create"
     assert captured["payload"]["client_name"] == "Qualified Commercial"
-    assert captured["payload"]["products"] == ["assets", "statements"]
+    assert captured["payload"]["products"] == ["assets"]
+    assert captured["payload"]["required_if_supported_products"] == ["statements"]
+    assert "statements" in captured["payload"]
     assert captured["payload"]["webhook"] == "https://api.example.test/plaid"
 
 
@@ -57,6 +59,27 @@ async def test_assets_only_link_does_not_request_unentitled_statements(monkeypat
     assert "statements" not in captured["payload"]
     assert plaid_client.assets_enabled() is True
     assert plaid_client.statements_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_statements_only_link_requests_no_assets(monkeypatch):
+    captured = {}
+
+    async def fake_post(path, payload, **_kwargs):
+        captured.update(path=path, payload=payload)
+        return SimpleNamespace(json=lambda: {"link_token": "link-statements"})
+
+    monkeypatch.setattr(plaid_client, "_post", fake_post)
+    token = await plaid_client.create_link_token(
+        dealer_id="file-1",
+        dealer_name="Northstar Holdings LLC",
+        requested_products=["statements"],
+    )
+
+    assert token == "link-statements"
+    assert captured["payload"]["products"] == ["statements"]
+    assert "required_if_supported_products" not in captured["payload"]
+    assert "statements" in captured["payload"]
 
 
 @pytest.mark.asyncio
@@ -100,6 +123,25 @@ async def test_update_link_can_request_new_account_selection(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_update_link_adds_only_the_newly_selected_product(monkeypatch):
+    captured = {}
+
+    async def fake_post(path, payload, **_kwargs):
+        captured.update(path=path, payload=payload)
+        return SimpleNamespace(json=lambda: {"link_token": "update-statements"})
+
+    monkeypatch.setattr(plaid_client, "_post", fake_post)
+    await plaid_client.create_update_link_token(
+        access_token="access-production",
+        client_user_id="file-1",
+        add_products=["statements"],
+    )
+
+    assert captured["payload"]["products"] == ["statements"]
+    assert "statements" in captured["payload"]
+
+
+@pytest.mark.asyncio
 async def test_completed_update_invalidates_cached_asset_report(monkeypatch):
     invalidated = {}
     item = SimpleNamespace(
@@ -111,12 +153,19 @@ async def test_completed_update_invalidates_cached_asset_report(monkeypatch):
         update_mode_reason="new_accounts_available",
         update_mode_account_selection=True,
         next_refresh_at=None,
+        plaid_products=["assets"],
+        plaid_unavailable_products=[],
     )
     db = object()
 
     monkeypatch.setattr(plaid_lifecycle, "decrypted_access_token", lambda _item: "access-token")
 
-    async def fake_item_get(_token):
+    async def fake_for_item(_db, _item):
+        return plaid_policy.PlaidProductPolicy(True, False), object()
+
+    async def fake_reconcile(_db, target_item):
+        target_item.plaid_products = ["assets"]
+        target_item.update_mode_reason = None
         return {"item": {"error": None}}
 
     async def fake_accounts_get(_token):
@@ -128,7 +177,8 @@ async def test_completed_update_invalidates_cached_asset_report(monkeypatch):
     async def fake_remove_reports(target_db, target_item, *, strict):
         invalidated.update(db=target_db, item=target_item, strict=strict)
 
-    monkeypatch.setattr(plaid_client, "item_get", fake_item_get)
+    monkeypatch.setattr(plaid_policy, "for_item", fake_for_item)
+    monkeypatch.setattr(plaid_policy, "reconcile_item", fake_reconcile)
     monkeypatch.setattr(plaid_client, "accounts_get", fake_accounts_get)
     monkeypatch.setattr(plaid_lifecycle, "remove_reports_for_item", fake_remove_reports)
 
@@ -170,6 +220,17 @@ async def test_assets_and_item_removal_use_production_endpoints(monkeypatch):
     assert calls[0][1]["options"]["webhook"] == "https://api.example.test/plaid"
     assert calls[1] == ("/asset_report/remove", {"asset_report_token": "report-token-1"})
     assert calls[2] == ("/item/remove", {"access_token": "access-1"})
+
+
+@pytest.mark.asyncio
+async def test_statement_download_requires_a_pdf(monkeypatch):
+    async def fake_post(_path, _payload, **_kwargs):
+        return SimpleNamespace(content=b'{"error":"not a pdf"}')
+
+    monkeypatch.setattr(plaid_client, "_post", fake_post)
+
+    with pytest.raises(plaid_client.PlaidUnavailable, match="invalid statement PDF"):
+        await plaid_client.statements_download("access-production", "statement-1")
 
 
 def test_production_environment_never_uses_the_sandbox_host():

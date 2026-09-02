@@ -23,6 +23,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.dealer_os.services import plaid_client, plaid_webhook
+from app.services import plaid_policy
 
 # ── signing helpers ─────────────────────────────────────────────────────────
 
@@ -50,6 +51,11 @@ def _stub_key(monkeypatch):
         return _KEY.public_key()
 
     monkeypatch.setattr(plaid_client, "_verification_key", _fake_key)
+
+    async def _enabled_policy(_db, _item):
+        return plaid_policy.PlaidProductPolicy(True, True), object()
+
+    monkeypatch.setattr(plaid_policy, "for_item", _enabled_policy)
     plaid_client._key_cache.clear()
     yield
     plaid_client._key_cache.clear()
@@ -129,11 +135,15 @@ class _FakeDB:
 
 
 class _AssetDB:
-    def __init__(self, report):
+    def __init__(self, report, *, assets_enabled=True):
         self.report = report
+        self.assets_enabled = assets_enabled
 
     async def execute(self, _stmt):
         return SimpleNamespace(scalar_one_or_none=lambda: self.report)
+
+    async def get(self, _model, _key):
+        return SimpleNamespace(plaid_assets_enabled=self.assets_enabled)
 
 
 def _item(**over):
@@ -276,7 +286,12 @@ async def test_login_repaired_dismisses_update_mode_prompt():
 @pytest.mark.asyncio
 async def test_asset_report_ready_webhook_marks_report_downloadable():
     report = SimpleNamespace(
-        status="pending", error="waiting", ready_at=None, ingested_at=None
+        status="pending",
+        error="waiting",
+        ready_at=None,
+        ingested_at=None,
+        dealer_id="dealer-1",
+        profile_id=None,
     )
     out = await plaid_webhook.handle(
         _AssetDB(report),
@@ -296,7 +311,12 @@ async def test_asset_report_ready_webhook_marks_report_downloadable():
 @pytest.mark.asyncio
 async def test_asset_report_ready_webhook_is_idempotent_after_ingestion():
     report = SimpleNamespace(
-        status="ingested", error=None, ready_at="earlier", ingested_at="done"
+        status="ingested",
+        error=None,
+        ready_at="earlier",
+        ingested_at="done",
+        dealer_id="dealer-1",
+        profile_id=None,
     )
     out = await plaid_webhook.handle(
         _AssetDB(report),
@@ -327,6 +347,31 @@ async def test_a_successful_statements_refresh_queues_a_sync():
     assert out == "sync queued"
     assert item.next_refresh_at is not None
     assert item.error is None
+
+
+@pytest.mark.asyncio
+async def test_statements_webhook_is_ignored_when_the_file_disabled_statements(
+    monkeypatch,
+):
+    item = _item(error="keep existing evidence")
+
+    async def _assets_only(_db, _item):
+        return plaid_policy.PlaidProductPolicy(True, False), object()
+
+    monkeypatch.setattr(plaid_policy, "for_item", _assets_only)
+    out = await plaid_webhook.handle(
+        _FakeDB(item),
+        {
+            "webhook_type": "STATEMENTS",
+            "webhook_code": "STATEMENTS_REFRESH_COMPLETE",
+            "item_id": "itm_1",
+            "result": "SUCCESS",
+        },
+    )
+
+    assert out == "ignored: statements disabled"
+    assert item.next_refresh_at is None
+    assert item.statements_refresh_state is None
 
 
 @pytest.mark.asyncio

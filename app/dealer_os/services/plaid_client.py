@@ -8,7 +8,7 @@ Settings class, per the isolation contract):
     DEALER_OS_PLAID_CLIENT_ID
     DEALER_OS_PLAID_SECRET
     DEALER_OS_PLAID_ENV           sandbox | production   (default sandbox)
-    DEALER_OS_PLAID_PRODUCTS      statements,assets      (default statements)
+    DEALER_OS_PLAID_PRODUCTS      assets,statements      (default assets)
     DEALER_OS_PLAID_CLIENT_NAME   Link display name
     DEALER_OS_PLAID_REDIRECT_URI       OAuth return, team app  (optional)
     DEALER_OS_PLAID_ROOM_REDIRECT_URI  OAuth return, client room (optional)
@@ -141,7 +141,7 @@ def client_name() -> str:
 def products() -> list[str]:
     configured = {
         value.strip().lower()
-        for value in (_env("DEALER_OS_PLAID_PRODUCTS") or "statements").split(",")
+        for value in (_env("DEALER_OS_PLAID_PRODUCTS") or "assets").split(",")
         if value.strip()
     }
     invalid = configured - _SUPPORTED_PRODUCTS
@@ -203,7 +203,11 @@ async def _post(path: str, payload: dict[str, Any], *, timeout: float = 30.0) ->
 
 
 async def create_link_token(
-    *, dealer_id: str, dealer_name: str, redirect_override: str | None = None
+    *,
+    dealer_id: str,
+    dealer_name: str,
+    requested_products: list[str] | None = None,
+    redirect_override: str | None = None,
 ) -> str:
     """A Link session for one business file.
 
@@ -211,14 +215,31 @@ async def create_link_token(
     client room needs a public page, the team app needs its authenticated one.
     """
     today = date.today()
-    configured_products = products()
+    available = set(products())
+    selected = set(requested_products or products())
+    if not selected or not selected.issubset(_SUPPORTED_PRODUCTS):
+        raise PlaidUnavailable("At least one supported Plaid product is required")
+    unavailable = selected - available
+    if unavailable:
+        raise PlaidUnavailable(
+            "Selected Plaid product is unavailable: " + ", ".join(sorted(unavailable))
+        )
+    # In combined mode, Statements is requested as supported so an institution
+    # without Statements does not block a valid Assets connection.
+    initial_products = sorted(selected - {"statements"}) if "assets" in selected else ["statements"]
+    optional_products = ["statements"] if selected == {"assets", "statements"} else []
     resp = await _post(
         "/link/token/create",
         {
             # Plaid identifies the platform here, never the customer or file.
             "client_name": client_name(),
             "user": {"client_user_id": dealer_id},
-            "products": configured_products,
+            "products": initial_products,
+            **(
+                {"required_if_supported_products": optional_products}
+                if optional_products
+                else {}
+            ),
             **(
                 {
                     "statements": {
@@ -228,7 +249,7 @@ async def create_link_token(
                         "end_date": today.isoformat(),
                     }
                 }
-                if "statements" in configured_products
+                if "statements" in selected
                 else {}
             ),
             "country_codes": ["US"],
@@ -335,13 +356,24 @@ async def statements_list(access_token: str) -> dict[str, Any]:
     return {"institution_name": data.get("institution_name"), "statements": deduped}
 
 
+async def statements_refresh(access_token: str) -> None:
+    """Ask Plaid to refresh available bank-produced statement PDFs.
+
+    Downloads begin only after STATEMENTS_REFRESH_COMPLETE arrives.
+    """
+    await _post("/statements/refresh", {"access_token": access_token})
+
+
 async def statements_download(access_token: str, statement_id: str) -> bytes:
     resp = await _post(
         "/statements/download",
         {"access_token": access_token, "statement_id": statement_id},
         timeout=90.0,
     )
-    return resp.content
+    content = resp.content
+    if not content.startswith(b"%PDF-"):
+        raise PlaidUnavailable("Plaid returned an invalid statement PDF")
+    return content
 
 
 async def accounts_get(access_token: str) -> list[dict[str, Any]]:

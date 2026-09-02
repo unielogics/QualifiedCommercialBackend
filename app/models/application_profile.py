@@ -37,6 +37,10 @@ class ApplicationProfile(TimestampMixin, Base):
         Index("ix_application_profiles_client", "client_id"),
         Index("ix_application_profiles_bucket", "primary_bucket_id"),
         Index("ix_application_profiles_underwriting_status", "underwriting_status"),
+        CheckConstraint(
+            "plaid_assets_enabled OR plaid_statements_enabled",
+            name="ck_application_profiles_plaid_product_enabled",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -60,6 +64,18 @@ class ApplicationProfile(TimestampMixin, Base):
     )
     primary_bucket_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
+    )
+    # Standalone Funding files own this policy. Linked profiles defer to the
+    # DealerBusiness row while retaining this snapshot for future handoffs.
+    plaid_assets_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    plaid_statements_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
 
     vertical: Mapped[str] = mapped_column(
@@ -415,6 +431,13 @@ class ApplicationPlaidItem(TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
     last_webhook_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    plaid_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_consented_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_billed_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_unavailable_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_products_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    statements_refresh_state: Mapped[str | None] = mapped_column(String(16))
+    statements_refresh_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PlaidAssetReport(TimestampMixin, Base):
@@ -452,6 +475,9 @@ class PlaidAssetReport(TimestampMixin, Base):
     document_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_documents.id", ondelete="SET NULL")
     )
+    bucket_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
+    )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -472,6 +498,7 @@ class ApplicationBankConsent(TimestampMixin, Base):
     disclosure_version: Mapped[str] = mapped_column(String(24), nullable=False)
     disclosure_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     disclosure_text: Mapped[str] = mapped_column(Text, nullable=False)
+    product_scope: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     consenter_name: Mapped[str | None] = mapped_column(String(160))
     captured_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")

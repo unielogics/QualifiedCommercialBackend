@@ -42,6 +42,12 @@ class DealerBusiness(TimestampMixin, Base):
     """The durable monitored business — distinct from intake leads and Clients."""
 
     __tablename__ = "dos_dealers"
+    __table_args__ = (
+        CheckConstraint(
+            "plaid_assets_enabled OR plaid_statements_enabled",
+            name="ck_dos_dealers_plaid_product_enabled",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
     name: Mapped[str] = mapped_column(String(180), nullable=False)
@@ -109,6 +115,18 @@ class DealerBusiness(TimestampMixin, Base):
     )
     workflow_ungated: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # Per-file Plaid policy. The deployment setting is only an availability
+    # allowlist; it must never decide what an individual client authorized.
+    plaid_assets_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    plaid_statements_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    plaid_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    plaid_policy_updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
     # No default. A file whose industry nobody stated used to claim to be an
@@ -1068,6 +1086,15 @@ class DealerPlaidItem(TimestampMixin, Base):
         Boolean, default=False, server_default="false"
     )
     last_webhook_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Authoritative product state returned by /item/get. Consent can be empty
+    # for non-DTM Items, so `plaid_products` remains the initialization gate.
+    plaid_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_consented_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_billed_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_unavailable_products: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plaid_products_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    statements_refresh_state: Mapped[str | None] = mapped_column(String(16))
+    statements_refresh_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DealerGroup(TimestampMixin, Base):
@@ -1837,6 +1864,9 @@ class DealerBankConsent(TimestampMixin, Base):
     disclosure_version: Mapped[str] = mapped_column(String(24), nullable=False)
     disclosure_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     disclosure_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Exact product scope authorized by this grant. Historical rows are
+    # conservatively backfilled to Assets only.
+    product_scope: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
     # Who was in the room, and from where.
     captured_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

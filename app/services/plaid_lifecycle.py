@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dealer_os.models import DealerPlaidItem
 from app.dealer_os.services import plaid_client
 from app.models.application_profile import ApplicationPlaidItem, PlaidAssetReport
+from app.services import plaid_policy
 
 PlaidItem = DealerPlaidItem | ApplicationPlaidItem
 
@@ -35,13 +36,20 @@ def decrypted_access_token(item: PlaidItem) -> str:
 
 async def complete_update(db: AsyncSession, item: PlaidItem) -> None:
     token = decrypted_access_token(item)
-    state = await plaid_client.item_get(token)
+    policy, _owner = await plaid_policy.for_item(db, item)
+    requested_products = plaid_policy.pending_products(item, policy)
+    state = await plaid_policy.reconcile_item(db, item)
     error = (state.get("item") or {}).get("error") or state.get("error")
     if error:
         item.status = "error"
         item.error = str(error.get("display_message") or error.get("error_message") or "Bank connection still needs attention")
         item.update_mode_reason = str(error.get("error_code") or "item_error").lower()[:32]
         raise plaid_client.PlaidUnavailable(item.error)
+    if (
+        "statements" in requested_products
+        and "statements" not in plaid_policy.item_products(item)
+    ):
+        plaid_policy.mark_optional_statements_unavailable(item, policy)
     accounts = await plaid_client.accounts_get(token)
     labels = [
         f"{row.get('name') or 'Account'} ··{row.get('mask')}"
@@ -52,7 +60,6 @@ async def complete_update(db: AsyncSession, item: PlaidItem) -> None:
     item.accounts_label = " · ".join(labels)[:200] or item.accounts_label
     item.status = "active"
     item.error = None
-    item.update_mode_reason = None
     item.update_mode_account_selection = False
     item.next_refresh_at = _now()
     # Update mode may add accounts without changing the Plaid Item id. Asset
@@ -94,9 +101,17 @@ async def create_asset_report(
 ) -> PlaidAssetReport:
     if (profile_id is None) == (dealer_id is None):
         raise ValueError("Exactly one Asset Report owner is required")
-    usable = [item for item in items if item.status == "active" and active_environment(item)]
+    usable = [
+        item
+        for item in items
+        if item.status == "active"
+        and active_environment(item)
+        and "assets" in plaid_policy.item_products(item)
+    ]
     if not usable:
-        raise plaid_client.PlaidUnavailable("Connect at least one healthy production bank first")
+        raise plaid_client.PlaidUnavailable(
+            "Authorize Plaid Assets on at least one healthy bank connection first"
+        )
     access_tokens = [decrypted_access_token(item) for item in usable]
     owner_id = profile_id or dealer_id
     report_id, report_token = await plaid_client.asset_report_create(

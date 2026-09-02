@@ -57,6 +57,7 @@ from app.schemas.application_profile import (
     UnifiedAuditEvent,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services import plaid_policy
 from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
@@ -172,6 +173,10 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         intake_id=profile.intake_id,
         dealer_id=profile.dealer_id,
         primary_bucket_id=profile.primary_bucket_id,
+        plaid_assets_enabled=profile.plaid_assets_enabled,
+        plaid_statements_enabled=profile.plaid_statements_enabled,
+        plaid_policy_updated_at=profile.plaid_policy_updated_at,
+        plaid_policy_updated_by_user_id=profile.plaid_policy_updated_by_user_id,
         vertical=profile.vertical,
         funding_category=profile.funding_category,
         entity_type=profile.entity_type,
@@ -506,6 +511,12 @@ async def resolve_profile(
                     )
                 )
                 profile.backfill_needs_review = True
+    if profile.dealer_id is not None:
+        dealer = source if isinstance(source, DealerBusiness) else await db.get(
+            DealerBusiness, profile.dealer_id
+        )
+        if dealer is not None:
+            await plaid_policy.copy_latest_policy_on_handoff(dealer, profile)
     await db.flush()
     return profile
 
@@ -853,6 +864,8 @@ async def bank_rows(
                 value = month.get("month") if isinstance(month, dict) else month
                 if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}", value):
                     coverage.setdefault(item_id, set()).add(value)
+        dealer = await db.get(DealerBusiness, profile.dealer_id)
+        policy = plaid_policy.from_owner(dealer) if dealer else plaid_policy.PlaidProductPolicy(True, False)
         return [
             ApplicationBankConnectionRead(
                 id=item.id,
@@ -869,6 +882,13 @@ async def bank_rows(
                 next_refresh_at=item.next_refresh_at,
                 statement_months=sorted(coverage.get(item.id, set())),
                 source="dealer",
+                products=plaid_policy.item_products(item),
+                consented_products=list(item.plaid_consented_products or []),
+                billed_products=list(item.plaid_billed_products or []),
+                unavailable_products=plaid_policy.unavailable_products(item),
+                pending_products=plaid_policy.pending_products(item, policy),
+                authorization_state=plaid_policy.authorization_state(item, policy),
+                products_checked_at=item.plaid_products_checked_at,
             )
             for item in items
         ]
@@ -898,6 +918,7 @@ async def bank_rows(
     for item_id, period in coverage_rows:
         if item_id and period:
             coverage.setdefault(item_id, set()).add(period)
+    policy = plaid_policy.from_owner(profile)
     return [
         ApplicationBankConnectionRead(
             id=item.id,
@@ -913,6 +934,13 @@ async def bank_rows(
             last_pulled_at=item.last_pulled_at,
             next_refresh_at=item.next_refresh_at,
             statement_months=sorted(coverage.get(item.id, set())),
+            products=plaid_policy.item_products(item),
+            consented_products=list(item.plaid_consented_products or []),
+            billed_products=list(item.plaid_billed_products or []),
+            unavailable_products=plaid_policy.unavailable_products(item),
+            pending_products=plaid_policy.pending_products(item, policy),
+            authorization_state=plaid_policy.authorization_state(item, policy),
+            products_checked_at=item.plaid_products_checked_at,
         )
         for item in items
     ]

@@ -24,15 +24,20 @@ error to Plaid earns a retry storm for an event we were never going to act on.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.application_profile import ApplicationPlaidItem, PlaidAssetReport
+from app.models.application_profile import (
+    ApplicationPlaidItem,
+    ApplicationProfile,
+    PlaidAssetReport,
+)
+from app.services import plaid_lifecycle, plaid_policy
 
-from ..models import DealerPlaidItem
+from ..models import DealerBusiness, DealerPlaidItem
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,19 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         if code == "PRODUCT_READY":
             if report.ingested_at is not None:
                 return "asset report already ingested"
+            if report.dealer_id is not None:
+                owner = await db.get(DealerBusiness, report.dealer_id)
+                enabled = bool(owner and owner.plaid_assets_enabled)
+            else:
+                profile = await db.get(ApplicationProfile, report.profile_id)
+                if profile is None:
+                    enabled = False
+                else:
+                    policy, _owner = await plaid_policy.for_profile(db, profile)
+                    enabled = policy.assets_enabled
+            if not enabled:
+                await plaid_lifecycle.remove_asset_report(report, strict=False)
+                return "ignored: assets disabled"
             report.status = "ready"
             report.error = None
             report.ready_at = _now()
@@ -119,6 +137,12 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
         # know which items we still track.
         return "ignored: unknown item"
     item.last_webhook_at = _now()
+
+    # Webhooks can arrive out of order. A refresh event that was already in
+    # flight when the client revoked access must never do policy lookups or
+    # schedule work for the revoked Item.
+    if item.status == "revoked" and code != "USER_PERMISSION_REVOKED":
+        return "ignored: item revoked"
 
     # ── The connection is gone, by the user's own choice ──
     if code == "USER_PERMISSION_REVOKED":
@@ -197,16 +221,21 @@ async def handle(db: AsyncSession, payload: dict[str, Any]) -> str:
 
     # ── Statements finished extracting ──
     if wtype == "STATEMENTS" and code == "STATEMENTS_REFRESH_COMPLETE":
+        policy, owner = await plaid_policy.for_item(db, item)
+        if owner is None or not policy.statements_enabled:
+            item.statements_refresh_state = None
+            item.statements_refresh_requested_at = None
+            return "ignored: statements disabled"
         if str(payload.get("result") or "").upper() == "SUCCESS":
-            if item.status == "revoked":
-                # Ordering is not guaranteed; never resurrect a revoked item.
-                return "ignored: item revoked"
             # Due immediately — the scheduler tick picks it up and does the
             # actual pull, so the webhook stays fast and this stays idempotent.
             item.next_refresh_at = _now()
             item.error = None
+            item.statements_refresh_state = "ready"
             return "sync queued"
         item.error = "Plaid could not extract statements from this connection."
+        item.statements_refresh_state = "failed"
+        item.next_refresh_at = _now() + timedelta(days=1)
         return "refresh failed"
 
     logger.info("plaid webhook: unhandled %s/%s for item %s", wtype, code, item_id)

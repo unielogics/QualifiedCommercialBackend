@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 ApplicationSourceKind = Literal["deal", "loan", "intake", "dealer"]
 ApplicationVertical = Literal["real_estate", "main_street", "dealer", "mca"]
@@ -33,6 +33,10 @@ class ApplicationProfileRead(BaseModel):
     intake_id: UUID | None = None
     dealer_id: UUID | None = None
     primary_bucket_id: UUID | None = None
+    plaid_assets_enabled: bool = True
+    plaid_statements_enabled: bool = False
+    plaid_policy_updated_at: datetime | None = None
+    plaid_policy_updated_by_user_id: UUID | None = None
     vertical: str
     funding_category: str | None = None
     entity_type: str | None = None
@@ -230,6 +234,13 @@ class ApplicationBankConnectionRead(BaseModel):
     next_refresh_at: datetime | None = None
     statement_months: list[str] = Field(default_factory=list)
     source: Literal["application", "dealer"] = "application"
+    products: list[str] = Field(default_factory=list)
+    consented_products: list[str] = Field(default_factory=list)
+    billed_products: list[str] = Field(default_factory=list)
+    unavailable_products: list[str] = Field(default_factory=list)
+    pending_products: list[str] = Field(default_factory=list)
+    authorization_state: str = "checking"
+    products_checked_at: datetime | None = None
 
 
 class PlaidAssetReportRead(BaseModel):
@@ -257,7 +268,27 @@ class ApplicationBankState(BaseModel):
     manual_statement_file_count: int = 0
     manual_statement_pending_count: int = 0
     assets_enabled: bool = False
+    statements_enabled: bool = False
+    selected_products: list[str] = Field(default_factory=list)
+    available_products: list[str] = Field(default_factory=list)
+    consent_product_scope: list[str] = Field(default_factory=list)
+    connections_requiring_client_authorization: int = 0
+    plaid_policy_updated_at: datetime | None = None
+    plaid_policy_updated_by_user_id: UUID | None = None
     asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
+
+
+class ApplicationPlaidSettingsPatch(BaseModel):
+    assets_enabled: bool
+    statements_enabled: bool
+    acknowledged: Literal[True]
+    note: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _one_product_required(self) -> ApplicationPlaidSettingsPatch:
+        if not self.assets_enabled and not self.statements_enabled:
+            raise ValueError("At least one Plaid product must remain enabled")
+        return self
 
 
 class ManualBankOverrideRequest(BaseModel):
@@ -549,6 +580,10 @@ class PublicBankVerificationRead(BaseModel):
     manual_statement_file_count: int = 0
     manual_statement_pending_count: int = 0
     assets_enabled: bool = False
+    statements_enabled: bool = False
+    selected_products: list[str] = Field(default_factory=list)
+    available_products: list[str] = Field(default_factory=list)
+    consent_product_scope: list[str] = Field(default_factory=list)
     asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
     statement_upload_enabled: bool = False
     expires_at: datetime

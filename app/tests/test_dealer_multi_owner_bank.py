@@ -279,6 +279,7 @@ async def test_non_clients_cannot_start_authenticated_plaid(role: Role) -> None:
             dealer_id,
             BankConsentGrant(consenter_name="Client Owner"),
             SimpleNamespace(client=None, headers={}),
+            SimpleNamespace(add_task=lambda *_args, **_kwargs: None),
             user,
             None,
         )

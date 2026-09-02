@@ -52,6 +52,7 @@ from app.schemas.application_profile import (
     ApplicationPlaidItemPatch,
     ApplicationPlaidLinkTokenRead,
     ApplicationPlaidRefreshRead,
+    ApplicationPlaidSettingsPatch,
     ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
@@ -105,8 +106,9 @@ from app.schemas.application_profile import (
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
-from app.services import plaid_lifecycle
+from app.services import plaid_lifecycle, plaid_policy
 from app.services.activity_log import log_activity, mark_loan_dirty
+from app.services.application_plaid_sync import sync_item_background
 from app.services.user_access import is_audit_client, is_funding_client
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
@@ -1619,19 +1621,33 @@ def _score_band(score: int | None) -> str | None:
     return f"{low}-{low + 49}"
 
 
-async def _application_consent_granted(db: AsyncSession, profile_id: UUID) -> bool:
-    row = (
+async def _application_consent_row(
+    db: AsyncSession, profile_id: UUID
+) -> ApplicationBankConsent | None:
+    return (
         await db.execute(
             select(ApplicationBankConsent).where(
                 ApplicationBankConsent.profile_id == profile_id,
                 ApplicationBankConsent.granted.is_(True),
                 ApplicationBankConsent.revoked_at.is_(None),
-                ApplicationBankConsent.disclosure_version
-                == dealer_bank_consent.BANK_DISCLOSURE_VERSION,
             ).order_by(ApplicationBankConsent.created_at.desc()).limit(1)
         )
     ).scalar_one_or_none()
-    return row is not None
+
+
+async def _application_consent_granted(
+    db: AsyncSession,
+    profile_id: UUID,
+    required_products: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    row = await _application_consent_row(db, profile_id)
+    if row is None:
+        return False
+    required = set(required_products or ["assets"])
+    version_allowed = row.disclosure_version == dealer_bank_consent.BANK_DISCLOSURE_VERSION or (
+        row.disclosure_version == "2026-08-24-assets-v1" and required <= {"assets"}
+    )
+    return version_allowed and required <= set(row.product_scope or [])
 
 
 async def _public_bank_invitation(
@@ -1690,24 +1706,55 @@ async def _public_application_room(
 async def _application_bank_state(
     db: AsyncSession, profile: ApplicationProfile
 ) -> ApplicationBankState:
-    disclosure = dealer_bank_consent.disclosure()
+    policy, policy_owner = await plaid_policy.for_profile(db, profile)
+    disclosure = dealer_bank_consent.disclosure(policy.selected_products)
+    if profile.dealer_id:
+        dealer_consent = await dealer_bank_consent.state(db, profile.dealer_id)
+        consent_scope = list(dealer_consent.product_scope)
+        consent_granted = await dealer_bank_consent.has_consent(
+            db, profile.dealer_id, policy.selected_products
+        )
+    else:
+        application_consent = await _application_consent_row(db, profile.id)
+        consent_scope = list(application_consent.product_scope or []) if application_consent else []
+        consent_granted = await _application_consent_granted(
+            db, profile.id, policy.selected_products
+        )
     manual_evidence = await profiles.manual_statement_evidence(db, profile)
+    items = await profiles.bank_rows(db, profile)
     return ApplicationBankState(
         enabled=plaid_client.enabled(),
         environment=plaid_client.environment(),
-        consent_granted=await _application_consent_granted(db, profile.id),
-        disclosure_version=disclosure["version"],
-        disclosure_text=disclosure["text"],
-        items=await profiles.bank_rows(db, profile),
+        consent_granted=consent_granted,
+        disclosure_version=str(disclosure["version"]),
+        disclosure_text=str(disclosure["text"]),
+        items=items,
         manual_override=profile.bank_verification_override_at is not None,
         manual_override_reason=profile.bank_verification_override_reason,
         manual_statement_months=manual_evidence.months,
         manual_statement_file_count=manual_evidence.file_count,
         manual_statement_pending_count=manual_evidence.pending_analysis_count,
-        assets_enabled=plaid_client.assets_enabled(),
+        assets_enabled=policy.assets_enabled,
+        statements_enabled=policy.statements_enabled,
+        selected_products=policy.selected_products,
+        available_products=policy.available_products,
+        consent_product_scope=consent_scope,
+        connections_requiring_client_authorization=(
+            len(items)
+            if items and not consent_granted
+            else sum(
+                row.authorization_state == "client_authorization_required" for row in items
+            )
+        ),
+        plaid_policy_updated_at=policy_owner.plaid_policy_updated_at,
+        plaid_policy_updated_by_user_id=policy_owner.plaid_policy_updated_by_user_id,
         asset_reports=[
             PlaidAssetReportRead.model_validate(row)
-            for row in await plaid_lifecycle.owner_asset_reports(db, profile_id=profile.id)
+            for row in await plaid_lifecycle.owner_asset_reports(
+                db,
+                dealer_id=profile.dealer_id,
+                profile_id=None if profile.dealer_id else profile.id,
+            )
         ],
     )
 
@@ -1777,10 +1824,12 @@ async def public_application_room_consent(
     token: str,
     payload: ApplicationRoomConsentGrant,
     request: Request,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationRoomState:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
-    disclosure = dealer_bank_consent.disclosure()
+    policy = plaid_policy.from_owner(profile)
+    disclosure = dealer_bank_consent.disclosure(policy.selected_products)
     db.add(
         ApplicationBankConsent(
             profile_id=profile.id,
@@ -1789,6 +1838,7 @@ async def public_application_room_consent(
             disclosure_version=disclosure["version"],
             disclosure_hash=disclosure["hash"],
             disclosure_text=disclosure["text"],
+            product_scope=disclosure["product_scope"],
             consenter_name=payload.consenter_name,
             ip_address=_client_ip(request),
             user_agent=(request.headers.get("user-agent") or "")[:400] or None,
@@ -1804,6 +1854,9 @@ async def public_application_room_consent(
         target_id=link.id,
     )
     await db.commit()
+    for item in await _profile_plaid_items(db, profile):
+        if item.status == "active":
+            background.add_task(sync_item_background, item.id)
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     return ApplicationRoomState(
@@ -1889,11 +1942,13 @@ async def public_application_room_link_token(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationPlaidLinkTokenRead:
     _link, profile = await _public_application_room(db, token, payload.passcode, request)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the bank disclosure before continuing")
     value = await plaid_client.create_link_token(
         dealer_id=str(profile.id),
         dealer_name=await _profile_plaid_display_name(db, profile),
+        requested_products=policy.selected_products,
         redirect_override=plaid_client.room_redirect_uri() or None,
     )
     return ApplicationPlaidLinkTokenRead(link_token=value)
@@ -1908,7 +1963,8 @@ async def public_application_room_exchange(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bank authorization is required")
     try:
         access_token, plaid_item_id = await plaid_client.exchange_public_token(payload.public_token)
@@ -1933,6 +1989,13 @@ async def public_application_room_exchange(
     item.update_mode_account_selection = False
     item.next_refresh_at = datetime.now(UTC)
     await db.flush()
+    try:
+        await plaid_policy.reconcile_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        item.status = "error"
+        item.error = str(exc)[:500]
+    else:
+        plaid_policy.mark_optional_statements_unavailable(item, policy)
     current = await profiles.bank_rows(db, profile)
     if payload.is_primary_operating or not any(row.is_primary_operating for row in current):
         await _make_primary(db, profile, item)
@@ -1965,7 +2028,8 @@ async def public_application_room_update_link_token(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationPlaidLinkTokenRead:
     _link, profile = await _public_application_room(db, token, payload.passcode, request)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
     item = await _profile_plaid_item(db, profile, item_id)
     value = await plaid_client.create_update_link_token(
@@ -1976,6 +2040,7 @@ async def public_application_room_update_link_token(
         account_selection_enabled=(
             payload.account_selection_enabled or item.update_mode_account_selection
         ),
+        add_products=plaid_policy.pending_products(item, policy),
     )
     return ApplicationPlaidLinkTokenRead(link_token=value)
 
@@ -2088,17 +2153,25 @@ async def public_bank_verification(
         await db.commit()
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     client = await db.get(Client, profile.client_id) if profile.client_id else None
-    disclosure = dealer_bank_consent.disclosure()
+    policy = plaid_policy.from_owner(profile)
+    consent_row = await _application_consent_row(db, profile.id)
+    disclosure = dealer_bank_consent.disclosure(policy.selected_products)
     manual_evidence = await profiles.manual_statement_evidence(db, profile)
     return PublicBankVerificationRead(
         business_name=_business_label(profile, intake, client),
-        disclosure_version=disclosure["version"], disclosure_text=disclosure["text"],
-        consent_granted=await _application_consent_granted(db, profile.id),
+        disclosure_version=str(disclosure["version"]), disclosure_text=str(disclosure["text"]),
+        consent_granted=await _application_consent_granted(
+            db, profile.id, policy.selected_products
+        ),
         items=await profiles.bank_rows(db, profile),
         manual_statement_months=manual_evidence.months,
         manual_statement_file_count=manual_evidence.file_count,
         manual_statement_pending_count=manual_evidence.pending_analysis_count,
-        assets_enabled=plaid_client.assets_enabled(),
+        assets_enabled=policy.assets_enabled,
+        statements_enabled=policy.statements_enabled,
+        selected_products=policy.selected_products,
+        available_products=policy.available_products,
+        consent_product_scope=list(consent_row.product_scope or []) if consent_row else [],
         asset_reports=[
             PlaidAssetReportRead.model_validate(row)
             for row in await plaid_lifecycle.owner_asset_reports(db, profile_id=profile.id)
@@ -2113,18 +2186,24 @@ async def public_bank_verification_consent(
     token: str,
     payload: ApplicationBankConsentGrant,
     request: Request,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> PublicBankVerificationRead:
     invitation, profile = await _public_bank_invitation(db, token)
-    disclosure = dealer_bank_consent.disclosure()
+    policy = plaid_policy.from_owner(profile)
+    disclosure = dealer_bank_consent.disclosure(policy.selected_products)
     db.add(ApplicationBankConsent(
         profile_id=profile.id, granted=payload.granted, method="secure_room",
         disclosure_version=disclosure["version"], disclosure_hash=disclosure["hash"], disclosure_text=disclosure["text"],
+        product_scope=disclosure["product_scope"],
         consenter_name=payload.consenter_name, ip_address=_client_ip(request),
         user_agent=(request.headers.get("user-agent") or "")[:400] or None,
     ))
     await profiles.log_profile_action(db, profile, None, "bank.consent.secure_room", "Client authorized bank evidence from the secure verification room", target_type="verification_invitation", target_id=invitation.id)
     await db.commit()
+    for item in await _profile_plaid_items(db, profile):
+        if item.status == "active":
+            background.add_task(sync_item_background, item.id)
     return await public_bank_verification(token, db)
 
 
@@ -2133,11 +2212,13 @@ async def public_bank_verification_link_token(
     token: str, db: AsyncSession = Depends(get_db)
 ) -> ApplicationPlaidLinkTokenRead:
     _invitation, profile = await _public_bank_invitation(db, token)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the bank disclosure before continuing")
     value = await plaid_client.create_link_token(
         dealer_id=str(profile.id),
         dealer_name=await _profile_plaid_display_name(db, profile),
+        requested_products=policy.selected_products,
         redirect_override=plaid_client.room_redirect_uri() or None,
     )
     return ApplicationPlaidLinkTokenRead(link_token=value)
@@ -2154,7 +2235,8 @@ async def public_bank_verification_update_link_token(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationPlaidLinkTokenRead:
     _invitation, profile = await _public_bank_invitation(db, token)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
     item = await _profile_plaid_item(db, profile, item_id)
     account_selection = payload.account_selection_enabled or item.update_mode_account_selection
@@ -2165,6 +2247,7 @@ async def public_bank_verification_update_link_token(
             display_name=await _profile_plaid_display_name(db, profile),
             redirect_override=plaid_client.room_redirect_uri() or None,
             account_selection_enabled=account_selection,
+            add_products=plaid_policy.pending_products(item, policy),
         )
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
@@ -2345,7 +2428,8 @@ async def public_bank_verification_exchange(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankConnectionRead:
     invitation, profile = await _public_bank_invitation(db, token)
-    if not await _application_consent_granted(db, profile.id):
+    policy = plaid_policy.from_owner(profile)
+    if not await _application_consent_granted(db, profile.id, policy.selected_products):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bank authorization is required")
     try:
         access_token, plaid_item_id = await plaid_client.exchange_public_token(payload.public_token)
@@ -2366,6 +2450,13 @@ async def public_bank_verification_exchange(
     item.update_mode_account_selection = False
     item.next_refresh_at = datetime.now(UTC)
     await db.flush()
+    try:
+        await plaid_policy.reconcile_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        item.status = "error"
+        item.error = str(exc)[:500]
+    else:
+        plaid_policy.mark_optional_statements_unavailable(item, policy)
     current = await profiles.bank_rows(db, profile)
     if payload.is_primary_operating or not any(row.is_primary_operating for row in current):
         await _make_primary(db, profile, item)
@@ -2401,34 +2492,125 @@ async def get_application_banks(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
-    disclosure = dealer_bank_consent.disclosure()
-    if profile.dealer_id:
-        consent = await dealer_bank_consent.has_consent(db, profile.dealer_id)
-    else:
-        consent = await _application_consent_granted(db, profile.id)
-    manual_evidence = await profiles.manual_statement_evidence(db, profile)
-    return ApplicationBankState(
-        enabled=plaid_client.enabled(),
-        environment=plaid_client.environment(),
-        consent_granted=consent,
-        disclosure_version=disclosure["version"],
-        disclosure_text=disclosure["text"],
-        items=await profiles.bank_rows(db, profile),
-        manual_override=bool(profile.bank_verification_override_at),
-        manual_override_reason=profile.bank_verification_override_reason,
-        manual_statement_months=manual_evidence.months,
-        manual_statement_file_count=manual_evidence.file_count,
-        manual_statement_pending_count=manual_evidence.pending_analysis_count,
-        assets_enabled=plaid_client.assets_enabled(),
-        asset_reports=[
-            PlaidAssetReportRead.model_validate(row)
-            for row in await plaid_lifecycle.owner_asset_reports(
-                db,
-                dealer_id=profile.dealer_id,
-                profile_id=None if profile.dealer_id else profile.id,
-            )
-        ],
+    return await _application_bank_state(db, profile)
+
+
+@router.patch("/{profile_id}/banks/settings", response_model=ApplicationBankState)
+async def update_application_plaid_settings(
+    profile_id: UUID,
+    payload: ApplicationPlaidSettingsPatch,
+    background: BackgroundTasks,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationBankState:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a super admin may change Plaid products for a file",
+        )
+    profile = await profiles.load_profile(db, profile_id, user)
+    proposed = plaid_policy.PlaidProductPolicy(
+        assets_enabled=payload.assets_enabled,
+        statements_enabled=payload.statements_enabled,
     )
+    try:
+        proposed.validate()
+    except plaid_policy.InvalidPlaidPolicy as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except plaid_policy.PlaidProductUnavailable as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "plaid_product_unavailable",
+                "message": str(exc),
+                "unavailable_products": exc.unavailable,
+                "available_products": exc.available,
+            },
+        ) from exc
+
+    before, policy_owner = await plaid_policy.for_profile(db, profile)
+    policy_owner.plaid_assets_enabled = proposed.assets_enabled
+    policy_owner.plaid_statements_enabled = proposed.statements_enabled
+    policy_owner.plaid_policy_updated_at = datetime.now(UTC)
+    policy_owner.plaid_policy_updated_by_user_id = user.id
+    # Keep the profile snapshot aligned even when the linked Dealer row is the
+    # authority, so detaching/handoff does not silently reset the choice.
+    profile.plaid_assets_enabled = proposed.assets_enabled
+    profile.plaid_statements_enabled = proposed.statements_enabled
+    profile.plaid_policy_updated_at = policy_owner.plaid_policy_updated_at
+    profile.plaid_policy_updated_by_user_id = user.id
+
+    items = await _profile_plaid_items(db, profile)
+    if profile.dealer_id:
+        consent_valid = await dealer_bank_consent.has_consent(
+            db, profile.dealer_id, proposed.selected_products
+        )
+    else:
+        consent_valid = await _application_consent_granted(
+            db, profile.id, proposed.selected_products
+        )
+    authorized_ids: list[UUID] = []
+    pending_ids: list[str] = []
+    for item in items:
+        if not before.statements_enabled and proposed.statements_enabled:
+            item.plaid_unavailable_products = [
+                value
+                for value in plaid_policy.unavailable_products(item)
+                if value != "statements"
+            ]
+        try:
+            await plaid_policy.reconcile_item(db, item)
+        except plaid_client.PlaidUnavailable as exc:
+            item.error = str(exc)[:500]
+        missing = plaid_policy.pending_products(item, proposed)
+        item.update_mode_reason = plaid_policy.update_reason(missing) or item.update_mode_reason
+        if missing:
+            pending_ids.append(str(item.id))
+        elif item.status == "active" and consent_valid:
+            item.next_refresh_at = datetime.now(UTC)
+            authorized_ids.append(item.id)
+
+    removed_report_ids: list[str] = []
+    if before.assets_enabled and not proposed.assets_enabled:
+        reports = await plaid_lifecycle.owner_asset_reports(
+            db,
+            dealer_id=profile.dealer_id,
+            profile_id=None if profile.dealer_id else profile.id,
+        )
+        for report in reports:
+            if report.ingested_at is None and report.status != "removed":
+                await plaid_lifecycle.remove_asset_report(report, strict=False)
+                removed_report_ids.append(str(report.id))
+
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "plaid.product_policy.updated",
+        "Updated the file's Plaid evidence products",
+        target_type="profile",
+        target_id=profile.id,
+        metadata={
+            "before_products": before.selected_products,
+            "products": proposed.selected_products,
+            "note": payload.note,
+            "connected_items": len(items),
+            "renewed_consent_required": not consent_valid,
+            "client_authorization_required_item_ids": pending_ids,
+            "queued_item_ids": [str(value) for value in authorized_ids],
+            "cancelled_unconsumed_asset_report_ids": removed_report_ids,
+            "retained_historical_evidence": True,
+        },
+    )
+    await db.commit()
+    for item_id in authorized_ids:
+        if profile.dealer_id:
+            background.add_task(_sync_dealer_plaid_item_background, item_id)
+        else:
+            from app.services.application_plaid_sync import sync_item_background
+
+            background.add_task(sync_item_background, item_id)
+    return await _application_bank_state(db, profile)
 
 
 @router.post("/{profile_id}/banks/manual-override", response_model=ApplicationBankState)
@@ -2467,12 +2649,14 @@ async def grant_application_bank_consent(
     profile_id: UUID,
     payload: ApplicationBankConsentGrant,
     request: Request,
+    background: BackgroundTasks,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
-    disclosure = dealer_bank_consent.disclosure()
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
+    disclosure = dealer_bank_consent.disclosure(policy.selected_products)
     if profile.dealer_id:
         await dealer_bank_consent.record(
             db,
@@ -2483,6 +2667,7 @@ async def grant_application_bank_consent(
             user_agent=request.headers.get("user-agent"),
             captured_by_user_id=user.id,
             captured_by_name=user.name,
+            product_scope=policy.selected_products,
         )
     else:
         db.add(
@@ -2493,6 +2678,7 @@ async def grant_application_bank_consent(
                 disclosure_version=disclosure["version"],
                 disclosure_hash=disclosure["hash"],
                 disclosure_text=disclosure["text"],
+                product_scope=disclosure["product_scope"],
                 consenter_name=payload.consenter_name,
                 captured_by_user_id=user.id,
                 ip_address=_client_ip(request),
@@ -2502,6 +2688,13 @@ async def grant_application_bank_consent(
     consent_action = "bank.consent.client" if profile.dealer_id else "bank.consent"
     await profiles.log_profile_action(db, profile, user, consent_action, "Recorded bank statement access authorization")
     await db.commit()
+    for item in await _profile_plaid_items(db, profile):
+        if item.status != "active":
+            continue
+        if profile.dealer_id:
+            background.add_task(_sync_dealer_plaid_item_background, item.id)
+        else:
+            background.add_task(sync_item_background, item.id)
     return await get_application_banks(profile_id, user, db)
 
 
@@ -2511,11 +2704,20 @@ async def create_application_plaid_link_token(
 ) -> ApplicationPlaidLinkTokenRead:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
-    consent = await dealer_bank_consent.has_consent(db, profile.dealer_id) if profile.dealer_id else await _application_consent_granted(db, profile.id)
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
+    consent = (
+        await dealer_bank_consent.has_consent(
+            db, profile.dealer_id, policy.selected_products
+        )
+        if profile.dealer_id
+        else await _application_consent_granted(db, profile.id, policy.selected_products)
+    )
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Record bank access authorization before opening Plaid")
     token = await plaid_client.create_link_token(
-        dealer_id=str(profile.id), dealer_name=await _profile_plaid_display_name(db, profile)
+        dealer_id=str(profile.id),
+        dealer_name=await _profile_plaid_display_name(db, profile),
+        requested_products=policy.selected_products,
     )
     return ApplicationPlaidLinkTokenRead(link_token=token)
 
@@ -2533,10 +2735,13 @@ async def create_application_plaid_update_link_token(
 ) -> ApplicationPlaidLinkTokenRead:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
     consent = (
-        await dealer_bank_consent.has_consent(db, profile.dealer_id)
+        await dealer_bank_consent.has_consent(
+            db, profile.dealer_id, policy.selected_products
+        )
         if profile.dealer_id
-        else await _application_consent_granted(db, profile.id)
+        else await _application_consent_granted(db, profile.id, policy.selected_products)
     )
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Accept the current bank disclosure before continuing")
@@ -2548,6 +2753,7 @@ async def create_application_plaid_update_link_token(
             client_user_id=str(profile.id),
             display_name=await _profile_plaid_display_name(db, profile),
             account_selection_enabled=account_selection,
+            add_products=plaid_policy.pending_products(item, policy),
         )
     except plaid_client.PlaidUnavailable as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
@@ -2650,7 +2856,14 @@ async def exchange_application_plaid_token(
 ) -> ApplicationBankConnectionRead:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_profile_bank_client(profile, user)
-    consent = await dealer_bank_consent.has_consent(db, profile.dealer_id) if profile.dealer_id else await _application_consent_granted(db, profile.id)
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
+    consent = (
+        await dealer_bank_consent.has_consent(
+            db, profile.dealer_id, policy.selected_products
+        )
+        if profile.dealer_id
+        else await _application_consent_granted(db, profile.id, policy.selected_products)
+    )
     if not consent:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bank access authorization is required")
     try:
@@ -2683,6 +2896,13 @@ async def exchange_application_plaid_token(
         )
         db.add(item)
     await db.flush()
+    try:
+        await plaid_policy.reconcile_item(db, item)
+    except plaid_client.PlaidUnavailable as exc:
+        item.status = "error"
+        item.error = str(exc)[:500]
+    else:
+        plaid_policy.mark_optional_statements_unavailable(item, policy)
     current = await profiles.bank_rows(db, profile)
     if payload.is_primary_operating or not any(row.is_primary_operating for row in current):
         await _make_primary(db, profile, item)
@@ -2742,21 +2962,28 @@ async def refresh_application_bank(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a super admin may retry statement synchronization")
     profile = await profiles.load_profile(db, profile_id, user)
     item = await _profile_plaid_item(db, profile, item_id)
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
     await _require_training_live_action(
         db,
         profile=profile,
         user=user,
         request=request,
-        action="Refresh bank statements",
+        action="Refresh Plaid bank evidence",
         provider="Plaid",
         recipient=item.institution_name,
-        effect="Run a live provider synchronization for this bank connection",
+        effect=(
+            "Retrieve Plaid Assets and bank-produced Statement PDFs for this connection"
+            if policy.assets_enabled and policy.statements_enabled
+            else "Retrieve a Plaid Asset Report for this file"
+            if policy.assets_enabled
+            else "Retrieve bank-produced Statement PDFs for this connection"
+        ),
     )
     if profile.dealer_id:
         from app.dealer_os.services.plaid_sync import sync_item
     else:
         from app.services.application_plaid_sync import sync_item
-    result = await sync_item(db, item)
+    result = await sync_item(db, item, scheduled=True)
     await profiles.log_profile_action(db, profile, user, "plaid.refresh.recovery", "Retried statement synchronization", target_type="plaid_item", target_id=item.id)
     await db.commit()
     return ApplicationPlaidRefreshRead(**result)
@@ -2842,10 +3069,16 @@ async def create_application_asset_report(
 ) -> PlaidAssetReport:
     profile = await profiles.load_profile(db, profile_id, user)
     _require_asset_report_staff(user)
+    policy, _policy_owner = await plaid_policy.for_profile(db, profile)
+    if not policy.assets_enabled:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"code": "plaid_product_disabled", "product": "assets"},
+        )
     consent = (
-        await dealer_bank_consent.has_consent(db, profile.dealer_id)
+        await dealer_bank_consent.has_consent(db, profile.dealer_id, ["assets"])
         if profile.dealer_id
-        else await _application_consent_granted(db, profile.id)
+        else await _application_consent_granted(db, profile.id, ["assets"])
     )
     if not consent:
         raise HTTPException(status.HTTP_409_CONFLICT, "The client must accept the current bank disclosure first")

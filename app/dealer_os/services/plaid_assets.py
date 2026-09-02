@@ -256,6 +256,13 @@ async def ensure_asset_report(
     )
     if not items:
         raise plaid_client.PlaidUnavailable("Connect at least one healthy production bank first")
+    from app.services import plaid_policy
+
+    items = [item for item in items if "assets" in plaid_policy.item_products(item)]
+    if not items:
+        raise plaid_client.PlaidUnavailable(
+            "Authorize Plaid Assets on at least one connected bank first"
+        )
     # A failed Statements pull (for example, an unentitled product) used to
     # mark an otherwise valid Item `error`. Assets may safely retry those
     # token-bearing Items. Login/revocation errors carry update_mode_reason or
@@ -316,6 +323,14 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
     if report.dealer_id is None:
         raise ValueError("Asset Report is not linked to a Field Desk file")
 
+    dealer = await db.get(DealerBusiness, report.dealer_id)
+    if dealer is None:
+        raise ValueError("Field Desk file not found for Asset Report")
+    if not dealer.plaid_assets_enabled:
+        await plaid_lifecycle.remove_asset_report(report, strict=False)
+        await db.flush()
+        return report
+
     token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
     if not token:
         raise plaid_client.PlaidUnavailable("Asset Report token is unavailable")
@@ -325,9 +340,6 @@ async def ingest_asset_report(db: AsyncSession, asset_report_id: str) -> PlaidAs
     if not normalized:
         raise plaid_client.PlaidUnavailable("Plaid returned no usable Asset Report accounts")
 
-    dealer = await db.get(DealerBusiness, report.dealer_id)
-    if dealer is None:
-        raise ValueError("Field Desk file not found for Asset Report")
     doc = await store_document_bytes(
         db,
         dealer.id,

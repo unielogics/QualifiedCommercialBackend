@@ -22,6 +22,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services import plaid_policy
+
 from ..models import DealerDocument, DealerPlaidItem
 from . import plaid_client
 from .audit import log_action
@@ -64,7 +66,12 @@ async def _bookkeep(db: AsyncSession, item_pk, *, error: str | None, retry_days:
     await db.commit()
 
 
-async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
+async def sync_item(
+    db: AsyncSession,
+    item: DealerPlaidItem,
+    *,
+    scheduled: bool = False,
+) -> dict:
     """Refresh configured bank evidence for one connected bank.
 
     Each statement is COMMITTED individually — one bad PDF (or a unique-index
@@ -80,7 +87,43 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
     dealer_id = item.dealer_id
     item_label = item.item_id[:12]
 
-    if plaid_client.assets_enabled():
+    policy, owner = await plaid_policy.for_item(db, item)
+    if owner is None:
+        return {"pulled": 0, "skipped": 0, "failed": 0}
+    try:
+        policy.validate()
+    except (plaid_policy.InvalidPlaidPolicy, plaid_policy.PlaidProductUnavailable) as exc:
+        await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
+        return {"pulled": 0, "skipped": 0, "failed": 1}
+    if not await plaid_policy.has_required_consent(db, item, policy):
+        item.status = "active"
+        item.error = None
+        item.next_refresh_at = None
+        await db.flush()
+        return {"pulled": 0, "skipped": 1, "failed": 0}
+
+    if item.plaid_products_checked_at is None:
+        try:
+            await plaid_policy.reconcile_item(db, item)
+        except plaid_client.PlaidUnavailable as exc:
+            await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
+            return {"pulled": 0, "skipped": 0, "failed": 1}
+    missing = plaid_policy.pending_products(item, policy)
+    if missing:
+        item.status = "active"
+        item.error = None
+        item.update_mode_reason = plaid_policy.update_reason(missing)
+        item.next_refresh_at = None
+        await db.flush()
+        return {"pulled": 0, "skipped": 1, "failed": 0}
+
+    statements_collectible = (
+        policy.statements_enabled
+        and "statements" not in plaid_policy.unavailable_products(item)
+    )
+    asset_pulled = asset_skipped = asset_failed = 0
+
+    if policy.assets_enabled:
         from . import plaid_assets
 
         try:
@@ -99,11 +142,15 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
             logger.exception(
                 "dealer-os plaid: asset report refresh failed for item %s", item_label
             )
-            if not plaid_client.statements_enabled():
+            asset_failed = 1
+            if not statements_collectible:
                 await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
                 return {"pulled": 0, "skipped": 0, "failed": 1}
         else:
-            if not plaid_client.statements_enabled():
+            asset_pulled = 1 if created or report_status == "ingested" else 0
+            asset_skipped = 0 if created else 1
+            asset_failed = 1 if report_status == "error" else 0
+            if not statements_collectible:
                 await _bookkeep(
                     db,
                     item_pk,
@@ -117,19 +164,26 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
                     ),
                 )
                 return {
-                    "pulled": 1 if created or report_status == "ingested" else 0,
-                    "skipped": 0 if created else 1,
-                    "failed": 1 if report_status == "error" else 0,
+                    "pulled": asset_pulled,
+                    "skipped": asset_skipped,
+                    "failed": asset_failed,
                 }
 
-    if not plaid_client.statements_enabled():
-        await _bookkeep(
-            db,
-            item_pk,
-            error="No supported Plaid bank-evidence product is enabled.",
-            retry_days=1,
-        )
-        return {"pulled": 0, "skipped": 0, "failed": 1}
+    if not statements_collectible:
+        # Statements-only files whose institution cannot supply the product
+        # use the guided PDF fallback. Do not leave an already-due timestamp
+        # behind or every scheduler tick will revisit an impossible provider
+        # call.
+        if not policy.assets_enabled:
+            item.status = "active"
+            item.error = None
+            item.next_refresh_at = None
+            await db.flush()
+        return {
+            "pulled": asset_pulled,
+            "skipped": asset_skipped,
+            "failed": asset_failed,
+        }
 
     token = plaid_client.decrypt_token(item.encrypted_access_token)
     if not token:
@@ -140,11 +194,36 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
         )
         return {"pulled": 0, "skipped": 0, "failed": 1}
 
+    if scheduled and item.statements_refresh_state != "ready":
+        try:
+            await plaid_client.statements_refresh(token)
+        except plaid_client.PlaidUnavailable as exc:
+            await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
+            return {
+                "pulled": asset_pulled,
+                "skipped": asset_skipped,
+                "failed": asset_failed + 1,
+            }
+        item.statements_refresh_state = "pending"
+        item.statements_refresh_requested_at = _now()
+        item.last_pulled_at = _now()
+        # Safety retry if Plaid never delivers a webhook. The next scheduled
+        # run requests again; no PDFs are downloaded until completion.
+        item.next_refresh_at = _now() + timedelta(days=1)
+        await db.flush()
+        return {
+            "pulled": asset_pulled,
+            "skipped": asset_skipped + 1,
+            "failed": asset_failed,
+        }
+
     try:
         listing = await plaid_client.statements_list(token)
     except plaid_client.PlaidUnavailable as exc:
         await _bookkeep(db, item_pk, error=str(exc), retry_days=1)
         return {"pulled": 0, "skipped": 0, "failed": 1}
+    item.statements_refresh_state = None
+    item.statements_refresh_requested_at = None
 
     institution = listing.get("institution_name")
     if institution and not item.institution_name:
@@ -232,7 +311,11 @@ async def sync_item(db: AsyncSession, item: DealerPlaidItem) -> dict:
         "dealer-os plaid: item %s pulled=%d skipped=%d failed=%d",
         item_label, pulled, skipped, failed,
     )
-    return {"pulled": pulled, "skipped": skipped, "failed": failed}
+    return {
+        "pulled": pulled + asset_pulled,
+        "skipped": skipped + asset_skipped,
+        "failed": failed + asset_failed,
+    }
 
 
 async def refresh_due() -> dict:
@@ -273,7 +356,7 @@ async def refresh_due() -> dict:
                 ).scalar_one_or_none()
                 if item is None:
                     continue
-                await sync_item(db, item)
+                await sync_item(db, item, scheduled=True)
                 await db.commit()
                 synced += 1
         except Exception:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -18,8 +19,8 @@ from app.models.application_profile import (
     ApplicationProfile,
     PlaidAssetReport,
 )
-from app.models.bucket import BucketFile
-from app.services import plaid_lifecycle
+from app.models.bucket import BucketFile, BucketFileAnalysis
+from app.services import plaid_lifecycle, plaid_policy
 from app.services.application_profiles import log_profile_action
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,153 @@ async def _put_pdf(key: str, raw: bytes) -> None:
     )
 
 
-async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, int]:
+async def ingest_asset_report(
+    db: AsyncSession, asset_report_id: str
+) -> PlaidAssetReport:
+    """Retain a standalone Funding Asset Report PDF and normalized JSON."""
+    report = (
+        await db.execute(
+            select(PlaidAssetReport)
+            .where(PlaidAssetReport.asset_report_id == asset_report_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if report is None or report.profile_id is None:
+        raise ValueError("Standalone Funding Asset Report not found")
+    if report.ingested_at is not None and report.bucket_file_id is not None:
+        return report
+    profile = await db.get(ApplicationProfile, report.profile_id)
+    if profile is None or profile.primary_bucket_id is None:
+        raise ValueError("Asset Report is not linked to an evidence bucket")
+    policy, _owner = await plaid_policy.for_profile(db, profile)
+    if not policy.assets_enabled:
+        await plaid_lifecycle.remove_asset_report(report, strict=False)
+        await db.flush()
+        return report
+    token = plaid_client.decrypt_token(report.encrypted_asset_report_token)
+    if not token:
+        raise plaid_client.PlaidUnavailable("Asset Report token is unavailable")
+    payload = await plaid_client.asset_report_get(token)
+    pdf = await plaid_client.asset_report_pdf(token)
+    if not pdf.startswith(b"%PDF-"):
+        raise plaid_client.PlaidUnavailable("Plaid returned an invalid Asset Report PDF")
+
+    from app.dealer_os.services.plaid_assets import normalize_asset_report
+    from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
+
+    normalized = normalize_asset_report(payload)
+    if not normalized:
+        raise plaid_client.PlaidUnavailable("Plaid returned no usable Asset Report accounts")
+    monthly_rows: list[dict] = []
+    account_rows: list[dict] = []
+    for account in normalized:
+        months = [dict(month) for month in account.get("months") or []]
+        monthly_rows.extend(months)
+        account_rows.append({"account": account.get("account") or {}, "months": months})
+    observed_months = sorted(
+        {
+            str(row.get("month"))
+            for row in monthly_rows
+            if re.fullmatch(r"\d{4}-\d{2}", str(row.get("month") or ""))
+        }
+    )
+    digest = hashlib.sha256(pdf).hexdigest()
+    file_id = uuid4()
+    filename = f"Plaid Asset Report {report.created_at:%Y-%m-%d}.pdf"
+    prefix = get_settings().buckets_s3_prefix.strip("/")
+    key = f"{prefix}/plaid-assets/{profile.primary_bucket_id}/{file_id}-{filename}"
+    await _put_pdf(key, pdf)
+    file = BucketFile(
+        id=file_id,
+        bucket_id=profile.primary_bucket_id,
+        file_name=filename,
+        s3_key=key,
+        content_type="application/pdf",
+        size_bytes=len(pdf),
+        uploaded_by_name="Plaid Assets",
+        status="uploaded",
+        content_hash=digest,
+        extraction_status="completed",
+    )
+    db.add(file)
+    await db.flush()
+    analysis = BucketFileAnalysis(
+        bucket_file_id=file.id,
+        bucket_id=file.bucket_id,
+        content_hash=digest,
+        analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
+        provider="plaid",
+        model="assets-json",
+        status="completed",
+        classification="bank_statement",
+        confidence="high",
+        summary=(
+            f"Verified Plaid Asset Report covering {len(observed_months)} month(s) "
+            f"across {len(account_rows)} account(s)."
+        ),
+        analysis={
+            "source": "plaid_assets",
+            "verified": True,
+            "asset_report_id": report.asset_report_id,
+            "key_facts": {"months": [{"month": month} for month in observed_months]},
+            "accounts": account_rows,
+        },
+        analyzed_at=_now(),
+    )
+    db.add(analysis)
+    report.bucket_file_id = file.id
+    report.status = "ingested"
+    report.ingested_at = _now()
+    report.error = None
+    await log_profile_action(
+        db,
+        profile,
+        None,
+        "plaid.asset_report.ingested",
+        "Added verified Plaid Assets evidence to the application bucket",
+        target_type="file",
+        target_id=file.id,
+        metadata={
+            "asset_report_id": report.asset_report_id,
+            "months": observed_months,
+            "account_count": len(account_rows),
+        },
+    )
+    await db.flush()
+    return report
+
+
+async def ingest_asset_report_background(asset_report_id: str) -> None:
+    from app.db import SessionLocal
+
+    try:
+        async with SessionLocal() as db:
+            report = (
+                await db.execute(
+                    select(PlaidAssetReport).where(
+                        PlaidAssetReport.asset_report_id == asset_report_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if report is None:
+                return
+            if report.dealer_id is not None:
+                from app.dealer_os.services.plaid_assets import ingest_asset_report as ingest_dealer
+
+                await ingest_dealer(db, asset_report_id)
+            else:
+                await ingest_asset_report(db, asset_report_id)
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("Plaid Asset Report ingestion failed report=%s", asset_report_id)
+
+
+async def sync_item(
+    db: AsyncSession,
+    item: ApplicationPlaidItem,
+    *,
+    scheduled: bool = False,
+) -> dict[str, int]:
     if item.status == "removed" or item.environment != plaid_client.environment():
         return {"pulled": 0, "skipped": 0, "failed": 0}
     profile = await db.get(ApplicationProfile, item.profile_id)
@@ -72,7 +219,48 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
         await db.flush()
         return {"pulled": 0, "skipped": 0, "failed": 1}
 
-    if plaid_client.assets_enabled():
+    policy, owner = await plaid_policy.for_item(db, item)
+    if owner is None:
+        return {"pulled": 0, "skipped": 0, "failed": 0}
+    try:
+        policy.validate()
+    except (plaid_policy.InvalidPlaidPolicy, plaid_policy.PlaidProductUnavailable) as exc:
+        item.status = "error"
+        item.error = str(exc)[:500]
+        item.next_refresh_at = _now() + timedelta(days=1)
+        await db.flush()
+        return {"pulled": 0, "skipped": 0, "failed": 1}
+    if not await plaid_policy.has_required_consent(db, item, policy):
+        item.status = "active"
+        item.error = None
+        item.next_refresh_at = None
+        await db.flush()
+        return {"pulled": 0, "skipped": 1, "failed": 0}
+    if item.plaid_products_checked_at is None:
+        try:
+            await plaid_policy.reconcile_item(db, item)
+        except plaid_client.PlaidUnavailable as exc:
+            item.status = "error"
+            item.error = str(exc)[:500]
+            item.next_refresh_at = _now() + timedelta(days=1)
+            await db.flush()
+            return {"pulled": 0, "skipped": 0, "failed": 1}
+    missing = plaid_policy.pending_products(item, policy)
+    if missing:
+        item.status = "active"
+        item.error = None
+        item.update_mode_reason = plaid_policy.update_reason(missing)
+        item.next_refresh_at = None
+        await db.flush()
+        return {"pulled": 0, "skipped": 1, "failed": 0}
+
+    statements_collectible = (
+        policy.statements_enabled
+        and "statements" not in plaid_policy.unavailable_products(item)
+    )
+    asset_pulled = asset_skipped = asset_failed = 0
+
+    if policy.assets_enabled:
         asset_items = list(
             (
                 await db.execute(
@@ -95,6 +283,11 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
             if asset_item.status == "error":
                 asset_item.status = "active"
                 asset_item.error = None
+        asset_items = [
+            asset_item
+            for asset_item in asset_items
+            if "assets" in plaid_policy.item_products(asset_item)
+        ]
         latest = (
             await db.execute(
                 select(PlaidAssetReport)
@@ -111,8 +304,17 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
         current = bool(
             latest is not None
             and sorted(latest.source_item_ids or []) == source_ids
-            and latest.status in {"pending", "ready"}
-            and _now() - latest.created_at < timedelta(days=plaid_client.REFRESH_EVERY_DAYS)
+            and (
+                (
+                    latest.status in {"pending", "ready"}
+                    and _now() - latest.created_at < timedelta(days=1)
+                )
+                or (
+                    latest.status == "ingested"
+                    and _now() - latest.created_at
+                    < timedelta(days=plaid_client.REFRESH_EVERY_DAYS)
+                )
+            )
         )
         try:
             if not current:
@@ -124,7 +326,8 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
                 )
                 await db.commit()
         except plaid_client.PlaidUnavailable as exc:
-            if not plaid_client.statements_enabled():
+            asset_failed = 1
+            if not statements_collectible:
                 item.status = "error"
                 item.error = str(exc)[:500]
                 item.last_pulled_at = _now()
@@ -132,7 +335,9 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
                 await db.flush()
                 return {"pulled": 0, "skipped": 0, "failed": 1}
         else:
-            if not plaid_client.statements_enabled():
+            asset_pulled = 0 if current else 1
+            asset_skipped = 1 if current else 0
+            if not statements_collectible:
                 item.status = "active"
                 item.error = None
                 item.last_pulled_at = _now()
@@ -146,19 +351,47 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
                     "failed": 0,
                 }
 
-    if not plaid_client.statements_enabled():
-        item.status = "error"
-        item.error = "No supported Plaid bank-evidence product is enabled"
-        item.last_pulled_at = _now()
-        item.next_refresh_at = _now() + timedelta(days=1)
-        await db.flush()
-        return {"pulled": 0, "skipped": 0, "failed": 1}
+    if not statements_collectible:
+        if not policy.assets_enabled:
+            item.status = "active"
+            item.error = None
+            item.next_refresh_at = None
+            await db.flush()
+        return {
+            "pulled": asset_pulled,
+            "skipped": asset_skipped,
+            "failed": asset_failed,
+        }
     token = plaid_client.decrypt_token(item.encrypted_access_token)
     if not token:
         item.status = "error"
         item.error = "Stored bank credentials could not be read; reconnect the bank"
         await db.flush()
         return {"pulled": 0, "skipped": 0, "failed": 1}
+    if scheduled and item.statements_refresh_state != "ready":
+        try:
+            await plaid_client.statements_refresh(token)
+        except plaid_client.PlaidUnavailable as exc:
+            item.status = "error"
+            item.error = str(exc)[:500]
+            item.next_refresh_at = _now() + timedelta(days=1)
+            await db.flush()
+            return {
+                "pulled": asset_pulled,
+                "skipped": asset_skipped,
+                "failed": asset_failed + 1,
+            }
+        item.statements_refresh_state = "pending"
+        item.statements_refresh_requested_at = _now()
+        item.last_pulled_at = _now()
+        item.next_refresh_at = _now() + timedelta(days=1)
+        await db.flush()
+        return {
+            "pulled": asset_pulled,
+            "skipped": asset_skipped + 1,
+            "failed": asset_failed,
+        }
+
     try:
         listing = await plaid_client.statements_list(token)
         if listing.get("institution_name") and not item.institution_name:
@@ -177,6 +410,8 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
         item.next_refresh_at = _now() + timedelta(days=1)
         await db.flush()
         return {"pulled": 0, "skipped": 0, "failed": 1}
+    item.statements_refresh_state = None
+    item.statements_refresh_requested_at = None
 
     existing = set(
         (
@@ -255,17 +490,21 @@ async def sync_item(db: AsyncSession, item: ApplicationPlaidItem) -> dict[str, i
         item.last_pulled_at = _now()
         item.next_refresh_at = _now() + timedelta(days=plaid_client.REFRESH_EVERY_DAYS)
         await db.flush()
-    return {"pulled": pulled, "skipped": skipped, "failed": failed}
+    return {
+        "pulled": pulled + asset_pulled,
+        "skipped": skipped + asset_skipped,
+        "failed": failed + asset_failed,
+    }
 
 
-async def sync_item_background(item_id) -> None:
+async def sync_item_background(item_id, scheduled: bool = False) -> None:
     from app.db import SessionLocal
 
     async with SessionLocal() as db:
         item = await db.get(ApplicationPlaidItem, item_id)
         if item is None:
             return
-        await sync_item(db, item)
+        await sync_item(db, item, scheduled=scheduled)
         await db.commit()
 
 
@@ -292,7 +531,7 @@ async def refresh_due() -> dict[str, int]:
     synced = 0
     for item_id in item_ids:
         try:
-            await sync_item_background(item_id)
+            await sync_item_background(item_id, scheduled=True)
             synced += 1
         except Exception:  # noqa: BLE001
             logger.exception("application Plaid scheduled refresh failed item=%s", item_id)
