@@ -1284,6 +1284,26 @@ async def _record_sms_consent(
     return rows
 
 
+def _apply_sms_consent_to_rep_contacts(
+    contacts: list[DealerRepContact],
+    *,
+    transactional: bool,
+    marketing: bool,
+    consent_at: datetime,
+    meta: dict,
+) -> None:
+    """Mirror a new file-level grant into already-open rep conversations."""
+    for contact in contacts:
+        if transactional:
+            contact.sms_transactional_consented_at = consent_at
+        if marketing:
+            contact.sms_marketing_consented_at = consent_at
+        contact.sms_consent_meta = meta
+        # A fresh explicit grant after STOP is a valid re-consent. The
+        # immutable ledger retains both the revocation and this later grant.
+        contact.sms_opted_out_at = None
+
+
 async def _notify_client_request(
     db: AsyncSession,
     dealer: DealerBusiness,
@@ -2675,6 +2695,39 @@ async def add_sms_consent(
     require_team_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
     rows = await _record_sms_consent(db, dealer, payload, user, request)
+
+    # The file-level consent ledger is the source of truth, while an existing
+    # Inbox thread gates sends from its DealerRepContact row. Keep both views in
+    # sync so recording consent in the Messages tab enables that conversation
+    # immediately instead of requiring a new thread to be created first.
+    phone = consent_delivery.normalize_phone(payload.phone)
+    if phone and rows:
+        contacts = list(
+            (
+                await db.execute(
+                    select(DealerRepContact).where(
+                        DealerRepContact.dealer_id == dealer.id,
+                        DealerRepContact.phone_e164 == phone,
+                    )
+                )
+            ).scalars().all()
+        )
+        consent_at = max(row.created_at for row in rows)
+        meta = {
+            "method": payload.method,
+            "captured_by": str(user.id),
+            "captured_by_name": user.name,
+            "captured_at": consent_at.isoformat(),
+            "ip": _client_ip(request),
+            "user_agent": request.headers.get("user-agent", "")[:400],
+        }
+        _apply_sms_consent_to_rep_contacts(
+            contacts,
+            transactional=payload.transactional,
+            marketing=payload.marketing,
+            consent_at=consent_at,
+            meta=meta,
+        )
     await db.commit()
     for r in rows:
         await db.refresh(r)

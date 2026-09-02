@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.dealer_os.router import (
+    _apply_sms_consent_to_rep_contacts,
     _global_search_appointment_access_filter,
     _global_search_contact_access_filter,
     _global_search_file_access_filter,
@@ -112,6 +113,31 @@ def test_inbox_compose_requires_contact_for_selected_channels() -> None:
         body="Hello",
     )
     assert payload.channels == ["email", "sms"]
+
+
+def test_file_sms_consent_enables_an_existing_rep_conversation() -> None:
+    consent_at = datetime(2026, 9, 1, 18, 30, tzinfo=UTC)
+    previous_opt_out = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    contact = SimpleNamespace(
+        sms_transactional_consented_at=None,
+        sms_marketing_consented_at=None,
+        sms_consent_meta=None,
+        sms_opted_out_at=previous_opt_out,
+    )
+    meta = {"method": "rep_attested", "captured_at": consent_at.isoformat()}
+
+    _apply_sms_consent_to_rep_contacts(
+        [contact],
+        transactional=True,
+        marketing=False,
+        consent_at=consent_at,
+        meta=meta,
+    )
+
+    assert contact.sms_transactional_consented_at == consent_at
+    assert contact.sms_marketing_consented_at is None
+    assert contact.sms_consent_meta == meta
+    assert contact.sms_opted_out_at is None
 
 
 def test_field_desk_inbox_filter_is_owner_only_for_every_staff_role() -> None:
