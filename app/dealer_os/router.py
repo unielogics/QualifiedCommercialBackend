@@ -10334,7 +10334,10 @@ def _appointment_dealer_href(dealer_id: UUID) -> str:
     return f"/applications/{dealer_id}"
 
 
-_PRECALL_SKIP_KINDS = frozenset(precall.SKIP_KINDS | {"underwriting_review"})
+# Signing and lender calls are not funding conversations. An underwriting
+# review is: booked for a new lead it opens the draft like any other field-desk
+# booking, and on an existing file it attaches and nudges what is still open.
+_PRECALL_SKIP_KINDS = frozenset(precall.SKIP_KINDS)
 
 
 async def _open_booking_draft(

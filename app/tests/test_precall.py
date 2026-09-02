@@ -206,3 +206,12 @@ def test_only_field_desk_bookings_open_the_draft() -> None:
     assert not precall.opens_draft("public")
     assert not precall.opens_draft("intake")
     assert not precall.opens_draft(None)
+
+
+def test_public_booking_origin_follows_the_host_or_the_link() -> None:
+    from app.routers.public import public_booking_origin
+
+    assert public_booking_origin("field_rep", None) == "field_desk"
+    assert public_booking_origin("super_admin", "field_desk_product") == "field_desk"
+    assert public_booking_origin("super_admin", None) == "public"
+    assert public_booking_origin("super_admin", "newsletter") == "public"

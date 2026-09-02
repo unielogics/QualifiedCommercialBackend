@@ -328,6 +328,9 @@ class PublicBookingCreate(BaseModel):
     phone: str | None = Field(default=None, max_length=40)
     notes: str | None = Field(default=None, max_length=1000)
     transactional_sms_consent: bool = False
+    #: Origin hint carried by the link (e.g. the rep product booklet appends
+    #: ?source=field_desk_product). A field-desk source is a rep-related booking.
+    source: str | None = Field(default=None, max_length=64)
 
 
 class PublicBookingCreateResult(BaseModel):
@@ -429,10 +432,11 @@ async def public_booking_create(
         sms_consent_ip=ip,
         sms_consent_user_agent=request.headers.get("user-agent"),
     )
-    # A public-page booking opens no file: the calendar outcome decides which
-    # file it becomes (intake, funding loan, or a dealer file). The draft file
-    # at booking is a field-desk thing — see precall.
-    draft = None
+    # Which file a public booking gets follows its origin. A booking through a
+    # rep's own page (the host is a field rep) or from a rep-sourced link is a
+    # field-desk booking and opens the draft file; the team's public page opens
+    # nothing — the calendar outcome decides (intake, funding loan, dealer).
+    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user, source=payload.source)
 
     db.add(
         Activity(
@@ -592,6 +596,39 @@ def _to_utc_minute(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
+def public_booking_origin(host_role: str | None, source: str | None) -> str:
+    """field_desk when the page belongs to a field rep or the link says so; public otherwise."""
+    role = (host_role or "").lower()
+    if role.endswith("field_rep") or (source or "").lower().startswith("field_desk"):
+        return "field_desk"
+    return "public"
+
+
+async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User, source: str | None):
+    """Rep-related public bookings open the draft file + room; the team page opens nothing. Flushes only."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.dealer_os.services import precall
+
+    origin = public_booking_origin(getattr(host.role, "value", str(host.role)), source)
+    if not booking.precall_enabled or not precall.opens_draft(origin):
+        return None
+    try:
+        result = await precall.create_draft_for_booking(
+            db, notice=notice, event=event, booking=booking, host=host,
+            notes=f"Booked from {host.name or 'the rep'}'s public booking page.",
+        )
+        ready = await precall.readiness(db, result.dealer)
+        if not ready.complete:
+            await precall.schedule(db, notice=notice, booking=booking, event=event, dealer=result.dealer)
+        return result
+    except SQLAlchemyError:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("public-booking: could not open the draft file for %s", notice.id)
+        return None
 
 
 async def _deliver_booking(
