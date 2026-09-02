@@ -71,6 +71,17 @@ class BucketUpdate(BaseModel):
     status: str | None = Field(default=None, max_length=40)
 
 
+class BucketLinkedFileRead(BaseModel):
+    id: UUID
+    kind: str
+    label: str
+    reference: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    route: str
+    surface: str
+
+
 class BucketRead(ORMModel):
     id: UUID
     name: str
@@ -85,6 +96,8 @@ class BucketRead(ORMModel):
     archived_at: datetime | None
     file_count: int = 0
     uploaded_file_count: int = 0
+    file_names: list[str] = Field(default_factory=list)
+    linked_files: list[BucketLinkedFileRead] = Field(default_factory=list)
 
 
 class BucketDetail(BucketRead):

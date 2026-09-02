@@ -21,10 +21,10 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
-from sqlalchemy import String, and_, exists, func, not_, select, or_
+from sqlalchemy import String, and_, delete as sa_delete, exists, func, not_, select, or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,7 +79,7 @@ from app.enums import (
     Role,
 )
 
-# READ-ONLY reuse: bucket models are queried/appended, never altered; the
+# Shared bucket models back the same archived document inventory; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
 from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
@@ -300,6 +300,7 @@ from .schemas import (
     DocRequestPatch,
     DocRequestRead,
     DocumentCoverageRead,
+    DocumentBucketSyncRead,
     DocumentRead,
     DocumentReject,
     DocumentUrlRead,
@@ -3013,6 +3014,7 @@ async def _remirror_documents(db: AsyncSession, dealer: DealerBusiness) -> int:
                 select(DealerDocument).where(
                     DealerDocument.dealer_id == dealer.id,
                     DealerDocument.s3_key.is_not(None),
+                    DealerDocument.status != "deleted",
                 )
             )
         )
@@ -3966,6 +3968,8 @@ async def update_dealer(
         await _require_group(db, changes["group_id"])
     for k, v in changes.items():
         setattr(dealer, k, v)
+    if dealer.bucket_id is not None and (bucket_changed or "name" in changes or "legal_name" in changes):
+        await buckets_link.ensure_bucket(db, dealer)
     if bucket_changed and dealer.bucket_id is not None:
         # Whichever bucket is the active connection receives the documents —
         # re-mirror the file set into the newly linked bucket.
@@ -4935,6 +4939,357 @@ async def upload_document(
     return doc
 
 
+async def _document_submission_state(
+    db: AsyncSession, dealer: DealerBusiness
+) -> tuple[bool, bool]:
+    review_windows_submitted = bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    DealerUnderwritingReviewPreference.dealer_id == dealer.id
+                )
+            )
+        )
+    )
+    package_evidence_exists = bool(
+        await db.scalar(
+            select(
+                exists().where(
+                    ContractEnvelope.dealer_id == dealer.id,
+                    ContractEnvelope.status != "void",
+                )
+            )
+        )
+    )
+    return bool(review_windows_submitted or dealer.audit_client_since), package_evidence_exists
+
+
+def _can_delete_documents(
+    role: Role, *, application_submitted: bool, package_evidence_exists: bool
+) -> bool:
+    return role == Role.SUPER_ADMIN or not (application_submitted or package_evidence_exists)
+
+
+async def _document_bucket_sync_read(
+    db: AsyncSession, dealer: DealerBusiness, user: User
+) -> DocumentBucketSyncRead:
+    application_submitted, package_evidence_exists = await _document_submission_state(db, dealer)
+    documents = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.status != "deleted",
+            )
+        )
+    ).scalars().all()
+
+    bucket = await db.get(Bucket, dealer.bucket_id) if dealer.bucket_id else None
+    active_files: list[BucketFile] = []
+    if bucket is not None:
+        active_files = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.bucket_id == bucket.id,
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    active_ids = {row.id for row in active_files}
+    tracked_ids = [row.id for row in documents if row.bucket_file_id in active_ids]
+    last_synced_at = max((row.updated_at for row in active_files), default=None)
+    return DocumentBucketSyncRead(
+        bucket_id=bucket.id if bucket else None,
+        bucket_name=bucket.name if bucket else None,
+        bucket_status=bucket.status if bucket else None,
+        active_bucket_files=len(active_files),
+        tracked_documents=len(tracked_ids),
+        pending_documents=max(0, len(documents) - len(tracked_ids)),
+        tracked_document_ids=tracked_ids,
+        last_synced_at=last_synced_at,
+        application_submitted=application_submitted,
+        package_evidence_exists=package_evidence_exists,
+        can_delete_documents=_can_delete_documents(
+            user.role,
+            application_submitted=application_submitted,
+            package_evidence_exists=package_evidence_exists,
+        ),
+        can_open_bucket=user.role == Role.SUPER_ADMIN,
+    )
+
+
+@router.get(
+    "/dealers/{dealer_id}/documents/bucket-status",
+    response_model=DocumentBucketSyncRead,
+)
+async def document_bucket_status(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DocumentBucketSyncRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    return await _document_bucket_sync_read(db, dealer, user)
+
+
+@router.post(
+    "/dealers/{dealer_id}/documents/bucket-sync",
+    response_model=DocumentBucketSyncRead,
+)
+async def sync_documents_to_bucket(
+    dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> DocumentBucketSyncRead:
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    bucket = await buckets_link.ensure_bucket(db, dealer)
+    documents = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.status != "deleted",
+            )
+        )
+    ).scalars().all()
+    repaired = 0
+    unavailable = 0
+    for document in documents:
+        if not document.s3_key:
+            unavailable += 1
+            continue
+        before = document.bucket_file_id
+        mirrored = await buckets_link.push_document(db, dealer, document, document.size_bytes or 0)
+        if mirrored is not None and (before != mirrored.id or mirrored.bucket_id != bucket.id):
+            repaired += 1
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "documents.bucket_sync",
+        "bucket",
+        entity_id=bucket.id,
+        after={"repaired": repaired, "unavailable": unavailable, "bucket_name": bucket.name},
+    )
+    await db.commit()
+    return await _document_bucket_sync_read(db, dealer, user)
+
+
+def _document_month_keys(document: DealerDocument, field: str = "months") -> set[date]:
+    source = document.extracted if field == "months" else document.doc_meta
+    values = source.get(field) if isinstance(source, dict) else None
+    periods: set[date] = set()
+    if not isinstance(values, list):
+        return periods
+    for item in values:
+        raw = item.get("month") if isinstance(item, dict) else None
+        if not isinstance(raw, str) or not re.fullmatch(r"\d{4}-\d{2}", raw):
+            continue
+        try:
+            periods.add(date(int(raw[:4]), int(raw[5:]), 1))
+        except ValueError:
+            continue
+    return periods
+
+
+@router.delete(
+    "/dealers/{dealer_id}/documents/{doc_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_dealer_document(
+    dealer_id: UUID,
+    doc_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Soft-delete document evidence and its bucket mirror as one audited act."""
+    require_team_or_rep(user)
+    dealer = await resolve_dealer_scope(db, user, dealer_id)
+    document = await _load_document(db, dealer.id, doc_id)
+    application_submitted, package_evidence_exists = await _document_submission_state(db, dealer)
+    if not _can_delete_documents(
+        user.role,
+        application_submitted=application_submitted,
+        package_evidence_exists=package_evidence_exists,
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "This file has been submitted for underwriting. Only a super admin can remove documents now.",
+        )
+    if document.status in {"uploaded", "extracting"}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This document is still processing. Refresh its status before removing it.",
+        )
+
+    children = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.parent_document_id == document.id,
+                DealerDocument.status != "deleted",
+            )
+        )
+    ).scalars().all()
+    targets = [document, *children]
+    target_ids = [row.id for row in targets]
+    original_status = document.status
+    bank_scopes: set[tuple[UUID | None, date]] = set()
+    pl_periods: set[date] = set()
+    for row in targets:
+        bank_scopes.update((row.account_id, period) for period in _document_month_keys(row))
+        pl_periods.update(_document_month_keys(row, "pl_months"))
+
+    cash_scopes = (
+        await db.execute(
+            select(DealerCashEvent.account_id, DealerCashEvent.period).where(
+                DealerCashEvent.dealer_id == dealer.id,
+                DealerCashEvent.document_id.in_(target_ids),
+            )
+        )
+    ).all()
+    bank_scopes.update((account_id, period) for account_id, period in cash_scopes)
+
+    bucket_file_ids = [row.bucket_file_id for row in targets if row.bucket_file_id]
+    bucket_files = []
+    if bucket_file_ids:
+        bucket_files = (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.id.in_(bucket_file_ids),
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    for bucket_file in bucket_files:
+        await buckets_link.soft_delete_mirrored_file(
+            db,
+            bucket_file,
+            user,
+            detail=f"Removed with Field Desk document {document.filename}",
+        )
+
+    await db.execute(
+        sa_update(DealerDocRequest)
+        .where(DealerDocRequest.fulfilled_document_id.in_(target_ids))
+        .values(status="open", fulfilled_document_id=None)
+    )
+    await db.execute(sa_delete(DealerCashEvent).where(DealerCashEvent.document_id.in_(target_ids)))
+    await db.execute(sa_delete(DealerTaxFiling).where(DealerTaxFiling.document_id.in_(target_ids)))
+    await db.execute(
+        sa_delete(DealerDebt).where(
+            DealerDebt.document_id.in_(target_ids), DealerDebt.origin != "admin"
+        )
+    )
+    await db.execute(
+        sa_update(DealerDebt)
+        .where(DealerDebt.document_id.in_(target_ids), DealerDebt.origin == "admin")
+        .values(document_id=None)
+    )
+    await db.execute(
+        sa_delete(DealerAddback).where(
+            DealerAddback.document_id.in_(target_ids), DealerAddback.status != "verified"
+        )
+    )
+    await db.execute(
+        sa_update(DealerAddback)
+        .where(DealerAddback.document_id.in_(target_ids), DealerAddback.status == "verified")
+        .values(document_id=None)
+    )
+    for row in targets:
+        row.status = "deleted"
+        row.error = None
+
+    remaining = (
+        await db.execute(
+            select(DealerDocument).where(
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.status == "extracted",
+                DealerDocument.id.not_in(target_ids),
+            )
+        )
+    ).scalars().all()
+    surviving_bank = {
+        (row.account_id, period)
+        for row in remaining
+        for period in _document_month_keys(row)
+    }
+    surviving_pl = {
+        period for row in remaining for period in _document_month_keys(row, "pl_months")
+    }
+    for account_id, period in bank_scopes:
+        await rebuild_periods(db, dealer.id, {period}, account_id=account_id)
+        if (account_id, period) in surviving_bank:
+            continue
+        period_account_clause = (
+            DealerFinancialPeriod.account_id == account_id
+            if account_id is not None
+            else DealerFinancialPeriod.account_id.is_(None)
+        )
+        financial_period = (
+            await db.execute(
+                select(DealerFinancialPeriod).where(
+                    DealerFinancialPeriod.dealer_id == dealer.id,
+                    DealerFinancialPeriod.period == period,
+                    period_account_clause,
+                )
+            )
+        ).scalar_one_or_none()
+        if financial_period is not None and financial_period.source != "manual":
+            event_account_clause = (
+                DealerCashEvent.account_id == account_id
+                if account_id is not None
+                else DealerCashEvent.account_id.is_(None)
+            )
+            remaining_events = await db.scalar(
+                select(func.count()).select_from(DealerCashEvent).where(
+                    DealerCashEvent.dealer_id == dealer.id,
+                    DealerCashEvent.period == period,
+                    event_account_clause,
+                )
+            )
+            if not remaining_events:
+                financial_period.deposits = None
+                financial_period.withdrawals = None
+            financial_period.starting_balance = None
+            financial_period.ending_balance = None
+            financial_period.low_balance = None
+            financial_period.avg_daily_balance = None
+            financial_period.nsf_count = 0
+            financial_period.liquidity = None
+    for period in pl_periods - surviving_pl:
+        financial_period = (
+            await db.execute(
+                select(DealerFinancialPeriod).where(
+                    DealerFinancialPeriod.dealer_id == dealer.id,
+                    DealerFinancialPeriod.period == period,
+                    DealerFinancialPeriod.account_id.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if financial_period is not None and financial_period.source != "manual":
+            financial_period.revenue = None
+            financial_period.net_income = None
+
+    await recompute_snapshot(db, dealer.id)
+    await log_action(
+        db,
+        dealer.id,
+        user,
+        "dealer_doc.delete",
+        "document",
+        entity_id=document.id,
+        before={
+            "filename": document.filename,
+            "status": original_status,
+            "bucket_file_ids": [str(value) for value in bucket_file_ids],
+        },
+        after={
+            "status": "deleted",
+            "children_removed": len(children),
+            "archive_retained": True,
+            "application_submitted": application_submitted,
+        },
+    )
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/dealers/{dealer_id}/documents", response_model=list[DocumentRead])
 async def list_documents(
     dealer_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
@@ -4945,7 +5300,10 @@ async def list_documents(
     the reviewer's note in `error` is the dealer-facing outcome."""
     require_team_or_dealer_or_rep(user)
     dealer = await resolve_dealer_scope(db, user, dealer_id)
-    q = select(DealerDocument).where(DealerDocument.dealer_id == dealer.id)
+    q = select(DealerDocument).where(
+        DealerDocument.dealer_id == dealer.id,
+        DealerDocument.status != "deleted",
+    )
     if is_audit_client(user):
         q = q.where(DealerDocument.status != "failed")
     rows = (
@@ -5148,16 +5506,8 @@ async def pipeline_status(
         )
     ).first()
 
-    months = int(
-        (
-            await db.execute(
-                select(func.count(func.distinct(DealerFinancialPeriod.period))).where(
-                    DealerFinancialPeriod.dealer_id == dealer.id
-                )
-            )
-        ).scalar_one()
-        or 0
-    )
+    covered_months, _, _ = await _statement_month_coverage(db, dealer.id)
+    months = len(covered_months)
     tax_years = int(
         (
             await db.execute(
@@ -5206,7 +5556,9 @@ async def reextract_document(
     doc = (
         await db.execute(
             select(DealerDocument).where(
-                DealerDocument.id == doc_id, DealerDocument.dealer_id == dealer.id
+                DealerDocument.id == doc_id,
+                DealerDocument.dealer_id == dealer.id,
+                DealerDocument.status != "deleted",
             )
         )
     ).scalar_one_or_none()
@@ -5259,7 +5611,9 @@ async def _load_document(db: AsyncSession, dealer_id: UUID, doc_id: UUID) -> Dea
     doc = (
         await db.execute(
             select(DealerDocument).where(
-                DealerDocument.id == doc_id, DealerDocument.dealer_id == dealer_id
+                DealerDocument.id == doc_id,
+                DealerDocument.dealer_id == dealer_id,
+                DealerDocument.status != "deleted",
             )
         )
     ).scalar_one_or_none()
@@ -18599,7 +18953,10 @@ async def rep_production(
         doc_rows = (
             await db.execute(
                 select(DealerDocument.dealer_id, func.count(DealerDocument.id))
-                .where(DealerDocument.dealer_id.in_(dealer_ids))
+                .where(
+                    DealerDocument.dealer_id.in_(dealer_ids),
+                    DealerDocument.status != "deleted",
+                )
                 .group_by(DealerDocument.dealer_id)
             )
         ).all()

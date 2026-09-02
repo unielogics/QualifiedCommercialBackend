@@ -169,7 +169,10 @@ async def build_context(
         (
             await db.execute(
                 select(DealerDocument)
-                .where(DealerDocument.dealer_id == dealer.id)
+                .where(
+                    DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.status != "deleted",
+                )
                 .order_by(DealerDocument.created_at.asc())
             )
         ).scalars().all()

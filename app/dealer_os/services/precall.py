@@ -373,6 +373,7 @@ async def readiness(db: AsyncSession, dealer: DealerBusiness) -> Readiness:
                 .select_from(DealerDocument)
                 .where(
                     DealerDocument.dealer_id == dealer.id,
+                    DealerDocument.status != "deleted",
                     or_(DealerDocument.kind == "bank_statement", DealerDocument.detected_kind == "bank_statement"),
                 )
             )
@@ -885,13 +886,15 @@ def template_values(
     first = name.split()[0] if name != "there" else "there"
     business = (dealer.name if dealer is not None else "") or "your business"
     missing = ready.missing_phrase if ready is not None else ""
+    day = str(local.day)
+    hour = str(local.hour % 12 or 12)
     return {
         "{name}": name,
         "{first}": first,
         "{rep}": (host.name or "").strip() or "Qualified Commercial",
         "{business}": business,
-        "{date}": local.strftime("%A, %B %-d"),
-        "{time}": local.strftime("%A, %B %-d at %-I:%M %p %Z"),
+        "{date}": f"{local.strftime('%A, %B')} {day}",
+        "{time}": f"{local.strftime('%A, %B')} {day} at {hour}:{local.strftime('%M %p %Z')}",
         "{join_link}": (notice.join_url or "").strip(),
         "{room_link}": room_link,
         "{pin}": pin or "",
@@ -1095,7 +1098,8 @@ async def mark_complete(
         try:
             when = ""
             if event is not None:
-                when = event.starts_at.astimezone(_tz("America/New_York")).strftime("%a %b %-d")
+                local_start = event.starts_at.astimezone(_tz("America/New_York"))
+                when = f"{local_start.strftime('%a %b')} {local_start.day}"
             await notify_users(
                 db,
                 recipient_ids=recipients,
@@ -1244,7 +1248,14 @@ async def archive_stale_drafts(db: AsyncSession, *, now: datetime | None = None,
             ).scalar_one_or_none()
         if touched is None:
             touched = (
-                await db.execute(select(DealerDocument.id).where(DealerDocument.dealer_id == dealer.id).limit(1))
+                await db.execute(
+                    select(DealerDocument.id)
+                    .where(
+                        DealerDocument.dealer_id == dealer.id,
+                        DealerDocument.status != "deleted",
+                    )
+                    .limit(1)
+                )
             ).scalar_one_or_none()
         if touched is None:
             touched = (

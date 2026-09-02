@@ -23,9 +23,11 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.config import get_settings
 from app.db import get_db
+from app.dealer_os.models import DealerBusiness
 from app.dealer_os.services.bucket_ingest import auto_ingest_bucket_files_for_bucket
 from app.deps import require_role
 from app.enums import Role
+from app.models.application_profile import ApplicationProfile
 from app.models.bucket import (
     Bucket,
     BucketActivityLog,
@@ -42,6 +44,9 @@ from app.models.bucket import (
     BucketUploadLink,
     BucketVendorAccess,
 )
+from app.models.client import Client
+from app.models.loan import Loan
+from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.bucket import (
     BucketActivityPage,
@@ -65,6 +70,7 @@ from app.schemas.bucket import (
     BucketFileUploadInit,
     BucketFileUploadInitResponse,
     BucketFileUrl,
+    BucketLinkedFileRead,
     BucketNoteCreate,
     BucketNoteRead,
     BucketPublicShareAccessRead,
@@ -611,6 +617,146 @@ def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     return data
 
 
+async def _attach_bucket_file_links(
+    db: AsyncSession, buckets: list[Bucket]
+) -> bool:
+    """Project every business-file identity linked to these storage buckets."""
+    bucket_ids = [bucket.id for bucket in buckets]
+    if not bucket_ids:
+        return False
+    links: dict[UUID, list[BucketLinkedFileRead]] = {bucket_id: [] for bucket_id in bucket_ids}
+    seen: dict[UUID, set[tuple[str, UUID]]] = {bucket_id: set() for bucket_id in bucket_ids}
+
+    def add(bucket_id: UUID, item: BucketLinkedFileRead) -> None:
+        key = (item.surface, item.id)
+        if bucket_id not in links or key in seen[bucket_id]:
+            return
+        seen[bucket_id].add(key)
+        links[bucket_id].append(item)
+
+    dealers = (
+        await db.execute(
+            select(DealerBusiness)
+            .where(DealerBusiness.bucket_id.in_(bucket_ids))
+            .order_by(DealerBusiness.updated_at.desc())
+        )
+    ).scalars().all()
+    dealers_by_bucket: dict[UUID, list[DealerBusiness]] = {}
+    for dealer in dealers:
+        if dealer.bucket_id is None:
+            continue
+        dealers_by_bucket.setdefault(dealer.bucket_id, []).append(dealer)
+        add(
+            dealer.bucket_id,
+            BucketLinkedFileRead(
+                id=dealer.id,
+                kind="Field Desk file",
+                label=dealer.name or dealer.legal_name or "Application",
+                reference=dealer.case_ref,
+                email=dealer.email,
+                phone=dealer.phone,
+                route=f"/applications/{dealer.id}",
+                surface="field_desk",
+            ),
+        )
+
+    profiles = (
+        await db.execute(
+            select(ApplicationProfile).where(ApplicationProfile.primary_bucket_id.in_(bucket_ids))
+        )
+    ).scalars().all()
+    loan_ids = {profile.loan_id for profile in profiles if profile.loan_id}
+    loans = {
+        row.id: row
+        for row in (
+            await db.execute(select(Loan).where(Loan.id.in_(loan_ids)))
+        ).scalars().all()
+    } if loan_ids else {}
+    client_ids = {profile.client_id for profile in profiles if profile.client_id}
+    client_ids.update(loan.client_id for loan in loans.values() if loan.client_id)
+    clients = {
+        row.id: row
+        for row in (
+            await db.execute(select(Client).where(Client.id.in_(client_ids)))
+        ).scalars().all()
+    } if client_ids else {}
+    for profile in profiles:
+        bucket_id = profile.primary_bucket_id
+        if bucket_id is None or profile.dealer_id is not None:
+            continue
+        loan = loans.get(profile.loan_id) if profile.loan_id else None
+        client_id = profile.client_id or (loan.client_id if loan else None)
+        client = clients.get(client_id) if client_id else None
+        if profile.loan_id is not None:
+            add(
+                bucket_id,
+                BucketLinkedFileRead(
+                    id=profile.loan_id,
+                    kind="Funding loan",
+                    label=(client.name if client else None) or (loan.address if loan else None) or "Funding loan",
+                    reference=loan.deal_id if loan else None,
+                    email=client.email if client else None,
+                    phone=client.phone if client else None,
+                    route=f"/loans/{profile.loan_id}",
+                    surface="funding",
+                ),
+            )
+        elif profile.deal_id is not None:
+            add(
+                bucket_id,
+                BucketLinkedFileRead(
+                    id=profile.deal_id,
+                    kind="Funding deal",
+                    label=client.name if client else "Funding deal",
+                    reference=str(profile.deal_id)[:8],
+                    email=client.email if client else None,
+                    phone=client.phone if client else None,
+                    route=f"/deals/{profile.deal_id}",
+                    surface="funding",
+                ),
+            )
+
+    intakes = (
+        await db.execute(
+            select(PublicUnderwritingIntake)
+            .where(PublicUnderwritingIntake.bucket_id.in_(bucket_ids))
+            .order_by(PublicUnderwritingIntake.created_at.desc())
+        )
+    ).scalars().all()
+    for intake in intakes:
+        add(
+            intake.bucket_id,
+            BucketLinkedFileRead(
+                id=intake.id,
+                kind="AI intake",
+                label=intake.business_name or intake.full_name,
+                reference=str(intake.id)[:8],
+                email=intake.email,
+                phone=intake.phone,
+                route=f"/admin/ai-underwriter-leads?lead={intake.id}",
+                surface="funding",
+            ),
+        )
+
+    changed = False
+    bucket_by_id = {bucket.id: bucket for bucket in buckets}
+    for bucket_id, linked_dealers in dealers_by_bucket.items():
+        if len(linked_dealers) != 1:
+            continue
+        dealer = linked_dealers[0]
+        expected = (dealer.name or dealer.legal_name or "Client").strip()[:180]
+        bucket = bucket_by_id[bucket_id]
+        if bucket.name != expected or bucket.client_name != expected:
+            bucket.name = expected
+            bucket.client_name = expected
+            changed = True
+    for bucket in buckets:
+        bucket.linked_files = links[bucket.id]
+    if changed:
+        await db.flush()
+    return changed
+
+
 async def _uploaded_bucket_files(db: AsyncSession, bucket_id: UUID, file_ids: list[UUID]) -> list[BucketFile]:
     unique_ids = list(dict.fromkeys(file_ids))
     if not unique_ids:
@@ -719,6 +865,7 @@ async def list_templates(
 
 @router.get("", response_model=list[BucketRead])
 async def list_buckets(
+    q: str | None = Query(default=None, max_length=200),
     _: User = Depends(require_role(Role.SUPER_ADMIN)),
     db: AsyncSession = Depends(get_db),
 ) -> list[Bucket]:
@@ -736,6 +883,44 @@ async def list_buckets(
     for bucket in buckets:
         bucket.file_count = len(bucket.files)
         bucket.uploaded_file_count = len([file for file in bucket.files if file.status == "uploaded"])
+        bucket.file_names = [
+            file.file_name
+            for file in bucket.files
+            if file.status == "uploaded" and file.deleted_at is None
+        ]
+    if await _attach_bucket_file_links(db, buckets):
+        await db.commit()
+    query = (q or "").strip().casefold()
+    if query:
+        buckets = [
+            bucket
+            for bucket in buckets
+            if query in " ".join(
+                str(value)
+                for value in (
+                    bucket.id,
+                    bucket.name,
+                    bucket.client_name,
+                    bucket.purpose,
+                    bucket.bucket_type,
+                    bucket.status,
+                    *(file.file_name for file in bucket.files),
+                    *(
+                        value
+                        for linked in bucket.linked_files
+                        for value in (
+                            linked.id,
+                            linked.label,
+                            linked.reference,
+                            linked.email,
+                            linked.phone,
+                            linked.kind,
+                        )
+                    ),
+                )
+                if value
+            ).casefold()
+        ]
     return buckets
 
 
@@ -800,6 +985,8 @@ async def get_bucket(
     db: AsyncSession = Depends(get_db),
 ) -> BucketDetail:
     bucket = await _load_bucket_detail_or_404(db, bucket_id)
+    if await _attach_bucket_file_links(db, [bucket]):
+        await db.commit()
     return _bucket_detail_read(bucket)
 
 
@@ -814,7 +1001,10 @@ async def update_bucket(
     bucket = await _load_bucket_or_404(db, bucket_id)
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
-        return _bucket_detail_read(await _load_bucket_detail_or_404(db, bucket_id))
+        detail = await _load_bucket_detail_or_404(db, bucket_id)
+        if await _attach_bucket_file_links(db, [detail]):
+            await db.commit()
+        return _bucket_detail_read(detail)
 
     changed_fields: list[str] = []
     for field, value in changes.items():
@@ -838,7 +1028,10 @@ async def update_bucket(
     else:
         await db.rollback()
 
-    return _bucket_detail_read(await _load_bucket_detail_or_404(db, bucket_id))
+    detail = await _load_bucket_detail_or_404(db, bucket_id)
+    if await _attach_bucket_file_links(db, [detail]):
+        await db.commit()
+    return _bucket_detail_read(detail)
 
 
 @router.get("/admin/{bucket_id}/activity", response_model=BucketActivityPage)

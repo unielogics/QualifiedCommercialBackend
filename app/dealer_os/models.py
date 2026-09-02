@@ -802,7 +802,7 @@ class DealerDocument(TimestampMixin, Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     s3_key: Mapped[str | None] = mapped_column(String(400))
     kind: Mapped[str] = mapped_column(String(24), default="statement", server_default="statement")  # statement|pl|tax|debt_schedule|other|archive
-    status: Mapped[str] = mapped_column(String(16), default="uploaded", server_default="uploaded")  # uploaded|extracting|extracted|failed
+    status: Mapped[str] = mapped_column(String(16), default="uploaded", server_default="uploaded")  # uploaded|extracting|extracted|failed|deleted
     error: Mapped[str | None] = mapped_column(Text)
     extracted: Mapped[dict | None] = mapped_column(JSONB)  # {months: [...], transactions_count, notes}
     # Doc hub (0114): children of an expanded ZIP archive point at their parent

@@ -7,7 +7,7 @@ Every DealerBusiness gets one linked document Bucket:
   2. else adopt the bucket of the NEWEST PublicUnderwritingIntake whose email
      matches dealer.email (case-insensitive) — the dealer's AI-underwriter
      lead and its already-uploaded statements become the audit workspace.
-  3. else create a fresh audit Bucket ("Audit — {dealer.name}").
+  3. else create a fresh audit Bucket named exactly after the application.
 
 Push: a Dealer OS document upload mirrors a BucketFile row referencing the
 SAME s3_key (no bytes are copied — both tables read the same archive object).
@@ -16,23 +16,25 @@ the cached BucketFileAnalysis (content_hash + current version) when one
 exists so no model tokens are re-spent; otherwise the raw bytes run through
 the normal extract pipeline.
 
-All functions flush, never commit — callers own the transaction. Existing
-tables (buckets, bucket_files, public_underwriting_intakes) are only ever
-read or appended to; no existing rows are mutated.
+All functions flush, never commit — callers own the transaction. The bridge
+may repair bucket identity and soft-delete mirrored files, but never deletes
+the shared S3 object because historical package evidence can reference it.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# READ-ONLY reuse of existing models (rows created, never schemas altered).
-from app.models.bucket import Bucket, BucketFile
+# Reuse existing models; this bridge adds no storage schema of its own.
+from app.models.bucket import Bucket, BucketActivityLog, BucketFile, BucketRequestedDocument
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.user import User
 
 from ..models import DealerBusiness, DealerDocument
 from .extract import _parse_amount
@@ -43,11 +45,23 @@ _UPLOADED_BY = "Capital OS"
 
 
 def audit_bucket_name(dealer: DealerBusiness) -> str:
-    """Bucket naming convention: '{dealer} — {City}, {ST}' (location parts
-    dropped when absent). Instantly identifiable in the shared bucket console."""
-    loc = ", ".join(p for p in ((dealer.city or "").strip(), (dealer.state or "").strip()) if p)
-    base = (dealer.name or "Client").strip()
-    return (f"{base} — {loc}" if loc else base)[:180]
+    """Use the application-facing name verbatim so both systems sort alike."""
+    return (dealer.name or dealer.legal_name or "Client").strip()[:180]
+
+
+async def sync_bucket_identity(db: AsyncSession, dealer: DealerBusiness, bucket: Bucket) -> bool:
+    """Keep a linked bucket searchable under the same name as its application."""
+    expected = audit_bucket_name(dealer)
+    changed = False
+    if bucket.name != expected:
+        bucket.name = expected
+        changed = True
+    if bucket.client_name != expected:
+        bucket.client_name = expected
+        changed = True
+    if changed:
+        await db.flush()
+    return changed
 
 
 async def ensure_bucket(
@@ -63,6 +77,7 @@ async def ensure_bucket(
     if dealer.bucket_id is not None:
         bucket = await db.get(Bucket, dealer.bucket_id)
         if bucket is not None:
+            await sync_bucket_identity(db, dealer, bucket)
             return bucket
         # Dangling link (bucket hard-deleted) — fall through and re-link.
         dealer.bucket_id = None
@@ -81,6 +96,7 @@ async def ensure_bucket(
             bucket = await db.get(Bucket, intake.bucket_id)
             if bucket is not None:
                 dealer.bucket_id = bucket.id
+                await sync_bucket_identity(db, dealer, bucket)
                 await db.flush()
                 logger.info(
                     "dealer-os: dealer %s adopted intake bucket %s (intake %s)",
@@ -90,7 +106,8 @@ async def ensure_bucket(
 
     # No intake to adopt — create a fresh audit bucket. Only `name` is
     # required on Bucket; bucket_type/purpose stay at their model defaults.
-    bucket = Bucket(name=audit_bucket_name(dealer), client_name=(dealer.name or "")[:180] or None)
+    bucket_name = audit_bucket_name(dealer)
+    bucket = Bucket(name=bucket_name, client_name=bucket_name)
     db.add(bucket)
     await db.flush()
     dealer.bucket_id = bucket.id
@@ -108,9 +125,12 @@ async def push_document(
     must point at a real S3 object. Flushes, never commits."""
     if not doc.s3_key:
         return None
-    if doc.bucket_file_id is not None:
-        return await db.get(BucketFile, doc.bucket_file_id)
     bucket = await ensure_bucket(db, dealer)
+    if doc.bucket_file_id is not None:
+        linked = await db.get(BucketFile, doc.bucket_file_id)
+        if linked is not None and linked.deleted_at is None and linked.bucket_id == bucket.id:
+            return linked
+        doc.bucket_file_id = None
     bucket_file = BucketFile(
         bucket_id=bucket.id,
         file_name=doc.filename[:255],
@@ -124,6 +144,56 @@ async def push_document(
     doc.bucket_file_id = bucket_file.id
     await db.flush()
     return bucket_file
+
+
+async def soft_delete_mirrored_file(
+    db: AsyncSession,
+    bucket_file: BucketFile,
+    user: User,
+    *,
+    detail: str,
+) -> None:
+    """Remove a mirror from active bucket views while retaining its archive."""
+    if bucket_file.deleted_at is not None:
+        return
+    now = datetime.now(UTC)
+    bucket_file.deleted_at = now
+    bucket_file.deleted_by_user_id = user.id
+    bucket_file.delete_storage_status = "retained_for_audit"
+
+    if bucket_file.requested_document_id is not None:
+        requested = await db.get(BucketRequestedDocument, bucket_file.requested_document_id)
+        if requested is not None:
+            active_count = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(BucketFile)
+                    .where(
+                        BucketFile.requested_document_id == requested.id,
+                        BucketFile.id != bucket_file.id,
+                        BucketFile.status == "uploaded",
+                        BucketFile.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+            requested.status = "uploaded" if active_count else "requested"
+
+    role = getattr(user.role, "value", str(user.role))
+    db.add(
+        BucketActivityLog(
+            bucket_id=bucket_file.bucket_id,
+            actor_user_id=user.id,
+            actor_name=user.name,
+            actor_email=user.email,
+            actor_role=role,
+            action="file_removed_from_field_desk",
+            target_type="file",
+            target_id=str(bucket_file.id),
+            detail=detail,
+            created_at=now,
+        )
+    )
+    await db.flush()
 
 
 # --- cached-analysis adapter (pure, unit-testable) ---------------------------

@@ -1817,6 +1817,21 @@ class DocumentRead(ORM):
     updated_at: datetime
 
 
+class DocumentBucketSyncRead(BaseModel):
+    bucket_id: UUID | None = None
+    bucket_name: str | None = None
+    bucket_status: str | None = None
+    active_bucket_files: int = 0
+    tracked_documents: int = 0
+    pending_documents: int = 0
+    tracked_document_ids: list[UUID] = Field(default_factory=list)
+    last_synced_at: datetime | None = None
+    application_submitted: bool = False
+    package_evidence_exists: bool = False
+    can_delete_documents: bool = False
+    can_open_bucket: bool = False
+
+
 class DocumentCoverageRead(BaseModel):
     """Intake completeness rollup for the Documents tab — what the team still
     needs to collect vs. what the extracted documents already cover."""
