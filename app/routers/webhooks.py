@@ -31,6 +31,7 @@ closed: no configured token ⇒ all pushes rejected.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -58,6 +59,7 @@ from app.models.billing import (
 )
 from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.sms_message import SmsMessage
+from app.services.communication_events import publish_communication_event
 from app.services.notifications import (
     client_agent_user_ids,
     notify_inbound_communication,
@@ -90,15 +92,18 @@ def _sms_payload(raw: dict) -> dict:
 
 
 async def _triggered_poll() -> None:
-    """Run an inbound poll triggered by a Gmail push. Failure-isolated —
-    a bad poll must never surface as a webhook error (Pub/Sub would
-    just retry and hammer us)."""
+    """Refresh lender and client inboxes from one coalesced Gmail push."""
     from app.services.email.inbound_poller import run_inbound_poll
+    from app.services.email.user_inbox_sync import run_user_inbox_sync
 
-    try:
-        await run_inbound_poll()
-    except Exception:  # noqa: BLE001
-        log.exception("gmail webhook: triggered inbound poll failed")
+    results = await asyncio.gather(
+        run_inbound_poll(),
+        run_user_inbox_sync(),
+        return_exceptions=True,
+    )
+    for name, result in zip(("lender", "client"), results, strict=True):
+        if isinstance(result, Exception):
+            log.error("gmail webhook: %s inbox refresh failed", name, exc_info=result)
 
 
 @router.post("/gmail")
@@ -320,6 +325,17 @@ async def _store_inbound_sms(
         thread.unread_count = int(thread.unread_count or 0) + 1
         contact.last_activity_at = now
         await db.flush()
+        if thread.owner_user_id is not None:
+            await publish_communication_event(
+                db,
+                recipient_user_ids={thread.owner_user_id},
+                event_type="message.created",
+                dealer_id=thread.dealer_id,
+                thread_id=thread.id,
+                message_id=message_row.id,
+                channel="sms",
+                direction="inbound",
+            )
         await notify_inbound_communication(
             db,
             recipient_ids=recipient_ids,
@@ -421,6 +437,18 @@ async def twilio_sms_status(request: Request) -> Response:
                 if message_status in {"failed", "undelivered", "canceled"}
                 else None
             )
+            await db.flush()
+            if message.owner_user_id is not None:
+                await publish_communication_event(
+                    db,
+                    recipient_user_ids={message.owner_user_id},
+                    event_type="message.delivery_updated",
+                    dealer_id=message.dealer_id,
+                    thread_id=message.thread_id,
+                    message_id=message.id,
+                    channel="sms",
+                    direction="outbound",
+                )
         reminder = (
             await db.execute(
                 select(BookingNotificationReminder).where(
@@ -757,6 +785,28 @@ async def sms_inbound(request: Request) -> Response:
                 provider_message_id=message_id,
                 status="delivered" if event == "sms:delivered" else "sent",
             )
+            inbox_message = (
+                await db.execute(
+                    select(DealerRepInboxMessage).where(
+                        DealerRepInboxMessage.provider == "android",
+                        DealerRepInboxMessage.provider_message_id == message_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if inbox_message is not None:
+                inbox_message.delivery_status = "delivered" if event == "sms:delivered" else "sent"
+                await db.flush()
+                if inbox_message.owner_user_id is not None:
+                    await publish_communication_event(
+                        db,
+                        recipient_user_ids={inbox_message.owner_user_id},
+                        event_type="message.delivery_updated",
+                        dealer_id=inbox_message.dealer_id,
+                        thread_id=inbox_message.thread_id,
+                        message_id=inbox_message.id,
+                        channel="sms",
+                        direction="outbound",
+                    )
             await db.commit()
         log.info("sms webhook: %s for id=%s matched=%s", event, message_id, moved)
         return Response(status_code=status.HTTP_204_NO_CONTENT)

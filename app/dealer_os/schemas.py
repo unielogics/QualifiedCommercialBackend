@@ -318,6 +318,7 @@ class DealerIntegrationStatus(BaseModel):
     isoftpull: IntegrationProviderStatus
     plaid: IntegrationProviderStatus
     sms: IntegrationProviderStatus
+    messaging: IntegrationProviderStatus
     address: IntegrationProviderStatus
 
 

@@ -56,6 +56,10 @@ def start_scheduler() -> None:
         log.info("scheduler already running; skipping start")
         return
 
+    from app.config import get_settings
+
+    gmail_push_configured = bool(get_settings().gmail_pubsub_topic)
+
     # Phase 6 — debounced summarizer drain. Every 5 min picks up any
     # Loan with summary_dirty=True and refreshes its Living Loan File.
     scheduler.add_job(
@@ -257,7 +261,7 @@ def start_scheduler() -> None:
     scheduler.add_job(
         _wrap(job_lender_inbound_poll),
         "interval",
-        seconds=60,
+        seconds=300 if gmail_push_configured else 60,
         id="lender_inbound_poll",
         replace_existing=True,
         coalesce=True,
@@ -286,7 +290,7 @@ def start_scheduler() -> None:
     scheduler.add_job(
         _wrap(job_user_inbox_sync),
         "interval",
-        minutes=2,
+        minutes=5 if gmail_push_configured else 2,
         id="user_inbox_sync",
         replace_existing=True,
         coalesce=True,

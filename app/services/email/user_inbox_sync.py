@@ -117,11 +117,17 @@ async def _resolve_owner_user_id(db: AsyncSession, mailbox: str) -> uuid.UUID | 
     ).scalar_one_or_none()
 
 
-async def _processed_ids(db: AsyncSession, mailbox: str) -> set[str]:
-    """Gmail ids already stored for this mailbox — dedup within our OWN store
-    (separate namespace from the lender poller's email.inbound Activity)."""
+async def _processed_ids(db: AsyncSession, mailbox: str, gmail_ids: list[str]) -> set[str]:
+    """Return existing ids only for this provider batch, not the mailbox's lifetime."""
+    if not gmail_ids:
+        return set()
     rows = (
-        await db.execute(select(EmailMessage.gmail_message_id).where(EmailMessage.mailbox == mailbox))
+        await db.execute(
+            select(EmailMessage.gmail_message_id).where(
+                EmailMessage.mailbox == mailbox,
+                EmailMessage.gmail_message_id.in_(gmail_ids),
+            )
+        )
     ).scalars().all()
     return set(rows)
 
@@ -232,7 +238,8 @@ async def _run_impl(cfg) -> dict[str, int]:
         if owner_user_id is None:
             log.warning("user_inbox_sync: no owner user for mailbox=%s — skipping", mailbox)
             return {"skipped": 1, "reason_no_owner": 1}
-        seen = await _processed_ids(db, mailbox)
+        gmail_ids = [str(ref["id"]) for ref in refs if ref.get("id")]
+        seen = await _processed_ids(db, mailbox, gmail_ids)
 
         for ref in refs:
             gmail_id = ref.get("id")

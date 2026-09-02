@@ -58,7 +58,6 @@ from app.routers import (
     loan_workspace,
     loans,
     me,
-    sms as sms_router,
     messages,
     meta,
     notifications,
@@ -81,6 +80,9 @@ from app.routers import (
 )
 from app.routers import (
     settings as settings_router,
+)
+from app.routers import (
+    sms as sms_router,
 )
 from app.routers import (
     webhooks as webhooks_router,
@@ -129,10 +131,14 @@ async def startup() -> None:
     # before scaling out to multiple backend instances.
     from app.services.scheduler import start_scheduler
     start_scheduler()
+    from app.services.communication_events import broker as communication_event_broker
+    await communication_event_broker.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    from app.services.communication_events import broker as communication_event_broker
+    await communication_event_broker.stop()
     from app.services.scheduler import shutdown_scheduler
     shutdown_scheduler()
 

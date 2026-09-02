@@ -32,7 +32,6 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.deps import CurrentUser
-from app.dealer_os.deps import is_rep
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
@@ -1136,6 +1135,15 @@ async def dealer_integration_status(
     ).scalar_one_or_none()
     address_status = await provider_settings_status(db)
     address_provider = str(address_status["address_provider"])
+    from app.services.communication_events import broker as communication_event_broker
+
+    gmail_push_ready = bool(settings.gmail_pubsub_topic and settings.gmail_push_token)
+    client_inbox_ready = bool(
+        settings.user_inbox_sync_enabled
+        and not settings.use_fake_inbox
+        and settings.gmail_service_account_path
+        and settings.gmail_delegated_user
+    )
     return DealerIntegrationStatus(
         isoftpull={
             "configured": isoftpull_ready,
@@ -1161,6 +1169,16 @@ async def dealer_integration_status(
                 f"{sms_status['detail']}. Latest delivery failure: {latest_sms_failure}"
                 if latest_sms_failure
                 else str(sms_status["detail"])
+            ),
+        },
+        messaging={
+            "configured": bool(communication_event_broker.connected and client_inbox_ready),
+            "environment": "push + 5m recovery" if gmail_push_ready else "scheduled recovery",
+            "endpoint": "/api/v1/communications/events",
+            "detail": (
+                "Live event stream connected; Gmail push refreshes client and lender conversations."
+                if communication_event_broker.connected and gmail_push_ready and client_inbox_ready
+                else "Event stream is connecting or client Gmail synchronization is not fully configured."
             ),
         },
         address={
@@ -7160,6 +7178,19 @@ async def _append_rep_inbox_message(
     if contact is not None:
         contact.last_activity_at = now
     await db.flush()
+    if thread.owner_user_id is not None:
+        from app.services.communication_events import publish_communication_event
+
+        await publish_communication_event(
+            db,
+            recipient_user_ids={thread.owner_user_id},
+            event_type="message.created",
+            dealer_id=thread.dealer_id,
+            thread_id=thread.id,
+            message_id=msg.id,
+            channel=channel,
+            direction=direction,
+        )
     if direction == "inbound" and thread.owner_user_id is not None:
         await notify_inbound_communication(
             db,

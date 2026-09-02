@@ -177,6 +177,15 @@ async def notify_users(
             )
             row.emailed_at = now
     await db.flush()
+    from app.services.communication_events import publish_communication_event
+
+    for row in rows:
+        await publish_communication_event(
+            db,
+            recipient_user_ids={row.recipient_user_id},
+            event_type="notification.created",
+            notification_id=row.id,
+        )
     return rows
 
 

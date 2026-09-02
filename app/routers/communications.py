@@ -2,16 +2,20 @@ from __future__ import annotations
 
 # FastAPI dependency declarations intentionally use Depends in defaults.
 # ruff: noqa: B008
+import asyncio
+import json
 from collections import Counter
 from datetime import UTC, datetime
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import false as sql_false
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.dealer_os.models import (
     DealerBusiness,
     DealerMessage,
@@ -19,7 +23,7 @@ from app.dealer_os.models import (
     DealerRepInboxMessage,
     DealerRepInboxThread,
 )
-from app.deps import CurrentUser
+from app.deps import CurrentUser, get_current_user
 from app.enums import MessageFrom, Role
 from app.models.bucket import Bucket, BucketAIMessage, BucketNote, BucketUploadLink
 from app.models.client import Client
@@ -45,10 +49,123 @@ from app.schemas.communication import (
     UnifiedContactPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
+from app.services.communication_events import broker as communication_event_broker
 from app.services.user_access import is_audit_client
 
 router = APIRouter(prefix="/communications", tags=["communications"])
 SCAN_LIMIT = 750
+
+
+@router.get("/events")
+async def stream_communication_events(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    x_dev_user: Annotated[str | None, Header()] = None,
+) -> StreamingResponse:
+    """Stream scoped invalidation signals; message content stays in read APIs."""
+    async with SessionLocal() as auth_db:
+        try:
+            user = await get_current_user(
+                request=request,
+                authorization=authorization,
+                x_dev_user=x_dev_user,
+                db=auth_db,
+            )
+            user_id = user.id
+            await auth_db.commit()
+        except Exception:
+            await auth_db.rollback()
+            raise
+
+    async def stream():
+        yield "retry: 3000\n\n"
+        ready = {
+            "id": f"ready:{user_id}",
+            "type": "sync.required",
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
+        yield f"event: sync.required\ndata: {json.dumps(ready, separators=(',', ':'))}\n\n"
+        async with communication_event_broker.subscribe([user_audience(user_id)]) as queue:
+            while not await request.is_disconnected():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
+                event_type = str(event.get("type") or "sync.required")
+                event_id = str(event.get("id") or "")
+                payload = json.dumps(event, separators=(",", ":"))
+                yield f"id: {event_id}\nevent: {event_type}\ndata: {payload}\n\n"
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/sync-state")
+async def communication_sync_state(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """Cheap recovery cursor used only while the event stream is unavailable."""
+    thread_scope = []
+    if user.role == Role.FIELD_REP:
+        thread_scope.append(DealerRepInboxThread.owner_user_id == user.id)
+    elif user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
+        thread_scope.append(DealerRepInboxThread.owner_user_id == user.id)
+
+    latest_thread = (
+        await db.execute(select(func.max(DealerRepInboxThread.updated_at)).where(*thread_scope))
+    ).scalar_one_or_none()
+    latest_message = (
+        await db.execute(
+            select(func.max(DealerRepInboxMessage.updated_at))
+            .join(DealerRepInboxThread, DealerRepInboxThread.id == DealerRepInboxMessage.thread_id)
+            .where(*thread_scope)
+        )
+    ).scalar_one_or_none()
+    latest_notification = (
+        await db.execute(
+            select(func.max(Notification.updated_at)).where(Notification.recipient_user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    unread_messages = int(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(DealerRepInboxThread.unread_count), 0)).where(*thread_scope)
+            )
+        ).scalar_one()
+        or 0
+    )
+    unread_notifications = int(
+        (
+            await db.execute(
+                select(func.count(Notification.id)).where(
+                    Notification.recipient_user_id == user.id,
+                    Notification.read_at.is_(None),
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    latest = max(
+        (value for value in (latest_thread, latest_message, latest_notification) if value is not None),
+        default=None,
+    )
+    return {
+        "revision": latest.isoformat() if latest else None,
+        "unread_messages": unread_messages,
+        "unread_notifications": unread_notifications,
+        "stream_connected": communication_event_broker.connected,
+        "server_time": datetime.now(UTC).isoformat(),
+    }
 
 
 def _at(value: datetime | None) -> datetime:
