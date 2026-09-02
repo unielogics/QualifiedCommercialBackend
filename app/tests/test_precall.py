@@ -213,3 +213,14 @@ def test_public_booking_origin_follows_the_host_never_the_link() -> None:
 
     assert public_booking_origin(True) == "field_desk"
     assert public_booking_origin(False) == "public"
+
+
+# --- address parts ------------------------------------------------------------------
+
+
+def test_compose_address_writes_the_line_a_person_would_write() -> None:
+    assert precall.compose_address("12 Main St", "Newark", "NJ", "07102") == "12 Main St, Newark NJ 07102"
+    assert precall.compose_address("12 Main St", None, None, None) == "12 Main St"
+    assert precall.compose_address(None, "Newark", "NJ", None) == "Newark NJ"
+    assert precall.compose_address(None, None, None, None) is None
+    assert precall.compose_address("  ", " ", "", None) is None

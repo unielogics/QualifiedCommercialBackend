@@ -427,6 +427,20 @@ def _amount(value: str | None) -> float | None:
         return None
 
 
+def compose_address(
+    street: str | None, city: str | None, state: str | None, zip_code: str | None
+) -> str | None:
+    """The one-line address a person would write, from its parts.
+
+    Used where only the joined string is wanted for display. The parts
+    themselves are what a file stores, so they are never derived back out of
+    this string.
+    """
+    locality = " ".join(part for part in [(city or "").strip(), (state or "").strip(), (zip_code or "").strip()] if part)
+    joined = ", ".join(part for part in [(street or "").strip(), locality] if part)
+    return joined or None
+
+
 def _split_name(full: str) -> tuple[str, str]:
     parts = (full or "").strip().split()
     if not parts:
@@ -510,12 +524,22 @@ async def create_draft_for_booking(
     if dealer is None:
         created = True
         business_name = (company or "").strip() or notice.invitee_name
+        # The address as the rep typed it. A booking that carried only the
+        # joined display string keeps it on the street line, which is exactly
+        # what happened before the parts existed.
+        street = (appointment.street or None) if appointment is not None else None
+        city = (appointment.city or None) if appointment is not None else None
+        state = (appointment.state or None) if appointment is not None else None
+        zip_code = (appointment.zip or None) if appointment is not None else None
         dealer = DealerBusiness(
             name=business_name[:180],
             legal_name=business_name[:180],
             email=notice.invitee_email,
             phone=notice.invitee_phone,
-            address=notice.full_address,
+            address=street or notice.full_address,
+            city=city,
+            state=state,
+            zip=zip_code,
             funding_goal=_amount(notice.requested_amount),
             client_requested_amount=_amount(notice.requested_amount),
             client_requested_program=(notice.program_name or "")[:80] or None,

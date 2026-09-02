@@ -111,7 +111,10 @@ class DealerBusiness(TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     funding_purpose: Mapped[str | None] = mapped_column(String(48))  # working_capital|equipment|real_estate|refinance|floorplan|other
-    industry: Mapped[str] = mapped_column(String(48), default="auto_dealer", server_default="auto_dealer")
+    # No default. A file whose industry nobody stated used to claim to be an
+    # auto dealer, which routed it to the dealer vertical on nothing but a
+    # column default. Unknown stays unknown until someone says otherwise.
+    industry: Mapped[str | None] = mapped_column(String(48))
     industry_label: Mapped[str | None] = mapped_column(String(180))
     status: Mapped[str] = mapped_column(String(24), default="active", server_default="active")
     # Rep-facing deletion is an archive tombstone. The file and every related
@@ -651,6 +654,12 @@ class DealerRepAppointment(TimestampMixin, Base):
     program_name: Mapped[str | None] = mapped_column(String(180))
     requested_amount: Mapped[str | None] = mapped_column(String(40))
     full_address: Mapped[str | None] = mapped_column(String(500))
+    # The address as typed. full_address is the joined display string; these
+    # are what a file needs, and joining threw them away.
+    street: Mapped[str | None] = mapped_column(String(120))
+    city: Mapped[str | None] = mapped_column(String(120))
+    state: Mapped[str | None] = mapped_column(String(120))
+    zip: Mapped[str | None] = mapped_column(String(120))
     join_url: Mapped[str | None] = mapped_column(String(500))
     meeting_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="video", server_default="video"

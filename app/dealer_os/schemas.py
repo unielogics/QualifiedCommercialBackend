@@ -39,7 +39,7 @@ class DealerCreate(BaseModel):
     city: str | None = None
     state: str | None = None
     zip: str | None = None
-    industry: str = "auto_dealer"
+    industry: str | None = None
     industry_label: str | None = None
     subindustry: str | None = None
     subindustry_label: str | None = None
@@ -184,7 +184,7 @@ class DealerRead(ORM):
     city: str | None = None
     state: str | None = None
     zip: str | None = None
-    industry: str
+    industry: str | None = None
     industry_label: str | None = None
     subindustry: str | None = None
     subindustry_label: str | None = None
@@ -761,6 +761,10 @@ class RepAppointmentRead(ORM):
     program_name: str | None = None
     requested_amount: str | None = None
     full_address: str | None = None
+    street: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
     join_url: str | None = None
     meeting_mode: Literal["video", "phone", "in_person"] = "video"
     location: str | None = None
@@ -929,6 +933,12 @@ class RepAppointmentCreate(BaseModel):
     program_name: str | None = Field(default=None, max_length=180)
     requested_amount: str | None = Field(default=None, max_length=40)
     full_address: str | None = Field(default=None, max_length=500)
+    #: The address as typed. full_address is the display string; these are what
+    #: a client file needs, so they are carried rather than joined away.
+    street: str | None = Field(default=None, max_length=120)
+    city: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=120)
+    zip: str | None = Field(default=None, max_length=120)
     transactional_sms_consent: bool = False
     #: Which surface booked this. The rep app sends field_desk, the operator
     #: calendar sends calendar; absent, the booker's role decides.

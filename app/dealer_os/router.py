@@ -6781,6 +6781,8 @@ def _booking_description(
     if amount is None and dealer and dealer.funding_goal is not None:
         amount = "$" + format(float(dealer.funding_goal), ",.0f")
     address = (payload.full_address or "").strip() or None
+    if address is None:
+        address = precall.compose_address(payload.street, payload.city, payload.state, payload.zip)
     if address is None and dealer:
         address = ", ".join(
             part for part in [
@@ -6962,6 +6964,10 @@ def _appointment_payload(
         program_name=appt.program_name,
         requested_amount=appt.requested_amount,
         full_address=appt.full_address,
+        street=appt.street,
+        city=appt.city,
+        state=appt.state,
+        zip=appt.zip,
         transactional_sms_consent=transactional_sms_consent,
     )
 
@@ -9488,6 +9494,10 @@ async def create_standalone_rep_appointment(
         program_name=program,
         requested_amount=requested_amount,
         full_address=full_address,
+        street=payload.street,
+        city=payload.city,
+        state=payload.state,
+        zip=payload.zip,
         join_url=payload.join_url,
         meeting_mode=payload.meeting_mode,
         location=payload.location,
@@ -9769,6 +9779,10 @@ async def create_rep_appointment(
         program_name=program,
         requested_amount=requested_amount,
         full_address=full_address,
+        street=payload.street,
+        city=payload.city,
+        state=payload.state,
+        zip=payload.zip,
         join_url=payload.join_url,
         meeting_mode=payload.meeting_mode,
         location=payload.location,
@@ -10593,7 +10607,10 @@ async def _convert_appointment_to_field_desk(
         legal_name=appt.company or appt.invitee_name,
         email=appt.invitee_email,
         phone=appt.invitee_phone,
-        address=appt.full_address,
+        address=appt.street or appt.full_address,
+        city=appt.city,
+        state=appt.state,
+        zip=appt.zip,
         funding_goal=_appointment_amount(appt.requested_amount),
         client_requested_amount=_appointment_amount(appt.requested_amount),
         funding_purpose=(appt.program_name or "other")[:48],
