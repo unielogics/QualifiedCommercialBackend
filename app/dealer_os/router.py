@@ -11824,6 +11824,10 @@ async def create_rep_inbox_thread(
             sender=sender,
             recipient=recipient,
         )
+        # A thread opened in this request has its server-side timestamps
+        # expired after the flush; reading them lazily is not allowed in an
+        # async session (MissingGreenlet). Refresh once so the read is plain.
+        await db.refresh(thread)
         result_threads.append(_thread_read(thread, contact))
         result_messages.append(msg)
 
