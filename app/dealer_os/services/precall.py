@@ -92,16 +92,18 @@ ORIGINS = ("field_desk", "calendar", "public", "intake")
 DRAFT_ORIGINS = frozenset({"field_desk"})
 
 
-def origin_for(explicit: str | None, role: str | None) -> str:
+def origin_for(explicit: str | None, *, is_rep: bool) -> str:
     """The origin of a rep-appointment booking.
 
-    The surface says so when it can (the rep app sends field_desk, the
-    operator calendar sends calendar). Without that, a field rep is booking
-    for the field desk and anyone else is booking from the calendar.
+    A rep's booking is rep-related whatever screen it came from (the
+    codebase's own definition of a rep: FIELD_REP, or a broker with
+    field-desk access). A team role's booking is field_desk only when the
+    surface says so explicitly (the rep app); otherwise it is a calendar
+    booking whose file the outcome decides.
     """
-    if explicit in ORIGINS:
-        return explicit
-    return "field_desk" if (role or "").lower().endswith("field_rep") else "calendar"
+    if is_rep:
+        return "field_desk"
+    return explicit if explicit in ("field_desk", "calendar") else "calendar"
 
 
 def opens_draft(origin: str | None) -> bool:

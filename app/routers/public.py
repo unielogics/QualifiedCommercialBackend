@@ -328,14 +328,15 @@ class PublicBookingCreate(BaseModel):
     phone: str | None = Field(default=None, max_length=40)
     notes: str | None = Field(default=None, max_length=1000)
     transactional_sms_consent: bool = False
-    #: Origin hint carried by the link (e.g. the rep product booklet appends
-    #: ?source=field_desk_product). A field-desk source is a rep-related booking.
+    #: Campaign hint carried by the link (e.g. the rep product booklet appends
+    #: ?source=field_desk_product). Recorded for the desk; never decides a file.
     source: str | None = Field(default=None, max_length=64)
 
 
 class PublicBookingCreateResult(BaseModel):
     ok: bool
     event_id: str
+    appointment_id: str | None = None
     #: The client's secure room, when the booking opened a draft file.
     room_url: str | None = None
     pin_delivered_via: str | None = None
@@ -420,6 +421,10 @@ async def public_booking_create(
     )
     db.add(ev)
     await db.flush()
+    from app.dealer_os.deps import is_rep
+    from app.dealer_os.services import booking_appointments
+
+    host_is_rep = is_rep(user)
     notice = await booking_reminders.register_booking(
         db,
         event=ev,
@@ -431,12 +436,24 @@ async def public_booking_create(
         sms_consent_method="self_web" if payload.transactional_sms_consent else None,
         sms_consent_ip=ip,
         sms_consent_user_agent=request.headers.get("user-agent"),
+        # A booking on a rep's own page is that rep's: it lands on their
+        # calendar and they get the staff reminders.
+        booked_by_user_id=user.id if host_is_rep else None,
     )
-    # Which file a public booking gets follows its origin. A booking through a
-    # rep's own page (the host is a field rep) or from a rep-sourced link is a
-    # field-desk booking and opens the draft file; the team's public page opens
-    # nothing — the calendar outcome decides (intake, funding loan, dealer).
-    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user, source=payload.source)
+    appointment = await booking_appointments.create_booking_appointment(
+        db,
+        event=ev,
+        host=user,
+        booking=booking,
+        origin=public_booking_origin(host_is_rep),
+        invitee_name=payload.full_name,
+        invitee_email=payload.email,
+        invitee_phone=payload.phone,
+        notes=payload.notes,
+        booked_by_user_id=user.id if host_is_rep else None,
+        contact_source="public_booking",
+    )
+    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user, appointment=appointment)
 
     db.add(
         Activity(
@@ -453,6 +470,9 @@ async def public_booking_create(
                 "starts_at": starts_at.isoformat(),
                 "duration_min": booking.duration_min,
                 "source": "public_booking_page",
+                # The link's hint (e.g. ?source=field_desk_product) is kept as a
+                # campaign label for the desk; it never decides anything.
+                "campaign": (payload.source or "")[:64] or None,
             },
         )
     )
@@ -462,10 +482,11 @@ async def public_booking_create(
     await db.commit()
     await db.refresh(ev)
 
-    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice, draft=draft)
+    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice, draft=draft, appointment=appointment)
     return PublicBookingCreateResult(
         ok=True,
         event_id=str(ev.id),
+        appointment_id=str(appointment.id),
         room_url=draft.room.url if draft is not None else None,
         pin_delivered_via=notice.precall_pin_delivered_via,
     )
@@ -598,26 +619,28 @@ def _to_utc_minute(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
-def public_booking_origin(host_role: str | None, source: str | None) -> str:
-    """field_desk when the page belongs to a field rep or the link says so; public otherwise."""
-    role = (host_role or "").lower()
-    if role.endswith("field_rep") or (source or "").lower().startswith("field_desk"):
-        return "field_desk"
-    return "public"
+def public_booking_origin(host_is_rep: bool) -> str:
+    """field_desk when the page belongs to a rep; public for the team's page.
+
+    Decided from the host alone — a server fact. The link's ?source= is an
+    unauthenticated query parameter and must never open a file on its own.
+    """
+    return "field_desk" if host_is_rep else "public"
 
 
-async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User, source: str | None):
+async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User, appointment=None):
     """Rep-related public bookings open the draft file + room; the team page opens nothing. Flushes only."""
     from sqlalchemy.exc import SQLAlchemyError
 
+    from app.dealer_os.deps import is_rep
     from app.dealer_os.services import precall
 
-    origin = public_booking_origin(getattr(host.role, "value", str(host.role)), source)
+    origin = public_booking_origin(is_rep(host))
     if not booking.precall_enabled or not precall.opens_draft(origin):
         return None
     try:
         result = await precall.create_draft_for_booking(
-            db, notice=notice, event=event, booking=booking, host=host,
+            db, notice=notice, event=event, booking=booking, host=host, appointment=appointment,
             notes=f"Booked from {host.name or 'the rep'}'s public booking page.",
         )
         ready = await precall.readiness(db, result.dealer)
@@ -640,6 +663,7 @@ async def _deliver_booking(
     ev: CalendarEvent,
     notice,
     draft=None,
+    appointment=None,
 ) -> None:
     """Everything that happens after the booking row is safely committed.
 
@@ -660,6 +684,8 @@ async def _deliver_booking(
     )
     if join_url:
         notice.join_url = join_url
+        if appointment is not None:
+            appointment.join_url = join_url
         try:
             ev.description = f"{ev.description or ''}\n\nJoin: {join_url}".strip()
             await db.commit()

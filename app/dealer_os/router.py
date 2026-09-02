@@ -32,6 +32,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.deps import CurrentUser
+from app.dealer_os.deps import is_rep
 from app.services.provider_secrets import provider_settings_status
 from app.config import get_settings
 from app.models.user import User
@@ -8353,6 +8354,11 @@ async def _link_calendar_file(
         "converted_intake_id": appointment.converted_intake_id,
         "linked_loan_id": appointment.linked_loan_id,
     }
+    # Linking a different file replaces the draft this booking opened. An
+    # untouched draft is archived; one the client already worked in is kept
+    # (409) so nothing the client did is orphaned — promote it instead.
+    if kind != "dealer" or file_id != appointment.dealer_id:
+        await _supersede_booking_draft(db, appointment, user)
     if kind == "dealer":
         dealer = await resolve_dealer_scope(db, user, file_id)
         appointment.dealer_id = dealer.id
@@ -9513,7 +9519,7 @@ async def create_standalone_rep_appointment(
         marketing=False,
         method="in_person_device",
     )
-    appt.origin = precall.origin_for(payload.origin, getattr(user.role, "value", str(user.role)))
+    appt.origin = precall.origin_for(payload.origin, is_rep=is_rep(user))
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
         booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind, origin=appt.origin,

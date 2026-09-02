@@ -9188,6 +9188,26 @@ async def book_dealer_call(
     db.add(ev)
     await db.flush()
     notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    # The calendar needs an appointment row to act on this booking; the
+    # intake is its file, so it is linked from the start (origin=intake).
+    from app.dealer_os.services import booking_appointments
+
+    await booking_appointments.create_booking_appointment(
+        db,
+        event=ev,
+        host=owner,
+        booking=booking,
+        origin="intake",
+        invitee_name=intake.full_name,
+        invitee_email=intake.email,
+        invitee_phone=intake.phone,
+        company=intake.business_name,
+        notes=f"Booked from the AI intake ({intake.variant}).",
+        program_name=intake.loan_purpose,
+        requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
+        converted_intake_id=intake.id,
+        contact_source="ai_intake",
+    )
 
     state = _intake_state(intake)
     state["call_booking"] = {
@@ -9856,6 +9876,26 @@ async def book_funding_review_call(
     db.add(ev)
     await db.flush()
     notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    # The calendar needs an appointment row to act on this booking; the
+    # intake is its file, so it is linked from the start (origin=intake).
+    from app.dealer_os.services import booking_appointments
+
+    await booking_appointments.create_booking_appointment(
+        db,
+        event=ev,
+        host=owner,
+        booking=booking,
+        origin="intake",
+        invitee_name=intake.full_name,
+        invitee_email=intake.email,
+        invitee_phone=intake.phone,
+        company=intake.business_name,
+        notes=f"Booked from the AI intake ({intake.variant}).",
+        program_name=intake.loan_purpose,
+        requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
+        converted_intake_id=intake.id,
+        contact_source="ai_intake",
+    )
     state = _intake_state(intake)
     state["call_booking"] = {
         "event_id": str(ev.id),
@@ -10831,6 +10871,26 @@ async def book_mca_refinance_call(
     db.add(ev)
     await db.flush()
     notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    # The calendar needs an appointment row to act on this booking; the
+    # intake is its file, so it is linked from the start (origin=intake).
+    from app.dealer_os.services import booking_appointments
+
+    await booking_appointments.create_booking_appointment(
+        db,
+        event=ev,
+        host=owner,
+        booking=booking,
+        origin="intake",
+        invitee_name=intake.full_name,
+        invitee_email=intake.email,
+        invitee_phone=intake.phone,
+        company=intake.business_name,
+        notes=f"Booked from the AI intake ({intake.variant}).",
+        program_name=intake.loan_purpose,
+        requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
+        converted_intake_id=intake.id,
+        contact_source="ai_intake",
+    )
     state = _intake_state(intake)
     state["call_booking"] = {
         "event_id": str(ev.id),

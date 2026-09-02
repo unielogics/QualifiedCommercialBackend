@@ -191,13 +191,13 @@ def test_settings_reject_pin_outside_the_pin_messages_and_clean_templates() -> N
 # --- origin → file rule --------------------------------------------------------------
 
 
-def test_origin_is_explicit_when_the_surface_says_and_role_based_otherwise() -> None:
-    assert precall.origin_for("field_desk", "super_admin") == "field_desk"
-    assert precall.origin_for("calendar", "field_rep") == "calendar"
-    assert precall.origin_for(None, "field_rep") == "field_desk"
-    assert precall.origin_for(None, "Role.FIELD_REP".lower()) == "field_desk"
-    assert precall.origin_for(None, "super_admin") == "calendar"
-    assert precall.origin_for("bogus", "loan_exec") == "calendar"
+def test_a_rep_is_always_field_desk_and_team_roles_need_to_say_so() -> None:
+    assert precall.origin_for(None, is_rep=True) == "field_desk"
+    assert precall.origin_for("calendar", is_rep=True) == "field_desk"
+    assert precall.origin_for("field_desk", is_rep=False) == "field_desk"
+    assert precall.origin_for("calendar", is_rep=False) == "calendar"
+    assert precall.origin_for(None, is_rep=False) == "calendar"
+    assert precall.origin_for("bogus", is_rep=False) == "calendar"
 
 
 def test_only_field_desk_bookings_open_the_draft() -> None:
@@ -208,10 +208,8 @@ def test_only_field_desk_bookings_open_the_draft() -> None:
     assert not precall.opens_draft(None)
 
 
-def test_public_booking_origin_follows_the_host_or_the_link() -> None:
+def test_public_booking_origin_follows_the_host_never_the_link() -> None:
     from app.routers.public import public_booking_origin
 
-    assert public_booking_origin("field_rep", None) == "field_desk"
-    assert public_booking_origin("super_admin", "field_desk_product") == "field_desk"
-    assert public_booking_origin("super_admin", None) == "public"
-    assert public_booking_origin("super_admin", "newsletter") == "public"
+    assert public_booking_origin(True) == "field_desk"
+    assert public_booking_origin(False) == "public"
