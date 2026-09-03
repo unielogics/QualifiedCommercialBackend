@@ -683,7 +683,17 @@ async def update_application_underwriting(
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         return _underwriting_read(profile)
+    await apply_underwriting_changes(db, profile, user, changes)
+    await db.commit()
+    await db.refresh(profile)
+    return _underwriting_read(profile)
 
+
+async def apply_underwriting_changes(
+    db: AsyncSession, profile: ApplicationProfile, user: User, changes: dict
+) -> Loan | None:
+    """Write underwriting fields, sync the loan stage and audit. Flushes; the caller commits.
+    Shared by the PATCH above and the Production Package term sheet (write-through)."""
     now = datetime.now(UTC)
     status_value = changes.get("underwriting_status")
     if status_value is not None:
@@ -730,9 +740,8 @@ async def update_application_underwriting(
             "loan_stage": loan.stage.value if loan else None,
         },
     )
-    await db.commit()
-    await db.refresh(profile)
-    return _underwriting_read(profile)
+    await db.flush()
+    return loan
 
 
 def _masked_recipient(channel: str, email: str | None, phone: str | None) -> str | None:

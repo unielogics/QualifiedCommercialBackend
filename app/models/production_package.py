@@ -20,11 +20,13 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -41,7 +43,8 @@ from app.models._mixins import TimestampMixin
 PACKAGE_STATUSES: tuple[str, ...] = ("draft", "out_for_signature", "executed", "void")
 REVISION_STATUSES: tuple[str, ...] = ("out_for_signature", "executed", "void")
 SIGNATURE_PARTIES: tuple[str, ...] = ("dealer", "qc", "sponsor")
-SIGNATURE_METHODS: tuple[str, ...] = ("electronic", "manual")
+SIGNATURE_METHODS: tuple[str, ...] = ("electronic", "manual", "stored")
+TERM_SHEET_STATUSES: tuple[str, ...] = ("current", "superseded", "withdrawn")
 SIGNATURE_STATUSES: tuple[str, ...] = ("pending", "signed", "voided")
 
 
@@ -56,10 +59,26 @@ def _user_ref() -> Mapped[uuid.UUID | None]:
 class ProductionPackage(TimestampMixin, Base):
     __tablename__ = "production_packages"
     __table_args__ = (
-        UniqueConstraint("profile_id", name="uq_production_packages_profile"),
+        # Stage one keeps its shipped semantics (one row per profile, void is
+        # terminal); only a voided FINAL may be redrafted.
+        Index(
+            "uq_production_packages_profile_stage_live", "profile_id", "stage", unique=True,
+            postgresql_where=text("stage = 1 OR status <> 'void'"),
+        ),
+        # The intake room's gate query stays single-row by construction.
+        Index(
+            "uq_production_packages_profile_out", "profile_id", unique=True,
+            postgresql_where=text("status = 'out_for_signature'"),
+        ),
+        CheckConstraint(
+            "(stage = 1 AND parent_package_id IS NULL AND source_revision_id IS NULL AND term_sheet_id IS NULL) "
+            "OR (stage = 2 AND parent_package_id IS NOT NULL AND source_revision_id IS NOT NULL AND term_sheet_id IS NOT NULL)",
+            name="ck_production_packages_parent_stage",
+        ),
         Index("ix_production_packages_intake", "intake_id"),
         Index("ix_production_packages_dealer", "dealer_id"),
         Index("ix_production_packages_status", "status"),
+        Index("ix_production_packages_parent", "parent_package_id"),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -117,8 +136,27 @@ class ProductionPackage(TimestampMixin, Base):
 
     created_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
     updated_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
-    updated_via: Mapped[str | None] = mapped_column(String(16))  # operator | share_link
+    updated_via: Mapped[str | None] = mapped_column(String(16))  # operator | share_link | partner
     updated_share_link_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+
+    # ---- stage two (the final, Program Activation and Production Agreement) ----
+    # The child package points at the executed stage-one package and the exact
+    # revision it was drafted from; the parent is never written again.
+    parent_package_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("production_packages.id", ondelete="RESTRICT")
+    )
+    source_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("production_package_revisions.id", ondelete="RESTRICT", use_alter=True,
+                                          name="fk_production_packages_source_revision")
+    )
+    term_sheet_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("production_term_sheets.id", ondelete="RESTRICT", use_alter=True,
+                                          name="fk_production_packages_term_sheet")
+    )
+    sent_via: Mapped[str | None] = mapped_column(String(16))  # operator | share_link | partner
+    sent_share_link_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    # Set when the dealer signed but the execution bundle could not be assembled; the desk retries.
+    execution_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
 
 class ProductionPackageRevision(TimestampMixin, Base):
@@ -225,6 +263,74 @@ class ProductionPackageSignature(TimestampMixin, Base):
     recorded_ip: Mapped[str | None] = mapped_column(String(64))
     recorded_user_agent: Mapped[str | None] = mapped_column(String(400))
     note: Mapped[str | None] = mapped_column(Text)
+
+    # Typed initials (jury-trial waiver, Schedule C/3 acknowledgment) and, for
+    # signatures placed from file (method="stored"), which stored signature.
+    initials: Mapped[str | None] = mapped_column(String(8))
+    stored_signature_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("stored_signatures.id", ondelete="RESTRICT", use_alter=True,
+                                          name="fk_production_package_signatures_stored")
+    )
+    placed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    placed_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+
+
+class ProductionTermSheet(TimestampMixin, Base):
+    """The loan terms, recorded by the desk before the final package can be
+    drafted. Append-only versions; one `current` row per profile."""
+
+    __tablename__ = "production_term_sheets"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "version", name="uq_production_term_sheets_version"),
+        Index("ix_production_term_sheets_profile", "profile_id"),
+        Index("uq_production_term_sheets_current", "profile_id", unique=True, postgresql_where=text("status = 'current'")),
+        CheckConstraint(
+            "approved_amount > 0 AND min_activation_amount > 0 AND min_activation_amount <= approved_amount",
+            name="ck_production_term_sheets_amounts",
+        ),
+        CheckConstraint("rate_pct >= 0 AND term_months > 0 AND monthly_debt_service > 0", name="ck_production_term_sheets_pricing"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="current", server_default="current")
+    funding_party_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    lender_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("lenders.id", ondelete="SET NULL"))
+    funding_party_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    facility_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    approved_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    min_activation_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    rate_pct: Mapped[float] = mapped_column(Numeric(7, 3), nullable=False)
+    term_months: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    monthly_debt_service: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    debt_service_is_level_payment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    expected_funding_date: Mapped[date | None] = mapped_column(Date)
+    activation_date: Mapped[date | None] = mapped_column(Date)
+    commencement_date: Mapped[date | None] = mapped_column(Date)
+    maturity_date: Mapped[date | None] = mapped_column(Date)
+    use_of_funds: Mapped[dict | None] = mapped_column(JSONB)
+    conditions: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+    extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("production_term_sheets.id", ondelete="RESTRICT")
+    )
+    entered_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    entered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    entered_ip: Mapped[str | None] = mapped_column(String(64))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    withdrawn_by_user_id: Mapped[uuid.UUID | None] = _user_ref()
+    withdraw_reason: Mapped[str | None] = mapped_column(Text)
+    consumed_by_package_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("production_packages.id", ondelete="SET NULL", use_alter=True,
+                                          name="fk_production_term_sheets_consumed_by")
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProductionPackageShareLink(TimestampMixin, Base):

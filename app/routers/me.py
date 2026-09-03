@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +38,8 @@ from app.schemas.booking_settings import (
     UserBookingSettingsUpdate,
 )
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
+from app.schemas.stored_signature import StoredSignatureAdoptBody, StoredSignatureState
+from app.services import stored_signatures as stored_sigs
 
 router = APIRouter(prefix="/me", tags=["me"])
 log = logging.getLogger(__name__)
@@ -1550,3 +1552,58 @@ async def my_files(
 
     rows.sort(key=lambda r: r.updated_at, reverse=True)
     return rows
+
+
+# ── Signature on file ───────────────────────────────────────────────────
+#
+# Any signed-in user may adopt one signature (E-SIGN adoption consent) that
+# gets placed on program agreements on their behalf — relationship managers
+# on the Production Package, dealer partners on their own paperwork. One live
+# row per user; adopting again retires the previous one, revoking never
+# touches documents already sent. Service: app.services.stored_signatures.
+
+def _signature_state(sig) -> StoredSignatureState:
+    return StoredSignatureState(
+        signature=stored_sigs.read_model(sig, presign=True),
+        consent_text=stored_sigs.STORED_SIGNATURE_CONSENT_TEXT,
+        consent_version=stored_sigs.STORED_SIGNATURE_CONSENT_VERSION,
+    )
+
+
+@router.get("/signature", response_model=StoredSignatureState)
+async def get_my_signature(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StoredSignatureState:
+    """The caller's live signature on file (null when none) plus the consent
+    text/version the pad shows before adopting one."""
+    return _signature_state(await stored_sigs.current(db, "user", user.id))
+
+
+@router.post("/signature", response_model=StoredSignatureState)
+async def adopt_my_signature(
+    payload: StoredSignatureAdoptBody,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StoredSignatureState:
+    """Adopt a pad drawing as the caller's signature on file. Consent is
+    required; a previous live signature is retired first."""
+    sig = await stored_sigs.adopt_user_signature(
+        db, user=user, signature_data_url=payload.signature_data_url, typed_name=payload.typed_name,
+        title=payload.title, consent=payload.consent, request=request,
+    )
+    await db.commit()
+    return _signature_state(sig)
+
+
+@router.delete("/signature", response_model=StoredSignatureState)
+async def revoke_my_signature(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> StoredSignatureState:
+    """Retire the caller's signature on file. Idempotent: returns the empty
+    state when nothing was live."""
+    await stored_sigs.revoke(db, subject_type="user", subject_id=user.id, user=user, reason="self")
+    await db.commit()
+    return _signature_state(None)

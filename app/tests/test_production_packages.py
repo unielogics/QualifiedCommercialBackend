@@ -92,8 +92,11 @@ def _user(role: Role, **kw) -> SimpleNamespace:
                            account_access_types=[], deleted_at=None, **kw)
 
 
-def _access(status: str = "draft", role: Role = Role.LOAN_EXEC, mode: str = "operator", link=None) -> pkgs.PackageAccess:
-    package = SimpleNamespace(id=uuid.uuid4(), status=status, version=1, arrangement={}, prefill_provenance={})
+def _access(status: str = "draft", role: Role = Role.LOAN_EXEC, mode: str = "operator", link=None, stage: int = 1, **pkg) -> pkgs.PackageAccess:
+    fields = {"id": uuid.uuid4(), "status": status, "version": 1, "arrangement": {}, "prefill_provenance": {}, "stage": stage,
+              "sent_by_user_id": None, "execution_pending": False, "sponsor_company_id": None}
+    fields.update(pkg)
+    package = SimpleNamespace(**fields)
     profile = SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None, intake_id=None, primary_bucket_id=None)
     return pkgs.PackageAccess(package=package, profile=profile, user=_user(role), mode=mode, link=link)
 
@@ -101,16 +104,40 @@ def _access(status: str = "draft", role: Role = Role.LOAN_EXEC, mode: str = "ope
 def test_capabilities_by_role_and_status():
     draft_exec = _access("draft", Role.LOAN_EXEC).capabilities()
     assert draft_exec.can_edit and draft_exec.can_send and draft_exec.can_share and not draft_exec.can_record
+    assert draft_exec.can_manage_terms and not draft_exec.can_draft_final and not draft_exec.can_adopt_sponsor_signature
     sent_admin = _access("out_for_signature", Role.SUPER_ADMIN).capabilities()
-    assert not sent_admin.can_edit and sent_admin.can_record and sent_admin.can_execute and sent_admin.can_reopen
+    assert not sent_admin.can_edit and sent_admin.can_record and sent_admin.can_reopen and sent_admin.can_remind
+    assert not sent_admin.can_execute  # execution is automatic; the retry appears only when pending
+    pending_admin = _access("out_for_signature", Role.SUPER_ADMIN, execution_pending=True).capabilities()
+    assert pending_admin.can_execute
     sent_exec = _access("out_for_signature", Role.LOAN_EXEC).capabilities()
     assert sent_exec.can_reopen and not sent_exec.can_record and not sent_exec.can_void
+    # agents: a rep holding a live link, and a dealer partner on their own lead, may send stage one
     rep = _access("draft", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4())).capabilities()
-    assert rep.can_edit and rep.can_generate and not rep.can_send and not rep.can_share and not rep.can_pick_sponsor
+    assert rep.can_edit and rep.can_generate and rep.can_send and not rep.can_share and not rep.can_pick_sponsor and not rep.can_manage_terms
+    partner = _access("draft", Role.DEALER_PARTNER, mode="partner").capabilities()
+    assert partner.can_edit and partner.can_send and not partner.can_share and not partner.can_pick_sponsor
+    rep_no_link = _access("draft", Role.FIELD_REP, mode="rep").capabilities()
+    assert not rep_no_link.can_edit and not rep_no_link.can_send
     rep_sent = _access("out_for_signature", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4())).capabilities()
-    assert not rep_sent.can_edit
+    assert not rep_sent.can_edit and not rep_sent.can_remind  # did not send it
+    me = _user(Role.FIELD_REP)
+    mine = pkgs.PackageAccess(package=SimpleNamespace(id=uuid.uuid4(), status="out_for_signature", version=1, arrangement={}, prefill_provenance={}, stage=1, sent_by_user_id=me.id, execution_pending=False, sponsor_company_id=None),
+                              profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None), user=me, mode="rep", link=SimpleNamespace(id=uuid.uuid4()))
+    assert mine.capabilities().can_remind
     executed = _access("executed", Role.SUPER_ADMIN).capabilities()
     assert not (executed.can_edit or executed.can_send or executed.can_void or executed.can_execute)
+    assert not executed.can_draft_final  # needs a term sheet
+    exec_with_sheet = _access("executed", Role.LOAN_EXEC)
+    exec_with_sheet.term_sheet = SimpleNamespace(id=uuid.uuid4())
+    assert exec_with_sheet.capabilities().can_draft_final and exec_with_sheet.capabilities().can_compare is False
+    exec_with_sheet.child = SimpleNamespace(id=uuid.uuid4(), status="draft")
+    assert not exec_with_sheet.capabilities().can_draft_final and exec_with_sheet.capabilities().can_compare
+    # the final: desk only, no sharing, no presentation
+    final = _access("draft", Role.LOAN_EXEC, stage=2).capabilities()
+    assert final.can_edit and final.can_send and not final.can_share and not final.can_generate and final.can_compare
+    final_rep = _access("draft", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4()), stage=2).capabilities()
+    assert not final_rep.can_edit and not final_rep.can_send
 
 
 async def test_rep_share_requires_rep_role_then_misses_identically():
@@ -166,7 +193,7 @@ async def test_rep_share_training_file_is_404_and_archived_is_410():
     pkgs._MISSES.clear()
     link = SimpleNamespace(rep_user_id=rep.id, revoked_at=None, expires_at=datetime.now(UTC) + timedelta(days=1),
                            package_id=uuid.uuid4(), last_used_at=None, use_count=0)
-    package = SimpleNamespace(id=link.package_id, profile_id=uuid.uuid4(), status="draft")
+    package = SimpleNamespace(id=link.package_id, profile_id=uuid.uuid4(), status="draft", stage=1)
     profile = SimpleNamespace(id=package.profile_id, vertical="dealer", dealer_id=uuid.uuid4(), intake_id=None)
     training = SimpleNamespace(is_training=True, archived_at=None)
 
@@ -174,6 +201,8 @@ async def test_rep_share_training_file_is_404_and_archived_is_410():
         return {package.id: package, profile.id: profile, profile.dealer_id: training}.get(key)
 
     db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: link)), get=get, flush=AsyncMock())
+    with patch.object(pkgs, "_load_family", AsyncMock()):
+        pass
     with pytest.raises(HTTPException) as exc:
         await pkgs.resolve_rep_share(db, rep, "tok")
     assert exc.value.status_code == 404
@@ -183,13 +212,14 @@ async def test_rep_share_training_file_is_404_and_archived_is_410():
         await pkgs.resolve_rep_share(db, rep, "tok")
     assert exc.value.status_code == 410
     training.archived_at = None
-    access = await pkgs.resolve_rep_share(db, rep, "tok")
-    assert access.mode == "rep" and access.editable and link.use_count == 1
+    with patch.object(pkgs, "_load_family", AsyncMock()):
+        access = await pkgs.resolve_rep_share(db, rep, "tok")
+    assert access.mode == "rep" and access.via == "share_link" and access.editable and link.use_count == 1
 
 
 async def test_rep_cannot_touch_sponsor_keys():
     rep = _user(Role.FIELD_REP)
-    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=3, arrangement={}, prefill_provenance={})
+    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=3, arrangement={}, prefill_provenance={}, stage=1, sent_by_user_id=None, execution_pending=False)
     access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None),
                                 user=rep, mode="rep", link=SimpleNamespace(id=uuid.uuid4()))
 
@@ -207,7 +237,7 @@ async def test_rep_cannot_touch_sponsor_keys():
 
 async def test_apply_changes_bumps_version_and_records_diff():
     user = _user(Role.LOAN_EXEC)
-    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement={"dealer_name": "Old"},
+    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement={"dealer_name": "Old"}, stage=1,
                               prefill_provenance={"dealer_name": {"source": "intake", "label": "AI intake", "confirmed": False}})
     profile = SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None, primary_bucket_id=None)
     access = pkgs.PackageAccess(package=package, profile=profile, user=user, mode="operator")
@@ -229,7 +259,7 @@ async def test_apply_changes_bumps_version_and_records_diff():
 
 async def test_frozen_package_refuses_edits():
     user = _user(Role.SUPER_ADMIN)
-    package = SimpleNamespace(id=uuid.uuid4(), status="out_for_signature", version=1, arrangement={}, prefill_provenance={})
+    package = SimpleNamespace(id=uuid.uuid4(), status="out_for_signature", version=1, arrangement={}, prefill_provenance={}, stage=1)
     access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None), user=user, mode="operator")
 
     async def get(model, key, with_for_update=False):
@@ -245,7 +275,7 @@ async def test_frozen_package_refuses_edits():
 async def test_send_refuses_blanks_and_is_idempotent_once_out():
     user = _user(Role.LOAN_EXEC)
     package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement=pa.empty_arrangement(),
-                              prefill_provenance={}, stage=1, delivery_history=[])
+                              prefill_provenance={}, stage=1, delivery_history=[], sent_by_user_id=None, execution_pending=False, sponsor_company_id=None)
     profile = SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None, intake_id=None, primary_bucket_id=None)
     access = pkgs.PackageAccess(package=package, profile=profile, user=user, mode="operator")
 
@@ -273,7 +303,7 @@ async def test_send_requires_a_signed_sponsor():
     assert pa.compute(arr)["attention"] == []
     user = _user(Role.LOAN_EXEC)
     package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement=arr, prefill_provenance={},
-                              stage=1, delivery_history=[], sponsor_company_id=None)
+                              stage=1, delivery_history=[], sponsor_company_id=None, sent_by_user_id=None, execution_pending=False)
     profile = SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None, intake_id=None, primary_bucket_id=None)
     access = pkgs.PackageAccess(package=package, profile=profile, user=user, mode="operator")
 
@@ -342,3 +372,91 @@ def test_apply_prefill_only_fills_blanks_unless_forced():
     assert merged["term"] == 24 and "term" in applied  # untouched default gets replaced
     forced, _p, applied2, _s = prefill.apply_prefill(arrangement, {}, result, force=True)
     assert forced["dealer_name"] == "Prefilled Co" and set(applied2) == {"dealer_name", "term"}
+
+
+
+# ---- stage two, terms and signatures on file -------------------------------
+
+def test_initials_match_rules():
+    assert signing._initials_match("RD", "Rafael Delgado")
+    assert signing._initials_match("rmd", "Rafael M. Delgado")
+    assert signing._initials_match("RD", "Rafael M. Delgado")  # middle optional
+    assert not signing._initials_match("XD", "Rafael Delgado")
+    assert not signing._initials_match("R", "Rafael Delgado")
+    assert signing._initials_of("Rafael M. Delgado") == "RMD"
+
+
+async def test_draft_final_preconditions():
+    user = _user(Role.LOAN_EXEC)
+    parent = SimpleNamespace(id=uuid.uuid4(), stage=1, status="draft", frozen_revision_id=None, profile_id=uuid.uuid4())
+    access = pkgs.PackageAccess(package=parent, profile=SimpleNamespace(id=parent.profile_id, vertical="dealer", dealer_id=None), user=user, mode="operator")
+
+    async def get(model, key, with_for_update=False):
+        return parent
+
+    db = SimpleNamespace(get=get, flush=AsyncMock(), execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)))
+    with pytest.raises(HTTPException) as exc:
+        await pkgs.draft_final(db, access)
+    assert exc.value.status_code == 409 and exc.value.detail["code"] == "stage_one_not_executed"
+    rep_access = pkgs.PackageAccess(package=parent, profile=access.profile, user=_user(Role.FIELD_REP), mode="rep", link=SimpleNamespace(id=uuid.uuid4()))
+    with pytest.raises(HTTPException) as exc:
+        await pkgs.draft_final(db, rep_access)
+    assert exc.value.status_code == 403
+    # executed parent + executed revision but no term sheet
+    parent.status = "executed"
+    parent.frozen_revision_id = uuid.uuid4()
+    revision = SimpleNamespace(id=parent.frozen_revision_id, status="executed", revision_no=1, snapshot={"arrangement": {}}, content_sha256="x")
+
+    async def get2(model, key, with_for_update=False):
+        return revision if key == parent.frozen_revision_id else parent
+
+    db2 = SimpleNamespace(get=get2, flush=AsyncMock(), execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)))
+    with patch.object(pkgs.sheets_svc, "current_sheet", AsyncMock(return_value=None)):
+        with pytest.raises(HTTPException) as exc:
+            await pkgs.draft_final(db2, access)
+    assert exc.value.status_code == 409 and exc.value.detail["code"] == "terms_missing"
+
+
+async def test_stage_two_apply_changes_locks_term_keys():
+    user = _user(Role.LOAN_EXEC)
+    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement={}, prefill_provenance={}, stage=2,
+                              sent_by_user_id=None, execution_pending=False, sponsor_company_id=None)
+    access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None), user=user, mode="operator")
+
+    async def get(model, key, with_for_update=False):
+        return package
+
+    with pytest.raises(HTTPException) as exc:
+        await pkgs.apply_changes(SimpleNamespace(get=get, flush=AsyncMock()), access, changes={"debt_service": 1}, version=1)
+    assert exc.value.status_code == 422 and exc.value.detail["code"] == "maintained_by_term_sheet"
+
+
+async def test_delete_guard_reads_every_row():
+    rows = [SimpleNamespace(status="void"), SimpleNamespace(status="draft")]
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))))
+    await signing.delete_guard(db, uuid.uuid4())  # nothing retained yet
+    rows.append(SimpleNamespace(status="executed"))
+    with pytest.raises(HTTPException) as exc:
+        await signing.delete_guard(db, uuid.uuid4())
+    assert exc.value.status_code == 409
+
+
+async def test_stage_two_gates_require_cleared_funding_and_matching_attestation():
+    from datetime import date as _date
+    user = _user(Role.LOAN_EXEC)
+    parent = SimpleNamespace(status="executed", executed_at=datetime(2026, 9, 1, tzinfo=UTC))
+    access = pkgs.PackageAccess(package=SimpleNamespace(id=uuid.uuid4(), stage=2, status="draft"), profile=SimpleNamespace(id=uuid.uuid4()), user=user, mode="operator")
+    access.parent = parent
+    arr = {**pa.empty_arrangement(), "funding_date": "2999-01-01", "funded_amount": 1000000, "funding_party_name": "First Bank"}
+    with pytest.raises(HTTPException) as exc:
+        await signing._stage_two_gates(SimpleNamespace(), access, arr, None)
+    assert exc.value.detail["code"] == "funding_not_yet_occurred"
+    arr["funding_date"] = _date.today().isoformat()
+    with pytest.raises(HTTPException) as exc:
+        await signing._stage_two_gates(SimpleNamespace(), access, arr, None)
+    assert exc.value.detail["code"] == "funding_attestation_required"
+    with pytest.raises(HTTPException) as exc:
+        await signing._stage_two_gates(SimpleNamespace(), access, arr, {"confirm": True, "actual_funding_date": arr["funding_date"], "amount_funded": 999999, "funding_party_name": "First Bank"})
+    assert exc.value.detail["code"] == "funding_mismatch" and "amount funded" in exc.value.detail["fields"]
+    ok = await signing._stage_two_gates(SimpleNamespace(), access, arr, {"confirm": True, "actual_funding_date": arr["funding_date"], "amount_funded": 1000000, "funding_party_name": "first bank"})
+    assert ok["attested_by_user_id"] == str(user.id) and ok["amount_funded"] == 1000000

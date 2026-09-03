@@ -131,6 +131,7 @@ from app.models.production_package import (  # noqa: F401
     ProductionPackageRevision,
     ProductionPackageShareLink,
     ProductionPackageSignature,
+    ProductionTermSheet,
 )
 from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
 from app.models.provider_secret import ProviderSecret  # noqa: F401
@@ -145,6 +146,7 @@ from app.models.rate_sheet import RateSheetEntry  # noqa: F401
 from app.models.referral_partner_company import ReferralPartnerCompany  # noqa: F401
 from app.models.regional_manager import RegionalManagerAgent  # noqa: F401
 from app.models.sms_message import SmsMessage  # noqa: F401
+from app.models.stored_signature import StoredSignature  # noqa: F401
 from app.models.sms_opt_out import SmsOptOut  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.user_access import UserAccessEvent, UserProductAccess  # noqa: F401

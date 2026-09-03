@@ -3486,7 +3486,8 @@ async def _enforce_production_gate(db: AsyncSession, intake: PublicUnderwritingI
             "code": "production_signing_required",
             "package_id": str(package.id),
             "revision_no": revision.revision_no,
-            "message": "Please sign your production commitment to continue.",
+            "stage": int(revision.stage or package.stage or 1),
+            "message": f"Please sign your {revision.document_title} to continue.",
         },
     )
 

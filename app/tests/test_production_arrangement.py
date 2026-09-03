@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC
 from decimal import Decimal
 
 import pytest
@@ -282,9 +283,9 @@ def test_snapshot_hash_is_stable_across_key_order_and_changes_on_edit():
 
 
 def test_jsonable_stringifies_uuid_dates_and_decimals():
-    from datetime import date, datetime, timezone
+    from datetime import date, datetime
     uid = uuid.uuid4()
-    out = pa.jsonable({"id": uid, "d": date(2026, 9, 3), "dt": datetime(2026, 9, 3, tzinfo=timezone.utc),
+    out = pa.jsonable({"id": uid, "d": date(2026, 9, 3), "dt": datetime(2026, 9, 3, tzinfo=UTC),
                        "n": Decimal("1.5"), "nan": float("nan"), "list": [uid]})
     assert out["id"] == str(uid) and out["d"] == "2026-09-03" and out["dt"].startswith("2026-09-03")
     assert out["n"] == 1.5 and out["nan"] is None and out["list"] == [str(uid)]
@@ -297,3 +298,97 @@ def test_compute_is_json_safe_on_an_empty_arrangement():
     assert c["econ"]["units"] == 0
     assert c["advance"]["advance"] == 0
     assert c["projection"]["retire_month"] is None
+
+
+
+# ---- stage two: terms, funding rules, comparison ---------------------------
+
+def _sheet(**over):
+    base = {
+        "approved_amount": 1000000, "min_activation_amount": 900000, "rate_pct": 12.5, "term_months": 36,
+        "monthly_debt_service": round(pa.level_payment(1000000, 12.5, 36), 2), "funding_party_kind": "Lender",
+        "funding_party_name": "First Bank", "facility_type": "Dealer capital advance",
+        "expected_funding_date": "2026-09-10", "activation_date": "2026-09-10", "commencement_date": "2026-10-01",
+        "maturity_date": "2029-09-10", "use_of_funds": {"inventory": 600000, "debt_payoff": 400000},
+    }
+    base.update(over)
+    return base
+
+
+def test_level_payment_inverts_pv_annuity_and_handles_zero_rate():
+    pmt = pa.level_payment(1000000, 12.5, 36)
+    assert pa.pv_annuity(pmt, 12.5, 36) == pytest.approx(1000000)
+    assert pa.level_payment(1200, 0, 12) == 100
+    assert pa.level_payment(1000, 5, 0) == 0
+
+
+def test_validate_terms_catches_amounts_dates_and_allocation():
+    assert pa.validate_terms(_sheet()) == []
+    errs = pa.validate_terms(_sheet(min_activation_amount=2000000, activation_date="2026-09-01", maturity_date="2026-09-10",
+                                    use_of_funds={"inventory": 1}, funding_party_name="", facility_type=""))
+    joined = " ".join(errs)
+    for needle in ("cannot exceed", "Activation date", "Maturity", "Use of funds", "Name the funding party", "facility type"):
+        assert needle in joined, needle
+
+
+def test_apply_term_sheet_fixes_the_advance_and_marks_the_lender_protected():
+    arr, applied = pa.apply_term_sheet(seed(), _sheet())
+    assert arr["requested"] == 1000000 and arr["sizing"] == "fixed" and arr["funded_amount"] == 1000000
+    assert arr["dealer_cof"] == 12.5 and arr["term"] == 36 and arr["funding_party"] == "Lender"
+    assert arr["funding_party_name"] == "First Bank" and arr["protected_1_name"] == "First Bank" and arr["protected_source"] == "First Bank"
+    assert arr["use_of_funds"]["inventory"] == 600000 and arr["use_of_funds"]["other_label"] == ""
+    assert set(pa.TERM_SHEET_KEYS) >= {"requested", "sizing", "funded_amount", "dealer_cof", "term", "debt_service", "use_of_funds"}
+    assert "requested" in applied and applied["requested"]["before"] == 1200000
+    c = pa.compute(arr, stage=2)
+    assert c["advance"]["advance"] == 1000000 and c["advance"]["sizing"] == "fixed"
+
+
+def test_compute_stage_two_reports_closing_blanks_and_funding_rules():
+    arr, _ = pa.apply_term_sheet(seed(), _sheet())
+    keys = {a["key"] for a in pa.compute(arr, stage=2)["attention"]}
+    assert {"funding_docs_executed_date", "controlled_account", "ach_account", "identity_ein", "owners", "rm_comp_categories"} <= keys
+    assert "funding_party" not in keys  # filled by the sheet
+    # stage one never sees the closing keys
+    assert not ({"controlled_account", "owners"} & {a["key"] for a in pa.compute(arr, stage=1)["attention"]})
+    bad = {**arr, "activation_date": "2026-09-01", "funded_amount": 800000, "use_of_funds": {"inventory": 10}, "owners": [{"name": "A", "pct": 60}],
+           "identity_naics": "12", "financing_cost_included": "Yes", "audit_discrepancy_threshold": 250}
+    keys = {a["key"] for a in pa.compute(bad, stage=2)["attention"]}
+    for k in ("activation_date", "funded_amount", "use_of_funds", "owners", "identity_naics", "financing_cost_explain", "audit_discrepancy_threshold"):
+        assert k in keys, k
+
+
+def test_steps_for_stage_and_new_step_keys():
+    assert [s[0] for s in pa.steps_for(1)] == ["parties", "lot", "products", "advance", "buildout", "thresholds", "shortfall", "projection", "preview", "send"]
+    assert "funding" in [s[0] for s in pa.steps_for(2)] and "disclosures" in [s[0] for s in pa.steps_for(2)]
+    assert pa.FIELD_RULES_BY_KEY["funding_party"].step == "funding"
+
+
+def test_normalize_rows_and_money_groups():
+    out = pa.normalize_changes({
+        "owners": [{"name": " Ana ", "pct": "60", "email": "a@x.com"}, {"name": "", "pct": ""}, {"name": "Bo", "pct": 40, "title": "CFO"}],
+        "use_of_funds": {"inventory": "600000", "other": "", "other_label": " Signage "},
+        "program_support": ["capital_health", "other"], "rm_comp_categories": "salary, hourly",
+    })
+    assert out["owners"] == [{"name": "Ana", "pct": 60, "title": "", "email": "a@x.com", "phone": "", "auth": ""},
+                             {"name": "Bo", "pct": 40, "title": "CFO", "email": "", "phone": "", "auth": ""}]
+    assert out["use_of_funds"]["inventory"] == 600000 and out["use_of_funds"]["other"] == "" and out["use_of_funds"]["other_label"] == "Signage"
+    assert out["program_support"] == ["capital_health", "other"] and out["rm_comp_categories"] == ["salary", "hourly"]
+    merged = pa.merge_changes(pa.empty_arrangement(), out)
+    assert pa.is_blank(pa.FIELD_RULES_BY_KEY["owners"], merged["owners"]) is False
+    assert pa.is_blank(pa.FIELD_RULES_BY_KEY["use_of_funds"], pa.empty_arrangement()["use_of_funds"]) is True
+
+
+def test_arrangement_diff_marks_changes_and_hides_desk_only_rows_from_the_dealer():
+    a = seed()
+    c1 = pa.compute(a)
+    b, _ = pa.apply_term_sheet(a, _sheet())
+    c2 = pa.compute(b, stage=2)
+    d = pa.arrangement_diff({"arrangement": a, "computed": c1}, {"arrangement": b, "computed": c2})
+    rows = {r["key"]: r for r in d["rows"]}
+    assert rows["requested"]["changed"] and rows["requested"]["before"] == "$1,200,000" and rows["requested"]["after"] == "$1,000,000"
+    assert rows["dealer_name"]["changed"] is False
+    assert rows["advance.spread"]["dealer_visible"] is False and rows["advance.advance"]["dealer_visible"] is True
+    assert rows["use_of_funds.inventory"]["original_blank"] is True
+    assert d["changed_count"] == sum(1 for r in d["rows"] if r["changed"]) > 0
+    import json as _json
+    _json.dumps(d)

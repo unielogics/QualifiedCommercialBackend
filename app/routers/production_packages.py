@@ -18,6 +18,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.schemas.production_package import (
     ProductionCapabilitiesRead,
+    ProductionComparisonRead,
     ProductionComputeRead,
     ProductionComputeRequest,
     ProductionHistoryRead,
@@ -25,14 +26,21 @@ from app.schemas.production_package import (
     ProductionPackageRead,
     ProductionPackageResolve,
     ProductionPrefillRequest,
+    ProductionReasonBody,
+    ProductionSendRequest,
+    ProductionSendResult,
     ProductionShareLinkCreate,
     ProductionShareLinkCreated,
     ProductionSmsConsentCapture,
     ProductionSmsConsentRead,
+    ProductionTermSheetBody,
+    ProductionTermSheetResult,
+    ProductionTermSheetState,
     SponsorOptionRead,
 )
 from app.services import production_arrangement as pa
 from app.services import production_packages as svc
+from app.services import production_term_sheets as sheets_svc
 
 router = APIRouter(prefix="/production-packages", tags=["production-packages"])
 
@@ -51,9 +59,51 @@ async def list_sponsors(user: CurrentUser, db: AsyncSession = Depends(get_db)) -
     return await svc.sponsor_options(db, user=user)
 
 
+# ---- term sheet (keyed on the profile: terms are recorded before any final exists) ----
+
+async def _profile_access(db: AsyncSession, profile_id: UUID, user: CurrentUser):
+    return await svc.resolve_package(db, profile_id, user)
+
+
+@router.get("/term-sheets/{profile_id}", response_model=ProductionTermSheetState)
+async def read_term_sheet(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionTermSheetState:
+    if user.role not in svc.OPERATOR_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required")
+    access = await _profile_access(db, profile_id, user)
+    await db.commit()
+    return ProductionTermSheetState(**await svc.term_sheet_state(db, access))
+
+
+@router.post("/term-sheets/{profile_id}", response_model=ProductionTermSheetResult)
+async def record_term_sheet(
+    profile_id: UUID, payload: ProductionTermSheetBody, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ProductionTermSheetResult:
+    access = await _profile_access(db, profile_id, user)
+    _sheet, reapplied = await sheets_svc.record_sheet(db, profile=access.profile, user=user, body=payload.model_dump(), request=request)
+    await db.commit()
+    await svc._load_family(db, access)
+    state = ProductionTermSheetState(**await svc.term_sheet_state(db, access))
+    final_read = None
+    if reapplied is not None:
+        child_access = await svc.load_package_access(db, reapplied.id, user)
+        final_read = await svc.serialize(db, child_access)
+    return ProductionTermSheetResult(state=state, final=final_read)
+
+
+@router.post("/term-sheets/{profile_id}/withdraw", response_model=ProductionTermSheetState)
+async def withdraw_term_sheet(
+    profile_id: UUID, payload: ProductionReasonBody, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ProductionTermSheetState:
+    access = await _profile_access(db, profile_id, user)
+    await sheets_svc.withdraw_sheet(db, profile=access.profile, user=user, reason=payload.reason)
+    await db.commit()
+    await svc._load_family(db, access)
+    return ProductionTermSheetState(**await svc.term_sheet_state(db, access))
+
+
 @router.post("/resolve", response_model=ProductionPackageRead)
 async def resolve_production_package(
-    payload: ProductionPackageResolve, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    payload: ProductionPackageResolve, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionPackageRead:
     access = await svc.resolve_package(db, payload.profile_id, user)
     await db.commit()
@@ -84,16 +134,48 @@ async def rep_share_patch(
 
 @router.post("/shares/{token}/compute", response_model=ProductionComputeRead)
 async def rep_share_compute(
-    token: str, payload: ProductionComputeRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    token: str, payload: ProductionComputeRequest, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionComputeRead:
     await svc.resolve_rep_share(db, user, token)
     await db.commit()
-    return _compute(payload.arrangement)
+    return _compute(payload.arrangement, 1)
+
+
+@router.post("/shares/{token}/send", response_model=ProductionSendResult)
+async def rep_share_send(
+    token: str, payload: ProductionSendRequest, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ProductionSendResult:
+    from app.services import production_signing as signing_svc
+
+    access = await svc.resolve_rep_share(db, user, token)
+    result = await signing_svc.send(
+        db, access, channel=payload.channel, recipient_email=None, recipient_phone=None, request=request, attestation=None,
+    )
+    await db.commit()
+    return ProductionSendResult(
+        package=await svc.serialize(db, access), delivered=result["delivered"], emailed=result["emailed"],
+        texted=result["texted"], detail=result["detail"], already_sent=result.get("already_sent", False),
+    )
+
+
+@router.post("/shares/{token}/remind", response_model=ProductionSendResult)
+async def rep_share_remind(
+    token: str, payload: ProductionSendRequest, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> ProductionSendResult:
+    from app.services import production_signing as signing_svc
+
+    access = await svc.resolve_rep_share(db, user, token)
+    result = await signing_svc.remind(db, access, channel=payload.channel, request=request)
+    await db.commit()
+    return ProductionSendResult(
+        package=await svc.serialize(db, access), delivered=result["delivered"], emailed=result["emailed"],
+        texted=result["texted"], detail=result["detail"],
+    )
 
 
 @router.post("/shares/{token}/prefill")
 async def rep_share_prefill(
-    token: str, payload: ProductionPrefillRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    token: str, payload: ProductionPrefillRequest, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     access = await svc.resolve_rep_share(db, user, token)
     out = await svc.run_prefill(db, access, force=payload.force, fields=payload.fields, apply=payload.apply)
@@ -103,9 +185,9 @@ async def rep_share_prefill(
 
 # ---- operator surface ----
 
-def _compute(arrangement: dict[str, Any]) -> ProductionComputeRead:
+def _compute(arrangement: dict[str, Any], stage: int = 1) -> ProductionComputeRead:
     merged = pa.merge_changes(pa.empty_arrangement(), arrangement or {})
-    computed = pa.jsonable(pa.compute(merged))
+    computed = pa.jsonable(pa.compute(merged, stage=stage))
     return ProductionComputeRead(
         computed=computed, attention=computed["attention"], attention_presentation=computed["attention_presentation"]
     )
@@ -132,7 +214,7 @@ async def patch_production_package(
 
 @router.post("/{package_id}/prefill")
 async def prefill_production_package(
-    package_id: UUID, payload: ProductionPrefillRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    package_id: UUID, payload: ProductionPrefillRequest, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     access = await svc.load_operator_access(db, package_id, user)
     out = await svc.run_prefill(db, access, force=payload.force, fields=payload.fields, apply=payload.apply)
@@ -142,15 +224,15 @@ async def prefill_production_package(
 
 @router.post("/{package_id}/compute", response_model=ProductionComputeRead)
 async def compute_production_package(
-    package_id: UUID, payload: ProductionComputeRequest, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    package_id: UUID, payload: ProductionComputeRequest, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionComputeRead:
-    await svc.load_operator_access(db, package_id, user)
-    return _compute(payload.arrangement)
+    access = await svc.load_operator_access(db, package_id, user)
+    return _compute(payload.arrangement, payload.stage or int(access.package.stage or 1))
 
 
 @router.post("/{package_id}/share-links", response_model=ProductionShareLinkCreated, status_code=201)
 async def create_share_link(
-    package_id: UUID, payload: ProductionShareLinkCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    package_id: UUID, payload: ProductionShareLinkCreate, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionShareLinkCreated:
     access = await svc.load_operator_access(db, package_id, user)
     link, token = await svc.mint_share_link(
@@ -159,7 +241,7 @@ async def create_share_link(
     )
     await db.commit()
     read = await svc.serialize(db, access)
-    row = next(l for l in read.share_links if l.id == link.id)
+    row = next(item for item in read.share_links if item.id == link.id)
     return ProductionShareLinkCreated(link=row, url=svc.share_link_url(token), expires_at=link.expires_at)
 
 
@@ -193,9 +275,7 @@ async def capture_production_sms_consent(
 # presentation, send, signatures, execution
 # ---------------------------------------------------------------------------
 
-from datetime import date as _date  # noqa: E402
 
-from fastapi import Response  # noqa: E402
 
 from app.schemas.production_package import (  # noqa: E402
     ProductionClientSignBody,
@@ -203,9 +283,7 @@ from app.schemas.production_package import (  # noqa: E402
     ProductionManualSignatureBody,
     ProductionManualSignatureResult,
     ProductionPresentationRead,
-    ProductionReasonBody,
     ProductionScanCompleteBody,
-    ProductionSendRequest,
     ProductionSendResult,
     ProductionSigningGateRead,
 )
@@ -245,6 +323,7 @@ async def request_signature(
     result = await signing.send(
         db, access, channel=payload.channel, recipient_email=payload.recipient_email,
         recipient_phone=payload.recipient_phone, request=request,
+        attestation=payload.funding_attestation.model_dump() if payload.funding_attestation else None,
     )
     await db.commit()
     return ProductionSendResult(
@@ -269,7 +348,7 @@ async def remind_signature(
 
 @router.post("/{package_id}/reopen", response_model=ProductionPackageRead)
 async def reopen_package(
-    package_id: UUID, payload: ProductionReasonBody, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    package_id: UUID, payload: ProductionReasonBody, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionPackageRead:
     access = await svc.load_operator_access(db, package_id, user)
     await signing.reopen(db, access, reason=payload.reason)
@@ -279,7 +358,7 @@ async def reopen_package(
 
 @router.post("/{package_id}/void", response_model=ProductionPackageRead)
 async def void_package(
-    package_id: UUID, payload: ProductionReasonBody, user: CurrentUser, db: AsyncSession = Depends(get_db)
+    package_id: UUID, payload: ProductionReasonBody, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionPackageRead:
     access = await svc.load_operator_access(db, package_id, user)
     await signing.void(db, access, reason=payload.reason)
@@ -297,7 +376,7 @@ async def record_manual_signature(
         db, access, party=payload.party, signer_name=payload.signer_name, signer_title=payload.signer_title,
         signed_on=payload.signed_on, attestation=payload.attestation, note=payload.note,
         override_reason=payload.override_reason, scan_file_name=payload.scan_file_name,
-        scan_content_type=payload.scan_content_type, request=request,
+        scan_content_type=payload.scan_content_type, request=request, initials=payload.initials,
     )
     await db.commit()
     read = await svc.serialize(db, access)
@@ -318,18 +397,48 @@ async def complete_signature_scan(
 
 @router.post("/{package_id}/execute", response_model=ProductionPackageRead)
 async def execute_package(package_id: UUID, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionPackageRead:
+    """Retry the execution bundle after the dealer signed but the assembly failed."""
     access = await svc.load_operator_access(db, package_id, user)
-    package, final_pdf = await signing.execute(db, access, request=request)
+    package, final_pdf, title = await signing.execute(db, access, request=request)
     await db.commit()
     if final_pdf:
-        _business, email, _phone = await svc.client_contact(db, access)
-        signing.email_signed_copy(email, pa.STAGE_ONE_TITLE, final_pdf, final=True)
+        await signing.notify_executed(db, access, title, final_pdf)
     return await svc.serialize(db, access)
+
+
+@router.post("/{package_id}/final", response_model=ProductionPackageRead)
+async def draft_final_package(package_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionPackageRead:
+    access = await svc.load_operator_access(db, package_id, user)
+    child = await svc.draft_final(db, access)
+    await db.commit()
+    return await svc.serialize(db, child)
+
+
+@router.get("/{package_id}/comparison", response_model=ProductionComparisonRead)
+async def read_comparison(package_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionComparisonRead:
+    access = await svc.load_operator_access(db, package_id, user)
+    target = access if int(access.package.stage or 1) == 2 else (await svc.load_operator_access(db, access.child.id, user) if access.child else None)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No final package to compare yet")
+    read = await svc.serialize(db, target)
+    if read.comparison is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No comparison available")
+    return read.comparison
+
+
+@router.post("/{package_id}/sponsor-signature/adopt")
+async def adopt_sponsor_signature(
+    package_id: UUID, payload: ProductionReasonBody, request: Request, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    access = await svc.load_operator_access(db, package_id, user)
+    out = await svc.adopt_sponsor_signature(db, access, authorization_note=payload.reason, request=request)
+    await db.commit()
+    return out
 
 
 @router.get("/{package_id}/revisions/{revision_id}/document")
 async def revision_document(
-    package_id: UUID, revision_id: UUID, user: CurrentUser, phase: str = "current", db: AsyncSession = Depends(get_db)
+    package_id: UUID, revision_id: UUID, user: CurrentUser, phase: str = "current", db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     from app.models.production_package import ProductionPackageRevision
 
@@ -397,17 +506,22 @@ async def room_production_pdf(token: str, db: AsyncSession = Depends(get_db)) ->
 
 @public_router.post("/{token}/production-package/sign", response_model=ProductionClientSignResult)
 async def room_production_sign(
-    token: str, payload: ProductionClientSignBody, request: Request, db: AsyncSession = Depends(get_db)
+    token: str, payload: ProductionClientSignBody, request: Request, db: AsyncSession = Depends(get_db),
 ) -> ProductionClientSignResult:
     intake = await _room_intake(db, token)
     result = await signing.sign_dealer(
-        db, intake, revision_id=payload.revision_id, typed_name=payload.typed_name, esign_consent=payload.esign_consent,
-        acknowledged=payload.acknowledged, signature_data_url=payload.signature_data_url,
+        db, intake, revision_id=payload.revision_id, typed_name=payload.typed_name, initials=payload.initials,
+        esign_consent=payload.esign_consent, acknowledged=payload.acknowledged, signature_data_url=payload.signature_data_url,
         document_sha256=payload.document_sha256, request=request,
     )
     await db.commit()
     pdf = result.pop("pdf", None)
     email = result.pop("email", None) or intake.email
+    title = result.get("title") or pa.STAGE_ONE_TITLE
+    executed = result.get("execution_status") == "executed"
     if pdf:
-        signing.email_signed_copy(email, pa.STAGE_ONE_TITLE, pdf)
+        signing.email_signed_copy(email, title, pdf, final=executed)
+        if executed and result.get("package_id"):
+            await signing.notify_executed_by_id(db, result["package_id"], title, pdf)
+    result.pop("package_id", None)
     return ProductionClientSignResult(**result)

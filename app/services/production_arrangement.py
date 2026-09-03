@@ -27,7 +27,7 @@ import hashlib
 import json
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -35,8 +35,8 @@ from typing import Any, Literal
 STAGE_ONE_TITLE = "Production Commitment and Capital Engagement Agreement"
 STAGE_TWO_TITLE = "Program Activation and Production Agreement"
 STAGE_ONE_DOCUMENT_KEY = "production_commitment_v1"
-STAGE_TWO_DOCUMENT_KEY = "program_activation_v1"  # reserved: stage two is deferred
-DOCUMENT_VERSION = "2026-09-03-1"
+STAGE_TWO_DOCUMENT_KEY = "program_activation_v1"
+DOCUMENT_VERSION = "2026-09-03-2"
 
 PRODUCT_KEYS: tuple[str, ...] = ("vsc", "gap", "theft", "appearance", "key", "tire", "maint", "power")
 PRODUCT_LABELS: dict[str, str] = {
@@ -86,6 +86,8 @@ STEPS: tuple[tuple[str, str, str], ...] = (
     ("buildout", "Policy buildout", "Whether the policies carry the loan payment, and what the dealer is left paying out of pocket."),
     ("thresholds", "Operative thresholds", "The exact figures that become enforceable at activation."),
     ("shortfall", "Shortfall billing and cure", "What happens in a month when production comes in light."),
+    ("funding", "Funding facility — Schedule 1", "The facility as funded: party, amounts, dates, accounts and use of funds, from the term sheet."),
+    ("disclosures", "Compensation and relationships — Schedules 2–4", "The relationship manager's compensation category, every disclosed fee, and the protected and preexisting funding relationships."),
     ("projection", "Repayment and earnout timeline", "How repayment, commissions and reserves build over the life of the deal."),
     ("preview", "Contract preview", "What prints on the agreement as it stands right now."),
     ("send", "Send and signatures", "Both stages, who has signed, and what is blocking the next one."),
@@ -93,11 +95,20 @@ STEPS: tuple[tuple[str, str, str], ...] = (
 STEP_LABELS: dict[str, str] = {
     "parties": "Parties", "lot": "Lot and baseline", "products": "Products and attachment",
     "advance": "Advance and programme cost", "buildout": "Policy buildout", "thresholds": "Operative thresholds",
-    "shortfall": "Shortfall and cure", "projection": "Projection", "preview": "Contract preview",
-    "send": "Send and signatures",
+    "shortfall": "Shortfall and cure", "funding": "Funding facility", "disclosures": "Compensation and relationships",
+    "projection": "Projection", "preview": "Contract preview", "send": "Send and signatures",
+}
+STEP_STAGES: dict[str, tuple[int, ...]] = {
+    "parties": (1, 2), "lot": (1, 2), "products": (1, 2), "advance": (1, 2), "buildout": (1, 2),
+    "thresholds": (1, 2), "shortfall": (1, 2), "funding": (2,), "disclosures": (2,),
+    "projection": (1, 2), "preview": (1, 2), "send": (1, 2),
 }
 
-FieldKind = Literal["text", "number", "date", "email", "phone", "select", "multiselect", "textarea"]
+
+def steps_for(stage: int) -> list[tuple[str, str, str]]:
+    return [s for s in STEPS if stage in STEP_STAGES.get(s[0], (1, 2))]
+
+FieldKind = Literal["text", "number", "date", "email", "phone", "select", "multiselect", "textarea", "rows", "money_group"]
 RequiredFor = Literal["presentation", "stage_one", "stage_two", "never"]
 
 
@@ -137,6 +148,28 @@ SIZING_MODES: tuple[str, ...] = ("backsolve", "fixed")
 BUILDOUT_MODES: tuple[str, ...] = ("reverse", "forward")
 FUNDING_PARTIES: tuple[str, ...] = ("Sponsor", "Qualified Commercial LLC", "Lender")
 TERM_OPTIONS: tuple[int, ...] = (12, 18, 24, 36)
+# Checkbox groups on the agreements (slug, label as printed).
+PROGRAM_SUPPORT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("application_packaging", "Application and packaging support"), ("reporting_technology", "Reporting technology"),
+    ("ongoing_monitoring", "Ongoing monitoring"), ("first_risk_reserve", "First-risk or reserve support"),
+    ("capital_health", "Capital Health Services"), ("controlled_account", "Controlled-account support"),
+    ("product_admin_platform", "Product-administration platform"), ("preferential_economics", "Preferential program economics"),
+    ("other", "Other"),
+)
+RM_COMP_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("salary", "Salary"), ("fixed_recurring", "Fixed recurring account-management compensation"),
+    ("hourly", "Hourly compensation"), ("disclosed_product", "Disclosed Covered Product sales or servicing compensation"),
+    ("fixed_implementation", "Fixed implementation compensation for documented services"), ("other", "Other lawful compensation"),
+)
+SBA_OPTIONS: tuple[str, ...] = ("Not an SBA transaction", "SBA transaction; required SBA compensation documentation attached")
+YES_NO: tuple[str, ...] = ("No", "Yes")
+USE_OF_FUNDS_KEYS: tuple[tuple[str, str], ...] = (
+    ("inventory", "Inventory"), ("debt_payoff", "Debt payoff"), ("working_capital", "Working capital allocation"),
+    ("equipment", "Equipment"), ("real_estate", "Real estate"), ("program_implementation", "Program implementation"),
+    ("other", "Other approved purpose"),
+)
+OWNER_FIELDS: tuple[str, ...] = ("name", "pct", "title", "email", "phone", "auth")
+MAX_OWNERS = 5
 
 # Ported from the design's textField / numField opts. `required_for` "stage_one"
 # is the design's `required: true`; "stage_two" is its `required: s.s1.sponsor
@@ -178,6 +211,8 @@ FIELD_RULES: tuple[FieldRule, ...] = (
               title="Relationship manager is blank", detail="Schedule 2 names the manager and their compensation category."),
     FieldRule("rm_employer", "parties", "Relationship manager employer", required_for="stage_one",
               title="Relationship manager employer is blank", detail="Schedule 2 names the manager's employer."),
+    FieldRule("rm_user_id", "parties", "Relationship manager (team member)",
+              hint="Set when the relationship manager is picked from the team list; matches the signature on file."),
     FieldRule("rm_email", "parties", "Relationship manager email", kind="email", required_for="stage_one",
               title="Relationship manager email is blank", detail="Schedule 2 needs a notice address for the manager."),
     FieldRule("rm_phone", "parties", "Relationship manager phone", kind="phone", required_for="stage_one",
@@ -255,27 +290,100 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("adj", "shortfall", "Program rate adjustment", kind="select", options=ADJUSTMENTS),
     FieldRule("adj_value", "shortfall", "Adjustment value", kind="number"),
     FieldRule("exclusions", "shortfall", "Approved exclusions", kind="textarea"),
-    # ---- stage two: funding activation certificate (deferred; rules kept) ----
-    FieldRule("funding_party", "send", "Funding party", kind="select", required_for="stage_two",
+    # ---- stage two: funding facility (Schedule 1) and activation certificate (Schedule 5) ----
+    FieldRule("funding_party", "funding", "Funding party", kind="select", required_for="stage_two",
               title="Funding party is blank",
               detail="The activation certificate has to name the entity that advanced the capital.",
               options=FUNDING_PARTIES),
-    FieldRule("funding_date", "send", "Actual funding date", kind="date", required_for="stage_two",
+    FieldRule("funding_date", "funding", "Actual funding date", kind="date", required_for="stage_two",
               title="Actual funding date is blank",
               detail="Stage two cannot be executed until actual funding has occurred."),
-    FieldRule("funded_amount", "send", "Funded amount", kind="number", required_for="stage_two", non_zero=True,
+    FieldRule("funded_amount", "funding", "Funded amount", kind="number", required_for="stage_two", non_zero=True,
               title="Funded amount is blank", detail="The certificate records the amount actually disbursed and cleared."),
-    FieldRule("commencement", "send", "Production commencement date", kind="date", required_for="stage_two",
+    FieldRule("commencement", "funding", "Production commencement date", kind="date", required_for="stage_two",
               title="Production commencement date is blank", detail="Addendum A names the commencement date."),
-    FieldRule("activation_date", "send", "Activation date", kind="date", required_for="stage_two",
+    FieldRule("activation_date", "funding", "Activation date", kind="date", required_for="stage_two",
               title="Activation date is blank", detail="May not be earlier than actual funding.",
               always="May not be earlier than actual funding"),
-    FieldRule("maturity", "send", "Original maturity date", kind="date", required_for="stage_two",
+    FieldRule("maturity", "funding", "Original maturity date", kind="date", required_for="stage_two",
               title="Original maturity date is blank", detail="The activation certificate records the maturity."),
+    FieldRule("funding_party_name", "funding", "Funding party legal name", required_for="stage_two",
+              title="Funding party legal name is blank", detail="Schedule 1 and the activation certificate name the entity that advanced the capital."),
+    FieldRule("funding_docs_executed_date", "funding", "Final funding documents executed on", kind="date", required_for="stage_two",
+              title="Funding documents date is blank", detail="Certificate line 1: the date the final Funding Documents were executed."),
+    FieldRule("controlled_account", "funding", "Controlled account", required_for="stage_two",
+              title="Controlled account is blank", detail="Schedule 1 names the controlled or remittance account."),
+    FieldRule("ach_account", "funding", "ACH account", required_for="stage_two",
+              title="ACH account is blank", detail="Schedule 1 names the ACH true-up account."),
+    FieldRule("use_of_funds", "funding", "Approved use of funds", kind="money_group", required_for="stage_two",
+              title="Use of funds is blank", detail="Schedule 1 allocates the funded amount across approved purposes."),
+    FieldRule("program_support", "funding", "Program support provided", kind="multiselect",
+              options=tuple(k for k, _ in PROGRAM_SUPPORT_OPTIONS)),
+    FieldRule("program_support_other", "funding", "Other program support"),
+    FieldRule("fp_joinder", "funding", "Funding Party joinder", kind="select", options=("no", "yes")),
+    # ---- stage two: identity and owners (§9.1, §9.2) ----
+    FieldRule("identity_formation_date", "parties", "Formation date", kind="date", required_for="stage_two",
+              title="Formation date is blank", detail="§9.1 requires the dealer's formation date."),
+    FieldRule("identity_ein", "parties", "EIN", required_for="stage_two", title="EIN is blank", detail="§9.1 requires the EIN."),
+    FieldRule("identity_naics", "parties", "NAICS (6-digit)", required_for="stage_two",
+              title="NAICS is blank", detail="§9.1 requires the exact six-digit NAICS activity."),
+    FieldRule("identity_license", "parties", "Dealer license no."),
+    FieldRule("identity_website", "parties", "Website"),
+    FieldRule("owners", "parties", "Ownership schedule", kind="rows", required_for="stage_two",
+              title="Ownership schedule is blank", detail="§9.2 requires every owner, totalling exactly 100.00%."),
+    FieldRule("dealer_notice_email", "parties", "Dealer notice email", kind="email", required_for="stage_two",
+              title="Dealer notice email is blank", detail="Formal notice is served by confirmed email."),
+    FieldRule("written_approval_date", "advance", "Written approval date", kind="date"),
+    FieldRule("outside_funding_date", "advance", "Outside funding date", kind="date"),
+    # ---- stage two: thresholds §9.5 / §10.7 and A.5 exclusions ----
+    FieldRule("audit_discrepancy_threshold", "thresholds", "Audit discrepancy threshold (%)", kind="number",
+              required_for="stage_two", non_zero=True, title="Audit discrepancy threshold is blank",
+              detail="§9.5: the reporting discrepancy that triggers audit-cost reimbursement (suggested 5%)."),
+    FieldRule("review_threshold", "thresholds", "Right-of-first-review threshold", kind="number",
+              required_for="stage_two", non_zero=True, title="Review threshold is blank",
+              detail="§10.7: new business-purpose financing above this amount is offered to Qualified Commercial for review first."),
+    FieldRule("exclusion_1", "shortfall", "Approved exclusion 1"),
+    FieldRule("exclusion_2", "shortfall", "Approved exclusion 2"),
+    FieldRule("exclusion_3", "shortfall", "Approved exclusion 3"),
+    # ---- stage two: Schedules 2–4 ----
+    FieldRule("rm_comp_categories", "disclosures", "Relationship manager compensation category", kind="multiselect",
+              required_for="stage_two", title="Relationship manager compensation category is blank",
+              detail="Schedule 2 names the compensation category; bank points and lender commissions are prohibited.",
+              options=tuple(k for k, _ in RM_COMP_OPTIONS)),
+    FieldRule("rm_comp_other", "disclosures", "Other lawful compensation"),
+    FieldRule("comp_fp_qc_amount", "disclosures", "Funding Party → Qualified Commercial (amount or formula)"),
+    FieldRule("comp_fp_qc_purpose", "disclosures", "Funding Party → Qualified Commercial (purpose)"),
+    FieldRule("comp_fp_sponsor_amount", "disclosures", "Funding Party → Sponsor (amount or formula)"),
+    FieldRule("comp_fp_sponsor_purpose", "disclosures", "Funding Party → Sponsor (purpose)"),
+    FieldRule("comp_dealer_qc_amount", "disclosures", "Dealer → Qualified Commercial post-funding (amount or formula)"),
+    FieldRule("comp_dealer_qc_purpose", "disclosures", "Dealer → Qualified Commercial post-funding (purpose)"),
+    FieldRule("comp_dealer_sponsor_amount", "disclosures", "Dealer → Sponsor post-funding (amount or formula)"),
+    FieldRule("comp_dealer_sponsor_purpose", "disclosures", "Dealer → Sponsor post-funding (purpose)"),
+    FieldRule("program_economics_1", "disclosures", "Sponsor or product economics (line 1)"),
+    FieldRule("program_economics_2", "disclosures", "Sponsor or product economics (line 2)"),
+    FieldRule("program_economics_3", "disclosures", "Sponsor or product economics (line 3)"),
+    FieldRule("financing_cost_included", "disclosures", "Compensation included in the cost of financing?", kind="select",
+              required_for="stage_two", title="Financing-cost disclosure is blank",
+              detail="Schedule 3: state whether any compensation is included in the cost of financing.", options=YES_NO),
+    FieldRule("financing_cost_explain", "disclosures", "If yes, explain", kind="textarea"),
+    FieldRule("conflict_disclosure_1", "disclosures", "Conflict disclosure (line 1)"),
+    FieldRule("conflict_disclosure_2", "disclosures", "Conflict disclosure (line 2)"),
+    FieldRule("sba_status", "disclosures", "SBA status", kind="select", required_for="stage_two",
+              title="SBA status is blank", detail="Schedule 3 records whether this is an SBA transaction.", options=SBA_OPTIONS),
+    FieldRule("protected_source", "disclosures", "Protected Funding Source (certificate line 15)"),
+    *[FieldRule(f"protected_{i}_{f}", "disclosures", f"Protected funding source {i} — {lbl}", kind="date" if f == "date" else "text")
+      for i in (1, 2, 3) for f, lbl in (("name", "legal name"), ("rel", "relationship"), ("date", "date introduced"), ("txn", "funded transaction"))],
+    *[FieldRule(f"existing_{i}_{f}", "disclosures", f"Preexisting relationship {i} — {lbl}")
+      for i in (1, 2, 3, 4) for f, lbl in (("name", "legal name"), ("rel", "existing relationship"), ("info", "supporting information"))],
 )
 FIELD_RULES_BY_KEY: dict[str, FieldRule] = {r.key: r for r in FIELD_RULES}
 FIELD_KEYS: frozenset[str] = frozenset(FIELD_RULES_BY_KEY)
 NUMBER_KEYS: frozenset[str] = frozenset(r.key for r in FIELD_RULES if r.kind == "number")
+# Keys the term sheet owns on the final; the desk changes them on the sheet, not the form.
+TERM_SHEET_KEYS: frozenset[str] = frozenset({
+    "requested", "sizing", "funded_amount", "dealer_cof", "term", "debt_service", "min_activation", "facility_type",
+    "funding_party", "funding_party_name", "funding_date", "activation_date", "commencement", "maturity", "use_of_funds",
+})
 SPONSOR_KEYS: frozenset[str] = frozenset(
     {"sponsor_name", "sponsor_state", "sponsor_entity", "sponsor_address", "sponsor_platform", "sponsor_email"}
 )
@@ -296,6 +404,10 @@ DEFAULTS: dict[str, Any] = {
     "term": 36,
     "exclusivity": 45,
     "cure_days": 5,
+    "financing_cost_included": "No",
+    "sba_status": "Not an SBA transaction",
+    "audit_discrepancy_threshold": 5,
+    "fp_joinder": "no",
 }
 DEFAULT_PRODUCT: dict[str, Any] = {
     "on": False, "cur_rate": "", "cur_premium": "", "rate": "", "premium": "", "repay": "",
@@ -305,7 +417,14 @@ DEFAULT_PRODUCT: dict[str, Any] = {
 
 def empty_arrangement() -> dict[str, Any]:
     """A blank arrangement with every key present, defaults applied."""
-    out: dict[str, Any] = {r.key: (list() if r.kind == "multiselect" else "") for r in FIELD_RULES}
+    out: dict[str, Any] = {}
+    for r in FIELD_RULES:
+        if r.kind == "multiselect" or r.kind == "rows":
+            out[r.key] = []
+        elif r.kind == "money_group":
+            out[r.key] = {k: "" for k, _ in USE_OF_FUNDS_KEYS} | {"other_label": ""}
+        else:
+            out[r.key] = ""
     out.update(DEFAULTS)
     out["products"] = {k: {**DEFAULT_PRODUCT, "on": k == PRIMARY_PRODUCT} for k in PRODUCT_KEYS}
     out["thresholds"] = {k: "" for k in THRESHOLD_KEYS}
@@ -353,6 +472,10 @@ def _blank_num(value: Any, *, non_zero: bool) -> bool:
 def is_blank(rule: FieldRule, value: Any) -> bool:
     if rule.kind == "number":
         return _blank_num(value, non_zero=rule.non_zero)
+    if rule.kind == "rows":
+        return not isinstance(value, list) or not any(isinstance(r, dict) and str(r.get("name") or "").strip() for r in value)
+    if rule.kind == "money_group":
+        return not isinstance(value, dict) or not any(_num(v) for k, v in value.items() if k != "other_label")
     return _blank_text(value)
 
 
@@ -503,6 +626,16 @@ def pv_annuity(payment: float, annual_rate_pct: float, n_months: int) -> float:
     if r <= 0:
         return payment * n_months
     return payment * ((1 - (1 + r) ** (-n_months)) / r)
+
+
+def level_payment(present_value: float, annual_rate_pct: float, n_months: int) -> float:
+    """The level monthly payment that amortises `present_value` at the dealer's rate; the inverse of `pv_annuity`."""
+    if n_months <= 0:
+        return 0.0
+    r = annual_rate_pct / 100 / 12
+    if r <= 0:
+        return present_value / n_months
+    return present_value * r / (1 - (1 + r) ** (-n_months))
 
 
 def irr_annual_pct(payment: float, n_months: int, present_value: float) -> float:
@@ -907,6 +1040,19 @@ def preview_rows(arr: dict[str, Any], computed: dict[str, Any], *, stage: int = 
         _pv("Monthly reporting deadline", A3_GUIDELINE["reporting_deadline"], schedule="Schedule 1"),
         _pv("Remittance shortage cure", f"{jsround(_num(arr.get('cure_days')))} business days" if _num(arr.get("cure_days")) else "", schedule="Addendum A"),
         _pv("Program rate adjustment", adj_text, schedule="Addendum A"),
+        _pv("Funding party legal name", arr.get("funding_party_name"), schedule="Schedule 1"),
+        _pv("Funding facility type", arr.get("facility_type"), schedule="Schedule 1"),
+        _pv("Minimum activation amount", _money(_num(arr.get("min_activation"))) if _num(arr.get("min_activation")) else "", schedule="Schedule 1"),
+        _pv("Controlled account", arr.get("controlled_account"), schedule="Schedule 1"),
+        _pv("ACH account", arr.get("ach_account"), schedule="Schedule 1"),
+        _pv("Approved use of funds", _money(sum(_num(v) for k, v in (arr.get("use_of_funds") or {}).items() if k != "other_label")) if isinstance(arr.get("use_of_funds"), dict) and any(_num(v) for k, v in arr["use_of_funds"].items() if k != "other_label") else "", schedule="Schedule 1"),
+        _pv("Final funding documents executed on", arr.get("funding_docs_executed_date"), schedule="Certificate"),
+        _pv("Audit discrepancy threshold", f"{_num(arr.get('audit_discrepancy_threshold')):g}%" if _num(arr.get("audit_discrepancy_threshold")) else "", schedule="§9.5"),
+        _pv("Right-of-first-review threshold", _money(_num(arr.get("review_threshold"))) if _num(arr.get("review_threshold")) else "", schedule="§10.7"),
+        _pv("Relationship manager compensation", ", ".join(dict(RM_COMP_OPTIONS).get(k, k) for k in (arr.get("rm_comp_categories") or [])) or "", schedule="Schedule 2"),
+        _pv("Compensation in the cost of financing", arr.get("financing_cost_included"), schedule="Schedule 3"),
+        _pv("SBA status", arr.get("sba_status"), schedule="Schedule 3"),
+        _pv("Protected Funding Source", arr.get("protected_source"), schedule="Schedule 4"),
     ]
 
 
@@ -914,7 +1060,59 @@ def preview_rows(arr: dict[str, Any], computed: dict[str, Any], *, stage: int = 
 # the whole thing
 # ---------------------------------------------------------------------------
 
-def compute(arrangement: dict[str, Any] | None) -> dict[str, Any]:
+def funding_attention(arr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Stage-two consistency rules over the funding facility (Schedule 1 / 5) and the closing schedules.
+    Blanks are reported by field_attention; these fire only on filled values."""
+    out: list[dict[str, Any]] = []
+
+    def d(key: str) -> date | None:
+        v = str(arr.get(key) or "").strip()
+        try:
+            return date.fromisoformat(v[:10]) if v else None
+        except ValueError:
+            return None
+
+    def add(step: str, key: str, title: str, detail: str) -> None:
+        out.append({"step": step, "key": key, "title": title, "detail": detail})
+
+    funding, activation, commencement, maturity, docs = (d("funding_date"), d("activation_date"), d("commencement"), d("maturity"), d("funding_docs_executed_date"))
+    if funding and activation and activation < funding:
+        add("funding", "activation_date", "Activation date is earlier than actual funding", "§1.3: the Activation Date may not be earlier than the date Actual Funding occurs.")
+    if funding and commencement and commencement < funding:
+        add("funding", "commencement", "Production commencement is earlier than funding", "§5.1: the Production Commencement Date should allow an implementation period after Actual Funding.")
+    if funding and maturity and maturity <= funding:
+        add("funding", "maturity", "Maturity is not after the funding date", "The original maturity date must fall after Actual Funding.")
+    if funding and docs and docs > funding:
+        add("funding", "funding_docs_executed_date", "Funding documents dated after funding", "Certificate line 1: the final Funding Documents are executed on or before Actual Funding.")
+    funded = _num(arr.get("funded_amount"))
+    min_act = _num(arr.get("min_activation"))
+    if funded and min_act and funded < min_act:
+        add("funding", "funded_amount", "Funded amount is below the minimum activation amount", "§1.16 / §2.4: a first disbursement below the Minimum Activation Amount does not activate the agreement.")
+    if arr.get("sizing") != "fixed":
+        add("advance", "sizing", "The advance is not fixed to the funded amount", "On the final the advance is the amount actually funded; the term sheet fixes it.")
+    if str(arr.get("funding_party") or "") == "Lender" and not str(arr.get("funding_party_name") or "").strip():
+        add("funding", "funding_party_name", "Lender is not named", "Schedule 1 and the certificate name the Funding Party.")
+    uof = arr.get("use_of_funds") if isinstance(arr.get("use_of_funds"), dict) else {}
+    total = sum(_num(v) for k, v in uof.items() if k != "other_label")
+    if funded and total and abs(total - funded) > 1.0:
+        add("funding", "use_of_funds", "Use of funds does not add up to the funded amount", f"Allocated {_money(total)} against {_money(funded)} funded. Schedule 1 must account for the whole facility.")
+    owners = arr.get("owners") if isinstance(arr.get("owners"), list) else []
+    if owners:
+        pct = sum(_num(o.get("pct")) for o in owners if isinstance(o, dict))
+        if abs(pct - 100.0) > 0.01:
+            add("parties", "owners", "Ownership does not total 100.00%", f"§9.2: the ownership schedule totals {pct:g}%.")
+    naics = str(arr.get("identity_naics") or "").strip()
+    if naics and not (naics.isdigit() and len(naics) == 6):
+        add("parties", "identity_naics", "NAICS is not six digits", "§9.1 requires the exact six-digit NAICS activity.")
+    if str(arr.get("financing_cost_included") or "") == "Yes" and not str(arr.get("financing_cost_explain") or "").strip():
+        add("disclosures", "financing_cost_explain", "Financing-cost inclusion is not explained", "Schedule 3: explain how compensation is included in the cost of financing.")
+    thr = _num(arr.get("audit_discrepancy_threshold"))
+    if arr.get("audit_discrepancy_threshold") not in ("", None) and not (0 < thr <= 100):
+        add("thresholds", "audit_discrepancy_threshold", "Audit discrepancy threshold is out of range", "§9.5: a percentage above 0 and at most 100.")
+    return out
+
+
+def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, Any]:
     """Everything the UI, the PDF and the send gate need, in one JSON-safe dict."""
     arr = {**empty_arrangement(), **(arrangement or {})}
     units = _num(arr.get("monthly_units"))
@@ -938,7 +1136,9 @@ def compute(arrangement: dict[str, Any] | None) -> dict[str, Any]:
     mgmt_m = _num(arr.get("mgmt_fee"))
     vsc = e.row(PRIMARY_PRODUCT)
 
-    attention = field_attention(arr, scope="stage_one")
+    attention = field_attention(arr, scope="stage_two" if stage == 2 else "stage_one")
+    if stage == 2:
+        attention += funding_attention(arr)
     attention += thr_attention
     attention += econ_attention(arr, e, adv, remittance_req)
     if build["debt_service"] > 0 and build["policy_funded"] < build["debt_service"] * 0.5:
@@ -951,6 +1151,7 @@ def compute(arrangement: dict[str, Any] | None) -> dict[str, Any]:
 
     computed: dict[str, Any] = {
         "document_version": DOCUMENT_VERSION,
+        "stage": stage,
         "econ": {
             "units": e.units, "rows": [r.as_dict() for r in e.rows], "on": [r.key for r in e.on],
             "covered_labels": [r.label for r in e.on],
@@ -1029,7 +1230,20 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
             out["thresholds"] = {tk: _coerce_number(tv) for tk, tv in value.items() if tk in THRESHOLD_KEYS}
         elif key in FIELD_KEYS:
             rule = FIELD_RULES_BY_KEY[key]
-            if rule.kind == "number":
+            if rule.kind == "rows":
+                rows: list[dict[str, Any]] = []
+                for row in (value or []) if isinstance(value, (list, tuple)) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    clean = {f: (_coerce_number(row.get(f)) if f == "pct" else ("" if row.get(f) is None else str(row.get(f)).strip())) for f in OWNER_FIELDS}
+                    if any(v not in ("", None) for v in clean.values()):
+                        rows.append(clean)
+                out[key] = rows[:MAX_OWNERS]
+            elif rule.kind == "money_group":
+                group = value if isinstance(value, dict) else {}
+                out[key] = {k: _coerce_number(group.get(k)) for k, _ in USE_OF_FUNDS_KEYS}
+                out[key]["other_label"] = "" if group.get("other_label") is None else str(group.get("other_label")).strip()
+            elif rule.kind == "number":
                 out[key] = _coerce_number(value)
             elif rule.kind == "multiselect":
                 out[key] = [str(v).strip() for v in (value or []) if str(v).strip()] if isinstance(value, (list, tuple)) else (
@@ -1109,3 +1323,208 @@ def money(n: float | None) -> str:
 
 def pct(n: float) -> str:
     return _pct(n)
+
+
+# ---------------------------------------------------------------------------
+# term sheet → final package
+# ---------------------------------------------------------------------------
+
+def validate_terms(terms: dict[str, Any], stage_one: dict[str, Any] | None = None) -> list[str]:
+    """Human-readable problems with a term sheet; empty when it can be recorded."""
+    errors: list[str] = []
+    approved = _num(terms.get("approved_amount"))
+    min_act = _num(terms.get("min_activation_amount"))
+    if approved <= 0:
+        errors.append("Approved amount must be above zero.")
+    if min_act <= 0:
+        errors.append("Minimum activation amount must be above zero.")
+    if approved and min_act and min_act > approved:
+        errors.append("Minimum activation amount cannot exceed the approved amount.")
+    if _num(terms.get("rate_pct")) < 0:
+        errors.append("Rate cannot be negative.")
+    if int(_num(terms.get("term_months"))) <= 0:
+        errors.append("Term must be at least one month.")
+    if _num(terms.get("monthly_debt_service")) <= 0:
+        errors.append("Monthly debt service must be above zero.")
+    if not str(terms.get("funding_party_name") or "").strip():
+        errors.append("Name the funding party.")
+    if str(terms.get("funding_party_kind") or "") not in FUNDING_PARTIES:
+        errors.append("Choose the funding party kind.")
+    if not str(terms.get("facility_type") or "").strip():
+        errors.append("Choose the facility type.")
+
+    def d(key: str) -> date | None:
+        v = terms.get(key)
+        if isinstance(v, date):
+            return v
+        v = str(v or "").strip()
+        try:
+            return date.fromisoformat(v[:10]) if v else None
+        except ValueError:
+            errors.append(f"{key.replace('_', ' ').capitalize()} is not a valid date.")
+            return None
+
+    funding, activation, commencement, maturity = d("expected_funding_date"), d("activation_date"), d("commencement_date"), d("maturity_date")
+    if funding and activation and activation < funding:
+        errors.append("Activation date may not be earlier than the funding date.")
+    if funding and commencement and commencement < funding:
+        errors.append("Production commencement may not be earlier than the funding date.")
+    if funding and maturity and maturity <= funding:
+        errors.append("Maturity must fall after the funding date.")
+    uof = terms.get("use_of_funds") if isinstance(terms.get("use_of_funds"), dict) else {}
+    total = sum(_num(v) for k, v in uof.items() if k != "other_label")
+    if total and approved and abs(total - approved) > 1.0:
+        errors.append(f"Use of funds ({_money(total)}) must add up to the approved amount ({_money(approved)}).")
+    return errors
+
+
+def apply_term_sheet(arrangement: dict[str, Any], sheet: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Write the term sheet onto the final's arrangement. Returns (arrangement, applied {key: {before, after}})."""
+    arr = {**empty_arrangement(), **(arrangement or {})}
+
+    def iso(v: Any) -> str:
+        if isinstance(v, (date, datetime)):
+            return v.isoformat()[:10]
+        return str(v or "").strip()[:10]
+
+    approved = _num(sheet.get("approved_amount"))
+    writes: dict[str, Any] = {
+        "requested": approved or "",
+        "sizing": "fixed",
+        "funded_amount": approved or "",
+        "dealer_cof": _num(sheet.get("rate_pct")),
+        "term": int(_num(sheet.get("term_months"))) or "",
+        "debt_service": _num(sheet.get("monthly_debt_service")) or "",
+        "min_activation": _num(sheet.get("min_activation_amount")) or "",
+        "facility_type": str(sheet.get("facility_type") or ""),
+        "funding_party": str(sheet.get("funding_party_kind") or ""),
+        "funding_party_name": str(sheet.get("funding_party_name") or ""),
+        "funding_date": iso(sheet.get("expected_funding_date")),
+        "activation_date": iso(sheet.get("activation_date")),
+        "commencement": iso(sheet.get("commencement_date")),
+        "maturity": iso(sheet.get("maturity_date")),
+    }
+    uof = sheet.get("use_of_funds") if isinstance(sheet.get("use_of_funds"), dict) else None
+    if uof is not None:
+        writes["use_of_funds"] = {k: _coerce_number(uof.get(k)) for k, _ in USE_OF_FUNDS_KEYS} | {"other_label": str(uof.get("other_label") or "")}
+    if str(sheet.get("funding_party_kind") or "") == "Lender" and sheet.get("funding_party_name"):
+        writes.update({
+            "protected_1_name": str(sheet.get("funding_party_name")), "protected_1_rel": "Funding Party",
+            "protected_1_date": iso(sheet.get("expected_funding_date")), "protected_1_txn": "Funding Facility",
+            "protected_source": str(sheet.get("funding_party_name")),
+        })
+    applied: dict[str, Any] = {}
+    for key, value in writes.items():
+        before = arr.get(key)
+        if before != value:
+            applied[key] = {"before": jsonable(before), "after": jsonable(value)}
+        arr[key] = value
+    return arr, applied
+
+
+# ---------------------------------------------------------------------------
+# original vs final
+# ---------------------------------------------------------------------------
+
+_DEALER_HIDDEN_KEYS = frozenset({"bank_cof", "orig_cost", "prof_fees", "mgmt_fee", "loss_prov"})
+
+
+def _fmt(value: Any, fmt: str) -> str:
+    if value in (None, "", []):
+        return "—"
+    if fmt == "money":
+        return _money(_num(value))
+    if fmt == "pct":
+        return _pct(_num(value))
+    if fmt == "count":
+        n = _num(value)
+        return f"{int(n):,}" if float(n).is_integer() else f"{n:,.2f}"
+    if fmt == "bool":
+        return "Yes" if value else "No"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def arrangement_diff(original: dict[str, Any], final: dict[str, Any]) -> dict[str, Any]:
+    """Rows comparing the executed stage-one snapshot with the final draft.
+    `original`/`final` carry {arrangement, computed, sponsor?, parties?}. Values are pre-formatted."""
+    oa = {**empty_arrangement(), **((original or {}).get("arrangement") or {})}
+    fa = {**empty_arrangement(), **((final or {}).get("arrangement") or {})}
+    oc = (original or {}).get("computed") or compute(oa, stage=1)
+    fc = (final or {}).get("computed") or compute(fa, stage=2)
+    rows: list[dict[str, Any]] = []
+
+    def row(section: str, key: str, label: str, fmt: str, before: Any, after: Any, *, dealer_visible: bool = True, original_blank: bool = False) -> None:
+        b, a = _fmt(before, fmt), _fmt(after, fmt)
+        rows.append({"section": section, "key": key, "label": label, "format": fmt, "before": b, "after": a,
+                     "changed": b != a, "original_blank": original_blank, "dealer_visible": dealer_visible})
+
+    # Facility and terms
+    for key, label, fmt in (("facility_type", "Facility type", "text"), ("requested", "Approved / requested amount", "money"),
+                            ("term", "Term (months)", "count"), ("dealer_cof", "Rate / dealer cost of funds", "pct"),
+                            ("debt_service", "Monthly debt service", "money"), ("min_activation", "Minimum activation amount", "money"),
+                            ("exclusivity", "Exclusivity window (days)", "count"), ("funding_party", "Funding party", "text"),
+                            ("funding_party_name", "Funding party legal name", "text"), ("funding_date", "Funding date", "text"),
+                            ("activation_date", "Activation date", "text"), ("commencement", "Production commencement", "text"),
+                            ("maturity", "Maturity", "text"), ("funded_amount", "Funded amount", "money")):
+        row("Facility and terms", key, label, fmt, oa.get(key), fa.get(key), original_blank=oa.get(key) in ("", None))
+    for key, label, fmt in (("advance", "Advance", "money"), ("sizing", "Sizing", "text"), ("implied_rate", "Implied return", "pct"),
+                            ("cost_rate", "Programme cost rate", "pct"), ("spread", "Spread (points)", "pct"), ("clears", "Clears underwriting", "bool")):
+        row("Facility and terms", f"advance.{key}", label, fmt, oc["advance"].get(key), fc["advance"].get(key),
+            dealer_visible=key in ("advance", "sizing"))
+    # Covered products
+    orows = {r["key"]: r for r in oc["econ"]["rows"]}
+    frows = {r["key"]: r for r in fc["econ"]["rows"]}
+    for pk in PRODUCT_KEYS:
+        o, f = orows.get(pk, {}), frows.get(pk, {})
+        row("Covered products", f"products.{pk}.on", f"{PRODUCT_LABELS[pk]} — covered", "bool", o.get("on"), f.get("on"))
+        if o.get("on") or f.get("on"):
+            for fld, label, fmt in (("rate", "attachment", "pct"), ("premium", "premium", "money"), ("repay", "repayment withheld", "money"),
+                                    ("comm_pct", "commission", "pct"), ("admin", "admin fee", "money"), ("retention_pct", "retention", "pct"), ("term", "term (months)", "count")):
+                row("Covered products", f"products.{pk}.{fld}", f"{PRODUCT_LABELS[pk]} — {label}", fmt, o.get(fld), f.get(fld))
+    for key, label in (("contracts", "Contracts / month"), ("gross", "Gross / month"), ("repay_m", "Repayment / month")):
+        row("Covered products", f"econ.{key}", label, "money" if key != "contracts" else "count", oc["econ"].get(key), fc["econ"].get(key))
+    # Operative thresholds
+    othr = {r["key"]: r for r in oc["thresholds"]["rows"] if r.get("editable")}
+    fthr = {r["key"]: r for r in fc["thresholds"]["rows"] if r.get("editable")}
+    for key in THRESHOLD_KEYS:
+        fmt = (fthr.get(key) or othr.get(key) or {}).get("format", "count")
+        row("Operative thresholds", f"thresholds.{key}", THRESHOLD_LABELS[key], fmt, (othr.get(key) or {}).get("operative"), (fthr.get(key) or {}).get("operative"))
+    row("Operative thresholds", "thresholds.remittance_req", "Remittance covenant", "money", oc["thresholds"].get("remittance_req"), fc["thresholds"].get("remittance_req"))
+    for i, r in enumerate(fc["thresholds"].get("rolling", [])):
+        o = (oc["thresholds"].get("rolling") or [{}] * 10)[i] if i < len(oc["thresholds"].get("rolling") or []) else {}
+        row("Operative thresholds", f"rolling.{i}", f"Rolling three-month — {r['label']}", r["format"], o.get("value"), r.get("value"))
+    row("Operative thresholds", "audit_discrepancy_threshold", "Audit discrepancy threshold", "pct", oa.get("audit_discrepancy_threshold"), fa.get("audit_discrepancy_threshold"), original_blank=True)
+    row("Operative thresholds", "review_threshold", "Right-of-first-review threshold", "money", oa.get("review_threshold"), fa.get("review_threshold"), original_blank=True)
+    # Shortfall and cure
+    for key, label, fmt in (("cadence", "Shortfall cadence", "text"), ("cure_days", "Cure period (business days)", "count"),
+                            ("corrective", "Corrective period", "text"), ("adj", "Rate adjustment", "text"), ("adj_value", "Adjustment value", "count"),
+                            ("exclusions", "Approved exclusions", "text"), ("exclusion_1", "Approved exclusion 1", "text"),
+                            ("exclusion_2", "Approved exclusion 2", "text"), ("exclusion_3", "Approved exclusion 3", "text")):
+        row("Shortfall and cure", key, label, fmt, oa.get(key), fa.get(key), original_blank=oa.get(key) in ("", None))
+    # Parties and sponsor
+    for key, label in (("dealer_name", "Dealer legal name"), ("dealer_entity", "Dealer entity type"), ("dealer_state", "Dealer state of formation"),
+                       ("dealer_address", "Dealer address"), ("dealer_signer_name", "Dealer signer"), ("sponsor_name", "Sponsor"),
+                       ("sponsor_entity", "Sponsor entity type"), ("sponsor_state", "Sponsor state"), ("sponsor_platform", "Sponsor platform"),
+                       ("rm_name", "Relationship manager"), ("rm_email", "Relationship manager email")):
+        row("Parties and sponsor", key, label, "text", oa.get(key), fa.get(key))
+    osp = (original or {}).get("sponsor") or {}
+    fsp = (final or {}).get("sponsor") or {}
+    row("Parties and sponsor", "sponsor.agreement", "Sponsor referral-protection agreement", "text",
+        (osp.get("agreement") or {}).get("contract_number"), (fsp.get("agreement") or {}).get("contract_number"))
+    # Baseline (Schedule E vs Addendum A.1)
+    for key, label, fmt in (("base_from", "Baseline from", "text"), ("base_through", "Baseline through", "text"),
+                            ("monthly_units", "Average monthly retail units", "count"), ("lot_units", "Vehicles in the lot", "count"),
+                            ("cancels", "Cancellations / month", "count"), ("chargebacks", "Chargebacks / month", "count"), ("evidence", "Evidence relied upon", "text")):
+        row("Baseline", key, label, fmt, oa.get(key), fa.get(key))
+    # Closing schedules (original side blank by nature)
+    for key, label, fmt in (("controlled_account", "Controlled account", "text"), ("ach_account", "ACH account", "text"),
+                            ("funding_docs_executed_date", "Funding documents executed on", "text"), ("protected_source", "Protected Funding Source", "text"),
+                            ("financing_cost_included", "Compensation in the cost of financing", "text"), ("sba_status", "SBA status", "text")):
+        row("Closing schedules", key, label, fmt, None, fa.get(key), original_blank=True, dealer_visible=key not in ("financing_cost_included",))
+    uof = fa.get("use_of_funds") if isinstance(fa.get("use_of_funds"), dict) else {}
+    for k, label in USE_OF_FUNDS_KEYS:
+        row("Closing schedules", f"use_of_funds.{k}", f"Use of funds — {label}", "money", None, uof.get(k), original_blank=True)
+    changed = sum(1 for r in rows if r["changed"])
+    return {"rows": rows, "changed_count": changed}

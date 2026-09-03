@@ -9,8 +9,8 @@ from __future__ import annotations
 import uuid
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +26,8 @@ from app.schemas.settings import (
     AppSettingsUpdate,
     SignatureUploadInitResponse,
 )
+from app.schemas.stored_signature import StoredSignatureRead
+from app.services import stored_signatures as stored_sigs
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -161,3 +163,87 @@ async def signature_upload_init(
         ) from exc
 
     return SignatureUploadInitResponse(s3_key=SIGNATURE_S3_KEY, upload_url=upload_url)
+
+
+# ── Company signature on file ───────────────────────────────────────────
+#
+# Qualified Commercial's own signature on program agreements. The image is
+# the letterhead signature already uploaded above (letterhead.signature_s3_key);
+# adopting it records the signer name/title and the image hash as the one
+# live "qc" row in stored_signatures (source="letterhead"), which the
+# production package places on every agreement it sends. Adopting again
+# retires the previous row; documents already sent are untouched.
+#
+# Gate: read is open to any signed-in team member (the settings page shows
+# who signs for the firm); adopting is SUPER_ADMIN only.
+
+
+class CompanySignatureAdoptBody(BaseModel):
+    typed_name: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=120)
+
+
+class CompanySignatureState(BaseModel):
+    signature: StoredSignatureRead | None = None
+    authorization_text: str
+    authorization_version: str
+    # Whether a letterhead signature image is saved — the precondition for adopting.
+    letterhead_signature_present: bool = False
+
+
+def _company_signature_state(sig, *, letterhead_present: bool) -> CompanySignatureState:
+    return CompanySignatureState(
+        signature=stored_sigs.read_model(sig, presign=True),
+        authorization_text=stored_sigs.COMPANY_SIGNATURE_AUTHORIZATION_TEXT,
+        authorization_version=stored_sigs.COMPANY_SIGNATURE_AUTHORIZATION_VERSION,
+        letterhead_signature_present=letterhead_present,
+    )
+
+
+def _letterhead_signature_key(row: AppSettings) -> str | None:
+    letterhead = (row.data or {}).get("letterhead") or {}
+    key = letterhead.get("signature_s3_key") if isinstance(letterhead, dict) else None
+    return key or None
+
+
+@router.get("/company-signature", response_model=CompanySignatureState)
+async def get_company_signature(_: CurrentUser, db: AsyncSession = Depends(get_db)) -> CompanySignatureState:
+    row = await _get_or_create(db)
+    sig = await stored_sigs.current(db, "qc", None)
+    return _company_signature_state(sig, letterhead_present=bool(_letterhead_signature_key(row)))
+
+
+@router.post(
+    "/company-signature/adopt",
+    response_model=CompanySignatureState,
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def adopt_company_signature(
+    payload: CompanySignatureAdoptBody,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> CompanySignatureState:
+    """Adopt the saved letterhead signature image as Qualified Commercial's
+    signature on file, signed by the named officer. 422
+    ``letterhead_signature_missing`` until an image is uploaded and saved."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super admin required")
+    row = await _get_or_create(db)
+    key = _letterhead_signature_key(row)
+    sig = await stored_sigs.adopt_qc_signature(
+        db, admin=user, signature_s3_key=key, signature_sha256=None,
+        typed_name=payload.typed_name, title=payload.title, request=request,
+    )
+    db.add(
+        Activity(
+            loan_id=None,
+            actor_id=user.id,
+            actor_label=user.role.value if hasattr(user.role, "value") else str(user.role),
+            kind="settings.company_signature_adopted",
+            summary=f"Adopted the company signature on file: {sig.typed_name}" + (f", {sig.title}" if sig.title else ""),
+            payload={"stored_signature_id": str(sig.id), "signature_s3_key": key, "signature_sha256": sig.signature_sha256},
+        )
+    )
+    await db.flush()
+    return _company_signature_state(sig, letterhead_present=True)
