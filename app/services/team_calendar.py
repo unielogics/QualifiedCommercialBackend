@@ -9,6 +9,71 @@ from app.models.booking_settings import BookingSettings
 from app.models.user import User
 from app.services.payment_authorization import primary_super_admin
 
+INHERITABLE_BOOKING_FIELDS = frozenset({
+    "duration_min",
+    "buffer_before_min",
+    "buffer_after_min",
+    "confirmation_email_enabled",
+    "confirmation_sms_enabled",
+    "reminder_email_enabled",
+    "reminder_email_minutes_before",
+    "reminder_email_minutes",
+    "reminder_sms_enabled",
+    "reminder_sms_minutes_before",
+    "reminder_sms_minutes",
+    "reminder_sms_messages",
+    "reminder_email_messages",
+    "confirmation_messages",
+    "precall_enabled",
+    "precall_messages",
+    "precall_default_variant",
+    "precall_allowed_variants",
+    "precall_allow_vertical_choice",
+    "google_meet_enabled",
+    "timezone",
+    "available_days",
+    "weekly_schedule",
+    "advance_booking_window_enabled",
+    "minimum_notice_days",
+    "maximum_advance_days",
+    "blocked_intervals",
+    "booking_questions",
+    "no_show_follow_up_enabled",
+    "morning_digest_enabled",
+    "missing_outcome_reminder_hours",
+    "start_time",
+    "end_time",
+})
+
+
+class EffectiveBookingSettings:
+    """Read-only overlay of firm defaults and an individual booking page."""
+
+    def __init__(self, personal: BookingSettings, firm: BookingSettings):
+        self._personal = personal
+        self._firm = firm
+        self._overrides = set(personal.firm_policy_overrides or [])
+
+    def __getattr__(self, name: str):
+        if name in INHERITABLE_BOOKING_FIELDS and name not in self._overrides:
+            return getattr(self._firm, name)
+        return getattr(self._personal, name)
+
+
+async def effective_booking_settings(
+    db: AsyncSession,
+    personal: BookingSettings,
+) -> BookingSettings | EffectiveBookingSettings:
+    if not personal.inherit_firm_policy:
+        return personal
+    firm_user = await primary_super_admin(db)
+    if firm_user is None or firm_user.id == personal.user_id:
+        return personal
+    firm = (
+        await db.execute(select(BookingSettings).where(BookingSettings.user_id == firm_user.id))
+    ).scalar_one_or_none()
+    return EffectiveBookingSettings(personal, firm) if firm is not None else personal
+
 
 async def lock_calendar_owner(db: AsyncSession, user_id: uuid.UUID) -> None:
     """Serialize bookings for one calendar owner inside the caller transaction."""

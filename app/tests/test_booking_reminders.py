@@ -9,6 +9,7 @@ from app.models.booking_notification import BookingNotification, BookingNotifica
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
+from app.services import booking_reminders
 from app.services.booking_availability import (
     booking_window_bounds,
     daily_booking_windows,
@@ -16,8 +17,11 @@ from app.services.booking_availability import (
     slot_overlaps_blocked_interval,
     slot_within_custom_booking_window,
 )
-from app.services import booking_reminders
-from app.services.booking_reminders import register_booking, send_confirmation_sms
+from app.services.booking_reminders import (
+    _dispatch_precall_reminder,
+    register_booking,
+    send_confirmation_sms,
+)
 
 
 class _FakeSession:
@@ -32,6 +36,40 @@ class _FakeSession:
 
     async def commit(self) -> None:
         return None
+
+
+@pytest.mark.asyncio
+async def test_precall_dispatch_uses_the_persisted_target_type(monkeypatch) -> None:
+    from app.dealer_os.services import application_precall, precall
+
+    calls: list[str] = []
+
+    async def application_dispatch(*args, **kwargs):
+        calls.append("application")
+        return True
+
+    async def dealer_dispatch(*args, **kwargs):
+        calls.append("dealer")
+        return True
+
+    monkeypatch.setattr(application_precall, "dispatch_row", application_dispatch)
+    monkeypatch.setattr(precall, "dispatch_row", dealer_dispatch)
+    common = {
+        "db": object(),
+        "reminder": object(),
+        "event": object(),
+        "booking": object(),
+        "host": object(),
+        "now": datetime.now(UTC),
+    }
+
+    assert await _dispatch_precall_reminder(
+        notice=SimpleNamespace(precall_intake_id=uuid4()), **common
+    )
+    assert await _dispatch_precall_reminder(
+        notice=SimpleNamespace(precall_intake_id=None), **common
+    )
+    assert calls == ["application", "dealer"]
 
 
 @pytest.mark.asyncio
@@ -254,6 +292,17 @@ def test_booking_settings_rejects_reversed_advance_window() -> None:
             minimum_notice_days=6,
             maximum_advance_days=5,
         )
+
+
+def test_booking_settings_rejects_unknown_firm_policy_overrides() -> None:
+    with pytest.raises(ValueError, match="Unknown firm policy override"):
+        UserBookingSettingsUpdate(firm_policy_overrides=["not_a_real_setting"])
+
+    payload = UserBookingSettingsUpdate(
+        inherit_firm_policy=True,
+        firm_policy_overrides=["precall_enabled", "weekly_schedule"],
+    )
+    assert payload.firm_policy_overrides == ["precall_enabled", "weekly_schedule"]
 
 
 def test_booking_window_uses_custom_days_only_when_enabled() -> None:

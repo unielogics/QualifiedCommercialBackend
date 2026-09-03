@@ -199,6 +199,11 @@ async def ingest_asset_report_background(asset_report_id: str) -> None:
                 await ingest_dealer(db, asset_report_id)
             else:
                 await ingest_asset_report(db, asset_report_id)
+                profile = await db.get(ApplicationProfile, report.profile_id) if report.profile_id else None
+                if profile is not None:
+                    from app.dealer_os.services import application_precall
+
+                    await application_precall.on_progress(db, profile, commit=False)
             await db.commit()
     except Exception:  # noqa: BLE001
         logger.exception("Plaid Asset Report ingestion failed report=%s", asset_report_id)
@@ -505,6 +510,11 @@ async def sync_item_background(item_id, scheduled: bool = False) -> None:
         if item is None:
             return
         await sync_item(db, item, scheduled=scheduled)
+        profile = await db.get(ApplicationProfile, item.profile_id)
+        if profile is not None:
+            from app.dealer_os.services import application_precall
+
+            await application_precall.on_progress(db, profile, commit=False)
         await db.commit()
 
 

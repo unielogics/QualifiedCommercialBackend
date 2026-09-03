@@ -532,6 +532,27 @@ class ApplicationRoomPrimaryBank(ApplicationRoomAccess):
     is_primary_operating: Literal[True] = True
 
 
+class ApplicationRoomOwnerCreate(ApplicationRoomAccess):
+    owner: FileOwnerCreate
+
+
+class ApplicationRoomOwnerPatch(ApplicationRoomAccess):
+    owner: FileOwnerPatch
+
+
+class ApplicationRoomCreditInvite(ApplicationRoomAccess):
+    # The owner has not granted SMS consent inside the shared business room;
+    # keep this private authorization link on email until the owner consents.
+    channel: Literal["email"] = "email"
+
+
+class ApplicationRoomPrecallState(BaseModel):
+    status: Literal["in_progress", "complete", "stopped", "disabled"] = "disabled"
+    complete: bool = False
+    done_count: int = 0
+    missing: list[str] = Field(default_factory=list)
+
+
 class ApplicationRoomSignable(BaseModel):
     id: UUID
     name: str
@@ -575,6 +596,9 @@ class ApplicationRoomState(BaseModel):
     business_name: str
     room_url: str
     capabilities: list[str] = Field(default_factory=list)
+    owners: list[FileOwnerRead] = Field(default_factory=list)
+    verification: FileOwnerRequirementState
+    precall: ApplicationRoomPrecallState | None = None
     banking: ApplicationBankState
     signable: list[ApplicationRoomSignable] = Field(default_factory=list)
     merchant_offer: ApplicationRoomMerchantOfferSummary | None = None

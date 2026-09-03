@@ -18,6 +18,7 @@ import zipfile
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -58,7 +59,7 @@ from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.notifications import notify_inbound_communication, notify_users
 from app.services import file_events, merchant_processing
-from app.services.team_calendar import lock_calendar_owner, team_booking_settings
+from app.services.team_calendar import effective_booking_settings, lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle, plaid_policy
 from app.services.email import ses_client
 from app.services.google import calendar_sync
@@ -455,7 +456,7 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import bank_consent, balance_health, client_room, consent_delivery, precall, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import application_precall, bank_consent, balance_health, client_room, consent_delivery, precall, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -6770,7 +6771,7 @@ async def _booking_settings_for(db: AsyncSession, host: User) -> BookingSettings
         await db.execute(select(BookingSettings).where(BookingSettings.user_id == host.id))
     ).scalar_one_or_none()
     if row is not None:
-        return row
+        return await effective_booking_settings(db, row)
     return BookingSettings(
         user_id=host.id,
         enabled=True,
@@ -7233,6 +7234,8 @@ async def _appointment_read_rows(
         )
     }
     drafts: dict[UUID, DealerBusiness] = {}
+    intake_drafts: dict[UUID, PublicUnderwritingIntake] = {}
+    intake_profiles: dict[UUID, ApplicationProfile] = {}
     if event_ids:
         notice_rows = (
             await db.execute(select(BookingNotification).where(BookingNotification.event_id.in_(event_ids)))
@@ -7243,6 +7246,25 @@ async def _appointment_read_rows(
             drafts = {
                 d.id: d
                 for d in (await db.execute(select(DealerBusiness).where(DealerBusiness.id.in_(draft_ids)))).scalars().all()
+            }
+        intake_ids = [row.precall_intake_id for row in notice_rows if row.precall_intake_id]
+        if intake_ids:
+            intake_drafts = {
+                item.id: item
+                for item in (
+                    await db.execute(
+                        select(PublicUnderwritingIntake).where(PublicUnderwritingIntake.id.in_(intake_ids))
+                    )
+                ).scalars().all()
+            }
+            intake_profiles = {
+                item.intake_id: item
+                for item in (
+                    await db.execute(
+                        select(ApplicationProfile).where(ApplicationProfile.intake_id.in_(intake_ids))
+                    )
+                ).scalars().all()
+                if item.intake_id is not None
             }
         notice_ids = [row.id for row in notice_rows]
         if notice_ids:
@@ -7319,7 +7341,10 @@ async def _appointment_read_rows(
             else "unavailable"
         )
         data["precall"] = _appointment_precall_summary(
-            notice, drafts.get(notice.precall_dealer_id) if notice and notice.precall_dealer_id else None
+            notice,
+            dealer=drafts.get(notice.precall_dealer_id) if notice and notice.precall_dealer_id else None,
+            intake=intake_drafts.get(notice.precall_intake_id) if notice and notice.precall_intake_id else None,
+            profile=intake_profiles.get(notice.precall_intake_id) if notice and notice.precall_intake_id else None,
         )
         payloads.append(data)
     return payloads
@@ -8219,11 +8244,17 @@ async def act_on_rep_appointment_precall(
     notice = (
         await db.execute(select(BookingNotification).where(BookingNotification.event_id == appointment.calendar_event_id))
     ).scalar_one_or_none()
-    if notice is None or not notice.precall_dealer_id:
+    if notice is None or not (notice.precall_dealer_id or notice.precall_intake_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "This booking has no draft file; pre-call prep was not opened for it.")
-    dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
     event = await db.get(CalendarEvent, notice.event_id)
-    if dealer is None or event is None:
+    dealer = await db.get(DealerBusiness, notice.precall_dealer_id) if notice.precall_dealer_id else None
+    intake = await db.get(PublicUnderwritingIntake, notice.precall_intake_id) if notice.precall_intake_id else None
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(ApplicationProfile.intake_id == notice.precall_intake_id)
+        )
+    ).scalar_one_or_none() if notice.precall_intake_id else None
+    if event is None or (dealer is None and (intake is None or profile is None)):
         raise HTTPException(status.HTTP_409_CONFLICT, "The draft file for this booking is gone.")
     host = await db.get(User, event.owner_user_id)
     booking = (
@@ -8231,7 +8262,8 @@ async def act_on_rep_appointment_precall(
     ).scalar_one_or_none()
     if host is None or booking is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "Booking settings for the host are missing.")
-    if payload.action in {"resend", "rotate_pin"}:
+    booking = await effective_booking_settings(db, booking)
+    if payload.action in {"resend", "rotate_pin"} and dealer is not None:
         await _require_training_live_action(
             db, dealer=dealer, user=user, request=request,
             action="Pre-call prep", provider="SES / SMS", recipient=notice.invitee_email or notice.invitee_phone,
@@ -8241,25 +8273,63 @@ async def act_on_rep_appointment_precall(
     passcode: str | None = None
     if payload.action == "stop":
         await precall.stop_sequence(db, notice, reason="host_disabled")
-        await log_action(db, dealer.id, user, "precall.stopped", "dealer", entity_id=dealer.id)
+        if dealer is not None:
+            await log_action(db, dealer.id, user, "precall.stopped", "dealer", entity_id=dealer.id)
+        else:
+            await application_profile_service.log_profile_action(
+                db, profile, user, "precall.stopped", "Pre-call preparation stopped by staff"
+            )
         await db.commit()
         detail = "Pre-call nudges stopped for this booking."
     elif payload.action == "resume":
         restored = await precall.resume_sequence(db, notice=notice, event=event)
-        await log_action(db, dealer.id, user, "precall.resumed", "dealer", entity_id=dealer.id, after={"restored": restored})
+        if dealer is not None:
+            await log_action(db, dealer.id, user, "precall.resumed", "dealer", entity_id=dealer.id, after={"restored": restored})
+        else:
+            await application_profile_service.log_profile_action(
+                db,
+                profile,
+                user,
+                "precall.resumed",
+                "Pre-call preparation resumed by staff",
+                metadata={"restored": restored},
+            )
         await db.commit()
         detail = f"Resumed; {restored} pending step{'s' if restored != 1 else ''} restored." if restored else "Resumed; no future steps were left to restore."
     else:
         if payload.action == "rotate_pin":
-            room = await client_room.rotate_passcode(db, dealer)
+            room = (
+                await client_room.rotate_passcode(db, dealer)
+                if dealer is not None
+                else await application_precall.rotate_passcode(db, intake)
+            )
             passcode = room.passcode
-            await log_action(db, dealer.id, user, "room.passcode_rotated", "dealer", entity_id=dealer.id, after={"via": "precall"})
+            if dealer is not None:
+                await log_action(db, dealer.id, user, "room.passcode_rotated", "dealer", entity_id=dealer.id, after={"via": "precall"})
+            else:
+                await application_profile_service.log_profile_action(
+                    db, profile, user, "room.passcode_rotated", "Application room PIN rotated",
+                    metadata={"via": "precall"},
+                )
         channels = ("email", "sms") if payload.channel == "both" else (payload.channel,)
         await db.commit()
-        sent = await precall.send_kit(
-            db, notice=notice, event=event, booking=booking, host=host, dealer=dealer,
-            channels=channels, pin=passcode,
-        )
+        if dealer is not None:
+            sent = await precall.send_kit(
+                db, notice=notice, event=event, booking=booking, host=host, dealer=dealer,
+                channels=channels, pin=passcode,
+            )
+        else:
+            sent = await application_precall.send_kit(
+                db,
+                notice=notice,
+                event=event,
+                booking=booking,
+                host=host,
+                intake=intake,
+                profile=profile,
+                channels=channels,
+                pin=passcode,
+            )
         if passcode and not sent["sms"] and notice.sms_consent:
             notice.precall_pin_delivered_via = "rep"
         elif passcode and sent["sms"]:
@@ -8271,9 +8341,26 @@ async def act_on_rep_appointment_precall(
         )
         if passcode and not sent["sms"]:
             detail = f"{detail} Read the new PIN to the client."
+    _record_appointment_activity(
+        db,
+        appointment,
+        event_type=f"precall.{payload.action}",
+        user=user,
+        body=detail,
+        after={
+            "action": payload.action,
+            "channel": payload.channel,
+            "target_kind": "field_desk" if dealer is not None else "ai_intake",
+            "pin_rotated": bool(passcode),
+            "delivery": sent if payload.action in {"resend", "rotate_pin"} else None,
+        },
+    )
+    await db.commit()
     await db.refresh(appointment)
-    room_url = client_room.room_url(
-        (await client_room.ensure_room(db, dealer, adopt_intake=False)).link.token
+    room_url = (
+        client_room.room_url((await client_room.ensure_room(db, dealer, adopt_intake=False)).link.token)
+        if dealer is not None
+        else (await application_precall.room_for_intake(db, intake)).url
     )
     return RepAppointmentPrecallResult(
         ok=True,
@@ -10028,6 +10115,14 @@ async def create_standalone_rep_appointment(
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
         booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind, origin=appt.origin,
+        request=request,
+        start_precall_preparation=payload.start_precall_preparation,
+        precall_variant=payload.precall_variant,
+        application_data={
+            "requested_amount": requested_amount,
+            "program_name": program,
+            "source": "manual_calendar",
+        },
     )
     thread = await _ensure_rep_thread(
         db,
@@ -10880,11 +10975,16 @@ async def _open_booking_draft(
     notes: str | None,
     kind: str,
     origin: str | None,
+    request: Request | None = None,
+    start_precall_preparation: bool = False,
+    precall_variant: str | None = None,
+    application_data: dict | None = None,
 ):
-    """A field-desk booking opens (or attaches) the draft dealer file and its
-    room, and starts the pre-call sequence when the checklist is still open.
-    Any other origin opens nothing here: the calendar outcome decides which
-    file it becomes.
+    """Open the booking's explicit pre-call target.
+
+    Field Desk retains its DealerBusiness draft. Calendar appointments open an
+    AI Intake only when the operator selected the preparation toggle. No
+    contact-value matching is used for either target.
 
     Flushes only — it rides in the booking transaction. A non-database error
     is logged and the booking still goes through; a database error has
@@ -10892,20 +10992,56 @@ async def _open_booking_draft(
     """
     from sqlalchemy.exc import SQLAlchemyError
 
-    if not booking.precall_enabled or kind in _PRECALL_SKIP_KINDS or not precall.opens_draft(origin):
+    if not booking.precall_enabled or kind in _PRECALL_SKIP_KINDS:
         return None
-    try:
-        result = await precall.create_draft_for_booking(
-            db, notice=notice, event=event, booking=booking, host=host, appointment=appointment,
-            contact=contact, dealer=dealer, booked_by=booked_by, company=company, notes=notes,
+    is_field_desk = precall.opens_draft(origin)
+    if not is_field_desk and not start_precall_preparation:
+        return None
+    if not is_field_desk and not notice.invitee_email:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "An email address is required to start pre-call preparation.",
         )
-        ready = await precall.readiness(db, result.dealer)
-        if not ready.complete:
-            await precall.schedule(
-                db, notice=notice, booking=booking, event=event, dealer=result.dealer,
-                timezone_name=appointment.timezone if appointment is not None else None,
+    if not is_field_desk and request is None:
+        raise RuntimeError("A request context is required to create an AI Intake preparation file")
+    try:
+        if is_field_desk:
+            result = await precall.create_draft_for_booking(
+                db, notice=notice, event=event, booking=booking, host=host, appointment=appointment,
+                contact=contact, dealer=dealer, booked_by=booked_by, company=company, notes=notes,
             )
+            ready = await precall.readiness(db, result.dealer)
+            if not ready.complete:
+                await precall.schedule(
+                    db, notice=notice, booking=booking, event=event, dealer=result.dealer,
+                    timezone_name=appointment.timezone if appointment is not None else None,
+                )
+        else:
+            result = await application_precall.create_draft_for_booking(
+                db,
+                notice=notice,
+                event=event,
+                booking=booking,
+                host=host,
+                request=request,
+                appointment=appointment,
+                variant=precall_variant,
+                company=company,
+                notes=notes,
+                application_data=application_data,
+            )
+            ready = await application_precall.readiness(db, result.profile)
+            if not ready.complete:
+                await application_precall.schedule(
+                    db,
+                    notice=notice,
+                    booking=booking,
+                    event=event,
+                    timezone_name=appointment.timezone if appointment is not None else None,
+                )
         return result
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except SQLAlchemyError:
         raise
     except Exception:  # noqa: BLE001
@@ -10928,9 +11064,14 @@ class _BookingKit:
 async def _booking_kit(db: AsyncSession, *, notice, event, booking, host, draft, timezone_name):
     if draft is None:
         return None
-    ready = await precall.readiness(db, draft.dealer)
+    if hasattr(draft, "profile"):
+        ready = await application_precall.readiness(db, draft.profile)
+        template_target = SimpleNamespace(name=draft.intake.business_name or draft.intake.full_name)
+    else:
+        ready = await precall.readiness(db, draft.dealer)
+        template_target = draft.dealer
     values = precall.template_values(
-        notice=notice, event=event, booking=booking, host=host, dealer=draft.dealer,
+        notice=notice, event=event, booking=booking, host=host, dealer=template_target,
         room_link=draft.room.url, ready=ready, pin=draft.room.passcode,
         stop_link=precall.stop_url(notice), timezone_name=timezone_name,
     )
@@ -10999,14 +11140,40 @@ async def _supersede_booking_draft(db: AsyncSession, appt: DealerRepAppointment,
     await db.flush()
 
 
-def _appointment_precall_summary(notice, dealer: DealerBusiness | None) -> dict | None:
+def _appointment_precall_summary(
+    notice,
+    *,
+    dealer: DealerBusiness | None = None,
+    intake: PublicUnderwritingIntake | None = None,
+    profile: ApplicationProfile | None = None,
+) -> dict | None:
     """The cheap, list-safe view: status and where the file is. Readiness and
     the step timeline are loaded only for the workspace and the precall route."""
-    if notice is None or not notice.precall_dealer_id or dealer is None:
+    if notice is None:
+        return None
+    if notice.precall_intake_id and intake is not None:
+        return {
+            "status": application_precall.status_for(notice, None, True),
+            "target_kind": "ai_intake",
+            "target_id": intake.id,
+            "intake_id": intake.id,
+            "profile_id": profile.id if profile else None,
+            "href": f"/admin/ai-underwriter-leads?lead={intake.id}&view=underwriting",
+            "case_ref": f"QC-I-{str(intake.id)[:8].upper()}",
+            "lifecycle": profile.underwriting_status if profile else intake.status,
+            "pin_delivered_via": notice.precall_pin_delivered_via,
+            "completed_at": notice.precall_completed_at,
+            "stopped_at": notice.precall_stopped_at,
+            "stop_reason": notice.precall_stop_reason,
+        }
+    if not notice.precall_dealer_id or dealer is None:
         return None
     return {
         "status": precall.status_for(notice, None, True),
+        "target_kind": "field_desk",
+        "target_id": dealer.id,
         "dealer_id": dealer.id,
+        "href": _appointment_dealer_href(dealer.id),
         "case_ref": dealer.case_ref,
         "lifecycle": dealer.application_lifecycle,
         "pin_delivered_via": notice.precall_pin_delivered_via,
@@ -11023,7 +11190,40 @@ async def _appointment_precall_read(db: AsyncSession, appointment: DealerRepAppo
     notice = (
         await db.execute(select(BookingNotification).where(BookingNotification.event_id == appointment.calendar_event_id))
     ).scalar_one_or_none()
-    if notice is None or not notice.precall_dealer_id:
+    if notice is None:
+        return None
+    if notice.precall_intake_id:
+        intake = await db.get(PublicUnderwritingIntake, notice.precall_intake_id)
+        profile = (
+            await db.execute(
+                select(ApplicationProfile).where(ApplicationProfile.intake_id == notice.precall_intake_id)
+            )
+        ).scalar_one_or_none()
+        if intake is None or profile is None:
+            return None
+        ready = await application_precall.readiness(db, profile)
+        room = await application_precall.room_for_intake(db, intake)
+        steps = await precall.steps_for(db, notice)
+        pending = [step for step in steps if step["status"] == "pending"]
+        return {
+            "status": application_precall.status_for(notice, ready, True),
+            "target_kind": "ai_intake",
+            "target_id": intake.id,
+            "intake_id": intake.id,
+            "profile_id": profile.id,
+            "href": f"/admin/ai-underwriter-leads?lead={intake.id}&view=underwriting",
+            "case_ref": f"QC-I-{str(intake.id)[:8].upper()}",
+            "lifecycle": profile.underwriting_status,
+            "room_url": room.url,
+            "pin_delivered_via": notice.precall_pin_delivered_via,
+            "completed_at": notice.precall_completed_at,
+            "stopped_at": notice.precall_stopped_at,
+            "stop_reason": notice.precall_stop_reason,
+            "next_step_at": min((step["due_at"] for step in pending), default=None),
+            "readiness": _precall_readiness_payload(ready),
+            "steps": steps,
+        }
+    if not notice.precall_dealer_id:
         return None
     dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
     if dealer is None:
@@ -11034,7 +11234,10 @@ async def _appointment_precall_read(db: AsyncSession, appointment: DealerRepAppo
     pending = [s for s in steps if s["status"] == "pending"]
     return {
         "status": precall.status_for(notice, ready, True),
+        "target_kind": "field_desk",
+        "target_id": dealer.id,
         "dealer_id": dealer.id,
+        "href": _appointment_dealer_href(dealer.id),
         "case_ref": dealer.case_ref,
         "lifecycle": dealer.application_lifecycle,
         "room_url": room.url,
@@ -11043,20 +11246,24 @@ async def _appointment_precall_read(db: AsyncSession, appointment: DealerRepAppo
         "stopped_at": notice.precall_stopped_at,
         "stop_reason": notice.precall_stop_reason,
         "next_step_at": min((s["due_at"] for s in pending), default=None),
-        "readiness": {
-            "ownership_complete": ready.ownership_complete,
-            "ownership_total": ready.ownership_total,
-            "contact_complete": ready.contact_complete,
-            "bank_complete": ready.bank_complete,
-            "bank_detail": ready.bank_detail,
-            "credit_complete": ready.credit_complete,
-            "credit_required": ready.credit_required,
-            "credit_done": ready.credit_done,
-            "complete": ready.complete,
-            "done_count": ready.done_count,
-            "missing": ready.missing,
-        },
+        "readiness": _precall_readiness_payload(ready),
         "steps": steps,
+    }
+
+
+def _precall_readiness_payload(ready) -> dict:
+    return {
+        "ownership_complete": ready.ownership_complete,
+        "ownership_total": ready.ownership_total,
+        "contact_complete": ready.contact_complete,
+        "bank_complete": ready.bank_complete,
+        "bank_detail": ready.bank_detail,
+        "credit_complete": ready.credit_complete,
+        "credit_required": ready.credit_required,
+        "credit_done": ready.credit_done,
+        "complete": ready.complete,
+        "done_count": ready.done_count,
+        "missing": ready.missing,
     }
 
 

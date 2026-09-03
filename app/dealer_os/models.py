@@ -724,6 +724,14 @@ class DealerRepAppointment(TimestampMixin, Base):
     converted_intake_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL")
     )
+    precall_intake_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL"),
+        index=True,
+    )
+    precall_application_data: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     linked_loan_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("loans.id", ondelete="SET NULL"), index=True
     )

@@ -865,7 +865,7 @@ async def plaid_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         await db.commit()
 
     if outcome == "asset report ready" and payload.get("asset_report_id"):
-        from app.dealer_os.services.plaid_assets import ingest_asset_report_background
+        from app.services.application_plaid_sync import ingest_asset_report_background
 
         background_tasks.add_task(
             ingest_asset_report_background, str(payload["asset_report_id"])

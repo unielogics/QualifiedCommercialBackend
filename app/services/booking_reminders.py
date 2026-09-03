@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
@@ -18,6 +19,7 @@ from app.models.user import User
 from app.services import message_render
 from app.services.email import ses_client
 from app.services.notifications import notify_users
+from app.services.team_calendar import effective_booking_settings
 
 log = logging.getLogger(__name__)
 
@@ -145,16 +147,22 @@ async def reschedule_pending(
     sms_rows = [row for row in reminders if row.channel == "sms"]
     notice.email_reminder_due_at = min((row.due_at for row in email_rows), default=None)
     notice.sms_reminder_due_at = min((row.due_at for row in sms_rows), default=None)
-    if notice.precall_dealer_id:
+    if notice.precall_dealer_id or notice.precall_intake_id:
         from app.dealer_os.models import DealerBusiness
         from app.dealer_os.services import precall
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
 
         event = await db.get(CalendarEvent, notice.event_id)
         booking = (
             await db.execute(select(BookingSettings).where(BookingSettings.user_id == event.owner_user_id))
         ).scalar_one_or_none() if event is not None else None
         if booking is not None:
-            dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+            booking = await effective_booking_settings(db, booking)
+            dealer = (
+                await db.get(DealerBusiness, notice.precall_dealer_id)
+                if notice.precall_dealer_id
+                else await db.get(PublicUnderwritingIntake, notice.precall_intake_id)
+            )
             await precall.retime_after_reschedule(
                 db, notice=notice, booking=booking, starts_at=starts_at, dealer=dealer
             )
@@ -176,7 +184,11 @@ async def cancel_pending(db: AsyncSession, notice: BookingNotification) -> None:
         notice.email_reminder_status = "cancelled"
     if notice.sms_reminder_status == "pending":
         notice.sms_reminder_status = "cancelled"
-    if notice.precall_dealer_id and notice.precall_stopped_at is None and notice.precall_completed_at is None:
+    if (
+        (notice.precall_dealer_id or notice.precall_intake_id)
+        and notice.precall_stopped_at is None
+        and notice.precall_completed_at is None
+    ):
         notice.precall_stopped_at = datetime.now(UTC)
         notice.precall_stop_reason = "cancelled"
 
@@ -344,19 +356,35 @@ async def _precall_values(db, precall, *, notice, event, booking, host) -> dict[
         "{done}": "",
         "{pin}": "",
     }
-    if not notice.precall_dealer_id or not booking.precall_enabled:
+    if not (notice.precall_dealer_id or notice.precall_intake_id) or not booking.precall_enabled:
         return base
     try:
         from app.dealer_os.models import DealerBusiness
-        from app.dealer_os.services import client_room
+        from app.dealer_os.services import application_precall, client_room
+        from app.models.application_profile import ApplicationProfile
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
 
-        dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
-        if dealer is None or dealer.archived_at is not None:
-            return base
-        ready = await precall.readiness(db, dealer)
-        room = await client_room.ensure_room(db, dealer, adopt_intake=False)
+        if notice.precall_intake_id:
+            intake = await db.get(PublicUnderwritingIntake, notice.precall_intake_id)
+            profile = (
+                await db.execute(
+                    select(ApplicationProfile).where(ApplicationProfile.intake_id == notice.precall_intake_id)
+                )
+            ).scalar_one_or_none()
+            if intake is None or profile is None:
+                return base
+            ready = await application_precall.readiness(db, profile)
+            room = await application_precall.room_for_intake(db, intake)
+            template_target = SimpleNamespace(name=intake.business_name or intake.full_name)
+        else:
+            dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+            if dealer is None or dealer.archived_at is not None:
+                return base
+            ready = await precall.readiness(db, dealer)
+            room = await client_room.ensure_room(db, dealer, adopt_intake=False)
+            template_target = dealer
         values = precall.template_values(
-            notice=notice, event=event, booking=booking, host=host, dealer=dealer,
+            notice=notice, event=event, booking=booking, host=host, dealer=template_target,
             room_link=room.url, ready=ready, timezone_name=booking.timezone,
         )
         base.update({k: v for k, v in values.items() if k in base})
@@ -370,6 +398,31 @@ async def _precall_values(db, precall, *, notice, event, booking, host) -> dict[
     except Exception:  # noqa: BLE001
         log.exception("reminder: pre-call values failed notification=%s", notice.id)
     return base
+
+
+async def _dispatch_precall_reminder(
+    db,
+    *,
+    reminder,
+    notice,
+    event,
+    booking,
+    host,
+    now,
+) -> bool:
+    """Route a pre-call row to the service that owns its persisted target."""
+    from app.dealer_os.services import application_precall, precall
+
+    dispatcher = application_precall.dispatch_row if notice.precall_intake_id else precall.dispatch_row
+    return await dispatcher(
+        db,
+        reminder=reminder,
+        notice=notice,
+        event=event,
+        booking=booking,
+        host=host,
+        now=now,
+    )
 
 
 def _rep_readiness_line(extra: dict[str, str]) -> str:
@@ -423,10 +476,11 @@ async def dispatch_due_reminders() -> int:
         from app.dealer_os.services import precall
 
         for reminder, notice, event, booking, host in rows:
+            booking = await effective_booking_settings(db, booking)
             if reminder.kind == "precall":
                 try:
                     sent += int(
-                        await precall.dispatch_row(
+                        await _dispatch_precall_reminder(
                             db, reminder=reminder, notice=notice, event=event, booking=booking, host=host, now=now
                         )
                     )

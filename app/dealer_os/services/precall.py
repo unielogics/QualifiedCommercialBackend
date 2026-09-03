@@ -1026,6 +1026,18 @@ async def dispatch_row(
     now: datetime,
 ) -> bool:
     """Send one due pre-call row, or resolve it without sending. Returns True on a send."""
+    if notice.precall_intake_id:
+        from . import application_precall
+
+        return await application_precall.dispatch_row(
+            db,
+            reminder=reminder,
+            notice=notice,
+            event=event,
+            booking=booking,
+            host=host,
+            now=now,
+        )
     dealer = await db.get(DealerBusiness, notice.precall_dealer_id) if notice.precall_dealer_id else None
     if dealer is None or dealer.archived_at is not None:
         reminder.status = "cancelled"
@@ -1364,9 +1376,11 @@ async def send_kit(
     channels: tuple[str, ...] = ("email", "sms"),
     pin: str | None = None,
 ) -> dict[str, bool]:
-    """Re-send the room kit on demand (rep action). Email carries the
-    checklist and link; SMS carries the link (and a fresh PIN when one was
-    just rotated). Returns what went out."""
+    """Re-send the room kit on demand.
+
+    Email carries the checklist and link. When a PIN was just rotated, SMS
+    carries only that PIN so the two credentials remain on separate channels.
+    """
     ready = await readiness(db, dealer)
     room = await client_room.ensure_room(db, dealer, adopt_intake=False)
     values = template_values(
@@ -1376,26 +1390,28 @@ async def send_kit(
     out = {"email": False, "sms": False}
     if "email" in channels and notice.invitee_email:
         body = precall_block(booking, values)
-        if pin:
-            body = f"{body}\n\nYour room PIN is {pin}."
         body = f"{body}\n\n{_stop_footer(notice, booking, values)}"
-        result = await asyncio.to_thread(
-            ses_client.send_email,
-            to_email=notice.invitee_email,
-            subject=message_render.render("Your secure room for your call with {rep}", values),
-            body_text=body,
-        )
-        out["email"] = bool(result.ok)
-        if result.ok:
-            notice.clear_delivery_error()
-        else:
-            notice.record_delivery_error(result.detail)
+        try:
+            result = await asyncio.to_thread(
+                ses_client.send_email,
+                to_email=notice.invitee_email,
+                subject=message_render.render("Your secure room for your call with {rep}", values),
+                body_text=body,
+            )
+            out["email"] = bool(result.ok)
+            if result.ok:
+                notice.clear_delivery_error()
+            else:
+                notice.record_delivery_error(result.detail)
+        except Exception:  # noqa: BLE001
+            log.exception("precall: kit email raised notification=%s", notice.id)
+            notice.record_delivery_error("email_provider_exception")
     if "sms" in channels and notice.sms_consent and notice.invitee_phone:
         if await optout.is_opted_out(db, notice.invitee_phone):
             out["sms"] = False
         else:
             template = (
-                "Qualified Commercial: your secure room for your call with {rep}: {room_link} PIN {pin}"
+                message_text(booking, "pin_sms")
                 if pin
                 else step_config(booking, "nudge_1").get("sms")
             )

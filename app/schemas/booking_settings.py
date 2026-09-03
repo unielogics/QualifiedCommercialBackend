@@ -100,6 +100,17 @@ class UserBookingSettingsBase(BaseModel):
     #:  "nudge_2": {before_hours, channel, email_subject, email_body, sms}}.
     precall_enabled: bool = True
     precall_messages: dict[str, object] = Field(default_factory=dict)
+    precall_default_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] = "main_street"
+    precall_allowed_variants: list[
+        Literal["dealer", "real_estate", "main_street", "mca_refinance"]
+    ] = Field(
+        default_factory=lambda: ["dealer", "real_estate", "main_street", "mca_refinance"],
+        min_length=1,
+        max_length=4,
+    )
+    precall_allow_vertical_choice: bool = True
+    inherit_firm_policy: bool = False
+    firm_policy_overrides: list[str] = Field(default_factory=list, max_length=80)
     google_meet_enabled: bool = True
     timezone: str = Field(default="America/New_York", min_length=3, max_length=80)
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
@@ -216,6 +227,17 @@ class UserBookingSettingsBase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_booking_window(self) -> UserBookingSettingsBase:
+        from app.services.team_calendar import INHERITABLE_BOOKING_FIELDS
+
+        self.precall_allowed_variants = list(dict.fromkeys(self.precall_allowed_variants))
+        if self.precall_default_variant not in self.precall_allowed_variants:
+            raise ValueError("The default pre-call vertical must be one of the allowed verticals")
+        self.firm_policy_overrides = sorted({str(value).strip() for value in self.firm_policy_overrides if str(value).strip()})
+        unknown_overrides = set(self.firm_policy_overrides) - INHERITABLE_BOOKING_FIELDS
+        if unknown_overrides:
+            raise ValueError(
+                "Unknown firm policy override(s): " + ", ".join(sorted(unknown_overrides))
+            )
         if self.maximum_advance_days < self.minimum_notice_days:
             raise ValueError("Latest booking day must be on or after the earliest booking day")
 
@@ -368,6 +390,16 @@ class UserBookingSettingsRead(UserBookingSettingsBase):
     profile_photo_url: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class TeamBookingSettingsRead(BaseModel):
+    user_id: str
+    name: str
+    email: str
+    role: str
+    is_firm_default: bool = False
+    settings: UserBookingSettingsRead
+    effective_settings: UserBookingSettingsRead
 
 
 class BookingAssetUploadInitRequest(BaseModel):

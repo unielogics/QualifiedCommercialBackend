@@ -3768,8 +3768,9 @@ async def _register_intake_booking(
     intake: PublicUnderwritingIntake,
     booking: BookingSettings,
     event: CalendarEvent,
+    owner: User,
 ):
-    return await booking_reminders.register_booking(
+    notice = await booking_reminders.register_booking(
         db,
         event=event,
         booking=booking,
@@ -3783,6 +3784,26 @@ async def _register_intake_booking(
         requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
         full_address=str(_intake_state(intake).get("property_address") or "").strip() or None,
     )
+    if booking.precall_enabled:
+        from app.dealer_os.services import application_precall
+        from app.services import application_profiles as application_profile_service
+
+        profile = await application_profile_service.resolve_profile(db, "intake", intake.id, owner)
+        notice.precall_dealer_id = None
+        notice.precall_intake_id = intake.id
+        notice.precall_application_data = {
+            "source": "linked_intake",
+            "vertical": intake.variant,
+        }
+        ready = await application_precall.readiness(db, profile)
+        if not ready.complete:
+            await application_precall.schedule(
+                db,
+                notice=notice,
+                booking=booking,
+                event=event,
+            )
+    return notice
 
 
 async def _deliver_intake_booking(
@@ -7122,6 +7143,9 @@ async def _create_admin_ai_lead_core(
     request: Request,
     user: CurrentUser,
     db: AsyncSession,
+    *,
+    commit: bool = True,
+    client_override: Client | None = None,
 ) -> DealerIntakeResponse:
     """Create an operator-owned intake after the caller has authorized access."""
     if payload.variant not in _ADMIN_VARIANT_CONSTANTS:
@@ -7178,7 +7202,7 @@ async def _create_admin_ai_lead_core(
             monthly_rent=payload.monthly_rent,
             estimated_credit_tier=payload.estimated_credit_tier,
         )
-        client = await _find_or_create_funding_client(db, adapter)
+        client = client_override or await _find_or_create_funding_client(db, adapter)
         bucket, link = await _create_bucket_for_funding_review(
             db, client, adapter, request, room_pin=payload.secure_room_pin
         )
@@ -7189,7 +7213,7 @@ async def _create_admin_ai_lead_core(
             phone=payload.phone,
             business_name=payload.business_name,
         )
-        client = await _find_or_create_client(db, adapter)
+        client = client_override or await _find_or_create_client(db, adapter)
         bucket, link = await _create_bucket_for_main_street(
             db,
             client,
@@ -7206,7 +7230,7 @@ async def _create_admin_ai_lead_core(
             phone=payload.phone,
             business_name=payload.business_name,
         )
-        client = await _find_or_create_mca_client(db, adapter)
+        client = client_override or await _find_or_create_mca_client(db, adapter)
         bucket, link = await _create_bucket_for_mca_refi(
             db,
             client,
@@ -7221,7 +7245,7 @@ async def _create_admin_ai_lead_core(
             phone=payload.phone,
             business_name=payload.business_name,
         )
-        client = await _find_or_create_client(db, adapter)
+        client = client_override or await _find_or_create_client(db, adapter)
         bucket, link = await _create_bucket_for_intake(
             db, client, adapter, request, room_pin=payload.secure_room_pin
         )
@@ -7312,7 +7336,10 @@ async def _create_admin_ai_lead_core(
     )
     welcome_text = _admin_created_welcome(variant_const)
     db.add(_persist_admin_welcome_message(bucket.id, welcome_text))
-    await db.commit()
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     intake = await _load_admin_dealer_lead(db, intake.id)
 
     email_note = ""
@@ -7350,7 +7377,10 @@ async def _create_admin_ai_lead_core(
                 created_by_user_id=user.id,
             )
         )
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         intake = await _load_admin_dealer_lead(db, intake.id)
         email_note = (
             " The secure room link was emailed to the client; share the PIN separately."
@@ -9769,7 +9799,9 @@ async def book_dealer_call(
     )
     db.add(ev)
     await db.flush()
-    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    notice = await _register_intake_booking(
+        db, intake=intake, booking=booking, event=ev, owner=owner
+    )
     # The calendar needs an appointment row to act on this booking; the
     # intake is its file, so it is linked from the start (origin=intake).
     from app.dealer_os.services import booking_appointments
@@ -9788,6 +9820,7 @@ async def book_dealer_call(
         program_name=intake.loan_purpose,
         requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
         converted_intake_id=intake.id,
+        precall_intake_id=intake.id if booking.precall_enabled else None,
         contact_source="ai_intake",
     )
 
@@ -10456,7 +10489,9 @@ async def book_funding_review_call(
     )
     db.add(ev)
     await db.flush()
-    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    notice = await _register_intake_booking(
+        db, intake=intake, booking=booking, event=ev, owner=owner
+    )
     # The calendar needs an appointment row to act on this booking; the
     # intake is its file, so it is linked from the start (origin=intake).
     from app.dealer_os.services import booking_appointments
@@ -10475,6 +10510,7 @@ async def book_funding_review_call(
         program_name=intake.loan_purpose,
         requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
         converted_intake_id=intake.id,
+        precall_intake_id=intake.id if booking.precall_enabled else None,
         contact_source="ai_intake",
     )
     state = _intake_state(intake)
@@ -11460,7 +11496,9 @@ async def book_mca_refinance_call(
     )
     db.add(ev)
     await db.flush()
-    notice = await _register_intake_booking(db, intake=intake, booking=booking, event=ev)
+    notice = await _register_intake_booking(
+        db, intake=intake, booking=booking, event=ev, owner=owner
+    )
     # The calendar needs an appointment row to act on this booking; the
     # intake is its file, so it is linked from the start (origin=intake).
     from app.dealer_os.services import booking_appointments
@@ -11479,6 +11517,7 @@ async def book_mca_refinance_call(
         program_name=intake.loan_purpose,
         requested_amount=str(intake.requested_loan_amount) if intake.requested_loan_amount else None,
         converted_intake_id=intake.id,
+        precall_intake_id=intake.id if booking.precall_enabled else None,
         contact_source="ai_intake",
     )
     state = _intake_state(intake)

@@ -30,14 +30,18 @@ from app.deps import CurrentUser
 from app.enums import Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
+from app.models.user import User
 from app.models.broker import Broker
 from app.services.user_phone import store_phone
 from app.schemas.booking_settings import (
     BookingAssetUploadInitRequest,
     BookingAssetUploadInitResponse,
+    TeamBookingSettingsRead,
     UserBookingSettingsRead,
     UserBookingSettingsUpdate,
 )
+from app.services.payment_authorization import primary_super_admin
+from app.services.team_calendar import INHERITABLE_BOOKING_FIELDS, effective_booking_settings
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
 from app.schemas.stored_signature import StoredSignatureAdoptBody, StoredSignatureState
 from app.services import stored_signatures as stored_sigs
@@ -92,6 +96,7 @@ async def _get_or_create_booking_settings(db: AsyncSession, user: CurrentUser) -
         slug=slug,
         title=None,
         intro=None,
+        inherit_firm_policy=user.role in {Role.FIELD_REP, Role.BROKER},
     )
     db.add(row)
     await db.flush()
@@ -161,6 +166,13 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
         confirmation_messages=row.confirmation_messages or {},
         precall_enabled=row.precall_enabled,
         precall_messages=row.precall_messages or {},
+        precall_default_variant=row.precall_default_variant,
+        precall_allowed_variants=row.precall_allowed_variants or [
+            "dealer", "real_estate", "main_street", "mca_refinance"
+        ],
+        precall_allow_vertical_choice=row.precall_allow_vertical_choice,
+        inherit_firm_policy=row.inherit_firm_policy,
+        firm_policy_overrides=row.firm_policy_overrides or [],
         google_meet_enabled=row.google_meet_enabled,
         timezone=row.timezone,
         available_days=row.available_days or [1, 2, 3, 4, 5],
@@ -254,6 +266,45 @@ async def get_booking_settings(
     return _booking_settings_read(row)
 
 
+@router.get("/booking-settings/team", response_model=list[TeamBookingSettingsRead])
+async def get_team_booking_settings(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[TeamBookingSettingsRead]:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin access required")
+    firm_user = await primary_super_admin(db)
+    members = list(
+        (
+            await db.execute(
+                select(User)
+                .where(
+                    User.deleted_at.is_(None),
+                    User.role.in_([Role.SUPER_ADMIN, Role.FIELD_REP, Role.BROKER]),
+                )
+                .order_by(User.name.asc().nullslast(), User.email.asc())
+            )
+        ).scalars().all()
+    )
+    output: list[TeamBookingSettingsRead] = []
+    for member in members:
+        settings = await _get_or_create_booking_settings(db, member)
+        effective = await effective_booking_settings(db, settings)
+        output.append(
+            TeamBookingSettingsRead(
+                user_id=str(member.id),
+                name=member.name or member.email,
+                email=member.email,
+                role=member.role.value if hasattr(member.role, "value") else str(member.role),
+                is_firm_default=bool(firm_user and member.id == firm_user.id),
+                settings=_booking_settings_read(settings),
+                effective_settings=_booking_settings_read(effective),
+            )
+        )
+    await db.commit()
+    return output
+
+
 class BookingLinkRead(BaseModel):
     enabled: bool
     slug: str | None
@@ -283,6 +334,70 @@ class BookingInviteShareResponse(BaseModel):
     detail: str | None = None
     message_id: str | None = None
     booking_url: str
+
+
+def _apply_booking_settings(row: BookingSettings, payload: UserBookingSettingsUpdate) -> None:
+    row.enabled = payload.enabled
+    row.slug = payload.slug
+    row.title = payload.title
+    row.intro = payload.intro
+    row.primary_color = payload.primary_color
+    row.background_color = payload.background_color
+    row.duration_min = payload.duration_min
+    row.buffer_before_min = payload.buffer_before_min
+    row.buffer_after_min = payload.buffer_after_min
+    row.confirmation_email_enabled = payload.confirmation_email_enabled
+    row.confirmation_sms_enabled = payload.confirmation_sms_enabled
+    row.reminder_email_enabled = payload.reminder_email_enabled
+    row.reminder_email_minutes = payload.reminder_email_minutes
+    row.reminder_email_minutes_before = payload.reminder_email_minutes[0] if payload.reminder_email_minutes else payload.reminder_email_minutes_before
+    row.reminder_sms_enabled = payload.reminder_sms_enabled
+    row.reminder_sms_minutes = payload.reminder_sms_minutes
+    row.reminder_sms_minutes_before = payload.reminder_sms_minutes[0] if payload.reminder_sms_minutes else payload.reminder_sms_minutes_before
+    row.reminder_sms_messages = payload.reminder_sms_messages
+    row.reminder_email_messages = payload.reminder_email_messages
+    row.confirmation_messages = payload.confirmation_messages
+    row.precall_enabled = payload.precall_enabled
+    row.precall_messages = payload.precall_messages
+    row.precall_default_variant = payload.precall_default_variant
+    row.precall_allowed_variants = list(payload.precall_allowed_variants)
+    row.precall_allow_vertical_choice = payload.precall_allow_vertical_choice
+    row.inherit_firm_policy = payload.inherit_firm_policy
+    row.firm_policy_overrides = list(payload.firm_policy_overrides)
+    row.google_meet_enabled = payload.google_meet_enabled
+    row.timezone = payload.timezone
+    row.available_days = payload.available_days
+    row.weekly_schedule = [schedule.model_dump() for schedule in payload.weekly_schedule]
+    row.advance_booking_window_enabled = payload.advance_booking_window_enabled
+    row.minimum_notice_days = payload.minimum_notice_days
+    row.maximum_advance_days = payload.maximum_advance_days
+    row.blocked_intervals = [interval.model_dump() for interval in payload.blocked_intervals]
+    row.booking_questions = dict(payload.booking_questions)
+    row.no_show_follow_up_enabled = payload.no_show_follow_up_enabled
+    row.morning_digest_enabled = payload.morning_digest_enabled
+    row.missing_outcome_reminder_hours = payload.missing_outcome_reminder_hours
+    row.start_time = payload.start_time
+    row.end_time = payload.end_time
+    row.logo_s3_key = payload.logo_s3_key
+    row.profile_photo_s3_key = payload.profile_photo_s3_key
+
+
+def _payload_policy_value(payload: UserBookingSettingsUpdate, field: str):
+    value = getattr(payload, field)
+    if field in {"weekly_schedule", "blocked_intervals"}:
+        return [item.model_dump() for item in value]
+    return value
+
+
+def _rep_policy_changed(row: BookingSettings, payload: UserBookingSettingsUpdate) -> bool:
+    if payload.inherit_firm_policy != row.inherit_firm_policy:
+        return True
+    if list(payload.firm_policy_overrides) != list(row.firm_policy_overrides or []):
+        return True
+    return any(
+        _payload_policy_value(payload, field) != getattr(row, field)
+        for field in INHERITABLE_BOOKING_FIELDS
+    )
 
 
 @router.post("/booking-link/share", response_model=BookingInviteShareResponse)
@@ -355,6 +470,11 @@ async def put_booking_settings(
     db: AsyncSession = Depends(get_db),
 ) -> UserBookingSettingsRead:
     row = await _get_or_create_booking_settings(db, user)
+    if user.role in {Role.FIELD_REP, Role.BROKER} and _rep_policy_changed(row, payload):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Booking schedules and pre-call automation are managed by a super admin.",
+        )
     if payload.enabled and not payload.slug:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "booking.slug is required when the booking page is enabled")
     if payload.slug:
@@ -369,48 +489,70 @@ async def put_booking_settings(
         if existing is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"booking slug {payload.slug!r} is already used")
 
-    row.enabled = payload.enabled
-    row.slug = payload.slug
-    row.title = payload.title
-    row.intro = payload.intro
-    row.primary_color = payload.primary_color
-    row.background_color = payload.background_color
-    row.duration_min = payload.duration_min
-    row.buffer_before_min = payload.buffer_before_min
-    row.buffer_after_min = payload.buffer_after_min
-    row.confirmation_email_enabled = payload.confirmation_email_enabled
-    row.confirmation_sms_enabled = payload.confirmation_sms_enabled
-    row.reminder_email_enabled = payload.reminder_email_enabled
-    row.reminder_email_minutes = payload.reminder_email_minutes
-    row.reminder_email_minutes_before = payload.reminder_email_minutes[0] if payload.reminder_email_minutes else payload.reminder_email_minutes_before
-    row.reminder_sms_enabled = payload.reminder_sms_enabled
-    row.reminder_sms_minutes = payload.reminder_sms_minutes
-    row.reminder_sms_messages = payload.reminder_sms_messages
-    row.reminder_email_messages = payload.reminder_email_messages
-    row.confirmation_messages = payload.confirmation_messages
-    row.precall_enabled = payload.precall_enabled
-    row.precall_messages = payload.precall_messages
-    row.reminder_sms_minutes_before = payload.reminder_sms_minutes[0] if payload.reminder_sms_minutes else payload.reminder_sms_minutes_before
-    row.google_meet_enabled = payload.google_meet_enabled
-    row.timezone = payload.timezone
-    row.available_days = payload.available_days
-    row.weekly_schedule = [schedule.model_dump() for schedule in payload.weekly_schedule]
-    row.advance_booking_window_enabled = payload.advance_booking_window_enabled
-    row.minimum_notice_days = payload.minimum_notice_days
-    row.maximum_advance_days = payload.maximum_advance_days
-    row.blocked_intervals = [interval.model_dump() for interval in payload.blocked_intervals]
-    row.booking_questions = dict(payload.booking_questions)
-    row.no_show_follow_up_enabled = payload.no_show_follow_up_enabled
-    row.morning_digest_enabled = payload.morning_digest_enabled
-    row.missing_outcome_reminder_hours = payload.missing_outcome_reminder_hours
-    row.start_time = payload.start_time
-    row.end_time = payload.end_time
-    row.logo_s3_key = payload.logo_s3_key
-    row.profile_photo_s3_key = payload.profile_photo_s3_key
+    _apply_booking_settings(row, payload)
 
     await db.commit()
     await db.refresh(row)
     return _booking_settings_read(row)
+
+
+@router.put("/booking-settings/team/{target_user_id}", response_model=TeamBookingSettingsRead)
+async def put_team_booking_settings(
+    target_user_id: UUID,
+    payload: UserBookingSettingsUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> TeamBookingSettingsRead:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Super-admin access required")
+    target = await db.get(User, target_user_id)
+    if target is None or target.deleted_at is not None or target.role not in {
+        Role.SUPER_ADMIN,
+        Role.FIELD_REP,
+        Role.BROKER,
+    }:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Calendar owner not found")
+    row = await _get_or_create_booking_settings(db, target)
+    if payload.enabled and not payload.slug:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "booking.slug is required when enabled")
+    if payload.slug:
+        existing = (
+            await db.execute(
+                select(BookingSettings.id).where(
+                    BookingSettings.slug == payload.slug,
+                    BookingSettings.user_id != target.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"booking slug {payload.slug!r} is already used")
+    _apply_booking_settings(row, payload)
+    db.add(
+        Activity(
+            actor_id=user.id,
+            actor_label=user.email,
+            kind="calendar.booking_policy_updated",
+            summary=f"Updated booking policy for {target.name or target.email}",
+            payload={
+                "target_user_id": str(target.id),
+                "inherit_firm_policy": payload.inherit_firm_policy,
+                "firm_policy_overrides": list(payload.firm_policy_overrides),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    firm_user = await primary_super_admin(db)
+    effective = await effective_booking_settings(db, row)
+    return TeamBookingSettingsRead(
+        user_id=str(target.id),
+        name=target.name or target.email,
+        email=target.email,
+        role=target.role.value if hasattr(target.role, "value") else str(target.role),
+        is_firm_default=bool(firm_user and target.id == firm_user.id),
+        settings=_booking_settings_read(row),
+        effective_settings=_booking_settings_read(effective),
+    )
 
 
 async def _booking_asset_upload_init(

@@ -75,6 +75,24 @@ class BookingSettings(TimestampMixin, Base):
     precall_messages: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    precall_default_variant: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="main_street", server_default="main_street"
+    )
+    precall_allowed_variants: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: ["dealer", "real_estate", "main_street", "mca_refinance"],
+        server_default=text("'[\"dealer\", \"real_estate\", \"main_street\", \"mca_refinance\"]'::jsonb"),
+    )
+    precall_allow_vertical_choice: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    inherit_firm_policy: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    firm_policy_overrides: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     google_meet_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     timezone: Mapped[str] = mapped_column(String(80), nullable=False, default="America/New_York")
     available_days: Mapped[list[int]] = mapped_column(

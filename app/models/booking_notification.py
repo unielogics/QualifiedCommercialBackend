@@ -3,7 +3,18 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -51,11 +62,19 @@ class BookingNotification(TimestampMixin, Base):
     #: any later write to the booking moves `updated_at`, so a resolved
     #: failure redated itself every time a reminder went out.
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # Pre-call prep. Every booking opens a draft dealer file; the sequence that
-    # nudges the client to finish ownership / bank / credit hangs off it here,
-    # on the booking, because a public booking has no appointment row.
+    # Pre-call prep. Field Desk bookings use a DealerBusiness; enabled direct
+    # booking pages and opted-in operator appointments use an AI Intake. The
+    # reminder sequence hangs off the booking notification in both cases.
     precall_dealer_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
+    )
+    precall_intake_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("public_underwriting_intakes.id", ondelete="SET NULL"),
+        index=True,
+    )
+    precall_application_data: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     precall_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     precall_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

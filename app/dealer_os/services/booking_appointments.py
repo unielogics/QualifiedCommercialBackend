@@ -43,6 +43,7 @@ async def create_booking_appointment(
     kind: str = "intro_call",
     booked_by_user_id: UUID | None = None,
     converted_intake_id: UUID | None = None,
+    precall_intake_id: UUID | None = None,
     contact_source: str = "public_booking",
 ) -> DealerRepAppointment:
     """Open the appointment row for a booking that has none, and point the
@@ -75,6 +76,7 @@ async def create_booking_appointment(
         crm_status="scheduled",
         booked_by_user_id=booked_by_user_id,
         converted_intake_id=converted_intake_id,
+        precall_intake_id=precall_intake_id,
     )
     db.add(appt)
     await db.flush()

@@ -880,6 +880,11 @@ class RepAppointmentPrecallRead(BaseModel):
     #: in_progress | complete | stopped | disabled
     status: str
     dealer_id: UUID | None = None
+    target_kind: Literal["field_desk", "ai_intake"] = "field_desk"
+    target_id: UUID | None = None
+    intake_id: UUID | None = None
+    profile_id: UUID | None = None
+    href: str | None = None
     case_ref: str | None = None
     lifecycle: str | None = None
     room_url: str | None = None
@@ -964,6 +969,8 @@ class RepAppointmentCreate(BaseModel):
     #: Which surface booked this. The rep app sends field_desk, the operator
     #: calendar sends calendar; absent, the booker's role decides.
     origin: Literal["field_desk", "calendar"] | None = None
+    start_precall_preparation: bool = False
+    precall_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] = "main_street"
     requested_document_keys: list[
         Literal[
             "ytd_profit_and_loss",

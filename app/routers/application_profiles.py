@@ -36,7 +36,12 @@ from app.models.application_profile import (
     FundingCategory,
     PlaidAssetReport,
 )
-from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
+from app.models.bucket import (
+    BucketFile,
+    BucketFileAnalysis,
+    BucketRequestedDocument,
+    BucketUploadLink,
+)
 from app.models.client import Client
 from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
@@ -63,10 +68,14 @@ from app.schemas.application_profile import (
     ApplicationProfileResolve,
     ApplicationRoomAccess,
     ApplicationRoomConsentGrant,
+    ApplicationRoomCreditInvite,
     ApplicationRoomMerchantOfferRespond,
     ApplicationRoomMerchantOfferSummary,
+    ApplicationRoomOwnerCreate,
+    ApplicationRoomOwnerPatch,
     ApplicationRoomPlaidExchange,
     ApplicationRoomPlaidUpdate,
+    ApplicationRoomPrecallState,
     ApplicationRoomPrimaryBank,
     ApplicationRoomSignable,
     ApplicationRoomSignRequest,
@@ -90,7 +99,6 @@ from app.schemas.application_profile import (
     FinancialFormSave,
     FinancialFormsRead,
     FinancialFormStatus,
-    UploadedStatementFigures,
     FinancialStatementOwnerLink,
     FinancialStatementRead,
     FinancialStatementWrite,
@@ -116,6 +124,7 @@ from app.schemas.application_profile import (
     TaxonomyReviewRequest,
     TaxonomySearchRead,
     UnifiedAuditEvent,
+    UploadedStatementFigures,
     VerificationInvitationCreate,
     VerificationInvitationRead,
     WorksheetCellWrite,
@@ -1698,6 +1707,9 @@ async def submit_public_application_credit_consent(
     owner.credit_pulled_at = pull.pulled_at or datetime.now(UTC)
     owner.credit_summary = {"status": str(pull.status), "expires_at": pull.expires_at.isoformat() if pull.expires_at else None}
     await profiles.log_profile_action(db, profile, None, "owner.soft_pull", f"Credit returned for {owner.full_name}", target_type="owner", target_id=owner.id, metadata={"tier": owner.credit_tier})
+    from app.dealer_os.services import application_precall
+
+    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     return PublicFileOwnerConsentResult(completed=True, credit_tier=owner.credit_tier, credit_score_band=_score_band(owner.credit_score))
 
@@ -1887,6 +1899,51 @@ async def _application_room_signables(
     ]
 
 
+async def _application_room_state(
+    db: AsyncSession,
+    *,
+    link: BucketUploadLink,
+    profile: ApplicationProfile,
+) -> ApplicationRoomState:
+    from app.dealer_os.services import application_precall
+    from app.models.booking_notification import BookingNotification
+
+    await application_precall.on_progress(db, profile)
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    owner_rows = await profiles.owner_rows(db, profile)
+    verification = await profiles.verification_state(db, profile)
+    notice = (
+        await db.execute(
+            select(BookingNotification)
+            .where(BookingNotification.precall_intake_id == profile.intake_id)
+            .order_by(BookingNotification.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none() if profile.intake_id else None
+    room_precall = None
+    if notice is not None:
+        ready = await application_precall.readiness(db, profile)
+        room_precall = ApplicationRoomPrecallState(
+            status=application_precall.status_for(notice, ready, True),
+            complete=ready.complete,
+            done_count=ready.done_count,
+            missing=ready.missing,
+        )
+    return ApplicationRoomState(
+        profile_id=profile.id,
+        business_name=_business_label(profile, intake, client),
+        room_url=_room_url(link),
+        capabilities=["documents", "ownership", "owner_credit", "business_banking", "agreements"],
+        owners=[profiles.owner_read(owner) for owner in owner_rows],
+        verification=verification,
+        precall=room_precall,
+        banking=await _application_bank_state(db, profile),
+        signable=await _application_room_signables(db, link.bucket_id),
+        merchant_offer=await _room_merchant_offer_summary(db, profile),
+    )
+
+
 @router.post("/public/room/{token}/state", response_model=ApplicationRoomState)
 async def public_application_room_state(
     token: str,
@@ -1895,16 +1952,150 @@ async def public_application_room_state(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationRoomState:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
+    return await _application_room_state(db, link=link, profile=profile)
+
+
+@router.post(
+    "/public/room/{token}/owners",
+    response_model=FileOwnerRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def public_application_room_create_owner(
+    token: str,
+    payload: ApplicationRoomOwnerCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> FileOwnerRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update())
+    existing = await profiles.owner_rows(db, profile)
+    if len(existing) >= profiles.MAX_OWNERS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "An application may contain at most five owners")
+    values = payload.owner.model_dump()
+    values["email"] = profiles.normalized_email(str(payload.owner.email) if payload.owner.email else None)
+    await _assert_unique_email(db, profile, values["email"])
+    if values.get("is_primary") and any(owner.is_primary for owner in existing):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This application already has a primary owner")
+    row = ApplicationOwner(profile_id=profile.id, **values)
+    db.add(row)
+    await db.flush()
+    await profiles.log_profile_action(
+        db, profile, None, "owner.create.application_room", f"Client added owner {row.full_name}",
+        target_type="owner", target_id=row.id,
+    )
+    await db.commit()
+    await db.refresh(row)
+    return profiles.owner_read(row)
+
+
+@router.patch("/public/room/{token}/owners/{owner_id}", response_model=FileOwnerRead)
+async def public_application_room_update_owner(
+    token: str,
+    owner_id: UUID,
+    payload: ApplicationRoomOwnerPatch,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> FileOwnerRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    patch = payload.owner.model_dump(exclude_unset=True)
+    if "email" in patch:
+        patch["email"] = profiles.normalized_email(str(patch["email"]) if patch["email"] else None)
+        await _assert_unique_email(db, profile, patch["email"], exclude_id=owner.id)
+    before = {key: getattr(owner, key) for key in patch}
+    for key, value in patch.items():
+        setattr(owner, key, value)
+    await profiles.log_profile_action(
+        db, profile, None, "owner.update.application_room", f"Client updated owner {owner.full_name}",
+        target_type="owner", target_id=owner.id,
+        metadata={"changed_fields": sorted(patch), "previous": {k: str(v) if v is not None else None for k, v in before.items()}},
+    )
+    await db.commit()
+    await db.refresh(owner)
+    return profiles.owner_read(owner)
+
+
+@router.delete("/public/room/{token}/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def public_application_room_delete_owner(
+    token: str,
+    owner_id: UUID,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    if owner.invite_sent_at is not None or owner.credit_pulled_at is not None or owner.credit_pull_id is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This owner has credit authorization history and cannot be deleted")
+    name = owner.full_name
+    await db.delete(owner)
+    await profiles.log_profile_action(
+        db, profile, None, "owner.delete.application_room", f"Client removed owner {name}",
+        target_type="owner", target_id=owner_id,
+    )
+    await db.commit()
+
+
+@router.post(
+    "/public/room/{token}/owners/{owner_id}/credit-invite",
+    response_model=FileCreditInviteRead,
+)
+async def public_application_room_credit_invite(
+    token: str,
+    owner_id: UUID,
+    payload: ApplicationRoomCreditInvite,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> FileCreditInviteRead:
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    owner = await _owner_for_profile(db, profile, owner_id)
+    verification = await profiles.verification_state(db, profile)
+    if not verification.ownership_complete:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Ownership must total 100.00% before credit links are sent; current total is {verification.ownership_total:.2f}%",
+        )
+    if not owner.credit_required:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Credit authorization is not required for this owner")
+    if not profiles.normalized_email(owner.email) or not profiles.normalized_phone(owner.phone):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This owner needs a personal email and valid phone before credit authorization can be sent",
+        )
+    public_token = f"app.{secrets.token_urlsafe(32)}"
+    owner.invite_token_hash = _hash_token(public_token)
+    owner.invite_sent_at = datetime.now(UTC)
+    owner.invite_opened_at = None
+    await profiles.log_profile_action(
+        db, profile, None, "owner.credit_invite.application_room",
+        f"Client requested a private credit authorization link for {owner.full_name}",
+        target_type="owner", target_id=owner.id,
+    )
+    await db.commit()
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     client = await db.get(Client, profile.client_id) if profile.client_id else None
-    return ApplicationRoomState(
-        profile_id=profile.id,
+    delivery = await consent_delivery.deliver_link_checked(
+        db,
+        channel="email",
+        to_email=owner.email,
+        to_phone=None,
         business_name=_business_label(profile, intake, client),
-        room_url=_room_url(link),
-        capabilities=["documents", "business_banking", "agreements"],
-        banking=await _application_bank_state(db, profile),
-        signable=await _application_room_signables(db, link.bucket_id),
-        merchant_offer=await _room_merchant_offer_summary(db, profile),
+        purpose="authorize a soft credit check",
+        path=f"/credit-consent#t={public_token}",
+        rep_name="Qualified Commercial",
+    )
+    await profiles.log_profile_action(
+        db, profile, None, "owner.credit_invite_delivery.application_room", delivery.detail,
+        target_type="owner", target_id=owner.id,
+        metadata={"delivered": delivery.ok, "channel": "email"},
+    )
+    await db.commit()
+    return FileCreditInviteRead(
+        owner_id=owner.id,
+        owner_name=owner.full_name,
+        delivered=delivery.ok,
+        channel="email",
+        detail=delivery.detail,
     )
 
 
@@ -2061,16 +2252,7 @@ async def public_application_room_consent(
     for item in await _profile_plaid_items(db, profile):
         if item.status == "active":
             background.add_task(sync_item_background, item.id)
-    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-    client = await db.get(Client, profile.client_id) if profile.client_id else None
-    return ApplicationRoomState(
-        profile_id=profile.id,
-        business_name=_business_label(profile, intake, client),
-        room_url=_room_url(link),
-        capabilities=["documents", "business_banking", "agreements"],
-        banking=await _application_bank_state(db, profile),
-        signable=await _application_room_signables(db, link.bucket_id),
-    )
+    return await _application_room_state(db, link=link, profile=profile)
 
 
 @router.post(
@@ -2213,6 +2395,9 @@ async def public_application_room_exchange(
         target_id=item.id,
         metadata={"upload_link_id": str(link.id)},
     )
+    from app.dealer_os.services import application_precall
+
+    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     from app.services.application_plaid_sync import sync_item_background
 
@@ -2666,6 +2851,9 @@ async def public_bank_verification_exchange(
         await _make_primary(db, profile, item)
     invitation.completed_at = datetime.now(UTC)
     await profiles.log_profile_action(db, profile, None, "plaid.connect.secure_room", f"Client connected {payload.institution_name or 'business bank'}", target_type="plaid_item", target_id=item.id)
+    from app.dealer_os.services import application_precall
+
+    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     await db.refresh(item)
     from app.services.application_plaid_sync import sync_item_background
@@ -2806,6 +2994,9 @@ async def update_application_plaid_settings(
             "retained_historical_evidence": True,
         },
     )
+    from app.dealer_os.services import application_precall
+
+    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     for item_id in authorized_ids:
         if profile.dealer_id:
@@ -2844,6 +3035,9 @@ async def approve_manual_bank_evidence(
             "reason": payload.reason.strip(),
         },
     )
+    from app.dealer_os.services import application_precall
+
+    await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     return await get_application_banks(profile_id, user, db)
 
@@ -3112,6 +3306,10 @@ async def exchange_application_plaid_token(
         await _make_primary(db, profile, item)
     connect_action = "plaid.connect.client" if profile.dealer_id else "plaid.connect"
     await profiles.log_profile_action(db, profile, user, connect_action, f"Connected {payload.institution_name or 'business bank'}", target_type="plaid_item", target_id=item.id)
+    if not profile.dealer_id:
+        from app.dealer_os.services import application_precall
+
+        await application_precall.on_progress(db, profile, commit=False)
     await db.commit()
     await db.refresh(item)
     if profile.dealer_id:

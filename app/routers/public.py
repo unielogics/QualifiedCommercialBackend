@@ -32,6 +32,8 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone, tzinfo
+from types import SimpleNamespace
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -40,6 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.dealer_os.services import consent_delivery
 from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
@@ -57,7 +60,7 @@ from app.services.booking_availability import (
     slot_overlaps_blocked_interval,
 )
 from app.services.google import calendar_sync
-from app.services.team_calendar import lock_calendar_owner
+from app.services.team_calendar import effective_booking_settings, lock_calendar_owner
 
 log = logging.getLogger(__name__)
 
@@ -362,6 +365,12 @@ class PublicBookingProfile(BaseModel):
     #: page must render this, not its own paraphrase.
     sms_disclosure_text: str = ""
     precall_enabled: bool = False
+    booking_questions: dict[str, bool] = Field(default_factory=dict)
+    precall_default_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] = "main_street"
+    precall_allowed_variants: list[
+        Literal["dealer", "real_estate", "main_street", "mca_refinance"]
+    ] = Field(default_factory=list)
+    precall_allow_vertical_choice: bool = False
 
 
 class PublicBookingCreate(BaseModel):
@@ -369,6 +378,10 @@ class PublicBookingCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=160)
     email: str = Field(min_length=5, max_length=320)
     phone: RequiredPhone
+    business_name: str | None = Field(default=None, max_length=180)
+    requested_amount: float | None = Field(default=None, gt=0)
+    vertical: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
+    preferred_bank_method: Literal["plaid", "statements", "decide_later"] | None = None
     notes: str | None = Field(default=None, max_length=1000)
     transactional_sms_consent: bool = False
     #: Campaign hint carried by the link (e.g. the rep product booklet appends
@@ -391,6 +404,9 @@ async def public_booking_profile(
     db: AsyncSession = Depends(get_db),
 ) -> PublicBookingProfile:
     user, booking = await _load_public_booking(db, slug)
+    from app.dealer_os.deps import is_rep
+
+    field_desk_page = is_rep(user)
     slots = await _available_booking_slots(db, user, booking)
     host_name = user.name or "Qualified Commercial"
     return PublicBookingProfile(
@@ -409,6 +425,16 @@ async def public_booking_profile(
         slots=slots,
         sms_disclosure_text=sms_consent_service.text_for("transactional"),
         precall_enabled=bool(booking.precall_enabled),
+        booking_questions=dict(booking.booking_questions or {}),
+        precall_default_variant=(
+            "dealer" if field_desk_page else booking.precall_default_variant or "main_street"
+        ),
+        precall_allowed_variants=(
+            ["dealer"] if field_desk_page else list(booking.precall_allowed_variants or [])
+        ),
+        precall_allow_vertical_choice=(
+            False if field_desk_page else bool(booking.precall_allow_vertical_choice)
+        ),
     )
 
 
@@ -419,9 +445,6 @@ async def public_booking_create(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> PublicBookingCreateResult:
-    if "@" not in payload.email or "." not in payload.email:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "A valid email is required.")
-
     ip = (request.client.host if request.client else "?") or "?"
     now = time.monotonic()
     last = _LAST_SUBMIT.get(ip)
@@ -433,6 +456,41 @@ async def public_booking_create(
     _LAST_SUBMIT[ip] = now
 
     user, booking = await _load_public_booking(db, slug)
+    from app.dealer_os.deps import is_rep
+
+    host_is_rep = is_rep(user)
+    questions = booking.booking_questions or {}
+    if questions.get("business_name") and not (payload.business_name or "").strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Business name is required.")
+    normalized_phone = consent_delivery.normalize_phone(payload.phone)
+    if questions.get("phone") and normalized_phone is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "A valid phone number is required.")
+    if payload.phone and normalized_phone is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter a valid phone number.")
+    if questions.get("requested_amount") and payload.requested_amount is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Requested amount is required.")
+    if questions.get("bank_statement") and payload.preferred_bank_method is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a banking evidence method.")
+    selected_variant = "dealer" if host_is_rep else booking.precall_default_variant or "main_street"
+    if booking.precall_enabled and not host_is_rep:
+        if payload.vertical and not booking.precall_allow_vertical_choice:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "This booking page does not allow the application type to be changed.",
+            )
+        selected_variant = (
+            payload.vertical
+            if booking.precall_allow_vertical_choice and payload.vertical
+            else booking.precall_default_variant or "main_street"
+        )
+        allowed_variants = set(
+            booking.precall_allowed_variants or [booking.precall_default_variant]
+        )
+        if selected_variant not in allowed_variants:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "That application type is not available on this booking page.",
+            )
     await lock_calendar_owner(db, user.id)
     starts_at = _to_utc_minute(payload.starts_at)
     slots = await _available_booking_slots(db, user, booking)
@@ -446,6 +504,10 @@ async def public_booking_create(
         f"Name: {payload.full_name}\n"
         f"Email: {payload.email}\n"
         f"Phone: {payload.phone or '(not provided)'}\n\n"
+        f"Business: {payload.business_name or '(not provided)'}\n"
+        f"Requested amount: {payload.requested_amount if payload.requested_amount is not None else '(not provided)'}\n"
+        f"Application type: {selected_variant}\n"
+        f"Bank evidence preference: {payload.preferred_bank_method or '(not provided)'}\n\n"
         f"Notes:\n{payload.notes or '(none)'}"
     )
     ev = CalendarEvent(
@@ -464,10 +526,8 @@ async def public_booking_create(
     )
     db.add(ev)
     await db.flush()
-    from app.dealer_os.deps import is_rep
     from app.dealer_os.services import booking_appointments
 
-    host_is_rep = is_rep(user)
     notice = await booking_reminders.register_booking(
         db,
         event=ev,
@@ -482,6 +542,8 @@ async def public_booking_create(
         # A booking on a rep's own page is that rep's: it lands on their
         # calendar and they get the staff reminders.
         booked_by_user_id=user.id if host_is_rep else None,
+        program_name="General funding discussion / Not decided yet",
+        requested_amount=(str(payload.requested_amount) if payload.requested_amount is not None else None),
     )
     appointment = await booking_appointments.create_booking_appointment(
         db,
@@ -492,11 +554,29 @@ async def public_booking_create(
         invitee_name=payload.full_name,
         invitee_email=payload.email,
         invitee_phone=payload.phone,
+        company=payload.business_name,
         notes=payload.notes,
+        requested_amount=(str(payload.requested_amount) if payload.requested_amount is not None else None),
         booked_by_user_id=user.id if host_is_rep else None,
         contact_source="public_booking",
     )
-    draft = await _open_public_booking_draft(db, notice=notice, event=ev, booking=booking, host=user, appointment=appointment)
+    draft = await _open_public_booking_draft(
+        db,
+        notice=notice,
+        event=ev,
+        booking=booking,
+        host=user,
+        appointment=appointment,
+        request=request,
+        variant=selected_variant,
+        company=payload.business_name,
+        application_data={
+            "requested_amount": payload.requested_amount,
+            "preferred_bank_method": payload.preferred_bank_method,
+            "vertical": selected_variant,
+            "booking_slug": booking.slug,
+        },
+    )
 
     db.add(
         Activity(
@@ -551,7 +631,7 @@ async def _load_public_booking(
         )
     ).first()
     if row:
-        return row[0], row[1]
+        return row[0], await effective_booking_settings(db, row[1])
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Booking page not found.")
 
 
@@ -671,29 +751,67 @@ def public_booking_origin(host_is_rep: bool) -> str:
     return "field_desk" if host_is_rep else "public"
 
 
-async def _open_public_booking_draft(db: AsyncSession, *, notice, event: CalendarEvent, booking: BookingSettings, host: User, appointment=None):
-    """Rep-related public bookings open the draft file + room; the team page opens nothing. Flushes only."""
+async def _open_public_booking_draft(
+    db: AsyncSession,
+    *,
+    notice,
+    event: CalendarEvent,
+    booking: BookingSettings,
+    host: User,
+    appointment=None,
+    request: Request,
+    variant: str,
+    company: str | None,
+    application_data: dict,
+):
+    """Open the explicit preparation target for this public booking."""
     from sqlalchemy.exc import SQLAlchemyError
 
     from app.dealer_os.deps import is_rep
-    from app.dealer_os.services import precall
+    from app.dealer_os.services import application_precall, precall
 
     origin = public_booking_origin(is_rep(host))
-    if not booking.precall_enabled or not precall.opens_draft(origin):
+    if not booking.precall_enabled:
         return None
     try:
-        result = await precall.create_draft_for_booking(
-            db, notice=notice, event=event, booking=booking, host=host, appointment=appointment,
-            notes=f"Booked from {host.name or 'the rep'}'s public booking page.",
-        )
-        ready = await precall.readiness(db, result.dealer)
-        if not ready.complete:
-            await precall.schedule(db, notice=notice, booking=booking, event=event, dealer=result.dealer)
+        if precall.opens_draft(origin):
+            result = await precall.create_draft_for_booking(
+                db,
+                notice=notice,
+                event=event,
+                booking=booking,
+                host=host,
+                appointment=appointment,
+                company=company,
+                notes=f"Booked from {host.name or 'the rep'}'s public booking page.",
+            )
+            ready = await precall.readiness(db, result.dealer)
+            if not ready.complete:
+                await precall.schedule(db, notice=notice, booking=booking, event=event, dealer=result.dealer)
+        else:
+            result = await application_precall.create_draft_for_booking(
+                db,
+                notice=notice,
+                event=event,
+                booking=booking,
+                host=host,
+                request=request,
+                appointment=appointment,
+                variant=variant,
+                company=company,
+                notes=f"Booked from {host.name or 'Qualified Commercial'}'s public booking page.",
+                application_data=application_data,
+            )
+            ready = await application_precall.readiness(db, result.profile)
+            if not ready.complete:
+                await application_precall.schedule(db, notice=notice, booking=booking, event=event)
         return result
     except SQLAlchemyError:
         raise
     except Exception:  # noqa: BLE001
         log.exception("public-booking: could not open the draft file for %s", notice.id)
+        notice.last_error = "precall_draft_creation_failed"
+        await db.flush()
         return None
 
 
@@ -750,12 +868,17 @@ async def _deliver_booking(
     )
     kit = None
     if draft is not None:
-        from app.dealer_os.services import precall
+        from app.dealer_os.services import application_precall, precall
 
         try:
-            ready = await precall.readiness(db, draft.dealer)
+            if hasattr(draft, "profile"):
+                ready = await application_precall.readiness(db, draft.profile)
+                template_target = SimpleNamespace(name=draft.intake.business_name or draft.intake.full_name)
+            else:
+                ready = await precall.readiness(db, draft.dealer)
+                template_target = draft.dealer
             values = precall.template_values(
-                notice=notice, event=ev, booking=booking, host=user, dealer=draft.dealer,
+                notice=notice, event=ev, booking=booking, host=user, dealer=template_target,
                 room_link=draft.room.url, ready=ready, pin=draft.room.passcode,
                 stop_link=precall.stop_url(notice), timezone_name=booking.timezone,
             )
