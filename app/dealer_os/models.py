@@ -1305,14 +1305,22 @@ class DealerSmsConsent(TimestampMixin, Base):
     __tablename__ = "dos_sms_consent"
     __table_args__ = (
         Index("ix_dos_sms_consent_dealer", "dealer_id"),
+        Index("ix_dos_sms_consent_profile", "profile_id"),
         # Lookups on send are always "is this number cleared for this kind".
         Index("ix_dos_sms_consent_phone_kind", "phone_e164", "consent_kind"),
+        # A grant belongs to a dealer file or to an application profile (an AI
+        # intake client with no Capital OS file yet) — never to nothing.
+        CheckConstraint("dealer_id IS NOT NULL OR profile_id IS NOT NULL", name="ck_dos_sms_consent_subject"),
     )
 
     id: Mapped[uuid.UUID] = _pk()
-    dealer_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=True
     )
+    # Platform-side breadcrumb (application_profiles.id); plain UUID, no FK
+    # across the Dealer OS boundary. consent_for() is keyed on the number, so
+    # a grant captured for a profile clears the same number everywhere.
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     # E.164. Consent belongs to a NUMBER, not a person or a business: if the
     # number changes, the old consent does not carry over to the new one.
     phone_e164: Mapped[str] = mapped_column(String(20), nullable=False)

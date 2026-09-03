@@ -154,6 +154,7 @@ async def record_consent(
     phone_e164: str,
     kind: str,
     method: str,
+    profile_id=None,
     captured_by_user_id=None,
     captured_by_name: str | None = None,
     consenter_name: str | None = None,
@@ -172,8 +173,11 @@ async def record_consent(
         raise ValueError(f"unknown consent method: {method}")
 
     text = text_for(kind)
+    if dealer_id is None and profile_id is None:
+        raise ValueError("a consent grant needs a dealer file or an application profile")
     row = DealerSmsConsent(
         dealer_id=dealer_id,
+        profile_id=profile_id,
         phone_e164=phone_e164,
         consent_kind=kind,
         granted=True,

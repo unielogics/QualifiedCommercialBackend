@@ -1044,6 +1044,9 @@ class DealerIntakeResponse(BaseModel):
     secure_room_pin: str | None = None
     room_delivery_status: str | None = None
     room_delivery_detail: str | None = None
+    # Set when the client owes a signature on a Production Package: the room
+    # shows the signing screen and nothing else until it is signed.
+    signing_gate: dict[str, Any] | None = None
 
 
 class DealerAILeadRow(BaseModel):
@@ -1510,7 +1513,7 @@ async def _start_login_challenge(
     return True
 
 
-async def _load_intake_by_dealer_session(db: AsyncSession, session_token: str) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge]:
+async def _load_intake_by_dealer_session(db: AsyncSession, session_token: str, *, allow_pending_signing: bool = False) -> tuple[PublicUnderwritingIntake, DealerIntakeLoginChallenge]:
     session_hash = _hash_token(session_token)
     challenge = (
         await db.execute(
@@ -1539,6 +1542,8 @@ async def _load_intake_by_dealer_session(db: AsyncSession, session_token: str) -
     ).scalar_one_or_none()
     if challenge is None or challenge.intake is None or challenge.intake.bucket.archived_at is not None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session is expired or invalid")
+    if not allow_pending_signing:
+        await _enforce_production_gate(db, challenge.intake)
     return challenge.intake, challenge
 
 
@@ -3440,7 +3445,7 @@ async def _create_bucket_for_funding_review(
     return bucket, link
 
 
-async def _load_public_intake(db: AsyncSession, token: str) -> PublicUnderwritingIntake:
+async def _load_public_intake(db: AsyncSession, token: str, *, allow_pending_signing: bool = False) -> PublicUnderwritingIntake:
     intake = (
         await db.execute(
             select(PublicUnderwritingIntake)
@@ -3457,7 +3462,33 @@ async def _load_public_intake(db: AsyncSession, token: str) -> PublicUnderwritin
     ).scalar_one_or_none()
     if intake is None or intake.bucket.archived_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI intake not found")
+    if not allow_pending_signing:
+        await _enforce_production_gate(db, intake)
     return intake
+
+
+async def _enforce_production_gate(db: AsyncSession, intake: PublicUnderwritingIntake) -> None:
+    """The client owes a signature on a Production Package: the room is closed
+    to everything except reading, logging out and signing. Derived from the
+    package state on every call, so a voided or reopened package or a
+    completed signature lifts it with no flag to forget."""
+    if intake.variant != DEALER_VARIANT:
+        return
+    from app.services.production_signing import pending_client_signature
+
+    pending = await pending_client_signature(db, intake.id)
+    if pending is None:
+        return
+    package, revision, _sig = pending
+    raise HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "production_signing_required",
+            "package_id": str(package.id),
+            "revision_no": revision.revision_no,
+            "message": "Please sign your production commitment to continue.",
+        },
+    )
 
 
 async def _load_client_intake(db: AsyncSession, user: CurrentUser, intake_id: UUID) -> PublicUnderwritingIntake:
@@ -4728,10 +4759,22 @@ async def _response(
         review_read = BucketAIReviewRead.model_validate(review)
         review_read.result = _client_safe_result(review_read.result)
         review_read.context_snapshot = None
+    signing_gate: dict[str, Any] | None = None
+    if intake.variant == DEALER_VARIANT and not include_management and not admin_thread:
+        from app.services.production_signing import gate_read, pending_client_signature
+
+        pending = await pending_client_signature(db, intake.id)
+        if pending is not None:
+            gate_package, gate_revision, gate_sig = pending
+            signing_gate = gate_read(
+                gate_package, gate_revision, gate_sig,
+                business_name=(intake.business_name or intake.full_name or "your business").strip(),
+            ).model_dump(mode="json")
     return DealerIntakeResponse(
         intake=intake_read,
         token=token,
         session_token=session_token,
+        signing_gate=signing_gate,
         resume_url=_public_url(f"{public_path}?token={token}") if token and public_path else None,
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
@@ -5548,11 +5591,11 @@ async def get_dealer_session(request: Request, db: AsyncSession = Depends(get_db
     session_token = _dealer_session_from_request(request)
     if not session_token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Dealer session is required")
-    intake, _challenge = await _load_intake_by_dealer_session(db, session_token)
+    intake, _challenge = await _load_intake_by_dealer_session(db, session_token, allow_pending_signing=True)
     public_token = _new_public_token()
     intake.token_hash = _hash_token(public_token)
     await db.commit()
-    intake = await _load_public_intake(db, public_token)
+    intake = await _load_public_intake(db, public_token, allow_pending_signing=True)
     return await _response(
         db,
         intake,
@@ -6531,6 +6574,16 @@ async def admin_confirm_lead_deletion(
     codebase to write a cross-bucket entry to."""
     _require_governance_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
+    # A sent or executed Production Package is a retained record; the file
+    # cannot be hard-deleted underneath it (409 with the reason).
+    from app.models.application_profile import ApplicationProfile as _ProfileForGuard
+    from app.services.production_signing import delete_guard as _production_delete_guard
+
+    _guard_profile = (
+        await db.execute(select(_ProfileForGuard.id).where(_ProfileForGuard.intake_id == intake.id))
+    ).scalar_one_or_none()
+    if _guard_profile is not None:
+        await _production_delete_guard(db, _guard_profile)
     # One-click super-admin delete: no prior request flag and no typed-name
     # required — the frontend danger dialog is the safeguard. (Brokers still
     # can only request; only a super admin reaches this hard-delete.)
@@ -8937,7 +8990,7 @@ async def send_dealer_ai_vendor_email(
 
 @router.get("/{token}", response_model=DealerIntakeResponse)
 async def get_dealer_intake(token: str, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
-    intake = await _load_public_intake(db, token)
+    intake = await _load_public_intake(db, token, allow_pending_signing=True)
     _require_dealer_intake(intake)
     return await _response(db, intake, token=token)
 

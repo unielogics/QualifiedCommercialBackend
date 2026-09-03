@@ -38,6 +38,7 @@ _REQUESTS: dict[str, tuple[str, str]] = {
     "client_request.document": ("Document request", "document"),
     "client_request.signature": ("Signature request", "signature"),
     "owner.credit_invite": ("Credit authorization", "credit"),
+    "production_package.sent_for_signature": ("Production package signature", "signature"),
 }
 
 # Events that advance a request already in the log, rather than starting one.
@@ -45,6 +46,7 @@ _COMPLETIONS: dict[str, tuple[str, str]] = {
     "owner.soft_pull": ("credit", "Completed"),
     "plaid.connect": ("bank", "Completed"),
     "plaid.connect.client": ("bank", "Completed"),
+    "production_package.dealer_signed": ("signature", "Completed"),
 }
 
 

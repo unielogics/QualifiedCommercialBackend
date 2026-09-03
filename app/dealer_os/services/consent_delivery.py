@@ -324,6 +324,10 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
 
     from . import sms_consent as sms_consent_svc
 
+    # Ledger context names the flow (consent link, signing request, ...) so the
+    # inbox and audits can tell them apart; deliver_link itself never sees it.
+    ledger_context = str(kwargs.pop("ledger_context", "") or "consent_link")[:32]
+
     ok = False
     if kwargs.get("channel") == "sms":
         phone = normalize_phone(kwargs.get("to_phone"))
@@ -361,7 +365,7 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
                 db, direction="outbound", phone_e164=phone, status=status,
                 provider=getattr(result, "provider", None) or selected_provider(),
                 provider_message_id=getattr(result, "provider_message_id", None) or "",
-                detail=detail, context="consent_link",
+                detail=detail, context=ledger_context,
             )
 
     return result

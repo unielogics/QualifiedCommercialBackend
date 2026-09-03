@@ -126,6 +126,12 @@ from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
+from app.models.production_package import (  # noqa: F401
+    ProductionPackage,
+    ProductionPackageRevision,
+    ProductionPackageShareLink,
+    ProductionPackageSignature,
+)
 from app.models.property_intelligence import PropertyIntelligenceSnapshot  # noqa: F401
 from app.models.provider_secret import ProviderSecret  # noqa: F401
 from app.models.provider_usage_event import ProviderUsageEvent  # noqa: F401
