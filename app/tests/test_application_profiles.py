@@ -96,3 +96,48 @@ def test_shared_dscr_engine_requires_deterministic_inputs() -> None:
     assert calculate_dscr(240_000, 200_000) == 1.2
     assert calculate_dscr(None, 200_000) is None
     assert calculate_dscr(240_000, 0) is None
+
+
+def test_classification_snapshot_survives_json_encoding() -> None:
+    """Confirming a classification writes this dict into a JSONB column.
+
+    The taxonomy entry ids are UUID columns, so leaving them as UUID objects
+    made psycopg's json.dumps raise at flush time — surfacing as a 500 from an
+    unrelated line further down the request, and only for files that actually
+    had a taxonomy entry selected.
+    """
+    import json
+    from uuid import uuid4
+
+    from app.models.application_profile import ApplicationProfile
+    from app.routers.application_profiles import _classification_dict
+
+    profile = ApplicationProfile(
+        vertical="main_street",
+        funding_category="working_capital",
+        entity_type="llc",
+        industry="restaurant_food_service",
+        subindustry="full_service",
+        naics_code="722511",
+        naics_label="Full-Service Restaurants",
+        industry_entry_id=uuid4(),
+        subindustry_entry_id=uuid4(),
+        activity_entry_id=uuid4(),
+    )
+
+    snapshot = _classification_dict(profile)
+    json.dumps({"analysis_status": "stale", "previous": snapshot, "current": snapshot})
+
+    assert snapshot["industry_entry_id"] == str(profile.industry_entry_id)
+    assert snapshot["naics_code"] == "722511"
+
+
+def test_classification_snapshot_keeps_unset_entry_ids_null() -> None:
+    from app.models.application_profile import ApplicationProfile
+    from app.routers.application_profiles import _classification_dict
+
+    snapshot = _classification_dict(ApplicationProfile(vertical="main_street"))
+
+    assert snapshot["industry_entry_id"] is None
+    assert snapshot["subindustry_entry_id"] is None
+    assert snapshot["activity_entry_id"] is None

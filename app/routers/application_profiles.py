@@ -3240,9 +3240,13 @@ def _classification_dict(profile: ApplicationProfile) -> dict:
         "naics_code": profile.naics_code,
         "naics_label": profile.naics_label,
         "custom_industry": profile.custom_industry,
-        "industry_entry_id": profile.industry_entry_id,
-        "subindustry_entry_id": profile.subindustry_entry_id,
-        "activity_entry_id": profile.activity_entry_id,
+        # Stringified because this snapshot is written straight into the
+        # classification_state JSONB column and into the audit trail. Leaving
+        # them as UUIDs made the encode fail at flush time, which surfaced as a
+        # 500 from whatever line happened to trigger the autoflush.
+        "industry_entry_id": str(profile.industry_entry_id) if profile.industry_entry_id else None,
+        "subindustry_entry_id": str(profile.subindustry_entry_id) if profile.subindustry_entry_id else None,
+        "activity_entry_id": str(profile.activity_entry_id) if profile.activity_entry_id else None,
     }
 
 
