@@ -74,6 +74,7 @@ ACTION_LABELS = {
     "file_uploaded": "Uploaded a document",
     "dealer_ai_zip_extracted": "Uploaded a ZIP (extracted)",
     "ai_chat_message_created": "Sent an AI chat message",
+    "chat_message_sent": "Sent a message in a conversation",
     "dealer_ai_intake_created": "Started a new dealer intake",
     "funding_review_intake_created": "Started a real-estate funding review",
     "dealer_ai_lead_created_by_broker": "Broker created a lead",

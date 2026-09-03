@@ -1090,8 +1090,8 @@ async def get_unified_communication_thread(
             messages = [
                 UnifiedCommunicationMessage(
                     id=str(row.id), thread_id=thread_id, body=row.content, sender_name=row.author_name,
-                    sender_type="ai" if row.role == "assistant" else "client" if channel == "client" and row.user_id is None else "operator",
-                    direction="system" if row.role == "assistant" else _message_direction(user, "client" if channel == "client" and row.user_id is None else "super_admin"),
+                    sender_type=_bucket_sender_type(row, channel),
+                    direction="system" if row.role == "assistant" else _message_direction(user, "client" if _bucket_sender_type(row, channel) == "client" else "super_admin"),
                     channel=channel, transport="portal", created_at=row.created_at,
                 ) for row in rows
             ]
@@ -1160,6 +1160,16 @@ async def get_unified_communication_thread(
     return UnifiedCommunicationThreadDetail(thread=thread, messages=messages)
 
 
+def _bucket_sender_type(row: BucketAIMessage, channel: str) -> str:
+    if row.role == "assistant":
+        return "ai"
+    if row.sender_kind == "operator":
+        return "operator"
+    if row.sender_kind == "client":
+        return "client"
+    return "client" if channel == "client" and row.user_id is None else "operator"
+
+
 @router.post("/threads/{thread_id:path}/messages", response_model=UnifiedCommunicationThreadDetail)
 async def reply_unified_communication_thread(
     thread_id: str,
@@ -1181,7 +1191,8 @@ async def reply_unified_communication_thread(
         intake = await db.get(PublicUnderwritingIntake, UUID(parts[1]))
         channel = parts[2]
         if channel in {"underwriter_ai", "client"}:
-            from app.services.bucket_ai import create_chat_reply
+            from app.services.ai import engagement
+            from app.services.bucket_ai import create_chat_reply, create_human_message
 
             bucket = await db.get(Bucket, intake.bucket_id)
             upload_link = (
@@ -1189,17 +1200,33 @@ async def reply_unified_communication_thread(
                 if channel == "client" and intake.bucket_upload_link_id
                 else None
             )
-            await create_chat_reply(
-                db,
-                bucket=bucket,
-                audience="admin" if channel == "underwriter_ai" else "uploader",
-                message=body,
-                actor_name=(f"Underwriter - {user.name}" if channel == "client" else user.name or user.email),
-                user=user,
-                upload_link=upload_link,
-                preferred_language=intake.preferred_language,
-                intake_id=intake.id,
-            )
+            if channel == "client":
+                # The borrower is being answered by a person. The AI neither replies
+                # to this message nor to the borrower's next one for the takeover
+                # window — the same rule as the cockpit's client conversation.
+                await create_human_message(
+                    db,
+                    bucket=bucket,
+                    audience="uploader",
+                    message=body,
+                    actor_name=f"Underwriter — {user.name}" if user.name else "Underwriter",
+                    user=user,
+                    upload_link=upload_link,
+                )
+                if upload_link is not None:
+                    engagement.pause(upload_link)
+            else:
+                await create_chat_reply(
+                    db,
+                    bucket=bucket,
+                    audience="admin",
+                    message=body,
+                    actor_name=user.name or user.email,
+                    user=user,
+                    upload_link=upload_link,
+                    preferred_language=intake.preferred_language,
+                    intake_id=intake.id,
+                )
         else:
             db.add(BucketNote(bucket_id=intake.bucket_id, author_name=user.name or user.email, author_role=str(user.role), visibility="admin", channel="internal" if channel == "internal" else "partner", content=body))
         intake.last_message_at = datetime.now(UTC)

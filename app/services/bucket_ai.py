@@ -2768,6 +2768,55 @@ def _thread_turns_for_model(history: list[BucketAIMessage], max_chars: int = 200
     return turns
 
 
+async def create_human_message(
+    db: AsyncSession,
+    *,
+    bucket: Bucket,
+    audience: str,
+    message: str,
+    actor_name: str,
+    user: User | None = None,
+    upload_link: BucketUploadLink | None = None,
+    share: BucketShare | None = None,
+    vendor_access: BucketVendorAccess | None = None,
+    sender_kind: str = "operator",
+) -> BucketAIMessage:
+    """Record a message a PERSON typed, without asking the model for anything.
+
+    This is the path for an underwriter answering the borrower on behalf of the
+    desk, and for a borrower's own message while a takeover is in progress. It
+    deliberately skips everything create_chat_reply does after the insert — the
+    model call and its billed tokens, the assistant row (including the "AI is
+    unavailable" one on the failure path), the proposed action items and the
+    borrower-fact merge — because none of that should happen for a human turn
+    the AI is not answering.
+    """
+    row = BucketAIMessage(
+        bucket_id=bucket.id,
+        upload_link_id=upload_link.id if upload_link else None,
+        share_id=share.id if share else None,
+        vendor_access_id=vendor_access.id if vendor_access else None,
+        user_id=user.id if user else None,
+        audience=audience,
+        role="user",
+        sender_kind=sender_kind,
+        author_name=actor_name,
+        content=message,
+    )
+    db.add(row)
+    await db.flush()
+    await log_bucket_ai_activity(
+        db,
+        bucket.id,
+        "chat_message_sent",
+        user=user,
+        actor_name=actor_name,
+        actor_role=sender_kind,
+        detail=f"{actor_name} sent a message in the {audience} thread",
+    )
+    return row
+
+
 async def create_chat_reply(
     db: AsyncSession,
     *,
@@ -2781,6 +2830,7 @@ async def create_chat_reply(
     vendor_access: BucketVendorAccess | None = None,
     preferred_language: str = "en",
     intake_id: UUID | None = None,
+    sender_kind: str | None = None,
 ) -> tuple[list[BucketAIMessage], list[BucketAIActionItem], str | None]:
     user_row = BucketAIMessage(
         bucket_id=bucket.id,
@@ -2790,6 +2840,7 @@ async def create_chat_reply(
         user_id=user.id if user else None,
         audience=audience,
         role="user",
+        sender_kind=sender_kind,
         author_name=actor_name,
         content=message,
     )

@@ -111,9 +111,11 @@ from app.schemas.bucket import (
     BucketVendorRead,
 )
 from app.services import clerk as clerk_service
+from app.services.ai import engagement
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
     create_chat_reply,
+    create_human_message,
     latest_review,
     share_visible_summary,
     upload_link_visible_summary,
@@ -2676,6 +2678,23 @@ async def request_ai_chat(
         await db.commit()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     bucket = await _load_bucket_or_404(db, link.bucket_id)
+    if engagement.is_paused(link):
+        # A person from the desk is answering in this thread; record the message
+        # and leave the reply to them.
+        row = await create_human_message(
+            db,
+            bucket=bucket,
+            audience="uploader",
+            message=payload.message,
+            actor_name=link.recipient_name,
+            upload_link=link,
+            sender_kind="client",
+        )
+        await db.commit()
+        return BucketAIChatResponse(
+            messages=[BucketAIMessageRead.model_validate(row)],
+            proposed_action_items=[],
+        )
     messages, proposals, _ = await create_chat_reply(
         db,
         bucket=bucket,
@@ -2683,6 +2702,7 @@ async def request_ai_chat(
         message=payload.message,
         actor_name=link.recipient_name,
         upload_link=link,
+        sender_kind="client",
     )
     await db.commit()
     return BucketAIChatResponse(

@@ -620,6 +620,10 @@ class BucketAIMessageRead(ORMModel):
     user_id: UUID | None
     audience: str
     role: str
+    # "operator" when a person from the desk typed it, "client" for the borrower,
+    # None on rows written before the takeover work. The rooms render an operator
+    # turn as a human reply rather than as the borrower's own message.
+    sender_kind: str | None = None
     author_name: str | None
     content: str
     proposed_context_patch: dict | None

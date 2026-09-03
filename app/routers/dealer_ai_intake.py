@@ -87,12 +87,14 @@ from app.schemas.bucket import (
 )
 from app.schemas.common import ORMModel
 from app.services import booking_notify, booking_reminders
+from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
     CURRENT_FILE_ANALYSIS_VERSION,
     create_chat_reply,
+    create_human_message,
     latest_review,
     run_bucket_ai_review,
     upload_link_visible_summary,
@@ -1024,6 +1026,9 @@ class DealerIntakeRead(ORMModel):
 
 class DealerIntakeResponse(BaseModel):
     intake: DealerIntakeRead
+    # Set while the desk has taken the conversation over: the room shows the
+    # underwriter is replying instead of rendering assistant_message as an AI turn.
+    ai_paused_until: datetime | None = None
     token: str | None = None
     session_token: str | None = None
     resume_url: str | None = None
@@ -4771,8 +4776,10 @@ async def _response(
                 gate_package, gate_revision, gate_sig,
                 business_name=(intake.business_name or intake.full_name or "your business").strip(),
             ).model_dump(mode="json")
+    _link = intake.bucket_upload_link
     return DealerIntakeResponse(
         intake=intake_read,
+        ai_paused_until=_link.ai_paused_until if _link is not None and engagement.is_paused(_link) else None,
         token=token,
         session_token=session_token,
         signing_gate=signing_gate,
@@ -8318,8 +8325,59 @@ async def _client_thread_messages(db: AsyncSession, intake: PublicUnderwritingIn
     return list(reversed(rows))
 
 
+async def _client_chat_turn(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    message: str,
+    *,
+    actor_name: str,
+    user: User | None = None,
+) -> tuple[list[Any], str | None, bool]:
+    """Record the borrower's own turn in the client thread.
+
+    While the desk has taken the conversation over, the message is recorded and
+    the assistant is not asked for anything — the borrower is talking to a person,
+    and an AI answer on top of that is exactly what the takeover exists to stop.
+    Returns (messages, assistant_message, paused)."""
+    link = intake.bucket_upload_link
+    if link is not None and engagement.is_paused(link):
+        row = await create_human_message(
+            db,
+            bucket=intake.bucket,
+            audience="uploader",
+            message=message,
+            actor_name=actor_name,
+            user=user,
+            upload_link=link,
+            sender_kind="client",
+        )
+        return [row], TAKEOVER_CLIENT_NOTICE, True
+    chat_messages, _, _ = await create_chat_reply(
+        db,
+        bucket=intake.bucket,
+        audience="uploader",
+        message=message,
+        actor_name=actor_name,
+        user=user,
+        upload_link=link,
+        preferred_language=intake.preferred_language,
+        sender_kind="client",
+    )
+    return chat_messages, (chat_messages[-1].content if chat_messages else None), False
+
+
 class ClientThreadResponse(BaseModel):
     messages: list[BucketAIMessageRead] = []
+    # Set while the desk has taken the conversation over and the AI is standing down.
+    ai_paused_until: datetime | None = None
+
+
+# Shown to the borrower in place of an AI answer while a human is replying. It is
+# never written to the thread and never comes from the model.
+TAKEOVER_CLIENT_NOTICE = (
+    "Your underwriter is replying to you here. They will answer you directly, so "
+    "the assistant is standing by."
+)
 
 
 @admin_router.get("/{intake_id}/client-thread", response_model=ClientThreadResponse)
@@ -8334,7 +8392,11 @@ async def get_dealer_ai_client_thread(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     messages = await _client_thread_messages(db, intake)
-    return ClientThreadResponse(messages=[BucketAIMessageRead.model_validate(m) for m in messages])
+    link = intake.bucket_upload_link
+    return ClientThreadResponse(
+        messages=[BucketAIMessageRead.model_validate(m) for m in messages],
+        ai_paused_until=link.ai_paused_until if link and engagement.is_paused(link) else None,
+    )
 
 
 @admin_router.post("/{intake_id}/client-thread/reply", response_model=ClientThreadResponse)
@@ -8346,9 +8408,14 @@ async def reply_dealer_ai_client_thread(
     db: AsyncSession = Depends(get_db),
 ) -> ClientThreadResponse:
     """Post a message ON BEHALF of the operator INTO the client's (uploader)
-    thread, attributed as the underwriter, so the borrower sees a human reply and
-    their AI advances the funnel. The message IS visible to the client (unlike the
-    private admin thread). An audit-log entry records the admin who authored it."""
+    thread, attributed as the underwriter, so the borrower gets a human reply.
+    The message IS visible to the client (unlike the private admin thread).
+
+    The AI does not answer this message, and it stands down in this conversation
+    for the takeover window so the underwriter and the borrower can talk without
+    it stepping in — the same rule as a Live Chat takeover on a loan. The window
+    lapses on its own; `/client-thread/resume` hands the conversation back early.
+    An audit-log entry records the admin who authored it."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     if not (payload.message and payload.message.strip()):
@@ -8356,7 +8423,7 @@ async def reply_dealer_ai_client_thread(
     if intake.bucket_upload_link is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This lead has no client upload link to reply into")
     attribution = f"Underwriter — {user.name}" if user.name else "Underwriter"
-    await create_chat_reply(
+    await create_human_message(
         db,
         bucket=intake.bucket,
         audience="uploader",
@@ -8364,8 +8431,8 @@ async def reply_dealer_ai_client_thread(
         actor_name=attribution,
         user=user,
         upload_link=intake.bucket_upload_link,
-        preferred_language=intake.preferred_language,
     )
+    paused_until = engagement.pause(intake.bucket_upload_link)
     await _log(
         db,
         intake.bucket_id,
@@ -8375,7 +8442,43 @@ async def reply_dealer_ai_client_thread(
         actor_role="super_admin",
         target_type="public_underwriting_intake",
         target_id=str(intake.id),
-        detail=f"On-behalf reply into client thread by {user.name or user.email}",
+        detail=f"On-behalf reply into client thread by {user.name or user.email} · AI paused until {paused_until.isoformat()}",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    messages = await _client_thread_messages(db, intake)
+    return ClientThreadResponse(
+        messages=[BucketAIMessageRead.model_validate(m) for m in messages],
+        ai_paused_until=paused_until,
+    )
+
+
+@admin_router.post("/{intake_id}/client-thread/resume", response_model=ClientThreadResponse)
+async def resume_dealer_ai_client_thread(
+    intake_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientThreadResponse:
+    """End the takeover early and let the assistant answer the borrower again.
+
+    The window lapses by itself, so this is only for handing the conversation
+    back before it does."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    if intake.bucket_upload_link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This lead has no client upload link")
+    engagement.resume(intake.bucket_upload_link)
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_client_thread_ai_resumed",
+        request=request,
+        user=user,
+        actor_role="super_admin",
+        target_type="public_underwriting_intake",
+        target_id=str(intake.id),
+        detail=f"AI resumed on the client thread by {user.name or user.email}",
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake_id)
@@ -9046,18 +9149,11 @@ async def dealer_intake_chat(
     messages = []
     assistant_message = None
     if payload.message and payload.message.strip():
-        chat_messages, _, _ = await create_chat_reply(
-            db,
-            bucket=intake.bucket,
-            audience="uploader",
-            message=payload.message.strip(),
-            actor_name=intake.full_name,
-            upload_link=intake.bucket_upload_link,
-            preferred_language=intake.preferred_language,
+        chat_messages, assistant_message, paused = await _client_chat_turn(
+            db, intake, payload.message.strip(), actor_name=intake.full_name
         )
         messages = chat_messages
-        if chat_messages:
-            assistant_message = chat_messages[-1].content
+        if chat_messages and not paused:
             raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
             proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
             newly_accepted = _merge_dealer_details(intake, proposed_facts)
@@ -9349,19 +9445,10 @@ async def my_dealer_intake_chat(
     messages = []
     assistant_message = None
     if payload.message and payload.message.strip():
-        chat_messages, _, _ = await create_chat_reply(
-            db,
-            bucket=intake.bucket,
-            audience="uploader",
-            message=payload.message.strip(),
-            actor_name=user.name or intake.full_name,
-            user=user,
-            upload_link=intake.bucket_upload_link,
-            preferred_language=intake.preferred_language,
+        chat_messages, assistant_message, _paused = await _client_chat_turn(
+            db, intake, payload.message.strip(), actor_name=user.name or intake.full_name, user=user
         )
         messages = chat_messages
-        if chat_messages:
-            assistant_message = chat_messages[-1].content
     await db.commit()
     intake = await _load_client_intake(db, user, intake_id)
     return await _response(
@@ -9782,18 +9869,11 @@ async def funding_review_chat(
     assistant_message = None
     if payload.message and payload.message.strip():
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_funding_review_context(intake)}
-        chat_messages, _, _ = await create_chat_reply(
-            db,
-            bucket=intake.bucket,
-            audience="uploader",
-            message=payload.message.strip(),
-            actor_name=intake.full_name,
-            upload_link=intake.bucket_upload_link,
-            preferred_language=intake.preferred_language,
+        chat_messages, assistant_message, paused = await _client_chat_turn(
+            db, intake, payload.message.strip(), actor_name=intake.full_name
         )
         messages = chat_messages
-        if chat_messages:
-            assistant_message = chat_messages[-1].content
+        if chat_messages and not paused:
             raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
             proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
             _merge_funding_review_details(intake, proposed_facts)
@@ -10584,18 +10664,11 @@ async def mca_refinance_chat(
     assistant_message = None
     if payload.message and payload.message.strip():
         intake.bucket.ai_context = {**(intake.bucket.ai_context or {}), **_mca_context(intake)}
-        chat_messages, _, _ = await create_chat_reply(
-            db,
-            bucket=intake.bucket,
-            audience="uploader",
-            message=payload.message.strip(),
-            actor_name=intake.full_name,
-            upload_link=intake.bucket_upload_link,
-            preferred_language=intake.preferred_language,
+        chat_messages, assistant_message, paused = await _client_chat_turn(
+            db, intake, payload.message.strip(), actor_name=intake.full_name
         )
         messages = chat_messages
-        if chat_messages:
-            assistant_message = chat_messages[-1].content
+        if chat_messages and not paused:
             raw = chat_messages[-1].metadata_json.get("raw") if isinstance(chat_messages[-1].metadata_json, dict) else None
             proposed_facts = raw.get("proposed_borrower_facts") if isinstance(raw, dict) else None
             _merge_mca_details(intake, proposed_facts)

@@ -159,6 +159,9 @@ class BucketUploadLink(TimestampMixin, Base):
     recipient_name: Mapped[str] = mapped_column(String(180), nullable=False)
     recipient_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Takeover window: while this is in the future a human is answering the
+    # borrower in the client thread, so the AI stays out of it.
+    ai_paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     allow_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     allow_multiple_sessions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     can_use_ai_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
@@ -554,6 +557,10 @@ class BucketAIMessage(Base):
     )
     audience: Mapped[str] = mapped_column(String(24), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Who typed this row: "operator" for a human replying on behalf of the desk,
+    # "client" for the borrower, None on legacy rows. Neither author_name nor
+    # user_id can carry this — a signed-in borrower also has a user_id.
+    sender_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     author_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     proposed_context_patch: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
