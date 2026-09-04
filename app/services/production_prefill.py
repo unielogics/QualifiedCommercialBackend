@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.models import DealerApplicationProfile, DealerBusiness
-from app.models.application_profile import ApplicationProfile
+from app.models.application_profile import ApplicationExtractedFact, ApplicationProfile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.services import application_profiles as profiles
@@ -203,6 +203,8 @@ async def extracted_facts(db: AsyncSession, profile: ApplicationProfile) -> dict
     ).scalars().all()
     best: dict[str, tuple[int, float, str]] = {}
     for row in rows:
+        if row.status == "rejected":  # the query excludes these; so does this
+            continue
         value = _text(row.normalized_value) or _text(row.value if isinstance(row.value, str) else (row.value or {}).get("value"))
         if not value:
             continue
@@ -239,10 +241,9 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
     entity_structure = state.get("entity_structure") if isinstance(state.get("entity_structure"), dict) else {}
     main_street = state.get("main_street_details") if isinstance(state.get("main_street_details"), dict) else {}
     primary_entity = entity_structure.get("primary_operating_entity")
-    snapshot = (intake.result_snapshot if intake is not None else None) or {}
-    key_metrics = snapshot.get("key_metrics") if isinstance(snapshot.get("key_metrics"), dict) else {}
 
     # ---- dealer identity ----
+    ident = file_identity(dealer, dap, profile, intake)
     if dealer is not None:
         out.put("dealer_name", _text(dealer.legal_name) or _text(dealer.name), "dealer")
         out.put("dealer_entity", normalize_entity_type(dealer.entity_type), "dealer")
@@ -256,20 +257,36 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
             out.put("term", int(dap.term_requested_months), "dealer_profile")
         out.put("debt_service", _number(dap.monthly_debt_payments), "dealer_profile")
     if intake is not None:
+        # `primary_operating_entity` is the entity's NAME, not its type or its
+        # state — the two readers that mined it for those were dead code that
+        # would have written a company name into both fields had they run.
         out.put("dealer_name", _text(intake.business_name) or _text(primary_entity), "intake")
-        out.put("dealer_entity", _entity_type_from_entity(primary_entity) or normalize_entity_type(main_street.get("entity_type")), "intake")
-        out.put("dealer_state", _state_from_entity(primary_entity), "intake")
+        out.put("dealer_entity", normalize_entity_type(main_street.get("entity_type")), "intake")
         out.put("requested", _number(intake.requested_loan_amount) or _number(dealer_details.get("requested_loan_amount")), "intake")
         out.put("debt_service", _number(dealer_details.get("stated_monthly_debt_payments")), "intake")
-        for k in ("lot_units", "vehicles_in_lot", "lot_size"):
-            out.put("lot_units", _number(dealer_details.get(k)), "intake")
-        for k in ("monthly_units", "monthly_retail_units", "units_per_month"):
-            out.put("monthly_units", _number(dealer_details.get(k)), "intake")
-        out.put("avg_cost", _number(dealer_details.get("average_vehicle_cost")), "intake")
-    if key_metrics:
-        for k in ("monthly_debt_service", "debt_service", "monthly_debt_payments"):
-            out.put("debt_service", _number(key_metrics.get(k)), "review")
     out.put("dealer_entity", normalize_entity_type(profile.entity_type), "profile")
+    out.put("dealer_dba", _text(ident.get("dba")), "dealer")
+
+    # ---- what the documents already say ----
+    # Below the typed columns: a human-entered value always wins over a reading.
+    facts = await extracted_facts(db, profile)
+    out.put("dealer_name", _text(facts.get("legal_entity_name")), "document_extraction")
+    out.put("dealer_entity", normalize_entity_type(facts.get("entity_type")), "document_extraction")
+    out.put("identity_naics", _text(facts.get("naics_code")), "document_extraction")
+
+    # ---- closing identity and ownership (§9.1, §9.2) ----
+    # load_file_context assembled these from the same columns, but only for
+    # draft_final — so stage one asked for facts the file had all along, and the
+    # Engagement printed the ownership schedule with nobody having reviewed it.
+    out.put("identity_formation_date", _text(ident.get("formation_date")), "dealer")
+    out.put("identity_ein", _text(ident.get("ein")), "dealer")
+    out.put("identity_naics", _text(ident.get("naics")), "profile")
+    out.put("identity_website", _text(ident.get("website")), "dealer_profile")
+    if intake is not None:
+        out.put("dealer_notice_email", _text(intake.email), "intake")
+    owner_rows = file_owner_rows(owners)
+    if owner_rows:
+        out.put("owners", owner_rows, "owners")
     if dealer is not None:
         # Address state is a weaker proxy for state of formation; last resort.
         out.put("dealer_state", _text(dealer.state), "dealer")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -329,22 +329,20 @@ async def test_pending_gate_is_none_without_intake_or_pending_row():
 
 async def test_prefill_precedence_dealer_then_intake_then_actor():
     dealer_id = uuid.uuid4()
-    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=dealer_id, intake_id=uuid.uuid4(), entity_type="s_corp", vertical="dealer")
-    dealer = SimpleNamespace(id=dealer_id, legal_name="Delgado Auto Group LLC", name="Delgado", entity_type="llc",
-                             address="4411 Gulf Fwy", city="Houston", state="TX", zip="77023",
-                             client_requested_amount=None, funding_goal=900000)
-    dap = SimpleNamespace(dba_name="Delgado Auto Sales", state_of_formation="Texas", mailing_address=None, mailing_city=None,
-                          mailing_state=None, mailing_zip=None, signer_title="Managing member", term_requested_months=24,
-                          monthly_debt_payments=41300)
+    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=dealer_id, intake_id=uuid.uuid4(), entity_type="s_corp",
+                              vertical="dealer", naics_code=None)
+    dealer = _dealer_row(dealer_id)
+    dap = _dap_row()
     intake = SimpleNamespace(business_name="Other Name", full_name="Rafael Delgado", email="r@example.com", phone="+19735550148",
                              requested_loan_amount=1200000, intake_state={"dealer_details": {"stated_monthly_debt_payments": 39000}},
                              result_snapshot={"key_metrics": {"monthly_debt_service": "$40,000"}})
-    owner = SimpleNamespace(first_name="Rafael", last_name="Delgado", is_primary=True)
+    owner = SimpleNamespace(first_name="Rafael", last_name="Delgado", is_primary=True, ownership_pct=100,
+                            email="r@example.com", phone="+19735550148", invite_sent_at=None, credit_pull_id=None)
 
     async def get(model, key):
         return {dealer_id: dealer, profile.intake_id: intake}.get(key)
 
-    db = SimpleNamespace(get=get, execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: dap)))
+    db = _prefill_db(get, dap, facts=[])
     with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[owner])):
         result = await prefill.build_prefill(db, profile, _user(Role.LOAN_EXEC))
     v, p = result.values, result.provenance
@@ -360,6 +358,126 @@ async def test_prefill_precedence_dealer_then_intake_then_actor():
     assert v["rm_employer"] == "Qualified Commercial LLC"
     assert "sponsor_name" not in v and "sponsor_name" not in result.missing
     assert "lot_units" in result.missing and "sponsor_platform" not in result.missing
+    # §9.1 and §9.2 arrive from the file rather than being typed at stage one.
+    assert v["identity_ein"] == "74-1234567" and v["identity_formation_date"] == "2014-03-11"
+    assert v["identity_naics"] == "441110" and v["identity_website"] == "https://delgadoauto.example"
+    assert v["dealer_notice_email"] == "r@example.com"
+    assert v["owners"] == [{"name": "Rafael Delgado", "pct": 100.0, "title": "",
+                            "email": "r@example.com", "phone": "+19735550148", "auth": ""}]
+
+
+def _dealer_row(dealer_id):
+    return SimpleNamespace(id=dealer_id, legal_name="Delgado Auto Group LLC", name="Delgado", entity_type="llc",
+                           address="4411 Gulf Fwy", city="Houston", state="TX", zip="77023",
+                           started_on=date(2014, 3, 11), ein="74-1234567", naics_code="441110",
+                           client_requested_amount=None, funding_goal=900000)
+
+
+def _dap_row():
+    return SimpleNamespace(dba_name="Delgado Auto Sales", state_of_formation="Texas", mailing_address=None, mailing_city=None,
+                           mailing_state=None, mailing_zip=None, signer_title="Managing member", term_requested_months=24,
+                           monthly_debt_payments=41300, website="https://delgadoauto.example")
+
+
+def _fact(field_key, value, *, status="suggested", confidence=0.9):
+    return SimpleNamespace(field_key=field_key, normalized_value=value, value={"value": value},
+                           status=status, confidence=confidence)
+
+
+def _prefill_db(get, dap, *, facts):
+    """build_prefill selects the dealer application profile only when there is a
+    dealer, then always selects the extracted facts."""
+    pending = [SimpleNamespace(scalar_one_or_none=lambda: dap)] if dap is not None else []
+
+    async def execute(_stmt):
+        if pending:
+            return pending.pop(0)
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: facts))
+
+    return SimpleNamespace(get=get, execute=execute)
+
+
+@pytest.mark.asyncio
+async def test_a_document_reading_fills_what_no_column_holds():
+    """The AI reads entity type off an upload into application_extracted_facts.
+
+    Nothing in the package had ever read that table, so an intake-only file
+    asked an operator to type a fact the system had already extracted.
+    """
+    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=None, intake_id=None, entity_type=None,
+                              vertical="dealer", naics_code=None)
+    facts = [_fact("entity_type", "llc"), _fact("legal_entity_name", "Bradley Motors LLC"), _fact("naics_code", "441110")]
+    db = _prefill_db(lambda *_: None, None, facts=facts)
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        result = await prefill.build_prefill(db, profile, None)
+
+    assert result.values["dealer_entity"] == "Limited liability company"
+    assert result.values["dealer_name"] == "Bradley Motors LLC"
+    assert result.values["identity_naics"] == "441110"
+    # Unconfirmed, and labelled, so the operator is asked to check it.
+    assert result.provenance["dealer_entity"]["confirmed"] is False
+    assert result.provenance["dealer_entity"]["label"] == "Read from an uploaded document"
+
+
+@pytest.mark.asyncio
+async def test_a_typed_column_always_beats_a_document_reading():
+    dealer_id = uuid.uuid4()
+    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=dealer_id, intake_id=None, entity_type=None,
+                              vertical="dealer", naics_code=None)
+    dealer = _dealer_row(dealer_id)
+
+    async def get(_model, key):
+        return {dealer_id: dealer}.get(key)
+
+    db = _prefill_db(get, _dap_row(), facts=[_fact("entity_type", "corporation", status="accepted", confidence=1.0)])
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        result = await prefill.build_prefill(db, profile, None)
+
+    assert result.values["dealer_entity"] == "Limited liability company"
+    assert result.provenance["dealer_entity"]["source"] == "dealer"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_reading_is_never_used():
+    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=None, intake_id=None, entity_type=None,
+                              vertical="dealer", naics_code=None)
+    db = _prefill_db(lambda *_: None, None, facts=[_fact("entity_type", "corporation", status="rejected")])
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        result = await prefill.build_prefill(db, profile, None)
+
+    assert "dealer_entity" not in result.values
+
+
+@pytest.mark.asyncio
+async def test_applying_a_prefill_requires_the_right_to_edit():
+    """run_prefill was the one mutating path gating on _require_editable alone.
+
+    Safe only because agents are 404'd at stage two; a write hole the moment
+    they are not.
+    """
+    access = _access("draft", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4()), stage=2)
+    result = prefill.PrefillResult()
+    result.put("dealer_name", "Filled Co", "intake")
+    with patch.object(pkgs.prefill_svc, "build_prefill", AsyncMock(return_value=result)):
+        with pytest.raises(HTTPException) as err:
+            await pkgs.run_prefill(SimpleNamespace(), access, force=False, fields=None, apply=True)
+    assert err.value.status_code == 403
+
+
+def test_the_intake_entity_name_is_never_mined_for_a_type_or_a_state():
+    """`primary_operating_entity` is a company name.
+
+    Two readers used to mine it for an entity type and a state of formation.
+    They only ran on a dict and the value is a string, so they were dead — but
+    had they run they would have written a company name into both fields.
+    """
+    import inspect as _inspect
+
+    source = _inspect.getsource(prefill.build_prefill)
+    assert "_entity_type_from_entity" not in source
+    assert "_state_from_entity" not in source
+    assert not hasattr(prefill, "_entity_type_from_entity")
+    assert not hasattr(prefill, "_state_from_entity")
 
 
 def test_apply_prefill_only_fills_blanks_unless_forced():

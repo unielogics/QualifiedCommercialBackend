@@ -617,6 +617,11 @@ async def run_prefill(
         package.arrangement or {}, package.prefill_provenance or {}, result, force=force, fields=fields
     )
     if apply and applied:
+        # The only mutating path that used to gate on _require_editable alone.
+        # Harmless while agents are 404'd at stage two; a write hole the moment
+        # they are not.
+        if not access.capabilities().can_edit:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "This package cannot be edited from this account.")
         _require_editable(package)
         computed = pa.compute(arrangement, stage=int(getattr(package, "stage", 1) or 1))
         package.arrangement = pa.jsonable(arrangement)
@@ -1101,20 +1106,10 @@ async def load_file_context(db: AsyncSession, access: PackageAccess) -> dict[str
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     owners = await profiles.owner_rows(db, profile)
     business_name, email, phone = await client_contact(db, access)
-    identity = {
-        "legal_name": (dealer.legal_name if dealer else None) or (intake.business_name if intake else None),
-        "dba": getattr(dap, "dba_name", None), "entity_type": (dealer.entity_type if dealer else None) or profile.entity_type,
-        "state": getattr(dap, "state_of_formation", None) or (dealer.state if dealer else None),
-        "formation_date": (dealer.started_on.isoformat() if dealer and dealer.started_on else None),
-        "ein": dealer.ein if dealer else None, "naics": profile.naics_code or (dealer.naics_code if dealer else None),
-        "address": prefill_svc.compose_address(dealer.address, dealer.city, dealer.state, dealer.zip) if dealer else None,
-        "license": None, "website": getattr(dap, "website", None),
-    }
-    owner_rows = [{
-        "name": " ".join(p for p in (str(getattr(o, "first_name", "") or ""), str(getattr(o, "last_name", "") or "")) if p),
-        "pct": float(getattr(o, "ownership_pct", 0) or 0), "title": "", "email": getattr(o, "email", None) or "",
-        "phone": getattr(o, "phone", None) or "", "auth": "Yes" if getattr(o, "invite_sent_at", None) or getattr(o, "credit_pull_id", None) else "",
-    } for o in owners[:pa.MAX_OWNERS]]
+    # One definition, shared with build_prefill: the stage-one form and the PDF
+    # builders must derive identity and ownership from the same columns.
+    identity = prefill_svc.file_identity(dealer, dap, profile, intake)
+    owner_rows = prefill_svc.file_owner_rows(owners)
     return pa.jsonable({
         "identity": identity, "owners": owner_rows,
         "qc": {"notice_email": getattr(cfg, "qc_notice_email", None), "notice_address": getattr(cfg, "qc_notice_address", None),
