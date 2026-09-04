@@ -3580,7 +3580,17 @@ async def _enforce_production_gate(db: AsyncSession, intake: PublicUnderwritingI
     )
 
 
-async def _load_client_intake(db: AsyncSession, user: CurrentUser, intake_id: UUID) -> PublicUnderwritingIntake:
+async def _load_client_intake(
+    db: AsyncSession, user: CurrentUser, intake_id: UUID, *, allow_pending_signing: bool = False
+) -> PublicUnderwritingIntake:
+    """The signed-in client's own intake.
+
+    Mirrors _load_public_intake, including the production signing gate. Without
+    it a dealer client who happened to have a login could keep chatting and
+    uploading while owing a signature — the same actions the token room refuses
+    — and could not sign either, because signing lives in the room the gate
+    closed. Reads pass allow_pending_signing so the gate itself can be rendered.
+    """
     if user.client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Current user has no linked client record")
     intake = (
@@ -3599,6 +3609,8 @@ async def _load_client_intake(db: AsyncSession, user: CurrentUser, intake_id: UU
     ).scalar_one_or_none()
     if intake is None or intake.bucket.archived_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Dealer AI intake not found")
+    if not allow_pending_signing:
+        await _enforce_production_gate(db, intake)
     return intake
 
 
@@ -9558,7 +9570,7 @@ async def list_my_dealer_intakes(user: CurrentUser, db: AsyncSession = Depends(g
 
 @client_router.get("/{intake_id}", response_model=DealerIntakeResponse)
 async def get_my_dealer_intake(intake_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> DealerIntakeResponse:
-    intake = await _load_client_intake(db, user, intake_id)
+    intake = await _load_client_intake(db, user, intake_id, allow_pending_signing=True)
     return await _response(db, intake, token=None)
 
 
@@ -9583,7 +9595,7 @@ async def my_dealer_intake_chat(
         )
         messages = chat_messages
     await db.commit()
-    intake = await _load_client_intake(db, user, intake_id)
+    intake = await _load_client_intake(db, user, intake_id, allow_pending_signing=True)
     return await _response(
         db,
         intake,

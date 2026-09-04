@@ -9,7 +9,7 @@ conversation over the assistant stays out of it.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -44,16 +44,16 @@ def test_pause_sets_an_hour_and_reads_back_as_paused():
     assert link.ai_paused_until == until
     assert engagement.is_paused(link) is True
     # The product's takeover window is one hour, the same as a loan Live Chat.
-    assert timedelta(minutes=59) < until - datetime.now(timezone.utc) <= timedelta(hours=1)
+    assert timedelta(minutes=59) < until - datetime.now(UTC) <= timedelta(hours=1)
 
 
 def test_pause_lapses_on_its_own_without_anyone_clearing_it():
-    link = _link(paused_until=datetime.now(timezone.utc) - timedelta(seconds=1))
+    link = _link(paused_until=datetime.now(UTC) - timedelta(seconds=1))
     assert engagement.is_paused(link) is False
 
 
 def test_a_naive_timestamp_does_not_blow_up_the_comparison():
-    naive = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
+    naive = (datetime.now(UTC) + timedelta(hours=1)).replace(tzinfo=None)
     link = _link(paused_until=naive)
     assert engagement.is_paused(link) is True
 
@@ -145,7 +145,7 @@ async def test_client_turn_asks_the_model_when_no_one_has_taken_over():
 async def test_client_turn_is_recorded_but_unanswered_during_a_takeover():
     from app.routers.dealer_ai_intake import TAKEOVER_CLIENT_NOTICE, _client_chat_turn
 
-    link = _link(paused_until=datetime.now(timezone.utc) + timedelta(minutes=30))
+    link = _link(paused_until=datetime.now(UTC) + timedelta(minutes=30))
     intake = SimpleNamespace(bucket=_bucket(), bucket_upload_link=link, preferred_language="en")
     row = SimpleNamespace(content="sure, my number is 555 0148")
     with patch("app.routers.dealer_ai_intake.create_chat_reply", new=AsyncMock()) as reply, \
@@ -166,7 +166,7 @@ async def test_client_turn_is_recorded_but_unanswered_during_a_takeover():
 async def test_the_model_answers_again_once_the_window_lapses():
     from app.routers.dealer_ai_intake import _client_chat_turn
 
-    link = _link(paused_until=datetime.now(timezone.utc) - timedelta(minutes=1))
+    link = _link(paused_until=datetime.now(UTC) - timedelta(minutes=1))
     intake = SimpleNamespace(bucket=_bucket(), bucket_upload_link=link, preferred_language="en")
     answer = SimpleNamespace(content="Thanks — I have that now.", metadata_json=None)
     with patch("app.routers.dealer_ai_intake.create_chat_reply",
@@ -217,3 +217,61 @@ def test_the_takeover_notice_never_pretends_to_be_the_assistant():
     text = TAKEOVER_CLIENT_NOTICE.lower()
     assert "underwriter" in text
     assert "bucket ai" not in text and "assistant is standing by" in text
+
+
+# --- the production signing gate reaches the signed-in client too --------------
+
+
+@pytest.mark.asyncio
+async def test_a_signed_in_client_owing_a_signature_cannot_keep_working():
+    """The gate closed the token room but not the login.
+
+    A dealer client with a login could keep chatting and uploading while owing a
+    signature — the same actions the token room refuses — and could not sign
+    either, because signing lives in the room the gate had closed.
+    """
+    from fastapi import HTTPException
+
+    from app.routers import dealer_ai_intake as router
+
+    intake = SimpleNamespace(id=uuid4(), variant="dealer_gatekeeper_v1", bucket=SimpleNamespace(archived_at=None))
+    package = SimpleNamespace(id=uuid4(), stage=1)
+    revision = SimpleNamespace(revision_no=2, stage=1, document_title="Production Commitment")
+
+    with patch.object(router, "pending_client_signature", new=AsyncMock(return_value=(package, revision, None)), create=True), \
+         patch("app.services.production_signing.pending_client_signature",
+               new=AsyncMock(return_value=(package, revision, None))):
+        with pytest.raises(HTTPException) as err:
+            await router._enforce_production_gate(None, intake)
+
+    assert err.value.status_code == 403
+    assert err.value.detail["code"] == "production_signing_required"
+
+
+@pytest.mark.asyncio
+async def test_the_gate_still_ignores_every_non_dealer_file():
+    """Production packages exist only on car-industry files, so the gate must
+    never close a real-estate, main-street or MCA room."""
+    from app.routers import dealer_ai_intake as router
+
+    for variant in ("real_estate_dscr_v1", "main_street_v1", "mca_refi_v1"):
+        intake = SimpleNamespace(id=uuid4(), variant=variant)
+        # Returns without ever asking whether a signature is pending.
+        assert await router._enforce_production_gate(None, intake) is None
+
+
+def test_the_signed_in_loader_gates_writes_and_lets_reads_render_the_gate():
+    import inspect
+
+    from app.routers import dealer_ai_intake as router
+
+    source = inspect.getsource(router._load_client_intake)
+    assert "_enforce_production_gate" in source
+    assert "allow_pending_signing" in source
+
+    # Reads pass the flag so the client can see what they owe; writes do not.
+    body = inspect.getsource(router)
+    calls = [line for line in body.splitlines() if "_load_client_intake(db, user, intake_id" in line]
+    allowed = [c for c in calls if "allow_pending_signing=True" in c]
+    assert len(calls) >= 6
+    assert len(allowed) == 2, calls
