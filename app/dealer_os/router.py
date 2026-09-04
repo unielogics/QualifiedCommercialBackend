@@ -18958,8 +18958,8 @@ async def _run_owner_soft_pull(
             await db.commit()
         return SoftPullResult(ok=False, detail=detail)
 
-    client = await _resolve_owner_client(db, dealer, owner)
     try:
+        client = await _resolve_owner_client(db, dealer, owner)
         pull = await run_soft_pull(
             db,
             client=client,
@@ -19102,24 +19102,54 @@ def _credit_tier(score: int | None) -> str | None:
 
 
 async def _resolve_owner_client(db: AsyncSession, dealer, owner) -> object:
-    """run_soft_pull keys its record to a Client. Find or create the one that
-    represents this owner so the pull lands against a stable subject rather
-    than a throwaway row."""
+    """run_soft_pull keys its record to a Client. Find the one that represents
+    this owner *on this file*, or make one.
+
+    Never by email. A global email match landed an owner's pull on whatever
+    stranger happened to share the address, wrote that person's FICO onto their
+    Client row, and — because the create branch below could not execute — was
+    the only path that completed at all. Resolution is scoped to the file now,
+    in three steps, each a fact about this owner rather than a guess.
+    """
     from app.models.client import Client
 
-    if owner.email:
-        existing = (
+    # 1. The subject a previous pull for this owner already used, so a refresh
+    #    lands on the same person rather than opening a second identity.
+    if owner.credit_pull_id:
+        prior = (
+            await db.execute(select(CreditPull.client_id).where(CreditPull.id == owner.credit_pull_id))
+        ).scalar_one_or_none()
+        if prior is not None:
+            existing = await db.get(Client, prior)
+            if existing is not None:
+                return existing
+
+    # 2. The primary owner is the borrower, so their pull belongs on the file's
+    #    own client — which is what makes `client.fico` correct rather than a
+    #    stranger's score.
+    if owner.is_primary:
+        subject_id = (
             await db.execute(
-                select(Client).where(func.lower(Client.email) == owner.email.lower()).limit(1)
+                select(ApplicationProfile.client_id).where(ApplicationProfile.dealer_id == dealer.id)
             )
         ).scalar_one_or_none()
-        if existing is not None:
-            return existing
+        if subject_id is None and dealer.dealer_user_id is not None:
+            # Client.user_id is the FK; User has no client_id column.
+            subject_id = (
+                await db.execute(select(Client.id).where(Client.user_id == dealer.dealer_user_id))
+            ).scalar_one_or_none()
+        if subject_id is not None:
+            existing = await db.get(Client, subject_id)
+            if existing is not None:
+                return existing
+
+    # 3. A co-owner is their own subject. Scoped to this file, never adopted
+    #    from elsewhere. `name` is the only required column on Client.
     client = Client(
-        first_name=owner.first_name,
-        last_name=owner.last_name,
-        email=owner.email or f"owner-{owner.id}@dealer-os.local",
+        name=owner.full_name or (owner.email or "Owner"),
+        email=(owner.email or "").strip().lower() or None,
         phone=owner.phone,
+        referral_source="dealer_os_owner",
     )
     db.add(client)
     await db.flush()
