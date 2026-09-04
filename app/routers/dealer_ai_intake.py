@@ -26,7 +26,7 @@ from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.config import get_settings
 from app.db import get_db
-from app.dealer_os.services import consent_delivery
+from app.dealer_os.services import client_room, consent_delivery
 from app.deps import CurrentUser
 from app.enums import (
     CalendarEventKind,
@@ -3225,8 +3225,10 @@ async def _create_bucket_for_intake(
         allow_multiple_sessions=True,
         can_use_ai_chat=True,
         can_view_ai_tasks=True,
-        passcode_hash=_hash_passcode(passcode),
     )
+    # The room PIN has to be recoverable, or a client can never be handed into
+    # their own room: only the hash was stored here, so the code was discarded.
+    client_room._store_passcode(link, passcode)
     db.add(link)
     await _log(
         db,
@@ -3346,8 +3348,10 @@ async def _create_bucket_for_main_street(
         allow_multiple_sessions=True,
         can_use_ai_chat=True,
         can_view_ai_tasks=True,
-        passcode_hash=_hash_passcode(passcode),
     )
+    # The room PIN has to be recoverable, or a client can never be handed into
+    # their own room: only the hash was stored here, so the code was discarded.
+    client_room._store_passcode(link, passcode)
     db.add(link)
     await _log(
         db,
@@ -3432,8 +3436,10 @@ async def _create_bucket_for_funding_review(
         allow_multiple_sessions=True,
         can_use_ai_chat=True,
         can_view_ai_tasks=True,
-        passcode_hash=_hash_passcode(passcode),
     )
+    # The room PIN has to be recoverable, or a client can never be handed into
+    # their own room: only the hash was stored here, so the code was discarded.
+    client_room._store_passcode(link, passcode)
     db.add(link)
     await _log(
         db,
@@ -10446,8 +10452,10 @@ async def _create_bucket_for_mca_refi(
         allow_multiple_sessions=True,
         can_use_ai_chat=True,
         can_view_ai_tasks=True,
-        passcode_hash=_hash_passcode(passcode),
     )
+    # The room PIN has to be recoverable, or a client can never be handed into
+    # their own room: only the hash was stored here, so the code was discarded.
+    client_room._store_passcode(link, passcode)
     db.add(link)
     await _log(
         db,

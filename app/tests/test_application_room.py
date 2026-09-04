@@ -175,3 +175,34 @@ def test_room_delivery_uses_the_canonical_app_origin(monkeypatch: pytest.MonkeyP
     assert result.ok
     assert "https://app.qualifiedcommercial.com/buckets/request/opaque-token" in captured["body"]
     assert "PIN" not in captured["body"]
+
+
+def test_only_one_writer_sets_a_room_pin() -> None:
+    """Every upload-link PIN goes through client_room._store_passcode.
+
+    Writing passcode_hash directly leaves encrypted_passcode stale or absent,
+    which is how a self-serve intake ended up with a room nobody could enter and
+    how staff were shown a rotated PIN that no longer opened the room. Shares are
+    a different model with no encrypted copy, so they are excluded on purpose.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for path in [
+        root / "routers" / "buckets.py",
+        root / "routers" / "application_profiles.py",
+        root / "routers" / "dealer_ai_intake.py",
+    ]:
+        source = path.read_text().splitlines()
+        for number, line in enumerate(source, start=1):
+            if not re.search(r"passcode_hash\s*=\s*_hash_passcode", line):
+                continue
+            # Walk back to the nearest constructor or assignment target.
+            context = "\n".join(source[max(0, number - 12):number])
+            if "BucketShare(" in context or "share." in line:
+                continue
+            offenders.append(f"{path.name}:{number}")
+
+    assert offenders == [], f"write these through client_room._store_passcode: {offenders}"

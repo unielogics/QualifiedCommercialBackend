@@ -24,6 +24,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 from app.config import get_settings
 from app.db import get_db
 from app.dealer_os.models import DealerBusiness
+from app.dealer_os.services import client_room
 from app.dealer_os.services.bucket_ingest import auto_ingest_bucket_files_for_bucket
 from app.deps import require_role
 from app.enums import Role
@@ -1445,8 +1446,8 @@ async def create_upload_link(
         allow_multiple_sessions=payload.allow_multiple_sessions,
         can_use_ai_chat=payload.can_use_ai_chat,
         can_view_ai_tasks=payload.can_view_ai_tasks,
-        passcode_hash=_hash_passcode(passcode),
     )
+    client_room._store_passcode(link, passcode)
     db.add(link)
     await db.flush()
     await _log(db, bucket_id, "upload_link_created", request=request, user=user, target_type="upload_link", target_id=str(link.id), detail=link.recipient_name)
@@ -1861,7 +1862,7 @@ async def regenerate_upload_link_passcode(
     if link is None or link.bucket_id != bucket_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload link not found")
     passcode = _generate_passcode()
-    link.passcode_hash = _hash_passcode(passcode)
+    client_room._store_passcode(link, passcode)
     await _log(
         db,
         bucket_id,

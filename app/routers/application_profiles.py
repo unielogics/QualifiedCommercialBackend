@@ -20,7 +20,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.dealer_os.models import DealerBusiness, DealerOwner, DealerPlaidItem
 from app.dealer_os.services import bank_consent as dealer_bank_consent
-from app.dealer_os.services import consent_delivery, plaid_client
+from app.dealer_os.services import client_room, consent_delivery, plaid_client
 from app.deps import CurrentUser
 from app.enums import LoanStage, Role
 from app.models.application_profile import (
@@ -40,7 +40,7 @@ from app.models.client import Client
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
-from app.routers.buckets import _hash_passcode, _verify_passcode
+from app.routers.buckets import _verify_passcode
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
     ApplicationBankConsentGrant,
@@ -969,7 +969,9 @@ async def rotate_application_room_pin(
     if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may rotate the room PIN")
     link = await _profile_room_link(db, profile)
-    link.passcode_hash = _hash_passcode(payload.secure_room_pin)
+    # One writer keeps the hash and the recoverable copy in step; assigning the
+    # hash alone left staff reading a PIN that no longer opens the room.
+    client_room._store_passcode(link, payload.secure_room_pin)
     await profiles.log_profile_action(
         db,
         profile,
