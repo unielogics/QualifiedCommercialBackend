@@ -135,6 +135,8 @@ class BookingSettings(TimestampMixin, Base):
     )
     start_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     end_time: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
+    #: Watched before the call, carried into the pre-call messages by {video}.
+    precall_video_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     logo_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     profile_photo_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
 

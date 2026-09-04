@@ -151,10 +151,16 @@ DEFAULT_STEPS: dict[str, dict] = {
     },
 }
 
+#: The short video every client should watch before the call. A host may set
+#: their own on their booking page; this is what {video} resolves to until they
+#: do, so the firm's video is live everywhere without a per-row backfill.
+DEFAULT_PRECALL_VIDEO_URL = "https://youtu.be/8-fOGmSBzPo"
+
 DEFAULT_MESSAGES: dict[str, str] = {
     # Appended to the confirmation email (and its ICS description).
     "precall_block": (
         "Before your call — about 10 minutes:\n"
+        "Watch this first, it explains what we do with what you connect: {video}\n"
         "1. Confirm who owns {business}.\n"
         "2. Connect the business bank account (read-only, through Plaid) — or upload statements.\n"
         "3. Authorize a soft credit check for each owner with 20% or more (no impact on your score).\n"
@@ -685,10 +691,17 @@ def step_config(booking: BookingSettings, key: str) -> dict:
     return base
 
 
+#: The settings UI stores the confirmation SMS under "sms"; this module asks for
+#: it as "confirmation_sms". Without the alias the host's own text was never read
+#: and the default always won.
+_CONFIRMATION_ALIASES = {"confirmation_sms": "sms"}
+
+
 def message_text(booking: BookingSettings, key: str) -> str:
     override = ((booking.precall_messages or {}).get(key) or "").strip()
     if not override and key in {"confirmation_sms", "pin_email_subject", "pin_email_body"}:
-        override = ((booking.confirmation_messages or {}).get(key) or "").strip()
+        confirmations = booking.confirmation_messages or {}
+        override = (confirmations.get(key) or confirmations.get(_CONFIRMATION_ALIASES.get(key, key)) or "").strip()
     return override or DEFAULT_MESSAGES[key]
 
 
@@ -906,6 +919,7 @@ def template_values(
             else ""
         ),
         "{stop_link}": stop_link,
+        "{video}": (booking.precall_video_url or DEFAULT_PRECALL_VIDEO_URL or "").strip(),
     }
 
 

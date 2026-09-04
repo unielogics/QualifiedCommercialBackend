@@ -30,6 +30,7 @@ PLACEHOLDERS: dict[str, str] = {
     "{missing}": "what is still needed before the call, e.g. 'connect your business bank and authorize a soft credit check'",
     "{done}": "how many of the three pre-call steps are done, e.g. '1 of 3'",
     "{precall}": "a ready-made 'still needed before your call' sentence, blank when nothing is needed",
+    "{video}": "the short video to watch before the call, blank when none is set",
 }
 
 #: Placeholders that may only appear in the two messages that deliver the PIN.

@@ -100,6 +100,8 @@ class UserBookingSettingsBase(BaseModel):
     missing_outcome_reminder_hours: int = Field(default=48, ge=1, le=720)
     start_time: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
     end_time: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
+    #: The short video the client watches before the call. Rendered by {video}.
+    precall_video_url: str | None = Field(default=None, max_length=500)
     logo_s3_key: str | None = None
     profile_photo_s3_key: str | None = None
 

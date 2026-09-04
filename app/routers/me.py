@@ -1607,3 +1607,356 @@ async def revoke_my_signature(
     await stored_sigs.revoke(db, subject_type="user", subject_id=user.id, user=user, reason="self")
     await db.commit()
     return _signature_state(None)
+
+
+# --- booking message templates: the placeholder contract, AI drafting, test sends ---
+
+#: What each authored message is for, so the drafter writes the right thing and
+#: the UI can label them consistently. The keys match the settings payload.
+BOOKING_TEMPLATE_KINDS: dict[str, dict[str, str]] = {
+    "confirmation_email": {
+        "label": "Booking confirmation email",
+        "goal": "Confirm the call is booked, say when it is, and get them into their secure room to prepare.",
+        "channel": "email",
+    },
+    "confirmation_sms": {
+        "label": "Booking confirmation text",
+        "goal": "Confirm the call in one or two short lines with the room link.",
+        "channel": "sms",
+    },
+    "pin_email": {
+        "label": "Room PIN email",
+        "goal": "Deliver the secure room PIN on its own, when the client has not consented to texts.",
+        "channel": "email",
+    },
+    "precall_block": {
+        "label": "Before your call block",
+        "goal": (
+            "The section appended to the confirmation email. Point them at the video, then at their secure "
+            "room to add owners, connect their bank through Plaid and authorize the soft credit check."
+        ),
+        "channel": "email",
+    },
+    "reminder_email": {
+        "label": "Reminder email",
+        "goal": "Remind them the call is coming and get anything still outstanding finished first.",
+        "channel": "email",
+    },
+    "reminder_sms": {
+        "label": "Reminder text",
+        "goal": "One short line: the call is coming, here is what is still needed, here is the link.",
+        "channel": "sms",
+    },
+    "nudge_1_email": {
+        "label": "First nudge email",
+        "goal": "Sent after booking. Nudge them to finish the pre-call steps while the call is still days away.",
+        "channel": "email",
+    },
+    "nudge_1_sms": {"label": "First nudge text", "goal": "A short nudge to finish the pre-call steps.", "channel": "sms"},
+    "nudge_2_email": {
+        "label": "Second nudge email",
+        "goal": "Sent close to the call. Last chance to finish the steps so the call is about real numbers.",
+        "channel": "email",
+    },
+    "nudge_2_sms": {"label": "Second nudge text", "goal": "A short last nudge before the call.", "channel": "sms"},
+}
+
+#: Never authorable: the transport appends these, and a drafted template that
+#: includes them would either duplicate the notice or fight the compliance copy.
+_DRAFTER_RULES = (
+    "Never write an opt-out line such as 'Reply STOP to opt out' — the sender appends it.\n"
+    "Never write an unsubscribe or 'why you got this' footer — the sender appends it.\n"
+    "Never invent a link, a phone number or an address. Use only the placeholders.\n"
+    "Never include the room PIN or the {pin} placeholder; the PIN travels separately.\n"
+)
+
+
+class BookingPlaceholderRead(BaseModel):
+    token: str
+    description: str
+    pin_only: bool = False
+
+
+class BookingPlaceholdersResponse(BaseModel):
+    placeholders: list[BookingPlaceholderRead]
+    #: The two message keys where {pin} is accepted.
+    pin_allowed_in: list[str]
+    kinds: dict[str, dict[str, str]]
+
+
+@router.get("/booking-settings/placeholders", response_model=BookingPlaceholdersResponse)
+async def booking_template_placeholders(user: CurrentUser) -> BookingPlaceholdersResponse:
+    """The canonical placeholder list, so the settings UI stops keeping its own copies."""
+    from app.services import message_render
+
+    return BookingPlaceholdersResponse(
+        placeholders=[
+            BookingPlaceholderRead(token=token, description=desc, pin_only=token in message_render.PIN_ONLY)
+            for token, desc in message_render.PLACEHOLDERS.items()
+        ],
+        pin_allowed_in=["confirmation_messages.sms", "confirmation_messages.pin_email_body"],
+        kinds=BOOKING_TEMPLATE_KINDS,
+    )
+
+
+class BookingTemplateDraftRequest(BaseModel):
+    kind: str
+    #: What the host wants this one to say, in their own words. Optional.
+    instruction: str | None = Field(default=None, max_length=1000)
+    #: The current text, when they want it rewritten rather than written fresh.
+    current_subject: str | None = Field(default=None, max_length=300)
+    current_body: str | None = Field(default=None, max_length=4000)
+    tone: Literal["direct", "warm", "formal"] = "direct"
+
+
+class BookingTemplateDraftResponse(BaseModel):
+    kind: str
+    channel: str
+    subject: str | None = None
+    body: str
+    #: True when the model was unavailable and this is the deterministic fallback.
+    fallback: bool = False
+
+
+def _draft_fallback(kind: str, booking: BookingSettings) -> tuple[str | None, str]:
+    """What the drafter returns when the model is unavailable.
+
+    An outage must never leave the host staring at an error where copy should be,
+    so this returns the wording that is actually in force for that message today.
+    Only some messages have a stored default — the rest are assembled at send
+    time — so those get a short, honest starting point instead.
+    """
+    from app.dealer_os.services import precall
+
+    if kind.startswith("nudge_"):
+        step = precall.step_config(booking, kind.rsplit("_", 1)[0])
+        if kind.endswith("_sms"):
+            return None, str(step.get("sms") or "")
+        return str(step.get("email_subject") or ""), str(step.get("email_body") or "")
+    if kind == "precall_block":
+        return None, precall.message_text(booking, "precall_block")
+    if kind == "confirmation_sms":
+        return None, precall.message_text(booking, "confirmation_sms")
+    if kind == "pin_email":
+        return precall.message_text(booking, "pin_email_subject"), precall.message_text(booking, "pin_email_body")
+    if kind == "reminder_sms":
+        return None, "Qualified Commercial: your call with {rep} is {time}. {precall} {room_link}"
+    if kind == "reminder_email":
+        return "Reminder: your call with {rep} is {time}", (
+            "Hi {first},\n\nYour call with {rep} is {time}.\n\n{precall}\n\n"
+            "Open your secure room: {room_link}\n\nQualified Commercial"
+        )
+    return "Your call with {rep} is confirmed for {time}", (
+        "Hi {first},\n\nYour call with {rep} is confirmed for {time}.\n\n"
+        "Open your secure room: {room_link}\n\nQualified Commercial"
+    )
+
+
+@router.post("/booking-settings/draft-template", response_model=BookingTemplateDraftResponse)
+async def draft_booking_template(
+    payload: BookingTemplateDraftRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingTemplateDraftResponse:
+    """Draft one booking message for the host to edit. Writes nothing.
+
+    The host always edits and saves the result themselves — this endpoint never
+    touches their settings.
+    """
+    from app.services import message_render
+    from app.services.ai.bedrock_client import get_client, model_light
+    from app.services.ai.usage import tracked_messages_create
+
+    spec = BOOKING_TEMPLATE_KINDS.get(payload.kind)
+    if spec is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown template: {payload.kind}")
+    row = await _get_or_create_booking_settings(db, user)
+    channel = spec["channel"]
+    wants_subject = channel == "email" and payload.kind != "precall_block"
+
+    allowed = [t for t in message_render.PLACEHOLDERS if t not in message_render.PIN_ONLY]
+    from app.dealer_os.services.precall import DEFAULT_PRECALL_VIDEO_URL
+
+    video = (row.precall_video_url or DEFAULT_PRECALL_VIDEO_URL or "").strip()
+    system = (
+        "You write short, plain client messages for a commercial finance desk. "
+        "The reader is a business owner who has booked a call and needs to arrive prepared.\n\n"
+        f"Message: {spec['label']}.\nGoal: {spec['goal']}\n"
+        f"Channel: {channel}.\n"
+        f"Tone: {payload.tone}.\n\n"
+        f"Use only these placeholders, exactly as written: {', '.join(allowed)}\n"
+        f"{_DRAFTER_RULES}\n"
+        + (
+            "There is a video the client should watch before the call. Reference it with the {video} placeholder.\n"
+            if video
+            else "There is no video configured, so do not mention one.\n"
+        )
+        + (
+            "SMS: one or two sentences, under 320 characters, no line breaks, open with the firm name.\n"
+            if channel == "sms"
+            else "Email: short paragraphs and plain line breaks, no HTML, no markdown, no signature block.\n"
+        )
+        + (
+            "\nReturn JSON with keys \"subject\" and \"body\"."
+            if wants_subject
+            else "\nReturn JSON with a single key \"body\"."
+        )
+    )
+    asks = [f"Write the {spec['label']}."]
+    if payload.instruction:
+        asks.append(f"The host asks: {payload.instruction.strip()}")
+    if payload.current_body:
+        asks.append(f"Improve on the current text rather than ignoring it:\n{payload.current_body.strip()}")
+    if payload.current_subject:
+        asks.append(f"Current subject: {payload.current_subject.strip()}")
+
+    try:
+        resp = await tracked_messages_create(
+            db,
+            feature="booking_template",
+            client=get_client(),
+            model=model_light(),
+            user_id=user.id,
+            metadata={"kind": payload.kind, "channel": channel},
+            max_tokens=900,
+            system=system,
+            messages=[{"role": "user", "content": "\n\n".join(asks)}],
+        )
+        import json as _json
+
+        text = ""
+        for block in getattr(resp, "content", []) or []:
+            text += getattr(block, "text", "") or ""
+        parsed: dict[str, object] = {}
+        cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        if cleaned.startswith("{"):
+            try:
+                parsed = _json.loads(cleaned)
+            except ValueError:
+                parsed = {}
+        body = str(parsed.get("body") or "").strip() or cleaned
+        subject = str(parsed.get("subject") or "").strip() if wants_subject else None
+        if not body:
+            raise ValueError("empty draft")
+    except Exception:  # noqa: BLE001 — an outage returns the shipped default, never an error
+        log.exception("booking template draft failed kind=%s", payload.kind)
+        subject, body = _draft_fallback(payload.kind, row)
+        return BookingTemplateDraftResponse(
+            kind=payload.kind, channel=channel, subject=subject if wants_subject else None, body=body, fallback=True
+        )
+
+    # The model is told not to write the opt-out line; strip it if it did anyway,
+    # because the transport appends its own and two would look broken.
+    if channel == "sms":
+        body = body.replace(message_render.STOP_NOTICE, "").strip()
+        body = " ".join(body.split())
+    for token in message_render.PIN_ONLY:
+        body = body.replace(token, "")
+        if subject:
+            subject = subject.replace(token, "")
+    return BookingTemplateDraftResponse(
+        kind=payload.kind, channel=channel, subject=subject or None, body=body.strip()
+    )
+
+
+class BookingTestSendRequest(BaseModel):
+    channel: Literal["email", "sms"]
+    subject: str | None = Field(default=None, max_length=300)
+    body: str = Field(min_length=1, max_length=4000)
+    #: Defaults to the signed-in user's own address or phone.
+    to: str | None = Field(default=None, max_length=320)
+
+
+class BookingTestSendResponse(BaseModel):
+    ok: bool
+    to: str
+    detail: str = ""
+    #: What the client would actually receive, after placeholders and the notice.
+    rendered: str = ""
+
+
+#: Stand-in values so a test send reads like a real message.
+_TEST_VALUES = {
+    "{name}": "Jordan Reyes",
+    "{first}": "Jordan",
+    "{business}": "Reyes Auto Group",
+    "{date}": "Tuesday, September 9",
+    "{time}": "Tuesday, September 9 at 10:00 AM EDT",
+    "{join_link}": "https://meet.example.com/sample",
+    "{missing}": "connect your business bank and authorize a soft credit check",
+    "{done}": "1 of 3",
+    "{pin}": "",
+}
+
+
+@router.post("/booking-settings/test-send", response_model=BookingTestSendResponse)
+async def test_send_booking_message(
+    payload: BookingTestSendRequest,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingTestSendResponse:
+    """Send one drafted message to the host so they can see what it looks like.
+
+    This is a message to the operator about their own settings, not a client
+    message: it goes to their own address or phone unless they name another, and
+    it is rendered with stand-in values and labelled as a test.
+    """
+    from app.dealer_os.services import precall as precall_defaults
+    from app.services import message_render
+    from app.services.email.ses_client import send_email
+
+    row = await _get_or_create_booking_settings(db, user)
+    values = {
+        **_TEST_VALUES,
+        "{rep}": (user.name or "").strip() or "Qualified Commercial",
+        "{room_link}": "https://app.qualifiedcommercial.com/buckets/request/sample-token",
+        # The same effective value a real send would use, so the test shows
+        # what the client actually gets rather than a blank line.
+        "{video}": (row.precall_video_url or precall_defaults.DEFAULT_PRECALL_VIDEO_URL or "").strip(),
+        "{precall}": "You still need to connect your business bank and authorize a soft credit check.",
+        "{stop_link}": "",
+    }
+
+    if payload.channel == "email":
+        to = (payload.to or user.email or "").strip()
+        if not to:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No address to send the test to")
+        body = message_render.render_lines(payload.body, values)
+        subject = message_render.render(payload.subject or "Test — booking message", values)
+        result = send_email(
+            to_email=to,
+            subject=f"[Test] {subject}",
+            body_text=f"{body}\n\n---\nThis is a test of a booking message, sent to you from your settings.",
+        )
+        ok, detail = result.ok, (result.detail or "")
+    else:
+        to = (payload.to or "").strip()
+        if not to:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter the mobile number to send the test to")
+        from app.services import sms as sms_service
+
+        if not sms_service.sms_available():
+            return BookingTestSendResponse(
+                ok=False, to=to, detail=sms_service.unavailable_reason() or "Texting is not available right now",
+                rendered=message_render.with_stop_notice(message_render.render(payload.body, values)),
+            )
+        body = message_render.with_stop_notice(message_render.render(payload.body, values))
+        # No consent gate: this is the operator's own test, not a client message.
+        # The suppression list still applies — an opted-out number stays opted out.
+        result = await sms_service.send_sms_checked(
+            db, to_phone=to, body=f"[Test] {body}", require_consent_kind=None, context="booking_template_test"
+        )
+        ok, detail = result.ok, (result.detail or "")
+        body = f"[Test] {body}"
+
+    db.add(
+        Activity(
+            actor_id=user.id,
+            actor_label="operator",
+            kind="booking.template_test_sent",
+            summary=f"Sent a test {payload.channel} for a booking message to {to}",
+        )
+    )
+    await db.commit()
+    return BookingTestSendResponse(ok=ok, to=to, detail=detail, rendered=body)
