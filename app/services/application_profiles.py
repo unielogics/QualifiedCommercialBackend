@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dealer_os.deps import resolve_dealer_scope
@@ -350,6 +351,112 @@ def _split_name(name: str) -> tuple[str, str]:
     return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
 
 
+async def provision_profile_for_intake(
+    db: AsyncSession, intake: PublicUnderwritingIntake
+) -> ApplicationProfile:
+    """The application profile for an AI-intake file, created if missing.
+
+    Split out of resolve_profile so it can run without a staff actor: an intake
+    always carries its own bucket, so none of the branches that need a `user`
+    apply. The profile is what turns the client's secure room from an empty
+    shell into one with banking and agreements — _public_application_room looks
+    the profile up by the link's bucket, and 404s the room without it.
+
+    Idempotent: uq_application_profiles_intake makes the double-tap a race we
+    lose politely rather than a duplicate.
+    """
+    profile = (
+        await db.execute(select(ApplicationProfile).where(ApplicationProfile.intake_id == intake.id))
+    ).scalar_one_or_none()
+    if profile is not None:
+        return profile
+
+    # A file handed over from Capital OS already has a profile under its dealer.
+    dealer = (
+        await db.execute(select(DealerBusiness).where(DealerBusiness.handoff_intake_id == intake.id))
+    ).scalar_one_or_none()
+    if dealer is not None:
+        profile = (
+            await db.execute(select(ApplicationProfile).where(ApplicationProfile.dealer_id == dealer.id))
+        ).scalar_one_or_none()
+        if profile is not None:
+            if profile.intake_id is None:
+                profile.intake_id = intake.id
+                await db.flush()
+            return profile
+
+    profile = ApplicationProfile(
+        intake_id=intake.id,
+        client_id=intake.client_id,
+        primary_bucket_id=intake.bucket_id,
+        vertical=_vertical_for_intake(intake),
+        funding_category=intake.loan_purpose,
+        industry=((intake.intake_state or {}).get("main_street_details") or {}).get("industry"),
+    )
+    db.add(profile)
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Two taps landed together; the other one won.
+        await db.rollback()
+        existing = (
+            await db.execute(select(ApplicationProfile).where(ApplicationProfile.intake_id == intake.id))
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return existing
+
+    await _seed_primary_owner(db, profile, intake=intake)
+    await db.flush()
+    return profile
+
+
+async def _seed_primary_owner(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    intake: PublicUnderwritingIntake | None = None,
+) -> None:
+    """One owner at 100%, flagged for review, so the file has somebody on it.
+
+    The credit flow needs an owner row to authorize against; this is a starting
+    point the client corrects, not an assertion that they own all of it.
+    """
+    if profile.dealer_id is not None:
+        return
+    count = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(ApplicationOwner).where(
+                    ApplicationOwner.profile_id == profile.id
+                )
+            )
+        ).scalar_one()
+    )
+    if count:
+        return
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    if intake is None and profile.intake_id:
+        intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+    name = (intake.full_name if intake else None) or (client.name if client else "")
+    if not name:
+        return
+    first, last = _split_name(name)
+    db.add(
+        ApplicationOwner(
+            profile_id=profile.id,
+            first_name=first or "Owner",
+            last_name=last or "Unknown",
+            email=normalized_email((intake.email if intake else None) or (client.email if client else None)),
+            phone=(intake.phone if intake else None) or (client.phone if client else None),
+            ownership_pct=Decimal("100.00"),
+            is_primary=True,
+            backfill_needs_review=True,
+        )
+    )
+    profile.backfill_needs_review = True
+
+
 async def resolve_profile(
     db: AsyncSession, source_kind: str, source_id: UUID, user: User
 ) -> ApplicationProfile:
@@ -482,35 +589,7 @@ async def resolve_profile(
         if isinstance(source, DealerBusiness):
             source.bucket_id = bucket.id
 
-    if profile.dealer_id is None:
-        count = int(
-            (
-                await db.execute(
-                    select(func.count()).select_from(ApplicationOwner).where(
-                        ApplicationOwner.profile_id == profile.id
-                    )
-                )
-            ).scalar_one()
-        )
-        if count == 0:
-            client = await db.get(Client, profile.client_id) if profile.client_id else None
-            intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-            name = (intake.full_name if intake else None) or (client.name if client else "")
-            if name:
-                first, last = _split_name(name)
-                db.add(
-                    ApplicationOwner(
-                        profile_id=profile.id,
-                        first_name=first or "Owner",
-                        last_name=last or "Unknown",
-                        email=normalized_email((intake.email if intake else None) or (client.email if client else None)),
-                        phone=(intake.phone if intake else None) or (client.phone if client else None),
-                        ownership_pct=Decimal("100.00"),
-                        is_primary=True,
-                        backfill_needs_review=True,
-                    )
-                )
-                profile.backfill_needs_review = True
+    await _seed_primary_owner(db, profile)
     if profile.dealer_id is not None:
         dealer = source if isinstance(source, DealerBusiness) else await db.get(
             DealerBusiness, profile.dealer_id

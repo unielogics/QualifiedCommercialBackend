@@ -87,6 +87,7 @@ from app.schemas.bucket import (
 )
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
+from app.services import application_profiles as profiles_service
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
@@ -248,6 +249,11 @@ _START_MIN_INTERVAL_SECONDS = 15.0
 _START_LAST_BY_IP: dict[str, float] = {}
 _REVIEW_MIN_INTERVAL_SECONDS = 45.0
 _REVIEW_LAST_BY_TOKEN: dict[str, float] = {}
+
+#: Handing a client into their room provisions a profile and reads the room PIN,
+#: so it is cheap but not free, and there is no reason to tap it in a loop.
+_ROOM_HANDOFF_MIN_INTERVAL_SECONDS = 3.0
+_ROOM_HANDOFF_LAST_BY_TOKEN: dict[str, float] = {}
 # Admin-initiated re-run cooldown, keyed by intake id. Each re-run is a heavy
 # Bedrock pass over up to 8 files; a short cooldown blocks accidental repeats.
 _ADMIN_REVIEW_MIN_INTERVAL_SECONDS = 60.0
@@ -1023,6 +1029,76 @@ class DealerIntakeRead(ORMModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+
+
+class SecureRoomHandoffResponse(BaseModel):
+    """Everything the browser needs to walk the client into their room.
+
+    The code is returned once, to a caller that already proved it holds this
+    intake, and is never emailed, logged or stored anywhere by this response.
+    """
+
+    room_url: str
+    #: None when the client set their own PIN — theirs to remember, not ours to resend.
+    room_code: str | None = None
+    #: recovered | minted | client_chosen
+    code_source: str
+    tab: str = "todo"
+
+
+async def _secure_room_handoff(
+    db: AsyncSession, intake: PublicUnderwritingIntake, request: Request, *, tab: str
+) -> SecureRoomHandoffResponse:
+    """Hand a client from their intake into their secure room.
+
+    The intake and the room are already the same bucket and the same link, so
+    nothing is created here except the application profile the room needs to
+    show banking and agreements at all. The room PIN is recovered rather than
+    rotated: rotating would break a link staff emailed with the code read out
+    separately, and would lock out a client who bookmarked the room.
+
+    The client is already verified on this intake — by the token they hold or an
+    emailed code — so handing them the room credential is not a widening of what
+    they can reach. It is the same file, with actions attached.
+    """
+    _throttle_or_429(
+        _ROOM_HANDOFF_LAST_BY_TOKEN,
+        str(intake.id),
+        _ROOM_HANDOFF_MIN_INTERVAL_SECONDS,
+        "One moment — your secure room is opening.",
+    )
+    link = intake.bucket_upload_link
+    if link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This file has no secure room yet")
+
+    await profiles_service.provision_profile_for_intake(db, intake)
+
+    if link.passcode_set_by_client_at is not None:
+        code, source = None, "client_chosen"
+    else:
+        code = client_room.read_passcode(link)
+        source = "recovered"
+        if code is None:
+            code = _generate_passcode()
+            client_room._store_passcode(link, code)
+            source = "minted"
+
+    await _log(
+        db,
+        intake.bucket_id,
+        "secure_room_handoff",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="upload_link",
+        target_id=str(link.id),
+        detail=f"Client opened their secure room from the intake · code {source}",
+    )
+    await db.commit()
+    return SecureRoomHandoffResponse(
+        room_url=client_room.room_url(link.token), room_code=code, code_source=source, tab=tab
+    )
 
 
 class DealerIntakeResponse(BaseModel):
@@ -9332,6 +9408,17 @@ async def run_dealer_review(
     return await _response(db, intake, token=token)
 
 
+@router.post("/{token}/secure-room", response_model=SecureRoomHandoffResponse)
+async def router_secure_room(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> SecureRoomHandoffResponse:
+    """Open this file's secure room, where the bank connection and the
+    agreements live. The client is already verified on this intake."""
+    intake = await _load_public_intake(db, token)
+    return await _secure_room_handoff(db, intake, request, tab="todo")
+
 @router.post("/{token}/book-call", response_model=DealerIntakeResponse)
 async def book_dealer_call(
     token: str,
@@ -10007,6 +10094,17 @@ async def run_funding_review(
     intake = await _load_public_intake(db, token)
     return await _response(db, intake, token=token, public_path=FUNDING_PUBLIC_PATH)
 
+
+@funding_router.post("/{token}/secure-room", response_model=SecureRoomHandoffResponse)
+async def funding_router_secure_room(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> SecureRoomHandoffResponse:
+    """Open this file's secure room, where the bank connection and the
+    agreements live. The client is already verified on this intake."""
+    intake = await _load_public_intake(db, token)
+    return await _secure_room_handoff(db, intake, request, tab="todo")
 
 @funding_router.post("/{token}/book-call", response_model=DealerIntakeResponse)
 async def book_funding_review_call(
@@ -11002,6 +11100,17 @@ async def run_mca_refinance_review(
     intake = await _load_public_intake(db, token)
     return await _response(db, intake, token=token, public_path=MCA_PUBLIC_PATH)
 
+
+@mca_router.post("/{token}/secure-room", response_model=SecureRoomHandoffResponse)
+async def mca_router_secure_room(
+    token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> SecureRoomHandoffResponse:
+    """Open this file's secure room, where the bank connection and the
+    agreements live. The client is already verified on this intake."""
+    intake = await _load_public_intake(db, token)
+    return await _secure_room_handoff(db, intake, request, tab="todo")
 
 @mca_router.post("/{token}/book-call", response_model=DealerIntakeResponse)
 async def book_mca_refinance_call(

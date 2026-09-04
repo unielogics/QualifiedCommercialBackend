@@ -1,0 +1,181 @@
+"""Walking an AI-intake client into their own secure room.
+
+The intake and the room have always been the same bucket and the same link, but
+the client had no way across: the room URL was returned on every intake response
+and rendered nowhere, and for a self-serve intake the room PIN was generated and
+thrown away, so nobody could enter. Even with a PIN the room showed empty
+banking and agreements tabs, because those are keyed on an application profile
+that only a staff member could create.
+
+This is the one tap that closes all three, and the rules it has to keep: recover
+the code rather than rotate it, never hand back a code the client chose
+themselves, and provision the profile that makes the room worth opening.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+
+
+def _link(**over):
+    row = SimpleNamespace(
+        id=uuid4(), token="room-token", passcode_set_by_client_at=None,
+        passcode_hash=None, encrypted_passcode=None, passcode_encryption_provider=None,
+    )
+    for k, v in over.items():
+        setattr(row, k, v)
+    return row
+
+
+def _intake(link=None):
+    return SimpleNamespace(
+        id=uuid4(), bucket_id=uuid4(), full_name="Loyd Bradley", email="loyd@example.com",
+        bucket_upload_link=link if link is not None else _link(),
+    )
+
+
+def _db():
+    return SimpleNamespace(commit=AsyncMock(), flush=AsyncMock(), add=lambda _row: None)
+
+
+async def _handoff(intake, *, db=None, read=None, provision=None):
+    from app.routers.dealer_ai_intake import _ROOM_HANDOFF_LAST_BY_TOKEN, _secure_room_handoff
+
+    _ROOM_HANDOFF_LAST_BY_TOKEN.clear()
+    with patch("app.routers.dealer_ai_intake.profiles_service.provision_profile_for_intake",
+               new=provision or AsyncMock()), \
+         patch("app.routers.dealer_ai_intake.client_room.read_passcode", return_value=read), \
+         patch("app.routers.dealer_ai_intake.client_room.room_url",
+               side_effect=lambda t: f"https://app.example.com/buckets/request/{t}"), \
+         patch("app.routers.dealer_ai_intake._log", new=AsyncMock()):
+        return await _secure_room_handoff(db or _db(), intake, SimpleNamespace(), tab="todo")
+
+
+# --- the code -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_existing_room_code_is_recovered_not_rotated():
+    # Rotating would break a link staff emailed with the code read out
+    # separately, and lock out a client who bookmarked the room.
+    out = await _handoff(_intake(), read="104293")
+
+    assert out.room_code == "104293"
+    assert out.code_source == "recovered"
+    assert out.room_url.endswith("/buckets/request/room-token")
+
+
+@pytest.mark.asyncio
+async def test_the_same_code_comes_back_on_a_second_tap():
+    intake = _intake()
+    first = await _handoff(intake, read="104293")
+    second = await _handoff(intake, read="104293")
+
+    assert first.room_code == second.room_code
+
+
+@pytest.mark.asyncio
+async def test_a_room_whose_code_was_discarded_gets_one_minted_and_stored():
+    # Every self-serve intake before the single-writer fix is in this state.
+    link = _link()
+    stored: dict[str, str] = {}
+    from app.routers.dealer_ai_intake import _ROOM_HANDOFF_LAST_BY_TOKEN, _secure_room_handoff
+
+    _ROOM_HANDOFF_LAST_BY_TOKEN.clear()
+    with patch("app.routers.dealer_ai_intake.profiles_service.provision_profile_for_intake", new=AsyncMock()), \
+         patch("app.routers.dealer_ai_intake.client_room.read_passcode", return_value=None), \
+         patch("app.routers.dealer_ai_intake.client_room._store_passcode",
+               side_effect=lambda _l, code: stored.update(code=code)), \
+         patch("app.routers.dealer_ai_intake.client_room.room_url", side_effect=lambda t: t), \
+         patch("app.routers.dealer_ai_intake._log", new=AsyncMock()):
+        out = await _secure_room_handoff(_db(), _intake(link), SimpleNamespace(), tab="todo")
+
+    assert out.code_source == "minted"
+    assert out.room_code == stored["code"]
+    assert len(out.room_code) == 6 and out.room_code.isdigit()
+
+
+@pytest.mark.asyncio
+async def test_a_code_the_client_chose_is_never_handed_back():
+    # Theirs to remember. Returning it would re-expose a secret they set, and
+    # they may well have reused it elsewhere.
+    from datetime import UTC, datetime
+
+    out = await _handoff(_intake(_link(passcode_set_by_client_at=datetime.now(UTC))), read="104293")
+
+    assert out.room_code is None
+    assert out.code_source == "client_chosen"
+    assert out.room_url  # they can still reach the room and type their own code
+
+
+# --- the room is worth opening -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_profile_the_room_needs_is_provisioned_on_the_way_through():
+    # Without it, _public_application_room 404s and the client lands on empty
+    # banking and agreements tabs.
+    provision = AsyncMock()
+    intake = _intake()
+    await _handoff(intake, read="104293", provision=provision)
+
+    provision.assert_awaited_once()
+    assert provision.await_args.args[1] is intake
+
+
+@pytest.mark.asyncio
+async def test_a_file_with_no_room_says_so_rather_than_half_working():
+    from fastapi import HTTPException
+
+    intake = _intake()
+    intake.bucket_upload_link = None
+    with pytest.raises(HTTPException) as err:
+        await _handoff(intake)
+    assert err.value.status_code == 409
+
+
+# --- not a loop ----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tapping_twice_in_a_row_is_throttled():
+    from fastapi import HTTPException
+
+    from app.routers.dealer_ai_intake import _ROOM_HANDOFF_LAST_BY_TOKEN, _secure_room_handoff
+
+    intake = _intake()
+    _ROOM_HANDOFF_LAST_BY_TOKEN.clear()
+    with patch("app.routers.dealer_ai_intake.profiles_service.provision_profile_for_intake", new=AsyncMock()), \
+         patch("app.routers.dealer_ai_intake.client_room.read_passcode", return_value="104293"), \
+         patch("app.routers.dealer_ai_intake.client_room.room_url", side_effect=lambda t: t), \
+         patch("app.routers.dealer_ai_intake._log", new=AsyncMock()):
+        await _secure_room_handoff(_db(), intake, SimpleNamespace(), tab="todo")
+        with pytest.raises(HTTPException) as err:
+            await _secure_room_handoff(_db(), intake, SimpleNamespace(), tab="todo")
+    assert err.value.status_code == 429
+
+
+# --- the routes ----------------------------------------------------------------
+
+
+def test_every_intake_room_can_be_opened():
+    # Asserted against the routers rather than app.main: nothing in this suite
+    # imports the app, and a sibling test stubbing a service breaks it if you do.
+    from app.routers.dealer_ai_intake import funding_router, mca_router, router
+
+    for name, api in (("dealer", router), ("funding", funding_router), ("mca", mca_router)):
+        paths = {r.path for r in api.routes}
+        assert any(p.endswith("/{token}/secure-room") for p in paths), name
+
+
+def test_the_handoff_is_a_post_so_a_code_never_lands_in_a_url_someone_shares():
+    from app.routers.dealer_ai_intake import funding_router, mca_router, router
+
+    for api in (router, funding_router, mca_router):
+        for route in api.routes:
+            if route.path.endswith("/{token}/secure-room"):
+                assert route.methods == {"POST"}
