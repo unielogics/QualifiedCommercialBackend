@@ -182,6 +182,23 @@ class BucketFile(TimestampMixin, Base):
     __tablename__ = "bucket_files"
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    #: How this document got here, decided by the route rather than the request
+    #: body. See services/provenance.py. Null on rows written before the trail
+    #: existed, which reads as "not recorded".
+    source_kind: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    source_detail: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    #: Set whenever a signed-in user of ours put it here. uploaded_by_name is a
+    #: display string the client's own browser can supply; this one cannot be.
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    @property
+    def source_label(self) -> str:
+        """One readable line for the operator. Serialised on the file reads."""
+        from app.services import provenance
+
+        return provenance.describe_document(self)
     bucket_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False, index=True
     )

@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -19,6 +20,15 @@ if TYPE_CHECKING:
 
 class PublicUnderwritingIntake(TimestampMixin, Base):
     __tablename__ = "public_underwriting_intakes"
+
+    #: How this file was started: a public form, someone internal, a rep, a
+    #: partner, a booking. Decided by the route. See services/provenance.py.
+    source_kind: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    source_detail: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_actor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     client_id: Mapped[uuid.UUID | None] = mapped_column(

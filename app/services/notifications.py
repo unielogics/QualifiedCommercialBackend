@@ -18,6 +18,7 @@ from app.models.event import CalendarEvent
 from app.models.loan import Loan
 from app.models.notification import Notification
 from app.models.user import User
+from app.services import provenance
 from app.services.email.ses_client import send_email
 from app.services.push import fire_and_forget_push
 
@@ -288,11 +289,23 @@ async def notify_bucket_file_uploaded(
         category="buckets",
         priority="high",
         title=f"New bucket upload: {bucket.name}",
-        body=f"{{count}} file(s) uploaded to {bucket.name}. Latest: {file.file_name}.",
+        # The team could not tell a client's own upload from one the desk made on
+        # their behalf: this email was identical either way.
+        body=(
+            f"{{count}} file(s) uploaded to {bucket.name}. Latest: {file.file_name}."
+            f"\nSource: {provenance.describe_document(file)}."
+        ),
         target_type="bucket",
         target_id=str(bucket.id),
         deep_link=f"/admin/buckets?bucket={bucket.id}",
-        meta={"bucket_id": str(bucket.id), "file_id": str(file.id), "file_name": file.file_name, "count": 1},
+        meta={
+            "bucket_id": str(bucket.id),
+            "file_id": str(file.id),
+            "file_name": file.file_name,
+            "count": 1,
+            "source_kind": file.source_kind,
+            "source_label": provenance.describe_document(file),
+        },
         batch_key=f"bucket_upload:{bucket.id}",
         email=True,
         push=True,

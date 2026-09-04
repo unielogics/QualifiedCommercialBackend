@@ -554,6 +554,11 @@ async def create_draft_for_booking(
             application_lifecycle="draft",
             status="draft",
             draft_source="booking",
+            # The booking's own origin (field desk, calendar, public, intake)
+            # lived only on the appointment row; the file it opened could not
+            # say where it came from.
+            source_kind="booking",
+            source_detail=f"Booking · {getattr(appointment, 'origin', '') or 'unknown origin'}"[:200],
             owner_user_id=owner_user_id,
             case_ref=await next_case_ref(db),
         )

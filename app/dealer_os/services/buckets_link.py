@@ -131,13 +131,20 @@ async def push_document(
         if linked is not None and linked.deleted_at is None and linked.bucket_id == bucket.id:
             return linked
         doc.bucket_file_id = None
+    # The mirror used to stamp every document "Capital OS", which erased the
+    # field rep or team member who actually uploaded it — and dos_documents had
+    # nowhere to keep them either. Carry whatever the source row now knows, and
+    # fall back to naming the system rather than pretending it was a person.
     bucket_file = BucketFile(
         bucket_id=bucket.id,
         file_name=doc.filename[:255],
         s3_key=doc.s3_key,
         content_type=(doc.content_type or "application/octet-stream")[:160],
         size_bytes=int(raw_size),
-        uploaded_by_name=_UPLOADED_BY,
+        uploaded_by_name=(doc.uploaded_by_name or _UPLOADED_BY)[:180],
+        uploaded_by_user_id=doc.uploaded_by_user_id,
+        source_kind=doc.source_kind or "capital_os",
+        source_detail=(doc.source_detail or _UPLOADED_BY)[:200],
     )
     db.add(bucket_file)
     await db.flush()

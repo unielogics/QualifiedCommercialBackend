@@ -54,7 +54,7 @@ from app.models.notification import Notification
 from app.services import application_profiles as application_profile_service
 from app.services import calendar_v2
 from app.services.activity_log import log_activity
-from app.services import booking_notify, booking_reminders
+from app.services import booking_notify, booking_reminders, provenance
 from app.services.notifications import notify_inbound_communication, notify_users
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle, plaid_policy
@@ -2807,7 +2807,14 @@ async def create_dealer(
     fields.update({key: value for key, value in taxonomy.items() if key != "taxonomy_status"})
     if fields.get("is_training"):
         fields["workflow_ungated"] = True
-    dealer = DealerBusiness(**fields, owner_user_id=user.id, case_ref=await _next_case_ref(db))
+    dealer = DealerBusiness(
+        **fields,
+        owner_user_id=user.id,
+        case_ref=await _next_case_ref(db),
+        source_kind="field_rep" if str(user.role) == "field_rep" else "internal_user",
+        source_actor_name=(user.name or user.email or "")[:200],
+        source_user_id=user.id,
+    )
     db.add(dealer)
     await db.flush()
     await _record_sms_consent(db, dealer, payload.sms_consent, user, request)
@@ -4754,6 +4761,9 @@ async def _ingest_zip_upload(
         kind="archive",
         status="extracted",
         detected_kind="archive",
+        uploaded_by_name=(user.name or user.email or "")[:200],
+        uploaded_by_user_id=user.id,
+        source_kind=provenance.document_source_for(user),
         extracted={
             "entries": [info.filename for info, _ in entries],
             "skipped": skipped,
@@ -4778,6 +4788,10 @@ async def _ingest_zip_upload(
             kind=kind if kind != "archive" else "other",
             status="pending_review" if is_dealer else "uploaded",
             parent_document_id=parent.id,
+            uploaded_by_name=(user.name or user.email or "")[:200],
+            uploaded_by_user_id=user.id,
+            source_kind="zip_extract",
+            source_detail=f"From {filename}"[:200],
         )
         db.add(child)
         children.append((child, entry_raw))
@@ -4911,6 +4925,9 @@ async def upload_document(
         s3_key=s3_key,
         kind=kind,
         status="pending_review" if is_dealer else "uploaded",
+        uploaded_by_name=(user.name or user.email or "")[:200],
+        uploaded_by_user_id=user.id,
+        source_kind=provenance.document_source_for(user),
     )
     db.add(doc)
     await db.flush()
@@ -5885,6 +5902,12 @@ async def _ingest_bucket_file_core(
         kind=buckets_link.guess_document_kind(bucket_file.file_name),
         status="uploaded",
         bucket_file_id=bucket_file.id,
+        # Mirrored the other way: keep whatever the bucket row already knows
+        # rather than restamping it as a Capital OS document.
+        uploaded_by_name=(bucket_file.uploaded_by_name or "")[:200] or None,
+        uploaded_by_user_id=bucket_file.uploaded_by_user_id,
+        source_kind=bucket_file.source_kind or "capital_os",
+        source_detail=(bucket_file.source_detail or "")[:200] or None,
     )
     db.add(doc)
     await db.flush()
@@ -10972,6 +10995,10 @@ async def _convert_appointment_to_field_desk(
         notes="\n\n".join(part for part in [appt.notes, "Created from converted appointment."] if part),
         application_lifecycle="draft",
         owner_user_id=owner_id,
+        source_kind="booking",
+        source_detail=f"Converted appointment · {appt.origin or 'unknown origin'}"[:200],
+        source_actor_name=(user.name or user.email or "")[:200] if user is not None else None,
+        source_user_id=user.id if user is not None else None,
         case_ref=await _next_case_ref(db),
     )
     db.add(dealer)

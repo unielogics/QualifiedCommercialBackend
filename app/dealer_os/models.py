@@ -42,6 +42,14 @@ class DealerBusiness(TimestampMixin, Base):
     """The durable monitored business — distinct from intake leads and Clients."""
 
     __tablename__ = "dos_dealers"
+
+    #: How this file was started, decided by the route. See services/provenance.py.
+    source_kind: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    source_detail: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_actor_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     __table_args__ = (
         CheckConstraint(
             "plaid_assets_enabled OR plaid_statements_enabled",
@@ -809,6 +817,15 @@ class DealerDocument(TimestampMixin, Base):
     rebuild_periods / recompute_snapshot pipeline as every other source."""
 
     __tablename__ = "dos_documents"
+
+    #: Who put this here and how. Before these columns a field rep's upload
+    #: reached the lead file as "Capital OS" with the rep unrecoverable.
+    source_kind: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    source_detail: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    uploaded_by_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     __table_args__ = (Index("ix_dos_documents_dealer_created", "dealer_id", "created_at"),)
 
     id: Mapped[uuid.UUID] = _pk()

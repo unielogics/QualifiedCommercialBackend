@@ -182,6 +182,11 @@ class BucketRequestUploadedFileRead(ORMModel):
     size_bytes: int
     uploaded_by_name: str | None
     uploaded_by_email: str | None
+    #: How this document got here. Null on rows written before the trail existed.
+    source_kind: str | None = None
+    source_detail: str | None = None
+    #: One readable line for the operator, e.g. "Uploaded by a field rep · Dana Ruiz".
+    source_label: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -241,6 +246,10 @@ class BucketFileRead(ORMModel):
     size_bytes: int
     uploaded_by_name: str | None
     uploaded_by_email: str | None
+    uploaded_by_user_id: UUID | None = None
+    source_kind: str | None = None
+    source_detail: str | None = None
+    source_label: str | None = None
     status: str
     deleted_at: datetime | None = None
     deleted_by_user_id: UUID | None = None

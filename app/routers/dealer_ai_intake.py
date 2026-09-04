@@ -86,7 +86,7 @@ from app.schemas.bucket import (
     BucketRequestUploadedFileRead,
 )
 from app.schemas.common import ORMModel
-from app.services import booking_notify, booking_reminders
+from app.services import booking_notify, booking_reminders, provenance
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
@@ -4809,7 +4809,20 @@ async def _start_upload(
     *,
     actor_name: str,
     actor_email: str,
+    source_kind: str = "client_room",
+    actor: User | None = None,
+    source_detail: str = "",
 ) -> BucketFileUploadInitResponse:
+    """Start an upload into an intake's bucket.
+
+    Six routes with six different trust levels funnel through here — the public
+    room, the signed-in borrower, a field rep, a dealer partner, the desk. They
+    used to write an identical row, so nothing downstream could tell a client's
+    own upload from an operator's on their behalf, and every one of them logged
+    the action as the public lead. The caller now says which it is, and the
+    actor is the authenticated user rather than a display string the browser
+    supplied.
+    """
     req = None
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
@@ -4859,6 +4872,9 @@ async def _start_upload(
         size_bytes=payload.size_bytes,
         uploaded_by_name=actor_name,
         uploaded_by_email=actor_email,
+        uploaded_by_user_id=actor.id if actor is not None else None,
+        source_kind=source_kind,
+        source_detail=source_detail or None,
         status="uploading",
     )
     db.add(file)
@@ -4867,12 +4883,13 @@ async def _start_upload(
         intake.bucket_id,
         "dealer_ai_file_upload_started",
         request=request,
+        user=actor,
         actor_name=actor_name,
         actor_email=actor_email,
-        actor_role="public_lead",
+        actor_role=provenance.actor_role_for(source_kind),
         target_type="file",
         target_id=str(file.id),
-        detail=payload.file_name,
+        detail=f"{payload.file_name} · {provenance.DOCUMENT_SOURCES.get(source_kind, source_kind)}",
     )
     await db.commit()
     upload_url, headers = _upload_url(s3_key, payload.content_type)
@@ -5012,6 +5029,9 @@ async def _extract_zip_bucket_files(
                     size_bytes=len(data),
                     uploaded_by_name=actor_name,
                     uploaded_by_email=actor_email,
+                    uploaded_by_user_id=file.uploaded_by_user_id,
+                    source_kind="zip_extract",
+                    source_detail=f"From {file.file_name}"[:200],
                     status="uploaded",
                     parent_zip_file_id=file.id,
                     zip_entry_path=entry_path,
@@ -5031,7 +5051,7 @@ async def _extract_zip_bucket_files(
             request=request,
             actor_name=actor_name,
             actor_email=actor_email,
-            actor_role="public_lead",
+            actor_role=provenance.actor_role_for(file.source_kind or "client_room"),
             target_type="file",
             target_id=str(file.id),
             detail=f"Extracted {extracted} supported file(s) from {file.file_name}",
@@ -5076,10 +5096,12 @@ async def _complete_upload(
         request=request,
         actor_name=actor_name,
         actor_email=actor_email,
-        actor_role="public_lead",
+        # The row knows who really did it; the log used to claim the public lead
+        # for everyone, including the desk.
+        actor_role=provenance.actor_role_for(file.source_kind or "client_room"),
         target_type="file",
         target_id=str(file.id),
-        detail=file.file_name,
+        detail=f"{file.file_name} · {provenance.describe_document(file)}",
     )
     # Queue this file (and any files extracted from it as a zip) for background
     # analysis so the review composes from a warm per-file cache.
@@ -5471,6 +5493,8 @@ async def start_dealer_intake(
     token = _new_public_token()
     attribution = _public_intake_attribution(payload)
     intake = PublicUnderwritingIntake(
+        source_kind="public_form",
+        source_detail="Dealer intake form",
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -6889,6 +6913,9 @@ async def _create_admin_ai_lead_core(
         }
 
     intake = PublicUnderwritingIntake(
+        source_kind="internal_user",
+        source_actor_name=(user.name or user.email or "")[:200],
+        source_user_id=user.id,
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -7188,6 +7215,9 @@ async def create_broker_ai_lead(
     }
 
     intake = PublicUnderwritingIntake(
+        source_kind="dealer_partner",
+        source_actor_name=(user.name or user.email or "")[:200],
+        source_user_id=user.id,
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -7396,7 +7426,8 @@ async def broker_dealer_lead_upload_init(
 ) -> BucketFileUploadInitResponse:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
-    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email)
+    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Dealer partner", actor_email=user.email,
+                               source_kind="dealer_partner", actor=user)
 
 
 @broker_router.post("/{intake_id}/files/complete", response_model=BucketFileRead)
@@ -7630,6 +7661,10 @@ async def create_admin_ai_lead_from_bucket(
 
     token = _new_public_token()
     intake = PublicUnderwritingIntake(
+        source_kind="bucket_conversion",
+        source_actor_name=(user.name or user.email or "")[:200],
+        source_user_id=user.id,
+        source_detail=f"From document room {bucket.id}"[:200],
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id if link else None,
@@ -8498,7 +8533,8 @@ async def dealer_ai_lead_upload_init(
     runs zip extraction on complete, like the client path)."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email)
+    return await _start_upload(db, intake, payload, request, actor_name=user.name or "Super admin", actor_email=user.email,
+                               source_kind="internal_upload", actor=user)
 
 
 @admin_router.post("/{intake_id}/files/complete", response_model=BucketFileRead)
@@ -9179,7 +9215,8 @@ async def dealer_upload_init(
 ) -> BucketFileUploadInitResponse:
     intake = await _load_public_intake(db, token)
     _require_dealer_intake(intake)
-    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email,
+                               source_kind="client_room")
 
 
 @router.post("/{token}/files/complete", response_model=BucketFileRead)
@@ -9469,7 +9506,8 @@ async def my_dealer_upload_init(
     db: AsyncSession = Depends(get_db),
 ) -> BucketFileUploadInitResponse:
     intake = await _load_client_intake(db, user, intake_id)
-    return await _start_upload(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email)
+    return await _start_upload(db, intake, payload, request, actor_name=user.name or intake.full_name, actor_email=user.email,
+                               source_kind="client_room", actor=None)
 
 
 @client_router.post("/{intake_id}/files/complete", response_model=BucketFileRead)
@@ -9631,6 +9669,8 @@ async def start_funding_review(
         "estimated_credit_tier": payload.estimated_credit_tier,
     }
     intake = PublicUnderwritingIntake(
+        source_kind="public_form",
+        source_detail="Funding review form",
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -9908,7 +9948,8 @@ async def funding_review_upload_init(
 ) -> BucketFileUploadInitResponse:
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
-    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email,
+                               source_kind="client_room")
 
 
 @funding_router.post("/{token}/files/complete", response_model=BucketFileRead)
@@ -10464,6 +10505,8 @@ async def start_mca_refinance(
     if payload.payment_frequency in _MCA_REMITS_PER_MONTH:
         seeded["payment_frequency"] = payload.payment_frequency
     intake = PublicUnderwritingIntake(
+        source_kind="public_form",
+        source_detail="MCA refinance form",
         client_id=client.id,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -10693,7 +10736,8 @@ async def mca_refinance_upload_init(
 ) -> BucketFileUploadInitResponse:
     intake = await _load_public_intake(db, token)
     _require_mca_intake(intake)
-    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+    return await _start_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email,
+                               source_kind="client_room")
 
 
 @mca_router.post("/{token}/files/complete", response_model=BucketFileRead)

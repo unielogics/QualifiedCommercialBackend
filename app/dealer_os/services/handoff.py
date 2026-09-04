@@ -111,6 +111,12 @@ async def start_handoff(
         business_name=adapter.business_name,
         asset_rows=[],
         intake_state={"source": "dealer_os_handoff", "messages": []},
+        # The acting user used to survive only in dos_audit_log, so the funding
+        # file itself could not say who handed it over.
+        source_kind="capital_os_handoff",
+        source_actor_name=(user.name or user.email or "")[:200],
+        source_user_id=user.id,
+        source_detail=f"From Capital OS file {dealer.id}"[:200],
     )
     db.add(intake)
     await db.flush()

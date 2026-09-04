@@ -9,8 +9,9 @@ Revision ID: 0184_booking_precall_video
 Revises: 0183_client_thread_takeover
 """
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0184_booking_precall_video"
 down_revision = "0183_client_thread_takeover"
