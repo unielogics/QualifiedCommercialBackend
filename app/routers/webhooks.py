@@ -267,7 +267,13 @@ async def _store_inbound_sms(
         # silently dropped — bank statements and IDs among them — because the
         # poller only ever read the text preview. Bound to the ledger row, so it
         # is visible wherever that message is.
-        await _store_inbound_attachments(db, ledger_row_id=ledger_row.id, attachments=attachments or [])
+        # Only when the ledger row actually landed — record() returns None on a
+        # failed write, and an image with nothing to hang off is worse than no
+        # image. The rest of this handler already treats that as possible.
+        if ledger_row is not None:
+            await _store_inbound_attachments(
+                db, ledger_row_id=ledger_row.id, attachments=attachments or []
+            )
 
         recipient_ids = {contact.owner_user_id for contact in contacts if contact.owner_user_id}
         if ledger_client is not None:

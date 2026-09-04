@@ -39,6 +39,7 @@ SOURCE_LABELS: dict[str, str] = {
     "user": "Relationship manager (you)",
     "derived": "Derived",
     "sponsor": "Sponsor agreement",
+    "document_extraction": "Read from an uploaded document",
 }
 
 _ENTITY_ALIASES: dict[str, str] = {
@@ -143,20 +144,72 @@ class PrefillResult:
         self.provenance[key] = {"source": source, "label": SOURCE_LABELS.get(source, source), "confirmed": False}
 
 
-def _state_from_entity(entity: Any) -> str:
-    if isinstance(entity, dict):
-        for k in ("state_of_formation", "state", "formation_state"):
-            if entity.get(k):
-                return _text(entity[k])
-    return ""
+def file_identity(
+    dealer: DealerBusiness | None,
+    dap: DealerApplicationProfile | None,
+    profile: ApplicationProfile,
+    intake: PublicUnderwritingIntake | None,
+) -> dict[str, Any]:
+    """The dealer's formation particulars, as both agreements print them.
+
+    One definition: `build_prefill` fills the stage-one form from it and
+    `load_file_context` hands the same values to the PDF builders. They used to
+    read the same columns twice, which is why stage one asked for an EIN the
+    file had held all along.
+    """
+    return {
+        "legal_name": (dealer.legal_name if dealer else None) or (intake.business_name if intake else None),
+        # DealerBusiness.name is the trade name; qc_master_application already
+        # treats it as the DBA when the application profile has none.
+        "dba": getattr(dap, "dba_name", None) or (dealer.name if dealer else None),
+        "entity_type": (dealer.entity_type if dealer else None) or profile.entity_type,
+        "state": getattr(dap, "state_of_formation", None) or (dealer.state if dealer else None),
+        "formation_date": (dealer.started_on.isoformat() if dealer and dealer.started_on else None),
+        "ein": dealer.ein if dealer else None,
+        "naics": profile.naics_code or (dealer.naics_code if dealer else None),
+        "address": compose_address(dealer.address, dealer.city, dealer.state, dealer.zip) if dealer else None,
+        "license": None,
+        "website": getattr(dap, "website", None),
+    }
 
 
-def _entity_type_from_entity(entity: Any) -> str:
-    if isinstance(entity, dict):
-        for k in ("entity_type", "type"):
-            if entity.get(k):
-                return normalize_entity_type(entity[k])
-    return ""
+def file_owner_rows(owners: list[Any]) -> list[dict[str, Any]]:
+    """The ownership schedule in the shape the `owners` arrangement key holds."""
+    return [{
+        "name": " ".join(p for p in (str(getattr(o, "first_name", "") or ""), str(getattr(o, "last_name", "") or "")) if p),
+        "pct": float(getattr(o, "ownership_pct", 0) or 0), "title": "",
+        "email": getattr(o, "email", None) or "", "phone": getattr(o, "phone", None) or "",
+        "auth": "Yes" if getattr(o, "invite_sent_at", None) or getattr(o, "credit_pull_id", None) else "",
+    } for o in owners[:pa.MAX_OWNERS]]
+
+
+async def extracted_facts(db: AsyncSession, profile: ApplicationProfile) -> dict[str, str]:
+    """What the AI read off the documents, best value per field.
+
+    Every upload is analysed into `application_extracted_facts`, and nothing in
+    the package has ever read them — so a file whose entity type is legible on
+    an uploaded tax return still asked an operator to type it. Accepted beats
+    suggested, higher confidence beats lower, and a rejected fact is never used.
+    """
+    rows = (
+        await db.execute(
+            select(ApplicationExtractedFact)
+            .where(
+                ApplicationExtractedFact.profile_id == profile.id,
+                ApplicationExtractedFact.status != "rejected",
+            )
+            .order_by(ApplicationExtractedFact.created_at.desc())
+        )
+    ).scalars().all()
+    best: dict[str, tuple[int, float, str]] = {}
+    for row in rows:
+        value = _text(row.normalized_value) or _text(row.value if isinstance(row.value, str) else (row.value or {}).get("value"))
+        if not value:
+            continue
+        rank = (1 if row.status == "accepted" else 0, float(row.confidence or 0))
+        if row.field_key not in best or rank > best[row.field_key][:2]:
+            best[row.field_key] = (*rank, value)
+    return {k: v[2] for k, v in best.items()}
 
 
 def _primary_owner(owners: list[Any]) -> Any | None:
