@@ -52,6 +52,7 @@ from app.models.booking_notification import BookingNotification, BookingNotifica
 from app.models.event import CalendarEvent
 from app.models.notification import Notification
 from app.services import application_profiles as application_profile_service
+from app.services import inline_images
 from app.services import calendar_v2
 from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders, provenance
@@ -8137,9 +8138,19 @@ async def _appointment_workspace(
             entity_name=linked_loan.entity_name,
             address=linked_loan.address,
         )
+    # Authorisation was settled when the appointment was loaded for this
+    # user; whoever may read the note may see what was pasted into it.
+    activity_images = await inline_images.hydrate(
+        db, "appointment_activity", [str(row.id) for row in activities]
+    )
     return RepAppointmentWorkspaceRead(
         appointment=RepAppointmentRead.model_validate(appointment_payload),
-        activities=[RepAppointmentActivityRead.model_validate(row) for row in activities],
+        activities=[
+            RepAppointmentActivityRead.model_validate(row).model_copy(
+                update={"images": activity_images.get(str(row.id), [])}
+            )
+            for row in activities
+        ],
         application=await _appointment_application_summary(db, appointment),
         funding_file=funding_file,
         application_candidates=application_candidates,
@@ -8595,7 +8606,7 @@ async def create_rep_appointment_note(
     payload: RepAppointmentNoteCreate,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> DealerRepAppointmentActivity:
+) -> RepAppointmentActivityRead:
     _require_appointment_crm(user)
     appointment = await _load_owned_appointment(db, appointment_id, user)
     row = _record_appointment_activity(
@@ -8605,9 +8616,19 @@ async def create_rep_appointment_note(
         user=user,
         body=payload.body,
     )
+    await db.flush()
+    attached = await inline_images.attach(
+        db,
+        image_ids=payload.image_ids,
+        subject_kind="appointment_activity",
+        subject_id=str(row.id),
+        user_id=user.id,
+    )
     await db.commit()
     await db.refresh(row)
-    return row
+    return RepAppointmentActivityRead.model_validate(row).model_copy(
+        update={"images": [inline_images.serialize(image) for image in attached]}
+    )
 
 
 @router.post(
@@ -12640,7 +12661,7 @@ async def list_messages(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     channel: str | None = None,
-) -> list[DealerMessage]:
+) -> list[dict]:
     """One channel of the file's conversation, oldest first.
 
     Omit `channel` and the desk gets everything, which is what the combined
@@ -12661,9 +12682,17 @@ async def list_messages(
         if channel not in MESSAGE_CHANNELS:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown channel {channel!r}")
         q = q.where(DealerMessage.channel == channel)
-    return (
+    rows = (
         (await db.execute(q.order_by(DealerMessage.created_at.asc()))).scalars().all()
     )
+    # One lookup for the page rather than one per message. Authorisation was
+    # already settled above by resolve_dealer_scope: whoever may read the text
+    # may see what was pasted into it.
+    images = await inline_images.hydrate(db, "dealer_message", [str(row.id) for row in rows])
+    return [
+        {**MessageRead.model_validate(row).model_dump(exclude={"images"}), "images": images.get(str(row.id), [])}
+        for row in rows
+    ]
 
 
 @router.post(
@@ -12671,7 +12700,7 @@ async def list_messages(
 )
 async def create_message(
     dealer_id: UUID, payload: MessageCreate, user: CurrentUser, db: AsyncSession = Depends(get_db)
-) -> DealerMessage:
+) -> dict:
     """Post to the file's thread.
 
     Two opposite defaults, both deliberate. A DEALER can never author an
@@ -12717,10 +12746,20 @@ async def create_message(
     )
     db.add(message)
     await db.flush()
+    attached = await inline_images.attach(
+        db,
+        image_ids=payload.image_ids,
+        subject_kind="dealer_message",
+        subject_id=str(message.id),
+        user_id=user.id,
+    )
     await _mirror_file_message_to_rep_inbox(db, dealer=dealer, user=user, message=message)
     await db.commit()
     await db.refresh(message)
-    return message
+    return {
+        **MessageRead.model_validate(message).model_dump(exclude={"images"}),
+        "images": [inline_images.serialize(row) for row in attached],
+    }
 
 
 @router.patch("/dealers/{dealer_id}/messages/{message_id}", response_model=MessageRead)

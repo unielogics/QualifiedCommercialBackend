@@ -561,6 +561,15 @@ class PathsRead(BaseModel):
 # --- Stream 5: messaging, sessions & lender package --------------------------
 
 
+class InlineImageRead(BaseModel):
+    id: UUID
+    filename: str
+    mime_type: str
+    size_bytes: int
+    #: Signed and short-lived. None when object storage is not configured.
+    url: str | None = None
+
+
 class MessageRead(ORM):
     id: UUID
     author_user_id: UUID | None = None
@@ -570,6 +579,8 @@ class MessageRead(ORM):
     channel: str = "client"
     edited_at: datetime | None = None
     created_at: datetime
+    #: Images pasted into this message, oldest first.
+    images: list[InlineImageRead] = []
 
 
 class MessageCreate(BaseModel):
@@ -582,6 +593,10 @@ class MessageCreate(BaseModel):
     # are given. Left unset, the server picks by role, which is what every
     # existing caller relies on.
     channel: Literal["desk", "client", "note"] | None = None
+    #: Uploads from this author to bind to the message once it exists. Ids that
+    #: are not theirs, not finished, or already bound elsewhere are ignored —
+    #: the message still posts.
+    image_ids: list[UUID] = []
 
 
 class MessageEdit(BaseModel):
@@ -1045,6 +1060,8 @@ class RepAppointmentActivityRead(ORM):
     before: dict | None = None
     after: dict | None = None
     created_at: datetime
+    #: Images pasted into this note, oldest first.
+    images: list["InlineImageRead"] = []
 
 
 class RepAppointmentCapabilities(BaseModel):
@@ -1138,6 +1155,8 @@ class RepAppointmentCrmPatch(BaseModel):
 
 class RepAppointmentNoteCreate(BaseModel):
     body: str = Field(min_length=1, max_length=5000)
+    #: Uploads from this author to bind to the note once it exists.
+    image_ids: list[UUID] = []
 
 
 class RepAppointmentStartApplication(BaseModel):
