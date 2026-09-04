@@ -608,6 +608,13 @@ async def apply_changes(
                 detail={"code": "maintained_by_desk", "fields": blocked,
                         "message": "The sponsor is chosen by the desk."},
             )
+        desk_only = sorted(k for k in changes if k in pa.DESK_ONLY_KEYS)
+        if desk_only:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "maintained_by_desk", "fields": desk_only,
+                        "message": "The advance and the programme cost are set by the desk."},
+            )
     if int(getattr(package, "stage", 1) or 1) == 2:
         locked = sorted(k for k in changes if k in pa.TERM_SHEET_KEYS) + (["sponsor_company_id"] if sponsor_change else []) + sorted(k for k in changes if k in pa.SPONSOR_KEYS)
         if locked:

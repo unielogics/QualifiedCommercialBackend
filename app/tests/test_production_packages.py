@@ -464,6 +464,57 @@ async def test_applying_a_prefill_requires_the_right_to_edit():
     assert err.value.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_an_agent_cannot_touch_the_programme_economics():
+    """The owner's line: "this is delicate and I dont want the agents to touch
+    that." A rep gathers what the dealer says; the cost of running the facility
+    and whether it clears is the desk's."""
+    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=3, arrangement={}, prefill_provenance={},
+                              stage=1, sent_by_user_id=None, execution_pending=False)
+    access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None),
+                                user=_user(Role.FIELD_REP), mode="rep", link=SimpleNamespace(id=uuid.uuid4()))
+
+    async def get(_model, _key, with_for_update=False):
+        return package
+
+    db = SimpleNamespace(get=get, flush=AsyncMock())
+    for field, value in (("prof_fees", 46000), ("dealer_cof", 14.5), ("requested", 500000), ("sizing", "fixed")):
+        with pytest.raises(HTTPException) as err:
+            await pkgs.apply_changes(db, access, changes={field: value}, version=3)
+        assert err.value.status_code == 422, field
+        assert err.value.detail["code"] == "maintained_by_desk"
+        assert err.value.detail["fields"] == [field]
+
+
+def test_the_desk_only_set_is_the_whole_advance_step():
+    """Derived from the step, so a field added to Advance cannot slip in without
+    someone deciding who owns it."""
+    advance = {r.key for r in pa.FIELD_RULES if r.step == "advance"}
+    assert pa.DESK_ONLY_KEYS == advance
+    # The owner chose to lock the step in full, the requested amount included:
+    # it arrives from the intake form, so an agent never needs to type it.
+    assert "requested" in pa.DESK_ONLY_KEYS
+    assert pa.DESK_ONLY_KEYS.isdisjoint(pa.SPONSOR_KEYS)
+    # buildout is a different step and stays with the agent.
+    assert "fund_target" not in pa.DESK_ONLY_KEYS
+
+
+def test_an_attention_row_says_who_can_clear_it():
+    """Five desk-only fields have no default and no prefill and still block the
+    send, so locking the step means an agent now waits on a desk pass. They have
+    to be able to see that, or the list reads as a wall of their own failures."""
+    blank = pa.empty_arrangement()
+    rows = pa.field_attention(blank, scope="stage_one")
+    by_key = {r["key"]: r for r in rows}
+
+    assert by_key["prof_fees"]["owner"] == "desk"
+    assert by_key["dealer_name"]["owner"] == "any"
+    assert {r["owner"] for r in rows} <= {"desk", "any"}
+    # And the ones that actually strand an agent are real, not hypothetical.
+    stranded = {k for k, r in by_key.items() if r["owner"] == "desk"}
+    assert {"min_activation", "dealer_cof", "orig_cost", "prof_fees", "markup"} <= stranded
+
+
 def test_the_intake_entity_name_is_never_mined_for_a_type_or_a_state():
     """`primary_operating_entity` is a company name.
 

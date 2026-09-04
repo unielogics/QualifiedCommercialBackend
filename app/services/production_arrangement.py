@@ -387,6 +387,15 @@ TERM_SHEET_KEYS: frozenset[str] = frozenset({
 SPONSOR_KEYS: frozenset[str] = frozenset(
     {"sponsor_name", "sponsor_state", "sponsor_entity", "sponsor_address", "sponsor_platform", "sponsor_email"}
 )
+# The programme economics. An agent gathers what the dealer tells them; what the
+# facility costs to run, and whether it clears, is the desk's to set — a rep or a
+# dealer partner editing a cost of funds is editing the deal's margin.
+#
+# Derived from the step rather than listed by hand, so a field added to the
+# advance step cannot slip in without someone deciding who owns it.
+DESK_ONLY_KEYS: frozenset[str] = frozenset(
+    r.key for r in FIELD_RULES if r.step == "advance"
+)
 STAGE_ONE_SCOPES: frozenset[str] = frozenset({"presentation", "stage_one"})
 
 DEFAULTS: dict[str, Any] = {
@@ -930,6 +939,10 @@ def field_attention(arr: dict[str, Any], *, scope: str) -> list[dict[str, Any]]:
                 "step": rule.step, "key": rule.key,
                 "title": rule.title or f"{rule.label} is blank",
                 "detail": rule.detail or "Required — a blank field is not enforceable",
+                # Who can actually clear it. Several desk-only fields have no
+                # default and no prefill and still block the send, so an agent
+                # needs to see that they are waiting rather than failing.
+                "owner": "desk" if rule.key in DESK_ONLY_KEYS else "any",
             })
     return out
 
