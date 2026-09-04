@@ -3681,7 +3681,9 @@ async def _deliver_intake_booking(
         )
         notice.confirmation_email_status = "sent" if email_result and email_result.ok else "failed"
         if email_result and not email_result.ok:
-            notice.last_error = email_result.detail[:1000]
+            notice.record_delivery_error(email_result.detail)
+        elif email_result:
+            notice.clear_delivery_error()
     await db.commit()
 
 

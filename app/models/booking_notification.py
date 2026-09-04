@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -46,6 +46,11 @@ class BookingNotification(TimestampMixin, Base):
     email_reminder_status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
     sms_reminder_status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", server_default="pending")
     last_error: Mapped[str | None] = mapped_column(Text)
+    #: When `last_error` was recorded. Kept as its own column because the
+    #: alternative — deriving it from `updated_at` — is not the same fact:
+    #: any later write to the booking moves `updated_at`, so a resolved
+    #: failure redated itself every time a reminder went out.
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Pre-call prep. Every booking opens a draft dealer file; the sequence that
     # nudges the client to finish ownership / bank / credit hangs off it here,
     # on the booking, because a public booking has no appointment row.
@@ -58,6 +63,35 @@ class BookingNotification(TimestampMixin, Base):
     precall_stop_reason: Mapped[str | None] = mapped_column(String(32))
     # sms|email|rep — how the first PIN reached the client.
     precall_pin_delivered_via: Mapped[str | None] = mapped_column(String(12))
+
+    #: The four channel statuses `last_error` can be describing. One text field
+    #: is shared by all of them, so "is anything still broken" has to be asked
+    #: of the statuses rather than of the message.
+    DELIVERY_STATUS_FIELDS = (
+        "confirmation_email_status",
+        "confirmation_sms_status",
+        "email_reminder_status",
+        "sms_reminder_status",
+    )
+
+    def record_delivery_error(self, detail: str | None) -> None:
+        """Store why a delivery failed, and when it actually failed."""
+        self.last_error = (detail or "").strip()[:1000] or None
+        self.last_error_at = datetime.now(UTC) if self.last_error else None
+
+    def clear_delivery_error(self) -> None:
+        """Drop the stored reason once no channel is failing any more.
+
+        Called after every success. The guard matters because `last_error` is
+        one field for four channels: a text going out does not mean the
+        confirmation email is fine, so the reason survives until the statuses
+        agree there is nothing left to explain. Set the channel's own status
+        before calling this.
+        """
+        if any(getattr(self, field, None) == "failed" for field in self.DELIVERY_STATUS_FIELDS):
+            return
+        self.last_error = None
+        self.last_error_at = None
 
     __table_args__ = (
         Index("ix_booking_notifications_email_due", "email_reminder_due_at", "email_reminder_sent_at"),

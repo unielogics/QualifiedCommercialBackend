@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.models.booking_notification import BookingNotificationReminder
+from app.models.booking_notification import BookingNotification, BookingNotificationReminder
 from app.models.booking_settings import BookingSettings
 from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
@@ -16,7 +16,8 @@ from app.services.booking_availability import (
     slot_overlaps_blocked_interval,
     slot_within_custom_booking_window,
 )
-from app.services.booking_reminders import register_booking
+from app.services import booking_reminders
+from app.services.booking_reminders import register_booking, send_confirmation_sms
 
 
 class _FakeSession:
@@ -27,6 +28,9 @@ class _FakeSession:
         self.added.append(row)
 
     async def flush(self) -> None:
+        return None
+
+    async def commit(self) -> None:
         return None
 
 
@@ -343,3 +347,113 @@ def test_booking_block_preserves_the_full_break_including_buffers() -> None:
         datetime(2026, 8, 31, 16, 5, tzinfo=zone),
         datetime(2026, 8, 31, 16, 25, tzinfo=zone),
     )
+
+
+def _notice(**overrides) -> BookingNotification:
+    row = BookingNotification(
+        id=uuid4(),
+        event_id=uuid4(),
+        invitee_name="paresh",
+        invitee_phone="+15551234567",
+        sms_consent=True,
+        confirmation_email_status="sent",
+        confirmation_sms_status="pending",
+        email_reminder_status="pending",
+        sms_reminder_status="pending",
+    )
+    for key, value in overrides.items():
+        setattr(row, key, value)
+    return row
+
+
+def test_record_delivery_error_dates_the_failure() -> None:
+    row = _notice()
+    before = datetime.now(UTC)
+
+    row.record_delivery_error("Configured but SMS_PRODUCTION is disabled")
+
+    assert row.last_error == "Configured but SMS_PRODUCTION is disabled"
+    assert row.last_error_at is not None and row.last_error_at >= before
+
+
+def test_record_delivery_error_truncates_and_treats_empty_as_no_error() -> None:
+    row = _notice()
+
+    row.record_delivery_error("x" * 1200)
+    assert len(row.last_error or "") == 1000
+
+    row.record_delivery_error("   ")
+    assert row.last_error is None
+    assert row.last_error_at is None
+
+
+def test_clear_delivery_error_holds_while_another_channel_is_failing() -> None:
+    """One text field serves four channels, so a success cannot speak for all."""
+    row = _notice(confirmation_email_status="failed")
+    row.record_delivery_error("Email provider unavailable")
+
+    row.confirmation_sms_status = "sent"
+    row.clear_delivery_error()
+
+    assert row.last_error == "Email provider unavailable"
+
+    row.confirmation_email_status = "sent"
+    row.clear_delivery_error()
+
+    assert row.last_error is None
+    assert row.last_error_at is None
+
+
+@pytest.mark.asyncio
+async def test_confirmation_sms_success_clears_a_stale_failure(monkeypatch) -> None:
+    """The regression: a resolved failure survived every later success.
+
+    A provider swap left bookings reading "Configured but SMS_PRODUCTION is
+    disabled" while texts for those same bookings were being delivered, because
+    nothing cleared the field and the panel dated it from `updated_at`.
+    """
+    row = _notice(last_error="Configured but SMS_PRODUCTION is disabled")
+    row.last_error_at = datetime(2026, 8, 31, 19, 38, tzinfo=UTC)
+    event = CalendarEvent(
+        id=row.event_id,
+        title="Program intro",
+        starts_at=datetime(2026, 9, 5, 15, 0, tzinfo=UTC),
+        duration_min=20,
+        owner_user_id=uuid4(),
+    )
+
+    async def _delivered(db, phone, body, *, context="", client_id=None):
+        return SimpleNamespace(ok=True, detail="Sent through the handset relay.")
+
+    monkeypatch.setattr(booking_reminders.consent_delivery, "send_sms_guarded", _delivered)
+    db = _FakeSession()
+
+    await send_confirmation_sms(db, row, event, timezone_name="America/New_York")
+
+    assert row.confirmation_sms_status == "sent"
+    assert row.last_error is None
+    assert row.last_error_at is None
+
+
+@pytest.mark.asyncio
+async def test_confirmation_sms_failure_records_the_reason_and_the_time(monkeypatch) -> None:
+    row = _notice()
+    event = CalendarEvent(
+        id=row.event_id,
+        title="Program intro",
+        starts_at=datetime(2026, 9, 5, 15, 0, tzinfo=UTC),
+        duration_min=20,
+        owner_user_id=uuid4(),
+    )
+
+    async def _refused(db, phone, body, *, context="", client_id=None):
+        return SimpleNamespace(ok=False, detail="The SMS relay is unreachable.")
+
+    monkeypatch.setattr(booking_reminders.consent_delivery, "send_sms_guarded", _refused)
+    db = _FakeSession()
+
+    await send_confirmation_sms(db, row, event, timezone_name="America/New_York")
+
+    assert row.confirmation_sms_status == "failed"
+    assert row.last_error == "The SMS relay is unreachable."
+    assert row.last_error_at is not None

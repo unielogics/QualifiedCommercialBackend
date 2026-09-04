@@ -7289,10 +7289,12 @@ async def _appointment_read_rows(
                 "email_reminder_status": notice.email_reminder_status,
                 "sms_reminder_status": notice.sms_reminder_status,
                 "delivery_error": notice.last_error,
-                # When the failure happened. Without it a stale error reads as a
-                # live fault: a provider swap can leave a row saying "SMS is
-                # disabled" long after it was re-enabled.
-                "delivery_error_at": notice.updated_at,
+                # When the failure happened — not when the row was last written.
+                # `updated_at` moves on every later write, including a reminder
+                # that goes out fine, which redated a resolved failure to today.
+                # Null on rows recorded before the column existed: the panel
+                # then shows the reason without claiming to know its age.
+                "delivery_error_at": notice.last_error_at,
             })
             staff_rows = rep_reminders.get(notice.id, [])
             staff_statuses = {item.status for item in staff_rows}
@@ -9663,8 +9665,11 @@ async def retry_rep_appointment_delivery(
             )
             retry_status = notice.confirmation_sms_status
             detail = notice.last_error if retry_status == "failed" else None
-    if notice is not None and retry_status == "failed" and detail:
-        notice.last_error = detail[:1000]
+    if notice is not None:
+        if retry_status == "failed" and detail:
+            notice.record_delivery_error(detail)
+        elif retry_status == "sent":
+            notice.clear_delivery_error()
     _record_appointment_activity(
         db,
         appointment,
@@ -10028,7 +10033,9 @@ async def create_standalone_rep_appointment(
                 "sent" if email_result and email_result.ok else "failed"
             )
             if email_result and not email_result.ok:
-                notice.last_error = email_result.detail[:1000]
+                notice.record_delivery_error(email_result.detail)
+            elif email_result:
+                notice.clear_delivery_error()
         await db.commit()
     booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
@@ -10198,7 +10205,7 @@ async def create_rep_appointment(
     )
     if dealer.is_training:
         await booking_reminders.cancel_pending(db, notice)
-        notice.last_error = "Training file: unattended reminders are suppressed."
+        notice.record_delivery_error("Training file: unattended reminders are suppressed.")
     appt.origin = "field_desk"
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=None,
@@ -10316,7 +10323,9 @@ async def create_rep_appointment(
                 "sent" if email_result and email_result.ok else "failed"
             )
             if email_result and not email_result.ok:
-                notice.last_error = email_result.detail[:1000]
+                notice.record_delivery_error(email_result.detail)
+            elif email_result:
+                notice.clear_delivery_error()
         await db.commit()
     booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
     await booking_reminders.send_confirmation_sms(
@@ -10443,7 +10452,9 @@ async def _cancel_rep_appointment(
         )
         results["client_email"] = "sent" if email_result and email_result.ok else "failed"
         if notice and email_result and not email_result.ok:
-            notice.last_error = email_result.detail[:1000]
+            notice.record_delivery_error(email_result.detail)
+        elif notice and email_result:
+            notice.clear_delivery_error()
     if notice and notice.invitee_phone and notice.sms_consent:
         sms_body = f"Qualified Commercial: your appointment on {_appointment_local_time(appt.starts_at, appt.timezone)} was cancelled."
         try:
@@ -10451,12 +10462,14 @@ async def _cancel_rep_appointment(
                 db, notice.invitee_phone, sms_body, context="booking_cancellation"
             )
             results["client_sms"] = "sent" if sms_result.ok else "failed"
-            if not sms_result.ok:
-                notice.last_error = sms_result.detail[:1000]
+            if sms_result.ok:
+                notice.clear_delivery_error()
+            else:
+                notice.record_delivery_error(sms_result.detail)
         except Exception:  # noqa: BLE001
             logger.exception("appointment cancellation SMS raised appointment=%s", appt.id)
             results["client_sms"] = "failed"
-            notice.last_error = "sms_provider_exception"
+            notice.record_delivery_error("sms_provider_exception")
     elif appt.invitee_phone:
         results["client_sms"] = "blocked_no_consent"
     await db.commit()
@@ -10707,7 +10720,9 @@ async def patch_rep_appointment(
             if notice:
                 notice.confirmation_email_status = results["client_email"]
                 if email_result and not email_result.ok:
-                    notice.last_error = email_result.detail[:1000]
+                    notice.record_delivery_error(email_result.detail)
+                elif email_result:
+                    notice.clear_delivery_error()
         rep_result = booking_notify.send_rep_invite(
             host or user,
             booking,
@@ -11538,7 +11553,7 @@ async def book_underwriting_review_preference(
     )
     if dealer.is_training:
         await booking_reminders.cancel_pending(db, notice)
-        notice.last_error = "Training file: unattended reminders are suppressed."
+        notice.record_delivery_error("Training file: unattended reminders are suppressed.")
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
@@ -11628,7 +11643,9 @@ async def book_underwriting_review_preference(
         )
         notice.confirmation_email_status = "sent" if email_result and email_result.ok else "failed"
         if email_result and not email_result.ok:
-            notice.last_error = email_result.detail[:1000]
+            notice.record_delivery_error(email_result.detail)
+        elif email_result:
+            notice.clear_delivery_error()
     booking_notify.send_rep_invite(
         host,
         booking,

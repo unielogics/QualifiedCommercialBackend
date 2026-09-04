@@ -470,7 +470,9 @@ async def twilio_sms_status(request: Request) -> Response:
                 if notice is not None:
                     notice.sms_reminder_status = terminal_status
                     if terminal_status == "failed":
-                        notice.last_error = f"Twilio reminder delivery {message_status}."
+                        notice.record_delivery_error(f"Twilio reminder delivery {message_status}.")
+                    else:
+                        notice.clear_delivery_error()
         await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

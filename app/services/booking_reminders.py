@@ -227,12 +227,16 @@ async def send_confirmation_sms(
     except Exception:  # noqa: BLE001
         log.exception("booking confirmation SMS raised notification=%s", row.id)
         row.confirmation_sms_status = "failed"
-        row.last_error = "sms_provider_exception"
+        row.record_delivery_error("sms_provider_exception")
         await db.commit()
         return
     row.confirmation_sms_status = "sent" if result.ok else "failed"
-    if not result.ok:
-        row.last_error = result.detail[:1000]
+    if result.ok:
+        # The stored reason outlives its cause otherwise: these rows kept
+        # "SMS_PRODUCTION is disabled" for days after the provider changed.
+        row.clear_delivery_error()
+    else:
+        row.record_delivery_error(result.detail)
     await db.commit()
 
 
@@ -463,8 +467,10 @@ async def dispatch_due_reminders() -> int:
                 reminder.error = None if result.ok else result.detail[:1000]
                 notice.email_reminder_status = reminder.status
                 notice.email_reminder_sent_at = now
-                if not result.ok:
-                    notice.last_error = result.detail[:1000]
+                if result.ok:
+                    notice.clear_delivery_error()
+                else:
+                    notice.record_delivery_error(result.detail)
                 sent += int(result.ok)
             elif reminder.channel == "sms":
                 # Resolved at send time, not at booking time, so editing a
@@ -490,7 +496,7 @@ async def dispatch_due_reminders() -> int:
                     reminder.error = "sms_provider_exception"
                     notice.sms_reminder_status = "failed"
                     notice.sms_reminder_sent_at = now
-                    notice.last_error = "sms_provider_exception"
+                    notice.record_delivery_error("sms_provider_exception")
                     continue
                 reminder.status = "sent" if result.ok else "failed"
                 reminder.sent_at = now
@@ -498,8 +504,10 @@ async def dispatch_due_reminders() -> int:
                 reminder.error = None if result.ok else result.detail[:1000]
                 notice.sms_reminder_status = reminder.status
                 notice.sms_reminder_sent_at = now
-                if not result.ok:
-                    notice.last_error = result.detail[:1000]
+                if result.ok:
+                    notice.clear_delivery_error()
+                else:
+                    notice.record_delivery_error(result.detail)
                 sent += int(result.ok)
             elif reminder.channel == "rep":
                 rep = await db.get(User, notice.booked_by_user_id) if notice.booked_by_user_id else None

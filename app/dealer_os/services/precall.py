@@ -991,8 +991,9 @@ async def deliver_pin(
         )
         if result.ok:
             notice.precall_pin_delivered_via = "email"
+            notice.clear_delivery_error()
             return "email"
-        notice.last_error = (result.detail or "pin_email_failed")[:1000]
+        notice.record_delivery_error(result.detail or "pin_email_failed")
     return None
 
 
@@ -1112,8 +1113,10 @@ async def dispatch_row(
     reminder.sent_at = now
     reminder.provider_message_id = getattr(result, "message_id", None)
     reminder.error = None if result.ok else (result.detail or "")[:1000]
-    if not result.ok:
-        notice.last_error = (result.detail or "")[:1000]
+    if result.ok:
+        notice.clear_delivery_error()
+    else:
+        notice.record_delivery_error(result.detail)
     await log_action(
         db, dealer.id, None, "precall.step_sent", "dealer", entity_id=dealer.id,
         after={"step": reminder.step_key, "channel": reminder.channel, "ok": bool(result.ok), "notification_id": str(notice.id)},
@@ -1383,8 +1386,10 @@ async def send_kit(
             body_text=body,
         )
         out["email"] = bool(result.ok)
-        if not result.ok:
-            notice.last_error = (result.detail or "")[:1000]
+        if result.ok:
+            notice.clear_delivery_error()
+        else:
+            notice.record_delivery_error(result.detail)
     if "sms" in channels and notice.sms_consent and notice.invitee_phone:
         if await optout.is_opted_out(db, notice.invitee_phone):
             out["sms"] = False
@@ -1398,8 +1403,10 @@ async def send_kit(
             try:
                 result = await consent_delivery.send_sms_guarded(db, notice.invitee_phone, body, context="precall_kit")
                 out["sms"] = bool(result.ok)
-                if not result.ok:
-                    notice.last_error = (result.detail or "")[:1000]
+                if result.ok:
+                    notice.clear_delivery_error()
+                else:
+                    notice.record_delivery_error(result.detail)
             except Exception:  # noqa: BLE001
                 log.exception("precall: kit SMS raised notification=%s", notice.id)
     await log_action(

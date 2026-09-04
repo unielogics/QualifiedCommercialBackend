@@ -744,7 +744,9 @@ async def _deliver_booking(
             "sent" if email_result and email_result.ok else "failed"
         )
         if email_result and not email_result.ok:
-            notice.last_error = email_result.detail[:1000]
+            notice.record_delivery_error(email_result.detail)
+        elif email_result:
+            notice.clear_delivery_error()
     await db.commit()
     await booking_reminders.send_confirmation_sms(
         db, notice, ev, timezone_name=booking.timezone,
