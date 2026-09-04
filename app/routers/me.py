@@ -1677,19 +1677,32 @@ class BookingPlaceholderRead(BaseModel):
     pin_only: bool = False
 
 
+class BookingVideoPlaceholderRead(BaseModel):
+    token: str
+    label: str
+    url: str
+
+
 class BookingPlaceholdersResponse(BaseModel):
     placeholders: list[BookingPlaceholderRead]
     #: The two message keys where {pin} is accepted.
     pin_allowed_in: list[str]
     kinds: dict[str, dict[str, str]]
+    #: One per video in the host's library, insertable into any message.
+    videos: list[BookingVideoPlaceholderRead] = []
 
 
 @router.get("/booking-settings/placeholders", response_model=BookingPlaceholdersResponse)
-async def booking_template_placeholders(user: CurrentUser) -> BookingPlaceholdersResponse:
+async def booking_template_placeholders(
+    user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> BookingPlaceholdersResponse:
     """The canonical placeholder list, so the settings UI stops keeping its own copies."""
+    from app.dealer_os.services import precall
     from app.services import message_render
 
+    row = await _get_or_create_booking_settings(db, user)
     return BookingPlaceholdersResponse(
+        videos=[BookingVideoPlaceholderRead(**v) for v in precall.video_placeholders(row)],
         placeholders=[
             BookingPlaceholderRead(token=token, description=desc, pin_only=token in message_render.PIN_ONLY)
             for token, desc in message_render.PLACEHOLDERS.items()
@@ -1775,9 +1788,10 @@ async def draft_booking_template(
     wants_subject = channel == "email" and payload.kind != "precall_block"
 
     allowed = [t for t in message_render.PLACEHOLDERS if t not in message_render.PIN_ONLY]
-    from app.dealer_os.services.precall import DEFAULT_PRECALL_VIDEO_URL
+    from app.dealer_os.services import precall as precall_service
 
-    video = (row.precall_video_url or DEFAULT_PRECALL_VIDEO_URL or "").strip()
+    videos = precall_service.video_placeholders(row)
+    video = videos[0]["url"] if videos else ""
     system = (
         "You write short, plain client messages for a commercial finance desk. "
         "The reader is a business owner who has booked a call and needs to arrive prepared.\n\n"
@@ -1787,7 +1801,9 @@ async def draft_booking_template(
         f"Use only these placeholders, exactly as written: {', '.join(allowed)}\n"
         f"{_DRAFTER_RULES}\n"
         + (
-            "There is a video the client should watch before the call. Reference it with the {video} placeholder.\n"
+            "Videos you may point the client at, by placeholder:\n"
+            + "\n".join(f"  {v['token']} — {v['label']}" for v in videos)
+            + "\nUse at most one, and only where it helps. Write the placeholder, never the URL.\n"
             if video
             else "There is no video configured, so do not mention one.\n"
         )
@@ -1859,6 +1875,79 @@ async def draft_booking_template(
     )
 
 
+class BookingSequenceDraftRequest(BaseModel):
+    #: Leave empty to draft everything that is still on the default wording.
+    kinds: list[str] = Field(default_factory=list, max_length=len(BOOKING_TEMPLATE_KINDS))
+    instruction: str | None = Field(default=None, max_length=1000)
+    tone: Literal["direct", "warm", "formal"] = "direct"
+    #: Off by default: a host who has written their own copy should not lose it
+    #: to a bulk action they thought only filled the blanks.
+    overwrite_authored: bool = False
+
+
+class BookingSequenceDraftResponse(BaseModel):
+    drafts: list[BookingTemplateDraftResponse]
+    skipped: list[str] = []
+
+
+@router.post("/booking-settings/draft-sequence", response_model=BookingSequenceDraftResponse)
+async def draft_booking_sequence(
+    payload: BookingSequenceDraftRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> BookingSequenceDraftResponse:
+    """Draft the whole sequence at once, so the host starts from copy not blanks.
+
+    Nothing is saved: this returns drafts for the host to edit and save exactly
+    as the per-message drafter does. Messages the host has already written are
+    left alone unless they ask otherwise, because the point of a bulk action is
+    to fill the empty ones.
+    """
+    row = await _get_or_create_booking_settings(db, user)
+    wanted = payload.kinds or list(BOOKING_TEMPLATE_KINDS)
+    unknown = [k for k in wanted if k not in BOOKING_TEMPLATE_KINDS]
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unknown template(s): {', '.join(unknown)}")
+
+    drafts: list[BookingTemplateDraftResponse] = []
+    skipped: list[str] = []
+    for kind in wanted:
+        if not payload.overwrite_authored and _has_authored_copy(row, kind):
+            skipped.append(kind)
+            continue
+        drafts.append(
+            await draft_booking_template(
+                BookingTemplateDraftRequest(kind=kind, instruction=payload.instruction, tone=payload.tone),
+                user,
+                db,
+            )
+        )
+    return BookingSequenceDraftResponse(drafts=drafts, skipped=skipped)
+
+
+def _has_authored_copy(row: BookingSettings, kind: str) -> bool:
+    """Whether the host has already written this one themselves."""
+    confirmations = row.confirmation_messages or {}
+    precall = row.precall_messages or {}
+    if kind == "confirmation_email":
+        return bool((confirmations.get("email_body") or "").strip())
+    if kind == "confirmation_sms":
+        return bool((confirmations.get("sms") or "").strip())
+    if kind == "pin_email":
+        return bool((confirmations.get("pin_email_body") or "").strip())
+    if kind == "precall_block":
+        return bool((precall.get("precall_block") or "").strip())
+    if kind.startswith("nudge_"):
+        step = precall.get(kind.rsplit("_", 1)[0]) or {}
+        field = "sms" if kind.endswith("_sms") else "email_body"
+        return bool((step.get(field) or "").strip())
+    if kind == "reminder_email":
+        return any((m or {}).get("body", "").strip() for m in (row.reminder_email_messages or {}).values())
+    if kind == "reminder_sms":
+        return any((m or "").strip() for m in (row.reminder_sms_messages or {}).values())
+    return False
+
+
 class BookingTestSendRequest(BaseModel):
     channel: Literal["email", "sms"]
     subject: str | None = Field(default=None, max_length=300)
@@ -1911,9 +2000,9 @@ async def test_send_booking_message(
         **_TEST_VALUES,
         "{rep}": (user.name or "").strip() or "Qualified Commercial",
         "{room_link}": "https://app.qualifiedcommercial.com/buckets/request/sample-token",
-        # The same effective value a real send would use, so the test shows
+        # The same effective values a real send would use, so the test shows
         # what the client actually gets rather than a blank line.
-        "{video}": (row.precall_video_url or precall_defaults.DEFAULT_PRECALL_VIDEO_URL or "").strip(),
+        **precall_defaults.video_values(row),
         "{precall}": "You still need to connect your business bank and authorize a soft credit check.",
         "{stop_link}": "",
     }

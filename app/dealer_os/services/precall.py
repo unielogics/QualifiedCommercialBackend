@@ -885,6 +885,32 @@ async def retime_after_reschedule(
 # --- rendering ------------------------------------------------------------------
 
 
+def video_values(booking: BookingSettings) -> dict[str, str]:
+    """{video} plus one token per video in the host's library.
+
+    {video} is the primary, so a message written before there was a library
+    still renders. Each entry also answers to {video_<key>}, which is what lets
+    a host point one email at the bank-connection video and another at the soft
+    credit check.
+    """
+    library = [v for v in (booking.precall_videos or []) if isinstance(v, dict) and (v.get("url") or "").strip()]
+    values = {f"{{video_{str(v.get('key') or '').strip()}}}": str(v["url"]).strip() for v in library if v.get("key")}
+    primary = (library[0]["url"].strip() if library else "") or (booking.precall_video_url or "").strip()
+    values["{video}"] = primary or DEFAULT_PRECALL_VIDEO_URL
+    return values
+
+
+def video_placeholders(booking: BookingSettings) -> list[dict[str, str]]:
+    """What the settings UI offers as insertable video tokens."""
+    out = [{"token": "{video}", "label": "Primary video", "url": video_values(booking)["{video}"]}]
+    for entry in booking.precall_videos or []:
+        key = str((entry or {}).get("key") or "").strip()
+        url = str((entry or {}).get("url") or "").strip()
+        if key and url:
+            out.append({"token": f"{{video_{key}}}", "label": str(entry.get("label") or key), "url": url})
+    return out
+
+
 def template_values(
     *,
     notice: BookingNotification,
@@ -924,7 +950,7 @@ def template_values(
             else ""
         ),
         "{stop_link}": stop_link,
-        "{video}": (booking.precall_video_url or DEFAULT_PRECALL_VIDEO_URL or "").strip(),
+        **video_values(booking),
     }
 
 

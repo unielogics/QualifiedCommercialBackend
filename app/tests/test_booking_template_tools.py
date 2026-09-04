@@ -9,6 +9,7 @@ of an error.
 
 from __future__ import annotations
 
+from datetime import UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -23,6 +24,7 @@ from app.services import message_render
 def _booking(**over):
     row = SimpleNamespace(
         precall_messages={}, confirmation_messages={}, precall_video_url=None,
+        precall_videos=[], reminder_email_messages={}, reminder_sms_messages={},
         timezone="America/New_York",
     )
     for k, v in over.items():
@@ -73,10 +75,10 @@ def test_the_default_precall_block_carries_the_video_and_the_room():
 
 def _template_values(booking):
     """The placeholder table, with the parts this test does not exercise stubbed."""
-    from datetime import datetime, timezone as tz
+    from datetime import datetime
 
     notice = SimpleNamespace(invitee_name="Jordan Reyes", join_url="")
-    event = SimpleNamespace(starts_at=datetime(2026, 9, 9, 14, 0, tzinfo=tz.utc))
+    event = SimpleNamespace(starts_at=datetime(2026, 9, 9, 14, 0, tzinfo=UTC))
     host = SimpleNamespace(name="Jonathan Franco")
     return precall.template_values(
         notice=notice, event=event, booking=booking, host=host, dealer=None,
@@ -264,3 +266,157 @@ async def test_a_test_text_goes_through_the_guarded_sender_with_its_own_context(
     assert kwargs["require_consent_kind"] is None
     assert kwargs["context"] == "booking_template_test"
     assert kwargs["body"].startswith("[Test] ")
+
+
+# --- the video library --------------------------------------------------------
+
+
+def test_a_message_points_at_a_video_by_key_not_by_url():
+    # Re-recording a video changes its URL; the key is what templates hold, so
+    # the pointer survives.
+    booking = _booking(precall_videos=[
+        {"key": "bank", "label": "Connecting your bank", "url": "https://videos.example.com/bank-v1"},
+        {"key": "credit", "label": "The soft credit check", "url": "https://videos.example.com/credit"},
+    ])
+    values = precall.video_values(booking)
+    assert values["{video_bank}"] == "https://videos.example.com/bank-v1"
+    assert values["{video_credit}"] == "https://videos.example.com/credit"
+
+    booking.precall_videos[0]["url"] = "https://videos.example.com/bank-v2"
+    assert precall.video_values(booking)["{video_bank}"] == "https://videos.example.com/bank-v2"
+
+
+def test_the_first_video_is_the_one_plain_video_renders():
+    booking = _booking(precall_videos=[
+        {"key": "intro", "label": "Intro", "url": "https://videos.example.com/intro"},
+        {"key": "bank", "label": "Bank", "url": "https://videos.example.com/bank"},
+    ])
+    assert precall.video_values(booking)["{video}"] == "https://videos.example.com/intro"
+
+
+def test_a_host_who_never_set_a_video_still_gets_the_firm_one():
+    assert precall.video_values(_booking())["{video}"] == precall.DEFAULT_PRECALL_VIDEO_URL
+
+
+def test_the_single_video_set_before_the_library_existed_still_renders():
+    booking = _booking(precall_video_url="https://videos.example.com/legacy")
+    assert precall.video_values(booking)["{video}"] == "https://videos.example.com/legacy"
+
+
+def test_an_entry_with_no_url_is_ignored_rather_than_rendering_blank():
+    booking = _booking(precall_videos=[
+        {"key": "empty", "label": "Not recorded yet", "url": "  "},
+        {"key": "real", "label": "Real", "url": "https://videos.example.com/real"},
+    ])
+    values = precall.video_values(booking)
+    assert "{video_empty}" not in values
+    assert values["{video}"] == "https://videos.example.com/real"
+
+
+def test_the_settings_ui_is_offered_every_video_as_an_insertable_token():
+    booking = _booking(precall_videos=[{"key": "bank", "label": "Connecting your bank", "url": "https://v/bank"}])
+    tokens = [v["token"] for v in precall.video_placeholders(booking)]
+    assert tokens == ["{video}", "{video_bank}"]
+
+
+def test_two_videos_cannot_share_a_key():
+    from pydantic import ValidationError
+
+    from app.schemas.booking_settings import UserBookingSettingsBase
+
+    with pytest.raises(ValidationError) as err:
+        UserBookingSettingsBase(precall_videos=[
+            {"key": "a", "label": "One", "url": "https://v/1"},
+            {"key": "a", "label": "Two", "url": "https://v/2"},
+        ])
+    assert "own key" in str(err.value)
+
+
+def test_a_video_key_stays_typeable_inside_a_placeholder():
+    from pydantic import ValidationError
+
+    from app.schemas.booking_settings import UserBookingSettingsBase
+
+    for key in ("Bank Video", "bank-video", "bank video", "_bank", "bank_"):
+        with pytest.raises(ValidationError):
+            UserBookingSettingsBase(precall_videos=[{"key": key, "label": "x", "url": "https://v/1"}])
+    ok = UserBookingSettingsBase(precall_videos=[{"key": "bank_2", "label": "x", "url": "https://v/1"}])
+    assert ok.precall_videos[0].key == "bank_2"
+
+
+def test_a_video_link_has_to_be_a_link():
+    from pydantic import ValidationError
+
+    from app.schemas.booking_settings import UserBookingSettingsBase
+
+    with pytest.raises(ValidationError):
+        UserBookingSettingsBase(precall_videos=[{"key": "x", "label": "x", "url": "javascript:alert(1)"}])
+
+
+# --- drafting the whole sequence ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_sequence_drafter_fills_the_blanks_and_leaves_written_copy_alone():
+    from app.routers.me import BookingSequenceDraftRequest, draft_booking_sequence
+
+    # The host has written the confirmation email; everything else is default.
+    booking = _booking(confirmation_messages={"email_body": "My own wording."})
+    resp = SimpleNamespace(content=[SimpleNamespace(text='{"subject": "S", "body": "B"}')])
+    with patch("app.services.ai.usage.tracked_messages_create", new=AsyncMock(return_value=resp)), \
+         patch("app.routers.me._get_or_create_booking_settings", new=AsyncMock(return_value=booking)):
+        out = await draft_booking_sequence(
+            BookingSequenceDraftRequest(), SimpleNamespace(id=uuid4(), name="Jonathan"), None
+        )
+
+    assert "confirmation_email" in out.skipped
+    drafted = {d.kind for d in out.drafts}
+    assert "confirmation_email" not in drafted
+    assert drafted == set(BOOKING_TEMPLATE_KINDS) - {"confirmation_email"}
+
+
+@pytest.mark.asyncio
+async def test_the_sequence_drafter_will_overwrite_when_asked():
+    from app.routers.me import BookingSequenceDraftRequest, draft_booking_sequence
+
+    booking = _booking(confirmation_messages={"email_body": "My own wording."})
+    resp = SimpleNamespace(content=[SimpleNamespace(text='{"subject": "S", "body": "B"}')])
+    with patch("app.services.ai.usage.tracked_messages_create", new=AsyncMock(return_value=resp)), \
+         patch("app.routers.me._get_or_create_booking_settings", new=AsyncMock(return_value=booking)):
+        out = await draft_booking_sequence(
+            BookingSequenceDraftRequest(overwrite_authored=True),
+            SimpleNamespace(id=uuid4(), name="Jonathan"), None,
+        )
+
+    assert out.skipped == []
+    assert len(out.drafts) == len(BOOKING_TEMPLATE_KINDS)
+
+
+@pytest.mark.asyncio
+async def test_the_sequence_drafter_can_be_pointed_at_named_messages():
+    from app.routers.me import BookingSequenceDraftRequest, draft_booking_sequence
+
+    resp = SimpleNamespace(content=[SimpleNamespace(text='{"body": "B"}')])
+    with patch("app.services.ai.usage.tracked_messages_create", new=AsyncMock(return_value=resp)), \
+         patch("app.routers.me._get_or_create_booking_settings", new=AsyncMock(return_value=_booking())):
+        out = await draft_booking_sequence(
+            BookingSequenceDraftRequest(kinds=["reminder_sms", "precall_block"]),
+            SimpleNamespace(id=uuid4(), name="Jonathan"), None,
+        )
+
+    assert [d.kind for d in out.drafts] == ["reminder_sms", "precall_block"]
+
+
+@pytest.mark.asyncio
+async def test_the_sequence_drafter_refuses_a_message_that_does_not_exist():
+    from fastapi import HTTPException
+
+    from app.routers.me import BookingSequenceDraftRequest, draft_booking_sequence
+
+    with patch("app.routers.me._get_or_create_booking_settings", new=AsyncMock(return_value=_booking())):
+        with pytest.raises(HTTPException) as err:
+            await draft_booking_sequence(
+                BookingSequenceDraftRequest(kinds=["not_a_message"]),
+                SimpleNamespace(id=uuid4(), name="Jonathan"), None,
+            )
+    assert err.value.status_code == 422

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class BookingBlockedInterval(BaseModel):
@@ -43,6 +43,27 @@ class BookingTimeRange(BaseModel):
 class BookingDaySchedule(BaseModel):
     weekday: int = Field(ge=0, le=6)
     intervals: list[BookingTimeRange] = Field(default_factory=list, max_length=6)
+
+
+class BookingVideo(BaseModel):
+    """One video in the host's library.
+
+    The key is what a message points at. It is slugified rather than free text so
+    a placeholder stays valid when the label is edited, and it is capped short
+    because it appears inside a {video_key} token the host types by hand.
+    """
+
+    key: str = Field(min_length=1, max_length=24, pattern=r"^[a-z0-9](?:[a-z0-9_]*[a-z0-9])?$")
+    label: str = Field(min_length=1, max_length=80)
+    url: str = Field(min_length=1, max_length=500)
+
+    @field_validator("url")
+    @classmethod
+    def _http_only(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.lower().startswith(("http://", "https://")):
+            raise ValueError("A video link must start with http:// or https://")
+        return cleaned
 
 
 class UserBookingSettingsBase(BaseModel):
@@ -102,6 +123,19 @@ class UserBookingSettingsBase(BaseModel):
     end_time: str = Field(default="17:00", pattern=r"^\d{2}:\d{2}$")
     #: The short video the client watches before the call. Rendered by {video}.
     precall_video_url: str | None = Field(default=None, max_length=500)
+    #: The video library. Each entry is {key, label, url}; a message references a
+    #: video by its key, so re-recording one does not break the templates that
+    #: point at it.
+    precall_videos: list[BookingVideo] = Field(default_factory=list, max_length=12)
+
+    @field_validator("precall_videos")
+    @classmethod
+    def _unique_video_keys(cls, videos: list[BookingVideo]) -> list[BookingVideo]:
+        keys = [v.key for v in videos]
+        duplicated = sorted({k for k in keys if keys.count(k) > 1})
+        if duplicated:
+            raise ValueError(f"Each video needs its own key. Repeated: {', '.join(duplicated)}")
+        return videos
     logo_s3_key: str | None = None
     profile_photo_s3_key: str | None = None
 

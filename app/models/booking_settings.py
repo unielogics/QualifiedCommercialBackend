@@ -137,6 +137,12 @@ class BookingSettings(TimestampMixin, Base):
     end_time: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
     #: Watched before the call, carried into the pre-call messages by {video}.
     precall_video_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    #: The video library: [{key, label, url}]. {video} renders the first one and
+    #: {video_<key>} renders any of them, so a message references a video by a
+    #: stable key rather than by a URL that changes when it is re-recorded.
+    precall_videos: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     logo_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     profile_photo_s3_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
