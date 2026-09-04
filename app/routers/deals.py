@@ -30,6 +30,7 @@ from app.schemas.deal import (
     MarkReadyRequest,
     MarkReadyResponse,
 )
+from app.services import inline_images
 from app.services.handoff import promote_deal_to_loan
 
 router = APIRouter(tags=["deals"])
@@ -49,6 +50,29 @@ async def _load_client_or_404(client_id: UUID, user, db: AsyncSession) -> Client
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
     return client
+
+
+async def _deal_out_with_note_images(db: AsyncSession, deal: Deal) -> DealOut:
+    """A deal, with each note entry carrying the images pasted into it.
+
+    The deal was already loaded through the client scope for this caller, so
+    the images inherit that decision rather than re-deriving one.
+    """
+    out = DealOut.model_validate(deal)
+    entries = out.notes_entries or []
+    images = await inline_images.hydrate(
+        db, "deal_note", [str(entry.get("id") or "") for entry in entries]
+    )
+    if not images:
+        return out
+    return out.model_copy(
+        update={
+            "notes_entries": [
+                {**entry, "images": images.get(str(entry.get("id") or ""), [])}
+                for entry in entries
+            ]
+        }
+    )
 
 
 @router.get("/deals/{deal_id}", response_model=DealOut)
@@ -78,7 +102,7 @@ async def get_deal(
     deal = await db.get(Deal, deal_id)
     if deal is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Deal not found")
-    return DealOut.model_validate(deal)
+    return await _deal_out_with_note_images(db, deal)
 
 
 @router.get("/deals/{deal_id}/ai-agents")
@@ -187,7 +211,7 @@ async def create_deal(
     except Exception:  # pragma: no cover — best-effort
         pass
 
-    return DealOut.model_validate(deal)
+    return await _deal_out_with_note_images(db, deal)
 
 
 @router.patch("/clients/{client_id}/deals/{deal_id}", response_model=DealOut)
@@ -219,8 +243,24 @@ async def update_deal(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(deal, k, v)
     await db.flush()
+    # A deal note is an element of a JSONB array with a client-generated id, so
+    # its images are bound by that id rather than by a foreign key. Binding on
+    # the write is what enforces "your own uploads only" — the read below trusts
+    # the binding, not the ids in the payload.
+    if payload.notes_entries is not None:
+        for entry in payload.notes_entries:
+            entry_id = str(entry.get("id") or "")
+            image_ids = entry.get("image_ids") or []
+            if entry_id and image_ids:
+                await inline_images.attach(
+                    db,
+                    image_ids=[UUID(str(value)) for value in image_ids],
+                    subject_kind="deal_note",
+                    subject_id=entry_id,
+                    user_id=user.id,
+                )
     await db.refresh(deal)
-    return DealOut.model_validate(deal)
+    return await _deal_out_with_note_images(db, deal)
 
 
 @router.post(

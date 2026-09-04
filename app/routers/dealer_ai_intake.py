@@ -88,7 +88,7 @@ from app.schemas.bucket import (
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
 from app.services import application_profiles as profiles_service
-from app.services import booking_notify, booking_reminders, provenance
+from app.services import booking_notify, booking_reminders, inline_images, provenance
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
@@ -571,6 +571,8 @@ class AdminLeadContactUpdate(BaseModel):
 
 class DealerLeadNoteCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
+    #: Uploads from this author to bind to the note once it exists.
+    image_ids: list[UUID] = []
 
 
 class AdminLeadFromBucketCreate(BaseModel):
@@ -4874,6 +4876,9 @@ async def _response(
                 business_name=(intake.business_name or intake.full_name or "your business").strip(),
             ).model_dump(mode="json")
     _link = intake.bucket_upload_link
+    # The lead is already authorised for this caller at this point, so the
+    # images ride on the same permission as the note text.
+    note_images = await inline_images.hydrate(db, "bucket_note", [str(n.id) for n in notes])
     return DealerIntakeResponse(
         intake=intake_read,
         ai_paused_until=_link.ai_paused_until if _link is not None and engagement.is_paused(_link) else None,
@@ -4891,7 +4896,12 @@ async def _response(
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
         artifacts=[_artifact_read(artifact) for artifact in artifacts],
         email_sends=[_email_send_read(row) for row in email_sends],
-        notes=[BucketNoteRead.model_validate(n) for n in notes],
+        notes=[
+            BucketNoteRead.model_validate(n).model_copy(
+                update={"images": note_images.get(str(n.id), [])}
+            )
+            for n in notes
+        ],
         secure_room_pin=secure_room_pin,
         room_delivery_status=room_delivery_status,
         room_delivery_detail=room_delivery_detail,
@@ -6743,10 +6753,19 @@ async def list_admin_lead_notes(
     intake_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> list[BucketNote]:
+) -> list[BucketNoteRead]:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    return sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+    notes = sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+    # The lead was authorised above; whoever may read the note may see what was
+    # pasted into it.
+    images = await inline_images.hydrate(db, "bucket_note", [str(note.id) for note in notes])
+    return [
+        BucketNoteRead.model_validate(note).model_copy(
+            update={"images": images.get(str(note.id), [])}
+        )
+        for note in notes
+    ]
 
 
 @admin_router.post("/{intake_id}/notes", response_model=BucketNoteRead, status_code=status.HTTP_201_CREATED)
@@ -6756,7 +6775,7 @@ async def create_admin_lead_note(
     request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> BucketNote:
+) -> BucketNoteRead:
     """Internal note on the shared admin <-> dealer-partner thread for this
     lead. visibility="admin" keeps it invisible to the client and to any
     bucket vendor/share viewer — confirmed no other surface reads visibility
@@ -6773,10 +6792,19 @@ async def create_admin_lead_note(
     db.add(note)
     intake.last_message_at = _now()
     await db.flush()
+    attached = await inline_images.attach(
+        db,
+        image_ids=payload.image_ids,
+        subject_kind="bucket_note",
+        subject_id=str(note.id),
+        user_id=user.id,
+    )
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
     await db.commit()
     await db.refresh(note)
-    return note
+    return BucketNoteRead.model_validate(note).model_copy(
+        update={"images": [inline_images.serialize(image) for image in attached]}
+    )
 
 
 @admin_router.patch("/{intake_id}/outcome-status", response_model=DealerIntakeResponse)
@@ -7434,10 +7462,19 @@ async def list_broker_lead_notes(
     intake_id: UUID,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> list[BucketNote]:
+) -> list[BucketNoteRead]:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
-    return sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+    notes = sorted((n for n in intake.bucket.notes if n.visibility == "admin"), key=lambda n: n.created_at)
+    # The lead was authorised above; whoever may read the note may see what was
+    # pasted into it.
+    images = await inline_images.hydrate(db, "bucket_note", [str(note.id) for note in notes])
+    return [
+        BucketNoteRead.model_validate(note).model_copy(
+            update={"images": images.get(str(note.id), [])}
+        )
+        for note in notes
+    ]
 
 
 @broker_router.post("/{intake_id}/notes", response_model=BucketNoteRead, status_code=status.HTTP_201_CREATED)
@@ -7447,7 +7484,7 @@ async def create_broker_lead_note(
     request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-) -> BucketNote:
+) -> BucketNoteRead:
     """Same shared thread as create_admin_lead_note — both routers write/read
     the identical BucketNote rows (visibility='admin'), which is what makes
     this a shared admin<->broker thread with no separate join table."""
@@ -7463,10 +7500,19 @@ async def create_broker_lead_note(
     db.add(note)
     intake.last_message_at = _now()
     await db.flush()
+    attached = await inline_images.attach(
+        db,
+        image_ids=payload.image_ids,
+        subject_kind="bucket_note",
+        subject_id=str(note.id),
+        user_id=user.id,
+    )
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
     await db.commit()
     await db.refresh(note)
-    return note
+    return BucketNoteRead.model_validate(note).model_copy(
+        update={"images": [inline_images.serialize(image) for image in attached]}
+    )
 
 
 @broker_router.post("/{intake_id}/chat", response_model=DealerIntakeResponse)

@@ -549,6 +549,15 @@ class BucketSharedDownloadCreate(BaseModel):
     passcode: str
 
 
+class BucketNoteImageRead(BaseModel):
+    id: UUID
+    filename: str
+    mime_type: str
+    size_bytes: int
+    #: Signed and short-lived. None when object storage is not configured.
+    url: str | None = None
+
+
 class BucketNoteRead(ORMModel):
     id: UUID
     bucket_id: UUID
@@ -560,6 +569,8 @@ class BucketNoteRead(ORMModel):
     content: str
     created_at: datetime
     updated_at: datetime
+    #: Images pasted into this note, oldest first.
+    images: list[BucketNoteImageRead] = []
 
 
 class BucketActivityRead(ORMModel):
