@@ -111,6 +111,7 @@ def test_admin_intake_requires_a_matching_shape_room_pin() -> None:
     row = AdminLeadCreate(
         full_name="Jane Owner",
         email="jane@example.com",
+        phone="(973) 555-0148",
         business_name="Example LLC",
         secure_room_pin="104293",
     )

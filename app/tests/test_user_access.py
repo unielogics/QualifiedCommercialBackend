@@ -259,6 +259,7 @@ def test_mca_public_intake_preserves_normalized_signup_attribution() -> None:
     payload = McaRefiStart(
         full_name="Example Owner",
         email="owner@example.com",
+        phone="(973) 555-0148",
         source=" public_site ",
         page=" /mca-refinance ",
         program="mca-refinance",

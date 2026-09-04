@@ -41,6 +41,7 @@ from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
+from app.schemas.phone import RequiredPhone
 from app.services import booking_notify, booking_reminders
 from app.services import fred as fred_service
 from app.services.booking_availability import (
@@ -93,7 +94,7 @@ class InvestorInquiry(BaseModel):
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
     full_name: str = Field(min_length=1, max_length=160)
-    phone: str = Field(min_length=3, max_length=40)
+    phone: RequiredPhone
     consent: bool
 
 
@@ -179,7 +180,7 @@ class SupportInquiry(BaseModel):
 
     full_name: str = Field(min_length=1, max_length=160)
     email: str = Field(min_length=5, max_length=160)
-    phone: str | None = Field(default=None, max_length=40)
+    phone: RequiredPhone
     topic: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=1, max_length=4000)
@@ -325,7 +326,7 @@ class PublicBookingCreate(BaseModel):
     starts_at: datetime
     full_name: str = Field(min_length=1, max_length=160)
     email: str = Field(min_length=5, max_length=320)
-    phone: str | None = Field(default=None, max_length=40)
+    phone: RequiredPhone
     notes: str | None = Field(default=None, max_length=1000)
     transactional_sms_consent: bool = False
     #: Campaign hint carried by the link (e.g. the rep product booklet appends

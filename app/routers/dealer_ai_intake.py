@@ -86,6 +86,7 @@ from app.schemas.bucket import (
     BucketRequestUploadedFileRead,
 )
 from app.schemas.common import ORMModel
+from app.schemas.phone import OptionalPhone, RequiredPhone
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
@@ -416,7 +417,7 @@ class PublicIntakeAttribution(BaseModel):
 class DealerIntakeStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     terms_accepted: bool = False
     privacy_accepted: bool = False
@@ -433,7 +434,7 @@ class DealerIntakeStart(PublicIntakeAttribution):
 class FundingReviewStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     investor_name: str | None = Field(default=None, max_length=180)
     target_property_address: str | None = Field(default=None, max_length=320)
     transaction_type: str | None = Field(default=None, max_length=64)
@@ -476,7 +477,7 @@ class AdminLeadCreate(BaseModel):
     variant: str = Field(default="dealer")
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
     # Main Street: an operating business is defined by what it does and what it
@@ -524,7 +525,7 @@ class BrokerLeadCreate(BaseModel):
 
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     notify_client: bool = False
     force_new: bool = False
@@ -549,7 +550,7 @@ class AdminLeadContactUpdate(BaseModel):
 
     full_name: str | None = Field(default=None, min_length=1, max_length=180)
     email: EmailStr | None = None
-    phone: str | None = Field(default=None, max_length=48)
+    phone: OptionalPhone = None
     business_name: str | None = Field(default=None, max_length=180)
     loan_purpose: str | None = Field(default=None, max_length=255)
     requested_loan_amount: float | None = Field(default=None, ge=0)
@@ -578,7 +579,7 @@ class AdminLeadFromBucketCreate(BaseModel):
     variant: str = Field(default="dealer")
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)  # or investor name, real-estate
     # Main Street: an operating business is defined by what it does and what it
     # wants, and the program screen cannot run without both. Optional so the
@@ -757,7 +758,7 @@ class LeadProgramFitResponse(BaseModel):
 
 class DealerIntakePatch(BaseModel):
     business_name: str | None = Field(default=None, max_length=180)
-    phone: str | None = Field(default=None, max_length=48)
+    phone: OptionalPhone = None
     loan_purpose: str | None = Field(default=None, max_length=255)
     requested_loan_amount: float | None = Field(default=None, ge=0)
     estimated_credit_score: int | None = Field(default=None, ge=300, le=850)
@@ -10188,7 +10189,7 @@ async def _load_mca_intake_by_session(db: AsyncSession, request: Request) -> tup
 class McaRefiStart(PublicIntakeAttribution):
     full_name: str = Field(min_length=1, max_length=180)
     email: EmailStr
-    phone: str | None = Field(default=None, max_length=48)
+    phone: RequiredPhone
     business_name: str | None = Field(default=None, max_length=180)
     # Optional pre-seed from the marketing calculator, so the room opens
     # already knowing what the applicant typed there.
