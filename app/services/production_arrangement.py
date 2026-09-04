@@ -1480,7 +1480,11 @@ def arrangement_diff(original: dict[str, Any], final: dict[str, Any]) -> dict[st
         o, f = orows.get(pk, {}), frows.get(pk, {})
         row("Covered products", f"products.{pk}.on", f"{PRODUCT_LABELS[pk]} — covered", "bool", o.get("on"), f.get("on"))
         if o.get("on") or f.get("on"):
-            for fld, label, fmt in (("rate", "attachment", "pct"), ("premium", "premium", "money"), ("repay", "repayment withheld", "money"),
+            # cur_rate and cur_premium were absent here, so the desk could
+            # rewrite the current figures between the commitment and the final
+            # and the comparison stayed silent about it.
+            for fld, label, fmt in (("cur_rate", "current attachment", "pct"), ("cur_premium", "current premium", "money"),
+                                    ("rate", "new attachment", "pct"), ("premium", "new premium", "money"), ("repay", "repayment withheld", "money"),
                                     ("comm_pct", "commission", "pct"), ("admin", "admin fee", "money"), ("retention_pct", "retention", "pct"), ("term", "term (months)", "count")):
                 row("Covered products", f"products.{pk}.{fld}", f"{PRODUCT_LABELS[pk]} — {label}", fmt, o.get(fld), f.get(fld))
     for key, label in (("contracts", "Contracts / month"), ("gross", "Gross / month"), ("repay_m", "Repayment / month")):

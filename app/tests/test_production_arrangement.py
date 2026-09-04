@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import UTC
@@ -39,7 +40,9 @@ def seed() -> dict:
         "requested": 1200000, "min_activation": 900000, "term": 36, "dealer_cof": 14.5, "exclusivity": 45,
         "bank_cof": 0.5, "orig_cost": 34000, "prof_fees": 46000, "mgmt_fee": 3200, "loss_prov": 1.5,
         "debt_service": 41300, "markup": 12, "fund_target": 100, "cure_days": 5, "adj_value": 200,
-        "products": SEED_PRODUCTS,
+        # Deep-copied: SEED_PRODUCTS is module-level, and a test that switches a
+        # product off was leaking that into every test that ran after it.
+        "products": copy.deepcopy(SEED_PRODUCTS),
     })
     return arr
 
@@ -392,3 +395,23 @@ def test_arrangement_diff_marks_changes_and_hides_desk_only_rows_from_the_dealer
     assert d["changed_count"] == sum(1 for r in d["rows"] if r["changed"]) > 0
     import json as _json
     _json.dumps(d)
+
+
+def test_the_comparison_shows_the_current_figures_moving_too():
+    """cur_rate and cur_premium were absent from the diff, so the desk could
+    restate the dealer's current production between the executed commitment and
+    the final and the comparison said nothing — on the very figures every
+    operative threshold is derived from."""
+    a = seed()
+    c1 = pa.compute(a)
+    b = {**a, "products": {**a["products"], "vsc": {**a["products"]["vsc"], "cur_rate": 20, "cur_premium": 999}}}
+    c2 = pa.compute(b)
+    d = pa.arrangement_diff({"arrangement": a, "computed": c1}, {"arrangement": b, "computed": c2})
+    rows = {r["key"]: r for r in d["rows"]}
+
+    assert rows["products.vsc.cur_rate"]["changed"] is True
+    assert rows["products.vsc.cur_premium"]["changed"] is True
+    assert rows["products.vsc.cur_premium"]["after"] == "$999"
+    # And the labels say which side of the table each row came from.
+    assert "current" in rows["products.vsc.cur_rate"]["label"]
+    assert "new" in rows["products.vsc.rate"]["label"]

@@ -177,8 +177,8 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append(_field("Relationship manager", " · ".join(p for p in (arr.get("rm_name"), arr.get("rm_employer")) if p)))
     out.append("</div>")
 
-    # 2. Today vs committed
-    out.append("<h2>2. Today versus the commitment</h2>")
+    # 2. Current vs new
+    out.append("<h2>2. Current versus new</h2>")
     out.append(
         f'<p>On <b>{_num(e["units"])}</b> retail units a month, today\'s verified production is '
         f'<b>{_num(e["cur_contracts"])}</b> contracts and <b>{_money(e["cur_gross"])}</b> gross. '
@@ -186,8 +186,8 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
         f'{_signed_num(e["d_contracts"])} contracts and {_signed_money(e["d_gross"])} a month, '
         f'{_signed_money(e["d_gross_term"])} over the {term}-month term.</p>'
     )
-    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">Today attach</th><th class=\"n\">Today premium</th>"
-               "<th class=\"n\">Committed attach</th><th class=\"n\">Committed premium</th><th class=\"n\">Uplift / contract</th>"
+    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">Current attach</th><th class=\"n\">Current premium</th>"
+               "<th class=\"n\">New attach</th><th class=\"n\">New premium</th><th class=\"n\">Uplift / contract</th>"
                "<th class=\"n\">+ Contracts / mo</th><th class=\"n\">+ Gross / mo</th></tr></thead><tbody>")
     for r in rows_on:
         out.append(
@@ -265,7 +265,7 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
         )
     if build["solve_rows"]:
         out.append(f'<p>To fund {_pct(build["fund_target_pct"], 0)} of the payment from policy production, the repayment withheld per contract would need to be:</p>')
-        out.append("<table><thead><tr><th>Product</th><th class=\"n\">Contracts / mo</th><th class=\"n\">Today premium</th><th class=\"n\">Withhold / contract</th><th class=\"n\">Premium needed</th><th class=\"n\">Uplift</th></tr></thead><tbody>")
+        out.append("<table><thead><tr><th>Product</th><th class=\"n\">Contracts / mo</th><th class=\"n\">Current premium</th><th class=\"n\">Withhold / contract</th><th class=\"n\">Premium needed</th><th class=\"n\">Uplift</th></tr></thead><tbody>")
         for r in build["solve_rows"]:
             out.append(f'<tr><td>{_e(r["label"])}</td><td class="n">{_num(r["contracts"])}</td><td class="n">{_money(r["cur_premium"])}</td><td class="n">{_money(r["solve_repay"])}</td><td class="n">{_money(r["needed"])}</td><td class="n">{_signed_money(r["uplift"])}</td></tr>')
         out.append("</tbody></table>")
@@ -415,7 +415,7 @@ def build_agreement_html(
 
     # Schedule B
     out.append("<h2>Schedule B — Covered Products, economics and operative thresholds</h2>")
-    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">Attachment</th><th class=\"n\">Premium</th><th class=\"n\">Repayment withheld</th><th class=\"n\">Commission</th><th class=\"n\">Admin fee</th><th class=\"n\">Retention</th><th class=\"n\">Term</th></tr></thead><tbody>")
+    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">New attachment</th><th class=\"n\">New premium</th><th class=\"n\">Repayment withheld</th><th class=\"n\">Commission</th><th class=\"n\">Admin fee</th><th class=\"n\">Retention</th><th class=\"n\">Term</th></tr></thead><tbody>")
     for r in rows_on:
         out.append(
             f'<tr><td>{_e(r["label"])}</td><td class="n">{_pct(r["rate"], 0)}</td><td class="n">{_money(r["premium"])}</td>'
