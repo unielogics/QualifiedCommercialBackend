@@ -36,6 +36,11 @@ class User(TimestampMixin, Base):
     clerk_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+    # An operator's own contact details (alembic 0190). The Production Package
+    # has always required the relationship manager's phone to send stage one and
+    # had nowhere to read one from: it lives in Clerk, which we never read.
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
     role: Mapped[Role] = mapped_column(String(32), nullable=False, default=Role.CLIENT)
     # Additional console entry points for operator identities. ``role`` remains
     # the primary permission profile; these values add narrowly scoped access.

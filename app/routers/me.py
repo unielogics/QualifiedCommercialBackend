@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings as get_app_config
 from app.db import get_db
 from app.deps import CurrentUser
+from app.dealer_os.services.consent_delivery import normalize_phone
 from app.enums import Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
@@ -202,6 +203,47 @@ def _booking_invite_body(body: str, booking_url: str) -> str:
     if booking_url in cleaned:
         return cleaned
     return f"{cleaned}\n\nChoose a time that works for you:\n{booking_url}"
+
+
+class ProfileRead(BaseModel):
+    name: str
+    email: str
+    phone: str | None = None
+    title: str | None = None
+
+
+class ProfileUpdate(BaseModel):
+    """An operator's own contact details.
+
+    The Production Package has always required the relationship manager's phone
+    to send stage one, and until 0190 there was nowhere to keep one — it exists
+    only in Clerk, which the backend never reads.
+    """
+
+    phone: str | None = Field(default=None, max_length=40)
+    title: str | None = Field(default=None, max_length=120)
+
+
+@router.get("/profile", response_model=ProfileRead)
+async def read_profile(user: CurrentUser) -> ProfileRead:
+    return ProfileRead(name=user.name, email=user.email, phone=user.phone, title=user.title)
+
+
+@router.patch("/profile", response_model=ProfileRead)
+async def update_profile(
+    payload: ProfileUpdate, user: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> ProfileRead:
+    changes = payload.model_dump(exclude_unset=True)
+    if "phone" in changes:
+        raw = (changes["phone"] or "").strip()
+        # E.164 where the number is unambiguous, otherwise exactly what they
+        # typed: this one is printed on an agreement, not texted, so an
+        # extension or a switchboard note must survive rather than vanish.
+        user.phone = (normalize_phone(raw) or raw) if raw else None
+    if "title" in changes:
+        user.title = (changes["title"] or "").strip() or None
+    await db.commit()
+    return ProfileRead(name=user.name, email=user.email, phone=user.phone, title=user.title)
 
 
 @router.get("/booking-settings", response_model=UserBookingSettingsRead)

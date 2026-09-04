@@ -13,12 +13,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.deps import require_role
+from app.deps import CurrentUser, require_role
 from app.enums import ContractSubjectType, ContractType, Role
 from app.models.contract_agreement import ContractAgreement
 from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
 from app.services import clerk as clerk_service
+
+# OPERATOR_ROLES has one definition already; a second copy here is how
+# permission sets drift apart.
+from app.services.production_packages import OPERATOR_ROLES
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -133,6 +137,47 @@ async def list_signed_referral_companies(
         )
     ).scalars().all()
     return [SignedCompanyRead(id=row.id, name=row.name) for row in rows]
+
+
+class TeamMemberRead(BaseModel):
+    """Just enough of a colleague to name them on a document.
+
+    `GET /users` is super-admin only, and rightly so — it carries invite state,
+    account status and referral-company wiring. But the Production Package's
+    relationship-manager picker renders for every operator and used that route,
+    swallowing the 403, so an underwriter or a rep silently got an empty list
+    and `rm_user_id` was never set. This is the list they actually need.
+    """
+
+    id: UUID
+    name: str
+    email: str
+    phone: str | None = None
+    title: str | None = None
+    role: str
+
+
+@router.get("/team", response_model=list[TeamMemberRead])
+async def list_team(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> list[TeamMemberRead]:
+    if user.role not in OPERATOR_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required")
+    rows = (
+        await db.execute(
+            select(User)
+            .where(
+                # Field reps are selectable as a relationship manager today;
+                # this list must not quietly narrow that.
+                User.role.in_([Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP]),
+                User.deleted_at.is_(None),
+                User.account_status == "active",
+            )
+            .order_by(User.name)
+        )
+    ).scalars().all()
+    return [
+        TeamMemberRead(id=r.id, name=r.name, email=r.email, phone=r.phone, title=r.title, role=str(r.role))
+        for r in rows
+    ]
 
 
 @router.get(

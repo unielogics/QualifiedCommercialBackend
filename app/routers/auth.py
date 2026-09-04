@@ -44,6 +44,10 @@ class MeResponse(ORMModel):
     referral_partner_company_id: UUID | None = None
     account_types: list[str]
     account_status: str
+    # An operator's own contact details. The Production Package names the
+    # relationship manager and their phone on both agreements.
+    phone: str | None = None
+    title: str | None = None
     can_access_funding: bool
     can_access_audit: bool
 
@@ -63,6 +67,8 @@ async def me(user: CurrentUser) -> MeResponse:
         referral_partner_company_id=user.referral_partner_company_id,
         account_types=effective_account_types,
         account_status=user.account_status,
+        phone=user.phone,
+        title=user.title,
         can_access_funding=has_product_access(user, ProductAccountType.FUNDING),
         can_access_audit=has_product_access(user, ProductAccountType.AUDIT),
     )
