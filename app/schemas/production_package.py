@@ -59,7 +59,33 @@ class SponsorOptionRead(BaseModel):
     principal_address: str | None = None
     notice_email: str | None = None
     notice_attention: str | None = None
+    notice_address: str | None = None
+    platform_name: str | None = None
+    signatory_name: str | None = None
+    signatory_title: str | None = None
+    phone: str | None = None
     agreement: SponsorAgreementRead | None = None
+    editable: bool = False
+
+
+class SponsorCompanyUpdate(BaseModel):
+    """Corrections to the sponsor company itself, not to one package's copy.
+
+    A company created blank by the invite path had no write path anywhere, so
+    it could never be fixed. Every field is optional; only what is sent is
+    written.
+    """
+
+    entity_type: str | None = Field(default=None, max_length=64)
+    state_of_formation: str | None = Field(default=None, max_length=64)
+    principal_address: str | None = Field(default=None, max_length=512)
+    notice_email: str | None = Field(default=None, max_length=320)
+    notice_attention: str | None = Field(default=None, max_length=255)
+    notice_address: str | None = Field(default=None, max_length=512)
+    platform_name: str | None = Field(default=None, max_length=255)
+    signatory_name: str | None = Field(default=None, max_length=255)
+    signatory_title: str | None = Field(default=None, max_length=128)
+    phone: str | None = Field(default=None, max_length=40)
 
 
 class ProductionShareLinkCreate(BaseModel):

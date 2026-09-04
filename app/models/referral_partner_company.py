@@ -33,3 +33,14 @@ class ReferralPartnerCompany(TimestampMixin, Base):
     entity_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     state_of_formation: Mapped[str | None] = mapped_column(String(64), nullable=True)
     principal_address: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Notice and signatory details. Backfilled in 0189 from the company's own
+    # signed Strategic Referral agreement, which records all but the phone;
+    # editable from the desk thereafter, because a company created blank by the
+    # invite path could not otherwise ever be corrected.
+    notice_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    notice_attention: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notice_address: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    platform_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    signatory_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    signatory_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)

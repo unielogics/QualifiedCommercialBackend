@@ -380,10 +380,59 @@ def _sponsor_option(company: ReferralPartnerCompany, agreement: ContractAgreemen
         entity_type=company.entity_type or fv.get("referral_partner_entity_type") or None,
         state_of_formation=company.state_of_formation or fv.get("referral_partner_state_of_organization") or None,
         principal_address=company.principal_address or fv.get("referral_partner_principal_place_of_business") or None,
-        notice_email=(fv.get("referral_partner_notice_email") or "").strip() or None,
-        notice_attention=(fv.get("referral_partner_notice_attn") or "").strip() or None,
+        # The company row wins over the signed agreement: a value corrected on
+        # the company is the newer fact, and the agreement cannot be edited.
+        notice_email=company.notice_email or (fv.get("referral_partner_notice_email") or "").strip() or None,
+        notice_attention=company.notice_attention or (fv.get("referral_partner_notice_attn") or "").strip() or None,
+        notice_address=company.notice_address or _rpa_notice_address(fv) or None,
+        platform_name=company.platform_name or None,
+        signatory_name=company.signatory_name or (fv.get("counterparty_signatory_name") or "").strip() or None,
+        signatory_title=company.signatory_title or (fv.get("counterparty_signatory_title") or "").strip() or None,
+        phone=company.phone or None,
         agreement=_agreement_read(agreement, user=user),
+        editable=bool(user is not None and getattr(user, "role", None) in SEND_ROLES),
     )
+
+
+def _rpa_notice_address(fv: dict[str, Any]) -> str:
+    lines = [str(fv.get(k) or "").strip() for k in ("referral_partner_notice_address_line1", "referral_partner_notice_address_line2")]
+    return ", ".join(p for p in lines if p)
+
+
+# The company's name and id are not among these: the name identifies the party on
+# a signed agreement, and renaming it would silently repoint every package.
+SPONSOR_EDITABLE_FIELDS: frozenset[str] = frozenset({
+    "entity_type", "state_of_formation", "principal_address", "notice_email",
+    "notice_attention", "notice_address", "platform_name", "signatory_name",
+    "signatory_title", "phone",
+})
+
+
+async def update_sponsor_company(
+    db: AsyncSession, company_id: UUID, changes: dict[str, Any], *, user: User
+) -> SponsorOptionRead:
+    """Correct the sponsor company itself.
+
+    There was no write path for one of these rows anywhere in the product — the
+    invite flow creates them and nothing could ever fix one — so a company that
+    arrived without an entity type stayed blank on every package forever.
+
+    This writes the company, not the package. A package already sent carries its
+    own copy and must not follow a later correction; picking the sponsor again
+    is what copies the new values onto a draft.
+    """
+    if getattr(user, "role", None) not in SEND_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "The sponsor is maintained by the desk.")
+    company = await db.get(ReferralPartnerCompany, company_id)
+    if company is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such sponsor.")
+    for key, value in changes.items():
+        if key not in SPONSOR_EDITABLE_FIELDS:
+            continue
+        text = str(value).strip() if value is not None else ""
+        setattr(company, key, text or None)
+    await db.flush()
+    return _sponsor_option(company, await _latest_rpa(db, company.id), user=user)
 
 
 async def sponsor_options(db: AsyncSession, *, user: User) -> list[SponsorOptionRead]:
@@ -483,6 +532,10 @@ async def _apply_sponsor(db: AsyncSession, access: PackageAccess, company_id: UU
         "sponsor_entity": prefill_svc.normalize_entity_type(option.entity_type) if option.entity_type else "",
         "sponsor_address": option.principal_address or "",
         "sponsor_email": option.notice_email or "",
+        # Was absent from this map, so switching sponsors left the previous
+        # sponsor's platform on the arrangement — a stage-one-required field
+        # naming the wrong company on Schedule A.
+        "sponsor_platform": option.platform_name or "",
     }
     for key, value in values.items():
         arrangement[key] = value

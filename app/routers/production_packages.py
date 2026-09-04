@@ -36,6 +36,7 @@ from app.schemas.production_package import (
     ProductionTermSheetBody,
     ProductionTermSheetResult,
     ProductionTermSheetState,
+    SponsorCompanyUpdate,
     SponsorOptionRead,
 )
 from app.services import production_arrangement as pa
@@ -57,6 +58,18 @@ async def list_sponsors(user: CurrentUser, db: AsyncSession = Depends(get_db)) -
     if user.role not in svc.OPERATOR_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Team role required")
     return await svc.sponsor_options(db, user=user)
+
+
+@router.patch("/sponsors/{company_id}", response_model=SponsorOptionRead)
+async def update_sponsor(
+    company_id: UUID, payload: SponsorCompanyUpdate, user: CurrentUser, db: AsyncSession = Depends(get_db),
+) -> SponsorOptionRead:
+    """Correct the sponsor company. The desk owns it; packages copy from it."""
+    out = await svc.update_sponsor_company(
+        db, company_id, payload.model_dump(exclude_unset=True), user=user
+    )
+    await db.commit()
+    return out
 
 
 # ---- term sheet (keyed on the profile: terms are recorded before any final exists) ----
