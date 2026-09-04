@@ -17,6 +17,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import func, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -856,6 +857,13 @@ def _share_link_read(link: ProductionPackageShareLink, names: dict[UUID, str]) -
 
 async def serialize(db: AsyncSession, access: PackageAccess) -> ProductionPackageRead:
     package = access.package
+    # Every writing route commits before serialising. `updated_at` carries a
+    # server-side onupdate, so the UPDATE flush expires it however
+    # expire_on_commit is set, and reading it back lazily raises MissingGreenlet
+    # in an async session — the write lands, the response 500s, and the client
+    # keeps a stale version until the next PATCH 409s. Reload it once.
+    if "updated_at" in sa_inspect(package).unloaded:
+        await db.refresh(package, ["updated_at"])
     operator = access.is_operator
     arrangement = {**pa.empty_arrangement(), **(package.arrangement or {})}
     computed = package.computed_cache or pa.jsonable(pa.compute(arrangement))
