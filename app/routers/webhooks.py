@@ -156,6 +156,47 @@ def _parse_occurred_at(value: object) -> datetime | None:
         return None
 
 
+async def _store_inbound_attachments(
+    db, *, ledger_row_id, attachments: list[dict]
+) -> int:
+    """Decode what the relay handed over and file it against the message.
+
+    Deliberately forgiving: a malformed or oversized part is skipped rather
+    than raised. The reply is the record that has to survive; its picture is a
+    bonus, and losing the whole text because one attachment was odd would be
+    the wrong trade.
+    """
+    if not attachments:
+        return 0
+    from app.services import inline_images
+
+    stored = 0
+    for part in attachments[:5]:  # a sane ceiling on one message
+        if not isinstance(part, dict):
+            continue
+        raw = part.get("data") or ""
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            data = base64.b64decode(raw, validate=True)
+        except Exception:  # noqa: BLE001
+            log.warning("sms webhook: undecodable attachment, skipped")
+            continue
+        row = await inline_images.store_bytes(
+            db,
+            subject_kind="sms_message",
+            subject_id=str(ledger_row_id),
+            filename=str(part.get("name") or "mms-image"),
+            mime_type=str(part.get("content_type") or part.get("contentType") or ""),
+            data=data,
+        )
+        if row is not None:
+            stored += 1
+    if stored:
+        log.info("sms webhook: stored %d inbound image(s)", stored)
+    return stored
+
+
 async def _store_inbound_sms(
     *,
     provider: str,
@@ -164,6 +205,7 @@ async def _store_inbound_sms(
     to_phone: str | None,
     body: str,
     occurred_at: datetime | None = None,
+    attachments: list[dict] | None = None,
 ) -> Response:
     async with SessionLocal() as db:
         if provider_id:
@@ -220,6 +262,12 @@ async def _store_inbound_sms(
             client_id=ledger_client.id if ledger_client is not None else None,
             occurred_at=occurred_at,
         )
+
+        # A picture the client texted us. MMS was arriving with the image
+        # silently dropped — bank statements and IDs among them — because the
+        # poller only ever read the text preview. Bound to the ledger row, so it
+        # is visible wherever that message is.
+        await _store_inbound_attachments(db, ledger_row_id=ledger_row.id, attachments=attachments or [])
 
         recipient_ids = {contact.owner_user_id for contact in contacts if contact.owner_user_id}
         if ledger_client is not None:
@@ -829,4 +877,5 @@ async def sms_inbound(request: Request) -> Response:
         to_phone=normalize_phone((body or {}).get("to") or ""),
         body=message,
         occurred_at=occurred_at,
+        attachments=(body or {}).get("attachments") or [],
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -50,6 +51,15 @@ class UnifiedCommunicationThreadPage(BaseModel):
     unread_total: int = 0
 
 
+class CommunicationImage(BaseModel):
+    id: UUID
+    filename: str
+    mime_type: str
+    size_bytes: int
+    #: Signed and short-lived. None when object storage is not configured.
+    url: str | None = None
+
+
 class UnifiedCommunicationMessage(BaseModel):
     id: str
     thread_id: str
@@ -62,6 +72,8 @@ class UnifiedCommunicationMessage(BaseModel):
     created_at: datetime
     seen: bool = True
     delivery_status: str | None = None
+    #: Pictures on this message. Today that means an MMS the client sent us.
+    images: list[CommunicationImage] = []
 
 
 class UnifiedCommunicationThreadDetail(BaseModel):

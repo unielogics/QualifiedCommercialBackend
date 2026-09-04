@@ -40,7 +40,16 @@ log = logging.getLogger(__name__)
 #: Closed set. A typo in a caller cannot quietly open a new namespace whose
 #: rows nothing will ever read back.
 SUBJECT_KINDS = frozenset(
-    {"deal_note", "bucket_note", "dealer_message", "appointment_activity"}
+    {
+        "deal_note",
+        "bucket_note",
+        "dealer_message",
+        "appointment_activity",
+        # Not pasted by anyone here: a picture the client texted us, stored by
+        # store_bytes when the relay hands it over. Same table because the read
+        # path and the rendering are identical.
+        "sms_message",
+    }
 )
 
 #: Formats a browser actually puts on the clipboard for a screenshot, plus the
@@ -193,6 +202,66 @@ async def attach(
         )
     return attached
 
+
+
+async def store_bytes(
+    db: AsyncSession,
+    *,
+    subject_kind: str,
+    subject_id: str,
+    filename: str,
+    mime_type: str,
+    data: bytes,
+    uploaded_by_user_id: UUID | None = None,
+) -> InlineImage | None:
+    """Store bytes we already hold, bound immediately.
+
+    The presigned-PUT flow exists because a browser should not push a file
+    through our API. That reasoning does not apply to an MMS the relay has
+    already downloaded from the handset — there is no browser, and the bytes
+    are in hand. Returns None when the type is not one we render or object
+    storage is not configured, because a dropped picture must not fail the text
+    that carried it.
+    """
+    normalized = (mime_type or "").split(";")[0].strip().lower()
+    if subject_kind not in SUBJECT_KINDS or normalized not in ALLOWED_MIME:
+        return None
+    if not data or len(data) > MAX_IMAGE_BYTES:
+        return None
+    settings = get_settings()
+    if not settings.s3_bucket:
+        return None
+
+    safe = _safe_filename(filename)
+    key = f"inline-images/{subject_kind}/{uuid4()}-{safe}"
+    try:
+        _s3_client().put_object(
+            Bucket=settings.s3_bucket,
+            Key=key,
+            Body=data,
+            ContentType=normalized,
+            ServerSideEncryption="AES256",
+        )
+    except Exception:  # noqa: BLE001
+        # The message itself is the record that matters; losing its picture is
+        # bad but losing the reply would be worse.
+        log.exception("inline images: could not store %s bytes for %s", len(data), subject_kind)
+        return None
+
+    row = InlineImage(
+        subject_kind=subject_kind,
+        subject_id=str(subject_id),
+        s3_key=key,
+        filename=safe,
+        mime_type=normalized,
+        size_bytes=len(data),
+        uploaded_by_user_id=uploaded_by_user_id,
+        status="ready",
+        attached_at=datetime.now(UTC),
+    )
+    db.add(row)
+    await db.flush()
+    return row
 
 def view_url(row: InlineImage) -> str | None:
     """Short-lived signed GET. The browser never sees a raw S3 key."""

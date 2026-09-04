@@ -49,6 +49,7 @@ from app.schemas.communication import (
     UnifiedContactPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
+from app.services import inline_images
 from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
 from app.services.user_access import is_audit_client
@@ -1131,6 +1132,9 @@ async def get_unified_communication_thread(
         # format it was stored — see _sms_threads.
         stmt = select(SmsMessage).where(_same_number(parts[2]))
         rows = list((await db.execute(stmt.order_by(SmsMessage.created_at.asc()))).scalars().all())
+        # A picture the client texted us, filed against the ledger row. The
+        # thread was already authorised above, so these ride the same decision.
+        sms_images = await inline_images.hydrate(db, "sms_message", [str(row.id) for row in rows])
         messages = [
             UnifiedCommunicationMessage(
                 id=str(row.id), thread_id=thread_id,
@@ -1142,6 +1146,7 @@ async def get_unified_communication_thread(
                 channel="sms", transport=f"sms:{row.provider}" if row.provider else "sms",
                 created_at=row.created_at,
                 delivery_status=row.status if row.direction == "outbound" else None,
+                images=sms_images.get(str(row.id), []),
             ) for row in rows
         ]
     elif parts[0] == "email":
