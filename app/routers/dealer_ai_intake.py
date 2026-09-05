@@ -5594,7 +5594,7 @@ async def _submit_debt_schedule_form(
         total_balance=key_facts["total_outstanding_balance"],
         total_monthly=key_facts["total_monthly_debt_service"],
     )
-    return await _store_drafted_form_pdf(
+    stored = await _store_drafted_form_pdf(
         db,
         intake,
         req,
@@ -5606,6 +5606,71 @@ async def _submit_debt_schedule_form(
         actor_name=actor_name,
         actor_email=actor_email,
     )
+    await _persist_client_debt_rows(db, intake, payload)
+    return stored
+
+
+async def _persist_client_debt_rows(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    payload: DealerDebtScheduleSubmission,
+) -> None:
+    """Put what the borrower typed on the actual debt schedule.
+
+    There were two debt schedules that never spoke: this form, which rendered a
+    PDF and dropped its rows, and `dos_debts`, which is the one the DSCR
+    denominator, the confirmation workflow and the refinance workbench read. A
+    borrower could fill this in and the DSCR would never know.
+
+    Rows land as `origin='client_form'` — the same standing as a row extracted
+    from a document the borrower uploaded, which is the honest comparison: both
+    are the borrower's own account of what they owe, neither is confirmed by the
+    desk. The desk's existing confirmation step is what promotes them, and
+    `count_in_dscr` keeps its existing rule rather than gaining an exception.
+
+    Non-fatal, like the statement: the PDF already satisfies the checklist, so a
+    failure here costs the structured copy and costs the borrower nothing.
+    """
+    from app.dealer_os.models import DealerDebt
+    from app.services import application_profiles as profile_service
+
+    try:
+        profile = await profile_service.provision_profile_for_intake(db, intake)
+        existing = (
+            (
+                await db.execute(
+                    select(DealerDebt).where(
+                        DealerDebt.profile_id == profile.id,
+                        DealerDebt.origin == "client_form",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # The form is the borrower's whole answer, so a resubmission replaces
+        # what they said last time rather than appending a second copy of it.
+        for row in existing:
+            await db.delete(row)
+        await db.flush()
+
+        for entry in payload.debts:
+            db.add(
+                DealerDebt(
+                    profile_id=profile.id,
+                    dealer_id=profile.dealer_id,
+                    lender=entry.lender[:180],
+                    balance=entry.balance,
+                    monthly_payment=entry.monthly_payment,
+                    origin="client_form",
+                    status="active",
+                )
+            )
+        await db.flush()
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "debt schedule: could not persist client rows for intake %s", intake.id
+        )
 
 
 @router.post("/start", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)

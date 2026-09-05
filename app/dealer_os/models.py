@@ -949,11 +949,22 @@ class DealerDebt(TimestampMixin, Base):
     evidence that it was proposed."""
 
     __tablename__ = "dos_debts"
-    __table_args__ = (Index("ix_dos_debts_dealer", "dealer_id"),)
+    __table_args__ = (
+        Index("ix_dos_debts_dealer", "dealer_id"),
+        Index("ix_dos_debts_profile", "profile_id"),
+    )
 
     id: Mapped[uuid.UUID] = _pk()
-    dealer_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE"), nullable=False
+    #: The file this obligation belongs to (0193). The primary key going
+    #: forward: only a minority of files have a dealer record, and a debt
+    #: schedule the borrower fills in has to land somewhere on every file.
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE")
+    )
+    #: Retained and still populated where a dealer exists — the rep app, the
+    #: refinance workbench and the vendor rollup all read it.
+    dealer_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="CASCADE")
     )
     lender: Mapped[str] = mapped_column(String(180), nullable=False)
     category: Mapped[str] = mapped_column(String(24), default="loan", server_default="loan")
