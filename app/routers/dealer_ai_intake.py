@@ -5436,43 +5436,19 @@ async def _store_drafted_form_pdf(
     extract_debt_schedule / extract_personal_financial_statements identically
     to a real AI-analyzed upload — those readers only look at `classification`
     and `key_facts`, never at provenance."""
-    _, prefix, _ = _bucket_storage_config()
-    file_id = uuid4()
-    s3_key = f"{prefix}/drafted-forms/{intake.bucket_id}/{file_id}.pdf"
-    _put_bucket_object(s3_key, "application/pdf", pdf_bytes)
-    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    from app.services.drafted_forms import store_form_pdf
 
-    result_file = BucketFile(
-        id=file_id,
+    result_file = await store_form_pdf(
+        db,
         bucket_id=intake.bucket_id,
-        requested_document_id=req.id,
         upload_link_id=intake.bucket_upload_link_id,
-        file_name=f"{file_label}.pdf"[:255],
-        s3_key=s3_key,
-        content_type="application/pdf",
-        size_bytes=len(pdf_bytes),
-        uploaded_by_name=actor_name,
-        uploaded_by_email=actor_email,
-        status="uploaded",
-    )
-    db.add(result_file)
-    req.status = "uploaded"
-    await db.flush()
-
-    db.add(
-        BucketFileAnalysis(
-            bucket_file_id=result_file.id,
-            bucket_id=intake.bucket_id,
-            content_hash=content_hash,
-            analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
-            provider="drafted_form",
-            status="completed",
-            classification=classification,
-            confidence="high",
-            summary=f"{file_label} submitted via the on-screen drafting form.",
-            analysis={"key_facts": key_facts},
-            analyzed_at=_now(),
-        )
+        requested_document=req,
+        pdf_bytes=pdf_bytes,
+        file_label=file_label,
+        classification=classification,
+        key_facts=key_facts,
+        actor_name=actor_name,
+        actor_email=actor_email,
     )
 
     await _log(

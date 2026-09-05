@@ -716,3 +716,59 @@ class PublicFileOwnerConsentResult(BaseModel):
     completed: bool
     credit_tier: str | None = None
     credit_score_band: str | None = None
+
+
+class FinancialStatementOwnerLink(BaseModel):
+    """Which applicant a statement speaks for, in whichever table they live in.
+
+    Owners are split across `application_owners` and `dos_owners` depending on
+    how the file was opened; `owner_storage` on the profile says which, and the
+    same discriminator is echoed here so a caller never has to guess.
+    """
+
+    owner_id: UUID
+    storage: Literal["application", "dealer"]
+    name: str | None = None
+
+
+class FinancialStatementRead(BaseModel):
+    id: UUID
+    profile_id: UUID
+    statement_date: date | None = None
+    schema_version: str
+    status: str
+    body: dict
+    total_assets: float = 0
+    total_liabilities: float = 0
+    net_worth: float = 0
+    liquid_assets: float = 0
+    submitted_at: datetime | None = None
+    #: True when a staff member completed it for the borrower rather than the
+    #: borrower filling it in themselves.
+    filled_by_staff: bool = False
+    bucket_file_id: UUID | None = None
+    owners: list[FinancialStatementOwnerLink] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class FinancialStatementWrite(BaseModel):
+    body: dict
+    statement_date: str | None = None
+    #: Owners this statement covers. A joint statement — one sheet for a married
+    #: couple — is simply two entries.
+    owners: list[FinancialStatementOwnerLink] = Field(default_factory=list)
+
+
+class FinancialStatementSlotRead(BaseModel):
+    """How the personal-financials request on this file has been met.
+
+    `filled` means someone typed it into our form and we hold the rows;
+    `uploaded` means a document satisfies the slot and we do not. The
+    distinction is the point: only the first can be reopened or corrected.
+    """
+
+    requested: bool = False
+    satisfied: bool = False
+    source: Literal["filled", "uploaded", "none"] = "none"
+    statement_id: UUID | None = None

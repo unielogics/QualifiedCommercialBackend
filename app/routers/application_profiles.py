@@ -37,6 +37,7 @@ from app.models.application_profile import (
 )
 from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
+from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
@@ -79,6 +80,9 @@ from app.schemas.application_profile import (
     FileOwnerPatch,
     FileOwnerRead,
     FileOwnerRequirementState,
+    FinancialStatementOwnerLink,
+    FinancialStatementRead,
+    FinancialStatementWrite,
     FundingCategoryCreate,
     FundingCategoryRead,
     ManualBankOverrideRequest,
@@ -106,7 +110,14 @@ from app.schemas.application_profile import (
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
-from app.services import plaid_lifecycle, plaid_policy
+from app.services import (
+    dealer_forms_pdf,
+    drafted_forms,
+    financial_statements,
+    pfs_schema,
+    plaid_lifecycle,
+    plaid_policy,
+)
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
 from app.services.user_access import is_audit_client, is_funding_client
@@ -3361,3 +3372,283 @@ async def get_application_audit(
 ) -> list[UnifiedAuditEvent]:
     profile = await profiles.load_profile(db, profile_id, user)
     return await profiles.audit_events(db, profile, min(max(limit, 1), 500))
+
+
+# ---------------------------------------------------------------------------
+# Personal financial statements
+#
+# Staff-facing. The borrower's own routes live on the public token; these exist
+# so the desk can retrieve a statement, correct it, or fill one in on a client's
+# behalf — none of which was possible while the form's rows were discarded.
+# ---------------------------------------------------------------------------
+
+_STATEMENT_DENIED_ROLES = {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}
+
+
+def _require_statement_staff(user: User) -> None:
+    if user.role in _STATEMENT_DENIED_ROLES:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only scoped staff may work on a financial statement"
+        )
+
+
+async def _statement_or_404(
+    db: AsyncSession, profile: ApplicationProfile, statement_id: UUID
+) -> FinancialStatement:
+    statement = await db.get(FinancialStatement, statement_id)
+    if statement is None or statement.profile_id != profile.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Financial statement not found")
+    return statement
+
+
+async def _owner_links(
+    db: AsyncSession, profile: ApplicationProfile, statement: FinancialStatement
+) -> list[FinancialStatementOwnerLink]:
+    """The applicants a statement covers, named for display.
+
+    Names come from whichever owner table this file uses, so the panel can show
+    "Applies to John and Mary" without the caller knowing which storage backs it.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(FinancialStatementOwner).where(
+                    FinancialStatementOwner.statement_id == statement.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return []
+    by_id = {owner.id: owner for owner in await profiles.owner_rows(db, profile)}
+    links: list[FinancialStatementOwnerLink] = []
+    for row in rows:
+        owner_id = row.application_owner_id or row.dealer_owner_id
+        owner = by_id.get(owner_id)
+        links.append(
+            FinancialStatementOwnerLink(
+                owner_id=owner_id,
+                storage="dealer" if row.dealer_owner_id else "application",
+                name=getattr(owner, "full_name", None) if owner else None,
+            )
+        )
+    return links
+
+
+async def _statement_read(
+    db: AsyncSession, profile: ApplicationProfile, statement: FinancialStatement
+) -> FinancialStatementRead:
+    payload = financial_statements.serialize(statement)
+    payload["owners"] = await _owner_links(db, profile, statement)
+    return FinancialStatementRead(**payload)
+
+
+async def _apply_owner_links(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    statement: FinancialStatement,
+    owners: list[FinancialStatementOwnerLink],
+) -> None:
+    """Attach the statement to the applicants it speaks for.
+
+    Ids are checked against this file's own owners, so a statement cannot be
+    pointed at somebody on another file.
+    """
+    valid = {owner.id for owner in await profiles.owner_rows(db, profile)}
+    unknown = [link.owner_id for link in owners if link.owner_id not in valid]
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Those owners are not on this file",
+        )
+    dealer_backed = profile.dealer_id is not None
+    await financial_statements.link_owners(
+        db,
+        statement,
+        application_owner_ids=[link.owner_id for link in owners] if not dealer_backed else [],
+        dealer_owner_ids=[link.owner_id for link in owners] if dealer_backed else [],
+    )
+
+
+@router.get("/financial-statements/schema")
+async def financial_statement_schema(user: CurrentUser) -> dict:
+    """The Form 413 field set, served rather than duplicated.
+
+    The old form hardcoded its labels and liquidity flags in the browser and
+    again in the backend, with a comment asking that the two be kept in sync by
+    hand. They drifted; `pfs_total_liquid_assets` gates programme eligibility,
+    so the drift mattered.
+    """
+    _require_statement_staff(user)
+    return pfs_schema.describe()
+
+
+@router.get("/{profile_id}/financial-statements", response_model=list[FinancialStatementRead])
+async def list_financial_statements(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[FinancialStatementRead]:
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    rows = await financial_statements.for_profile(db, profile.id)
+    return [await _statement_read(db, profile, row) for row in rows]
+
+
+@router.post(
+    "/{profile_id}/financial-statements",
+    response_model=FinancialStatementRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_financial_statement(
+    profile_id: UUID,
+    payload: FinancialStatementWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialStatementRead:
+    """Start a statement, or record one a borrower gave us another way.
+
+    Saved as a draft. Submitting is a separate call, because that is the step
+    that generates the PDF and satisfies the checklist item, and staff building
+    one from a phone call should be able to stop halfway.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    statement = await financial_statements.save_statement(
+        db,
+        profile,
+        body=payload.body or pfs_schema.empty_body(),
+        statement_date=payload.statement_date,
+        status="draft",
+        actor_user_id=user.id,
+    )
+    await _apply_owner_links(db, profile, statement, payload.owners)
+    await profiles.log_profile_action(
+        db, profile, user, "financial_statement.created",
+        "Started a personal financial statement",
+        target_type="financial_statement", target_id=statement.id,
+    )
+    await db.commit()
+    await db.refresh(statement)
+    return await _statement_read(db, profile, statement)
+
+
+@router.patch(
+    "/{profile_id}/financial-statements/{statement_id}", response_model=FinancialStatementRead
+)
+async def update_financial_statement(
+    profile_id: UUID,
+    statement_id: UUID,
+    payload: FinancialStatementWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialStatementRead:
+    """Correct a statement, including one already submitted.
+
+    A submitted statement stays submitted: the PDF on the checklist is the one
+    the borrower signed off, and silently swapping it because someone fixed a
+    typo would change what a partner was sent without saying so. Re-submitting
+    is an explicit act.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    statement = await _statement_or_404(db, profile, statement_id)
+    await financial_statements.save_statement(
+        db,
+        profile,
+        body=payload.body,
+        statement_date=payload.statement_date,
+        status=statement.status,
+        actor_user_id=user.id,
+        statement=statement,
+    )
+    await _apply_owner_links(db, profile, statement, payload.owners)
+    await profiles.log_profile_action(
+        db, profile, user, "financial_statement.updated",
+        "Edited a personal financial statement",
+        target_type="financial_statement", target_id=statement.id,
+    )
+    await db.commit()
+    await db.refresh(statement)
+    return await _statement_read(db, profile, statement)
+
+
+@router.post(
+    "/{profile_id}/financial-statements/{statement_id}/submit",
+    response_model=FinancialStatementRead,
+)
+async def submit_financial_statement(
+    profile_id: UUID,
+    statement_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialStatementRead:
+    """Generate the sheet and satisfy the checklist item.
+
+    Files the PDF exactly as a borrower's own upload would be filed, through the
+    same helper, so the two cannot drift apart about what counts as satisfying a
+    request. `submitted_by_user_id` records that staff completed it, which the
+    audit trail should be able to tell apart from the borrower doing it.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    statement = await _statement_or_404(db, profile, statement_id)
+    if profile.primary_bucket_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This file has no document room to file the statement in"
+        )
+
+    requested = (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.category == "Personal Financials",
+            )
+        )
+    ).scalars().first()
+    if requested is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A personal financial statement is not requested on this file",
+        )
+
+    statement_date = (
+        statement.statement_date.isoformat() if statement.statement_date else "not stated"
+    )
+    applicant = (statement.body or {}).get("applicant") or {}
+    label = f"Personal Financial Statement — {applicant.get('name') or 'applicant'}"
+
+    stored = await drafted_forms.store_form_pdf(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        upload_link_id=None,
+        requested_document=requested,
+        pdf_bytes=dealer_forms_pdf.render_pfs_413_pdf(
+            body=statement.body or {}, statement_date=statement_date
+        ),
+        file_label=label,
+        classification="personal_financial_statement",
+        key_facts=pfs_schema.key_facts(statement.body or {}, statement_date=statement_date),
+        actor_name=user.name or user.email,
+        actor_email=user.email,
+        summary=f"{label} completed by {user.name or user.email} on the borrower's behalf.",
+    )
+    await financial_statements.save_statement(
+        db,
+        profile,
+        body=statement.body or {},
+        status="submitted",
+        actor_user_id=user.id,
+        statement=statement,
+    )
+    statement.bucket_file_id = stored.id
+    await profiles.log_profile_action(
+        db, profile, user, "financial_statement.submitted",
+        "Filed a personal financial statement on the borrower's behalf",
+        target_type="financial_statement", target_id=statement.id,
+    )
+    await db.commit()
+    await db.refresh(statement)
+    return await _statement_read(db, profile, statement)
