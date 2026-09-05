@@ -66,6 +66,14 @@ class DeliveryResult:
     provider_message_id: str | None = None
     sender: str | None = None
     delivery_status: str | None = None
+    #: Exactly what the email leg sent, carried back so the message ledger
+    #: stores the message rather than a re-rendering of it. `secret` is the
+    #: tokened URL, declared so the stored copy has it removed.
+    email_subject: str | None = None
+    email_body: str | None = None
+    email_to: str | None = None
+    email_detail: str | None = None
+    secret: str | None = None
 
     @property
     def message_id(self) -> str | None:
@@ -239,7 +247,11 @@ def deliver_link(
             f"ignore it and nothing will happen.\n\n"
             f"Qualified Commercial\n"
         )
-        email_res = _send_email(to, f"Action needed for {business_name}", body)
+        email_subject = f"Action needed for {business_name}"
+        email_res = _send_email(to, email_subject, body)
+        email_res.email_subject = email_subject
+        email_res.email_body = body
+        email_res.email_to = to
 
     sms_res: DeliveryResult | None = None
     if channel == "sms":
@@ -287,6 +299,13 @@ def deliver_link(
     channel_label = (
         "email+sms" if email_ok and sms_ok else "email" if email_ok else "sms" if sms_ok else "none"
     )
+    composed = {
+        "email_subject": getattr(email_res, "email_subject", None),
+        "email_body": getattr(email_res, "email_body", None),
+        "email_to": getattr(email_res, "email_to", None),
+        "email_detail": email_res.detail if email_res else None,
+        "secret": url,
+    }
     return DeliveryResult(
         email_ok or sms_ok,
         channel_label,
@@ -305,6 +324,7 @@ def deliver_link(
             if sms_res is not None
             else "sent" if email_ok else "failed"
         ),
+        **composed,
     )
 
 
@@ -327,6 +347,9 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
     # Ledger context names the flow (consent link, signing request, ...) so the
     # inbox and audits can tell them apart; deliver_link itself never sees it.
     ledger_context = str(kwargs.pop("ledger_context", "") or "consent_link")[:32]
+    # Who the message is about, for the audit page's ownership rule. Optional:
+    # a caller that does not pass one leaves the row unowned.
+    message_subject = kwargs.pop("message_subject", None)
 
     ok = False
     if kwargs.get("channel") == "sms":
@@ -367,5 +390,29 @@ async def deliver_link_checked(db, **kwargs) -> DeliveryResult:
                 provider_message_id=getattr(result, "provider_message_id", None) or "",
                 detail=detail, context=ledger_context,
             )
+
+    # The email leg. Until now this seam stored nothing at all — deliberately,
+    # because the body carries a live token and there was nowhere safe to put
+    # it. The outbox masks the URL out of the stored copy, so the message can
+    # finally be kept.
+    if result.email_to:
+        from app.services.messaging import outbox
+
+        await outbox.record(
+            db,
+            channel="email",
+            status="sent" if result.email_ok else "failed",
+            draft=outbox.Draft(
+                to=result.email_to,
+                subject=result.email_subject or "",
+                body_text=result.email_body or "",
+                secrets=(result.secret,) if result.secret else (),
+            ),
+            context=ledger_context,
+            provider="ses",
+            provider_message_id=result.provider_message_id if result.email_ok else None,
+            detail="" if result.email_ok else (result.email_detail or result.detail),
+            subject=message_subject,
+        )
 
     return result
