@@ -443,6 +443,8 @@ async def dispatch_due_reminders() -> int:
             # what is still open on the draft file, or nothing when the client
             # has finished (or there is no draft), so the reminder reads as it
             # always did for bookings without one.
+            from app.services.messaging import outbox
+
             extra = await _precall_values(db, precall, notice=notice, event=event, booking=booking, host=host)
             if reminder.channel == "email":
                 subject, body = render_reminder_email(
@@ -467,10 +469,23 @@ async def dispatch_due_reminders() -> int:
                 reminder.error = None if result.ok else result.detail[:1000]
                 notice.email_reminder_status = reminder.status
                 notice.email_reminder_sent_at = now
+                # rendered_body exists on this row and only the precall branch
+                # ever filled it, so a plain reminder left no copy of itself.
+                reminder.rendered_body = f"{subject}\n\n{body}"
                 if result.ok:
                     notice.clear_delivery_error()
                 else:
                     notice.record_delivery_error(result.detail)
+                await outbox.record(
+                    db, channel="email", status="sent" if result.ok else "failed",
+                    draft=outbox.Draft(
+                        to=notice.invitee_email or "", subject=subject, body_text=body
+                    ),
+                    context="booking_reminder", provider="ses",
+                    provider_message_id=getattr(result, "message_id", None),
+                    detail="" if result.ok else result.detail,
+                    subject=outbox.Subject(owner_user_id=notice.booked_by_user_id),
+                )
                 sent += int(result.ok)
             elif reminder.channel == "sms":
                 # Resolved at send time, not at booking time, so editing a

@@ -40,6 +40,15 @@ def _db(row=None):
     return db
 
 
+def _ledger_db():
+    """The notification email now writes a ledger row as well as sending, so
+    the helper needs a session it can add to."""
+    db = SimpleNamespace(added=[])
+    db.add = db.added.append
+    db.flush = AsyncMock()
+    return db
+
+
 def _sms(**over):
     row = SimpleNamespace(
         id=uuid4(), direction="outbound", status="sent", detail="",
@@ -60,7 +69,7 @@ async def test_a_refused_send_reports_itself_rather_than_returning_none():
     refused = SesSendResult(False, None, "send_failed: address suppressed")
     with patch.object(notifications, "send_email", return_value=refused):
         out = await notifications._send_notification_email(
-            "dana@example.com", subject="Hi", body="Body"
+            _ledger_db(), "dana@example.com", subject="Hi", body="Body"
         )
     assert out.ok is False
     assert "suppressed" in out.detail
@@ -69,7 +78,9 @@ async def test_a_refused_send_reports_itself_rather_than_returning_none():
 @pytest.mark.asyncio
 async def test_a_raising_transport_still_returns_a_result():
     with patch.object(notifications, "send_email", side_effect=RuntimeError("boom")):
-        out = await notifications._send_notification_email("d@example.com", subject="s", body="b")
+        out = await notifications._send_notification_email(
+            _ledger_db(), "d@example.com", subject="s", body="b"
+        )
     assert out.ok is False and "boom" in out.detail
 
 
@@ -148,3 +159,21 @@ def test_every_twilio_terminal_state_maps_onto_a_ledger_state():
     assert {_LEDGER_STATUS[k] for k in ("failed", "undelivered", "canceled")} == {"failed"}
     # In-flight states are deliberately absent: the ledger already says "sent".
     assert "queued" not in _LEDGER_STATUS and "sending" not in _LEDGER_STATUS
+
+
+@pytest.mark.asyncio
+async def test_a_notification_email_is_recorded_whether_or_not_it_lands():
+    """Fourteen callers, and none of them left a trace of what was sent."""
+    for ok, expected in ((True, "sent"), (False, "failed")):
+        db = _ledger_db()
+        result = SesSendResult(ok, "SES-9" if ok else None, "sent" if ok else "refused")
+        with patch.object(notifications, "send_email", return_value=result):
+            await notifications._send_notification_email(
+                db, "dana@example.com", subject="A file was uploaded",
+                body="Body", event_type="bucket_file_uploaded",
+            )
+        assert len(db.added) == 1
+        row = db.added[0]
+        assert row.status == expected
+        assert row.context == "bucket_file_uploaded"
+        assert row.channel == "email"

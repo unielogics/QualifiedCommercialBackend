@@ -174,9 +174,12 @@ async def notify_users(
             # recorded as a delivered one, on every caller. Stamp it only when
             # the send actually succeeded, and keep the reason when it did not.
             sent = await _send_notification_email(
+                db,
                 recipient.email,
                 subject=row.title,
                 body=f"{row.body}\n\nOpen Qualified Commercial: {deep_link or '/'}",
+                event_type=event_type,
+                owner_user_id=recipient.id,
             )
             if sent.ok:
                 row.emailed_at = now
@@ -236,12 +239,19 @@ async def notify_inbound_communication(
     )
 
 
-async def _send_notification_email(to_email: str, *, subject: str, body: str) -> SesSendResult:
-    """Send and report. boto3 is blocking, so it runs on a thread — but the
-    caller waits for the answer, because a notification that claims to have been
-    emailed and was not is worse than a slow one."""
+async def _send_notification_email(
+    db: AsyncSession, to_email: str, *, subject: str, body: str,
+    event_type: str = "", owner_user_id=None,
+) -> SesSendResult:
+    """Send, record, and report.
+
+    boto3 is blocking so it runs on a thread, but the caller waits for the
+    answer: a notification that claims to have been emailed and was not is
+    worse than a slow one. The ledger row is what the audit page reads, and it
+    is written whether the send worked or not.
+    """
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             send_email,
             to_email=to_email,
             subject=subject[:200],
@@ -249,7 +259,23 @@ async def _send_notification_email(to_email: str, *, subject: str, body: str) ->
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("notification email failed to=%s", to_email)
-        return SesSendResult(False, None, f"send_failed: {exc}")
+        result = SesSendResult(False, None, f"send_failed: {exc}")
+
+    from app.services.messaging import outbox
+
+    await outbox.record(
+        db,
+        channel="email",
+        status="sent" if result.ok else "failed",
+        draft=outbox.Draft(to=to_email, subject=subject[:200], body_text=body),
+        context=(event_type or "notification")[:48],
+        provider="ses",
+        provider_message_id=result.message_id,
+        detail="" if result.ok else result.detail,
+        # The recipient is a colleague, so the notification is theirs to see.
+        subject=outbox.Subject(owner_user_id=owner_user_id),
+    )
+    return result
 
 
 async def notify_document_uploaded(
