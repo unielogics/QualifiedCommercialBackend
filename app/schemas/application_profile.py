@@ -727,7 +727,11 @@ class FinancialStatementOwnerLink(BaseModel):
     """
 
     owner_id: UUID
-    storage: Literal["application", "dealer"]
+    #: Echoed on reads so a caller never has to guess which table an owner sits
+    #: in. Ignored on writes — the server decides it from the file, because a
+    #: browser cannot know and a wrong value would point the link at the wrong
+    #: table.
+    storage: Literal["application", "dealer"] = "application"
     name: str | None = None
 
 

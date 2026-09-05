@@ -888,6 +888,18 @@ class DealerPfsSubmission(BaseModel):
     acknowledgment: bool
 
 
+class DealerFinancialStatementSave(BaseModel):
+    """A Form 413 body from the client's own page.
+
+    `submit` is the difference between keeping progress and finishing: the page
+    autosaves without it and passes it when they press Save.
+    """
+
+    body: dict
+    statement_date: str | None = None
+    submit: bool = False
+
+
 class DealerDebtScheduleRow(BaseModel):
     lender: str = Field(min_length=1, max_length=180)
     balance: float = Field(ge=0)
@@ -11312,3 +11324,101 @@ async def book_mca_refinance_call(
         public_path=MCA_PUBLIC_PATH,
         assistant_message="Your call is booked. Anything still open on the three-item checklist can be finished right here before the meeting.",
     )
+
+
+@client_router.get("/{intake_id}/financial-statement")
+async def read_client_financial_statement(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The client's own statement, on their own file.
+
+    Scoped through `_load_client_intake`, so a signed-in client reaches their
+    file and nobody else's. The staff endpoints are profile-scoped and refuse
+    the CLIENT role outright; this is the same data through the door a client
+    actually has.
+    """
+    from app.services import application_profiles as profile_service
+    from app.services import financial_statements, pfs_schema
+
+    intake = await _load_client_intake(db, user, intake_id, allow_pending_signing=True)
+    profile = await profile_service.provision_profile_for_intake(db, intake)
+    statement = await financial_statements.latest_for_profile(db, profile.id)
+    await db.commit()
+    return {
+        "schema": pfs_schema.describe(),
+        "statement_id": str(statement.id) if statement else None,
+        "status": statement.status if statement else None,
+        "body": (statement.body if statement else None) or pfs_schema.empty_body(),
+    }
+
+
+@client_router.put("/{intake_id}/financial-statement")
+async def save_client_financial_statement(
+    intake_id: UUID,
+    payload: DealerFinancialStatementSave,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Save what the client has entered, and file it.
+
+    One button for them, as asked: saving is finishing. The rows are kept either
+    way, so a client who spots a wrong figure reopens the page and corrects it
+    rather than starting again.
+    """
+    from app.services import application_profiles as profile_service
+    from app.services import financial_statements
+
+    intake = await _load_client_intake(db, user, intake_id)
+    profile = await profile_service.provision_profile_for_intake(db, intake)
+    statement = await financial_statements.latest_for_profile(db, profile.id)
+    saved = await financial_statements.save_statement(
+        db,
+        profile,
+        body=payload.body,
+        statement_date=payload.statement_date,
+        status=statement.status if statement else "draft",
+        statement=statement,
+    )
+    if payload.submit:
+        req = next(
+            (doc for doc in intake.bucket.requested_documents if doc.category == "Personal Financials"),
+            None,
+        )
+        if req is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "A personal financial statement is not requested on this file",
+            )
+        from app.services import dealer_forms_pdf, drafted_forms, pfs_schema
+
+        statement_date = (
+            saved.statement_date.isoformat() if saved.statement_date else "not stated"
+        )
+        applicant = (payload.body or {}).get("applicant") or {}
+        label = f"Personal Financial Statement — {applicant.get('name') or user.name or 'applicant'}"
+        stored = await drafted_forms.store_form_pdf(
+            db,
+            bucket_id=intake.bucket_id,
+            upload_link_id=intake.bucket_upload_link_id,
+            requested_document=req,
+            pdf_bytes=dealer_forms_pdf.render_pfs_413_pdf(
+                body=payload.body or {}, statement_date=statement_date
+            ),
+            file_label=label,
+            classification="personal_financial_statement",
+            key_facts=pfs_schema.key_facts(payload.body or {}, statement_date=statement_date),
+            actor_name=user.name or user.email,
+            actor_email=user.email,
+            summary=f"{label} submitted by the client from their own account.",
+        )
+        # `submitted_by_user_id` stays null: the client filled this in
+        # themselves, and `filled_by_staff` must not claim otherwise just
+        # because they happened to be signed in.
+        await financial_statements.save_statement(
+            db, profile, body=payload.body or {}, status="submitted", statement=saved
+        )
+        saved.bucket_file_id = stored.id
+    await db.commit()
+    return {"statement_id": str(saved.id), "submitted": bool(payload.submit)}

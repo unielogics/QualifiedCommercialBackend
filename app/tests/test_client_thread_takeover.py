@@ -270,8 +270,12 @@ def test_the_signed_in_loader_gates_writes_and_lets_reads_render_the_gate():
     assert "allow_pending_signing" in source
 
     # Reads pass the flag so the client can see what they owe; writes do not.
+    # The count is deliberately exact: a new call arriving with the flag set
+    # trips this, which is the point — it should be a decision, not a default.
+    # Three reads today: the intake detail, its gate render, and the financial
+    # statement (readable while gated; saving it is a write and is not).
     body = inspect.getsource(router)
     calls = [line for line in body.splitlines() if "_load_client_intake(db, user, intake_id" in line]
     allowed = [c for c in calls if "allow_pending_signing=True" in c]
     assert len(calls) >= 6
-    assert len(allowed) == 2, calls
+    assert len(allowed) == 3, calls
