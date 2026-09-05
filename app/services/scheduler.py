@@ -231,6 +231,16 @@ def start_scheduler() -> None:
     )
 
     scheduler.add_job(
+        _wrap(job_inline_image_sweep),
+        "interval",
+        hours=6,
+        id="inline_image_sweep",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
         _wrap(job_bucket_file_analysis_drain),
         "interval",
         minutes=1,
@@ -602,6 +612,26 @@ async def job_bucket_ai_review_drain() -> None:
             await db.rollback()
             log.exception("bucket_ai_review_drain: failed; rolled back")
 
+
+
+async def job_inline_image_sweep() -> None:
+    """Remove pasted images that never became part of a message or a note.
+
+    Uploads happen on send, so this only ever finds the narrow case where the
+    upload landed and the send that followed it failed. Six-hourly because
+    nothing here is urgent — the point is that the pile does not grow forever.
+    """
+    from app.db import SessionLocal
+    from app.services.inline_images import sweep_orphans
+
+    async with SessionLocal() as db:
+        try:
+            removed = await sweep_orphans(db)
+            if removed:
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("inline_image_sweep failed")
+            await db.rollback()
 
 async def job_bucket_file_analysis_drain() -> None:
     """Analyze files queued on upload-complete so reviews compose from a warm

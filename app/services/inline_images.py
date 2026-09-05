@@ -315,3 +315,59 @@ async def hydrate(
     for row in rows:
         out.setdefault(str(row.subject_id), []).append(serialize(row))
     return out
+
+
+#: How long an unattached upload is allowed to live. Long enough to cover a
+#: send that failed and was retried; short enough that abandoned bytes do not
+#: accumulate.
+ORPHAN_GRACE_HOURS = 24
+
+
+async def sweep_orphans(db: AsyncSession, *, limit: int = 200) -> int:
+    """Delete uploads that never became part of anything.
+
+    Images are uploaded when a message or note is sent, not when one is pasted,
+    so this is a backstop rather than the main line of defence: what it catches
+    is the narrow case where the upload succeeded and the send that followed it
+    did not. Without it those bytes sit in object storage attached to nothing,
+    and the pile only grows.
+
+    A row is only a candidate once it is older than the grace period — a row
+    created seconds ago may belong to a send that is still in flight, and
+    deleting it would break the very message it was uploaded for.
+    """
+    from datetime import timedelta
+
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - timedelta(hours=ORPHAN_GRACE_HOURS)
+    rows = (
+        (
+            await db.execute(
+                select(InlineImage)
+                .where(InlineImage.subject_id.is_(None), InlineImage.created_at < cutoff)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return 0
+
+    client = _s3_client() if settings.s3_bucket else None
+    removed = 0
+    for row in rows:
+        if client is not None and row.s3_key:
+            try:
+                client.delete_object(Bucket=settings.s3_bucket, Key=row.s3_key)
+            except Exception:  # noqa: BLE001
+                # Leave the row so the next sweep tries again. Dropping it here
+                # would strand the object with nothing left pointing at it.
+                log.warning("inline images: could not delete %s, leaving the row", row.s3_key)
+                continue
+        await db.delete(row)
+        removed += 1
+    await db.flush()
+    if removed:
+        log.info("inline images: swept %d unattached upload(s)", removed)
+    return removed

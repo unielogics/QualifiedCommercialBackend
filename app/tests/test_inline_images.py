@@ -169,3 +169,74 @@ async def test_attach_is_a_no_op_without_ids() -> None:
         _FakeSession(), image_ids=[], subject_kind="dealer_message",
         subject_id="m", user_id=uuid.uuid4(),
     ) == []
+
+
+# --- the sweeper -----------------------------------------------------------
+
+
+class _SweepSession(_FakeSession):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.deleted = []
+
+    async def execute(self, _statement):
+        # Stands in for "unattached and older than the grace period".
+        return _FakeResult([r for r in self.rows if r.subject_id is None])
+
+    async def delete(self, row):
+        self.deleted.append(row)
+
+
+@pytest.mark.asyncio
+async def test_the_sweeper_removes_an_upload_that_never_joined_anything(monkeypatch):
+    """Uploads happen on send, so this only catches the narrow case where the
+    upload landed and the send that followed it did not."""
+    orphan = _image(subject_id=None)
+    session = _SweepSession([orphan])
+
+    deleted_keys = []
+
+    class _Client:
+        def delete_object(self, **kwargs):
+            deleted_keys.append(kwargs["Key"])
+
+    monkeypatch.setattr(inline_images, "_s3_client", lambda: _Client())
+    removed = await inline_images.sweep_orphans(session)
+
+    assert removed == 1
+    assert session.deleted == [orphan]
+    assert deleted_keys == [orphan.s3_key]
+
+
+@pytest.mark.asyncio
+async def test_a_row_survives_when_its_object_cannot_be_deleted(monkeypatch):
+    """Dropping the row anyway would strand the object with nothing pointing at
+    it. Leaving it means the next sweep tries again."""
+    orphan = _image(subject_id=None)
+    session = _SweepSession([orphan])
+
+    class _Failing:
+        def delete_object(self, **kwargs):
+            raise RuntimeError("s3 is unhappy")
+
+    monkeypatch.setattr(inline_images, "_s3_client", lambda: _Failing())
+    removed = await inline_images.sweep_orphans(session)
+
+    assert removed == 0
+    assert session.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweeper_leaves_attached_images_alone(monkeypatch):
+    attached = _image(subject_id="message-1")
+    session = _SweepSession([attached])
+    monkeypatch.setattr(inline_images, "_s3_client", lambda: None)
+
+    assert await inline_images.sweep_orphans(session) == 0
+    assert session.deleted == []
+
+
+def test_the_grace_period_is_long_enough_to_cover_a_retried_send():
+    """A row created seconds ago may belong to a send still in flight; deleting
+    it would break the very message it was uploaded for."""
+    assert inline_images.ORPHAN_GRACE_HOURS >= 1
