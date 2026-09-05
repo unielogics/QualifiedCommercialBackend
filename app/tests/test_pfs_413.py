@@ -10,6 +10,7 @@ flag rather than the wording of a label.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 
@@ -250,3 +251,54 @@ def test_the_legacy_mapping_is_positional_not_by_label():
     Matching on them is the fragility this change exists to remove."""
     body = _legacy_body([_Row("Renamed by a designer", 7_000)], [])
     assert float(body["assets"]["cash_on_hand"]) == 7_000.0
+
+
+# --- the share link --------------------------------------------------------
+
+
+def test_the_token_is_stored_only_as_a_hash():
+    """The link carries no access code, so the URL is the whole credential.
+
+    A database read — a backup, a support query, a leaked dump — must not hand
+    somebody a working link.
+    """
+    from app.services import financial_statements
+
+    token = "a-secret-token"
+    digest = financial_statements.hash_token(token)
+
+    assert digest != token
+    assert len(digest) == 64
+    assert financial_statements.hash_token(token) == digest  # stable
+    assert financial_statements.hash_token("a-secret-tokem") != digest
+
+
+def test_a_link_closes_on_expiry_and_on_revocation_independently():
+    """Two different facts: a deadline, and somebody deciding. Either shuts it."""
+    from datetime import timedelta
+
+    from app.models.financial_form_link import FinancialFormLink
+
+    live = FinancialFormLink(kind="pfs", token_hash="x")
+    assert live.is_open is True
+
+    expired = FinancialFormLink(
+        kind="pfs", token_hash="x", expires_at=datetime.now(UTC) - timedelta(seconds=1)
+    )
+    assert expired.is_open is False
+
+    revoked = FinancialFormLink(
+        kind="pfs",
+        token_hash="x",
+        expires_at=datetime.now(UTC) + timedelta(days=30),
+        revoked_at=datetime.now(UTC),
+    )
+    assert revoked.is_open is False
+
+
+def test_links_expire_by_default():
+    """An open link with no end date is a permanent credential to someone's
+    finances living in whatever inbox it was forwarded to."""
+    from app.services import financial_statements
+
+    assert financial_statements.DEFAULT_LINK_TTL_DAYS > 0

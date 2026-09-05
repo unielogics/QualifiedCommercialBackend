@@ -220,3 +220,79 @@ def serialize(statement: FinancialStatement) -> dict[str, Any]:
         "created_at": statement.created_at,
         "updated_at": statement.updated_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# Share links
+# ---------------------------------------------------------------------------
+
+#: Long enough that guessing is not a strategy. The URL is the whole credential
+#: on these links, so this is the only thing standing in front of a balance
+#: sheet.
+_TOKEN_BYTES = 32
+
+#: Links die on their own. An open link with no end date is a permanent
+#: credential to someone's finances living in whatever inbox it was forwarded
+#: to; 30 days is long enough for a borrower who means to get to it.
+DEFAULT_LINK_TTL_DAYS = 30
+
+
+def hash_token(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def mint_link(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    kind: str,
+    statement_id: UUID | None = None,
+    label: str | None = None,
+    invitee_email: str | None = None,
+    created_by: UUID | None = None,
+    ttl_days: int = DEFAULT_LINK_TTL_DAYS,
+) -> tuple[Any, str]:
+    """A new link, and the only time its token exists in readable form.
+
+    Returns `(link, token)`. Only the hash is stored, so this token cannot be
+    recovered later — a lost link is reminted, not looked up.
+    """
+    import secrets
+    from datetime import timedelta
+
+    from app.models.financial_form_link import FinancialFormLink
+
+    token = secrets.token_urlsafe(_TOKEN_BYTES)
+    link = FinancialFormLink(
+        profile_id=profile.id,
+        kind=kind,
+        statement_id=statement_id,
+        token_hash=hash_token(token),
+        label=label,
+        invitee_email=invitee_email,
+        created_by=created_by,
+        expires_at=datetime.now(UTC) + timedelta(days=ttl_days) if ttl_days else None,
+    )
+    db.add(link)
+    await db.flush()
+    return link, token
+
+
+async def link_for_token(db: AsyncSession, token: str):
+    """The live link behind a token, or None.
+
+    Expiry and revocation are checked here rather than by callers, so no route
+    can forget one of them.
+    """
+    from app.models.financial_form_link import FinancialFormLink
+
+    link = (
+        await db.execute(
+            select(FinancialFormLink).where(FinancialFormLink.token_hash == hash_token(token))
+        )
+    ).scalar_one_or_none()
+    if link is None or not link.is_open:
+        return None
+    return link

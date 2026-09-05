@@ -3472,6 +3472,80 @@ async def _apply_owner_links(
     )
 
 
+
+async def _personal_financials_slot(
+    db: AsyncSession, profile: ApplicationProfile
+) -> BucketRequestedDocument:
+    if profile.primary_bucket_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This file has no document room to file the statement in"
+        )
+    requested = (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.category == "Personal Financials",
+            )
+        )
+    ).scalars().first()
+    if requested is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A personal financial statement is not requested on this file",
+        )
+    return requested
+
+
+async def _file_statement(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    statement: FinancialStatement,
+    *,
+    requested_document: BucketRequestedDocument,
+    actor_name: str,
+    actor_email: str,
+    actor_user_id: UUID | None,
+    summary_suffix: str,
+) -> None:
+    """Generate the sheet and satisfy the request.
+
+    One function for both ways a statement gets filed — the borrower pressing
+    Save on their own link, and the desk completing one for them. They differ
+    only in who the actor is, and that difference is recorded rather than
+    reimplemented: `actor_user_id` is null for a borrower, which is what
+    `filled_by_staff` reads.
+    """
+    statement_date = (
+        statement.statement_date.isoformat() if statement.statement_date else "not stated"
+    )
+    applicant = (statement.body or {}).get("applicant") or {}
+    label = f"Personal Financial Statement — {applicant.get('name') or 'applicant'}"
+
+    stored = await drafted_forms.store_form_pdf(
+        db,
+        bucket_id=profile.primary_bucket_id,
+        upload_link_id=None,
+        requested_document=requested_document,
+        pdf_bytes=dealer_forms_pdf.render_pfs_413_pdf(
+            body=statement.body or {}, statement_date=statement_date
+        ),
+        file_label=label,
+        classification="personal_financial_statement",
+        key_facts=pfs_schema.key_facts(statement.body or {}, statement_date=statement_date),
+        actor_name=actor_name,
+        actor_email=actor_email,
+        summary=f"{label} {summary_suffix}",
+    )
+    await financial_statements.save_statement(
+        db,
+        profile,
+        body=statement.body or {},
+        status="submitted",
+        actor_user_id=actor_user_id,
+        statement=statement,
+    )
+    statement.bucket_file_id = stored.id
+
 @router.get("/financial-statements/schema")
 async def financial_statement_schema(user: CurrentUser) -> dict:
     """The Form 413 field set, served rather than duplicated.
@@ -3595,55 +3669,17 @@ async def submit_financial_statement(
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
     statement = await _statement_or_404(db, profile, statement_id)
-    if profile.primary_bucket_id is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, "This file has no document room to file the statement in"
-        )
-
-    requested = (
-        await db.execute(
-            select(BucketRequestedDocument).where(
-                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
-                BucketRequestedDocument.category == "Personal Financials",
-            )
-        )
-    ).scalars().first()
-    if requested is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "A personal financial statement is not requested on this file",
-        )
-
-    statement_date = (
-        statement.statement_date.isoformat() if statement.statement_date else "not stated"
-    )
-    applicant = (statement.body or {}).get("applicant") or {}
-    label = f"Personal Financial Statement — {applicant.get('name') or 'applicant'}"
-
-    stored = await drafted_forms.store_form_pdf(
-        db,
-        bucket_id=profile.primary_bucket_id,
-        upload_link_id=None,
-        requested_document=requested,
-        pdf_bytes=dealer_forms_pdf.render_pfs_413_pdf(
-            body=statement.body or {}, statement_date=statement_date
-        ),
-        file_label=label,
-        classification="personal_financial_statement",
-        key_facts=pfs_schema.key_facts(statement.body or {}, statement_date=statement_date),
-        actor_name=user.name or user.email,
-        actor_email=user.email,
-        summary=f"{label} completed by {user.name or user.email} on the borrower's behalf.",
-    )
-    await financial_statements.save_statement(
+    requested = await _personal_financials_slot(db, profile)
+    await _file_statement(
         db,
         profile,
-        body=statement.body or {},
-        status="submitted",
+        statement,
+        requested_document=requested,
+        actor_name=user.name or user.email,
+        actor_email=user.email,
         actor_user_id=user.id,
-        statement=statement,
+        summary_suffix=f"completed by {user.name or user.email} on the borrower's behalf.",
     )
-    statement.bucket_file_id = stored.id
     await profiles.log_profile_action(
         db, profile, user, "financial_statement.submitted",
         "Filed a personal financial statement on the borrower's behalf",
@@ -3652,3 +3688,148 @@ async def submit_financial_statement(
     await db.commit()
     await db.refresh(statement)
     return await _statement_read(db, profile, statement)
+
+
+@router.post(
+    "/{profile_id}/financial-statements/{statement_id}/link",
+    status_code=status.HTTP_201_CREATED,
+)
+async def mint_financial_statement_link(
+    profile_id: UUID,
+    statement_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A link that opens this statement and nothing else.
+
+    The token is returned once and stored only as a hash, so a lost link is
+    reminted rather than looked up. It expires, because an open link with no end
+    date is a permanent credential to someone's finances sitting in whatever
+    inbox it was forwarded to.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    statement = await _statement_or_404(db, profile, statement_id)
+    link, token = await financial_statements.mint_link(
+        db,
+        profile,
+        kind="pfs",
+        statement_id=statement.id,
+        created_by=user.id,
+    )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_statement.link_minted",
+        "Created a share link for a personal financial statement",
+        target_type="financial_statement", target_id=statement.id,
+    )
+    await db.commit()
+    return {
+        "url": f"{get_settings().frontend_app_url.rstrip('/')}/forms/pfs/{token}",
+        "expires_at": link.expires_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The borrower's own view of one form. No login, no access code — the token is
+# the whole credential, which is why it is hashed at rest and expires.
+# ---------------------------------------------------------------------------
+
+
+async def _open_link_or_404(db: AsyncSession, token: str):
+    link = await financial_statements.link_for_token(db, token)
+    if link is None:
+        # One message for "never existed", "expired" and "revoked". Telling them
+        # apart would confirm which tokens are real to anyone probing.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
+    return link
+
+
+@router.get("/public/financial-forms/{token}")
+async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) -> dict:
+    link = await _open_link_or_404(db, token)
+    statement = (
+        await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
+    )
+    profile = await db.get(ApplicationProfile, link.profile_id)
+    link.last_used_at = datetime.now(UTC)
+    await db.commit()
+    return {
+        "kind": link.kind,
+        "schema": pfs_schema.describe(),
+        "body": (statement.body if statement else None) or pfs_schema.empty_body(),
+        # Drives the thank-you state, so a reload returns to it rather than to
+        # a form the borrower has already finished with.
+        "completed": link.completed_at is not None,
+        "business_name": getattr(profile, "legal_entity_name", None),
+    }
+
+
+@router.post("/public/financial-forms/{token}/draft")
+async def save_public_financial_form_draft(
+    token: str, payload: FinancialStatementWrite, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Keep what has been typed so far.
+
+    Form 413 is long and people fill it in on a phone. Without this, closing the
+    tab loses everything, which is most of why the old form went unused.
+    """
+    link = await _open_link_or_404(db, token)
+    profile = await db.get(ApplicationProfile, link.profile_id)
+    statement = (
+        await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
+    )
+    saved = await financial_statements.save_statement(
+        db,
+        profile,
+        body=payload.body,
+        statement_date=payload.statement_date,
+        status=statement.status if statement else "draft",
+        statement=statement,
+    )
+    link.statement_id = saved.id
+    await db.commit()
+    return {"saved": True}
+
+
+@router.post("/public/financial-forms/{token}/submit")
+async def submit_public_financial_form(
+    token: str, payload: FinancialStatementWrite, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """The borrower pressed Save.
+
+    Files the sheet the same way the desk does, then marks the link complete so
+    the page can thank them and tell them they are done. The link keeps working
+    until it expires: someone who spots a wrong figure should be able to reopen
+    it and correct it, which is the whole reason for keeping the rows.
+    """
+    link = await _open_link_or_404(db, token)
+    profile = await db.get(ApplicationProfile, link.profile_id)
+    statement = (
+        await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
+    )
+    saved = await financial_statements.save_statement(
+        db,
+        profile,
+        body=payload.body,
+        statement_date=payload.statement_date,
+        status="draft",
+        statement=statement,
+    )
+    link.statement_id = saved.id
+
+    applicant = (payload.body or {}).get("applicant") or {}
+    await _file_statement(
+        db,
+        profile,
+        saved,
+        requested_document=await _personal_financials_slot(db, profile),
+        actor_name=applicant.get("name") or link.invitee_email or "Borrower",
+        actor_email=link.invitee_email or "",
+        # Null: the borrower filled this in themselves, and `filled_by_staff`
+        # must not claim otherwise.
+        actor_user_id=None,
+        summary_suffix="submitted by the borrower through their own link.",
+    )
+    link.completed_at = datetime.now(UTC)
+    await db.commit()
+    return {"completed": True}
