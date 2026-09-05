@@ -5519,7 +5519,7 @@ async def _submit_pfs_form(
         total_liabilities=key_facts["total_liabilities"],
         net_worth=key_facts["net_worth"],
     )
-    return await _store_drafted_form_pdf(
+    stored = await _store_drafted_form_pdf(
         db,
         intake,
         req,
@@ -5531,6 +5531,53 @@ async def _submit_pfs_form(
         actor_name=actor_name,
         actor_email=actor_email,
     )
+    await _persist_pfs_statement(db, intake, payload, bucket_file=stored)
+    return stored
+
+
+async def _persist_pfs_statement(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    payload: DealerPfsSubmission,
+    *,
+    bucket_file: BucketFile,
+) -> None:
+    """Keep the numbers, not just the picture of them.
+
+    The PDF has always satisfied the checklist; what was missing was any way to
+    reopen the statement, correct it, or finish it for a borrower. Saving the
+    rows here means every surface that already submits a PFS starts persisting
+    today, before the browser moves to the Form 413 layout.
+
+    Deliberately non-fatal. A borrower who has just filled in a financial
+    statement must not see it rejected because we could not file it — the PDF
+    is already stored and already satisfies the request, so a failure here costs
+    us the structured copy and costs them nothing.
+    """
+    from app.services import application_profiles as profile_service
+    from app.services import financial_statements
+
+    try:
+        profile = await profile_service.provision_profile_for_intake(db, intake)
+        body = financial_statements.from_legacy_submission(
+            assets=list(payload.assets),
+            liabilities=list(payload.liabilities),
+            owner_full_name=payload.owner_full_name,
+            statement_date=payload.statement_date,
+        )
+        statement = await financial_statements.save_statement(
+            db,
+            profile,
+            body=body,
+            statement_date=payload.statement_date,
+            status="submitted",
+        )
+        statement.bucket_file_id = bucket_file.id
+        await db.flush()
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "pfs: could not persist the structured statement for intake %s", intake.id
+        )
 
 
 async def _submit_debt_schedule_form(
