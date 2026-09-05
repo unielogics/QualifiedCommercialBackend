@@ -30,6 +30,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app import request_context
 from app.db import Base
 from app.models._mixins import TimestampMixin
 
@@ -915,6 +916,16 @@ class DealerAuditLog(Base):
     after: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # The request or scheduler tick this happened in (alembic 0194). The
+    # messages it caused carry the same id, which is what turns "which user
+    # activity triggered what" into a join instead of a guess.
+    #
+    # Filled by a column default rather than by the writers: this table has
+    # five of them and the next one has not been written yet. A default cannot
+    # be forgotten. Nothing bound (a script, a test) simply leaves it NULL.
+    request_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True, default=lambda: request_context.request_id() or None
     )
 
 

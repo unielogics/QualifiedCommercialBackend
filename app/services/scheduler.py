@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from app import request_context
+
 log = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="UTC")
@@ -391,13 +393,17 @@ def _wrap(coro_fn):
     async def runner():
         name = coro_fn.__name__
         started = datetime.now(timezone.utc)
-        try:
-            await coro_fn()
-        except Exception:
-            log.exception("scheduler job %s failed", name)
-        finally:
-            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-            log.info("scheduler job %s finished in %.2fs", name, elapsed)
+        # A tick has no request, so it binds its own context naming the job.
+        # Without this a message sent by the five-minute digest would be
+        # attributable to nobody; with it, the page can say which job sent it.
+        with request_context.bind(actor_label="cron", job=name):
+            try:
+                await coro_fn()
+            except Exception:
+                log.exception("scheduler job %s failed", name)
+            finally:
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+                log.info("scheduler job %s finished in %.2fs", name, elapsed)
 
     return runner
 

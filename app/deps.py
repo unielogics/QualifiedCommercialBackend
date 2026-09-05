@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import request_context
 from app.config import get_settings
 from app.db import get_db
 from app.enums import ProductAccountType, Role
@@ -282,7 +283,7 @@ async def _recover_primary_super_admin_user(
     ).scalar_one()
 
 
-async def get_current_user(
+async def _resolve_current_user(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
@@ -575,6 +576,21 @@ async def get_current_user(
     await ensure_legacy_product_access(db, user)
     _enforce_account_active(user, request)
     _enforce_external_product_boundary(user, request)
+    return user
+
+
+async def get_current_user(
+    user: Annotated[User, Depends(_resolve_current_user)],  # noqa: B008
+) -> User:
+    """The resolved user, with the request context told who it is.
+
+    A thin wrapper over the resolution itself, which has four return paths.
+    Naming the actor here rather than at each of them means a new path cannot
+    forget, and it is the only place in the request lifecycle where the identity
+    is actually known — the middleware binds the request id long before anyone
+    has read the token.
+    """
+    request_context.set_actor(user.id, actor_label=str(getattr(user, "role", "") or "user"))
     return user
 
 

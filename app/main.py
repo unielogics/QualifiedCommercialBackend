@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.dealer_os import crm_router as dealer_os_crm_router
 from app.dealer_os import router as dealer_os_router
+from app.request_context import RequestContextMiddleware
 from app.routers import (
     admin as admin_router,
 )
@@ -27,7 +28,6 @@ from app.routers import (
     ai_voice,
     analysis,
     application_profiles,
-    production_packages,
     auth,
     billing,
     brokers,
@@ -65,6 +65,7 @@ from app.routers import (
     notifications,
     operator_files,
     prequal,
+    production_packages,
     rates,
     regional_managers,
     reports,
@@ -113,6 +114,11 @@ app.add_middleware(
     # package.zip / intelligence.pdf); without this the header is hidden cross-origin.
     expose_headers=["Content-Disposition"],
 )
+
+# Added last, so it is the outermost layer and every request carries an id
+# before anything else runs. Until now there was no middleware here but CORS,
+# and so no way to say which action produced which message.
+app.add_middleware(RequestContextMiddleware)
 
 
 @app.on_event("startup")
