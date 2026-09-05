@@ -775,17 +775,8 @@ async def _profile_room_link(
 ) -> BucketUploadLink:
     if profile.primary_bucket_id is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This file has no application room")
-    link = (
-        await db.execute(
-            select(BucketUploadLink)
-            .where(
-                BucketUploadLink.bucket_id == profile.primary_bucket_id,
-                BucketUploadLink.status == "active",
-            )
-            .order_by(BucketUploadLink.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    # One resolver for "which link is the room" — see client_room.active_link.
+    link = await client_room.active_link(db, profile.primary_bucket_id)
     if link is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This file has no active application room")
     return link

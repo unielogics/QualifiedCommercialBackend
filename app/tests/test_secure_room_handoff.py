@@ -238,3 +238,37 @@ def test_a_freshly_minted_code_wins_over_the_stored_one():
 
     assert out.passcode == "123456"
     stored.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Which link is "the room" — one rule, one place.
+# ---------------------------------------------------------------------------
+
+
+def test_every_screen_resolves_the_room_through_one_function():
+    """The newest-active-link query must not grow copies again.
+
+    It had four: the room service, the application-profile room, the
+    bank-evidence panel and the credit-invite PIN gate. Four places that had to
+    agree about which door a client was sent to, with nothing making them.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    canonical = root / "dealer_os" / "services" / "client_room.py"
+
+    # A query that orders upload links by recency is the tie-break rule itself.
+    pattern = re.compile(r"BucketUploadLink\.created_at\.desc\(\)")
+    offenders = [
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if path != canonical
+        and "tests" not in path.parts
+        and pattern.search(path.read_text())
+    ]
+
+    assert offenders == [], (
+        "These modules re-derive which upload link is the room. Call "
+        "client_room.active_link instead: " + ", ".join(offenders)
+    )

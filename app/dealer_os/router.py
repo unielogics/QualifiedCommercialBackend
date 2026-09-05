@@ -82,7 +82,7 @@ from app.enums import (
 
 # Shared bucket models back the same archived document inventory; the
 # analysis-version constant keeps cache lookups aligned with the bucket AI.
-from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
+from app.models.bucket import Bucket, BucketFile, BucketFileAnalysis, BucketRequestedDocument
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 from .deps import (
@@ -1514,17 +1514,7 @@ async def bank_evidence(
     room_url: str | None = None
     passcode: str | None = None
     if dealer.bucket_id is not None:
-        link = (
-            await db.execute(
-                select(BucketUploadLink)
-                .where(
-                    BucketUploadLink.bucket_id == dealer.bucket_id,
-                    BucketUploadLink.status == "active",
-                )
-                .order_by(BucketUploadLink.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        link = await client_room.active_link(db, dealer.bucket_id)
         if link is not None:
             room_url = client_room.room_url(link.token)
     return BankEvidenceRead(
@@ -3342,22 +3332,13 @@ async def _room_code_hash(db: AsyncSession, dealer_id: UUID) -> str | None:
     treated as "no code required" so links minted before this gate existed
     keep working. Every new credit invite ensures a room first, so new links
     always carry the gate."""
-    from app.models.bucket import Bucket
-
-    row = (
-        await db.execute(
-            select(BucketUploadLink.passcode_hash)
-            .join(Bucket, Bucket.id == BucketUploadLink.bucket_id)
-            .join(DealerBusiness, DealerBusiness.bucket_id == Bucket.id)
-            .where(
-                DealerBusiness.id == dealer_id,
-                BucketUploadLink.status == "active",
-            )
-            .order_by(BucketUploadLink.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return row
+    dealer = await db.get(DealerBusiness, dealer_id)
+    if dealer is None or dealer.bucket_id is None:
+        return None
+    # Same resolver as every other screen, so the gate cannot end up checking a
+    # different link than the one the client was actually sent.
+    link = await client_room.active_link(db, dealer.bucket_id)
+    return link.passcode_hash if link is not None else None
 
 
 def _statement_window_complete(

@@ -55,6 +55,7 @@ __all__ = [
     "get_room",
     "initialize_room",
     "passcode_problem",
+    "active_link",
     "read_passcode",
     "request_document",
     "resolve_room",
@@ -136,7 +137,18 @@ class ClientRoom:
     passcode: str | None
 
 
-async def _active_link(db: AsyncSession, bucket_id) -> BucketUploadLink | None:
+async def active_link(db: AsyncSession, bucket_id) -> BucketUploadLink | None:
+    """THE rule for which link is this file's room: newest active one wins.
+
+    Exported, and the only place this is decided. Four screens used to carry
+    their own copy of this query — the room service, the application-profile
+    room, the bank-evidence panel and the credit-invite PIN gate — so a change
+    to the rule in one would have left them pointing at different doors on the
+    same bucket while every one of them called it "the room".
+
+    A bucket can legitimately hold several invites (two upload parties on one
+    file), which is exactly why the tie-break has to live in one place.
+    """
     return (
         await db.execute(
             select(BucketUploadLink)
@@ -154,7 +166,7 @@ async def get_room(db: AsyncSession, dealer: DealerBusiness) -> ClientRoom | Non
     """Return the durable room without creating or rotating credentials."""
     if dealer.bucket_id is None:
         return None
-    link = await _active_link(db, dealer.bucket_id)
+    link = await active_link(db, dealer.bucket_id)
     if link is None:
         return None
     return ClientRoom(link, room_url(link.token), None)
@@ -173,7 +185,7 @@ async def initialize_room(
     if len(passcode) != 6 or not passcode.isascii() or not passcode.isdigit():
         raise ValueError("The secure client-room PIN must contain six digits.")
     bucket = await buckets_link.ensure_bucket(db, dealer)
-    link = await _active_link(db, bucket.id)
+    link = await active_link(db, bucket.id)
     if link is None:
         link = BucketUploadLink(
             bucket_id=bucket.id,
@@ -202,7 +214,7 @@ async def ensure_room(
     """The file's client room, created if it does not exist yet. Flushes, never commits."""
     bucket = await buckets_link.ensure_bucket(db, dealer, adopt_intake=adopt_intake)
 
-    link = await _active_link(db, bucket.id)
+    link = await active_link(db, bucket.id)
     if link is not None:
         return ClientRoom(link, room_url(link.token), None)
 
