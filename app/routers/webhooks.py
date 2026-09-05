@@ -555,6 +555,63 @@ async def twilio_sms_status(request: Request) -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/ses")
+async def ses_events(request: Request) -> Response:
+    """Delivery, bounce, complaint and open events from SES.
+
+    settings.ses_configuration_set has been set all along and nothing consumed
+    it, so "sent" everywhere meant only "the SES API accepted the call" — a
+    bounced invite read exactly like a delivered one.
+
+    Authenticated by SNS signature rather than a shared token: the topic is
+    public-facing and the payload names its own signing certificate, so the
+    certificate host is checked against Amazon before it is fetched.
+    """
+    from app.services.messaging import outbox, sns
+
+    try:
+        envelope = json.loads((await request.body()) or b"{}")
+    except Exception:  # noqa: BLE001
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(envelope, dict):
+        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+
+    if not await sns.verify(envelope):
+        log.warning("ses webhook: rejected unverified SNS message")
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
+    kind = str(envelope.get("Type") or "")
+    if kind == "SubscriptionConfirmation":
+        await sns.confirm_subscription(envelope)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    if kind != "Notification":
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    try:
+        event = json.loads(envelope.get("Message") or "{}")
+    except Exception:  # noqa: BLE001
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    event_type = str(event.get("eventType") or event.get("notificationType") or "")
+    message_id = str(((event.get("mail") or {}).get("messageId")) or "")
+    if not message_id or event_type not in outbox.SES_EVENT_STATUS:
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+
+    detail = ""
+    if event_type == "Bounce":
+        bounce = event.get("bounce") or {}
+        detail = f"{bounce.get('bounceType', 'Bounce')}/{bounce.get('bounceSubType', '')}".strip("/")
+    elif event_type == "Complaint":
+        detail = str((event.get("complaint") or {}).get("complaintFeedbackType") or "complaint")
+
+    async with SessionLocal() as db:
+        await outbox.mark_delivery(
+            db, provider_message_id=message_id, event=event_type, detail=detail
+        )
+        await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 def _verify_stripe_signature(
     *,
     payload: bytes,

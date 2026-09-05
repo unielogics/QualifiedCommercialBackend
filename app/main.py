@@ -37,6 +37,7 @@ from app.routers import (
     clients,
     closing_costs,
     communications,
+    communications_audit,
     contracts,
     credit,
     deal_chat,
@@ -186,6 +187,7 @@ for r in [
     loan_workspace.public_router,  # /public/hud/{token} — no auth
     clients.router,
     communications.router,
+    communications_audit.router,
     deals.router,
     deal_chat.router,
     agent_tasks.router,

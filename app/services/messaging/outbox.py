@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import request_context
@@ -246,3 +247,56 @@ async def deliver_email(
             row.failed_at = datetime.now(UTC)
         await db.flush()
     return SendOutcome(ok, detail, message_id, row)
+
+
+#: SES event types mapped onto the ledger's vocabulary. `Send` and `Reject` are
+#: about the API call, which the row already records, so they are ignored.
+SES_EVENT_STATUS = {
+    "Delivery": "delivered",
+    "Bounce": "bounced",
+    "Complaint": "complained",
+    "Open": "opened",
+}
+
+
+async def mark_delivery(
+    db: AsyncSession, *, provider_message_id: str, event: str, detail: str = ""
+) -> bool:
+    """Advance a row on an SES event.
+
+    Mirrors the SMS ledger's rule and extends it: events arrive out of order, so
+    a late `Delivery` must not undo a `Bounce`. A bounce or complaint is
+    terminal — it can only be learned after the fact and it is the truer answer.
+    An open is a hint, not a state, so it dates the row without changing it.
+    """
+    status = SES_EVENT_STATUS.get(event)
+    if not provider_message_id or not status:
+        return False
+    row = (
+        await db.execute(
+            select(MessageSend).where(
+                MessageSend.provider_message_id == provider_message_id,
+                MessageSend.direction == "outbound",
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        log.info("message ledger: %s event for unknown id %s", event, provider_message_id)
+        return False
+
+    now = datetime.now(UTC)
+    if status == "opened":
+        # Image-blocking makes an unopened message indistinguishable from an
+        # unloaded pixel, so this never becomes the row's status.
+        row.opened_at = row.opened_at or now
+    elif status == "delivered":
+        if row.status not in ("bounced", "complained"):
+            row.status = "delivered"
+            row.delivered_at = now
+    else:
+        row.status = status
+        row.failed_at = now
+        if detail:
+            row.detail = detail[:500]
+    await db.flush()
+    return True
