@@ -66,7 +66,7 @@ async def record(
 
 
 async def mark_delivery(
-    db: AsyncSession, *, provider_message_id: str, status: str
+    db: AsyncSession, *, provider_message_id: str, status: str, detail: str = ""
 ) -> bool:
     """Advance an outbound row on a carrier state event (sent/delivered).
 
@@ -90,7 +90,13 @@ async def mark_delivery(
     if status == "delivered":
         row.status = "delivered"
         row.delivered_at = datetime.now(timezone.utc)
-    elif status == "sent" and row.status not in ("delivered",):
+    elif status == "failed":
+        # A carrier rejection is the one state that must overwrite "delivered":
+        # it can only arrive after the fact, and it is the truer answer.
+        row.status = "failed"
+        if detail:
+            row.detail = detail[:300]
+    elif status == "sent" and row.status not in ("delivered", "failed"):
         row.status = "sent"
     await db.flush()
     return True

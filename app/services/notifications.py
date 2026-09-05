@@ -19,7 +19,7 @@ from app.models.loan import Loan
 from app.models.notification import Notification
 from app.models.user import User
 from app.services import provenance
-from app.services.email.ses_client import send_email
+from app.services.email.ses_client import SesSendResult, send_email
 from app.services.push import fire_and_forget_push
 
 log = logging.getLogger(__name__)
@@ -169,14 +169,19 @@ async def notify_users(
             )
             row.pushed_at = now
         if email and recipient.email:
-            asyncio.create_task(
-                _send_email_best_effort(
-                    recipient.email,
-                    subject=row.title,
-                    body=f"{row.body}\n\nOpen Qualified Commercial: {deep_link or '/'}",
-                )
+            # emailed_at used to be stamped here, next to a fire-and-forget task
+            # whose result was discarded — so a bounced or refused send was
+            # recorded as a delivered one, on every caller. Stamp it only when
+            # the send actually succeeded, and keep the reason when it did not.
+            sent = await _send_notification_email(
+                recipient.email,
+                subject=row.title,
+                body=f"{row.body}\n\nOpen Qualified Commercial: {deep_link or '/'}",
             )
-            row.emailed_at = now
+            if sent.ok:
+                row.emailed_at = now
+            else:
+                row.meta = {**(row.meta or {}), "email_error": sent.detail[:200]}
     await db.flush()
     from app.services.communication_events import publish_communication_event
 
@@ -231,16 +236,20 @@ async def notify_inbound_communication(
     )
 
 
-async def _send_email_best_effort(to_email: str, *, subject: str, body: str) -> None:
+async def _send_notification_email(to_email: str, *, subject: str, body: str) -> SesSendResult:
+    """Send and report. boto3 is blocking, so it runs on a thread — but the
+    caller waits for the answer, because a notification that claims to have been
+    emailed and was not is worse than a slow one."""
     try:
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             send_email,
             to_email=to_email,
             subject=subject[:200],
             body_text=body,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("notification email failed to=%s", to_email)
+        return SesSendResult(False, None, f"send_failed: {exc}")
 
 
 async def notify_document_uploaded(

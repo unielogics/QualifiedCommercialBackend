@@ -461,6 +461,18 @@ async def twilio_sms_inbound(request: Request) -> Response:
     )
 
 
+# Twilio's vocabulary mapped onto the ledger's. Anything unlisted (queued,
+# sending, accepted) is a state the ledger already reflects, so it is ignored.
+_LEDGER_STATUS = {
+    "delivered": "delivered",
+    "read": "delivered",
+    "sent": "sent",
+    "failed": "failed",
+    "undelivered": "failed",
+    "canceled": "failed",
+}
+
+
 @router.post("/twilio/sms/status")
 async def twilio_sms_status(request: Request) -> Response:
     form, valid = await _twilio_form(request)
@@ -475,6 +487,8 @@ async def twilio_sms_status(request: Request) -> Response:
         error_message = re.sub(r"\+\d{8,15}", "[phone number]", error_message)[:320]
     if not message_sid or not message_status:
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    from app.services.sms import ledger as sms_ledger
+
     async with SessionLocal() as db:
         message = (
             await db.execute(
@@ -527,6 +541,16 @@ async def twilio_sms_status(request: Request) -> Response:
                         notice.record_delivery_error(f"Twilio reminder delivery {message_status}.")
                     else:
                         notice.clear_delivery_error()
+        # The ledger is the record of every text we sent, and until now nothing
+        # advanced it: mark_delivery existed with no caller, so every outbound
+        # row sat at "sent" forever and delivered_at was always NULL — while
+        # this same webhook updated two other tables.
+        await sms_ledger.mark_delivery(
+            db,
+            provider_message_id=message_sid,
+            status=_LEDGER_STATUS.get(message_status, ""),
+            detail=f"twilio {error_code or message_status}: {error_message}" if error_message else "",
+        )
         await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
