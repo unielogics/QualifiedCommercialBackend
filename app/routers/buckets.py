@@ -595,7 +595,18 @@ async def _load_public_share_for_admin_read(db: AsyncSession, share_id: UUID) ->
 def _upload_link_read(link: BucketUploadLink, *, passcode: str | None = None) -> BucketUploadLinkRead:
     data = BucketUploadLinkRead.model_validate(link)
     data.upload_url = _public_url(f"/buckets/request/{link.token}")
-    data.passcode = passcode
+    # A freshly minted code is passed in. Otherwise read the stored one back
+    # when it is recoverable: without this the panel told staff to regenerate —
+    # which changes the client's PIN — when all they wanted was to copy an
+    # invite they had already sent. Links minted before the recoverable copy
+    # existed still read as secured, which is honest, because for those the
+    # code really is gone.
+    #
+    # Safe to expose here: `upload_links` appears only on BucketDetail, which
+    # is produced only by _bucket_detail_read on /admin routes gated by
+    # require_role(SUPER_ADMIN) — the same audience already shown this PIN on
+    # the AI-intake screen and the file room.
+    data.passcode = passcode or client_room.read_passcode(link)
     return data
 
 

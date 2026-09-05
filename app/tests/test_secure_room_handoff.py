@@ -179,3 +179,62 @@ def test_the_handoff_is_a_post_so_a_code_never_lands_in_a_url_someone_shares():
         for route in api.routes:
             if route.path.endswith("/{token}/secure-room"):
                 assert route.methods == {"POST"}
+
+
+# ---------------------------------------------------------------------------
+# The same rule, one screen over: the buckets admin panel.
+# ---------------------------------------------------------------------------
+
+
+def _upload_link_row(**over):
+    from datetime import UTC, datetime
+
+    row = SimpleNamespace(
+        id=uuid4(), bucket_id=uuid4(), token="room-token",
+        recipient_name="John Grace", recipient_email="john@example.com",
+        expires_at=None, allow_notes=True, allow_multiple_sessions=True,
+        can_use_ai_chat=True, can_view_ai_tasks=True, status="active",
+        completed_at=None, created_at=datetime.now(UTC),
+        passcode_hash="x", encrypted_passcode="enc", passcode_encryption_provider="fernet",
+    )
+    for k, v in over.items():
+        setattr(row, k, v)
+    return row
+
+
+def test_invite_panel_reads_a_recoverable_code_instead_of_hiding_it():
+    """Staff were told to regenerate to see a code the system could still read.
+
+    Regenerating changes the client's PIN, so the advice broke an invite that
+    had already been sent in order to display it.
+    """
+    from app.routers import buckets
+
+    with patch.object(buckets.client_room, "read_passcode", return_value="954577"), \
+         patch.object(buckets, "_public_url", side_effect=lambda p: f"https://app.example.com{p}"):
+        out = buckets._upload_link_read(_upload_link_row())
+
+    assert out.passcode == "954577"
+
+
+def test_invite_panel_stays_silent_when_the_code_really_is_gone():
+    """Links minted before the recoverable copy existed have no code to show."""
+    from app.routers import buckets
+
+    with patch.object(buckets.client_room, "read_passcode", return_value=None), \
+         patch.object(buckets, "_public_url", side_effect=lambda p: f"https://app.example.com{p}"):
+        out = buckets._upload_link_read(_upload_link_row(encrypted_passcode=None))
+
+    assert out.passcode is None
+
+
+def test_a_freshly_minted_code_wins_over_the_stored_one():
+    """Create and regenerate pass the plaintext they just generated."""
+    from app.routers import buckets
+
+    with patch.object(buckets.client_room, "read_passcode", return_value="000000") as stored, \
+         patch.object(buckets, "_public_url", side_effect=lambda p: f"https://app.example.com{p}"):
+        out = buckets._upload_link_read(_upload_link_row(), passcode="123456")
+
+    assert out.passcode == "123456"
+    stored.assert_not_called()
