@@ -184,6 +184,14 @@ async def initialize_room(
     """
     if len(passcode) != 6 or not passcode.isascii() or not passcode.isdigit():
         raise ValueError("The secure client-room PIN must contain six digits.")
+    # The same denylist the client is held to when they choose their own. It
+    # only guarded that path before, so staff could hand out 111111 or 123456 —
+    # the codes a guesser tries first — on a credential that opens banking and
+    # signing. One rule, both ends.
+    if passcode in _TRIVIAL_PASSCODES:
+        raise ValueError(
+            "That PIN is too easy to guess. Choose six digits that are not all the same or in a row."
+        )
     bucket = await buckets_link.ensure_bucket(db, dealer)
     link = await active_link(db, bucket.id)
     if link is None:
