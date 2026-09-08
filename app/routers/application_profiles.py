@@ -4112,3 +4112,50 @@ async def save_debt_schedule(
     )
     await db.commit()
     return {"row_count": len(rows), "submitted": bool(payload.submit)}
+
+
+@router.post("/{profile_id}/financial-forms/{kind}/request", status_code=status.HTTP_201_CREATED)
+async def request_financial_form(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Put the form on the file's checklist.
+
+    Idempotent: asking twice does not produce two rows for the same thing, which
+    is what would happen if two people on the desk both decided the borrower
+    needed a debt schedule.
+    """
+    if kind not in _FORM_SLOT_CATEGORY:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    if profile.primary_bucket_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This file has no document room to request into"
+        )
+
+    existing = await _requested_slot(db, profile, kind)
+    if existing is not None:
+        return {"requested": True, "already": True}
+
+    db.add(
+        BucketRequestedDocument(
+            bucket_id=profile.primary_bucket_id,
+            name=_FORM_LABEL[kind],
+            category=_FORM_SLOT_CATEGORY[kind],
+            description=(
+                "Fill this in online or upload your own — either satisfies the request."
+            ),
+            required=True,
+            status="requested",
+        )
+    )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.requested",
+        f"Requested the {_FORM_LABEL[kind].lower()}",
+        target_type="financial_form", target_id=profile.id,
+    )
+    await db.commit()
+    return {"requested": True, "already": False}
