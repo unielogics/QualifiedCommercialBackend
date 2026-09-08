@@ -95,3 +95,18 @@ def test_an_undecryptable_copy_reports_nothing_rather_than_raising():
     link = SimpleNamespace(id="l1", encrypted_passcode="corrupt", passcode_encryption_provider="fernet")
     with patch.object(client_room, "_decrypt_fernet", side_effect=ValueError("bad key")):
         assert client_room.read_passcode(link) is None
+
+
+def test_a_bad_pin_is_a_422_not_a_503():
+    """It used to fall into the generic handler and come back as "The secure
+    client room could not be created. Try creating the file again." — an
+    outage message for a typo, and trying again would fail identically."""
+    import inspect
+
+    from app.dealer_os import router
+
+    source = inspect.getsource(router.create_dealer)
+    value_at = source.index("except ValueError")
+    generic_at = source.index("except Exception")
+    assert value_at < generic_at, "the generic handler would swallow it first"
+    assert "HTTP_422_UNPROCESSABLE_ENTITY" in source

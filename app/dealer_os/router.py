@@ -2818,6 +2818,11 @@ async def create_dealer(
     # client credential.
     try:
         room = await client_room.initialize_room(db, dealer, payload.secure_room_pin)
+    except ValueError as exc:
+        # The PIN itself is unacceptable — too easy to guess, or not six
+        # digits. "Try again" would fail identically forever, so say what is
+        # wrong and let the caller change it.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except Exception as exc:
         logger.exception("dealer-os: client room creation failed for new dealer %s", dealer.id)
         raise HTTPException(
