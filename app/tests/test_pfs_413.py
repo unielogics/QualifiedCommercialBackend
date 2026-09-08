@@ -302,3 +302,57 @@ def test_links_expire_by_default():
     from app.services import financial_statements
 
     assert financial_statements.DEFAULT_LINK_TTL_DAYS > 0
+
+
+# --- the debt schedule form ------------------------------------------------
+
+
+def test_blank_debt_rows_are_dropped_not_stored():
+    """Someone tabbing through an empty line is not an obligation."""
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body(
+        {
+            "debts": [
+                {"lender": "First National", "balance": "12,000", "monthly_payment": "$450"},
+                {"lender": "", "balance": "", "monthly_payment": ""},
+                {"lender": "  ", "balance": None, "monthly_payment": None},
+            ]
+        }
+    )
+    assert len(rows) == 1
+    assert rows[0]["lender"] == "First National"
+    # Commas and currency symbols survive the same way they do on the 413.
+    assert float(rows[0]["balance"]) == 12000.0
+    assert float(rows[0]["monthly_payment"]) == 450.0
+
+
+def test_a_row_with_figures_but_no_lender_is_still_an_obligation():
+    """Dropping it would quietly understate what the borrower owes."""
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body({"debts": [{"lender": "", "balance": "5000", "monthly_payment": "200"}]})
+    assert len(rows) == 1
+    assert rows[0]["lender"] == "Unnamed lender"
+
+
+def test_debt_key_facts_keep_the_shape_the_dscr_reads():
+    """`extract_debt_schedule` and the DSCR metric read these by name."""
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body(
+        {
+            "debts": [
+                {"lender": "A", "balance": "1000", "monthly_payment": "100"},
+                {"lender": "B", "balance": "2000", "monthly_payment": "250"},
+            ]
+        }
+    )
+    facts = fs.debt_key_facts(rows)
+
+    assert set(facts) == {"debts", "total_monthly_debt_service", "total_outstanding_balance"}
+    assert facts["total_monthly_debt_service"] == 350.0
+    assert facts["total_outstanding_balance"] == 3000.0
+    assert set(facts["debts"][0]) == {
+        "lender", "original_amount", "current_balance", "monthly_payment", "maturity_date",
+    }

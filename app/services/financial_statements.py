@@ -296,3 +296,133 @@ async def link_for_token(db: AsyncSession, token: str):
     if link is None or not link.is_open:
         return None
     return link
+
+
+# ---------------------------------------------------------------------------
+# The business debt schedule
+# ---------------------------------------------------------------------------
+
+#: What the borrower is asked for per obligation. Deliberately short: a debt
+#: schedule someone abandons halfway is worth less than a complete one with
+#: four columns, and the desk can enrich a row afterwards.
+DEBT_COLUMNS = ("lender", "balance", "monthly_payment", "maturity_on", "notes")
+
+
+def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """The rows out of a submitted debt-schedule form, cleaned.
+
+    A row with no lender and no figures is someone tabbing through an empty
+    line, not an obligation; it is dropped rather than stored as a blank.
+    """
+    out: list[dict[str, Any]] = []
+    for raw in (body or {}).get("debts") or []:
+        if not isinstance(raw, dict):
+            continue
+        lender = str(raw.get("lender") or "").strip()
+        balance = pfs_schema._amount(raw.get("balance"))
+        monthly = pfs_schema._amount(raw.get("monthly_payment"))
+        if not lender and not balance and not monthly:
+            continue
+        out.append(
+            {
+                "lender": (lender or "Unnamed lender")[:180],
+                "balance": balance,
+                "monthly_payment": monthly,
+                "notes": str(raw.get("notes") or "").strip() or None,
+            }
+        )
+    return out
+
+
+def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The same shape the old form emitted, so nothing downstream changes."""
+    return {
+        "debts": [
+            {
+                "lender": row["lender"],
+                "original_amount": None,
+                "current_balance": float(row["balance"]),
+                "monthly_payment": float(row["monthly_payment"]),
+                "maturity_date": None,
+            }
+            for row in rows
+        ],
+        "total_monthly_debt_service": float(sum(row["monthly_payment"] for row in rows)),
+        "total_outstanding_balance": float(sum(row["balance"] for row in rows)),
+    }
+
+
+async def replace_debt_rows(
+    db: AsyncSession, profile: ApplicationProfile, rows: list[dict[str, Any]], *, origin: str
+) -> None:
+    """Put the borrower's answer on the file's actual debt schedule.
+
+    Replaces this source's previous rows rather than appending: the form is the
+    whole answer, and submitting it twice should not leave the file claiming
+    double the debt. Rows from other sources — an AI draft, a desk edit, a
+    document — are untouched.
+    """
+    from app.dealer_os.models import DealerDebt
+
+    existing = (
+        (
+            await db.execute(
+                select(DealerDebt).where(
+                    DealerDebt.profile_id == profile.id, DealerDebt.origin == origin
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in existing:
+        await db.delete(row)
+    await db.flush()
+
+    for row in rows:
+        db.add(
+            DealerDebt(
+                profile_id=profile.id,
+                dealer_id=profile.dealer_id,
+                lender=row["lender"],
+                balance=row["balance"],
+                monthly_payment=row["monthly_payment"],
+                notes=row.get("notes"),
+                origin=origin,
+                status="active",
+            )
+        )
+    await db.flush()
+
+
+async def debt_body_for_profile(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    """The file's current schedule, shaped for the form.
+
+    Seeded from whatever is already on the file — an AI draft, rows the desk
+    added, a previous submission — so a borrower confirms and corrects rather
+    than retyping what we already know.
+    """
+    from app.dealer_os.models import DealerDebt
+
+    rows = (
+        (
+            await db.execute(
+                select(DealerDebt)
+                .where(DealerDebt.profile_id == profile.id, DealerDebt.status == "active")
+                .order_by(DealerDebt.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "debts": [
+            {
+                "lender": row.lender,
+                "balance": str(row.balance or ""),
+                "monthly_payment": str(row.monthly_payment or ""),
+                "notes": row.notes or "",
+            }
+            for row in rows
+        ]
+    }

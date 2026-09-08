@@ -764,15 +764,33 @@ class FinancialStatementWrite(BaseModel):
     owners: list[FinancialStatementOwnerLink] = Field(default_factory=list)
 
 
-class FinancialStatementSlotRead(BaseModel):
-    """How the personal-financials request on this file has been met.
+class FinancialFormStatus(BaseModel):
+    """How one of the two financial forms stands on this file.
 
-    `filled` means someone typed it into our form and we hold the rows;
-    `uploaded` means a document satisfies the slot and we do not. The
-    distinction is the point: only the first can be reopened or corrected.
+    `filled` means someone typed it into our form and we hold the figures;
+    `uploaded` means a document satisfies the request and we do not. The
+    distinction is the whole point of tracking it: only the first can be
+    reopened, corrected, or handed back to the borrower to finish.
     """
 
+    kind: Literal["pfs", "debt_schedule"]
+    label: str
+    #: Whether the checklist actually asks for it on this file. A form nobody
+    #: has requested is not outstanding — it is simply not part of this deal.
     requested: bool = False
     satisfied: bool = False
     source: Literal["filled", "uploaded", "none"] = "none"
+    #: The statement to open, for a PFS that was filled in.
     statement_id: UUID | None = None
+    #: Rows on the business debt schedule, and what they come to.
+    row_count: int = 0
+    total_monthly: float = 0
+    total_balance: float = 0
+    net_worth: float | None = None
+    updated_at: datetime | None = None
+    #: True when a staff member completed it rather than the borrower.
+    filled_by_staff: bool = False
+
+
+class FinancialFormsRead(BaseModel):
+    forms: list[FinancialFormStatus] = Field(default_factory=list)

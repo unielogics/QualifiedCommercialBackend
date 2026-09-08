@@ -80,6 +80,8 @@ from app.schemas.application_profile import (
     FileOwnerPatch,
     FileOwnerRead,
     FileOwnerRequirementState,
+    FinancialFormsRead,
+    FinancialFormStatus,
     FinancialStatementOwnerLink,
     FinancialStatementRead,
     FinancialStatementWrite,
@@ -3747,16 +3749,26 @@ async def _open_link_or_404(db: AsyncSession, token: str):
 @router.get("/public/financial-forms/{token}")
 async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) -> dict:
     link = await _open_link_or_404(db, token)
-    statement = (
-        await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
-    )
     profile = await db.get(ApplicationProfile, link.profile_id)
     link.last_used_at = datetime.now(UTC)
+
+    if link.kind == "debt_schedule":
+        # Seeded from what the file already holds, so the borrower confirms and
+        # corrects rather than retyping what we know.
+        body = await financial_statements.debt_body_for_profile(db, profile)
+        schema = {"columns": list(financial_statements.DEBT_COLUMNS)}
+    else:
+        statement = (
+            await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
+        )
+        body = (statement.body if statement else None) or pfs_schema.empty_body()
+        schema = pfs_schema.describe()
+
     await db.commit()
     return {
         "kind": link.kind,
-        "schema": pfs_schema.describe(),
-        "body": (statement.body if statement else None) or pfs_schema.empty_body(),
+        "schema": schema,
+        "body": body,
         # Drives the thank-you state, so a reload returns to it rather than to
         # a form the borrower has already finished with.
         "completed": link.completed_at is not None,
@@ -3775,6 +3787,17 @@ async def save_public_financial_form_draft(
     """
     link = await _open_link_or_404(db, token)
     profile = await db.get(ApplicationProfile, link.profile_id)
+
+    if link.kind == "debt_schedule":
+        await financial_statements.replace_debt_rows(
+            db,
+            profile,
+            financial_statements.debt_rows_from_body(payload.body),
+            origin="client_form",
+        )
+        await db.commit()
+        return {"saved": True}
+
     statement = (
         await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
     )
@@ -3804,6 +3827,40 @@ async def submit_public_financial_form(
     """
     link = await _open_link_or_404(db, token)
     profile = await db.get(ApplicationProfile, link.profile_id)
+
+    if link.kind == "debt_schedule":
+        rows = financial_statements.debt_rows_from_body(payload.body)
+        await financial_statements.replace_debt_rows(
+            db, profile, rows, origin="client_form"
+        )
+        slot = await _requested_slot(db, profile, "debt_schedule")
+        if slot is not None:
+            facts = financial_statements.debt_key_facts(rows)
+            await drafted_forms.store_form_pdf(
+                db,
+                bucket_id=profile.primary_bucket_id,
+                upload_link_id=None,
+                requested_document=slot,
+                pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
+                    business_name=(payload.body or {}).get("business_name") or "the business",
+                    debts=[
+                        (row["lender"], float(row["balance"]), float(row["monthly_payment"]))
+                        for row in rows
+                    ],
+                    total_balance=facts["total_outstanding_balance"],
+                    total_monthly=facts["total_monthly_debt_service"],
+                ),
+                file_label="Business Debt Schedule",
+                classification="debt_schedule",
+                key_facts=facts,
+                actor_name=link.invitee_email or "Borrower",
+                actor_email=link.invitee_email or "",
+                summary="Business Debt Schedule submitted by the borrower through their own link.",
+            )
+        link.completed_at = datetime.now(UTC)
+        await db.commit()
+        return {"completed": True}
+
     statement = (
         await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
     )
@@ -3833,3 +3890,150 @@ async def submit_public_financial_form(
     link.completed_at = datetime.now(UTC)
     await db.commit()
     return {"completed": True}
+
+
+# ---------------------------------------------------------------------------
+# Both financial forms, and where each one stands.
+# ---------------------------------------------------------------------------
+
+_FORM_SLOT_CATEGORY = {"pfs": "Personal Financials", "debt_schedule": "Debts"}
+_FORM_LABEL = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule"}
+
+
+async def _requested_slot(
+    db: AsyncSession, profile: ApplicationProfile, kind: str
+) -> BucketRequestedDocument | None:
+    if profile.primary_bucket_id is None:
+        return None
+    return (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.category == _FORM_SLOT_CATEGORY[kind],
+            )
+        )
+    ).scalars().first()
+
+
+@router.get("/{profile_id}/financial-forms", response_model=FinancialFormsRead)
+async def financial_forms_status(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> FinancialFormsRead:
+    """Both forms in one answer, with how each was met.
+
+    The desk needs to see at a glance which of the two are outstanding, and for
+    the ones that are done, whether we hold the figures or only a document.
+    Those are different situations — one can be corrected in the browser, the
+    other needs the borrower to send a new file — and a single tick beside both
+    would hide that.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+
+    forms: list[FinancialFormStatus] = []
+
+    # --- personal financial statement -----------------------------------
+    slot = await _requested_slot(db, profile, "pfs")
+    statement = await financial_statements.latest_for_profile(db, profile.id)
+    submitted = statement if statement and statement.status == "submitted" else None
+    forms.append(
+        FinancialFormStatus(
+            kind="pfs",
+            label=_FORM_LABEL["pfs"],
+            requested=slot is not None,
+            satisfied=bool(slot and slot.status == "uploaded"),
+            source=(
+                "filled"
+                if submitted is not None
+                else "uploaded"
+                if slot is not None and slot.status == "uploaded"
+                else "none"
+            ),
+            statement_id=statement.id if statement else None,
+            net_worth=float(statement.net_worth) if statement and statement.net_worth is not None else None,
+            updated_at=statement.updated_at if statement else None,
+            filled_by_staff=bool(statement and statement.submitted_by_user_id),
+        )
+    )
+
+    # --- business debt schedule -----------------------------------------
+    from app.dealer_os.models import DealerDebt
+
+    slot = await _requested_slot(db, profile, "debt_schedule")
+    rows = list(
+        (
+            await db.execute(
+                select(DealerDebt).where(
+                    DealerDebt.profile_id == profile.id, DealerDebt.status == "active"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    forms.append(
+        FinancialFormStatus(
+            kind="debt_schedule",
+            label=_FORM_LABEL["debt_schedule"],
+            requested=slot is not None,
+            satisfied=bool(slot and slot.status == "uploaded"),
+            source=(
+                "filled"
+                if rows
+                else "uploaded"
+                if slot is not None and slot.status == "uploaded"
+                else "none"
+            ),
+            row_count=len(rows),
+            total_monthly=float(sum((row.monthly_payment or 0) for row in rows)),
+            total_balance=float(sum((row.balance or 0) for row in rows)),
+            updated_at=max((row.updated_at for row in rows), default=None),
+        )
+    )
+
+    return FinancialFormsRead(forms=forms)
+
+
+@router.post("/{profile_id}/financial-forms/{kind}/link", status_code=status.HTTP_201_CREATED)
+async def mint_financial_form_link(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A link to either form, made in one step.
+
+    For a PFS it creates the statement the link will fill, so asking a borrower
+    for one does not mean starting a draft yourself first and then finding
+    somewhere to share it. The debt schedule writes its rows straight to the
+    file's schedule, so it needs no placeholder.
+    """
+    if kind not in _FORM_SLOT_CATEGORY:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+
+    statement_id = None
+    if kind == "pfs":
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        if statement is None:
+            statement = await financial_statements.save_statement(
+                db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
+            )
+        statement_id = statement.id
+
+    link, token = await financial_statements.mint_link(
+        db, profile, kind=kind, statement_id=statement_id, created_by=user.id
+    )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.link_minted",
+        f"Created a share link for the {_FORM_LABEL[kind].lower()}",
+        target_type="financial_form", target_id=link.id,
+    )
+    await db.commit()
+    return {
+        "url": f"{get_settings().frontend_app_url.rstrip('/')}/forms/{kind}/{token}",
+        "expires_at": link.expires_at,
+    }
