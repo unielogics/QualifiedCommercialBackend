@@ -80,6 +80,7 @@ from app.schemas.application_profile import (
     FileOwnerPatch,
     FileOwnerRead,
     FileOwnerRequirementState,
+    FinancialFormSave,
     FinancialFormsRead,
     FinancialFormStatus,
     FinancialStatementOwnerLink,
@@ -4037,3 +4038,77 @@ async def mint_financial_form_link(
         "url": f"{get_settings().frontend_app_url.rstrip('/')}/forms/{kind}/{token}",
         "expires_at": link.expires_at,
     }
+
+
+@router.get("/{profile_id}/financial-forms/debt-schedule/body")
+async def read_debt_schedule_body(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The file's schedule, shaped for the form.
+
+    Seeded from whatever is already on the file — an AI draft, rows the desk
+    added, a borrower's earlier answer — so opening it shows what we know rather
+    than a blank grid.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    return await financial_statements.debt_body_for_profile(db, profile)
+
+
+@router.put("/{profile_id}/financial-forms/debt-schedule")
+async def save_debt_schedule(
+    profile_id: UUID,
+    payload: FinancialFormSave,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Write the desk's version of the schedule.
+
+    Saved under `origin='admin'`, which the existing precedence law already
+    protects from being overwritten by a re-draft — a desk edit outranks an AI
+    draft, and that rule predates this form. Rows a borrower submitted through
+    their own link carry `client_form` and are left alone here, so the two
+    sources stay distinguishable rather than one silently eating the other.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    rows = financial_statements.debt_rows_from_body(payload.body)
+    await financial_statements.replace_debt_rows(db, profile, rows, origin="admin")
+
+    if payload.submit:
+        slot = await _requested_slot(db, profile, "debt_schedule")
+        if slot is not None:
+            facts = financial_statements.debt_key_facts(rows)
+            await drafted_forms.store_form_pdf(
+                db,
+                bucket_id=profile.primary_bucket_id,
+                upload_link_id=None,
+                requested_document=slot,
+                pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
+                    business_name=(payload.body or {}).get("business_name") or "the business",
+                    debts=[
+                        (row["lender"], float(row["balance"]), float(row["monthly_payment"]))
+                        for row in rows
+                    ],
+                    total_balance=facts["total_outstanding_balance"],
+                    total_monthly=facts["total_monthly_debt_service"],
+                ),
+                file_label="Business Debt Schedule",
+                classification="debt_schedule",
+                key_facts=facts,
+                actor_name=user.name or user.email,
+                actor_email=user.email,
+                summary=(
+                    f"Business Debt Schedule completed by {user.name or user.email} "
+                    "on the borrower's behalf."
+                ),
+            )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.debt_schedule_saved",
+        f"Saved {len(rows)} obligation(s) on the business debt schedule",
+        target_type="financial_form", target_id=profile.id,
+    )
+    await db.commit()
+    return {"row_count": len(rows), "submitted": bool(payload.submit)}

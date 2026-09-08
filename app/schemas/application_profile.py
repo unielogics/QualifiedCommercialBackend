@@ -792,5 +792,13 @@ class FinancialFormStatus(BaseModel):
     filled_by_staff: bool = False
 
 
+class FinancialFormSave(BaseModel):
+    """A form body from the desk. `submit` is the difference between keeping the
+    figures and filing the sheet on the checklist."""
+
+    body: dict
+    submit: bool = False
+
+
 class FinancialFormsRead(BaseModel):
     forms: list[FinancialFormStatus] = Field(default_factory=list)
