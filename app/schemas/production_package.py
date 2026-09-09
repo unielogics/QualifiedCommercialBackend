@@ -54,6 +54,12 @@ class SponsorAgreementRead(BaseModel):
 class SponsorOptionRead(BaseModel):
     company_id: UUID
     name: str
+    # "referral_partner" or "house". The house is never a sponsor; it is what
+    # internal staff are linked to.
+    kind: str = "referral_partner"
+    # Kept in the rep's narrowed copy, so a rep can see "agreement on file"
+    # without the agreement's details (which are the desk's).
+    has_agreement: bool = False
     entity_type: str | None = None
     state_of_formation: str | None = None
     principal_address: str | None = None
@@ -66,6 +72,19 @@ class SponsorOptionRead(BaseModel):
     phone: str | None = None
     agreement: SponsorAgreementRead | None = None
     editable: bool = False
+
+
+class SponsorDefaultRead(BaseModel):
+    """What the sponsor would default to from the agent on the file, and whether it did."""
+
+    company_id: UUID
+    name: str
+    signed: bool
+    person_id: UUID
+    person_name: str
+    via: Literal["rm", "agent", "creator"]
+    # package.sponsor_company_id == company_id
+    applied: bool
 
 
 class SponsorCompanyUpdate(BaseModel):
@@ -328,6 +347,9 @@ class ProductionPackageRead(BaseModel):
     attention: list[dict[str, Any]]
     attention_presentation: list[dict[str, Any]]
     sponsor: SponsorOptionRead | None = None
+    # Operators only: where the sponsor defaults from (the agent's linked
+    # profile) and whether that is the sponsor on the package now.
+    sponsor_default: SponsorDefaultRead | None = None
     presentation: ProductionPresentationRead
     active_revision: ProductionRevisionRead | None = None
     revisions: list[ProductionRevisionRead] = Field(default_factory=list)

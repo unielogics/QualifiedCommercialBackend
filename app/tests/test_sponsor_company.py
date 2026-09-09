@@ -142,7 +142,7 @@ async def test_choosing_a_sponsor_sets_every_sponsor_key():
     option = SimpleNamespace(company_id=uuid4(), name="Choice Car Care", state_of_formation="NJ",
                              entity_type="llc", principal_address="12 Harbor Rd",
                              notice_email="russ@choicecarcare.us", platform_name="Endurance",
-                             agreement=SimpleNamespace(id=uuid4()))
+                             agreement=SimpleNamespace(id=uuid4()), kind="referral_partner", has_agreement=True)
     with patch.object(pkgs, "sponsor_option_for", AsyncMock(return_value=option)):
         out = await pkgs._apply_sponsor(SimpleNamespace(), access, option.company_id)
 
@@ -160,7 +160,7 @@ async def test_a_sponsor_with_no_platform_clears_the_previous_one():
     access = SimpleNamespace(package=package, user=_user())
     option = SimpleNamespace(company_id=uuid4(), name="PEA LLC", state_of_formation="NJ", entity_type=None,
                              principal_address=None, notice_email=None, platform_name=None,
-                             agreement=SimpleNamespace(id=uuid4()))
+                             agreement=SimpleNamespace(id=uuid4()), kind="referral_partner", has_agreement=True)
     with patch.object(pkgs, "sponsor_option_for", AsyncMock(return_value=option)):
         out = await pkgs._apply_sponsor(SimpleNamespace(), access, option.company_id)
 
@@ -169,13 +169,16 @@ async def test_a_sponsor_with_no_platform_clears_the_previous_one():
 
 
 def test_the_sponsor_key_set_and_the_copy_map_cannot_drift():
-    """_apply_sponsor must name every sponsor key. This is the guard that the
-    next key added to SPONSOR_KEYS is not silently left uncopied."""
+    """The copy step must name every sponsor key. This is the guard that the
+    next key added to SPONSOR_KEYS is not silently left uncopied — by the desk's
+    pick and by the default from the agent's linked profile alike, which share it."""
     import inspect
 
-    source = inspect.getsource(pkgs._apply_sponsor)
+    source = inspect.getsource(pkgs._copy_sponsor_block)
     for key in pa.SPONSOR_KEYS:
         assert f'"{key}"' in source, key
+    assert "_copy_sponsor_block(" in inspect.getsource(pkgs._apply_sponsor)
+    assert "_copy_sponsor_block(" in inspect.getsource(pkgs._default_sponsor_onto)
 
 
 def test_the_correction_route_is_registered():

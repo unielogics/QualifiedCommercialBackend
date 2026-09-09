@@ -1129,7 +1129,9 @@ def field_attention(arr: dict[str, Any], *, scope: str) -> list[dict[str, Any]]:
                 # Who can actually clear it. Several desk-only fields have no
                 # default and no prefill and still block the send, so an agent
                 # needs to see that they are waiting rather than failing.
-                "owner": "desk" if rule.key in DESK_ONLY_KEYS else "any",
+                # The sponsor is chosen by the desk too: a rep cannot pick it, so
+                # its rows are theirs to wait on, not to fail.
+                "owner": "desk" if rule.key in DESK_ONLY_KEYS or rule.key in SPONSOR_KEYS else "any",
             })
     return out
 

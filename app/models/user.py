@@ -66,11 +66,13 @@ class User(TimestampMixin, Base):
     suspended_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    # Set for Role.DEALER_PARTNER users at invite time (typed company name,
-    # find-or-create against ReferralPartnerCompany). Whether that COMPANY
-    # has a signed Referral Protection Agreement on file is a separate,
-    # company-scoped ContractAgreement query — this FK only records which
-    # company a given individual belongs to. NULL for every other role.
+    # The business relationship profile this person belongs to. A dealer
+    # partner's is their company (typed at invite, find-or-create); internal
+    # staff are linked to the house row (kind = "house", seeded in 0198). The
+    # Production Package's sponsor defaults from the agent's link. Whether a
+    # partner COMPANY has a signed Referral Protection Agreement on file is a
+    # separate, company-scoped ContractAgreement query — this FK only records
+    # which profile a given individual belongs to.
     referral_partner_company_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("referral_partner_companies.id", ondelete="SET NULL"), nullable=True
     )

@@ -8,8 +8,9 @@ sponsor block is never prefilled here — it is copied from the chosen
 company by the orchestration layer.
 
 Every prefilled value carries provenance so the editor can see where it came
-from and confirm or change it; a required field that is prefilled but not
-confirmed still counts as a blank for the send gate.
+from and confirm or change it. Provenance is a review affordance, not a gate:
+the send gate is the attention list plus the signatures on file, and an
+unconfirmed prefill does not block it.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dealer_os.models import DealerApplicationProfile, DealerBusiness
 from app.models.application_profile import ApplicationExtractedFact, ApplicationProfile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
+from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
 from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
@@ -39,6 +41,9 @@ SOURCE_LABELS: dict[str, str] = {
     "user": "Relationship manager (you)",
     "derived": "Derived",
     "sponsor": "Sponsor agreement",
+    # The default from the agent's linked business relationship profile; the
+    # stored label names the person ("Linked profile of Jane Doe").
+    "sponsor_default": "Linked profile",
     "document_extraction": "Read from an uploaded document",
 }
 
@@ -304,9 +309,18 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
         out.put("dealer_signer_name", _text(intake.full_name), "intake")
 
     # ---- relationship manager ----
+    employer: str | None = None
     if actor is not None:
         out.put("rm_name", _text(getattr(actor, "name", None)), "user")
         out.put("rm_email", _text(getattr(actor, "email", None)), "user")
+        # The employer is the manager's linked business relationship profile
+        # (the house for internal staff, which is the constant below anyway).
+        company_id = getattr(actor, "referral_partner_company_id", None)
+        if company_id is not None:
+            company = await db.get(ReferralPartnerCompany, company_id)
+            employer = _text(getattr(company, "name", None)) if company is not None else None
+    if employer:
+        out.put("rm_employer", employer, "user")
     out.put("rm_employer", pa.DEFAULTS["rm_employer"], "derived")
 
     # ---- baseline window ----

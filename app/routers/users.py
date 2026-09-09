@@ -16,15 +16,24 @@ from app.db import get_db
 from app.deps import CurrentUser, require_role
 from app.enums import ContractSubjectType, ContractType, Role
 from app.models.contract_agreement import ContractAgreement
-from app.models.referral_partner_company import ReferralPartnerCompany
+from app.models.referral_partner_company import (
+    KIND_HOUSE,
+    KIND_REFERRAL_PARTNER,
+    ReferralPartnerCompany,
+)
 from app.models.user import User
 from app.services import clerk as clerk_service
 
 # OPERATOR_ROLES has one definition already; a second copy here is how
 # permission sets drift apart.
-from app.services.production_packages import OPERATOR_ROLES
+from app.services.production_packages import OPERATOR_ROLES, house_company
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+# Every employee is linked to a business relationship profile. These are the
+# roles that are the house's own people: with no company on the invite they
+# are linked to the house row, and their link can be changed but never cleared.
+HOUSE_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP})
 
 _ACCOUNT_ACCESS_TYPES = {"funding", "field_desk", "audit"}
 
@@ -47,10 +56,13 @@ class UserRead(BaseModel):
     role: Role
     referral_partner_company_id: UUID | None = None
     referral_partner_company_name: str | None = None
+    # "referral_partner" or "house"; None when there is no link.
+    company_kind: str | None = None
     # Whether referral_partner_company_id's company has a signed Referral
     # Protection Agreement on file — the "does this broker's company always
     # have a contract in place" visibility the business owner asked for.
-    # None when the user has no linked company (not a DEALER_PARTNER).
+    # None when the user has no linked company; False for the house, which
+    # never signs one.
     company_agreement_signed: bool | None = None
     account_types: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
@@ -62,12 +74,13 @@ class UserInvite(BaseModel):
     email: EmailStr
     name: str
     role: Role
-    # Required for role=DEALER_PARTNER: their company must always have a
-    # signed Referral Protection Agreement on file (see
-    # app/routers/dealer_ai_intake.py's _require_dealer_partner and
-    # app/routers/contracts.py). Find-or-create by name (case-insensitive) —
-    # the same company invited more than once links to the same row rather
-    # than creating duplicates.
+    # The business relationship profile. Required for role=DEALER_PARTNER —
+    # their company must sign the Referral Protection Agreement before they
+    # have standing (see app/routers/dealer_ai_intake.py's
+    # _require_dealer_partner), but the link itself may precede the signature.
+    # Find-or-create by name (case-insensitive) — the same company invited
+    # more than once links to the same row rather than creating duplicates.
+    # A house role with neither is linked to the house.
     company_name: str | None = None
     referral_partner_company_id: UUID | None = None
     account_types: list[str] | None = None
@@ -92,27 +105,63 @@ class SignedCompanyRead(BaseModel):
     name: str
 
 
-async def _signed_company(
-    db: AsyncSession, company_id: UUID
-) -> ReferralPartnerCompany:
+class ReferralCompanyRead(BaseModel):
+    id: UUID
+    name: str
+    kind: str
+    signed: bool
+
+
+async def _company_for_link(db: AsyncSession, company_id: UUID) -> ReferralPartnerCompany:
+    """Linking may precede the signature. Standing (a partner's access) still
+    means signed — that gate is _require_dealer_partner and is untouched."""
     company = await db.get(ReferralPartnerCompany, company_id)
     if company is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found")
-    signed = (
-        await db.execute(
-            select(ContractAgreement.id).where(
-                ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
-                ContractAgreement.subject_type == ContractSubjectType.COMPANY,
-                ContractAgreement.subject_id == company_id,
-            ).limit(1)
-        )
-    ).scalar_one_or_none()
-    if signed is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "The selected company does not have a signed Referral Protection Agreement.",
-        )
     return company
+
+
+async def _company_by_name(db: AsyncSession, company_name: str) -> ReferralPartnerCompany:
+    """Find-or-create by name, the way the docstrings always said it worked."""
+    company = (
+        await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
+    ).scalar_one_or_none()
+    if company is None:
+        company = ReferralPartnerCompany(name=company_name, kind=KIND_REFERRAL_PARTNER)
+        db.add(company)
+        await db.flush()
+    return company
+
+
+async def _signed_company_ids(db: AsyncSession, company_ids: set[UUID]) -> set[UUID]:
+    if not company_ids:
+        return set()
+    return set(
+        (
+            await db.execute(
+                select(ContractAgreement.subject_id).where(
+                    ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
+                    ContractAgreement.subject_type == ContractSubjectType.COMPANY,
+                    ContractAgreement.subject_id.in_(company_ids),
+                )
+            )
+        ).scalars().all()
+    )
+
+
+async def _with_company(db: AsyncSession, user: User, result: UserRead) -> UserRead:
+    """The linked profile on a user read: name, kind, and whether it really signed."""
+    result.account_types = _account_types(user)
+    if user.referral_partner_company_id is not None:
+        company = await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
+        result.referral_partner_company_name = company.name if company else None
+        result.company_kind = getattr(company, "kind", None) if company else None
+        result.company_agreement_signed = user.referral_partner_company_id in await _signed_company_ids(db, {user.referral_partner_company_id})
+    return result
+
+
+def _is_house(company: ReferralPartnerCompany | None) -> bool:
+    return company is not None and getattr(company, "kind", None) == KIND_HOUSE
 
 
 @router.get(
@@ -139,6 +188,19 @@ async def list_signed_referral_companies(
     return [SignedCompanyRead(id=row.id, name=row.name) for row in rows]
 
 
+@router.get(
+    "/referral-companies",
+    response_model=list[ReferralCompanyRead],
+    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
+)
+async def list_referral_companies(db: AsyncSession = Depends(get_db)) -> list[ReferralCompanyRead]:
+    """Every business relationship profile, the house first, each saying whether it signed."""
+    rows = (await db.execute(select(ReferralPartnerCompany).order_by(ReferralPartnerCompany.name))).scalars().all()
+    signed = await _signed_company_ids(db, {r.id for r in rows})
+    rows = sorted(rows, key=lambda r: (0 if _is_house(r) else 1, r.name.lower()))
+    return [ReferralCompanyRead(id=r.id, name=r.name, kind=getattr(r, "kind", None) or KIND_REFERRAL_PARTNER, signed=r.id in signed) for r in rows]
+
+
 class TeamMemberRead(BaseModel):
     """Just enough of a colleague to name them on a document.
 
@@ -155,6 +217,12 @@ class TeamMemberRead(BaseModel):
     phone: str | None = None
     title: str | None = None
     role: str
+    # The linked business relationship profile: the package's employer line
+    # and the sponsor default follow it.
+    company_id: UUID | None = None
+    company_name: str | None = None
+    company_kind: str | None = None
+    company_signed: bool = False
 
 
 @router.get("/team", response_model=list[TeamMemberRead])
@@ -174,10 +242,21 @@ async def list_team(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> li
             .order_by(User.name)
         )
     ).scalars().all()
-    return [
-        TeamMemberRead(id=r.id, name=r.name, email=r.email, phone=r.phone, title=r.title, role=str(r.role))
-        for r in rows
-    ]
+    company_ids = {getattr(r, "referral_partner_company_id", None) for r in rows} - {None}
+    companies: dict[UUID, ReferralPartnerCompany] = {}
+    if company_ids:
+        companies = {c.id: c for c in (await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.id.in_(company_ids)))).scalars().all()}
+    signed = await _signed_company_ids(db, company_ids)
+    out: list[TeamMemberRead] = []
+    for r in rows:
+        company = companies.get(getattr(r, "referral_partner_company_id", None))
+        out.append(TeamMemberRead(
+            id=r.id, name=r.name, email=r.email, phone=r.phone, title=r.title, role=str(r.role),
+            company_id=company.id if company else None, company_name=company.name if company else None,
+            company_kind=(getattr(company, "kind", None) or KIND_REFERRAL_PARTNER) if company else None,
+            company_signed=bool(company and company.id in signed),
+        ))
+    return out
 
 
 @router.get(
@@ -225,6 +304,7 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
         if r.referral_partner_company_id is not None:
             company = companies.get(r.referral_partner_company_id)
             user_read.referral_partner_company_name = company.name if company else None
+            user_read.company_kind = getattr(company, "kind", None) if company else None
             user_read.company_agreement_signed = r.referral_partner_company_id in signed_company_ids
         results.append(user_read)
     return results
@@ -273,24 +353,22 @@ async def invite_user(
     if body.role == Role.DEALER_PARTNER and not company_name and body.referral_partner_company_id is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Company name is required for Dealer Partner invites — their company must always have a "
-            "signed Referral Protection Agreement on file.",
+            "Company name is required for Dealer Partner invites — their company must sign the "
+            "Referral Protection Agreement before they can use the platform.",
         )
 
     referral_partner_company_id = body.referral_partner_company_id
     if referral_partner_company_id is not None:
-        await _signed_company(db, referral_partner_company_id)
+        company = await _company_for_link(db, referral_partner_company_id)
+        if body.role == Role.DEALER_PARTNER and _is_house(company):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "A dealer partner belongs to their own company, not the house.")
     elif company_name:
-        company = (
-            await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
-        ).scalar_one_or_none()
-        if company is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "No company with that name and a signed agreement was found.",
-            )
-        await _signed_company(db, company.id)
-        referral_partner_company_id = company.id
+        referral_partner_company_id = (await _company_by_name(db, company_name)).id
+    elif body.role in HOUSE_ROLES:
+        # Every employee is linked. Skip silently if the house row is absent
+        # (a fresh database before 0198 ran) rather than fail the invite.
+        house = await house_company(db)
+        referral_partner_company_id = house.id if house else None
 
     existing = (
         await db.execute(select(User).where(User.email == body.email.lower()))
@@ -331,13 +409,7 @@ async def invite_user(
         redirect_url=_INVITE_LANDING.get(body.role),
     )
 
-    result = UserRead.model_validate(user)
-    result.account_types = _account_types(user)
-    if referral_partner_company_id is not None:
-        company = await db.get(ReferralPartnerCompany, referral_partner_company_id)
-        result.referral_partner_company_name = company.name if company else None
-        result.company_agreement_signed = True
-    return result
+    return await _with_company(db, user, UserRead.model_validate(user))
 
 
 @router.patch(
@@ -368,41 +440,45 @@ async def update_user(
         # (dealer_ai_intake.py) until a linked ReferralPartnerCompany has a
         # signed Referral Protection Agreement -- a user with no company
         # link at all can never pass that check. Require one here, same as
-        # invite_user, rather than silently leaving the role unusable.
-        if body.role == Role.DEALER_PARTNER and user.referral_partner_company_id is None:
+        # invite_user, rather than silently leaving the role unusable. A
+        # house-linked staffer counts as having no partner company: promoting
+        # them without one would lock them out for good.
+        linked = await db.get(ReferralPartnerCompany, user.referral_partner_company_id) if user.referral_partner_company_id else None
+        if body.role == Role.DEALER_PARTNER and (linked is None or _is_house(linked)):
             if body.referral_partner_company_id is not None:
-                await _signed_company(db, body.referral_partner_company_id)
-                user.referral_partner_company_id = body.referral_partner_company_id
-                user.role = body.role
+                company = await _company_for_link(db, body.referral_partner_company_id)
+                if _is_house(company):
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, "A dealer partner belongs to their own company, not the house.")
+                user.referral_partner_company_id = company.id
             else:
                 company_name = (body.company_name or "").strip()
                 if not company_name:
                     raise HTTPException(
                         status.HTTP_400_BAD_REQUEST,
-                        "Company name is required to set the Dealer Partner role — their company must have a "
-                        "signed Referral Protection Agreement on file.",
+                        "Company name is required to set the Dealer Partner role — their company must sign the "
+                        "Referral Protection Agreement before they can use the platform.",
                     )
-                company = (
-                    await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(company_name)))
-                ).scalar_one_or_none()
-                if company is None:
-                    raise HTTPException(
-                        status.HTTP_404_NOT_FOUND,
-                        "No company with that name and a signed agreement was found.",
-                    )
-                await _signed_company(db, company.id)
-                user.referral_partner_company_id = company.id
+                user.referral_partner_company_id = (await _company_by_name(db, company_name)).id
+        elif body.role in HOUSE_ROLES and user.role == Role.DEALER_PARTNER and "referral_partner_company_id" not in body.model_fields_set:
+            # Coming in from a partner company with no new link named: the
+            # house, or their old company would keep defaulting the sponsor.
+            house = await house_company(db)
+            if house is not None:
+                user.referral_partner_company_id = house.id
         user.role = body.role
     if body.name is not None:
         user.name = body.name
     if "referral_partner_company_id" in body.model_fields_set:
-        if body.referral_partner_company_id is None and (body.role or user.role) == Role.DEALER_PARTNER:
+        role_after = body.role or user.role
+        if body.referral_partner_company_id is None and role_after in HOUSE_ROLES | {Role.DEALER_PARTNER}:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "Dealer Partner access requires a company with a signed agreement.",
+                "Every operator is linked to a business relationship profile — pick the house or a partner company.",
             )
         if body.referral_partner_company_id is not None:
-            await _signed_company(db, body.referral_partner_company_id)
+            company = await _company_for_link(db, body.referral_partner_company_id)
+            if role_after == Role.DEALER_PARTNER and _is_house(company):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "A dealer partner belongs to their own company, not the house.")
         user.referral_partner_company_id = body.referral_partner_company_id
     if body.account_types is not None:
         requested_access = set(body.account_types)
@@ -411,13 +487,7 @@ async def update_user(
         user.account_access_types = sorted(requested_access)
     await db.flush()
     await db.refresh(user)
-    result = UserRead.model_validate(user)
-    result.account_types = _account_types(user)
-    if user.referral_partner_company_id is not None:
-        company = await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
-        result.referral_partner_company_name = company.name if company else None
-        result.company_agreement_signed = True
-    return result
+    return await _with_company(db, user, UserRead.model_validate(user))
 
 
 @router.delete(

@@ -41,7 +41,11 @@ from app.models.production_package import (
     ProductionTermSheet,
 )
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
-from app.models.referral_partner_company import ReferralPartnerCompany
+from app.models.referral_partner_company import (
+    KIND_HOUSE,
+    KIND_REFERRAL_PARTNER,
+    ReferralPartnerCompany,
+)
 from app.models.user import User
 from app.schemas.production_package import (
     ProductionCapabilities,
@@ -54,6 +58,7 @@ from app.schemas.production_package import (
     ProductionSmsConsentRead,
     ProductionTermSheetRead,
     SponsorAgreementRead,
+    SponsorDefaultRead,
     SponsorOptionRead,
 )
 from app.services import application_profiles as profiles
@@ -248,26 +253,33 @@ async def resolve_package(db: AsyncSession, profile_id: UUID, user: User) -> Pac
         arrangement, provenance, _applied, _skipped = prefill_svc.apply_prefill(
             pa.empty_arrangement(), {}, result
         )
-        computed = pa.compute(arrangement)
         package = ProductionPackage(
             profile_id=profile.id,
             intake_id=profile.intake_id,
             dealer_id=profile.dealer_id,
-            arrangement=pa.jsonable(arrangement),
-            prefill_provenance=provenance,
-            attention=computed["attention"],
-            computed_cache=pa.jsonable(computed),
             created_by_user_id=user.id,
             updated_by_user_id=user.id,
             updated_via="operator",
         )
+        # The sponsor defaults from the agent's linked profile, unconfirmed;
+        # the desk overrides it from the picker.
+        default = await _default_sponsor_onto(db, package, profile, arrangement, provenance, user)
+        computed = pa.compute(arrangement)
+        package.arrangement = pa.jsonable(arrangement)
+        package.prefill_provenance = provenance
+        package.attention = computed["attention"]
+        package.computed_cache = pa.jsonable(computed)
         db.add(package)
         await db.flush()
         await profiles.log_profile_action(
             db, profile, user, "production_package.created",
             "Production package opened from the file",
             target_type="production_package", target_id=package.id,
-            metadata={"prefilled": sorted(provenance), "missing": result.missing, "via": mode},
+            metadata={
+                "prefilled": sorted(provenance), "missing": result.missing, "via": mode,
+                "sponsor_default": ({"company_id": str(default.company_id), "via": default.via, "person_id": str(default.person_id),
+                                     "signed": default.signed, "applied": package.sponsor_company_id == default.company_id} if default else None),
+            },
         )
     access = PackageAccess(package=package, profile=profile, user=user, mode=mode, dealer=await _dealer_for(db, profile),
                            via="operator" if mode == "operator" else "ownership")
@@ -524,6 +536,8 @@ def _sponsor_option(company: ReferralPartnerCompany, agreement: ContractAgreemen
     return SponsorOptionRead(
         company_id=company.id,
         name=company.name,
+        kind=getattr(company, "kind", None) or KIND_REFERRAL_PARTNER,
+        has_agreement=agreement is not None,
         entity_type=company.entity_type or fv.get("referral_partner_entity_type") or None,
         state_of_formation=company.state_of_formation or fv.get("referral_partner_state_of_organization") or None,
         principal_address=company.principal_address or fv.get("referral_partner_principal_place_of_business") or None,
@@ -592,6 +606,7 @@ async def sponsor_options(db: AsyncSession, *, user: User) -> list[SponsorOption
                 & (ContractAgreement.subject_type == ContractSubjectType.COMPANY)
                 & (ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION),
             )
+            .where(ReferralPartnerCompany.kind == KIND_REFERRAL_PARTNER)
             .distinct()
             .order_by(ReferralPartnerCompany.name)
         )
@@ -618,6 +633,8 @@ async def require_signed_sponsor(db: AsyncSession, package: ProductionPackage) -
             detail={"code": "sponsor_missing", "message": "Choose the sponsor before requesting a signature."},
         )
     company = await db.get(ReferralPartnerCompany, package.sponsor_company_id)
+    if company is not None and getattr(company, "kind", None) == KIND_HOUSE:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=_HOUSE_NOT_A_SPONSOR)
     agreement = await _latest_rpa(db, package.sponsor_company_id) if company else None
     if company is None or agreement is None:
         raise HTTPException(
@@ -628,6 +645,12 @@ async def require_signed_sponsor(db: AsyncSession, package: ProductionPackage) -
             },
         )
     return company, agreement
+
+
+_HOUSE_NOT_A_SPONSOR = {
+    "code": "house_is_not_a_sponsor",
+    "message": "Qualified Commercial is the house, not a sponsor. Choose the referral partner that sponsors this dealer.",
+}
 
 
 def sponsor_snapshot(company: ReferralPartnerCompany, agreement: ContractAgreement, arrangement: dict[str, Any]) -> dict[str, Any]:
@@ -664,7 +687,9 @@ async def _apply_sponsor(db: AsyncSession, access: PackageAccess, company_id: UU
             provenance.pop(key, None)
         return {"arrangement": arrangement, "provenance": provenance}
     option = await sponsor_option_for(db, company_id, user=access.user)
-    if option is None or option.agreement is None:
+    if option is not None and option.kind == KIND_HOUSE:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=_HOUSE_NOT_A_SPONSOR)
+    if option is None or not option.has_agreement:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
@@ -673,6 +698,15 @@ async def _apply_sponsor(db: AsyncSession, access: PackageAccess, company_id: UU
             },
         )
     package.sponsor_company_id = option.company_id
+    # The desk chose it: confirmed. A default from the agent's linked profile
+    # arrives through the same copy, unconfirmed, and the chip says so.
+    _copy_sponsor_block(option, arrangement, provenance, confirmed=True, label=prefill_svc.SOURCE_LABELS["sponsor"])
+    return {"arrangement": arrangement, "provenance": provenance}
+
+
+def _copy_sponsor_block(option: SponsorOptionRead, arrangement: dict[str, Any], provenance: dict[str, Any], *, confirmed: bool, label: str) -> None:
+    """Copy the company onto the six sponsor keys, with provenance. The
+    company is the record; the package holds a copy."""
     values = {
         "sponsor_name": option.name,
         "sponsor_state": option.state_of_formation or "",
@@ -684,13 +718,122 @@ async def _apply_sponsor(db: AsyncSession, access: PackageAccess, company_id: UU
         # naming the wrong company on Schedule A.
         "sponsor_platform": option.platform_name or "",
     }
+    source = "sponsor" if confirmed else "sponsor_default"
     for key, value in values.items():
         arrangement[key] = value
         if value:
-            provenance[key] = {"source": "sponsor", "label": prefill_svc.SOURCE_LABELS["sponsor"], "confirmed": True}
+            provenance[key] = {"source": source, "label": label, "confirmed": confirmed}
         else:
             provenance.pop(key, None)
-    return {"arrangement": arrangement, "provenance": provenance}
+
+
+# ---------------------------------------------------------------------------
+# the sponsor defaults from the agent's linked profile
+# ---------------------------------------------------------------------------
+
+SponsorVia = Literal["rm", "agent", "creator"]
+
+
+@dataclass(frozen=True)
+class SponsorDefault:
+    company_id: UUID
+    company_name: str
+    signed: bool
+    person_id: UUID
+    person_name: str
+    via: SponsorVia
+
+
+async def house_company(db: AsyncSession) -> ReferralPartnerCompany | None:
+    return (await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.kind == KIND_HOUSE).limit(1))).scalar_one_or_none()
+
+
+async def linked_company(db: AsyncSession, user_id: UUID | None) -> ReferralPartnerCompany | None:
+    """The business relationship profile a person is linked to, if any."""
+    if user_id is None:
+        return None
+    user = await db.get(User, user_id)
+    if user is None or user.deleted_at is not None or user.referral_partner_company_id is None:
+        return None
+    return await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
+
+
+async def default_sponsor_company_id(
+    db: AsyncSession, profile: ApplicationProfile, arrangement: dict[str, Any], actor: User | None,
+) -> SponsorDefault | None:
+    """Where the sponsor defaults from: the relationship manager's linked
+    profile, then the agent on the file's, then the creator's.
+
+    The owner's rule — "the agent and every employee should be linked to a
+    business relationship profile; whatever that account is, is what it
+    defaults to" — read strictly:
+
+    * The house is transparent. Internal staff are linked to it so that every
+      employee is linked, but the house is never a sponsor, so a house-linked
+      candidate is skipped rather than returned.
+    * An UNSIGNED linked company stops the walk. Falling through to a later
+      candidate's signed company would attribute the deal to a party other
+      than the one the agent's own account names, which is exactly what the
+      rule forbids. The desk gets "ask X to sign" instead of a default.
+    """
+    candidates: list[tuple[SponsorVia, UUID | None]] = [("rm", await rm_user_id_for(db, arrangement))]
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    if intake is not None and intake.broker_id:
+        candidates.append(("agent", intake.broker_id))
+    dealer = await db.get(DealerBusiness, profile.dealer_id) if profile.dealer_id else None
+    if dealer is not None and dealer.owner_user_id:
+        candidates.append(("agent", dealer.owner_user_id))
+    if actor is not None:
+        candidates.append(("creator", actor.id))
+    seen: set[UUID] = set()
+    for via, user_id in candidates:
+        if user_id is None or user_id in seen:
+            continue
+        seen.add(user_id)
+        person = await db.get(User, user_id)
+        if person is None or person.deleted_at is not None or person.referral_partner_company_id is None:
+            continue
+        company = await db.get(ReferralPartnerCompany, person.referral_partner_company_id)
+        if company is None or getattr(company, "kind", None) == KIND_HOUSE:
+            continue
+        return SponsorDefault(
+            company_id=company.id, company_name=company.name,
+            signed=(await _latest_rpa(db, company.id)) is not None,
+            person_id=person.id, person_name=person.name or person.email or "the agent", via=via,
+        )
+    return None
+
+
+def _say_why_the_sponsor_is_blank(rows: list[dict[str, Any]], default: SponsorDefault) -> list[dict[str, Any]]:
+    """The blank-sponsor attention row says why there is no default, and what to
+    do. Decorated on the read only: compute() stays pure and computed_cache
+    never carries a value that needs the database."""
+    return [
+        ({**row,
+          "detail": (f"Ask {default.company_name} to sign the Strategic Referral, Capital Advisory and Business "
+                     f"Relationship Protection Agreement — {default.person_name} is linked to it."),
+          "action": {"kind": "copy_signing_link", "label": "Copy signing link"}}
+         if row.get("key") == "sponsor_name" else row)
+        for row in rows
+    ]
+
+
+async def _default_sponsor_onto(
+    db: AsyncSession, package: ProductionPackage, profile: ApplicationProfile,
+    arrangement: dict[str, Any], provenance: dict[str, Any], actor: User | None,
+) -> SponsorDefault | None:
+    """Apply the default when there is one and it is signed. Never replaces a sponsor already on the package."""
+    if package.sponsor_company_id is not None:
+        return None
+    default = await default_sponsor_company_id(db, profile, arrangement, actor)
+    if default is None or not default.signed:
+        return default
+    option = await sponsor_option_for(db, default.company_id, user=None)
+    if option is None or option.kind == KIND_HOUSE or not option.has_agreement:
+        return default
+    package.sponsor_company_id = option.company_id
+    _copy_sponsor_block(option, arrangement, provenance, confirmed=False, label=f"Linked profile of {default.person_name}")
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -799,9 +942,28 @@ async def apply_changes(
             diff[key] = {"before": _clip(before.get(key)), "after": _clip(arrangement.get(key))}
             if key in provenance and key not in pa.SPONSOR_KEYS:
                 provenance[key] = {"source": "user", "label": "Edited", "confirmed": True}
+    rm_changed = "rm_user_id" in normalized and before.get("rm_user_id") != arrangement.get("rm_user_id")
+    if rm_changed and not sponsor_change and int(getattr(package, "stage", 1) or 1) == 1:
+        # A new manager may carry a linked profile the package had no default
+        # from yet. A sponsor already chosen — confirmed or not — is never replaced.
+        creator = await db.get(User, package.created_by_user_id) if package.created_by_user_id else None
+        default = await _default_sponsor_onto(db, package, access.profile, arrangement, provenance, creator)
+        if default is not None and package.sponsor_company_id == default.company_id and before.get("sponsor_name") != arrangement.get("sponsor_name"):
+            diff["sponsor_company_id"] = {"before": _clip(before.get("sponsor_name")), "after": _clip(arrangement.get("sponsor_name")), "defaulted_from": default.via}
+        # The employer follows the manager's linked profile unless the desk typed one.
+        if not str(arrangement.get("rm_employer") or "").strip() or arrangement.get("rm_employer") == pa.DEFAULTS["rm_employer"]:
+            employer = await linked_company(db, await rm_user_id_for(db, arrangement))
+            if employer is not None and employer.name != arrangement.get("rm_employer"):
+                arrangement["rm_employer"] = employer.name
+                diff["rm_employer"] = {"before": _clip(before.get("rm_employer")), "after": employer.name}
     for key in confirm or []:
         if key in provenance:
             provenance[key] = {**provenance[key], "confirmed": True}
+        # One click confirms the whole sponsor block: it was copied as one.
+        if key == "sponsor_name":
+            for sk in pa.SPONSOR_KEYS:
+                if sk in provenance:
+                    provenance[sk] = {**provenance[sk], "confirmed": True}
     if sponsor_change:
         diff["sponsor_company_id"] = {"before": _clip(before.get("sponsor_name")), "after": _clip(arrangement.get("sponsor_name"))}
     computed = pa.compute(arrangement, stage=int(getattr(package, "stage", 1) or 1))
@@ -1185,7 +1347,22 @@ async def serialize(db: AsyncSession, access: PackageAccess) -> ProductionPackag
     business_name, email, phone = await client_contact(db, access)
     sponsor = await sponsor_option_for(db, package.sponsor_company_id, user=access.user if operator else None)
     if sponsor is not None and not operator:
-        sponsor = SponsorOptionRead(company_id=sponsor.company_id, name=sponsor.name)
+        # A rep sees the name and that an agreement exists — never the agreement's details.
+        sponsor = SponsorOptionRead(company_id=sponsor.company_id, name=sponsor.name, kind=sponsor.kind, has_agreement=sponsor.has_agreement)
+    sponsor_default: SponsorDefaultRead | None = None
+    attention_rows = list(computed.get("attention", []))
+    if operator and int(getattr(package, "stage", 1) or 1) == 1:
+        creator = await db.get(User, package.created_by_user_id) if package.created_by_user_id else None
+        default = await default_sponsor_company_id(db, access.profile, arrangement, creator)
+        if default is not None:
+            sponsor_default = SponsorDefaultRead(
+                company_id=default.company_id, name=default.company_name, signed=default.signed,
+                person_id=default.person_id, person_name=default.person_name, via=default.via,
+                applied=package.sponsor_company_id == default.company_id,
+            )
+            if not default.signed and package.sponsor_company_id is None:
+                attention_rows = _say_why_the_sponsor_is_blank(attention_rows, default)
+    computed = {**computed, "attention": attention_rows}
     signer_phone = phone
     consent = await sms_consent_status(db, signer_phone) if operator else ProductionSmsConsentRead()
     stale = bool(package.presentation_s3_key) and package.presentation_snapshot_sha256 != pa.snapshot_hash(arrangement)
@@ -1237,9 +1414,9 @@ async def serialize(db: AsyncSession, access: PackageAccess) -> ProductionPackag
         stage=package.stage, status=package.status, version=package.version, business_name=business_name,
         client_email=email if operator else None, client_phone=phone if operator else None,
         arrangement=arrangement, prefill_provenance=package.prefill_provenance or {},
-        computed=computed, attention=computed.get("attention", []),
+        computed=computed, attention=attention_rows,
         attention_presentation=computed.get("attention_presentation", []),
-        sponsor=sponsor,
+        sponsor=sponsor, sponsor_default=sponsor_default,
         presentation=ProductionPresentationRead(
             url=presign_private_s3_object(
                 package.presentation_s3_key, ttl_seconds=3600,

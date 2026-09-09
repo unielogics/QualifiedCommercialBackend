@@ -42,10 +42,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ContractSubjectType, ContractType, Role
-from app.models.contract_agreement import ContractAgreement
 from app.models.agreement_counterparty import AgreementCounterparty
+from app.models.contract_agreement import ContractAgreement
 from app.models.public_contract_sign_session import PublicContractSignSession
-from app.models.referral_partner_company import ReferralPartnerCompany
+from app.models.referral_partner_company import KIND_HOUSE, ReferralPartnerCompany
 from app.models.user import User
 from app.services import contract_templates as tpl
 
@@ -372,6 +372,9 @@ async def _find_or_create_company(db: AsyncSession, payload: ContractSignRequest
     existing = (
         await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.name.ilike(name)))
     ).scalar_one_or_none()
+    if existing is not None and getattr(existing, "kind", None) == KIND_HOUSE:
+        # Signing an agreement "for" the house would turn it into a sponsor candidate.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{existing.name} is the house, not a referral partner.")
     if existing:
         return existing
     company = ReferralPartnerCompany(

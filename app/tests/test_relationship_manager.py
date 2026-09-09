@@ -110,13 +110,16 @@ async def test_a_client_cannot_read_the_team_list():
 
 @pytest.mark.asyncio
 async def test_the_team_list_carries_no_invite_or_account_state():
-    """The reason /users stays super-admin only: it exposes invite status,
-    account status and referral-company wiring. This one is a name and a way to
-    reach them."""
+    """The reason /users stays super-admin only: it exposes invite status and
+    account status. This one is a name, a way to reach them, and the business
+    relationship profile they belong to — the package's employer line and the
+    sponsor default follow it."""
     from app.routers.users import TeamMemberRead, list_team
 
     out = await list_team(_user(Role.LOAN_EXEC), _db([_user()]))
-    assert set(TeamMemberRead.model_fields) == {"id", "name", "email", "phone", "title", "role"}
+    assert set(TeamMemberRead.model_fields) == {"id", "name", "email", "phone", "title", "role",
+                                                "company_id", "company_name", "company_kind", "company_signed"}
+    assert out[0].company_id is None and out[0].company_signed is False
     assert out and out[0].email == "dana@example.com"
 
 
