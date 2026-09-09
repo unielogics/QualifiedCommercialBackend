@@ -13,7 +13,7 @@ field rep got an empty list, no explanation, and `rm_user_id` was never set.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -137,3 +137,114 @@ def test_the_profile_routes_are_registered():
     contract = {(r.path, m) for r in router.routes for m in getattr(r, "methods", set())}
     assert ("/me/profile", "GET") in contract
     assert ("/me/profile", "PATCH") in contract
+
+
+# --- once, then reused: the phone lifecycle ---------------------------------------
+
+
+def test_needs_phone_is_only_asked_of_the_people_named_on_agreements():
+    from app.services.user_phone import needs_phone
+
+    for role in (Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP):
+        assert needs_phone(_user(role, phone=None)) is True, role
+        assert needs_phone(_user(role, phone="   ")) is True, role
+        assert needs_phone(_user(role, phone="+19735550148")) is False, role
+    for role in (Role.CLIENT, Role.DEALER_PARTNER, Role.LENDER, Role.BROKER):
+        assert needs_phone(_user(role, phone=None)) is False, role
+    # A broker with field-desk access is a rep in every other respect, and here too.
+    assert needs_phone(_user(Role.BROKER, phone=None, account_access_types=["field_desk"])) is True
+
+
+def test_store_phone_is_one_rule_for_both_doors():
+    from app.services.user_phone import store_phone
+
+    assert store_phone("(973) 555-0148") == "+19735550148"
+    assert store_phone("973-555-0148 ext 4") == "973-555-0148 ext 4"
+    assert store_phone("   ") is None and store_phone(None) is None
+
+
+@pytest.mark.asyncio
+async def test_auth_me_says_when_a_phone_is_still_needed():
+    from app.routers.auth import me
+
+    with patch("app.routers.auth.account_types", return_value=[]), patch("app.routers.auth.has_product_access", return_value=False):
+        out = await me(_user(Role.FIELD_REP, phone=None, id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None))
+        assert out.needs_phone is True
+        out = await me(_user(Role.FIELD_REP, phone="+19735550148", id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None))
+        assert out.needs_phone is False
+
+
+def test_the_user_reads_carry_the_phone():
+    from app.routers.users import UserInvite, UserPatch, UserRead
+
+    assert "phone" in UserRead.model_fields and "phone" in UserInvite.model_fields and "phone" in UserPatch.model_fields
+
+
+@pytest.mark.asyncio
+async def test_an_invite_can_carry_a_phone_stored_in_e164():
+    from app.routers import users as users_router
+
+    added = []
+
+    async def get(_model, _key, **_kw):
+        return None
+
+    async def execute(_stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: None, scalars=lambda: SimpleNamespace(all=lambda: []))
+
+    async def refresh(_row):
+        return None
+
+    def add(row):
+        row.id = uuid4()
+        added.append(row)
+
+    db = SimpleNamespace(get=get, execute=execute, flush=AsyncMock(), refresh=refresh, add=add)
+    with patch.object(users_router.clerk_service, "invite_user", AsyncMock()), \
+         patch.object(users_router, "house_company", AsyncMock(return_value=None)), \
+         patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())):
+        out = await users_router.invite_user(users_router.UserInvite(email="rep@example.com", name="Rita Moss", role=Role.FIELD_REP, phone="(973) 555-0148"), db)
+    assert added[0].phone == "+19735550148" and out.phone == "+19735550148"
+
+
+@pytest.mark.asyncio
+async def test_a_super_admin_can_fix_a_colleagues_phone():
+    from app.routers import users as users_router
+
+    colleague = _user(Role.LOAN_EXEC, phone=None, id=uuid4(), deleted_at=None, referral_partner_company_id=None, account_access_types=[])
+
+    async def get(_model, _key, **_kw):
+        return None
+
+    async def execute(_stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: colleague, scalars=lambda: SimpleNamespace(all=lambda: []))
+
+    async def refresh(_row):
+        return None
+
+    db = SimpleNamespace(get=get, execute=execute, flush=AsyncMock(), refresh=refresh)
+    with patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())):
+        out = await users_router.update_user(colleague.id, users_router.UserPatch(phone="973 555 0148"), db)
+        assert colleague.phone == "+19735550148" and out.phone == "+19735550148"
+        # A field that was not sent is left alone.
+        await users_router.update_user(colleague.id, users_router.UserPatch(name="Dana R"), db)
+        assert colleague.phone == "+19735550148"
+
+
+def test_the_phone_backfill_never_overwrites_a_number_someone_typed():
+    """Migration 0199 copies the rep-app card's phone onto the user row only
+    where the row has none, and the other way only where the card is blank."""
+    from pathlib import Path
+
+    source = Path("alembic/versions/0199_user_phone_reconciliation.py").read_text()
+    assert "u.phone IS NULL" in source
+    assert "NULLIF(TRIM(p.phone), '') IS NULL" in source
+    assert 'down_revision = "0198_referral_company_kind_and_house"' in source
+
+
+def test_the_migration_chain_has_one_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
+    assert heads == ["0199_user_phone_reconciliation"]

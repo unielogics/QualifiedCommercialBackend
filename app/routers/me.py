@@ -27,11 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings as get_app_config
 from app.db import get_db
 from app.deps import CurrentUser
-from app.dealer_os.services.consent_delivery import normalize_phone
 from app.enums import Role
 from app.models.activity import Activity
 from app.models.booking_settings import BookingSettings
 from app.models.broker import Broker
+from app.services.user_phone import store_phone
 from app.schemas.booking_settings import (
     BookingAssetUploadInitRequest,
     BookingAssetUploadInitResponse,
@@ -235,11 +235,8 @@ async def update_profile(
 ) -> ProfileRead:
     changes = payload.model_dump(exclude_unset=True)
     if "phone" in changes:
-        raw = (changes["phone"] or "").strip()
-        # E.164 where the number is unambiguous, otherwise exactly what they
-        # typed: this one is printed on an agreement, not texted, so an
-        # extension or a switchboard note must survive rather than vanish.
-        user.phone = (normalize_phone(raw) or raw) if raw else None
+        # One rule for both doors (this one and the rep app's card): see user_phone.
+        user.phone = store_phone(changes["phone"])
     if "title" in changes:
         user.title = (changes["title"] or "").strip() or None
     await db.commit()

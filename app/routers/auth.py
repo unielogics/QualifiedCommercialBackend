@@ -17,6 +17,7 @@ from app.enums import ProductAccountType, Role
 from app.routers.users import _account_types
 from app.schemas.common import ORMModel
 from app.services.user_access import account_types, has_product_access
+from app.services.user_phone import needs_phone
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -48,6 +49,9 @@ class MeResponse(ORMModel):
     # relationship manager and their phone on both agreements.
     phone: str | None = None
     title: str | None = None
+    # The one-time gate both apps show a rep, an underwriter or a super admin
+    # with no mobile on file. Computed here so the two apps cannot disagree.
+    needs_phone: bool = False
     can_access_funding: bool
     can_access_audit: bool
 
@@ -69,6 +73,7 @@ async def me(user: CurrentUser) -> MeResponse:
         account_status=user.account_status,
         phone=user.phone,
         title=user.title,
+        needs_phone=needs_phone(user),
         can_access_funding=has_product_access(user, ProductAccountType.FUNDING),
         can_access_audit=has_product_access(user, ProductAccountType.AUDIT),
     )

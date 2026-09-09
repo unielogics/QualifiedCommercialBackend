@@ -313,6 +313,10 @@ async def build_prefill(db: AsyncSession, profile: ApplicationProfile, actor: Us
     if actor is not None:
         out.put("rm_name", _text(getattr(actor, "name", None)), "user")
         out.put("rm_email", _text(getattr(actor, "email", None)), "user")
+        # Set up once on the person, reused on every package they open: the
+        # phone Schedule 2 prints, and the id the signature on file is matched by.
+        out.put("rm_phone", _text(getattr(actor, "phone", None)), "user")
+        out.put("rm_user_id", _text(str(getattr(actor, "id", "") or "")), "user")
         # The employer is the manager's linked business relationship profile
         # (the house for internal staff, which is the constant below anyway).
         company_id = getattr(actor, "referral_partner_company_id", None)
@@ -358,6 +362,13 @@ def apply_prefill(
         if not force and not untouched:
             skipped.append(key)
             continue
+        # A refill by a colleague must not put their phone or id under the
+        # manager already named on the package.
+        if key in ("rm_phone", "rm_user_id") and result.provenance.get(key, {}).get("source") == "user":
+            named = str(base.get("rm_email") or "").strip().lower()
+            if named and named != str(result.values.get("rm_email") or "").strip().lower():
+                skipped.append(key)
+                continue
         base[key] = result.values[key]
         prov[key] = dict(result.provenance[key])
         applied.append(key)

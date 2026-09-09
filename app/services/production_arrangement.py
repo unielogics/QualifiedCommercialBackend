@@ -239,7 +239,9 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("rm_email", "parties", "Relationship manager email", kind="email", required_for="stage_one",
               title="Relationship manager email is blank", detail="Schedule 2 needs a notice address for the manager."),
     FieldRule("rm_phone", "parties", "Relationship manager phone", kind="phone", required_for="stage_one",
-              title="Relationship manager phone is blank", detail="Schedule 2 needs a phone number for the manager."),
+              title="Relationship manager phone is blank",
+              detail="Schedule 2 needs a phone number for the manager. Pick them from the team list, or ask them to add one under Profile → Your contact details.",
+              hint="Set once on the person's profile; it arrives with the pick"),
     # ---- lot and baseline ----
     FieldRule("lot_units", "lot", "Vehicles in the lot", kind="number", required_for="presentation", non_zero=True,
               title="Vehicles in the lot is blank", detail="The lot count anchors the whole baseline.",

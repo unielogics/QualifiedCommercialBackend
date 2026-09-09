@@ -1522,9 +1522,15 @@ async def signatures_on_file_status(db: AsyncSession, access: PackageAccess) -> 
                       "how_to_fix": None if sponsor else ("Choose the sponsor first." if not access.package.sponsor_company_id else "Authorize the sponsor's signature on file (super admin) from the sponsor row.")}
     rm_id = await rm_user_id_for(db, arrangement)
     rm = await sigs_svc.current(db, "user", rm_id) if rm_id else None
+    rm_name = arrangement.get("rm_name") or "the relationship manager"
+    # The phone travels with the person: say when the named manager has none on file.
+    rm_phone = (await db.execute(select(User.phone).where(User.id == rm_id))).scalar_one_or_none() if rm_id else None
+    phone_present = bool((rm_phone or "").strip())
     out["rm"] = {"present": rm is not None, "user_id": str(rm_id) if rm_id else None, "typed_name": getattr(rm, "typed_name", None),
                  "adopted_at": (rm.adopted_at.isoformat() if rm is not None and rm.adopted_at else None),
-                 "how_to_fix": None if rm else (f"Ask {arrangement.get('rm_name') or 'the relationship manager'} to adopt their signature (Profile → My signature)." if rm_id else "Pick the relationship manager from the team list so their signature on file can be used.")}
+                 "how_to_fix": None if rm else (f"Ask {rm_name} to adopt their signature (Profile → My signature)." if rm_id else "Pick the relationship manager from the team list so their signature on file can be used."),
+                 "phone_present": phone_present,
+                 "phone_how_to_fix": None if phone_present or not rm_id else f"Ask {rm_name} to add a phone on their profile (Profile → Your contact details)."}
     out["ready"] = all(out[p]["present"] for p in ("qc", "sponsor", "rm"))
     return out
 

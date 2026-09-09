@@ -31,6 +31,7 @@ from app.models.user import User
 from app.schemas.application_profile import TaxonomyContributionCreate, TaxonomyEntryRead
 from app.services.email import ses_client
 from app.services.payment_authorization import primary_super_admin
+from app.services.user_phone import store_phone
 
 from .crm_schemas import (
     CompanyContactIn,
@@ -661,6 +662,8 @@ async def _field_desk_profile_for(
         user_id=owner.id,
         display_name=owner.name or None,
         display_email=owner.email,
+        # The card starts from the number on the user row — one phone, two doors.
+        phone=owner.phone or None,
         preferred_locale="en",
         card_visible=True,
         headshot_s3_key=booking.profile_photo_s3_key if booking else None,
@@ -689,7 +692,8 @@ async def _field_desk_profile_read(
         "user_id": str(owner.id),
         "display_name": profile.display_name or owner.name,
         "title": profile.title,
-        "phone": profile.phone,
+        # users.phone is the record; the card's copy is kept in step on every save.
+        "phone": owner.phone or profile.phone,
         "display_email": profile.display_email or owner.email,
         "short_bio": profile.short_bio,
         "preferred_locale": profile.preferred_locale,
@@ -810,8 +814,16 @@ def _apply_field_desk_profile_update(
     payload: FieldDeskProfileUpdate,
     *,
     owner_id: UUID,
+    owner: User | None = None,
 ) -> None:
     changes = payload.model_dump(exclude_unset=True)
+    if "phone" in changes:
+        # One phone: the user row is the record (it prints on production
+        # agreements and lifts the first-login gate); the card mirrors it.
+        stored = store_phone(changes["phone"])
+        changes["phone"] = stored
+        if owner is not None:
+            owner.phone = stored
     headshot_key = changes.get("headshot_s3_key")
     if (
         headshot_key
@@ -871,7 +883,7 @@ async def update_my_field_desk_profile(
     require_team_or_rep(user)
     profile = await _field_desk_profile_for(db, user, create=True)
     assert profile is not None
-    _apply_field_desk_profile_update(profile, payload, owner_id=user.id)
+    _apply_field_desk_profile_update(profile, payload, owner_id=user.id, owner=user)
     await db.commit()
     await db.refresh(profile)
     return await _field_desk_profile_read(db, user, profile)
@@ -929,7 +941,7 @@ async def update_field_desk_profile_as_admin(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Field Desk user not found")
     profile = await _field_desk_profile_for(db, owner, create=True)
     assert profile is not None
-    _apply_field_desk_profile_update(profile, payload, owner_id=owner.id)
+    _apply_field_desk_profile_update(profile, payload, owner_id=owner.id, owner=owner)
     await db.commit()
     await db.refresh(profile)
     return await _field_desk_profile_read(db, owner, profile)

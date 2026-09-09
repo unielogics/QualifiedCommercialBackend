@@ -27,6 +27,7 @@ from app.services import clerk as clerk_service
 # OPERATOR_ROLES has one definition already; a second copy here is how
 # permission sets drift apart.
 from app.services.production_packages import OPERATOR_ROLES, house_company
+from app.services.user_phone import store_phone
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -64,6 +65,9 @@ class UserRead(BaseModel):
     # None when the user has no linked company; False for the house, which
     # never signs one.
     company_agreement_signed: bool | None = None
+    # The mobile on file. Collected at invite or at first login; printed as the
+    # relationship manager's phone on production agreements.
+    phone: str | None = None
     account_types: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
 
@@ -84,11 +88,15 @@ class UserInvite(BaseModel):
     company_name: str | None = None
     referral_partner_company_id: UUID | None = None
     account_types: list[str] | None = None
+    # Their mobile, taken up front so the first-login gate has nothing to ask.
+    phone: str | None = Field(default=None, max_length=40)
 
 
 class UserPatch(BaseModel):
     role: Role | None = None
     name: str | None = None
+    # A super admin fixing a colleague's number from the Team table.
+    phone: str | None = Field(default=None, max_length=40)
     # Required when setting role=DEALER_PARTNER on a user who has no
     # referral_partner_company_id yet (e.g. promoting an existing user via
     # the Team page's role dropdown, which -- unlike the invite flow --
@@ -383,6 +391,7 @@ async def invite_user(
         existing.clerk_id = None  # force re-bind on next sign-in
         existing.referral_partner_company_id = referral_partner_company_id
         existing.account_access_types = sorted(requested_access)
+        existing.phone = store_phone(body.phone) or existing.phone
         user = existing
     else:
         user = User(
@@ -392,6 +401,7 @@ async def invite_user(
             clerk_id=None,  # bound on first sign-in via JIT provision
             referral_partner_company_id=referral_partner_company_id,
             account_access_types=sorted(requested_access),
+            phone=store_phone(body.phone),
         )
         db.add(user)
 
@@ -468,6 +478,8 @@ async def update_user(
         user.role = body.role
     if body.name is not None:
         user.name = body.name
+    if "phone" in body.model_fields_set:
+        user.phone = store_phone(body.phone)
     if "referral_partner_company_id" in body.model_fields_set:
         role_after = body.role or user.role
         if body.referral_partner_company_id is None and role_after in HOUSE_ROLES | {Role.DEALER_PARTNER}:

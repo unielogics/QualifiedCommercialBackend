@@ -853,3 +853,42 @@ def test_client_ip_reads_the_address_caddy_appended():
     assert client_ip(req) == "5.6.7.8"  # the last entry, not the one the client wrote first
     assert client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))) == "127.0.0.1"
     assert client_ip(None) is None
+
+
+# --- the manager's phone travels with the person ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prefill_names_the_actor_with_phone_and_id():
+    profile = SimpleNamespace(id=uuid.uuid4(), dealer_id=None, intake_id=None, entity_type=None, vertical="dealer", naics_code=None)
+    actor = _user(Role.LOAN_EXEC, phone="+19735550148", referral_partner_company_id=None)
+
+    async def get(_model, _key, **_kw):
+        return None
+
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        result = await prefill.build_prefill(_prefill_db(get, None, facts=[]), profile, actor)
+    assert result.values["rm_phone"] == "+19735550148" and result.provenance["rm_phone"]["source"] == "user"
+    assert result.values["rm_user_id"] == str(actor.id)
+    # No phone on the person: nothing is put, and the attention row says where it comes from.
+    with patch.object(prefill.profiles, "owner_rows", AsyncMock(return_value=[])):
+        bare = await prefill.build_prefill(_prefill_db(get, None, facts=[]), profile, _user(Role.LOAN_EXEC, phone=None, referral_partner_company_id=None))
+    assert "rm_phone" not in bare.values and "rm_phone" in bare.missing
+    assert "Profile → Your contact details" in pa.FIELD_RULES_BY_KEY["rm_phone"].detail
+
+
+def test_a_refill_never_puts_the_actors_phone_under_another_managers_name():
+    result = prefill.PrefillResult()
+    result.put("rm_name", "Cleo Desk", "user")
+    result.put("rm_email", "cleo@example.com", "user")
+    result.put("rm_phone", "+19735550100", "user")
+    result.put("rm_user_id", str(uuid.uuid4()), "user")
+    # The package already names Rita, with no phone yet.
+    base = {**pa.empty_arrangement(), "rm_name": "Rita Moss", "rm_email": "rita@example.com", "rm_phone": "", "rm_user_id": ""}
+    arrangement, _prov, applied, skipped = prefill.apply_prefill(base, {}, result)
+    assert "rm_phone" in skipped and "rm_user_id" in skipped
+    assert arrangement["rm_phone"] == "" and arrangement["rm_user_id"] == ""
+    # The same manager, or nobody named yet: the phone lands.
+    base["rm_email"] = "cleo@example.com"
+    arrangement, _prov, applied, _skipped = prefill.apply_prefill(base, {}, result)
+    assert arrangement["rm_phone"] == "+19735550100" and "rm_phone" in applied

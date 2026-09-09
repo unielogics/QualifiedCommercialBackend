@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -79,3 +80,28 @@ Qualified Commercial"""
 
 def test_vcard_escape_protects_delimiters_and_newlines() -> None:
     assert _vcard_escape("Last, First; Team\nDesk") == "Last\\, First\\; Team\\nDesk"
+
+
+# --- one phone, two doors ------------------------------------------------------------
+
+
+def test_saving_the_field_desk_phone_writes_the_user_row_too() -> None:
+    owner_id = uuid4()
+    owner = SimpleNamespace(id=owner_id, phone=None)
+    profile = _profile(user_id=owner_id, headshot_s3_key=None)
+
+    _apply_field_desk_profile_update(profile, FieldDeskProfileUpdate(phone="(973) 555-0148"), owner_id=owner_id, owner=owner)
+
+    # The same stored string in both places, E.164 where it can be.
+    assert profile.phone == "+19735550148" and owner.phone == "+19735550148"
+    _apply_field_desk_profile_update(profile, FieldDeskProfileUpdate(phone=""), owner_id=owner_id, owner=owner)
+    assert profile.phone is None and owner.phone is None
+
+
+def test_the_field_desk_read_and_seed_prefer_the_user_row() -> None:
+    import inspect
+
+    from app.dealer_os import crm_router
+
+    assert 'owner.phone or profile.phone' in inspect.getsource(crm_router._field_desk_profile_read)
+    assert "phone=owner.phone or None" in inspect.getsource(crm_router._field_desk_profile_for)
