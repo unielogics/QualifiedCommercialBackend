@@ -668,3 +668,87 @@ def test_the_exclusivity_window_follows_the_size_of_the_request():
     assert next(r for r in c["preview"]["one"] if r["label"] == "Exclusivity window (days)")["value"] == "60"
     arr["exclusivity"] = ""
     assert not any(a["key"] == "exclusivity" for a in pa.compute(arr)["attention"])
+
+
+# ---- where the loan goes ----
+
+def test_where_the_loan_goes_is_seeded_and_blank_until_an_amount_is_entered():
+    arr = pa.empty_arrangement()
+    assert [r["label"] for r in arr["proceeds"]] == ["New working capital", "Previous contract repayment"]
+    assert all(r["amount"] == "" and r["note"] == "" for r in arr["proceeds"])
+    rule = pa.FIELD_RULES_BY_KEY["proceeds"]
+    assert pa.is_blank(rule, arr["proceeds"]) is True
+    assert pa.is_blank(rule, [{"label": "Signage", "amount": 1, "note": ""}]) is False
+    # A legacy package with no key gets the seed; a desk that removed both lines keeps them removed.
+    assert pa.compute({})["advance"]["proceeds"] == [{"label": "New working capital", "amount": 0.0, "note": "", "entered": False},
+                                                     {"label": "Previous contract repayment", "amount": 0.0, "note": "", "entered": False}]
+    assert pa.compute({"proceeds": []})["advance"]["proceeds"] == []
+    # It is the desk's: the advance step, so DESK_ONLY_KEYS picks it up by derivation.
+    assert "proceeds" in pa.DESK_ONLY_KEYS and rule.step == "advance" and rule.required is False
+
+
+def test_where_the_loan_goes_normalises_like_the_owners_table():
+    out = pa.normalize_changes({"proceeds": [
+        {"label": " New working capital ", "amount": "250000", "note": ""},
+        {"label": "", "amount": "", "note": "  "},
+        {"label": "Previous contract repayment", "amount": 100000.5, "note": " payoff of the Acme advance "},
+        "junk",
+        {"label": "x", "amount": "abc"},
+    ]})
+    assert out["proceeds"] == [
+        {"label": "New working capital", "amount": 250000, "note": ""},
+        {"label": "Previous contract repayment", "amount": 100000.5, "note": "payoff of the Acme advance"},
+        {"label": "x", "amount": "", "note": ""},
+    ]
+    capped = pa.normalize_changes({"proceeds": [{"label": f"l{i}", "amount": i + 1} for i in range(12)]})
+    assert len(capped["proceeds"]) == pa.MAX_PROCEEDS
+    # The owners table still normalises byte for byte the way it did before the two kinds shared a path.
+    assert pa.OWNER_COLUMNS == (("name", "text"), ("pct", "number"), ("title", "text"), ("email", "text"), ("phone", "text"), ("auth", "text"))
+
+
+def test_where_the_loan_goes_flags_only_when_both_sides_are_filled_and_disagree():
+    arr = seed()
+    arr["proceeds"] = [{"label": "New working capital", "amount": 700000}, {"label": "Previous contract repayment", "amount": 500000}]
+    c = pa.compute(arr)
+    assert c["advance"]["proceeds_total"] == 1200000 and c["advance"]["proceeds_gap"] == 0
+    assert not [a for a in c["attention"] if a["key"] == "proceeds"]
+    arr["proceeds"][1]["amount"] = 400000
+    rows = [a for a in pa.compute(arr)["attention"] if a["key"] == "proceeds"]
+    assert len(rows) == 1 and rows[0]["owner"] == "desk" and "$100,000 unallocated" in rows[0]["detail"]
+    arr["proceeds"][1]["amount"] = 600000
+    assert "$100,000 over the request" in [a for a in pa.compute(arr)["attention"] if a["key"] == "proceeds"][0]["detail"]
+    # Labels alone, or no request, never flag.
+    arr["proceeds"] = [{"label": "New working capital", "amount": ""}]
+    assert not [a for a in pa.compute(arr)["attention"] if a["key"] == "proceeds"]
+    arr["proceeds"] = [{"label": "New working capital", "amount": 5}]
+    arr["requested"] = ""
+    assert not [a for a in pa.compute(arr)["attention"] if a["key"] == "proceeds"]
+
+
+def test_where_the_loan_goes_never_invents_a_change_in_the_comparison():
+    a = seed()
+    a["proceeds"] = [{"label": "New working capital", "amount": 700000}, {"label": "Previous contract repayment", "amount": 500000}]
+    b = copy.deepcopy(a)
+    d = pa.arrangement_diff({"arrangement": a, "computed": pa.compute(a)}, {"arrangement": b, "computed": pa.compute(b, stage=2)})
+    rows = {r["key"]: r for r in d["rows"]}
+    assert rows["proceeds.0"]["changed"] is False and rows["proceeds.total"]["changed"] is False
+    assert rows["proceeds.0"]["dealer_visible"] is True and rows["proceeds.0"]["original_blank"] is False
+    # A commitment executed before the lines existed reads as blank on the original side, not as a change from nothing.
+    old = seed()
+    old.pop("proceeds", None)
+    d2 = pa.arrangement_diff({"arrangement": old, "computed": pa.compute(old)}, {"arrangement": b, "computed": pa.compute(b, stage=2)})
+    r0 = {r["key"]: r for r in d2["rows"]}["proceeds.0"]
+    assert r0["original_blank"] is True and r0["before"] == "—" and r0["after"] == "$700,000"
+
+
+def test_the_proposal_prints_where_the_loan_goes_only_once_an_amount_is_entered():
+    from app.services import production_presentation as pp
+    arr = seed()
+    meta = {"generated_at": "2026-09-09", "package_id": "x", "business_name": "Delgado"}
+    html = pp.build_presentation_html(arr, pa.compute(arr), meta=meta)
+    assert "Where the loan goes" not in html
+    arr["proceeds"] = [{"label": "New working capital", "amount": 700000, "note": "floorplan relief"}, {"label": "Previous contract repayment", "amount": ""}]
+    html = pp.build_presentation_html(arr, pa.compute(arr), meta=meta)
+    assert "Where the loan goes" in html and "floorplan relief" in html and "$700,000" in html
+    assert "$500,000 of the request unallocated" in html
+    assert "Previous contract repayment" not in html.split("Where the loan goes", 1)[1].split("</table>", 1)[0]

@@ -117,7 +117,7 @@ STEP_STAGES: dict[str, tuple[int, ...]] = {
 def steps_for(stage: int) -> list[tuple[str, str, str]]:
     return [s for s in STEPS if stage in STEP_STAGES.get(s[0], (1, 2))]
 
-FieldKind = Literal["text", "number", "date", "email", "phone", "select", "multiselect", "textarea", "rows", "money_group"]
+FieldKind = Literal["text", "number", "date", "email", "phone", "select", "multiselect", "textarea", "rows", "money_group", "lines"]
 RequiredFor = Literal["presentation", "stage_one", "stage_two", "never"]
 
 
@@ -134,6 +134,12 @@ class FieldRule:
     hint: str = ""
     always: str = ""
     options: tuple[str, ...] = ()
+    # Tabular kinds ("rows", "lines"): the columns each row carries, as
+    # (key, "text" | "number"); the most rows kept; the labels a blank
+    # arrangement starts with.
+    columns: tuple[tuple[str, str], ...] = ()
+    max_rows: int = 0
+    seed_labels: tuple[str, ...] = ()
 
     @property
     def required(self) -> bool:
@@ -179,6 +185,14 @@ USE_OF_FUNDS_KEYS: tuple[tuple[str, str], ...] = (
 )
 OWNER_FIELDS: tuple[str, ...] = ("name", "pct", "title", "email", "phone", "auth")
 MAX_OWNERS = 5
+OWNER_COLUMNS: tuple[tuple[str, str], ...] = tuple((f, "number" if f == "pct" else "text") for f in OWNER_FIELDS)
+# Where the loan goes: a breakdown of the requested amount, free-form. Not
+# Schedule 1's use of funds (that is the fixed split of the *funded* amount at
+# stage two); this is what the dealer says the money is for, at stage one, and
+# it prints on the proposal and nowhere contractual.
+PROCEEDS_COLUMNS: tuple[tuple[str, str], ...] = (("label", "text"), ("amount", "number"), ("note", "text"))
+PROCEEDS_SEED: tuple[str, ...] = ("New working capital", "Previous contract repayment")
+MAX_PROCEEDS = 8
 
 # Ported from the design's textField / numField opts. `required_for` "stage_one"
 # is the design's `required: true`; "stage_two" is its `required: s.s1.sponsor
@@ -258,6 +272,9 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("facility_type", "advance", "Requested facility type", kind="select", required_for="presentation",
               title="Requested facility type is blank", detail="Schedule A prints the requested facility type.",
               options=FACILITY_TYPES),
+    FieldRule("proceeds", "advance", "Where the loan goes", kind="lines",
+              hint="What the requested amount is for. It prints on the dealer proposal, not on the agreement.",
+              columns=PROCEEDS_COLUMNS, max_rows=MAX_PROCEEDS, seed_labels=PROCEEDS_SEED),
     FieldRule("term", "advance", "Term (months)", kind="number", required_for="presentation", non_zero=True,
               title="Term is blank", detail="The repayment term drives the whole projection."),
     FieldRule("dealer_cof", "advance", "Dealer cost of funds (%)", kind="number", required_for="presentation",
@@ -336,7 +353,8 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("identity_license", "parties", "Dealer license no."),
     FieldRule("identity_website", "parties", "Website"),
     FieldRule("owners", "parties", "Ownership schedule", kind="rows", required_for="stage_two",
-              title="Ownership schedule is blank", detail="§9.2 requires every owner, totalling exactly 100.00%."),
+              title="Ownership schedule is blank", detail="§9.2 requires every owner, totalling exactly 100.00%.",
+              columns=OWNER_COLUMNS, max_rows=MAX_OWNERS),
     FieldRule("dealer_notice_email", "parties", "Dealer notice email", kind="email", required_for="stage_two",
               title="Dealer notice email is blank", detail="Formal notice is served by confirmed email."),
     FieldRule("written_approval_date", "advance", "Written approval date", kind="date"),
@@ -436,6 +454,10 @@ def empty_arrangement() -> dict[str, Any]:
     for r in FIELD_RULES:
         if r.kind == "multiselect" or r.kind == "rows":
             out[r.key] = []
+        elif r.kind == "lines":
+            # Seeded, so an old package gets the two lines with no migration;
+            # a desk that removes them keeps them removed (the stored [] wins).
+            out[r.key] = [{c: (label if c == "label" else "") for c, _ in r.columns} for label in r.seed_labels]
         elif r.kind == "money_group":
             out[r.key] = {k: "" for k, _ in USE_OF_FUNDS_KEYS} | {"other_label": ""}
         else:
@@ -491,7 +513,24 @@ def is_blank(rule: FieldRule, value: Any) -> bool:
         return not isinstance(value, list) or not any(isinstance(r, dict) and str(r.get("name") or "").strip() for r in value)
     if rule.kind == "money_group":
         return not isinstance(value, dict) or not any(_num(v) for k, v in value.items() if k != "other_label")
+    if rule.kind == "lines":
+        return not isinstance(value, list) or not any(isinstance(r, dict) and _num(r.get("amount")) for r in value)
     return _blank_text(value)
+
+
+def proceeds_lines(arr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where the loan goes, with amounts as numbers. Rows with nothing typed are dropped."""
+    raw = arr.get("proceeds") if isinstance(arr.get("proceeds"), list) else []
+    out: list[dict[str, Any]] = []
+    for r in raw:
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "").strip()
+        note = str(r.get("note") or "").strip()
+        amount = _num(r.get("amount"))
+        if label or note or amount:
+            out.append({"label": label, "amount": amount, "note": note, "entered": r.get("amount") not in ("", None)})
+    return out
 
 
 def _money(n: float | None) -> str:
@@ -1121,6 +1160,17 @@ def econ_attention(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon, remi
             "detail": (f"A request of {_money(_num(arr.get('requested')))} carries {exclusivity_tier(arr)} days at most; "
                        f"{int(stored)} was entered. The agreement prints {exclusivity_days(arr)}."),
         })
+    requested = _num(arr.get("requested"))
+    lines = proceeds_lines(arr)
+    allocated = sum(float(line["amount"]) for line in lines)
+    if requested and allocated and abs(allocated - requested) > 1.0:
+        out.append({
+            "step": "advance", "key": "proceeds", "owner": "desk",
+            "title": "Where the loan goes does not add up to the requested amount",
+            "detail": (f"{_money(allocated)} is allocated against a {_money(requested)} request — "
+                       f"{_money(abs(requested - allocated))} {'unallocated' if requested > allocated else 'over the request'}. "
+                       "The proposal prints the breakdown; make it whole or leave the amounts blank."),
+        })
     build = buildout_mode(arr) != "forward"
     for row in e.on:
         if not row.stack_known:
@@ -1395,6 +1445,10 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
             "mgmt_total": adv.mgmt_total, "loss_cost": adv.loss_cost, "total_cost": adv.total_cost,
             "total_repay": adv.total_repay,
             "cost_lines": adv.cost_lines(mgmt_m, _num(arr.get("loss_prov")), _num(arr.get("bank_cof"))),
+            # Where the loan goes: the breakdown of the request, its total, and what is left of the request.
+            "proceeds": proceeds_lines(arr),
+            "proceeds_total": sum(float(line["amount"]) for line in proceeds_lines(arr)),
+            "proceeds_gap": adv.requested - sum(float(line["amount"]) for line in proceeds_lines(arr)),
         },
         "thresholds": {
             "rows": thr_rows, "guideline": A3_GUIDELINE,
@@ -1447,15 +1501,8 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
             out["thresholds"] = {tk: _coerce_number(tv) for tk, tv in value.items() if tk in THRESHOLD_KEYS}
         elif key in FIELD_KEYS:
             rule = FIELD_RULES_BY_KEY[key]
-            if rule.kind == "rows":
-                rows: list[dict[str, Any]] = []
-                for row in (value or []) if isinstance(value, (list, tuple)) else []:
-                    if not isinstance(row, dict):
-                        continue
-                    clean = {f: (_coerce_number(row.get(f)) if f == "pct" else ("" if row.get(f) is None else str(row.get(f)).strip())) for f in OWNER_FIELDS}
-                    if any(v not in ("", None) for v in clean.values()):
-                        rows.append(clean)
-                out[key] = rows[:MAX_OWNERS]
+            if rule.kind in ("rows", "lines"):
+                out[key] = _normalize_rows(rule, value)
             elif rule.kind == "money_group":
                 group = value if isinstance(value, dict) else {}
                 out[key] = {k: _coerce_number(group.get(k)) for k, _ in USE_OF_FUNDS_KEYS}
@@ -1469,6 +1516,18 @@ def normalize_changes(changes: dict[str, Any]) -> dict[str, Any]:
             else:
                 out[key] = "" if value is None else str(value).strip()
     return out
+
+
+def _normalize_rows(rule: FieldRule, value: Any) -> list[dict[str, Any]]:
+    """Rows onto the rule's columns: numbers coerced, text stripped, empty rows dropped, capped."""
+    rows: list[dict[str, Any]] = []
+    for row in (value or []) if isinstance(value, (list, tuple)) else []:
+        if not isinstance(row, dict):
+            continue
+        clean = {c: (_coerce_number(row.get(c)) if kind == "number" else ("" if row.get(c) is None else str(row.get(c)).strip())) for c, kind in rule.columns}
+        if any(v not in ("", None) for v in clean.values()):
+            rows.append(clean)
+    return rows[: rule.max_rows] if rule.max_rows else rows
 
 
 def _coerce_number(value: Any) -> float | int | str:
@@ -1686,6 +1745,18 @@ def arrangement_diff(original: dict[str, Any], final: dict[str, Any]) -> dict[st
                             ("activation_date", "Activation date", "text"), ("commencement", "Production commencement", "text"),
                             ("maturity", "Maturity", "text"), ("funded_amount", "Funded amount", "money")):
         row("Facility and terms", key, label, fmt, oa.get(key), fa.get(key), original_blank=oa.get(key) in ("", None))
+    olines, flines = proceeds_lines(oa), proceeds_lines(fa)
+    for i in range(max(len(olines), len(flines))):
+        o = olines[i] if i < len(olines) else None
+        f = flines[i] if i < len(flines) else None
+        label = (f or o or {}).get("label") or f"line {i + 1}"
+        row("Facility and terms", f"proceeds.{i}", f"Where the loan goes — {label}", "money",
+            o["amount"] if o and o["entered"] else None, f["amount"] if f and f["entered"] else None,
+            original_blank=not (o and o["entered"]))
+    if olines or flines:
+        row("Facility and terms", "proceeds.total", "Where the loan goes — total", "money",
+            oc["advance"].get("proceeds_total") or None, fc["advance"].get("proceeds_total") or None,
+            original_blank=not any(o["entered"] for o in olines))
     for key, label, fmt in (("advance", "Advance", "money"), ("sizing", "Sizing", "text"), ("implied_rate", "Implied return", "pct"),
                             ("cost_rate", "Programme cost rate", "pct"), ("spread", "Spread (points)", "pct"), ("clears", "Clears underwriting", "bool")):
         row("Facility and terms", f"advance.{key}", label, fmt, oc["advance"].get(key), fc["advance"].get(key),

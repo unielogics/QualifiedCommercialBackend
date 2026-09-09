@@ -252,6 +252,19 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append("</div>")
     if not stage_two:
         out.append('<p class="muted">The commitment pursues the requested amount. The rate, the term, the payment and the program that supports it are set in the term sheet at closing; the figures on this page use underwriting\'s working assumptions so the arrangement can be shown whole.</p>')
+    # Where the loan goes: printed only once an amount is entered — a list of
+    # labels with no figures says nothing to the dealer.
+    lines = [line for line in adv.get("proceeds") or [] if line.get("entered")]
+    if lines:
+        out.append("<h3>Where the loan goes</h3>")
+        out.append("<table><thead><tr><th>Purpose</th><th class=\"n\">Amount</th><th>Note</th></tr></thead><tbody>")
+        for line in lines:
+            out.append(f'<tr><td>{_e(line["label"] or "—")}</td><td class="n">{_money(line["amount"])}</td><td class="muted">{_e(line["note"])}</td></tr>')
+        total = float(adv.get("proceeds_total") or 0.0)
+        gap = float(adv.get("proceeds_gap") or 0.0)
+        remainder = "" if abs(gap) <= 1.0 else (f" · {_money(gap)} of the request unallocated" if gap > 0 else f" · {_money(-gap)} over the request")
+        out.append(f'<tr><th>Total</th><th class="n">{_money(total)}</th><th class="muted">{_e(("of a " + _money(adv["requested"]) + " request") if adv["requested"] else "")}{_e(remainder)}</th></tr>')
+        out.append("</tbody></table>")
 
     # 6. Policy buildout
     out.append("<h2>6. Policy buildout — does the product carry the payment?</h2>")
