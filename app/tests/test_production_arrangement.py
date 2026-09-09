@@ -247,10 +247,10 @@ def test_products_attention_rules():
     assert any(a["key"] == "products" for a in pa.compute(empty)["attention"])
 
 
-def test_preview_rows_flag_blanks():
+def test_preview_rows_flag_blanks():  # 18 stage-one rows: Schedule A carries the breach fee and the TBD line now
     c = pa.compute(seed())
     one = c["preview"]["one"]
-    assert len(one) == 16
+    assert len(one) == 18
     assert not any(r["blank"] for r in one)
     labels = [r["label"] for r in one]
     assert labels[0] == "Dealer legal name" and labels[-1] == "Evidence relied upon"

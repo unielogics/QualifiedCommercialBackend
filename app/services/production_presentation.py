@@ -155,7 +155,6 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     build = computed["buildout"]
     proj = computed["projection"]
     lot = computed["lot"]
-    sponsor = computed.get("sponsor") or {}
     rows_on = [r for r in e["rows"] if r["on"]]
     term = adv["term"]
 
@@ -179,40 +178,48 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
 
     # 2. Current vs new
     out.append("<h2>2. Current versus new</h2>")
+    savings_m = float(e.get("savings_m") or 0.0)
+    cost_same = float(e.get("cost_same") or 0.0)
+    from_attach = float(e.get("d_gross_from_attach") or 0.0)
+    from_price = float(e.get("d_gross_from_price") or 0.0)
     out.append(
-        f'<p>On <b>{_num(e["units"])}</b> retail units a month, today\'s verified production is '
-        f'<b>{_num(e["cur_contracts"])}</b> contracts and <b>{_money(e["cur_gross"])}</b> gross. '
-        f'The program commits to <b>{_num(e["contracts"])}</b> contracts and <b>{_money(e["gross"])}</b> gross — '
-        f'{_signed_num(e["d_contracts"])} contracts and {_signed_money(e["d_gross"])} a month, '
-        f'{_signed_money(e["d_gross_term"])} over the {term}-month term.</p>'
+        f'<p>On <b>{_num(e["units"])}</b> retail units a month, the dealer pays another provider '
+        f'<b>{_money(e["cur_gross"])}</b> a month today for <b>{_num(e["cur_contracts"])}</b> contracts. '
+        f'The same contracts with us cost <b>{_money(cost_same)}</b> — '
+        + (f'<b>{_money(savings_m)} a month less</b>.' if savings_m >= 0 else f'<b>{_money(-savings_m)} a month more</b>.')
+        + f' At the programme\'s attachment the dealer sells <b>{_num(e["contracts"])}</b> contracts for <b>{_money(e["gross"])}</b> a month: '
+        f'{_signed_money(e["d_gross"])} against today, of which {_signed_money(from_attach)} comes from selling more contracts and '
+        f'{_signed_money(from_price)} from the price per contract.</p>'
     )
-    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">Current attach</th><th class=\"n\">Current premium</th>"
-               "<th class=\"n\">New attach</th><th class=\"n\">New premium</th><th class=\"n\">Uplift / contract</th>"
-               "<th class=\"n\">+ Contracts / mo</th><th class=\"n\">+ Gross / mo</th></tr></thead><tbody>")
+    out.append("<table><thead><tr><th>Covered product</th><th class=\"n\">Attaches today</th><th class=\"n\">Pays today</th>"
+               "<th class=\"n\">Attaches with us</th><th class=\"n\">Pays with us</th><th class=\"n\">Saves / contract</th>"
+               "<th class=\"n\">+ Contracts / mo</th><th class=\"n\">Saves / mo, today\'s volume</th></tr></thead><tbody>")
     for r in rows_on:
+        saves = float(r.get("savings") if r.get("savings") is not None else -r["uplift"])
+        saves_m = r["cur_contracts"] * saves
         out.append(
             f'<tr><td>{_e(r["label"])}</td><td class="n">{_pct(r["cur_rate"], 0)}</td><td class="n">{_money(r["cur_premium"])}</td>'
-            f'<td class="n">{_pct(r["rate"], 0)}</td><td class="n">{_money(r["premium"])}</td><td class="n">{_signed_money(r["uplift"])}</td>'
-            f'<td class="n">{_signed_num(r["d_contracts"])}</td><td class="n">{_signed_money(r["d_gross"])}</td></tr>'
+            f'<td class="n">{_pct(r["rate"], 0)}</td><td class="n">{_money(r["premium"])}</td><td class="n">{_signed_money(saves)}</td>'
+            f'<td class="n">{_signed_num(r["d_contracts"])}</td><td class="n">{_signed_money(saves_m)}</td></tr>'
         )
     out.append(
         f'<tr><th>Total</th><th class="n"></th><th class="n">{_money(e["cur_gross"])} / mo</th><th class="n"></th>'
-        f'<th class="n">{_money(e["gross"])} / mo</th><th class="n"></th><th class="n">{_signed_num(e["d_contracts"])}</th>'
-        f'<th class="n">{_signed_money(e["d_gross"])}</th></tr></tbody></table>'
+        f'<th class="n">{_money(cost_same)} / mo, today\'s volume</th><th class="n"></th><th class="n">{_signed_num(e["d_contracts"])}</th>'
+        f'<th class="n">{_signed_money(savings_m)}</th></tr></tbody></table>'
     )
     off = [r["label"] for r in e["rows"] if not r["on"]]
     if off:
         out.append(f'<p class="muted">Not covered: {_e(", ".join(off))}.</p>')
 
     # 3. Where the premium goes
-    out.append("<h2>3. Where each VSC premium goes</h2><table><tbody>")
+    out.append("<h2>3. One vehicle service contract — today, and with us</h2><table><tbody>")
     for w in e.get("waterfall", []):
-        out.append(f'<tr><th>{_e(w["label"])}</th><td class="n">{_money2(w["value"])}</td></tr>')
+        group = w.get("group") or ""
+        cls = ' class="n"' if group not in ("today", "total", "savings") else ' class="n"><b'
+        tail = "</b" if group in ("today", "total", "savings") else ""
+        out.append(f'<tr><th>{_e(w["label"])}</th><td{cls}>{_money2(w["value"])}{tail}</td></tr>')
     out.append("</tbody></table>")
-    out.append(
-        f'<div class="grid3">{_field("Repayment withheld / month", _money(e["repay_m"]))}'
-        f'{_field("Agency commissions / month", _money(e["comm_m"]))}{_field("Earned reserves / month", _money(e["reserve_m"]))}</div>'
-    )
+    out.append(f'<div class="grid3">{_field("Carried to the loan / month", _money(e["repay_m"]))}{_field("Room after markup / month", _money(float(e.get("room_m") or 0.0)))}{_field("The dealer saves / month", _money(savings_m))}</div>'),
 
     # 4. Lot and baseline
     out.append("<h2>4. The lot and the verified baseline</h2><div class=\"grid3\">")
@@ -230,27 +237,21 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
         out.append(f'<p class="muted"><b>Seasonality.</b> {_e(arr.get("seasonality"))}</p>')
 
     # 5. Advance and programme cost
-    out.append("<h2>5. Advance and programme cost</h2><div class=\"grid3\">")
+    stage_two = int(computed.get("stage") or 1) == 2
+    tbd = "To be determined at closing"
+    out.append("<h2>5. The request</h2><div class=\"grid3\">")
     out.append(_field("Requested facility type", arr.get("facility_type")))
-    out.append(_field("Requested amount", _money(adv["requested"]) if adv["requested"] else ""))
+    out.append(_field("Requested amount" if stage_two else "Requested amount (to be determined at closing)", _money(adv["requested"]) if adv["requested"] else ""))
     out.append(_field("Minimum activation amount", _money(arr.get("min_activation")) if arr.get("min_activation") else ""))
-    out.append(_field("Term", f"{term} months"))
-    out.append(_field("Dealer cost of funds", _pct(arr.get("dealer_cof")) if arr.get("dealer_cof") else ""))
-    out.append(_field("Monthly facility debt service", _money(arr.get("debt_service")) if arr.get("debt_service") else ""))
-    out.append(_field("Advance the repayment stream supports" if adv["sizing"] == "backsolve" else "Advance (fixed)", _money(adv["advance"])))
-    out.append(_field("Implied return", _pct(adv["implied_rate"])))
-    out.append(_field("All-in programme cost", _pct(adv["cost_rate"])))
+    out.append(_field("Term", f"{term} months" if stage_two else tbd))
+    out.append(_field("Rate", _pct(arr.get("dealer_cof")) if stage_two and arr.get("dealer_cof") else tbd))
+    out.append(_field("Monthly payment", _money(arr.get("debt_service")) if stage_two and arr.get("debt_service") else tbd))
+    out.append(_field("Exclusivity window", f'{pa.exclusivity_days(arr)} days from written approval'))
+    out.append(_field("Breach fee (Section 3.5)", _money(pa.BREACH_FEE_USD)))
+    out.append(_field("Program support", tbd if not stage_two else ", ".join(str(s) for s in (arr.get("program_support") or [])) or "None"))
     out.append("</div>")
-    verdict = "ok" if adv["clears"] else "danger"
-    out.append(
-        f'<div class="callout {verdict}"><span class="big">{"+" if adv["spread"] >= 0 else ""}{adv["spread"]:.1f} points</span> — '
-        + ("clears the 3 point underwriting floor." if adv["clears"] else "under the 3 point underwriting floor.")
-        + "</div>"
-    )
-    out.append("<table><thead><tr><th>Programme cost line</th><th class=\"n\">Amount</th><th>When</th><th class=\"n\">Share</th></tr></thead><tbody>")
-    for line in adv["cost_lines"]:
-        out.append(f'<tr><td>{_e(line["label"])}</td><td class="n">{_money(line["amount"])}</td><td>{_e(line["when"])}</td><td class="n">{_pct(line["share_pct"]) if line.get("share_pct") is not None else "—"}</td></tr>')
-    out.append(f'<tr><th>Total over the term</th><th class="n">{_money(adv["total_cost"])}</th><th></th><th class="n">100%</th></tr></tbody></table>')
+    if not stage_two:
+        out.append('<p class="muted">The commitment pursues the requested amount. The rate, the term, the payment and the program that supports it are set in the term sheet at closing; the figures on this page use underwriting\'s working assumptions so the arrangement can be shown whole.</p>')
 
     # 6. Policy buildout
     out.append("<h2>6. Policy buildout — does the product carry the payment?</h2>")
@@ -264,11 +265,13 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
             f'product gross {_money(s["gross"])} a month.</div>'
         )
     if build["solve_rows"]:
-        out.append(f'<p>To fund {_pct(build["fund_target_pct"], 0)} of the payment from policy production, the repayment withheld per contract would need to be:</p>')
-        out.append("<table><thead><tr><th>Product</th><th class=\"n\">Contracts / mo</th><th class=\"n\">Current premium</th><th class=\"n\">Withhold / contract</th><th class=\"n\">Premium needed</th><th class=\"n\">Uplift</th></tr></thead><tbody>")
+        out.append(f'<p>To carry {_pct(build["fund_target_pct"], 0)} of the payment out of the cushion, each covered product carries:</p>')
+        out.append("<table><thead><tr><th>Product</th><th class=\"n\">Contracts / mo</th><th class=\"n\">Pays today</th><th class=\"n\">Room / contract</th><th class=\"n\">Carries / contract</th><th class=\"n\">Pays with us</th><th class=\"n\">Still saves</th></tr></thead><tbody>")
         for r in build["solve_rows"]:
-            out.append(f'<tr><td>{_e(r["label"])}</td><td class="n">{_num(r["contracts"])}</td><td class="n">{_money(r["cur_premium"])}</td><td class="n">{_money(r["solve_repay"])}</td><td class="n">{_money(r["needed"])}</td><td class="n">{_signed_money(r["uplift"])}</td></tr>')
+            out.append(f'<tr><td>{_e(r["label"])}</td><td class="n">{_num(r["contracts"])}</td><td class="n">{_money(r["cur_premium"])}</td><td class="n">{_money(float(r.get("room") or 0.0))}</td><td class="n">{_money(r["solve_repay"])}</td><td class="n">{_money(r["needed"])}</td><td class="n">{_signed_money(float(r.get("savings_after") if r.get("savings_after") is not None else -r["uplift"]))}</td></tr>')
         out.append("</tbody></table>")
+        if build.get("shortfall"):
+            out.append(f'<div class="callout warning">The room across the covered products carries {_money(float(build.get("room_m") or 0.0))} a month; the payment target is {_money(build["need_monthly"])}. The rest is spread on top, and the dealer pays more than today on the products marked.</div>')
 
     # 7. Operative thresholds
     out.append("<h2>7. Operative thresholds (Addendum A.2, A.3 guideline)</h2>")
@@ -332,12 +335,9 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append('<p class="muted">Sponsor-caused shortfalls (A.9) — a shortage caused by the sponsor\'s own platform, remittance or administration failure is excluded from the dealer\'s shortfall.</p>')
 
     # 10. Sponsor economics + next steps
-    out.append("<h2>10. Sponsor economics and next steps</h2><div class=\"grid3\">")
-    out.append(_field("Sponsor markup", _pct(sponsor.get("markup_pct")) if sponsor.get("markup_pct") else ""))
-    out.append(_field("Markup / month", _money(sponsor.get("markup_m"))))
-    out.append(_field("Programme management / month", _money(sponsor.get("mgmt_m"))))
-    out.append(_field("Sponsor total over the term", _money(sponsor.get("total_over_term"))))
+    out.append("<h2>10. Next steps</h2><div class=\"grid3\">")
     out.append(_field("Exclusivity window", f'{pa.exclusivity_days(arr)} days from written approval'))
+    out.append(_field("Breach fee (Section 3.5)", f'{_money(pa.BREACH_FEE_USD)}, payable to Qualified Commercial LLC for time, resources and consultation of the file if the window is breached'))
     out.append(_field("Prepared by", " · ".join(p for p in (arr.get("rm_name"), arr.get("rm_email"), arr.get("rm_phone")) if p)))
     out.append("</div>")
     out.append(

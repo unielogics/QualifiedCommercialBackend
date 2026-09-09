@@ -48,10 +48,10 @@ from bs4 import BeautifulSoup, Tag
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "app" / "services" / "production_agreements"
-DEFAULT_ARTIFACT_DIR = Path(
-    "/home/ubuntu/.claude/projects/-home-ubuntu/5c67e146-a1cd-4d3f-8270-197ef660bb67/tool-results"
-)
-MANIFEST_VERSION = "2026-09-03-1"
+# The owner's Claude Design sources live in the tree, so the ritual survives
+# the session that first ran it.
+DEFAULT_ARTIFACT_DIR = ROOT / "scripts" / "agreement_sources"
+MANIFEST_VERSION = "2026-09-09-1"
 
 ARCHIVO = 'Archivo, "DejaVu Sans", Arial, sans-serif'
 PLEX = '"IBM Plex Sans", "DejaVu Sans", Arial, sans-serif'
@@ -114,7 +114,7 @@ SOURCES: dict[str, dict[str, Any]] = {
     "commitment_v1": {
         "artifact": "artifact-633d324a-1788403760-21c1.html",
         "title": "Production Commitment and Capital Engagement Agreement",
-        "source_fields": 147,
+        "source_fields": 148,  # + sa_breach_fee
         "check_groups": ("products", "support", "rm_comp", "financing_cost", "sba"),
         "captions": 6,   # Schedules A-E + Signature Page
         "signature_blocks": 3,

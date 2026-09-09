@@ -19,7 +19,7 @@ from app.services import production_fields as pf
 sys.path.insert(0, "app/tests")
 from test_production_arrangement import seed  # noqa: E402
 
-DESIGN_SLOTS = {"commitment_v1": 147, "activation_v1": 150}
+DESIGN_SLOTS = {"commitment_v1": 148, "activation_v1": 150}
 DESIGN_CHECKS = {"commitment_v1": 28, "activation_v1": 19}
 EXPECTED_ANCHORS = {
     "commitment_v1": {"qc": 1, "dealer": 1, "sponsor": 1, "fp": 0, "rm": 1},
@@ -121,7 +121,7 @@ def test_manifest_inventories(key: str):
     assert entry["anchors"] == EXPECTED_ANCHORS[key]
     assert entry["initials"] == EXPECTED_INITIALS
     assert entry["source_artifact"].startswith("artifact-")
-    assert tpl.manifest()["version"] == "2026-09-03-1"
+    assert tpl.manifest()["version"] == "2026-09-09-1"
     html, sha = tpl.load_template(key)
     assert sha == entry["sha256"] == hashlib.sha256(html.encode("utf-8")).hexdigest()
 
@@ -296,6 +296,7 @@ def test_commitment_values_cover_the_manifest_on_the_seed():
     # Schedule A
     assert values["sa_requested_amount"] == "$1,200,000" and values["sa_facility_type"] == "Dealer capital advance"
     assert values["sa_sponsor_platform"] == "AcmeAdmin"
+    assert values["sa_breach_fee"] == "$10,000"
     assert values["sa_notice_qc_email"] == "notices@qualifiedcommercial.com"
     assert values["sa_notice_dealer_email"] == "office@delgado.example"
     assert values["sa_notice_sponsor_email"] == "notices@acme.example"
@@ -480,3 +481,28 @@ def test_rendered_pdfs_carry_every_anchor():
                 assert len(hits) == 1, f"{key}: {token} found {len(hits)} times"
         assert "Delgado Auto Group LLC" in text
         assert not re.search(r"\[\[(SIG|DATE|INI):", tpl.strip_anchors(text))
+
+
+ACTIVATION_SHA_BEFORE_THE_BREACH_FEE = "b8b3c6e2a90bef70e5a7618150f8c5c311566e6211395632034ce87f6c703687"
+
+
+def test_the_breach_fee_changed_the_commitment_and_nothing_else():
+    """Stage one is indicative and carries a disclosed breach fee. The
+    commitment's §3.5 names the fee stated in Schedule A; §2.2, §6 and §7.5
+    each gain the same carve-out; expiry (§2.6), declining (§3.2) and exiting
+    by written notice (§3.3) stay word-for-word. The Activation agreement is
+    untouched, hash and all."""
+    html, _sha = tpl.load_template("commitment_v1")
+    text = BeautifulSoup(html, "html.parser").get_text(" ")
+    text = " ".join(text.split())
+    assert text.count("other than the Breach Fee under Section 3.5") == 3
+    assert "entitles Qualified Commercial to the Breach Fee stated in Schedule A, as disclosed liquidated damages" in text
+    assert "any liquidated damages not stated in Schedule A are not recoverable" in text
+    assert "Requested amount (to be determined at closing)" in text
+    assert "Interest rate, term and Program Support are determined in the Activation Agreement" in text
+    # untouched
+    assert "automatically expires without fee" in text
+    assert "Create any fee if the Dealer declines the financing" in text
+    assert "the Dealer owes no fee and no further obligation under this Section" in text
+    assert "sa_breach_fee" in tpl.template_field_keys("commitment_v1")
+    assert tpl.manifest()["templates"]["activation_v1"]["sha256"] == ACTIVATION_SHA_BEFORE_THE_BREACH_FEE

@@ -1,7 +1,7 @@
 {
   "templates": {
     "commitment_v1": {
-      "sha256": "a9252bd7a7588b0c8152ec74cdb9a2fdec51b859b44e856fb18c7fa0fd8050b3",
+      "sha256": "1d97a273347aff1d446e1a0242b3b18449a72bb26b752267cef738832ef23125",
       "fields": [
         "sponsor_logo_text",
         "agreement_no",
@@ -66,6 +66,7 @@
         "sa_requested_amount",
         "sa_minimum_activation_amount",
         "sa_exclusivity_days",
+        "sa_breach_fee",
         "sa_sponsor_platform",
         "sa_products_other",
         "sa_support_other",
@@ -391,5 +392,5 @@
       "source_artifact": "artifact-2dd2d613-1788403699-c6f9.html"
     }
   },
-  "version": "2026-09-03-1"
+  "version": "2026-09-09-1"
 }

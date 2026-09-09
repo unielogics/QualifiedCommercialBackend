@@ -481,6 +481,7 @@ def commitment_values(
         "sa_requested_amount": money(arr.get("requested")),
         "sa_minimum_activation_amount": money(arr.get("min_activation")),
         "sa_exclusivity_days": count(pa.exclusivity_days(arr)),
+        "sa_breach_fee": money(pa.BREACH_FEE_USD),
         "sa_sponsor_platform": first(arr.get("sponsor_platform"), sponsor.get("platform")),
         "sa_products_other": text(arr.get("products_other")),
         "sa_support_other": text(arr.get("program_support_other")),

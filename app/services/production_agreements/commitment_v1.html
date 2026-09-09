@@ -233,7 +233,7 @@ h2,h3{break-after:avoid}
 <h3>2.2  No Pre-Funding Dealer Payment or Production Obligation</h3>
 <p>Before Actual Funding:</p>
 <ol>
-<li>The Dealer owes no fee under this Agreement;</li>
+<li>The Dealer owes no fee under this Agreement, other than the Breach Fee under Section 3.5;</li>
 <li>The Dealer has no obligation to route, produce, or remit any Covered Product;</li>
 <li>No production, penetration, remittance, or reporting covenant applies;</li>
 <li>No default rate or pricing adjustment applies;</li>
@@ -286,7 +286,7 @@ h2,h3{break-after:avoid}
 <h3>3.4  Qualified Commercial’s Reciprocal Obligation</h3>
 <p>During the Exclusivity Window, Qualified Commercial will pursue the approved financing diligently and in good faith; keep the Dealer reasonably informed of file status; promptly identify outstanding conditions; and notify the Dealer in writing if it determines the financing is no longer achievable. If Qualified Commercial fails to pursue the file for fifteen consecutive business days without a documented reason, the Exclusivity Window ends automatically.</p>
 <h3>3.5  Remedy for Breach</h3>
-<p>A proven intentional breach of Section 3.1 may entitle Qualified Commercial to its actual, documented out-of-pocket costs incurred in pursuing the approved financing, and to reasonable enforcement costs awarded by a court. Speculative future production, lost expected compensation, punitive damages, and undisclosed liquidated damages are not recoverable under this Section.</p>
+<p>A proven intentional breach of Section 3.1 during the Exclusivity Window entitles Qualified Commercial to the Breach Fee stated in Schedule A, as disclosed liquidated damages for its time, resources and consultation on the file, due on demand and in place of documented out-of-pocket costs, together with reasonable enforcement costs awarded by a court. Speculative future production, lost expected compensation, punitive damages, and any liquidated damages not stated in Schedule A are not recoverable under this Section.</p>
 <h3>3.6  Duration</h3>
 <div style="display:flex;align-items:flex-end;gap:14px;margin-top:6px;border:0.5px solid #B9C6D8;padding:10px 12px">
 <div style="font-size:9.5px;line-height:1.5;color:#1F3350;flex:1">The Exclusivity Window runs for the following number of calendar days after the date of Written Approval. If this field is left blank, no exclusivity applies.</div>
@@ -350,7 +350,7 @@ h2,h3{break-after:avoid}
 <h3>6.1  Designation</h3>
 <p>The Relationship Manager assigned to the Dealer is identified in Schedule B. The Relationship Manager is an employee or authorized contractor of Qualified Commercial or the Sponsor and is not an employee, agent, partner, or fiduciary of the Dealer or Funding Party.</p>
 <h3>6.2  Acknowledgment of Pre-Funding Time</h3>
-<p>The Dealer acknowledges that the Relationship Manager may devote substantial pre-funding time to visiting the dealership; understanding the Dealer’s business; explaining the program; gathering authorized business information; identifying missing documents; coordinating owner authorizations; scheduling review calls; assisting with use-of-funds detail; organizing financial information; and preparing the Dealer for underwriting. That time is devoted at the risk of the Relationship Manager’s employer and creates no Dealer payment obligation if Actual Funding does not occur.</p>
+<p>The Dealer acknowledges that the Relationship Manager may devote substantial pre-funding time to visiting the dealership; understanding the Dealer’s business; explaining the program; gathering authorized business information; identifying missing documents; coordinating owner authorizations; scheduling review calls; assisting with use-of-funds detail; organizing financial information; and preparing the Dealer for underwriting. That time is devoted at the risk of the Relationship Manager’s employer and creates no Dealer payment obligation if Actual Funding does not occur, other than the Breach Fee under Section 3.5.</p>
 <h3>6.3  Permitted Pre-Funding Activities</h3>
 <p>Subject to applicable law and company policy, the Relationship Manager may:</p>
 <ol>
@@ -403,7 +403,7 @@ h2,h3{break-after:avoid}
 <h3>7.4  Commencement of Account-Management Compensation</h3>
 <p>A fixed post-funding account-management payment may begin after activation because ongoing account-management services begin at that time. Such payment must compensate continuing services and must not be a payment for the mere fact that a loan closed.</p>
 <h3>7.5  No Dealer Fee Before Funding</h3>
-<p>The Dealer owes no application, consulting, intermediary, advisory, packaging, commitment, or success fee under this Agreement before Actual Funding. Third-party costs ordered with the Dealer’s prior written authorization may be governed by a separate written authorization, but may not be mischaracterized as a Relationship Manager commission.</p>
+<p>The Dealer owes no application, consulting, intermediary, advisory, packaging, commitment, or success fee under this Agreement before Actual Funding, other than the Breach Fee under Section 3.5. Third-party costs ordered with the Dealer’s prior written authorization may be governed by a separate written authorization, but may not be mischaracterized as a Relationship Manager commission.</p>
 <h3>7.6  Dealer-Paid Compensation</h3>
 <p>The Dealer owes no compensation to the Relationship Manager personally. Any post-funding fee payable by the Dealer to Qualified Commercial or the Sponsor must be:</p>
 <ol>
@@ -648,9 +648,10 @@ h2,h3{break-after:avoid}
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:11px 16px;margin-top:12px">
 <div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Dealer legal name</div><div data-field="sa_dealer_legal_name" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
 <div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Requested facility type</div><div data-field="sa_facility_type" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
-<div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Requested amount</div><div data-field="sa_requested_amount" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
+<div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Requested amount (to be determined at closing)</div><div data-field="sa_requested_amount" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
 <div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Minimum Activation Amount</div><div data-field="sa_minimum_activation_amount" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
 <div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Exclusivity Window (days)</div><div data-field="sa_exclusivity_days" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
+<div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Breach fee (Section 3.5)</div><div data-field="sa_breach_fee" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
 <div><div style="font-size:7.5px;letter-spacing:0.1em;text-transform:uppercase;color:#5E7391">Sponsor Platform</div><div data-field="sa_sponsor_platform" style="min-height:16px;border-bottom:1px solid #0B1D3A;margin-top:3px"></div></div>
 </div>
 <div style='font-family:Archivo, "DejaVu Sans", Arial, sans-serif;font-weight:700;font-size:9.5px;letter-spacing:0.1em;text-transform:uppercase;color:#0B1D3A;margin-top:16px;padding-bottom:4px;border-bottom:1px solid #0B1D3A'>Covered Products</div>
@@ -670,6 +671,7 @@ h2,h3{break-after:avoid}
 </div>
 </div>
 <div style='font-family:Archivo, "DejaVu Sans", Arial, sans-serif;font-weight:700;font-size:9.5px;letter-spacing:0.1em;text-transform:uppercase;color:#0B1D3A;margin-top:16px;padding-bottom:4px;border-bottom:1px solid #0B1D3A'>Program Support to be provided</div>
+<div style="font-size:9.5px;line-height:1.5;color:#1F3350;margin-top:6px">Interest rate, term and Program Support are determined in the Activation Agreement. Nothing checked below is a representation that support has been agreed.</div>
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 22px;margin-top:9px">
 <div style="display:flex;align-items:center;gap:8px;font-size:9.5px;color:#1F3350"><span class="chk" data-check="support.application_packaging" style="width:11px;height:11px;border:1px solid #0B1D3A;display:inline-block;flex:none"></span>Application and packaging support</div>
 <div style="display:flex;align-items:center;gap:8px;font-size:9.5px;color:#1F3350"><span class="chk" data-check="support.reporting_technology" style="width:11px;height:11px;border:1px solid #0B1D3A;display:inline-block;flex:none"></span>Reporting technology</div>

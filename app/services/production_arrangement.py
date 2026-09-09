@@ -951,6 +951,11 @@ def room_solve(e: PortfolioEcon, need_monthly: float) -> tuple[list[dict[str, An
 # dealer gives sixty days; at or under it, thirty or less. The desk may
 # shorten under the tier and never lengthen. Every reader — compute, the
 # preview, the commitment's two slots, the proposal — goes through this.
+# Schedule A states it and §3.5 names it: what a proven intentional breach of
+# the window costs, payable to Qualified Commercial LLC for time, resources
+# and consultation on the file. One constant, so a change is a code change.
+BREACH_FEE_USD = 10_000
+
 EXCLUSIVITY_TIER_AMOUNT = 350_000
 EXCLUSIVITY_DAYS_OVER = 60
 EXCLUSIVITY_DAYS_UNDER = 30
@@ -1195,6 +1200,8 @@ def preview_rows(arr: dict[str, Any], computed: dict[str, Any], *, stage: int = 
             _pv("Requested amount", _money(_num(arr.get("requested"))) if _num(arr.get("requested")) else "", schedule="A"),
             _pv("Minimum activation amount", _money(_num(arr.get("min_activation"))) if _num(arr.get("min_activation")) else "", schedule="A"),
             _pv("Exclusivity window (days)", exclusivity_days(arr), schedule="A"),
+            _pv("Breach fee (Section 3.5)", _money(BREACH_FEE_USD), schedule="A"),
+            _pv("Rate, term and program support", "To be determined at closing", schedule="A"),
             _pv("Sponsor platform", arr.get("sponsor_platform"), schedule="A"),
             _pv("Sponsor legal name", arr.get("sponsor_name"), schedule="A"),
             _pv("Relationship manager", arr.get("rm_name"), schedule="A"),
