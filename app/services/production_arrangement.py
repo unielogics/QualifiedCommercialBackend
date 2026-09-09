@@ -264,7 +264,7 @@ FIELD_RULES: tuple[FieldRule, ...] = (
               non_zero=True, title="Dealer cost of funds is blank",
               detail="Priced on the dealer's credit profile and negotiated directly.",
               always="Negotiated with the dealer on their credit profile"),
-    FieldRule("exclusivity", "advance", "Exclusivity window (days)", kind="number", required_for="stage_one",
+    FieldRule("exclusivity", "advance", "Exclusivity window (days)", kind="number", required_for="never",
               non_zero=True, title="Exclusivity window is blank",
               detail="Schedule A prints the exclusivity window in days from written approval."),
     FieldRule("bank_cof", "advance", "Bank cost of funds (%)", kind="number",
@@ -417,7 +417,6 @@ DEFAULTS: dict[str, Any] = {
     "loss_prov": 1.5,
     "fund_target": 100,
     "term": 36,
-    "exclusivity": 45,
     "cure_days": 5,
     "financing_cost_included": "No",
     "sba_status": "Not an SBA transaction",
@@ -948,6 +947,29 @@ def room_solve(e: PortfolioEcon, need_monthly: float) -> tuple[list[dict[str, An
     return rows, shortfall
 
 
+# The exclusivity window follows the size of the request: over $350,000 the
+# dealer gives sixty days; at or under it, thirty or less. The desk may
+# shorten under the tier and never lengthen. Every reader — compute, the
+# preview, the commitment's two slots, the proposal — goes through this.
+EXCLUSIVITY_TIER_AMOUNT = 350_000
+EXCLUSIVITY_DAYS_OVER = 60
+EXCLUSIVITY_DAYS_UNDER = 30
+
+
+def exclusivity_tier(arr: dict[str, Any]) -> int:
+    return EXCLUSIVITY_DAYS_OVER if _num(arr.get("requested")) > EXCLUSIVITY_TIER_AMOUNT else EXCLUSIVITY_DAYS_UNDER
+
+
+def exclusivity_days(arr: dict[str, Any]) -> int:
+    """The window that governs: the tier for the request, or the desk's shorter number."""
+    tier = exclusivity_tier(arr)
+    stored = arr.get("exclusivity")
+    if stored in ("", None):
+        return tier
+    n = int(_num(stored))
+    return min(n, tier) if n > 0 else tier
+
+
 def buildout_mode(arr: dict[str, Any]) -> str:
     """`reverse` — build the payment into the policies; `forward` — the dealer
     pays it from operations. normalize_changes stores a select with no
@@ -1085,6 +1107,14 @@ def econ_attention(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon, remi
             "title": "Vehicle service contracts are not covered",
             "detail": "VSC is the primary repayment product. With it unchecked there is no production commitment on it.",
         })
+    stored = _num(arr.get("exclusivity"))
+    if stored > exclusivity_tier(arr):
+        out.append({
+            "step": "advance", "key": "exclusivity", "owner": "desk",
+            "title": "Exclusivity window is longer than the request allows",
+            "detail": (f"A request of {_money(_num(arr.get('requested')))} carries {exclusivity_tier(arr)} days at most; "
+                       f"{int(stored)} was entered. The agreement prints {exclusivity_days(arr)}."),
+        })
     build = buildout_mode(arr) != "forward"
     for row in e.on:
         if not row.stack_known:
@@ -1164,7 +1194,7 @@ def preview_rows(arr: dict[str, Any], computed: dict[str, Any], *, stage: int = 
             _pv("Requested facility type", arr.get("facility_type"), schedule="A"),
             _pv("Requested amount", _money(_num(arr.get("requested"))) if _num(arr.get("requested")) else "", schedule="A"),
             _pv("Minimum activation amount", _money(_num(arr.get("min_activation"))) if _num(arr.get("min_activation")) else "", schedule="A"),
-            _pv("Exclusivity window (days)", arr.get("exclusivity"), schedule="A"),
+            _pv("Exclusivity window (days)", exclusivity_days(arr), schedule="A"),
             _pv("Sponsor platform", arr.get("sponsor_platform"), schedule="A"),
             _pv("Sponsor legal name", arr.get("sponsor_name"), schedule="A"),
             _pv("Relationship manager", arr.get("rm_name"), schedule="A"),
@@ -1349,6 +1379,7 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
         },
         "lot": lot,
         "advance": {
+            "exclusivity_days": exclusivity_days(arr), "exclusivity_tier": exclusivity_tier(arr),
             "term": adv.term, "requested": adv.requested, "supported": adv.supported, "advance": adv.advance,
             "sizing": adv.sizing, "implied_rate": adv.implied_rate, "cost_rate": adv.cost_rate,
             "spread": adv.spread, "clears": adv.clears, "floor_points": SPREAD_FLOOR_POINTS,

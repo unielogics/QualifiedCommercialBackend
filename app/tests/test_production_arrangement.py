@@ -205,10 +205,12 @@ def test_required_rules_by_scope():
     assert pres <= one
     assert {"dealer_signer_name", "sponsor_platform", "sponsor_email"} <= one
     assert "funding_party" not in one
-    # cure_days and exclusivity carry design defaults (5 days, 45 days); blanking them flags them
+    # cure_days carries a design default (5 days); blanking it flags it. The
+    # exclusivity window is never blank now — the tier for the request supplies it.
     assert {"cure_days", "exclusivity"}.isdisjoint(one)
     cleared = {**arr, "cure_days": "", "exclusivity": 0}
-    assert {"cure_days", "exclusivity"} <= {a["key"] for a in pa.field_attention(cleared, scope="stage_one")}
+    flagged = {a["key"] for a in pa.field_attention(cleared, scope="stage_one")}
+    assert "cure_days" in flagged and "exclusivity" not in flagged
     two = {a["key"] for a in pa.field_attention(arr, scope="stage_two")}
     assert {"funding_party", "funded_amount", "maturity"} <= two
 
@@ -640,3 +642,29 @@ def test_the_waterfall_tells_today_versus_with_us():
     assert w["What the dealer pays with us"]["value"] == 2400
     assert w["The dealer saves"]["value"] == -250
     assert w["Base product cost"]["value"] + w["Administrator fee"]["value"] + w["Other fees"]["value"] + w["Our markup"]["value"] + w["Carried to the loan"]["value"] == 2400
+
+
+def test_the_exclusivity_window_follows_the_size_of_the_request():
+    """Over $350,000: sixty days. At or under: thirty or less. The desk may
+    shorten under the tier, never lengthen, and the number that prints is the
+    number that governs."""
+    arr = seed()
+    arr["requested"] = 350_000
+    arr.pop("exclusivity", None)
+    assert pa.exclusivity_days(arr) == 30
+    arr["requested"] = 350_001
+    assert pa.exclusivity_days(arr) == 60
+    arr["exclusivity"] = 20
+    assert pa.exclusivity_days(arr) == 20
+    arr["exclusivity"] = 45
+    assert pa.exclusivity_days(arr) == 45  # shorter than the tier: the desk's number governs
+    assert not any(a["key"] == "exclusivity" for a in pa.compute(arr)["attention"])
+    arr["exclusivity"] = 90
+    assert pa.exclusivity_days(arr) == 60  # past the tier: the tier governs, and the desk is told
+    c = pa.compute(arr)
+    row = next(a for a in c["attention"] if a["key"] == "exclusivity")
+    assert row["owner"] == "desk" and "60" in row["detail"]
+    assert c["advance"]["exclusivity_days"] == 60 and c["advance"]["exclusivity_tier"] == 60
+    assert next(r for r in c["preview"]["one"] if r["label"] == "Exclusivity window (days)")["value"] == "60"
+    arr["exclusivity"] = ""
+    assert not any(a["key"] == "exclusivity" for a in pa.compute(arr)["attention"])

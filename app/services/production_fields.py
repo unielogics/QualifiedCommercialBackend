@@ -472,7 +472,7 @@ def commitment_values(
         "outside_funding_date": fmt_date(first(arr.get("outside_funding_date"), meta.get("outside_funding_date"))),
         **_header_parties(arr, sponsor, parties, file_ctx),
         "minimum_activation_amount": money(arr.get("min_activation")),
-        "exclusivity_days": count(arr.get("exclusivity")),
+        "exclusivity_days": count(pa.exclusivity_days(arr)),
         **_identity(arr, parties, file_ctx),
         **_owners(arr, file_ctx),
         # Schedule A
@@ -480,7 +480,7 @@ def commitment_values(
         "sa_facility_type": text(arr.get("facility_type")),
         "sa_requested_amount": money(arr.get("requested")),
         "sa_minimum_activation_amount": money(arr.get("min_activation")),
-        "sa_exclusivity_days": count(arr.get("exclusivity")),
+        "sa_exclusivity_days": count(pa.exclusivity_days(arr)),
         "sa_sponsor_platform": first(arr.get("sponsor_platform"), sponsor.get("platform")),
         "sa_products_other": text(arr.get("products_other")),
         "sa_support_other": text(arr.get("program_support_other")),

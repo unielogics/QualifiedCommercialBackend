@@ -287,7 +287,7 @@ def test_commitment_values_cover_the_manifest_on_the_seed():
     assert values["sponsor_legal_name"] == "Acme Warranty Administrators Inc" == values["sponsor_logo_text"]
     assert values["sponsor_address"] == SPONSOR["principal_address"]
     assert values["qc_address"] == FILE_CTX["qc"]["address"]
-    assert values["minimum_activation_amount"] == "$900,000" and values["exclusivity_days"] == "45"
+    assert values["minimum_activation_amount"] == "$900,000" and values["exclusivity_days"] == "45"  # the desk shortened under the sixty-day tier
     # §9.1 falls back to the file for what the seed does not carry
     assert values["identity_legal_name"] == "Delgado Auto Group LLC" and values["identity_ein"] == "45-1234567"
     assert values["identity_formation_date"] == "March 12, 2014" and values["identity_naics"] == "441120"

@@ -276,7 +276,7 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     for r in thr["rows"]:
         if r.get("editable"):
             fmt = r["format"]
-            def show(v: Any) -> str:
+            def show(v: Any, fmt: str = fmt) -> str:
                 if v is None:
                     return "N/A"
                 return _money(v) if fmt == "money" else (_pct(v, 0) if fmt == "pct" else _num(v))
@@ -337,7 +337,7 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append(_field("Markup / month", _money(sponsor.get("markup_m"))))
     out.append(_field("Programme management / month", _money(sponsor.get("mgmt_m"))))
     out.append(_field("Sponsor total over the term", _money(sponsor.get("total_over_term"))))
-    out.append(_field("Exclusivity window", f'{_num(arr.get("exclusivity"))} days from written approval' if arr.get("exclusivity") else ""))
+    out.append(_field("Exclusivity window", f'{pa.exclusivity_days(arr)} days from written approval'))
     out.append(_field("Prepared by", " · ".join(p for p in (arr.get("rm_name"), arr.get("rm_email"), arr.get("rm_phone")) if p)))
     out.append("</div>")
     out.append(
@@ -431,7 +431,7 @@ def build_agreement_html(
     for r in thr["rows"]:
         if r.get("editable"):
             fmt = r["format"]
-            def show(v: Any) -> str:
+            def show(v: Any, fmt: str = fmt) -> str:
                 if v is None:
                     return "N/A"
                 return _money(v) if fmt == "money" else (_pct(v, 0) if fmt == "pct" else _num(v))
