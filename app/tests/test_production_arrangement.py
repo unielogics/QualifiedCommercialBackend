@@ -14,14 +14,14 @@ from app.services import production_arrangement as pa
 
 # The design's seed: Delgado Auto Group, 96 retail units a month.
 SEED_PRODUCTS = {
-    "vsc": {"on": True, "cur_rate": 54, "cur_premium": 2150, "rate": 62, "premium": 2400, "repay": 420, "comm": 14, "admin": 260, "retention": 38, "term": 36},
-    "gap": {"on": True, "cur_rate": 36, "cur_premium": 795, "rate": 41, "premium": 895, "repay": 150, "comm": 16, "admin": 110, "retention": 46, "term": 36},
-    "theft": {"on": True, "cur_rate": 19, "cur_premium": 545, "rate": 24, "premium": 595, "repay": 95, "comm": 18, "admin": 70, "retention": 52, "term": 24},
-    "appearance": {"on": True, "cur_rate": 14, "cur_premium": 725, "rate": 19, "premium": 795, "repay": 120, "comm": 18, "admin": 95, "retention": 50, "term": 24},
-    "key": {"on": False, "cur_rate": 9, "cur_premium": 329, "rate": 12, "premium": 349, "repay": 55, "comm": 20, "admin": 45, "retention": 55, "term": 24},
-    "tire": {"on": True, "cur_rate": 17, "cur_premium": 645, "rate": 22, "premium": 699, "repay": 110, "comm": 17, "admin": 85, "retention": 48, "term": 24},
-    "maint": {"on": False, "cur_rate": 11, "cur_premium": 849, "rate": 15, "premium": 899, "repay": 0, "comm": 15, "admin": 120, "retention": 44, "term": 12},
-    "power": {"on": False, "cur_rate": 6, "cur_premium": 1425, "rate": 8, "premium": 1495, "repay": 0, "comm": 15, "admin": 180, "retention": 40, "term": 36},
+    "vsc": {"on": True, "cur_rate": 54, "cur_premium": 2150, "rate": 62, "premium": 2400, "repay": 420, "comm": 14, "admin": 260, "retention": 38, "term": 36, "base": 1300, "other": 120, "markup": 300},
+    "gap": {"on": True, "cur_rate": 36, "cur_premium": 795, "rate": 41, "premium": 895, "repay": 150, "comm": 16, "admin": 110, "retention": 46, "term": 36, "base": 480, "other": 55, "markup": 100},
+    "theft": {"on": True, "cur_rate": 19, "cur_premium": 545, "rate": 24, "premium": 595, "repay": 95, "comm": 18, "admin": 70, "retention": 52, "term": 24, "base": 330, "other": 40, "markup": 60},
+    "appearance": {"on": True, "cur_rate": 14, "cur_premium": 725, "rate": 19, "premium": 795, "repay": 120, "comm": 18, "admin": 95, "retention": 50, "term": 24, "base": 440, "other": 50, "markup": 90},
+    "key": {"on": False, "cur_rate": 9, "cur_premium": 329, "rate": 12, "premium": 349, "repay": 55, "comm": 20, "admin": 45, "retention": 55, "term": 24, "base": 190, "other": 20, "markup": 39},
+    "tire": {"on": True, "cur_rate": 17, "cur_premium": 645, "rate": 22, "premium": 699, "repay": 110, "comm": 17, "admin": 85, "retention": 48, "term": 24, "base": 380, "other": 44, "markup": 80},
+    "maint": {"on": False, "cur_rate": 11, "cur_premium": 849, "rate": 15, "premium": 899, "repay": 0, "comm": 15, "admin": 120, "retention": 44, "term": 12, "base": 600, "other": 60, "markup": 119},
+    "power": {"on": False, "cur_rate": 6, "cur_premium": 1425, "rate": 8, "premium": 1495, "repay": 0, "comm": 15, "admin": 180, "retention": 40, "term": 36, "base": 1000, "other": 100, "markup": 215},
 }
 
 
@@ -39,7 +39,7 @@ def seed() -> dict:
         "evidence": ["DMS unit reports", "Sponsor production reports", "Bank statements (Plaid)"],
         "requested": 1200000, "min_activation": 900000, "term": 36, "dealer_cof": 14.5, "exclusivity": 45,
         "bank_cof": 0.5, "orig_cost": 34000, "prof_fees": 46000, "mgmt_fee": 3200, "loss_prov": 1.5,
-        "debt_service": 41300, "markup": 12, "fund_target": 100, "cure_days": 5, "adj_value": 200,
+        "debt_service": 41300, "fund_target": 100, "cure_days": 5, "adj_value": 200,
         # Deep-copied: SEED_PRODUCTS is module-level, and a test that switches a
         # product off was leaking that into every test that ran after it.
         "products": copy.deepcopy(SEED_PRODUCTS),
@@ -221,10 +221,15 @@ def test_non_zero_rule_and_blank_multiselect():
     assert "monthly_units" in keys and "evidence" in keys
 
 
-def test_seed_is_send_ready_except_for_the_covenant():
+def test_seed_is_send_ready_except_for_the_covenant_and_the_price():
+    """The seed is an old-story deal: every covered product prices above what
+    the dealer pays today. The covenant row is the only other thing open."""
     c = pa.compute(seed())
-    keys = [a["key"] for a in c["attention"]]
-    assert keys == ["remittance_coverage"]
+    keys = {a["key"] for a in c["attention"]}
+    over = {f"products.{r['key']}.over" for r in c["econ"]["rows"] if r["on"]}
+    assert all(r["savings"] < 0 for r in c["econ"]["rows"] if r["on"])
+    assert keys == {"remittance_coverage"} | over
+    assert all(a.get("owner") != "desk" for a in c["attention"])  # the price is the rep's to fix
 
 
 def test_products_attention_rules():
@@ -440,14 +445,21 @@ def test_a_legacy_row_admits_it_knows_no_base_cost():
     """_num(None) is 0.0, so a ten-key row would otherwise compute a cushion the
     size of today's whole premium. stack_known is what the UI and the PDF read
     before showing a cushion or a saving as real."""
-    r = pa.product_econ(96, "vsc", SEED_PRODUCTS["vsc"])
+    legacy = {k: v for k, v in SEED_PRODUCTS["vsc"].items() if k not in ("base", "other", "markup")}
+    r = pa.product_econ(96, "vsc", legacy)
     assert r.stack_known is False
     assert r.cushion == r.cur_premium - r.admin  # the fabricated figure, present but flagged
     # And the additive phase changed nothing the old row already reported.
     assert r.reserve == pytest.approx((2400 - 420 - 336 - 260) * 0.38)
-    c = pa.compute(seed())
+    arr = seed()
+    arr["products"] = {k: {f: v for f, v in row.items() if f not in ("base", "other", "markup")} for k, row in arr["products"].items()}
+    c = pa.compute(arr)
     json.dumps(c)
     assert all(row["stack_known"] is False for row in c["econ"]["rows"])
+    # A legacy arrangement is told to enter its base costs, and blamed for nothing else about the stack.
+    keys = {a["key"] for a in c["attention"]}
+    assert {f"products.{r['key']}.base" for r in c["econ"]["rows"] if r["on"]} <= keys
+    assert not any(k.endswith((".over", ".cushion", ".premium")) for k in keys)
 
 
 def test_savings_hold_volume_constant_and_the_gross_delta_splits_cleanly():
@@ -486,7 +498,8 @@ def test_the_comparison_never_shows_our_cost_to_the_dealer_and_never_invents_a_c
     """A stage-two package drafted from a commitment executed before the stack
     existed: the new rows are blank on the original, not changed — and our base
     cost, markup and commission never reach the dealer's signing gate."""
-    a = seed()  # ten-key products, as every executed commitment today
+    a = seed()
+    a["products"] = {k: {f: v for f, v in row.items() if f not in ("base", "other", "markup")} for k, row in a["products"].items()}  # as every executed commitment today
     c1 = pa.compute(a)
     b, _ = pa.apply_term_sheet(a, _sheet())
     b["products"]["vsc"].update({"base": 1380, "other": 40, "markup": 200})
@@ -504,3 +517,126 @@ def test_the_comparison_never_shows_our_cost_to_the_dealer_and_never_invents_a_c
         assert rows[f"products.vsc.{fld}"]["original_blank"] is True, fld
     assert rows["products.vsc.other"]["dealer_visible"] is True
     assert rows["products.vsc.premium"]["original_blank"] is False
+
+
+
+# ---------------------------------------------------------------------------
+# the story: the payment comes out of the cushion
+# ---------------------------------------------------------------------------
+
+def new_story() -> dict:
+    """Every covered product priced below today with room to spare."""
+    arr = seed()
+    for row in arr["products"].values():
+        row.update({"base": round(row["cur_premium"] * 0.55), "other": 20, "markup": round(row["cur_premium"] * 0.08), "repay": 0})
+        row["premium"] = row["base"] + row["admin"] + row["other"] + row["markup"]
+    return arr
+
+
+def send_ready(debt_service: float = 30000) -> dict:
+    """A new-story arrangement with the loan built into the policies out of
+    the room, so nothing is open but what a test chooses to open."""
+    arr = new_story()
+    arr["thresholds"] = {}
+    arr["debt_service"] = debt_service
+    rows, shortfall = pa.room_solve(pa.portfolio_econ(96, arr["products"]), debt_service * 1.25)
+    assert shortfall == 0, "the seed's room must carry the covenant"
+    for r in rows:
+        row = arr["products"][r["key"]]
+        row["repay"] = r["solve_repay"]
+        row["premium"] = row["base"] + row["admin"] + row["other"] + row["markup"] + row["repay"]
+    return arr
+
+
+def test_send_ready_means_nothing_open():
+    assert pa.compute(send_ready())["attention"] == []
+
+
+def test_room_solve_fills_the_room_first_and_never_hides_a_shortfall():
+    arr = new_story()
+    e = pa.portfolio_econ(96, arr["products"])
+    rows, shortfall = pa.room_solve(e, 5000)
+    assert shortfall == 0
+    assert sum(r["solve_repay"] * r["contracts"] for r in rows) >= 5000
+    assert not any(r["over_room"] for r in rows)
+    assert all(r["savings_after"] >= 0 for r in rows)  # nobody pays more than today
+    # The rounding remainder lands on the product with the most room.
+    assert max(rows, key=lambda r: r["room_m"])["solve_repay"] >= rows[0]["solve_repay"] or len(rows) == 1
+    # Short: the rest is spread evenly on top, reported, and flagged per row.
+    big, short = pa.room_solve(e, 500_000)
+    assert short > 0 and any(r["over_room"] for r in big)
+    assert sum(r["solve_repay"] * r["contracts"] for r in big) >= 500_000
+    assert pa.room_solve(pa.portfolio_econ(96, {}), 1000) == ([], 1000)
+
+
+def test_a_legacy_row_takes_only_the_even_share():
+    """A row with no base cost has no room it can vouch for."""
+    arr = new_story()
+    for f in ("base", "other", "markup"):
+        arr["products"]["gap"].pop(f)
+    e = pa.portfolio_econ(96, arr["products"])
+    rows, _ = pa.room_solve(e, 5000)
+    gap = next(r for r in rows if r["key"] == "gap")
+    assert gap["room"] == 0 and gap["solve_repay"] == 0
+
+
+def test_the_dealer_can_carry_the_loan_directly():
+    """buildout_mode was declared, defaulted and never read. `forward` now means
+    the dealer pays from operations: nothing is carried, whatever the products
+    say, and the half-payment rule stays quiet because nothing was meant to be."""
+    arr = seed()
+    c = pa.compute(arr)
+    assert c["buildout"]["mode"] == "reverse" and c["buildout"]["build"] is True
+    assert c["buildout"]["policy_funded"] == c["econ"]["repay_m"] > 0
+    arr["buildout_mode"] = "forward"
+    d = pa.compute(arr)
+    assert d["buildout"]["build"] is False and d["buildout"]["policy_funded"] == 0
+    assert d["buildout"]["out_of_pocket"] == d["buildout"]["debt_service"]
+    assert not any(a["key"] == "buildout" for a in d["attention"])
+    assert not any(a["key"].endswith(".repay") for a in d["attention"])
+    arr["buildout_mode"] = "sideways"  # stored without a membership check; not trusted
+    assert pa.compute(arr)["buildout"]["mode"] == "reverse"
+
+
+def test_the_story_rules():
+    arr = new_story()
+    c = pa.compute(arr)
+    keys = {a["key"] for a in c["attention"]}
+    assert not any(k.endswith((".over", ".cushion", ".base", ".premium")) for k in keys)
+    # Our base cost above today's price: no cushion, and the dealer pays more.
+    arr["products"]["vsc"]["base"] = 2500
+    arr["products"]["vsc"]["premium"] = 2500 + 260 + 20 + arr["products"]["vsc"]["markup"]
+    keys = {a["key"]: a for a in pa.compute(arr)["attention"]}
+    assert "products.vsc.cushion" in keys and keys["products.vsc.cushion"]["owner"] == "desk"
+    assert "products.vsc.over" in keys and "markup" in keys["products.vsc.over"]["detail"]
+    # The premium and the stack disagree by more than a dollar.
+    arr = new_story()
+    arr["products"]["vsc"]["premium"] += 2
+    assert "products.vsc.premium" in {a["key"] for a in pa.compute(arr)["attention"]}
+    arr["products"]["vsc"]["premium"] -= 2.5  # within rounding
+    assert "products.vsc.premium" not in {a["key"] for a in pa.compute(arr)["attention"]}
+    # The loan pushing the ticket over today names the repayment as the lever.
+    arr = new_story()
+    vsc = arr["products"]["vsc"]
+    vsc["repay"] = vsc["cur_premium"] - vsc["base"] - vsc["admin"] - vsc["other"] - vsc["markup"] + 50
+    vsc["premium"] = vsc["base"] + vsc["admin"] + vsc["other"] + vsc["markup"] + vsc["repay"]
+    over = next(a for a in pa.compute(arr)["attention"] if a["key"] == "products.vsc.over")
+    assert "carried to the loan" in over["detail"]
+
+
+def test_the_sponsor_block_reads_the_per_product_markup():
+    c = pa.compute(seed())
+    e = c["econ"]
+    expected = sum(r["contracts"] * r["markup"] for r in e["rows"] if r["on"])
+    assert c["sponsor"]["markup_m"] == pytest.approx(expected) and expected > 0
+    assert c["sponsor"]["markup_pct"] == pytest.approx(expected / e["gross"] * 100)
+    assert "markup" not in pa.FIELD_RULES_BY_KEY
+    assert "markup" not in pa.DESK_ONLY_KEYS and "markup" in pa.DESK_ONLY_PRODUCT_FIELDS
+
+
+def test_the_waterfall_tells_today_versus_with_us():
+    w = {row["label"]: row for row in pa.compute(seed())["econ"]["waterfall"]}
+    assert w["What the dealer pays today"]["value"] == 2150
+    assert w["What the dealer pays with us"]["value"] == 2400
+    assert w["The dealer saves"]["value"] == -250
+    assert w["Base product cost"]["value"] + w["Administrator fee"]["value"] + w["Other fees"]["value"] + w["Our markup"]["value"] + w["Carried to the loan"]["value"] == 2400

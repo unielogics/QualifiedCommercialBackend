@@ -22,7 +22,7 @@ from app.services import production_signing as signing
 
 fitz = pytest.importorskip("fitz")
 sys.path.insert(0, "app/tests")
-from test_production_arrangement import seed  # noqa: E402
+from test_production_arrangement import seed, send_ready  # noqa: E402
 
 
 def _anchored_pdf() -> bytes:
@@ -106,8 +106,7 @@ def test_filled_templates_carry_anchors_for_every_placed_party_and_strip_cleanly
 
 async def test_send_refuses_when_a_signature_on_file_is_missing():
     user = SimpleNamespace(id=uuid.uuid4(), role=Role.LOAN_EXEC, name="Desk")
-    arr = seed()
-    arr["debt_service"] = 30000  # clears the covenant
+    arr = send_ready()  # the loan carried out of the room, so nothing is open before the signature check
     package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement=arr, prefill_provenance={}, stage=1,
                               delivery_history=[], sponsor_company_id=uuid.uuid4(), sent_by_user_id=None, execution_pending=False, agreement_no=None)
     profile = SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None, intake_id=None, primary_bucket_id=None)

@@ -36,7 +36,7 @@ STAGE_ONE_TITLE = "Production Commitment and Capital Engagement Agreement"
 STAGE_TWO_TITLE = "Program Activation and Production Agreement"
 STAGE_ONE_DOCUMENT_KEY = "production_commitment_v1"
 STAGE_TWO_DOCUMENT_KEY = "program_activation_v1"
-DOCUMENT_VERSION = "2026-09-03-2"
+DOCUMENT_VERSION = "2026-09-09-1"
 
 PRODUCT_KEYS: tuple[str, ...] = ("vsc", "gap", "theft", "appearance", "key", "tire", "maint", "power")
 PRODUCT_LABELS: dict[str, str] = {
@@ -284,9 +284,6 @@ FIELD_RULES: tuple[FieldRule, ...] = (
               non_zero=True, title="Monthly debt service is not set",
               detail="The minimum remittance covenant is 125% of debt service — it cannot be derived until this is filled.",
               always="Sets the 125% remittance covenant"),
-    FieldRule("markup", "advance", "Sponsor markup (%)", kind="number", required_for="presentation", non_zero=True,
-              title="Sponsor markup is blank", detail="The sponsor's markup on premium is what this arrangement earns them.",
-              always="The sponsor's margin on every contract sold"),
     FieldRule("sizing", "advance", "Advance sizing", kind="select", options=SIZING_MODES),
     FieldRule("buildout_mode", "buildout", "Buildout mode", kind="select", options=BUILDOUT_MODES),
     # ---- shortfall and cure ----
@@ -902,15 +899,78 @@ def reverse_solve(e: PortfolioEcon, need_monthly: float) -> list[dict[str, Any]]
     return rows
 
 
+def room_solve(e: PortfolioEcon, need_monthly: float) -> tuple[list[dict[str, Any]], float]:
+    """Carry the payment out of each product's room — the cushion left after
+    our markup — in proportion, so the dealer pays no more than today on any
+    product. When the room across the covered products is short, the rest is
+    spread evenly per contract on top and reported as `shortfall`, never
+    silently: an attention row says the ticket has gone above today's price.
+
+    A row with no base cost entered has no room it can vouch for; it takes
+    only the even share. Returns (rows, shortfall)."""
+    on = list(e.on)
+    room_of = {r.key: (r.room if r.stack_known else 0.0) for r in on}
+    room_m = sum(room_of[r.key] * r.contracts for r in on)
+    contracts = sum(r.contracts for r in on)
+    fill = min(1.0, need_monthly / room_m) if room_m > 0 else 0.0
+    shortfall = max(0.0, need_monthly - room_m)
+    extra = shortfall / contracts if contracts > 0 else 0.0
+    rows: list[dict[str, Any]] = []
+    for r in on:
+        per_contract = room_of[r.key] * fill + extra
+        solve_repay = jsround(per_contract)
+        # premium - repay is stack + markup when the stack reconciles, and the
+        # ticket without its current withholding when it does not.
+        needed = jsround(r.premium - r.repay + solve_repay)
+        rows.append({
+            "key": r.key, "label": r.label, "contracts": r.contracts, "cur_premium": r.cur_premium,
+            "room": room_of[r.key], "room_m": room_of[r.key] * r.contracts,
+            "solve_repay": solve_repay, "needed": needed,
+            "savings_after": r.cur_premium - needed, "over_room": solve_repay > room_of[r.key],
+        })
+    if rows:
+        rounded = sum(r["solve_repay"] * r["contracts"] for r in rows)
+        gap = need_monthly - rounded
+        if gap > 0:
+            # The remainder lands on the product with the most room, not the
+            # most contracts — the biggest seller may already be at its edge.
+            roomiest = max(rows, key=lambda r: (r["room_m"], r["contracts"]))
+            if roomiest["contracts"] > 0:
+                add = math.ceil(gap / roomiest["contracts"])
+                roomiest["solve_repay"] += add
+                roomiest["needed"] += add
+                roomiest["savings_after"] -= add
+                roomiest["over_room"] = roomiest["solve_repay"] > roomiest["room"]
+    for r in rows:
+        # Transitional names the client still reads; slice 5 drops them.
+        r["uplift"] = r["needed"] - r["cur_premium"]
+        r["steep"] = r["over_room"]
+    return rows, shortfall
+
+
+def buildout_mode(arr: dict[str, Any]) -> str:
+    """`reverse` — build the payment into the policies; `forward` — the dealer
+    pays it from operations. normalize_changes stores a select with no
+    membership check, so the stored string is not trusted."""
+    mode = arr.get("buildout_mode")
+    return mode if mode in BUILDOUT_MODES else "reverse"
+
+
 def buildout(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon) -> dict[str, Any]:
     ds = _num(arr.get("debt_service"))
     target = _num(arr.get("fund_target"))
-    policy_funded = e.repay_m
+    mode = buildout_mode(arr)
+    build = mode != "forward"
+    # With the dealer paying directly, the withholdings are not carrying the
+    # loan whatever the products say.
+    policy_funded = e.repay_m if build else 0.0
     funded_pct = (policy_funded / ds) * 100 if ds > 0 else 0.0
     out_of_pocket = max(0.0, ds - policy_funded)
     loan_free = ds > 0 and policy_funded >= ds
     need_monthly = ds * (target / 100)
-    solve_rows = reverse_solve(e, need_monthly)
+    solve_rows, shortfall = room_solve(e, need_monthly)
+    room_m = sum(r.room_m for r in e.on if r.stack_known)
+    required_vs_room_pct = (need_monthly / room_m) * 100 if room_m > 0 else None
     required_per_contract = need_monthly / e.contracts if e.contracts > 0 else 0.0
     avg_cur_premium = (
         sum(r.cur_contracts * r.cur_premium for r in e.on) / max(1, e.cur_contracts) if e.contracts > 0 else 0.0
@@ -934,9 +994,12 @@ def buildout(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon) -> dict[st
         }
 
     return {
+        "mode": mode, "build": build,
         "debt_service": ds, "fund_target_pct": target, "policy_funded": policy_funded,
         "funded_pct": funded_pct, "out_of_pocket": out_of_pocket, "loan_free": loan_free,
         "need_monthly": need_monthly, "solve_rows": solve_rows,
+        "room_m": room_m, "shortfall": shortfall, "over_room": any(r["over_room"] for r in solve_rows),
+        "required_vs_room_pct": required_vs_room_pct,
         "required_per_contract": required_per_contract, "required_uplift_pct": required_uplift_pct,
         "scenarios": {"with": scenario(True), "without": scenario(False)},
     }
@@ -1022,12 +1085,47 @@ def econ_attention(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon, remi
             "title": "Vehicle service contracts are not covered",
             "detail": "VSC is the primary repayment product. With it unchecked there is no production commitment on it.",
         })
+    build = buildout_mode(arr) != "forward"
     for row in e.on:
-        if not row.repay:
+        if not row.stack_known:
+            out.append({
+                "step": "products", "key": f"products.{row.key}.base", "owner": "desk",
+                "title": f"{row.label} has no base cost",
+                "detail": ("Without our cost of the product there is no cushion, and the saving shown on the "
+                           "proposal is not real. The desk enters it in the fee stack."),
+            })
+            continue
+        if row.cushion < 0:
+            out.append({
+                "step": "products", "key": f"products.{row.key}.cushion", "owner": "desk",
+                "title": f"Our base cost on {row.label.lower()} is above today's price",
+                "detail": (f"The dealer pays {_money(row.cur_premium)} today; our base stack alone is "
+                           f"{_money(row.stack)}. There is no cushion here."),
+            })
+        if row.savings < 0:
+            over = -row.savings
+            lever = (f"Even before the loan, our markup of {_money(row.markup)} is above the {_money(row.cushion)} cushion."
+                     if row.markup > row.cushion else
+                     f"The {_money(row.repay)} carried to the loan is bigger than the {_money(row.room)} of room after our markup.")
+            out.append({
+                "step": "products", "key": f"products.{row.key}.over",
+                "title": f"{row.label} costs the dealer more than today",
+                "detail": (f"+{_money(over)} a contract over the {_money(row.cur_premium)} they pay now. {lever} "
+                           "Lower the markup on it, lift attachment, or move some of the loan to another product."),
+            })
+        if abs(row.premium - (row.stack + row.markup + row.repay)) > 1.0:
+            out.append({
+                "step": "products", "key": f"products.{row.key}.premium",
+                "title": f"{row.label}: the premium and the fee stack disagree",
+                "detail": (f"The premium is {_money(row.premium)}; base, admin, other fees, markup and the loan add up to "
+                           f"{_money(row.stack + row.markup + row.repay)}. One of them is wrong."),
+            })
+        if build and row.room > 0 and not row.repay:
             out.append({
                 "step": "products", "key": f"products.{row.key}.repay",
-                "title": f"{row.label} has no repayment amount",
-                "detail": "A covered product with no per-contract withholding contributes nothing to repayment.",
+                "title": f"{row.label} carries none of the payment",
+                "detail": (f"There is {_money(row.room)} a contract of room after our markup and none of it is "
+                           "carrying the loan. Build it, or set the repayment in the fee stack."),
             })
     if not e.on:
         out.append({
@@ -1203,7 +1301,8 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
         "months_of_inventory": (lot_units / e.units) if lot_units and e.units else None,
         "sell_through_pct": (e.units / lot_units * 100) if lot_units else None,
     }
-    markup_m = e.gross * (_num(arr.get("markup")) / 100)
+    markup_m = e.markup_m  # per-product dollars, summed over the covered products
+    markup_pct = (markup_m / e.gross * 100) if e.gross > 0 else 0.0
     mgmt_m = _num(arr.get("mgmt_fee"))
     vsc = e.row(PRIMARY_PRODUCT)
 
@@ -1212,7 +1311,7 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
         attention += funding_attention(arr)
     attention += thr_attention
     attention += econ_attention(arr, e, adv, remittance_req)
-    if build["debt_service"] > 0 and build["policy_funded"] < build["debt_service"] * 0.5:
+    if build["build"] and build["debt_service"] > 0 and build["policy_funded"] < build["debt_service"] * 0.5:
         attention.append({
             "step": "buildout", "key": "buildout",
             "title": "Policies carry less than half the payment",
@@ -1235,12 +1334,17 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
             "cost_same": e.cost_same, "savings_m": e.savings_m,
             "stack_m": e.stack_m, "cushion_m": e.cushion_m, "room_m": e.room_m, "markup_m": e.markup_m,
             "d_gross_from_attach": e.d_gross_from_attach, "d_gross_from_price": e.d_gross_from_price,
+            # Today versus with us, on the primary product: what the dealer
+            # pays now, the stack it becomes, our margin, the loan, the saving.
             "waterfall": [
-                {"label": "VSC premium the customer pays", "value": vsc.premium},
-                {"label": "Withheld toward repayment", "value": vsc.repay},
-                {"label": "Agency commission", "value": vsc.comm},
-                {"label": "Administrator fee", "value": vsc.admin},
-                {"label": "Reserve after expected claims", "value": vsc.reserve},
+                {"label": "What the dealer pays today", "value": vsc.cur_premium, "group": "today"},
+                {"label": "Base product cost", "value": vsc.base, "group": "stack"},
+                {"label": "Administrator fee", "value": vsc.admin, "group": "stack"},
+                {"label": "Other fees", "value": vsc.other, "group": "stack"},
+                {"label": "Our markup", "value": vsc.markup, "group": "margin"},
+                {"label": "Carried to the loan", "value": vsc.repay, "group": "loan"},
+                {"label": "What the dealer pays with us", "value": vsc.premium, "group": "total"},
+                {"label": "The dealer saves", "value": vsc.savings, "group": "savings"},
             ],
         },
         "lot": lot,
@@ -1259,7 +1363,7 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
             "rolling": rolling_three_month(thr_rows, remittance_req),
         },
         "buildout": build,
-        "sponsor": {"markup_pct": _num(arr.get("markup")), "markup_m": markup_m, "mgmt_m": mgmt_m,
+        "sponsor": {"markup_pct": markup_pct, "markup_m": markup_m, "mgmt_m": mgmt_m,
                     "total_over_term": (markup_m + mgmt_m) * adv.term},
         "projection": proj,
         "attention": attention,

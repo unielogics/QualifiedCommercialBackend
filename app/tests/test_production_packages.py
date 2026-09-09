@@ -295,11 +295,9 @@ async def test_send_refuses_blanks_and_is_idempotent_once_out():
 async def test_send_requires_a_signed_sponsor():
     import sys
     sys.path.insert(0, "app/tests")
-    from test_production_arrangement import seed
-    arr = seed()
-    arr["thresholds"] = {}
-    # make the covenant clear so the only blocker is the sponsor
-    arr["debt_service"] = 30000
+    from test_production_arrangement import send_ready
+    # the loan carried out of the room, so the only blocker is the sponsor
+    arr = send_ready()
     assert pa.compute(arr)["attention"] == []
     user = _user(Role.LOAN_EXEC)
     package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=1, arrangement=arr, prefill_provenance={},
@@ -512,7 +510,7 @@ def test_an_attention_row_says_who_can_clear_it():
     assert {r["owner"] for r in rows} <= {"desk", "any"}
     # And the ones that actually strand an agent are real, not hypothetical.
     stranded = {k for k, r in by_key.items() if r["owner"] == "desk"}
-    assert {"min_activation", "dealer_cof", "orig_cost", "prof_fees", "markup"} <= stranded
+    assert {"min_activation", "dealer_cof", "orig_cost", "prof_fees"} <= stranded
 
 
 def test_the_intake_entity_name_is_never_mined_for_a_type_or_a_state():
