@@ -615,6 +615,20 @@ async def apply_changes(
                 detail={"code": "maintained_by_desk", "fields": desk_only,
                         "message": "The advance and the programme cost are set by the desk."},
             )
+        # DESK_ONLY_KEYS filters top-level keys, and `products` is one key — so
+        # without this a share link could rewrite our cost and our margin.
+        products = changes.get("products")
+        desk_only_product = sorted(
+            f"products.{pk}.{fld}"
+            for pk, row in (products.items() if isinstance(products, dict) else ())
+            if isinstance(row, dict) for fld in row if fld in pa.DESK_ONLY_PRODUCT_FIELDS
+        )
+        if desk_only_product:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"code": "maintained_by_desk", "fields": desk_only_product,
+                        "message": "Product cost and margin are set by the desk."},
+            )
     if int(getattr(package, "stage", 1) or 1) == 2:
         locked = sorted(k for k in changes if k in pa.TERM_SHEET_KEYS) + (["sponsor_company_id"] if sponsor_change else []) + sorted(k for k in changes if k in pa.SPONSOR_KEYS)
         if locked:

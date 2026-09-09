@@ -52,7 +52,16 @@ PRODUCT_LABELS: dict[str, str] = {
 PRIMARY_PRODUCT = "vsc"
 PRODUCT_FIELDS: tuple[str, ...] = (
     "on", "cur_rate", "cur_premium", "rate", "premium", "repay", "comm", "admin", "retention", "term",
+    # The fee stack behind `premium`: our base product cost, other fees that
+    # leave, and our margin per contract. `premium` stays the field of record
+    # (Schedule B, the diff, the proposal all read it); the workspace writes it
+    # as base + admin + other + markup + repay, and an attention rule catches
+    # the two disagreeing.
+    "base", "other", "markup",
 )
+# Per-product economics a rep or a share link must not set: our cost and our
+# margin. `DESK_ONLY_KEYS` covers top-level keys only; `products` is one key.
+DESK_ONLY_PRODUCT_FIELDS: frozenset[str] = frozenset({"base", "other", "markup", "comm", "retention"})
 
 # Addendum A.3 guideline: 85% monthly floor, 90% rolling three-month, 125%
 # remittance coverage, 100% routing, fifth business day reporting.
@@ -421,6 +430,7 @@ DEFAULTS: dict[str, Any] = {
 DEFAULT_PRODUCT: dict[str, Any] = {
     "on": False, "cur_rate": "", "cur_premium": "", "rate": "", "premium": "", "repay": "",
     "comm": "", "admin": "", "retention": "", "term": 36,
+    "base": "", "other": "", "markup": "",
 }
 
 
@@ -535,6 +545,26 @@ class ProductEcon:
     uplift: float
     d_contracts: int
     d_gross: float
+    # The fee stack (all $ per contract) and what it leaves.
+    base: float = 0.0
+    other: float = 0.0
+    markup: float = 0.0
+    stack: float = 0.0          # base + admin + other — what the product costs before margin and the loan
+    cushion: float = 0.0        # cur_premium - stack — the room between today's price and our cost
+    room: float = 0.0           # max(0, cushion - markup) — what is left to carry the loan
+    savings: float = 0.0        # cur_premium - premium, i.e. -uplift, stated so nobody has to flip the sign
+    # False when no base cost has been entered. _num(None) is 0.0, so without
+    # this a legacy row would compute a cushion the size of today's whole
+    # premium and a saving that is not real.
+    stack_known: bool = False
+    cost_same: float = 0.0      # cur_contracts * premium — today's volume at our price
+    stack_m: float = 0.0
+    cushion_m: float = 0.0
+    room_m: float = 0.0
+    markup_m: float = 0.0
+    # d_gross split into "sells more contracts" and "charges more per contract".
+    d_gross_from_attach: float = 0.0
+    d_gross_from_price: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -546,6 +576,11 @@ class ProductEcon:
             "gross": self.gross, "cur_gross": self.cur_gross,
             "repay_m": self.repay_m, "comm_m": self.comm_m, "admin_m": self.admin_m, "reserve_m": self.reserve_m,
             "uplift": self.uplift, "d_contracts": self.d_contracts, "d_gross": self.d_gross,
+            "base": self.base, "other": self.other, "markup": self.markup,
+            "stack": self.stack, "cushion": self.cushion, "room": self.room, "savings": self.savings,
+            "stack_known": self.stack_known, "cost_same": self.cost_same,
+            "stack_m": self.stack_m, "cushion_m": self.cushion_m, "room_m": self.room_m, "markup_m": self.markup_m,
+            "d_gross_from_attach": self.d_gross_from_attach, "d_gross_from_price": self.d_gross_from_price,
         }
 
 
@@ -564,6 +599,14 @@ class PortfolioEcon:
     admin_m: float
     reserve_m: float
     max_term: int
+    cost_same: float = 0.0      # today's contracts at our price
+    savings_m: float = 0.0      # cur_gross - cost_same: the honest saving, volume held constant
+    stack_m: float = 0.0
+    cushion_m: float = 0.0
+    room_m: float = 0.0
+    markup_m: float = 0.0       # per-product margin dollars; distinct from the sponsor block's figure
+    d_gross_from_attach: float = 0.0
+    d_gross_from_price: float = 0.0
 
     @property
     def d_contracts(self) -> int:
@@ -590,6 +633,14 @@ def product_econ(units: float, key: str, values: dict[str, Any] | None) -> Produ
     admin = _num(v.get("admin"))
     retention = _num(v.get("retention"))
     term = int(_num(v.get("term"))) or 12
+    base = _num(v.get("base"))
+    other = _num(v.get("other"))
+    markup = _num(v.get("markup"))
+    stack_known = bool(str(v.get("base") if v.get("base") is not None else "").strip())
+    stack = base + admin + other
+    cushion = cur_premium - stack
+    room = max(0.0, cushion - markup)
+    savings = cur_premium - premium
     cur_contracts = jsround(units * cur_rate / 100) if on else 0
     contracts = jsround(units * rate / 100) if on else 0
     comm = premium * (comm_pct / 100)
@@ -605,6 +656,10 @@ def product_econ(units: float, key: str, values: dict[str, Any] | None) -> Produ
         gross=gross, cur_gross=cur_gross,
         repay_m=contracts * repay, comm_m=contracts * comm, admin_m=contracts * admin, reserve_m=contracts * reserve,
         uplift=premium - cur_premium, d_contracts=contracts - cur_contracts, d_gross=gross - cur_gross,
+        base=base, other=other, markup=markup, stack=stack, cushion=cushion, room=room, savings=savings,
+        stack_known=stack_known, cost_same=cur_contracts * premium,
+        stack_m=contracts * stack, cushion_m=contracts * cushion, room_m=contracts * room, markup_m=contracts * markup,
+        d_gross_from_attach=(contracts - cur_contracts) * cur_premium, d_gross_from_price=contracts * (premium - cur_premium),
     )
 
 
@@ -622,6 +677,9 @@ def portfolio_econ(units: float, products: dict[str, Any] | None) -> PortfolioEc
         cur_contracts=int(total("cur_contracts")), cur_gross=total("cur_gross"), d_gross=total("d_gross"),
         repay_m=total("repay_m"), comm_m=total("comm_m"), admin_m=total("admin_m"), reserve_m=total("reserve_m"),
         max_term=max((r.term for r in on), default=12),
+        cost_same=total("cost_same"), savings_m=total("cur_gross") - total("cost_same"),
+        stack_m=total("stack_m"), cushion_m=total("cushion_m"), room_m=total("room_m"), markup_m=total("markup_m"),
+        d_gross_from_attach=total("d_gross_from_attach"), d_gross_from_price=total("d_gross_from_price"),
     )
 
 
@@ -1174,6 +1232,9 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
             "max_term": e.max_term,
             "blended_attach": (e.contracts / e.units) if e.units else None,
             "cur_per_vehicle": (e.cur_contracts / e.units) if e.units else None,
+            "cost_same": e.cost_same, "savings_m": e.savings_m,
+            "stack_m": e.stack_m, "cushion_m": e.cushion_m, "room_m": e.room_m, "markup_m": e.markup_m,
+            "d_gross_from_attach": e.d_gross_from_attach, "d_gross_from_price": e.d_gross_from_price,
             "waterfall": [
                 {"label": "VSC premium the customer pays", "value": vsc.premium},
                 {"label": "Withheld toward repayment", "value": vsc.repay},
@@ -1284,7 +1345,7 @@ def merge_changes(arrangement: dict[str, Any], changes: dict[str, Any]) -> dict[
     normalized = normalize_changes(changes)
     for key, value in normalized.items():
         if key == "products":
-            merged = {k: dict(base["products"].get(k, DEFAULT_PRODUCT)) for k in PRODUCT_KEYS}
+            merged = {k: {**DEFAULT_PRODUCT, **(base["products"].get(k) or {})} for k in PRODUCT_KEYS}
             for pk, row in value.items():
                 merged[pk].update(row)
             base["products"] = merged
@@ -1498,8 +1559,10 @@ def arrangement_diff(original: dict[str, Any], final: dict[str, Any]) -> dict[st
             # and the comparison stayed silent about it.
             for fld, label, fmt in (("cur_rate", "current attachment", "pct"), ("cur_premium", "current premium", "money"),
                                     ("rate", "new attachment", "pct"), ("premium", "new premium", "money"), ("repay", "repayment withheld", "money"),
-                                    ("comm_pct", "commission", "pct"), ("admin", "admin fee", "money"), ("retention_pct", "retention", "pct"), ("term", "term (months)", "count")):
-                row("Covered products", f"products.{pk}.{fld}", f"{PRODUCT_LABELS[pk]} — {label}", fmt, o.get(fld), f.get(fld))
+                                    ("comm_pct", "commission", "pct"), ("admin", "admin fee", "money"), ("retention_pct", "retention", "pct"), ("term", "term (months)", "count"),
+                                    ("base", "base cost", "money"), ("other", "other fees", "money"), ("markup", "markup / contract", "money"), ("stack", "fee stack", "money")):
+                row("Covered products", f"products.{pk}.{fld}", f"{PRODUCT_LABELS[pk]} — {label}", fmt, o.get(fld), f.get(fld),
+                    dealer_visible=fld not in ("base", "markup", "comm_pct"), original_blank=fld not in o)
     for key, label in (("contracts", "Contracts / month"), ("gross", "Gross / month"), ("repay_m", "Repayment / month")):
         row("Covered products", f"econ.{key}", label, "money" if key != "contracts" else "count", oc["econ"].get(key), fc["econ"].get(key))
     # Operative thresholds

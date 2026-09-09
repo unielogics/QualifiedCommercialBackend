@@ -415,3 +415,92 @@ def test_the_comparison_shows_the_current_figures_moving_too():
     # And the labels say which side of the table each row came from.
     assert "current" in rows["products.vsc.cur_rate"]["label"]
     assert "new" in rows["products.vsc.rate"]["label"]
+
+
+# ---------------------------------------------------------------------------
+# the fee stack behind premium
+# ---------------------------------------------------------------------------
+
+# The design's own worked VSC example: what the dealer pays another provider
+# today, our base cost, the admin fee, other fees, our markup, nothing carried
+# to the loan yet.
+DESIGN_VSC = {"on": True, "cur_rate": 54, "cur_premium": 2150, "rate": 54, "premium": 1715, "repay": 0,
+              "comm": 0, "admin": 95, "retention": 0, "term": 36, "base": 1380, "other": 40, "markup": 200}
+
+
+def test_the_fee_stack_reproduces_the_designs_worked_example():
+    r = pa.product_econ(96, "vsc", DESIGN_VSC)
+    assert r.stack == 1515 and r.cushion == 635 and r.premium == 1715
+    assert r.savings == 435 and r.room == 435
+    assert r.stack_known is True
+    assert r.uplift == -r.savings  # one number, two names; the sign is stated so nobody flips it
+
+
+def test_a_legacy_row_admits_it_knows_no_base_cost():
+    """_num(None) is 0.0, so a ten-key row would otherwise compute a cushion the
+    size of today's whole premium. stack_known is what the UI and the PDF read
+    before showing a cushion or a saving as real."""
+    r = pa.product_econ(96, "vsc", SEED_PRODUCTS["vsc"])
+    assert r.stack_known is False
+    assert r.cushion == r.cur_premium - r.admin  # the fabricated figure, present but flagged
+    # And the additive phase changed nothing the old row already reported.
+    assert r.reserve == pytest.approx((2400 - 420 - 336 - 260) * 0.38)
+    c = pa.compute(seed())
+    json.dumps(c)
+    assert all(row["stack_known"] is False for row in c["econ"]["rows"])
+
+
+def test_savings_hold_volume_constant_and_the_gross_delta_splits_cleanly():
+    """`savings_m` compares today's contracts at today's price with today's
+    contracts at ours; `d_gross` is split into "sells more" and "charges more"
+    so a proposal can say which one moved the number."""
+    e = pa.compute(seed())["econ"]
+    assert e["savings_m"] == pytest.approx(e["cur_gross"] - e["cost_same"])
+    assert e["d_gross_from_attach"] + e["d_gross_from_price"] == pytest.approx(e["d_gross"])
+    assert e["cost_same"] != e["gross"]  # the seed lifts attachment, so volume-held and volume-lifted differ
+    # On the new story's happy path — price down, attachment up — the total is
+    # positive while the price component is negative.
+    arr = seed()
+    arr["products"]["vsc"].update(DESIGN_VSC | {"rate": 62})
+    e2 = pa.compute(arr)["econ"]
+    vsc = next(r for r in e2["rows"] if r["key"] == "vsc")
+    assert vsc["d_gross_from_price"] < 0 < vsc["d_gross_from_attach"]
+
+
+def test_normalize_keeps_the_stack_and_still_drops_an_unknown_product_key():
+    n = pa.normalize_changes({"products": {"vsc": {"base": 1380, "other": 40, "markup": 200, "bogus": 1}}})
+    assert n["products"]["vsc"] == {"base": 1380, "other": 40, "markup": 200}
+
+
+def test_a_patch_heals_a_legacy_product_row_to_the_full_shape():
+    """merge_changes used to copy the stored row when the key existed, so a
+    ten-key row stayed ten keys forever. Now a PATCH of any field brings it up
+    to DEFAULT_PRODUCT's shape."""
+    m = pa.merge_changes({"products": {"vsc": {"on": True, "premium": 2400}}}, {"products": {"vsc": {"rate": 60}}})
+    assert sorted(m["products"]["vsc"]) == sorted(pa.DEFAULT_PRODUCT)
+    assert m["products"]["vsc"]["premium"] == 2400 and m["products"]["vsc"]["rate"] == 60
+    assert m["products"]["vsc"]["base"] == ""
+
+
+def test_the_comparison_never_shows_our_cost_to_the_dealer_and_never_invents_a_change():
+    """A stage-two package drafted from a commitment executed before the stack
+    existed: the new rows are blank on the original, not changed — and our base
+    cost, markup and commission never reach the dealer's signing gate."""
+    a = seed()  # ten-key products, as every executed commitment today
+    c1 = pa.compute(a)
+    b, _ = pa.apply_term_sheet(a, _sheet())
+    b["products"]["vsc"].update({"base": 1380, "other": 40, "markup": 200})
+    c2 = pa.compute(b, stage=2)
+    rows = {r["key"]: r for r in pa.arrangement_diff({"arrangement": a, "computed": c1}, {"arrangement": b, "computed": c2})["rows"]}
+    # c1 was computed by this code, so its rows carry the keys; simulate a
+    # frozen pre-deploy snapshot by removing them from the original's rows.
+    for r in c1["econ"]["rows"]:
+        for k in ("base", "other", "markup", "stack"):
+            r.pop(k, None)
+    rows = {r["key"]: r for r in pa.arrangement_diff({"arrangement": a, "computed": c1}, {"arrangement": b, "computed": c2})["rows"]}
+    for fld in ("base", "markup", "comm_pct"):
+        assert rows[f"products.vsc.{fld}"]["dealer_visible"] is False, fld
+    for fld in ("base", "other", "markup", "stack"):
+        assert rows[f"products.vsc.{fld}"]["original_blank"] is True, fld
+    assert rows["products.vsc.other"]["dealer_visible"] is True
+    assert rows["products.vsc.premium"]["original_blank"] is False

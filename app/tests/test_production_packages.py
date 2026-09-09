@@ -629,3 +629,29 @@ async def test_stage_two_gates_require_cleared_funding_and_matching_attestation(
     assert exc.value.detail["code"] == "funding_mismatch" and "amount funded" in exc.value.detail["fields"]
     ok = await signing._stage_two_gates(SimpleNamespace(), access, arr, {"confirm": True, "actual_funding_date": arr["funding_date"], "amount_funded": 1000000, "funding_party_name": "first bank"})
     assert ok["attested_by_user_id"] == str(user.id) and ok["amount_funded"] == 1000000
+
+
+@pytest.mark.asyncio
+async def test_a_share_link_cannot_set_our_cost_or_our_margin():
+    """DESK_ONLY_KEYS filters top-level keys, and `products` is one key — so
+    until this gate a rep or a forwarded link could rewrite `products.vsc.markup`
+    and the save returned 200. Our cost and margin are the desk's."""
+    package = SimpleNamespace(id=uuid.uuid4(), status="draft", version=3, arrangement={}, prefill_provenance={},
+                              stage=1, sent_by_user_id=None, execution_pending=False)
+    access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None),
+                                user=_user(Role.FIELD_REP), mode="rep", link=SimpleNamespace(id=uuid.uuid4()))
+
+    async def get(_model, _key, with_for_update=False):
+        return package
+
+    db = SimpleNamespace(get=get, flush=AsyncMock())
+    for field in ("base", "other", "markup", "comm", "retention"):
+        with pytest.raises(HTTPException) as err:
+            await pkgs.apply_changes(db, access, changes={"products": {"vsc": {field: 1}}}, version=3)
+        assert err.value.status_code == 422, field
+        assert err.value.detail["code"] == "maintained_by_desk"
+        assert err.value.detail["fields"] == [f"products.vsc.{field}"]
+    # What the rep gathers from the dealer still goes through.
+    with pytest.raises(HTTPException) as err:
+        await pkgs.apply_changes(db, access, changes={"products": {"vsc": {"cur_rate": 54, "rate": 60, "repay": 100}}}, version=999)
+    assert err.value.detail["code"] != "maintained_by_desk"  # it fails on the stale version, not the gate
