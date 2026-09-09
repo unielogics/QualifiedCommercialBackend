@@ -56,7 +56,31 @@ def test_broker_without_field_desk_entitlement_is_not_a_field_rep() -> None:
 def test_operator_access_combines_primary_role_and_additional_console() -> None:
     user = SimpleNamespace(role=Role.BROKER, account_access_types=["field_desk"])
 
-    assert _account_types(user) == ["field_desk", "funding"]
+    # Field Desk implies Audit for a broker: the dealer-OS backend serves
+    # both rep. and audit. with the same owner-scoped tier.
+    assert _account_types(user) == ["audit", "field_desk", "funding"]
+
+
+def test_a_field_rep_inherits_field_desk_and_audit() -> None:
+    assert _account_types(SimpleNamespace(role=Role.FIELD_REP, account_access_types=[])) == ["audit", "field_desk"]
+    assert _account_types(SimpleNamespace(role=Role.FIELD_REP, account_access_types=["funding"])) == ["audit", "field_desk", "funding"]
+
+
+def test_console_grants_are_ignored_for_client_roles() -> None:
+    user = SimpleNamespace(role=Role.DEALER, account_access_types=["funding", "field_desk"], deleted_at=None, account_status="active")
+
+    assert _account_types(user) == []
+    assert is_rep(user) is False
+
+
+def test_audit_alone_is_not_a_grant_for_a_broker_and_the_manager_is_not_rep_tier() -> None:
+    # An "audit" value stored on its own (old data) opens nothing and does
+    # not make the broker rep-tier; a regional manager's Field Desk is a
+    # sign-in only — the rep tier stays exactly as it was.
+    assert is_rep(SimpleNamespace(role=Role.BROKER, account_access_types=["audit"], deleted_at=None, account_status="active")) is False
+    assert _account_types(SimpleNamespace(role=Role.BROKER, account_access_types=["audit"])) == ["funding"]
+    assert is_rep(SimpleNamespace(role=Role.REGIONAL_MANAGER, account_access_types=["field_desk"], deleted_at=None, account_status="active")) is False
+    assert _account_types(SimpleNamespace(role=Role.REGIONAL_MANAGER, account_access_types=["field_desk"])) == ["field_desk", "funding"]
 
 
 def test_super_admin_inherits_all_operator_accounts() -> None:

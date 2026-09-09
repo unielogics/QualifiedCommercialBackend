@@ -31,6 +31,14 @@ def _user(role=Role.LOAN_EXEC, **over):
     return row
 
 
+def _request():
+    return SimpleNamespace(headers={}, client=None)
+
+
+def _actor():
+    return SimpleNamespace(id=uuid4(), role=Role.SUPER_ADMIN)
+
+
 def _db(rows=()):
     return SimpleNamespace(
         execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: list(rows)))),
@@ -166,12 +174,46 @@ def test_store_phone_is_one_rule_for_both_doors():
 @pytest.mark.asyncio
 async def test_auth_me_says_when_a_phone_is_still_needed():
     from app.routers.auth import me
+    from app.services import user_acknowledgment as ack
 
-    with patch("app.routers.auth.account_types", return_value=[]), patch("app.routers.auth.has_product_access", return_value=False):
-        out = await me(_user(Role.FIELD_REP, phone=None, id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None))
+    with patch("app.routers.auth.account_types", return_value=[]), patch("app.routers.auth.has_product_access", return_value=False), \
+         patch.object(ack, "latest_acceptance", AsyncMock(return_value=None)), \
+         patch("app.services.user_access.get_settings", return_value=SimpleNamespace(frontend_app_url="https://f", rep_app_url="https://r", audit_app_url="https://a")):
+        out = await me(_user(Role.FIELD_REP, phone=None, id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None, deleted_at=None), SimpleNamespace())
         assert out.needs_phone is True
-        out = await me(_user(Role.FIELD_REP, phone="+19735550148", id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None))
+        out = await me(_user(Role.FIELD_REP, phone="+19735550148", id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None, deleted_at=None), SimpleNamespace())
         assert out.needs_phone is False
+
+
+@pytest.mark.asyncio
+async def test_auth_me_lists_the_consoles_a_login_may_enter():
+    from app.routers.auth import me
+    from app.services import user_acknowledgment as ack
+
+    settings = SimpleNamespace(frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a")
+    with patch("app.routers.auth.account_types", return_value=[]), patch("app.routers.auth.has_product_access", return_value=False), \
+         patch.object(ack, "latest_acceptance", AsyncMock(return_value=None)), \
+         patch("app.services.user_access.get_settings", return_value=settings):
+        rep = _user(Role.FIELD_REP, id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None, deleted_at=None)
+        out = await me(rep, SimpleNamespace())
+        assert [c.key for c in out.consoles] == ["field_desk", "audit"] and out.consoles[0].url == "https://r"
+        rep.account_access_types = ["funding"]
+        assert [c.key for c in (await me(rep, SimpleNamespace())).consoles] == ["funding", "field_desk", "audit"]
+        assert (await me(rep, SimpleNamespace())).consoles[0].url == "https://f"
+        sa = _user(Role.SUPER_ADMIN, id=uuid4(), clerk_id=None, account_status="active", account_access_types=[], referral_partner_company_id=None, deleted_at=None)
+        assert [c.key for c in (await me(sa, SimpleNamespace())).consoles] == ["funding", "field_desk", "audit"]
+        sa.account_status = "suspended"
+        assert (await me(sa, SimpleNamespace())).consoles == []
+
+
+def test_the_invite_lands_on_the_console_the_role_works_in():
+    from app.routers import users as users_router
+
+    settings = SimpleNamespace(frontend_app_url="https://f", rep_app_url="https://r/", audit_app_url="https://a")
+    with patch.object(users_router, "get_settings", return_value=settings):
+        assert users_router._invite_landing(Role.FIELD_REP) == "https://r/sign-in"
+        assert users_router._invite_landing(Role.DEALER) == "https://a/sign-in"
+        assert users_router._invite_landing(Role.LOAN_EXEC) is None
 
 
 def test_the_user_reads_carry_the_phone():
@@ -203,7 +245,7 @@ async def test_an_invite_can_carry_a_phone_stored_in_e164():
     with patch.object(users_router.clerk_service, "invite_user", AsyncMock()), \
          patch.object(users_router, "house_company", AsyncMock(return_value=None)), \
          patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())):
-        out = await users_router.invite_user(users_router.UserInvite(email="rep@example.com", name="Rita Moss", role=Role.FIELD_REP, phone="(973) 555-0148"), db)
+        out = await users_router.invite_user(users_router.UserInvite(email="rep@example.com", name="Rita Moss", role=Role.FIELD_REP, phone="(973) 555-0148"), _request(), db, current=_actor())
     assert added[0].phone == "+19735550148" and out.phone == "+19735550148"
 
 
@@ -224,10 +266,10 @@ async def test_a_super_admin_can_fix_a_colleagues_phone():
 
     db = SimpleNamespace(get=get, execute=execute, flush=AsyncMock(), refresh=refresh)
     with patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())):
-        out = await users_router.update_user(colleague.id, users_router.UserPatch(phone="973 555 0148"), db)
+        out = await users_router.update_user(colleague.id, users_router.UserPatch(phone="973 555 0148"), _request(), db, current=_actor())
         assert colleague.phone == "+19735550148" and out.phone == "+19735550148"
         # A field that was not sent is left alone.
-        await users_router.update_user(colleague.id, users_router.UserPatch(name="Dana R"), db)
+        await users_router.update_user(colleague.id, users_router.UserPatch(name="Dana R"), _request(), db, current=_actor())
         assert colleague.phone == "+19735550148"
 
 

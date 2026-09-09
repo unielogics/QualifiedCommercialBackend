@@ -297,6 +297,14 @@ def test_sponsor_fields_are_the_desks_to_clear():
 # --- linking any role ---------------------------------------------------------------
 
 
+def _request():
+    return SimpleNamespace(headers={}, client=None)
+
+
+def _actor():
+    return SimpleNamespace(id=uuid4(), role=Role.SUPER_ADMIN)
+
+
 def _router_db(rows, *, existing_user=None):
     """Enough of a session for invite_user / update_user."""
     table = {r.id: r for r in rows}
@@ -329,17 +337,17 @@ async def test_any_role_may_be_linked_and_the_house_is_the_default_for_staff():
          patch.object(users_router, "house_company", AsyncMock(return_value=house)), \
          patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())):
         # A field rep linked to a company that has not signed yet: linking precedes the signature.
-        out = await users_router.invite_user(users_router.UserInvite(email="rep@example.com", name="Rita Moss", role=Role.FIELD_REP, referral_partner_company_id=unsigned.id), db)
+        out = await users_router.invite_user(users_router.UserInvite(email="rep@example.com", name="Rita Moss", role=Role.FIELD_REP, referral_partner_company_id=unsigned.id), _request(), db, current=_actor())
         assert out.referral_partner_company_id == unsigned.id and out.company_agreement_signed is False and out.company_kind == KIND_REFERRAL_PARTNER
         # An underwriter invited with nothing is linked to the house.
-        out = await users_router.invite_user(users_router.UserInvite(email="uw@example.com", name="Cleo Desk", role=Role.LOAN_EXEC), db)
+        out = await users_router.invite_user(users_router.UserInvite(email="uw@example.com", name="Cleo Desk", role=Role.LOAN_EXEC), _request(), db, current=_actor())
         assert out.referral_partner_company_id == house.id and out.company_kind == KIND_HOUSE
         # A dealer partner still needs a company, and it can never be the house.
         with pytest.raises(HTTPException) as err:
-            await users_router.invite_user(users_router.UserInvite(email="dp@example.com", name="Andy Gale", role=Role.DEALER_PARTNER), db)
+            await users_router.invite_user(users_router.UserInvite(email="dp@example.com", name="Andy Gale", role=Role.DEALER_PARTNER), _request(), db, current=_actor())
         assert err.value.status_code == 400
         with pytest.raises(HTTPException) as err:
-            await users_router.invite_user(users_router.UserInvite(email="dp2@example.com", name="Andy Gale", role=Role.DEALER_PARTNER, referral_partner_company_id=house.id), db)
+            await users_router.invite_user(users_router.UserInvite(email="dp2@example.com", name="Andy Gale", role=Role.DEALER_PARTNER, referral_partner_company_id=house.id), _request(), db, current=_actor())
         assert err.value.status_code == 400 and "house" in err.value.detail
 
 
@@ -353,11 +361,11 @@ async def test_an_operators_link_cannot_be_cleared_and_a_house_linked_promotion_
     with patch.object(users_router, "_signed_company_ids", AsyncMock(return_value=set())), \
          patch.object(users_router, "house_company", AsyncMock(return_value=house)):
         with pytest.raises(HTTPException) as err:
-            await users_router.update_user(staffer.id, users_router.UserPatch(referral_partner_company_id=None), db)
+            await users_router.update_user(staffer.id, users_router.UserPatch(referral_partner_company_id=None), _request(), db, current=_actor())
         assert err.value.status_code == 400 and "linked" in err.value.detail
         # Promoting a house-linked staffer to dealer partner without a company would lock them out for good.
         with pytest.raises(HTTPException) as err:
-            await users_router.update_user(staffer.id, users_router.UserPatch(role=Role.DEALER_PARTNER), db)
+            await users_router.update_user(staffer.id, users_router.UserPatch(role=Role.DEALER_PARTNER), _request(), db, current=_actor())
         assert err.value.status_code == 400
         assert staffer.role == Role.LOAN_EXEC and staffer.referral_partner_company_id == house.id
 

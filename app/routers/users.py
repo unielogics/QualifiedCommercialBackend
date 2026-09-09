@@ -7,11 +7,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser, require_role
 from app.enums import ContractSubjectType, ContractType, Role
@@ -23,10 +24,20 @@ from app.models.referral_partner_company import (
 )
 from app.models.user import User
 from app.services import clerk as clerk_service
+from app.services import user_acknowledgment as ack
 
 # OPERATOR_ROLES has one definition already; a second copy here is how
 # permission sets drift apart.
 from app.services.production_packages import OPERATOR_ROLES, house_company
+from app.services.user_access import (
+    CONSOLE_KEYS,
+    allowed_console_keys,
+    console_keys,
+    console_state,
+    inherited_console_keys,
+    record_access_event,
+    request_metadata,
+)
 from app.services.user_phone import store_phone
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -36,18 +47,56 @@ router = APIRouter(prefix="/users", tags=["users"])
 # are linked to the house row, and their link can be changed but never cleared.
 HOUSE_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP})
 
-_ACCOUNT_ACCESS_TYPES = {"funding", "field_desk", "audit"}
-
 
 def _account_types(user: User) -> list[str]:
-    values = set(user.account_access_types or [])
-    if user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
-        values.update(_ACCOUNT_ACCESS_TYPES)
-    elif user.role in {Role.BROKER, Role.REGIONAL_MANAGER}:
-        values.add("funding")
-    elif user.role == Role.FIELD_REP:
-        values.add("field_desk")
-    return sorted(values)
+    """The consoles this person may open. Kept under its old name — the
+    rule itself lives in services/user_access.console_keys."""
+    return console_keys(user)
+
+
+def _check_console_grants(role: Role, requested: set[str]) -> None:
+    """A stored grant list may hold what the role inherits (the Team table
+    echoes those back) plus the standalone grants the role allows; nothing
+    else, and nothing at all for roles that do not live in the consoles."""
+    if not requested.issubset(CONSOLE_KEYS):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown account access type")
+    if not requested.issubset(allowed_console_keys(role)):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Console access is not available for this role.",
+        )
+
+
+def _request_ip(request: Request | None) -> str | None:
+    if request is None:
+        return None
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    return forwarded or (request.client.host if request.client else None)
+
+
+async def _tell_clerk_and_record(
+    db: AsyncSession, *, user: User, actor: User, request: Request | None, action: str, before: dict | None,
+) -> None:
+    """PATCH /users changed a role but never told Clerk, so the edge claim
+    QCDashboard's middleware reads kept the invite-time role. Best-effort
+    sync (a no-op without a secret; skipped until the row is bound to a
+    Clerk id — an invite carries the same metadata on the invitation) and
+    one row in the access-event trail whenever the console state changed."""
+    after = console_state(user)
+    if before == after:
+        return
+    if user.clerk_id:
+        await clerk_service.update_user_access_metadata(
+            user.clerk_id, role=user.role, account_types=console_keys(user), account_status=after["account_status"],
+        )
+    record_access_event(
+        db, user_id=user.id, actor_user_id=actor.id, action=action, reason=None,
+        before_state=before, after_state=after,
+        metadata=request_metadata(
+            ip_address=_request_ip(request),
+            user_agent=request.headers.get("user-agent") if request is not None else None,
+        ),
+    )
 
 
 class UserRead(BaseModel):
@@ -68,7 +117,20 @@ class UserRead(BaseModel):
     # The mobile on file. Collected at invite or at first login; printed as the
     # relationship manager's phone on production agreements.
     phone: str | None = None
+    # The consoles this person may open, and the ones the role brings by
+    # itself (those render as on and disabled in the Team table).
     account_types: list[str] = Field(default_factory=list)
+    inherited_account_types: list[str] = Field(default_factory=list)
+    # The person's own click-through acknowledgment of the platform documents
+    # (current | out_of_date | missing | not_asked), never the company's
+    # agreement; and, for a dealer partner, their own e-signed Platform Access
+    # Agreement (the certificate is GET /contracts/platform_access/certificate
+    # ?subject_id=). Populated by the list; the single-row reads after an
+    # invite or a patch leave them at None and the page re-lists.
+    acknowledgment_status: str | None = None
+    acknowledged_at: datetime | None = None
+    platform_access_signed_at: datetime | None = None
+    platform_access_contract_number: str | None = None
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
@@ -157,9 +219,34 @@ async def _signed_company_ids(db: AsyncSession, company_ids: set[UUID]) -> set[U
     )
 
 
+async def _platform_access_by_user(db: AsyncSession, user_ids: set[UUID]) -> dict[UUID, ContractAgreement]:
+    """The newest SIGNED Platform Access Agreement per person, one query.
+    signed_at IS NOT NULL is what lifts the PlatformAccessGate (contracts.py
+    contract_status), so this column can never say Signed for a partner the
+    gate still blocks. _signed_company_ids keeps its row-existence test —
+    every _sign() stamps signed_at, so the two agree on real rows."""
+    if not user_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(ContractAgreement)
+            .distinct(ContractAgreement.subject_id)
+            .where(
+                ContractAgreement.contract_type == ContractType.PLATFORM_ACCESS,
+                ContractAgreement.subject_type == ContractSubjectType.USER,
+                ContractAgreement.subject_id.in_(user_ids),
+                ContractAgreement.signed_at.is_not(None),
+            )
+            .order_by(ContractAgreement.subject_id, ContractAgreement.created_at.desc())
+        )
+    ).scalars().all()
+    return {row.subject_id: row for row in rows}
+
+
 async def _with_company(db: AsyncSession, user: User, result: UserRead) -> UserRead:
     """The linked profile on a user read: name, kind, and whether it really signed."""
     result.account_types = _account_types(user)
+    result.inherited_account_types = sorted(inherited_console_keys(user.role))
     if user.referral_partner_company_id is not None:
         company = await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
         result.referral_partner_company_name = company.name if company else None
@@ -305,37 +392,52 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
             ).scalars().all()
         )
 
+    acceptances = await ack.latest_acceptances(db, {r.id for r in rows})
+    platform_access = await _platform_access_by_user(db, {r.id for r in rows if r.role == Role.DEALER_PARTNER})
+
     results = []
     for r in rows:
         user_read = UserRead.model_validate(r)
         user_read.account_types = _account_types(r)
+        user_read.inherited_account_types = sorted(inherited_console_keys(r.role))
         if r.referral_partner_company_id is not None:
             company = companies.get(r.referral_partner_company_id)
             user_read.referral_partner_company_name = company.name if company else None
             user_read.company_kind = getattr(company, "kind", None) if company else None
             user_read.company_agreement_signed = r.referral_partner_company_id in signed_company_ids
+        latest = acceptances.get(r.id)
+        user_read.acknowledgment_status = ack.acknowledgment_status(r, latest)
+        user_read.acknowledged_at = latest.created_at if latest is not None else None
+        paa = platform_access.get(r.id)
+        if paa is not None:
+            user_read.platform_access_signed_at = paa.signed_at
+            user_read.platform_access_contract_number = paa.contract_number
         results.append(user_read)
     return results
 
 
-# Which product each role signs in to. Roles absent from this map fall back to
-# Clerk's default (the desktop sign-up page), which is correct for the
-# operator-console roles.
-_INVITE_LANDING: dict[Role, str] = {
-    Role.FIELD_REP: "https://rep.qualifiedcommercial.com/sign-in",
-    Role.DEALER: "https://audit.qualifiedcommercial.com/sign-in",
-}
+def _invite_landing(role: Role) -> str | None:
+    """Which console the invite lands on. Roles absent here fall back to
+    Clerk's default (the desktop sign-up page), which is correct for the
+    operator-console roles. Hosts come from Settings, like the switcher's."""
+    settings = get_settings()
+    if role == Role.FIELD_REP:
+        return f"{settings.rep_app_url.rstrip('/')}/sign-in"
+    if role == Role.DEALER:
+        return f"{settings.audit_app_url.rstrip('/')}/sign-in"
+    return None
 
 
 @router.post(
     "",
     response_model=UserRead,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
 )
 async def invite_user(
     body: UserInvite,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
 ) -> UserRead:
     """Invite a new operator-team member.
 
@@ -356,8 +458,7 @@ async def invite_user(
         )
     company_name = (body.company_name or "").strip()
     requested_access = set(body.account_types or [])
-    if not requested_access.issubset(_ACCOUNT_ACCESS_TYPES):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown account access type")
+    _check_console_grants(body.role, requested_access)
     if body.role == Role.DEALER_PARTNER and not company_name and body.referral_partner_company_id is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -416,8 +517,11 @@ async def invite_user(
         email=body.email,
         name=body.name,
         role=body.role,
-        redirect_url=_INVITE_LANDING.get(body.role),
+        redirect_url=_invite_landing(body.role),
+        account_types=console_keys(user),
+        account_status=getattr(user, "account_status", None) or "active",
     )
+    await _tell_clerk_and_record(db, user=user, actor=current, request=request, action="team_access.invited", before=None)
 
     return await _with_company(db, user, UserRead.model_validate(user))
 
@@ -425,12 +529,13 @@ async def invite_user(
 @router.patch(
     "/{user_id}",
     response_model=UserRead,
-    dependencies=[Depends(require_role(Role.SUPER_ADMIN))],
 )
 async def update_user(
     user_id: UUID,
     body: UserPatch,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
 ) -> UserRead:
     user = (
         await db.execute(
@@ -440,6 +545,7 @@ async def update_user(
     ).scalar_one_or_none()
     if user is None or user.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    before = console_state(user)
     if body.role is not None:
         if body.role == Role.CLIENT:
             raise HTTPException(
@@ -494,11 +600,11 @@ async def update_user(
         user.referral_partner_company_id = body.referral_partner_company_id
     if body.account_types is not None:
         requested_access = set(body.account_types)
-        if not requested_access.issubset(_ACCOUNT_ACCESS_TYPES):
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown account access type")
+        _check_console_grants(body.role or user.role, requested_access)
         user.account_access_types = sorted(requested_access)
     await db.flush()
     await db.refresh(user)
+    await _tell_clerk_and_record(db, user=user, actor=current, request=request, action="team_access.updated", before=before)
     return await _with_company(db, user, UserRead.model_validate(user))
 
 

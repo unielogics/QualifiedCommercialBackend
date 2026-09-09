@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -19,9 +19,14 @@ from app.routers.client_access import ClientAccessDirectoryRow, _matches_filters
 from app.routers.dealer_ai_intake import McaRefiStart, _public_intake_attribution
 from app.scoping import scope_client_query, scope_loan_query
 from app.services import clerk as clerk_service
+from app.services import user_access
 from app.services.user_access import (
     account_types,
+    allowed_console_keys,
+    console_links,
     enabled_product_values,
+    enterable_console_keys,
+    has_product_access,
     is_audit_client,
     is_funding_client,
     synchronize_external_compatibility_role,
@@ -276,3 +281,71 @@ def test_mca_public_intake_preserves_normalized_signup_attribution() -> None:
         "campaign": "summer-recovery",
         "cta": "start_mca_refinance",
     }
+
+
+# --- consoles: which sign-ins a login may use ----------------------------------------
+
+
+def _staff(role: Role, grants=(), *, account_status="active"):
+    # No product_accesses attribute: the staff path, not the entitlement path.
+    return SimpleNamespace(id=uuid4(), role=role, account_status=account_status, deleted_at=None, account_access_types=list(grants))
+
+
+@pytest.mark.asyncio
+async def test_a_field_rep_granted_funding_may_enter_the_funding_console() -> None:
+    granted = _staff(Role.FIELD_REP, ["funding"])
+    assert has_product_access(granted, ProductAccountType.FUNDING) is True
+    assert has_product_access(granted, ProductAccountType.AUDIT) is True
+    assert await require_funding_access(granted) is granted
+    bare = _staff(Role.FIELD_REP)
+    assert has_product_access(bare, ProductAccountType.FUNDING) is False
+    with pytest.raises(HTTPException) as exc:
+        await require_funding_access(bare)
+    assert exc.value.status_code == 403
+
+
+def test_a_grant_never_widens_a_broker_into_the_audit_product() -> None:
+    # Default closed: the only tier a grant changes is the one it always changed.
+    assert has_product_access(_staff(Role.BROKER, ["audit"]), ProductAccountType.AUDIT) is False
+    assert has_product_access(_staff(Role.BROKER, ["field_desk"]), ProductAccountType.AUDIT) is False
+    assert has_product_access(_staff(Role.REGIONAL_MANAGER, ["field_desk"]), ProductAccountType.AUDIT) is False
+
+
+def test_suspended_staff_may_enter_nothing() -> None:
+    assert enabled_product_values(_staff(Role.FIELD_REP, ["funding"], account_status="suspended")) == set()
+    assert enterable_console_keys(_staff(Role.SUPER_ADMIN, account_status="suspended")) == set()
+
+
+def test_external_rows_ignore_console_grants() -> None:
+    user = _external_user(role=Role.DEALER, products=("audit",))
+    user.account_access_types = ["funding", "field_desk"]
+    assert enabled_product_values(user) == {"audit"}
+    # For clients and dealers the consoles are exactly their product entitlements.
+    assert enterable_console_keys(user) == {"audit"}
+    assert enterable_console_keys(_external_user(role=Role.CLIENT, products=("funding", "audit"))) == {"funding", "audit"}
+    # Everyone else lives on the funding app.
+    assert enterable_console_keys(SimpleNamespace(role=Role.DEALER_PARTNER, deleted_at=None, account_status="active")) == {"funding"}
+
+
+def test_what_a_role_may_be_granted() -> None:
+    assert allowed_console_keys(Role.SUPER_ADMIN) == {"funding", "field_desk", "audit"}
+    assert allowed_console_keys(Role.BROKER) == {"funding", "field_desk"}
+    assert allowed_console_keys(Role.REGIONAL_MANAGER) == {"funding", "field_desk"}
+    assert allowed_console_keys(Role.FIELD_REP) == {"field_desk", "audit", "funding"}
+    assert allowed_console_keys(Role.DEALER_PARTNER) == set() and allowed_console_keys(Role.CLIENT) == set()
+
+
+def test_console_links_follow_settings_and_grants() -> None:
+    settings = SimpleNamespace(frontend_app_url="https://f/", rep_app_url="https://r", audit_app_url="https://a/")
+    with patch.object(user_access, "get_settings", return_value=settings):
+        assert console_links(_staff(Role.SUPER_ADMIN)) == [
+            {"key": "funding", "label": "Funding", "url": "https://f"},
+            {"key": "field_desk", "label": "Field Desk", "url": "https://r"},
+            {"key": "audit", "label": "Audit", "url": "https://a"},
+        ]
+        assert [c["key"] for c in console_links(_staff(Role.FIELD_REP))] == ["field_desk", "audit"]
+        assert [c["key"] for c in console_links(_staff(Role.FIELD_REP, ["funding"]))] == ["funding", "field_desk", "audit"]
+        assert [c["key"] for c in console_links(_staff(Role.BROKER, ["field_desk"]))] == ["funding", "field_desk", "audit"]
+        assert [c["key"] for c in console_links(_staff(Role.BROKER))] == ["funding"]
+        assert console_links(_staff(Role.FIELD_REP, account_status="suspended")) == []
+        assert [c["key"] for c in console_links(_external_user(role=Role.CLIENT, products=("funding", "audit")))] == ["funding", "audit"]

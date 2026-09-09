@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import ProductAccountType, Role
-from app.routers.users import _account_types
 from app.schemas.common import ORMModel
-from app.services.user_access import account_types, has_product_access
+from app.services import user_acknowledgment as ack
+from app.services.user_access import account_types, console_keys, console_links, has_product_access
 from app.services.user_phone import needs_phone
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -29,6 +29,12 @@ class SignupAttribution(BaseModel):
     vertical: str | None = Field(default=None, max_length=64)
     campaign: str | None = Field(default=None, max_length=120)
     cta: str | None = Field(default=None, max_length=120)
+
+
+class ConsoleLink(BaseModel):
+    key: str
+    label: str
+    url: str
 
 
 class MeResponse(ORMModel):
@@ -52,16 +58,27 @@ class MeResponse(ORMModel):
     # The one-time gate both apps show a rep, an underwriter or a super admin
     # with no mobile on file. Computed here so the two apps cannot disagree.
     needs_phone: bool = False
+    # The platform-document acknowledgment every console shows a team login
+    # once, and once more after a version bump. Computed here so the three
+    # apps cannot disagree.
+    needs_acknowledgment: bool = False
     can_access_funding: bool
     can_access_audit: bool
+    # The consoles this login may sign in to — Funding, Field Desk, Audit —
+    # with their URLs. The frontends render the switcher from it and show an
+    # entry notice when their own key is absent. For operator roles it is
+    # advisory (which sign-ins to offer); the server-enforced boundaries stay
+    # the dealer-OS rep/team guards and the external product boundary.
+    consoles: list[ConsoleLink] = Field(default_factory=list)
 
 
 @router.get("/me", response_model=MeResponse)
-async def me(user: CurrentUser) -> MeResponse:
+async def me(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> MeResponse:
     products = account_types(user)
     effective_account_types = sorted(
-        {*_account_types(user), *(product.value for product in products)}
+        {*console_keys(user), *(product.value for product in products)}
     )
+    latest = await ack.latest_acceptance(db, user.id)
     return MeResponse(
         id=str(user.id),
         clerk_id=user.clerk_id,
@@ -74,8 +91,10 @@ async def me(user: CurrentUser) -> MeResponse:
         phone=user.phone,
         title=user.title,
         needs_phone=needs_phone(user),
+        needs_acknowledgment=ack.needs_acknowledgment(user, latest),
         can_access_funding=has_product_access(user, ProductAccountType.FUNDING),
         can_access_audit=has_product_access(user, ProductAccountType.AUDIT),
+        consoles=[ConsoleLink(**c) for c in console_links(user)],
     )
 
 

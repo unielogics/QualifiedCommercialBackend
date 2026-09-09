@@ -7,7 +7,14 @@ Two endpoints:
   - GET  /legal/acceptance — return the user's most recent acceptance
                            (used by the UI to know whether to re-prompt
                            when the Effective Date is bumped).
+  - GET  /legal/acknowledgment — what the first-login acknowledgment screen
+                           shows a team login: the versions in force, the
+                           documents, the latest row, and the linked
+                           company's signed agreement. /auth/me carries the
+                           flag that decides whether the screen renders.
 """
+
+# ruff: noqa: B008
 
 from __future__ import annotations
 
@@ -19,10 +26,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.models.legal_acceptance import LegalAcceptance
 from app.schemas.common import ORMModel
+from app.services import user_acknowledgment as ack
 
 router = APIRouter(prefix="/legal", tags=["legal"])
 
@@ -85,6 +94,48 @@ async def accept(
     await db.flush()
     await db.refresh(row)
     return AcceptanceRead.model_validate(row)
+
+
+class DocumentRead(BaseModel):
+    key: str
+    title: str
+    version: str
+    url: str
+
+
+class CompanyAgreementRead(BaseModel):
+    company_name: str
+    title: str
+    contract_number: str
+    signed_at: datetime | None
+
+
+class AcknowledgmentRead(BaseModel):
+    status: str
+    current: dict[str, str]
+    documents: list[DocumentRead]
+    latest: AcceptanceRead | None
+    company_agreement: CompanyAgreementRead | None
+
+
+@router.get("/acknowledgment", response_model=AcknowledgmentRead)
+async def acknowledgment(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> AcknowledgmentRead:
+    """What the acknowledgment screen shows the current user. The apps POST
+    back exactly the `current` versions handed to them, so they never compare
+    versions themselves."""
+    latest = await ack.latest_acceptance(db, user.id)
+    docs = ack.documents(get_settings().frontend_app_url)
+    company = await ack.company_agreement_on_file(db, user)
+    return AcknowledgmentRead(
+        status=ack.acknowledgment_status(user, latest),
+        current=ack.current_versions(),
+        documents=[DocumentRead(**d) for d in docs],
+        latest=AcceptanceRead.model_validate(latest) if latest else None,
+        company_agreement=CompanyAgreementRead(
+            company_name=company.company_name, title=company.title,
+            contract_number=company.contract_number, signed_at=company.signed_at,
+        ) if company else None,
+    )
 
 
 @router.get("/acceptance", response_model=AcceptanceRead | None)

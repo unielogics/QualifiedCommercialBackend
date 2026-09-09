@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import Role
 from app.models.user import User
-from app.services.user_access import is_audit_client
+from app.services.user_access import has_rep_tier_grant, is_audit_client
 
 from .models import DealerBusiness
 
@@ -87,10 +87,9 @@ def require_field_rep(user: User) -> None:
 
 
 def is_rep(user: User) -> bool:
-    return user.role == Role.FIELD_REP or (
-        user.role == Role.BROKER
-        and "field_desk" in (getattr(user, "account_access_types", None) or [])
-    )
+    # A field rep, or a broker granted the Field Desk console — the same truth
+    # table it always had; the grant rule lives with the other console rules.
+    return user.role == Role.FIELD_REP or has_rep_tier_grant(user)
 
 
 async def load_dealer(db: AsyncSession, dealer_id: UUID) -> DealerBusiness:

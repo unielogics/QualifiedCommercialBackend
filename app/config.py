@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     )
     frontend_app_url: str = "https://app.qualifiedcommercial.com"
     rep_app_url: str = "https://rep.qualifiedcommercial.com"
+    audit_app_url: str = "https://audit.qualifiedcommercial.com"
     public_api_url: str = "https://api.qualifiedcommercial.com"
 
     # Clerk (auth)
