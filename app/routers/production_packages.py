@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -22,6 +22,9 @@ from app.schemas.production_package import (
     ProductionComputeRead,
     ProductionComputeRequest,
     ProductionHistoryRead,
+    ProductionLinkResolved,
+    ProductionLinkUnlockBody,
+    ProductionLinkUnlocked,
     ProductionPackagePatch,
     ProductionPackageRead,
     ProductionPackageResolve,
@@ -196,6 +199,14 @@ async def rep_share_prefill(
     return out
 
 
+@router.get("/shares/{token}/resolve", response_model=ProductionLinkResolved)
+async def share_resolve(token: str, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionLinkResolved:
+    """A signed-in person opened a forwarded link: where do they belong?"""
+    out = await svc.resolve_share_for_user(db, user, token)
+    await db.commit()
+    return ProductionLinkResolved(**out)
+
+
 # ---- operator surface ----
 
 def _compute(arrangement: dict[str, Any], stage: int = 1) -> ProductionComputeRead:
@@ -248,6 +259,17 @@ async def create_share_link(
     package_id: UUID, payload: ProductionShareLinkCreate, user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> ProductionShareLinkCreated:
     access = await svc.load_operator_access(db, package_id, user)
+    if payload.kind == "public":
+        link, token, pin = await svc.mint_public_link(
+            db, access, label=payload.label, recipient_name=payload.recipient_name,
+            recipient_email=payload.recipient_email, expires_in_days=payload.expires_in_days,
+        )
+        await db.commit()
+        read = await svc.serialize(db, access)
+        row = next(item for item in read.share_links if item.id == link.id)
+        return ProductionShareLinkCreated(link=row, url=svc.share_link_url(token, "public"), expires_at=link.expires_at, pin=pin)
+    if payload.rep_user_id is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a field representative")
     link, token = await svc.mint_share_link(
         db, access, rep_user_id=payload.rep_user_id, label=payload.label,
         expires_in_days=payload.expires_in_days, outside_book=payload.outside_book,
@@ -469,6 +491,75 @@ async def revision_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No document for that phase yet")
     return {"url": presign_private_s3_object(key, ttl_seconds=900, download_filename=f"{revision.document_title}.pdf"),
             "sha256": sha, "phase": phase}
+
+
+# ---------------------------------------------------------------------------
+# the forwarded link: no account, a PIN, then a signed session
+# ---------------------------------------------------------------------------
+# Its own router, included before the package router: a non-UUID segment under
+# /production-packages/{package_id} is a 422, not a fall-through.
+
+link_router = APIRouter(prefix="/production-packages/link", tags=["production-packages-link"])
+_LINK_SESSION_HEADER = "X-Link-Session"
+
+
+def _link_ip(request: Request) -> str | None:
+    from app.request_context import client_ip
+
+    return client_ip(request)
+
+
+@link_router.get("/{token}", response_model=ProductionPackageRead)
+async def link_read(
+    token: str, request: Request, session: str | None = Header(default=None, alias=_LINK_SESSION_HEADER),
+    db: AsyncSession = Depends(get_db),
+) -> ProductionPackageRead:
+    access, _s, _e = await svc.resolve_public_share(db, token, session=session, client_ip=_link_ip(request))
+    await db.commit()
+    return await svc.serialize(db, access)
+
+
+@link_router.post("/{token}/unlock", response_model=ProductionLinkUnlocked)
+async def link_unlock(
+    token: str, payload: ProductionLinkUnlockBody, request: Request, db: AsyncSession = Depends(get_db),
+) -> ProductionLinkUnlocked:
+    access, session, expires = await svc.resolve_public_share(db, token, pin=payload.pin, client_ip=_link_ip(request))
+    await db.commit()
+    return ProductionLinkUnlocked(session=session or "", expires_at=expires, package=await svc.serialize(db, access))
+
+
+@link_router.patch("/{token}", response_model=ProductionPackageRead)
+async def link_patch(
+    token: str, payload: ProductionPackagePatch, request: Request,
+    session: str | None = Header(default=None, alias=_LINK_SESSION_HEADER), db: AsyncSession = Depends(get_db),
+) -> ProductionPackageRead:
+    access, _s, _e = await svc.resolve_public_share(db, token, session=session, client_ip=_link_ip(request))
+    await svc.apply_changes(
+        db, access, changes=payload.changes, version=payload.version, confirm=payload.confirm, request=request
+    )
+    await db.commit()
+    return await svc.serialize(db, access)
+
+
+@link_router.post("/{token}/compute", response_model=ProductionComputeRead)
+async def link_compute(
+    token: str, payload: ProductionComputeRequest, request: Request,
+    session: str | None = Header(default=None, alias=_LINK_SESSION_HEADER), db: AsyncSession = Depends(get_db),
+) -> ProductionComputeRead:
+    await svc.resolve_public_share(db, token, session=session, client_ip=_link_ip(request))
+    await db.commit()
+    return _compute(payload.arrangement, 1)
+
+
+@link_router.post("/{token}/presentation", response_model=ProductionPackageRead)
+async def link_generate_presentation(
+    token: str, request: Request, session: str | None = Header(default=None, alias=_LINK_SESSION_HEADER),
+    db: AsyncSession = Depends(get_db),
+) -> ProductionPackageRead:
+    access, _s, _e = await svc.resolve_public_share(db, token, session=session, client_ip=_link_ip(request))
+    await signing.generate_presentation(db, access)
+    await db.commit()
+    return await svc.serialize(db, access)
 
 
 # ---------------------------------------------------------------------------

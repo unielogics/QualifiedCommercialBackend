@@ -76,6 +76,24 @@ def bind(*, request_id: str = "", actor_user_id=None, actor_label: str = "system
         _ctx.reset(token)
 
 
+def client_ip(request) -> str | None:
+    """The caller's address, for a lockout key. X-Forwarded-For is read from
+    its *last* entry, not its first: Caddy appends the address it saw, and
+    everything before that is whatever the client chose to send. The API
+    listens only on loopback behind Caddy, so the last entry is Caddy's."""
+    if request is None:
+        return None
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        last = forwarded_for.rsplit(",", 1)[-1].strip()[:80]
+        if last:
+            return last
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()[:80] or None
+    return request.client.host[:80] if getattr(request, "client", None) else None
+
+
 def set_actor(user_id, *, actor_label: str = "user") -> None:
     """Name the actor on the context already bound.
 

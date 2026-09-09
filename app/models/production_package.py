@@ -334,9 +334,11 @@ class ProductionTermSheet(TimestampMixin, Base):
 
 
 class ProductionPackageShareLink(TimestampMixin, Base):
-    """A package-scoped grant to one signed-in field rep. The raw token is
-    returned once at mint and never stored; the link is useless without the
-    named rep's own session."""
+    """A package-scoped grant. `kind = "rep"` is a link for one signed-in
+    field rep — useless without that rep's own session. `kind = "public"` is
+    a forwarded link for someone with no account, opened with a six-digit
+    PIN the sharer communicates separately. Either way the raw token is
+    returned once at mint and never stored."""
 
     __tablename__ = "production_package_share_links"
     __table_args__ = (
@@ -346,7 +348,7 @@ class ProductionPackageShareLink(TimestampMixin, Base):
             "package_id",
             "rep_user_id",
             unique=True,
-            postgresql_where=text("revoked_at IS NULL"),
+            postgresql_where=text("revoked_at IS NULL AND kind = 'rep'"),
         ),
     )
 
@@ -355,9 +357,19 @@ class ProductionPackageShareLink(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("production_packages.id", ondelete="CASCADE"), nullable=False
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    rep_user_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="rep", server_default="rep")  # rep | public
+    rep_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
+    # Who a forwarded link was made for — attribution only, never access.
+    recipient_name: Mapped[str | None] = mapped_column(String(120))
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    # The PIN on a forwarded link, hashed like the client room's. Wrong
+    # attempts are counted here, not in memory: one worker forgets on restart.
+    pin_hash: Mapped[str | None] = mapped_column(String(160))
+    pin_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pin_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    pin_locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     label: Mapped[str | None] = mapped_column(String(120))
     # The rep was granted a file outside their own book; the operator confirmed it.
     outside_book: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")

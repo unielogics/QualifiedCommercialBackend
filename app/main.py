@@ -213,6 +213,7 @@ for r in [
     ai_preview.router,
     analysis.router,
     application_profiles.router,
+    production_packages.link_router,  # before the package router: /link/{token} is not a package id
     production_packages.router,
     production_packages.public_router,
     analysis.property_router,

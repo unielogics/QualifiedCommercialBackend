@@ -247,15 +247,12 @@ def _is_active(status_value: str, expires_at: datetime | None) -> bool:
 
 
 def _client_ip(request: Request | None) -> str | None:
-    if request is None:
-        return None
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()[:80] or None
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()[:80] or None
-    return request.client.host[:80] if request.client else None
+    # The first X-Forwarded-For entry is the client's to write, which made the
+    # per-address PIN lockout the attacker's to reset. request_context reads
+    # the last entry — the one Caddy appended.
+    from app.request_context import client_ip
+
+    return client_ip(request)
 
 
 def _user_agent(request: Request | None) -> str | None:

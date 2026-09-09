@@ -7,7 +7,11 @@ everything that decides who may touch it.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
+import hmac
+import json
 import secrets
 from collections import defaultdict
 from dataclasses import dataclass
@@ -65,7 +69,11 @@ SHARE_LINK_MAX_DAYS = 30
 SHARE_LINK_DEFAULT_DAYS = 14
 _MISS_LIMIT = 10
 _MISS_WINDOW = timedelta(minutes=15)
-_MISSES: dict[UUID, list[datetime]] = defaultdict(list)
+_MISSES: dict[Any, list[datetime]] = defaultdict(list)
+# A forwarded link's PIN: five misses lock the row for a while, on the row.
+_PIN_MAX_ATTEMPTS = 5
+_PIN_LOCKOUT = timedelta(minutes=15)
+_LINK_SESSION_TTL = timedelta(hours=12)
 
 Mode = Literal["operator", "rep", "partner"]
 Via = Literal["operator", "share_link", "ownership"]
@@ -95,7 +103,7 @@ def not_found() -> HTTPException:
 class PackageAccess:
     package: ProductionPackage
     profile: ApplicationProfile
-    user: User
+    user: User | None  # None on a forwarded link: the PIN, not a person, opened it
     mode: Mode
     link: ProductionPackageShareLink | None = None
     dealer: DealerBusiness | None = None
@@ -115,8 +123,21 @@ class PackageAccess:
         return (self.mode == "rep" and self.link is not None) or self.mode == "partner"
 
     @property
-    def role(self) -> Role:
-        return self.user.role
+    def anonymous(self) -> bool:
+        """A forwarded link with no session behind it."""
+        return self.user is None
+
+    @property
+    def actor_user_id(self) -> UUID | None:
+        """Who a write is attributed to: the person, or for a forwarded link
+        the person who shared it."""
+        if self.user is not None:
+            return self.user.id
+        return self.link.created_by_user_id if self.link is not None else None
+
+    @property
+    def role(self) -> Role | None:
+        return self.user.role if self.user is not None else None
 
     @property
     def stage(self) -> int:
@@ -134,12 +155,13 @@ class PackageAccess:
         desk = op and role in SEND_ROLES
         rec = op and role in RECORD_ROLES
         agent_s1 = self.is_agent and stage == 1
-        sent_by_me = getattr(pkg, "sent_by_user_id", None) == self.user.id
+        sent_by_me = self.user is not None and getattr(pkg, "sent_by_user_id", None) == self.user.id
         return ProductionCapabilities(
             can_edit=self.editable and (op or agent_s1),
             can_confirm=self.editable and (op or agent_s1),
             can_generate=stage == 1 and pkg.status in ("draft", "out_for_signature", "executed") and (op or self.is_agent),
-            can_send=self.editable and (desk or agent_s1),
+            # A forwarded URL must never put a document in front of a dealer.
+            can_send=self.editable and (desk or (agent_s1 and not self.anonymous)),
             can_remind=pkg.status == "out_for_signature" and (desk or (agent_s1 and sent_by_me)),
             can_reopen=desk and pkg.status == "out_for_signature",
             can_void=rec and pkg.status in ("draft", "out_for_signature"),
@@ -277,18 +299,143 @@ async def load_package_access(db: AsyncSession, package_id: UUID, user: User) ->
 load_operator_access = load_package_access
 
 
-def _note_miss(user_id: UUID) -> None:
+def _note_miss(key: Any) -> None:
     now = _now()
-    hits = [t for t in _MISSES[user_id] if now - t < _MISS_WINDOW]
+    hits = [t for t in _MISSES[key] if now - t < _MISS_WINDOW]
     hits.append(now)
-    _MISSES[user_id] = hits
+    _MISSES[key] = hits
 
 
-def _locked(user_id: UUID) -> bool:
+def _locked(key: Any) -> bool:
     now = _now()
-    hits = [t for t in _MISSES[user_id] if now - t < _MISS_WINDOW]
-    _MISSES[user_id] = hits
+    hits = [t for t in _MISSES[key] if now - t < _MISS_WINDOW]
+    _MISSES[key] = hits
     return len(hits) >= _MISS_LIMIT
+
+
+# ---- the forwarded link: token + PIN, then a signed session --------------
+
+def _link_secret() -> bytes:
+    """Derived from the app's own secret, like the pre-call links: nothing extra
+    to provision, and a rotated secret simply ends every open session."""
+    s = get_settings()
+    raw = s.clerk_secret_key or getattr(s, "provider_secrets_encryption_key", "") or "qc-production-link"
+    return hashlib.sha256(f"production-link-session:{raw}".encode()).digest()
+
+
+def _link_session(link: ProductionPackageShareLink) -> tuple[str, datetime]:
+    """A short-lived credential minted on a PIN unlock, bound to the link and
+    to when its PIN was set — rotating the PIN ends the session."""
+    expires = _now() + _LINK_SESSION_TTL
+    payload = {"lid": str(link.id), "pst": link.pin_set_at.isoformat() if link.pin_set_at else "", "exp": int(expires.timestamp())}
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = hmac.new(_link_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}", expires
+
+
+def _link_session_valid(session: str | None, link: ProductionPackageShareLink) -> bool:
+    try:
+        body, sig = (session or "").split(".", 1)
+    except ValueError:
+        return False
+    if not hmac.compare_digest(sig, hmac.new(_link_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]):
+        return False
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((body + "=" * (-len(body) % 4)).encode()).decode())
+    except (ValueError, UnicodeDecodeError):
+        return False
+    pst = link.pin_set_at.isoformat() if link.pin_set_at else ""
+    return payload.get("lid") == str(link.id) and payload.get("pst") == pst and int(payload.get("exp", 0)) > int(_now().timestamp())
+
+
+async def resolve_public_share(
+    db: AsyncSession, token: str, *, session: str | None = None, pin: str | None = None, client_ip: str | None = None,
+) -> tuple[PackageAccess, str | None, datetime | None]:
+    """A forwarded link: the token plus either a live session or the PIN.
+
+    Every miss reads the same — unknown, revoked, expired, wrong kind, the
+    wrong stage — so a probe learns nothing about which tokens are real. The
+    PIN check runs off the event loop; a wrong PIN counts on the row and
+    locks it after a few, and the per-address throttle keys on the address
+    Caddy appended, not the one the client wrote.
+
+    Returns (access, session, session_expires); the session is minted only
+    on a PIN unlock."""
+    from app.dealer_os.services.client_room import verify_passcode
+
+    gone = HTTPException(status.HTTP_404_NOT_FOUND, "This link is no longer available")
+    throttle_key = f"link:{hash_token(token or '')[:16]}:{client_ip or '-'}"
+    if _locked(throttle_key):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many attempts. Try again in a few minutes.")
+    link = (
+        await db.execute(
+            select(ProductionPackageShareLink).where(ProductionPackageShareLink.token_hash == hash_token(token or ""))
+        )
+    ).scalar_one_or_none()
+    if link is None or link.kind != "public" or link.revoked_at is not None or link.expires_at <= _now():
+        _note_miss(throttle_key)
+        raise gone
+    package = await db.get(ProductionPackage, link.package_id)
+    profile = await db.get(ApplicationProfile, package.profile_id) if package else None
+    if package is None or profile is None or profile.vertical != "dealer":
+        raise gone
+    dealer = await _dealer_for(db, profile)
+    if dealer is not None and (dealer.is_training or dealer.archived_at is not None):
+        raise gone
+    if int(getattr(package, "stage", 1) or 1) != 1:
+        raise gone
+    new_session: str | None = None
+    expires: datetime | None = None
+    if session and _link_session_valid(session, link):
+        pass
+    elif pin is not None:
+        now = _now()
+        if link.pin_locked_until is not None and link.pin_locked_until > now:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS,
+                                detail={"code": "pin_locked", "message": "Too many wrong PINs. Try again in a few minutes."})
+        ok = await asyncio.to_thread(verify_passcode, str(pin).strip(), link.pin_hash)
+        if not ok:
+            link.pin_attempts = (link.pin_attempts or 0) + 1
+            if link.pin_attempts >= _PIN_MAX_ATTEMPTS:
+                link.pin_locked_until = now + _PIN_LOCKOUT
+                link.pin_attempts = 0
+            await db.flush()
+            _note_miss(throttle_key)
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "pin_invalid", "message": "That PIN is not right."})
+        link.pin_attempts = 0
+        link.pin_locked_until = None
+        new_session, expires = _link_session(link)
+    else:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "pin_required", "label": link.label})
+    link.last_used_at = _now()
+    link.use_count = (link.use_count or 0) + 1
+    await db.flush()
+    access = PackageAccess(package=package, profile=profile, user=None, mode="rep", link=link, dealer=dealer, via="share_link")
+    await _load_family(db, access)
+    return access, new_session, expires
+
+
+async def resolve_share_for_user(db: AsyncSession, user: User, token: str) -> dict[str, Any]:
+    """The two doors. A signed-in person opening a forwarded link: a rep the
+    link was issued to stays on the token route with their session; an
+    operator or a partner whose own access reaches the package belongs on
+    the id route; anyone else learns nothing."""
+    link = (
+        await db.execute(
+            select(ProductionPackageShareLink).where(ProductionPackageShareLink.token_hash == hash_token(token or ""))
+        )
+    ).scalar_one_or_none()
+    if link is None or link.revoked_at is not None or link.expires_at <= _now():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
+    if link.kind == "rep" and link.rep_user_id == user.id:
+        return {"package_id": link.package_id, "direct": False, "mode": "rep"}
+    try:
+        access = await load_package_access(db, link.package_id, user)
+    except HTTPException:
+        access = None
+    if access is not None and (access.is_operator or access.mode == "partner"):
+        return {"package_id": link.package_id, "direct": True, "mode": access.mode}
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
 
 
 async def resolve_rep_share(db: AsyncSession, user: User, token: str) -> PackageAccess:
@@ -663,7 +810,7 @@ async def apply_changes(
     package.attention = computed["attention"]
     package.computed_cache = pa.jsonable(computed)
     package.version = (package.version or 1) + 1
-    package.updated_by_user_id = access.user.id
+    package.updated_by_user_id = access.actor_user_id
     package.updated_via = "operator" if access.is_operator else ("partner" if access.mode == "partner" else "share_link")
     package.updated_share_link_id = access.link.id if access.link else None
     await db.flush()
@@ -703,7 +850,7 @@ async def run_prefill(
         package.attention = computed["attention"]
         package.computed_cache = pa.jsonable(computed)
         package.version = (package.version or 1) + 1
-        package.updated_by_user_id = access.user.id
+        package.updated_by_user_id = access.actor_user_id
         package.updated_via = "operator" if access.is_operator else ("partner" if access.mode == "partner" else "share_link")
         await db.flush()
         await profiles.log_profile_action(
@@ -723,17 +870,60 @@ async def run_prefill(
 # share links
 # ---------------------------------------------------------------------------
 
-def share_link_url(token: str) -> str:
+def share_link_url(token: str, kind: str = "rep") -> str:
+    if kind == "public":
+        return f"{get_settings().frontend_app_url.rstrip('/')}/production-package/link/{token}"
     return f"{get_settings().rep_app_url.rstrip('/')}/production-package/{token}"
 
 
+async def mint_public_link(
+    db: AsyncSession, access: PackageAccess, *, label: str | None, recipient_name: str | None,
+    recipient_email: str | None, expires_in_days: int,
+) -> tuple[ProductionPackageShareLink, str, str]:
+    """A forwarded link with a PIN. The PIN reuses the client room's hashing
+    and its list of codes too easy to guess; it is returned once, like the
+    token, and the sharer tells the recipient separately."""
+    from app.dealer_os.services.client_room import (
+        _generate_passcode,
+        _hash_passcode,
+        passcode_problem,
+    )
+
+    if not access.capabilities().can_share:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the desk can share a stage-one draft")
+    days = max(1, min(SHARE_LINK_MAX_DAYS, int(expires_in_days or SHARE_LINK_DEFAULT_DAYS)))
+    now = _now()
+    pin = _generate_passcode()
+    while passcode_problem(pin):
+        pin = _generate_passcode()
+    token = new_token()
+    link = ProductionPackageShareLink(
+        package_id=access.package.id, token_hash=hash_token(token), kind="public", rep_user_id=None,
+        recipient_name=(recipient_name or "").strip()[:120] or None,
+        recipient_email=(recipient_email or "").strip()[:320] or None,
+        label=(label or "").strip()[:120] or None, outside_book=False,
+        pin_hash=await asyncio.to_thread(_hash_passcode, pin), pin_set_at=now,
+        created_by_user_id=access.user.id, expires_at=now + timedelta(days=days),
+    )
+    db.add(link)
+    await db.flush()
+    await profiles.log_profile_action(
+        db, access.profile, access.user, "production_package.share_link_minted",
+        f"Production package forwarded to {link.recipient_name or 'a recipient with no account'}",
+        target_type="production_package", target_id=access.package.id,
+        metadata={"link_id": str(link.id), "kind": "public", "recipient_email": link.recipient_email,
+                  "expires_at": link.expires_at.isoformat()},
+    )
+    return link, token, pin
+
+
 async def mint_share_link(
-    db: AsyncSession, access: PackageAccess, *, rep_user_id: UUID, label: str | None,
+    db: AsyncSession, access: PackageAccess, *, rep_user_id: UUID | None, label: str | None,
     expires_in_days: int, outside_book: bool,
 ) -> tuple[ProductionPackageShareLink, str]:
     if not access.capabilities().can_share:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the desk can share a stage-one draft")
-    rep = await db.get(User, rep_user_id)
+    rep = await db.get(User, rep_user_id) if rep_user_id else None
     if rep is None or not is_rep(rep) or getattr(rep, "deleted_at", None) is not None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a field representative")
     if access.dealer is not None and access.dealer.owner_user_id != rep.id and not outside_book:
@@ -758,7 +948,7 @@ async def mint_share_link(
         row.revoked_by_user_id = access.user.id
     token = new_token()
     link = ProductionPackageShareLink(
-        package_id=access.package.id, token_hash=hash_token(token), rep_user_id=rep.id,
+        package_id=access.package.id, token_hash=hash_token(token), kind="rep", rep_user_id=rep.id,
         label=(label or "").strip()[:120] or None, outside_book=bool(outside_book and access.dealer is not None and access.dealer.owner_user_id != rep.id),
         created_by_user_id=access.user.id, expires_at=now + timedelta(days=days),
     )
@@ -927,7 +1117,10 @@ def _revision_read(
 def _share_link_read(link: ProductionPackageShareLink, names: dict[UUID, str]) -> ProductionShareLinkRead:
     now = _now()
     return ProductionShareLinkRead(
-        id=link.id, rep_user_id=link.rep_user_id, rep_name=names.get(link.rep_user_id), label=link.label,
+        id=link.id, kind=getattr(link, "kind", None) or "rep", rep_user_id=link.rep_user_id,
+        rep_name=names.get(link.rep_user_id) if link.rep_user_id else None,
+        recipient_name=getattr(link, "recipient_name", None), recipient_email=getattr(link, "recipient_email", None),
+        label=link.label,
         outside_book=link.outside_book, created_at=link.created_at, expires_at=link.expires_at,
         revoked_at=link.revoked_at, last_used_at=link.last_used_at, use_count=link.use_count or 0,
         active=link.revoked_at is None and link.expires_at > now,

@@ -89,7 +89,12 @@ class SponsorCompanyUpdate(BaseModel):
 
 
 class ProductionShareLinkCreate(BaseModel):
-    rep_user_id: UUID
+    # `rep`: for one signed-in field rep (rep_user_id required).
+    # `public`: forwarded to anyone; opened with the PIN returned once at mint.
+    kind: Literal["rep", "public"] = "rep"
+    rep_user_id: UUID | None = None
+    recipient_name: str | None = Field(default=None, max_length=120)
+    recipient_email: str | None = Field(default=None, max_length=320)
     label: str | None = Field(default=None, max_length=120)
     expires_in_days: int = Field(default=14, ge=1, le=30)
     outside_book: bool = False
@@ -97,8 +102,11 @@ class ProductionShareLinkCreate(BaseModel):
 
 class ProductionShareLinkRead(BaseModel):
     id: UUID
-    rep_user_id: UUID
+    kind: Literal["rep", "public"] = "rep"
+    rep_user_id: UUID | None = None
     rep_name: str | None = None
+    recipient_name: str | None = None
+    recipient_email: str | None = None
     label: str | None = None
     outside_book: bool = False
     created_at: datetime
@@ -113,6 +121,25 @@ class ProductionShareLinkCreated(BaseModel):
     link: ProductionShareLinkRead
     url: str
     expires_at: datetime
+    # Shown once, like the token. Tell the recipient separately from the link.
+    pin: str | None = None
+
+
+class ProductionLinkUnlockBody(BaseModel):
+    pin: str = Field(min_length=6, max_length=6)
+
+
+class ProductionLinkUnlocked(BaseModel):
+    session: str
+    expires_at: datetime
+    package: ProductionPackageRead
+
+
+class ProductionLinkResolved(BaseModel):
+    """Where a signed-in person belongs when they open a forwarded link."""
+    package_id: UUID
+    direct: bool
+    mode: str
 
 
 class ProductionSignatureRead(BaseModel):

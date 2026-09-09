@@ -653,3 +653,203 @@ async def test_a_share_link_cannot_set_our_cost_or_our_margin():
     with pytest.raises(HTTPException) as err:
         await pkgs.apply_changes(db, access, changes={"products": {"vsc": {"cur_rate": 54, "rate": 60, "repay": 100}}}, version=999)
     assert err.value.detail["code"] != "maintained_by_desk"  # it fails on the stale version, not the gate
+
+
+# ---- the forwarded link ----------------------------------------------------
+
+def _public_link(**over):
+    from app.dealer_os.services.client_room import _hash_passcode
+
+    base = dict(id=uuid.uuid4(), package_id=uuid.uuid4(), kind="public", rep_user_id=None, label="For Marisol",
+                recipient_name="Marisol", recipient_email=None, pin_hash=_hash_passcode("482913"),
+                pin_set_at=datetime(2026, 9, 9, 12, 0, tzinfo=UTC), pin_attempts=0, pin_locked_until=None,
+                created_by_user_id=uuid.uuid4(), expires_at=datetime.now(UTC) + timedelta(days=7), revoked_at=None,
+                last_used_at=None, use_count=0, outside_book=False)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _link_db(link, package=None, profile=None):
+    """execute() answers the link lookup first, then _load_family's child query; get() dispatches on the model."""
+    package = package or SimpleNamespace(id=link.package_id, profile_id=uuid.uuid4(), stage=1, status="draft", version=1,
+                                         arrangement={}, prefill_provenance={}, sent_by_user_id=None, execution_pending=False,
+                                         parent_package_id=None)
+    profile = profile or SimpleNamespace(id=package.profile_id, vertical="dealer", dealer_id=None)
+    answers = [link, None]
+
+    async def execute(_stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: answers.pop(0) if answers else None)
+
+    async def get(model, key, with_for_update=False):
+        return {"ProductionPackage": package, "ApplicationProfile": profile}.get(model.__name__)
+
+    return SimpleNamespace(execute=execute, get=get, flush=AsyncMock()), package
+
+
+def test_a_forwarded_link_can_edit_but_never_send():
+    """A signed-in rep with a link may send; a PIN is not a person."""
+    link = _public_link()
+    anon = pkgs.PackageAccess(package=SimpleNamespace(status="draft", stage=1, sent_by_user_id=None, execution_pending=False),
+                              profile=SimpleNamespace(id=uuid.uuid4()), user=None, mode="rep", link=link, via="share_link")
+    caps = anon.capabilities()
+    assert anon.anonymous and anon.role is None and anon.actor_user_id == link.created_by_user_id
+    assert caps.can_edit and caps.can_confirm and caps.can_generate
+    assert not caps.can_send and not caps.can_remind and not caps.can_share and not caps.can_pick_sponsor
+    rep = _access("draft", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4())).capabilities()
+    assert rep.can_send  # existing behaviour, must not regress
+
+
+@pytest.mark.asyncio
+async def test_every_miss_on_a_forwarded_link_reads_the_same():
+    from app.services import production_term_sheets as sheets
+
+    with patch.object(sheets, "current_sheet", AsyncMock(return_value=None)):
+        messages = set()
+        for link in (
+            None,
+            _public_link(kind="rep", rep_user_id=uuid.uuid4()),
+            _public_link(revoked_at=datetime.now(UTC)),
+            _public_link(expires_at=datetime.now(UTC) - timedelta(minutes=1)),
+        ):
+            db, _ = _link_db(link) if link else (SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)), get=AsyncMock(), flush=AsyncMock()), None)
+            with pytest.raises(HTTPException) as err:
+                await pkgs.resolve_public_share(db, "tok", pin="482913", client_ip="203.0.113.9")
+            assert err.value.status_code == 404
+            messages.add(err.value.detail)
+        assert len(messages) == 1
+        # The right kind at the wrong stage says the same thing.
+        link = _public_link()
+        db, package = _link_db(link)
+        package.stage = 2
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_public_share(db, "tok", pin="482913", client_ip="203.0.113.9")
+        assert err.value.status_code == 404 and err.value.detail in messages
+
+
+@pytest.mark.asyncio
+async def test_the_pin_gates_the_link_and_locks_on_the_row():
+    from app.services import production_term_sheets as sheets
+
+    with patch.object(sheets, "current_sheet", AsyncMock(return_value=None)):
+        link = _public_link()
+        db, _ = _link_db(link)
+        # No credential at all: asked for the PIN, told the sharer's note, nothing else.
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_public_share(db, "tok", client_ip="203.0.113.9")
+        assert err.value.status_code == 401 and err.value.detail == {"code": "pin_required", "label": "For Marisol"}
+        # Wrong PINs count on the row; the fifth locks it.
+        for n in range(1, 5):
+            db, _ = _link_db(link)
+            with pytest.raises(HTTPException) as err:
+                await pkgs.resolve_public_share(db, "tok", pin="000000", client_ip=f"203.0.113.{n}")
+            assert err.value.status_code == 401 and err.value.detail["code"] == "pin_invalid"
+            assert link.pin_attempts == n and link.pin_locked_until is None
+        db, _ = _link_db(link)
+        with pytest.raises(HTTPException):
+            await pkgs.resolve_public_share(db, "tok", pin="000000", client_ip="203.0.113.5")
+        assert link.pin_locked_until is not None and link.pin_attempts == 0
+        db, _ = _link_db(link)
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_public_share(db, "tok", pin="482913", client_ip="203.0.113.6")  # even the right one
+        assert err.value.status_code == 429 and err.value.detail["code"] == "pin_locked"
+        # The lock lifts; the right PIN mints a session the next call accepts, and the row resets.
+        link.pin_locked_until = datetime.now(UTC) - timedelta(seconds=1)
+        db, _ = _link_db(link)
+        access, session, expires = await pkgs.resolve_public_share(db, "tok", pin="482913", client_ip="203.0.113.7")
+        assert access.user is None and access.mode == "rep" and access.link is link and session and expires > datetime.now(UTC)
+        assert link.pin_attempts == 0 and link.pin_locked_until is None and link.use_count == 1
+        db, _ = _link_db(link)
+        again, none_session, _ = await pkgs.resolve_public_share(db, "tok", session=session, client_ip="203.0.113.7")
+        assert again.link is link and none_session is None
+        # A session is bound to the PIN it was minted under.
+        link.pin_set_at = datetime.now(UTC)
+        db, _ = _link_db(link)
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_public_share(db, "tok", session=session, client_ip="203.0.113.7")
+        assert err.value.detail["code"] == "pin_required"
+        # And one address hammering the token is throttled before the PIN is even read.
+        for _ in range(pkgs._MISS_LIMIT):
+            pkgs._note_miss("link:" + pkgs.hash_token("tok")[:16] + ":198.51.100.1")
+        db, _ = _link_db(link)
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_public_share(db, "tok", pin="482913", client_ip="198.51.100.1")
+        assert err.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_minting_a_forwarded_link_needs_no_rep_and_returns_a_real_pin():
+    from app.dealer_os.services.client_room import passcode_problem, verify_passcode
+
+    access = _access("draft", Role.LOAN_EXEC)
+    added = []
+    db = SimpleNamespace(add=added.append, flush=AsyncMock(), get=AsyncMock(return_value=None))
+    with patch.object(pkgs.profiles, "log_profile_action", AsyncMock()):
+        link, token, pin = await pkgs.mint_public_link(db, access, label="For Marisol", recipient_name="Marisol",
+                                                       recipient_email="m@example.com", expires_in_days=7)
+    assert link.kind == "public" and link.rep_user_id is None and link.recipient_name == "Marisol"
+    assert len(pin) == 6 and pin.isdigit() and passcode_problem(pin) is None
+    assert verify_passcode(pin, link.pin_hash) and link.pin_set_at is not None
+    assert pkgs.hash_token(token) == link.token_hash and len(token) > 30
+    assert pkgs.share_link_url(token, "public").endswith(f"/production-package/link/{token}")
+    assert "/production-package/link/" not in pkgs.share_link_url(token)  # a rep link is unchanged
+    with pytest.raises(HTTPException):
+        await pkgs.mint_public_link(db, _access("draft", Role.FIELD_REP, mode="rep", link=SimpleNamespace(id=uuid.uuid4())),
+                                    label=None, recipient_name=None, recipient_email=None, expires_in_days=7)
+
+
+@pytest.mark.asyncio
+async def test_the_two_doors():
+    """A rep the link was issued to stays on the token route; an operator whose
+    own access reaches the package goes to the id route; anyone else learns nothing."""
+    rep = _user(Role.FIELD_REP)
+    rep_link = _public_link(kind="rep", rep_user_id=rep.id)
+
+    def db_for(link):
+        return SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: link)))
+
+    out = await pkgs.resolve_share_for_user(db_for(rep_link), rep, "tok")
+    assert out == {"package_id": rep_link.package_id, "direct": False, "mode": "rep"}
+    public = _public_link()
+    op = _user(Role.LOAN_EXEC)
+    with patch.object(pkgs, "load_package_access", AsyncMock(return_value=SimpleNamespace(is_operator=True, mode="operator"))):
+        out = await pkgs.resolve_share_for_user(db_for(public), op, "tok")
+    assert out == {"package_id": public.package_id, "direct": True, "mode": "operator"}
+    stranger = _user(Role.FIELD_REP)
+    with patch.object(pkgs, "load_package_access", AsyncMock(side_effect=HTTPException(404))):
+        with pytest.raises(HTTPException) as err:
+            await pkgs.resolve_share_for_user(db_for(public), stranger, "tok")
+    assert err.value.status_code == 404
+    with pytest.raises(HTTPException):
+        await pkgs.resolve_share_for_user(db_for(_public_link(revoked_at=datetime.now(UTC))), op, "tok")
+
+
+@pytest.mark.asyncio
+async def test_an_anonymous_edit_is_attributed_to_whoever_shared_it():
+    link = _public_link()
+    package = SimpleNamespace(id=link.package_id, status="draft", version=3, arrangement={}, prefill_provenance={},
+                              stage=1, sent_by_user_id=None, execution_pending=False, updated_by_user_id=None, updated_via=None,
+                              computed_cache=None, updated_at=None, snapshot_hash=None)
+    access = pkgs.PackageAccess(package=package, profile=SimpleNamespace(id=uuid.uuid4(), vertical="dealer", dealer_id=None),
+                                user=None, mode="rep", link=link, via="share_link")
+
+    async def get(_model, _key, with_for_update=False):
+        return package
+
+    db = SimpleNamespace(get=get, flush=AsyncMock())
+    with patch.object(pkgs.profiles, "log_profile_action", AsyncMock()) as logged:
+        await pkgs.apply_changes(db, access, changes={"lot_units": 140}, version=3)
+    assert package.updated_by_user_id == link.created_by_user_id and package.updated_via == "share_link"
+    assert logged.await_args.args[2] is None  # the action log does not pretend the sharer typed it
+    # And the desk's fields are still the desk's.
+    with pytest.raises(HTTPException) as err:
+        await pkgs.apply_changes(db, access, changes={"prof_fees": 1}, version=package.version)
+    assert err.value.detail["code"] == "maintained_by_desk"
+
+
+def test_client_ip_reads_the_address_caddy_appended():
+    from app.request_context import client_ip
+
+    req = SimpleNamespace(headers={"x-forwarded-for": "1.2.3.4, 5.6.7.8"}, client=SimpleNamespace(host="127.0.0.1"))
+    assert client_ip(req) == "5.6.7.8"  # the last entry, not the one the client wrote first
+    assert client_ip(SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"))) == "127.0.0.1"
+    assert client_ip(None) is None
