@@ -310,6 +310,9 @@ class ProductionSmsConsentRead(BaseModel):
 
 class ProductionPackageRead(BaseModel):
     id: UUID
+    # QC-PA-…-R{n} at stage one, QC-AA-… at stage two — what prints in the
+    # agreement header, so the workspace can show the same reference.
+    agreement_no: str | None = None
     profile_id: UUID
     intake_id: UUID | None = None
     dealer_id: UUID | None = None

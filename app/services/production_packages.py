@@ -1228,8 +1228,12 @@ async def serialize(db: AsyncSession, access: PackageAccess) -> ProductionPackag
         from app.routers.application_profiles import _masked_recipient
 
         recipient_preview = _masked_recipient("email", email, None)
+    # signing imports this module, so the number's helper is reached at call time.
+    from app.services.production_signing import _agreement_number
+
+    agreement_no = getattr(package, "agreement_no", None) or _agreement_number(package, revisions[0].revision_no if revisions else 1)
     return ProductionPackageRead(
-        id=package.id, profile_id=package.profile_id, intake_id=package.intake_id, dealer_id=package.dealer_id,
+        id=package.id, agreement_no=agreement_no, profile_id=package.profile_id, intake_id=package.intake_id, dealer_id=package.dealer_id,
         stage=package.stage, status=package.status, version=package.version, business_name=business_name,
         client_email=email if operator else None, client_phone=phone if operator else None,
         arrangement=arrangement, prefill_provenance=package.prefill_provenance or {},
