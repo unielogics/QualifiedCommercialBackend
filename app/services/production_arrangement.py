@@ -1099,7 +1099,8 @@ def econ_attention(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon, remi
     out: list[dict[str, Any]] = []
     if not adv.clears:
         out.append({
-            "step": "advance", "key": "spread",
+            # The spread is the desk's to fix; a rep sees it under "Waiting on the desk", not as their failure.
+            "step": "advance", "key": "spread", "owner": "desk",
             "title": ("The programme costs more than it returns" if adv.spread < 0
                       else "Spread is under the 3 point floor"),
             "detail": (f"Projected return is {_pct(adv.implied_rate)} against an all-in programme cost of "
