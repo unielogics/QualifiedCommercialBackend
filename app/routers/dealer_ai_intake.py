@@ -674,7 +674,8 @@ class RequestLeadDeletionRequest(BaseModel):
 
 
 class ConfirmLeadDeletionRequest(BaseModel):
-    """Super-admin's confirmation for an irreversible hard delete. The
+    """The desk's confirmation for an irreversible hard delete — a super admin
+    or an underwriter, nobody else (the owner's rule for the intake table). The
     frontend gates this behind a themed danger confirm dialog, so the API no
     longer requires a prior deletion-request flag or a typed-name speed bump —
     a super admin can delete in one action. confirm_name is accepted but
@@ -6743,8 +6744,9 @@ async def admin_request_lead_deletion(
     """Admin flags a lead for deletion — same flag broker-side "request
     deletion" sets, needed here for admin-created/self-serve leads that have
     no broker to defer to. Destroys nothing; only gates the separate
-    confirm-deletion endpoint open."""
-    _require_governance_admin(user)
+    confirm-deletion endpoint open. Delete is the desk's — super admin and
+    underwriting — and nobody else's."""
+    _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.delete_requested_at = _now()
     intake.delete_requested_by_user_id = user.id
@@ -6766,7 +6768,7 @@ async def admin_cancel_lead_deletion(
 ) -> DealerIntakeResponse:
     """Admin retracts a pending deletion request (their own, or a broker's)
     without destroying anything — fully reversible."""
-    _require_governance_admin(user)
+    _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     intake.delete_requested_at = None
     intake.delete_requested_by_user_id = None
@@ -6810,8 +6812,11 @@ async def admin_confirm_lead_deletion(
     The bucket's own BucketActivityLog is about to be destroyed by
     definition, so this action is logged to the application logger instead
     of _log(...) — there is no durable admin-wide audit trail in this
-    codebase to write a cross-bucket entry to."""
-    _require_governance_admin(user)
+    codebase to write a cross-bucket entry to.
+
+    Who: a super admin or an underwriter — the owner's rule for the intake
+    table is "delete is only for super admin and underwriting, nobody else"."""
+    _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     # A sent or executed Production Package is a retained record; the file
     # cannot be hard-deleted underneath it (409 with the reason).
@@ -6823,9 +6828,10 @@ async def admin_confirm_lead_deletion(
     ).scalar_one_or_none()
     if _guard_profile is not None:
         await _production_delete_guard(db, _guard_profile)
-    # One-click super-admin delete: no prior request flag and no typed-name
+    # One-click desk delete: no prior request flag and no typed-name
     # required — the frontend danger dialog is the safeguard. (Brokers still
-    # can only request; only a super admin reaches this hard-delete.)
+    # can only request; only a super admin or an underwriter reaches this
+    # hard-delete.)
     confirm_target = (intake.business_name or intake.full_name or "").strip().lower()
 
     for file in intake.bucket.files:
@@ -6840,8 +6846,8 @@ async def admin_confirm_lead_deletion(
                 log.warning("hard-delete: S3 object delete failed for artifact id=%s key=%s", artifact.id, artifact.s3_key)
 
     log.warning(
-        "hard-delete: super_admin=%s (%s) permanently deleted dealer AI lead id=%s bucket_id=%s email=%s name=%s requested_by=%s at=%s ip=%s",
-        user.id, user.email, intake.id, intake.bucket_id, intake.email, confirm_target,
+        "hard-delete: %s=%s (%s) permanently deleted dealer AI lead id=%s bucket_id=%s email=%s name=%s requested_by=%s at=%s ip=%s",
+        str(user.role), user.id, user.email, intake.id, intake.bucket_id, intake.email, confirm_target,
         intake.delete_requested_by_user_id, intake.delete_requested_at, _client_ip(request),
     )
     await db.delete(intake.bucket)
