@@ -180,3 +180,99 @@ def test_the_public_route_serves_an_attachment_and_404s_an_unknown_slug():
         asyncio.run(financial_template_download("tax-return"))
     assert caught.value.status_code == 404
     assert templates.workbook_for_slug("nope") is None
+
+
+# --- The fifth download: the four forms as four tabs of one workbook. --------
+#
+# The owner asked for "a google sheet type of interface with all these already
+# in one single sheet that we can forward the client or their accountant". The
+# risk this section guards is that _Form is shared with the four singles: it
+# now picks wb.active for the first form and a new sheet for each one after,
+# so a bug there would corrupt all five downloads at once.
+
+
+def _packet():
+    return load_workbook(BytesIO(templates.build_packet_workbook()))
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_each_single_workbook_is_still_exactly_one_sheet(kind):
+    """The packet must not leak extra tabs into the four singles."""
+    assert _open(kind).sheetnames == [templates.SHEET_TITLES[kind]]
+
+
+def test_the_packet_is_the_four_forms_as_tabs_in_the_order_a_reader_expects():
+    wb = _packet()
+    assert wb.sheetnames == [
+        "Profit and Loss",
+        "Balance Sheet",
+        "Business Debt Schedule",
+        "Personal Financial Statement",
+    ]
+    assert [templates.SHEET_TITLES[kind] for kind in templates.PACKET_KINDS] == wb.sheetnames
+    assert wb.properties.title == "Financial Package"
+    for ws in wb.worksheets:
+        assert ws.print_area, ws.title
+        assert ws.protection.sheet is True, ws.title
+
+
+def test_the_packet_stays_inside_the_analyzers_sheet_and_row_budget():
+    """A filled copy uploaded back to a room must be read whole, not truncated."""
+    wb = _packet()
+    assert len(wb.sheetnames) <= MAX_SPREADSHEET_SHEETS
+    for ws in wb.worksheets:
+        assert ws.max_row <= MAX_SPREADSHEET_ROWS, (ws.title, ws.max_row)
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_every_defined_name_of_every_single_workbook_is_in_the_packet_on_its_own_tab(kind):
+    """The pl. / bs. / ds. / pfs. prefixes keep the four sets apart in one
+    workbook, and each name still carries its own sheet title, so a reader
+    written against a single template reads the packet unchanged."""
+    single = _open(kind)
+    packet = _packet()
+    assert single.defined_names, kind
+    for name, defined in single.defined_names.items():
+        assert name in packet.defined_names, name
+        assert packet.defined_names[name].attr_text == defined.attr_text, name
+        assert templates.SHEET_TITLES[kind] in defined.attr_text, name
+        assert _named_cell(packet, name).parent.title == templates.SHEET_TITLES[kind], name
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_each_packet_tab_is_cell_for_cell_the_single_workbook(kind):
+    single = _open(kind).active
+    tab = _packet()[templates.SHEET_TITLES[kind]]
+    assert [cell.value for cell in _cells(tab)] == [cell.value for cell in _cells(single)]
+    assert tab.max_row == single.max_row and tab.max_column == single.max_column
+
+
+def test_the_packet_filename_is_not_read_as_a_bank_statement():
+    """`filename_evidence_classification` classifies anything with "statement"
+    in the name it cannot place more precisely as a bank_statement. The packet
+    is four documents at once and belongs to no single checklist row, so its
+    name deliberately avoids that word and classifies as None — otherwise a
+    filled copy uploaded back would be filed against bank statements."""
+    name = templates.PACKET_ATTACHMENT_FILENAME
+    assert name == "Qualified Commercial - Financial Package.xlsx"
+    assert "statement" not in name.casefold()
+    assert filename_evidence_classification(name) is None
+
+
+def test_the_packet_bytes_are_deterministic_and_built_once():
+    assert templates.build_packet_workbook.__wrapped__() == templates.build_packet_workbook.__wrapped__()
+    assert templates.build_packet_workbook() is templates.build_packet_workbook()
+
+
+def test_the_public_route_serves_the_packet_like_the_other_four():
+    from app.routers.public import financial_template_download
+
+    assert templates.PACKET_SLUG == "financial-package"
+    assert templates.PACKET_SLUG not in templates.SLUGS   # not a schema kind
+    response = asyncio.run(financial_template_download(templates.PACKET_SLUG))
+    assert response.media_type == templates.MEDIA_TYPE
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="Qualified Commercial - Financial Package.xlsx"'
+    )
+    assert response.headers["cache-control"] == "public, max-age=86400"
+    assert response.body == templates.build_packet_workbook()

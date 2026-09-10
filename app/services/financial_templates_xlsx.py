@@ -28,6 +28,12 @@ What the generator fixes in the originals, deliberately:
 - pinned document properties and zip timestamps, so the bytes are the same on
   every build and the edge can cache them by content.
 
+There is a fifth download: the same four forms as four tabs of one workbook
+(`build_packet_workbook`, slug "financial-package"), the "one sheet we can
+forward the client or their accountant" the owner asked for. It is built from
+the very same builders — nothing about a form changes because it is a tab
+rather than a file — so the packet cannot drift from the four singles either.
+
 A workbook written by openpyxl carries no cached formula values. The analyzer
 shows both the value view and the formula view, and its typed prompt block
 tells the model to copy the lines and leave a total null when the document
@@ -39,6 +45,7 @@ Labels are English. The resource page says so on its Spanish card.
 from __future__ import annotations
 
 import functools
+import re
 import zipfile
 from datetime import datetime
 from io import BytesIO
@@ -57,13 +64,30 @@ from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
 
 MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-#: Public URL slug → workbook kind.
+#: Public URL slug → workbook kind. One kind per slug; the combined packet is
+#: not a kind (it has no schema of its own) and lives at PACKET_SLUG instead.
 SLUGS: dict[str, str] = {
     "profit-and-loss": "p_and_l",
     "balance-sheet": "balance_sheet",
     "business-debt-schedule": "debt_schedule",
     "personal-financial-statement": "pfs",
 }
+
+#: The fifth download: all four forms as four tabs of one workbook, in this
+#: order. Deliberately outside SLUGS — SLUGS maps to a `business_statement_schema`
+#: kind and every caller reads it that way.
+PACKET_SLUG = "financial-package"
+PACKET_KINDS: tuple[str, ...] = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
+PACKET_TITLE = "Financial Package"
+
+#: The packet's attachment filename. It must NOT contain the word "statement":
+#: `bucket_evidence.filename_evidence_classification` falls through to a
+#: `"statement" in value` branch that returns "bank_statement" for anything it
+#: cannot place more precisely, so a filled copy of the combined workbook
+#: uploaded back to a room would be routed to the bank-statement checklist row.
+#: A packet is four documents at once and belongs to no single row, so the name
+#: is chosen to classify as None and be filed by hand. Pinned by a test.
+PACKET_ATTACHMENT_FILENAME = "Qualified Commercial - Financial Package.xlsx"
 
 #: The attachment filename per kind. Each passes
 #: `bucket_evidence.filename_evidence_classification`, so a filled copy
@@ -111,14 +135,28 @@ _RIGHT = Alignment(horizontal="right")
 _WRAP = Alignment(wrap_text=True, vertical="top")
 
 
+def _sheet_for(wb: Workbook, kind: str, *, first: bool) -> Worksheet:
+    """The sheet one form writes into.
+
+    A workbook openpyxl creates already has one sheet, so the FIRST form built
+    into a workbook takes it and every form after it adds one — which is what
+    turns the four single-tab templates into the four tabs of the packet, in
+    build order. Told explicitly rather than inferred from whether the active
+    sheet looks empty: `wb.active` is the first sheet forever, so a builder
+    that guessed would silently overwrite tab one.
+    """
+    ws: Worksheet = wb.active if first else wb.create_sheet()
+    ws.title = SHEET_TITLES[kind]
+    return ws
+
+
 class _Form:
     """A label / input / hidden-key layout, one line per row."""
 
     LABEL, INPUT, KEY = "A", "B", "C"
 
-    def __init__(self, wb: Workbook, kind: str) -> None:
-        self.ws: Worksheet = wb.active
-        self.ws.title = SHEET_TITLES[kind]
+    def __init__(self, wb: Workbook, kind: str, *, first: bool = True) -> None:
+        self.ws: Worksheet = _sheet_for(wb, kind, first=first)
         self.wb = wb
         self.prefix = NAME_PREFIX[kind]
         self.row = 0
@@ -239,9 +277,9 @@ def _header_fields(form: _Form, fields: tuple[bss.HeaderField, ...]) -> None:
         form.text_field(field.key, field.label, input=field.input, options=field.options)
 
 
-def _build_p_and_l(wb: Workbook) -> None:
+def _build_p_and_l(wb: Workbook, *, first: bool = True) -> None:
     schema = bss.SCHEMA_FOR["p_and_l"]
-    form = _Form(wb, "p_and_l")
+    form = _Form(wb, "p_and_l", first=first)
     form.title(
         "Profit and Loss Statement",
         "Enter the figures for the period. Totals are calculated for you.",
@@ -298,9 +336,9 @@ def _build_p_and_l(wb: Workbook) -> None:
     form.finish()
 
 
-def _build_balance_sheet(wb: Workbook) -> None:
+def _build_balance_sheet(wb: Workbook, *, first: bool = True) -> None:
     schema = bss.SCHEMA_FOR["balance_sheet"]
-    form = _Form(wb, "balance_sheet")
+    form = _Form(wb, "balance_sheet", first=first)
     form.title(
         "Balance Sheet",
         "Enter every balance as of one date. Totals are calculated for you.",
@@ -362,8 +400,8 @@ def _build_balance_sheet(wb: Workbook) -> None:
     form.finish()
 
 
-def _build_pfs(wb: Workbook) -> None:
-    form = _Form(wb, "pfs")
+def _build_pfs(wb: Workbook, *, first: bool = True) -> None:
+    form = _Form(wb, "pfs", first=first)
     form.title(
         "Personal Financial Statement",
         "One statement per owner. Totals are calculated for you.",
@@ -404,9 +442,8 @@ def _build_pfs(wb: Workbook) -> None:
     form.finish()
 
 
-def _build_debt_schedule(wb: Workbook) -> None:
-    ws: Worksheet = wb.active
-    ws.title = SHEET_TITLES["debt_schedule"]
+def _build_debt_schedule(wb: Workbook, *, first: bool = True) -> None:
+    ws: Worksheet = _sheet_for(wb, "debt_schedule", first=first)
     prefix = NAME_PREFIX["debt_schedule"]
     columns = len(DEBT_COLUMNS)
     key_column = columns + 1  # hidden, carries the row key
@@ -492,17 +529,55 @@ _BUILDERS = {
 }
 
 
+#: `dcterms:modified` inside docProps/core.xml, whatever openpyxl put there.
+_MODIFIED_STAMP = re.compile(
+    rb"(<dcterms:modified[^>]*>)[^<]*(</dcterms:modified>)"
+)
+
+_PINNED_ISO = b"1980-01-01T00:00:00Z"
+
+
 def _pin_zip_timestamps(raw: bytes) -> bytes:
     """openpyxl stamps zip entries with the wall clock. Rewrite them with one
-    fixed timestamp so the same workbook is the same bytes on every build."""
+    fixed timestamp so the same workbook is the same bytes on every build.
+
+    docProps/core.xml needs the same treatment for a reason that is easy to
+    miss: setting `wb.properties.modified` before saving does nothing, because
+    openpyxl's writer overwrites that field with `datetime.now()` on its way
+    out (writer/excel.py). Pinning it here — after the save, on the way through
+    the zip — is the only place it sticks. Without this the bytes changed on
+    every build, which made two determinism tests pass on luck alone: they
+    compared two builds that usually, but not always, landed in the same
+    wall-clock second.
+    """
     source = zipfile.ZipFile(BytesIO(raw))
     out = BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
         for info in source.infolist():
             pinned = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
             pinned.compress_type = zipfile.ZIP_DEFLATED
-            target.writestr(pinned, source.read(info.filename))
+            body = source.read(info.filename)
+            if info.filename == "docProps/core.xml":
+                body = _MODIFIED_STAMP.sub(rb"\g<1>" + _PINNED_ISO + rb"\g<2>", body)
+            target.writestr(pinned, body)
     return out.getvalue()
+
+
+def _blank_workbook(title: str) -> Workbook:
+    """An empty workbook with the pinned properties every download carries."""
+    wb = Workbook()
+    wb.properties.creator = _AUTHOR
+    wb.properties.lastModifiedBy = _AUTHOR
+    wb.properties.title = title
+    wb.properties.created = _PINNED_STAMP
+    wb.properties.modified = _PINNED_STAMP
+    return wb
+
+
+def _finished_bytes(wb: Workbook) -> bytes:
+    buffer = BytesIO()
+    wb.save(buffer)
+    return _pin_zip_timestamps(buffer.getvalue())
 
 
 @functools.cache
@@ -510,20 +585,32 @@ def build_workbook(kind: str) -> bytes:
     """The workbook for one kind, as bytes. Built once per process."""
     if kind not in _BUILDERS:
         raise KeyError(kind)
-    wb = Workbook()
-    wb.properties.creator = _AUTHOR
-    wb.properties.lastModifiedBy = _AUTHOR
-    wb.properties.title = SHEET_TITLES[kind]
-    wb.properties.created = _PINNED_STAMP
-    wb.properties.modified = _PINNED_STAMP
+    wb = _blank_workbook(SHEET_TITLES[kind])
     _BUILDERS[kind](wb)
-    buffer = BytesIO()
-    wb.save(buffer)
-    return _pin_zip_timestamps(buffer.getvalue())
+    return _finished_bytes(wb)
+
+
+@functools.cache
+def build_packet_workbook() -> bytes:
+    """All four forms as four tabs of one workbook, as bytes.
+
+    The "one sheet we can forward the client or their accountant": a client or
+    their accountant fills one file instead of four. Same builders, same rows,
+    same defined names — the prefixes (`pl.` / `bs.` / `ds.` / `pfs.`) and the
+    sheet title inside each name keep them apart in one workbook. Four sheets
+    of 50/56/22/49 rows sits inside the analyzer's budget, so a filled copy
+    uploaded back is still read whole. Built once per process.
+    """
+    wb = _blank_workbook(PACKET_TITLE)
+    for index, kind in enumerate(PACKET_KINDS):
+        _BUILDERS[kind](wb, first=index == 0)
+    return _finished_bytes(wb)
 
 
 def workbook_for_slug(slug: str) -> tuple[str, bytes] | None:
     """(attachment filename, bytes) for a public slug, or None for an unknown one."""
+    if slug == PACKET_SLUG:
+        return PACKET_ATTACHMENT_FILENAME, build_packet_workbook()
     kind = SLUGS.get(slug)
     if kind is None:
         return None

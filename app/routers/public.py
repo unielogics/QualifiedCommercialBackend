@@ -77,14 +77,21 @@ _THROTTLE_SECONDS = 20.0
 
 @router.get("/financial-templates/{slug}.xlsx")
 async def financial_template_download(slug: str) -> Response:
-    """One of the four financial templates, as an Excel workbook.
+    """A financial template, as an Excel workbook.
+
+    Five slugs: the four single forms, and `financial-package`, which carries
+    all four as tabs of one workbook for a borrower to forward to a bookkeeper
+    or accountant.
 
     Generated from the same schemas the on-screen forms render, never a
     committed binary, so the spreadsheet a borrower downloads cannot drift from
-    the form their advisor sends. The attachment filename is chosen so a filled
-    copy uploaded back to a room routes to its checklist row by name before
-    analysis runs. Bytes are built once per process and cached a day at the
-    edge; nothing here reads or writes the database.
+    the form their advisor sends. Each single form's attachment filename is
+    chosen so a filled copy uploaded back to a room routes to its checklist row
+    by name before analysis runs; the package's deliberately does not, because
+    one file answering four requests cannot pick a row (and a filename carrying
+    the word "statement" would be read as a bank statement). Bytes are built
+    once per process and cached a day at the edge; nothing here reads or writes
+    the database.
     """
     from app.services import financial_templates_xlsx
 
