@@ -356,3 +356,102 @@ def test_debt_key_facts_keep_the_shape_the_dscr_reads():
     assert set(facts["debts"][0]) == {
         "lender", "original_amount", "current_balance", "monthly_payment", "maturity_date",
     }
+
+
+# ---------------------------------------------------------------------------
+# Figures read off an uploaded document.
+#
+# An upload is the other way either form gets satisfied, and the analyzer has
+# always read it — a PFS yields assets/liabilities/net worth, a debt schedule a
+# debts array and its totals. Those figures were being discarded by the status
+# endpoint, which then told the desk there was nothing behind the document.
+# ---------------------------------------------------------------------------
+
+
+def _pfs_analysis(**facts):
+    return {"classification": "personal_financial_statement", "key_facts": facts}
+
+
+def _debt_analysis(**facts):
+    return {"classification": "debt_schedule", "key_facts": facts}
+
+
+def test_uploaded_statement_carries_every_figure_including_liquidity():
+    from app.routers.application_profiles import _uploaded_statements
+
+    rows = _uploaded_statements(
+        [_pfs_analysis(
+            statement_date="2026-06-30",
+            total_assets=2_450_000,
+            total_liabilities=910_000,
+            net_worth=1_540_000,
+            liquid_assets=220_000,
+        )]
+    )
+    assert len(rows) == 1
+    assert rows[0].net_worth == 1_540_000
+    assert rows[0].total_assets == 2_450_000
+    assert rows[0].total_liabilities == 910_000
+    # Liquidity gates programme eligibility elsewhere; dropping it here would
+    # make the panel disagree with the underwriting screen.
+    assert rows[0].liquid_assets == 220_000
+
+
+def test_two_statements_stay_two_people():
+    """A PFS belongs to an individual. Husband and wife each file one, and a
+    combined net worth would be a household balance sheet neither signed."""
+    from app.routers.application_profiles import _uploaded_statements
+
+    rows = _uploaded_statements([
+        _pfs_analysis(net_worth=6_365_000, total_assets=6_365_000, total_liabilities=0),
+        _pfs_analysis(net_worth=2_845_779, total_assets=3_601_100, total_liabilities=755_321),
+    ])
+    assert [row.net_worth for row in rows] == [6_365_000, 2_845_779]
+
+
+def test_debt_schedule_prefers_the_documents_own_totals():
+    from app.routers.application_profiles import _uploaded_debt_figures
+
+    figures = _uploaded_debt_figures([
+        _debt_analysis(
+            total_monthly_debt_service=18_400,
+            total_outstanding_balance=742_000,
+            debts=[{"lender": "Ally"}, {"lender": "Westlake"}],
+        )
+    ])
+    assert figures == (2, 18_400.0, 742_000.0)
+
+
+def test_debt_schedule_sums_the_rows_when_the_document_never_totals_them():
+    """And survives a figure the analyzer left as printed text."""
+    from app.routers.application_profiles import _uploaded_debt_figures
+
+    figures = _uploaded_debt_figures([
+        _debt_analysis(debts=[
+            {"lender": "A", "current_balance": "$100,000", "monthly_payment": "2,500"},
+            {"lender": "B", "current_balance": 50_000, "monthly_payment": 900},
+        ])
+    ])
+    assert figures == (2, 3_400.0, 150_000.0)
+
+
+def test_a_document_with_no_figures_reports_none_not_zero():
+    """"$0 a month" is a finding about the borrower. "We could not read it" is
+    a finding about the document, and the panel must not confuse the two."""
+    from app.routers.application_profiles import _uploaded_debt_figures
+
+    assert _uploaded_debt_figures([_debt_analysis()]) is None
+    # An MCA contract dropped into the Debts slot is not a schedule, and its
+    # figures must not be counted as one — the DSCR denominator depends on it.
+    assert _uploaded_debt_figures(
+        [{"classification": "floorplan_mca_inventory", "key_facts": {"total_monthly_debt_service": 9_999}}]
+    ) is None
+
+
+def test_amounts_survive_currency_formatting():
+    from app.routers.application_profiles import _form_amount
+
+    assert _form_amount("$1,200.50") == 1200.50
+    assert _form_amount(300) == 300.0
+    assert _form_amount(None) == 0.0
+    assert _form_amount("not a number") == 0.0

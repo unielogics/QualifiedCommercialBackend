@@ -35,7 +35,7 @@ from app.models.application_profile import (
     FundingCategory,
     PlaidAssetReport,
 )
-from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadLink
+from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.models.lender import Lender
@@ -86,6 +86,7 @@ from app.schemas.application_profile import (
     FinancialFormSave,
     FinancialFormsRead,
     FinancialFormStatus,
+    UploadedStatementFigures,
     FinancialStatementOwnerLink,
     FinancialStatementRead,
     FinancialStatementWrite,
@@ -4122,6 +4123,128 @@ async def _requested_slot(
     ).scalars().first()
 
 
+def _form_amount(value: object) -> float:
+    """A figure off an analyzed document, as a number.
+
+    The analyzer is told to emit bare numbers and almost always does, but a
+    stray "$1,200" must not take a whole schedule's total to zero.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r"[,$\s]", "", value)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _uploaded_statements(analyses: list[dict]) -> list[UploadedStatementFigures]:
+    """Every personal financial statement the analyzer read, one per document."""
+    from app.services.public_underwriting_packet_pdf import extract_personal_financial_statements
+
+    return [UploadedStatementFigures(**row) for row in extract_personal_financial_statements(analyses)]
+
+
+def _uploaded_debt_figures(analyses: list[dict]) -> tuple[int, float, float] | None:
+    """A debt schedule read off an upload: obligations, monthly, outstanding.
+
+    None when nothing on the slot read as a schedule, and None again when one
+    did but carried no figures — a document we could not get numbers out of has
+    to look different from a borrower who genuinely owes nothing, or the panel
+    reports "$0 a month" as a finding.
+    """
+    from app.services.public_underwriting_packet_pdf import extract_debt_schedule
+
+    schedule = extract_debt_schedule(analyses)
+    if not schedule:
+        return None
+    listed = [item for item in schedule.get("debts") or [] if isinstance(item, dict)]
+    # The document's own stated totals win. They come off its total line, which
+    # is what a lender reads; summing the rows is the fallback for a schedule
+    # that lists obligations without totalling them.
+    total_monthly = float(
+        schedule.get("total_monthly_debt_service")
+        or sum(_form_amount(item.get("monthly_payment")) for item in listed)
+    )
+    total_balance = float(
+        schedule.get("total_outstanding_balance")
+        or sum(_form_amount(item.get("current_balance")) for item in listed)
+    )
+    if not listed and not total_monthly and not total_balance:
+        return None
+    return len(listed), total_monthly, total_balance
+
+
+async def _slot_analyses(
+    db: AsyncSession, slot: BucketRequestedDocument | None
+) -> tuple[list[dict], bool]:
+    """What the file analyzer made of the documents sitting in this slot.
+
+    An upload is the other way either form gets satisfied, and the analyzer
+    already reads both: a PFS yields total_assets / total_liabilities /
+    net_worth, a debt schedule yields a debts array plus its two totals. Those
+    figures were being thrown away here — the panel said "there are no figures
+    behind it" while the same numbers were driving programme eligibility
+    elsewhere in the system.
+
+    Shaped for the extract_* helpers the lender packet uses, so both surfaces
+    read an upload the same way. Returns the analyses and whether a document is
+    still being read, because "not finished yet" and "nothing there" look
+    identical to a caller and are not the same thing.
+    """
+    if slot is None:
+        return [], False
+
+    files = list(
+        (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.requested_document_id == slot.id,
+                    BucketFile.deleted_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not files:
+        return [], False
+
+    rows = list(
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .order_by(BucketFileAnalysis.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Newest analysis per file: a re-upload of the same slot leaves the earlier
+    # row in place, and the stale figures must not be counted alongside the new.
+    latest: dict[UUID, BucketFileAnalysis] = {}
+    for row in rows:
+        latest.setdefault(row.bucket_file_id, row)
+
+    analyses = [
+        {
+            "classification": row.classification,
+            "key_facts": (row.analysis or {}).get("key_facts") or {},
+        }
+        for row in latest.values()
+        if row.status == "completed"
+    ]
+    pending = any(
+        file.id not in latest or latest[file.id].status not in {"completed", "skipped"}
+        for file in files
+    )
+    return analyses, pending
+
+
 @router.get("/{profile_id}/financial-forms", response_model=FinancialFormsRead)
 async def financial_forms_status(
     profile_id: UUID,
@@ -4145,21 +4268,47 @@ async def financial_forms_status(
     slot = await _requested_slot(db, profile, "pfs")
     statement = await financial_statements.latest_for_profile(db, profile.id)
     submitted = statement if statement and statement.status == "submitted" else None
+    source = (
+        "filled"
+        if submitted is not None
+        else "uploaded"
+        if slot is not None and slot.status == "uploaded"
+        else "none"
+    )
+
+    net_worth = None
+    uploaded_statements: list[UploadedStatementFigures] = []
+    figures_from = None
+    pending = False
+    if source == "filled":
+        net_worth = float(statement.net_worth) if statement and statement.net_worth is not None else None
+        figures_from = "form" if net_worth is not None else None
+    elif source == "uploaded":
+        analyses, pending = await _slot_analyses(db, slot)
+        uploaded_statements = _uploaded_statements(analyses)
+        # Mirrored only when there is exactly one. Net worth belongs to a person,
+        # so summing two owners' statements would publish a figure neither of
+        # them signed; with several, the caller reads the list.
+        if len(uploaded_statements) == 1:
+            net_worth = uploaded_statements[0].net_worth
+        if any(
+            item.net_worth is not None or item.total_assets is not None
+            for item in uploaded_statements
+        ):
+            figures_from = "document"
+
     forms.append(
         FinancialFormStatus(
             kind="pfs",
             label=_FORM_LABEL["pfs"],
             requested=slot is not None,
             satisfied=bool(slot and slot.status == "uploaded"),
-            source=(
-                "filled"
-                if submitted is not None
-                else "uploaded"
-                if slot is not None and slot.status == "uploaded"
-                else "none"
-            ),
+            source=source,
             statement_id=statement.id if statement else None,
-            net_worth=float(statement.net_worth) if statement and statement.net_worth is not None else None,
+            net_worth=net_worth,
+            statements=uploaded_statements,
+            figures_from=figures_from,
+            analysis_pending=pending,
             updated_at=statement.updated_at if statement else None,
             filled_by_staff=bool(statement and statement.submitted_by_user_id),
         )
@@ -4180,22 +4329,37 @@ async def financial_forms_status(
         .scalars()
         .all()
     )
+    source = (
+        "filled"
+        if rows
+        else "uploaded"
+        if slot is not None and slot.status == "uploaded"
+        else "none"
+    )
+    row_count = len(rows)
+    total_monthly = float(sum((row.monthly_payment or 0) for row in rows))
+    total_balance = float(sum((row.balance or 0) for row in rows))
+    figures_from = "form" if rows else None
+    pending = False
+    if source == "uploaded":
+        analyses, pending = await _slot_analyses(db, slot)
+        figures = _uploaded_debt_figures(analyses)
+        if figures is not None:
+            row_count, total_monthly, total_balance = figures
+            figures_from = "document"
+
     forms.append(
         FinancialFormStatus(
             kind="debt_schedule",
             label=_FORM_LABEL["debt_schedule"],
             requested=slot is not None,
             satisfied=bool(slot and slot.status == "uploaded"),
-            source=(
-                "filled"
-                if rows
-                else "uploaded"
-                if slot is not None and slot.status == "uploaded"
-                else "none"
-            ),
-            row_count=len(rows),
-            total_monthly=float(sum((row.monthly_payment or 0) for row in rows)),
-            total_balance=float(sum((row.balance or 0) for row in rows)),
+            source=source,
+            row_count=row_count,
+            total_monthly=total_monthly,
+            total_balance=total_balance,
+            figures_from=figures_from,
+            analysis_pending=pending,
             updated_at=max((row.updated_at for row in rows), default=None),
         )
     )

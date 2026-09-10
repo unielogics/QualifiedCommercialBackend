@@ -782,6 +782,23 @@ class FinancialStatementWrite(BaseModel):
     owners: list[FinancialStatementOwnerLink] = Field(default_factory=list)
 
 
+class UploadedStatementFigures(BaseModel):
+    """One personal financial statement, as the file analyzer read it.
+
+    Kept as a list rather than folded into a single total because a PFS belongs
+    to one person. Two documents on a file are two people, and adding their net
+    worth together would state a household balance sheet nobody signed.
+    """
+
+    statement_date: str | None = None
+    total_assets: float | None = None
+    total_liabilities: float | None = None
+    net_worth: float | None = None
+    #: Cash, deposits and marketable securities only. Carried through because it
+    #: is the figure programme eligibility is screened on, not a nicety.
+    liquid_assets: float | None = None
+
+
 class FinancialFormStatus(BaseModel):
     """How one of the two financial forms stands on this file.
 
@@ -808,6 +825,17 @@ class FinancialFormStatus(BaseModel):
     updated_at: datetime | None = None
     #: True when a staff member completed it rather than the borrower.
     filled_by_staff: bool = False
+    #: Where these figures came from. "form" means someone typed them in and we
+    #: hold the rows; "document" means the analyzer read them off an upload.
+    #: None when we hold no figures at all — which is not the same as zero.
+    figures_from: Literal["form", "document"] | None = None
+    #: Every personal financial statement read off an upload, one per document.
+    #: `net_worth` above mirrors the single entry when there is exactly one, so
+    #: a caller that only wants the headline figure does not have to unpack this.
+    statements: list[UploadedStatementFigures] = Field(default_factory=list)
+    #: A document satisfies the slot but has not been read yet. The figures are
+    #: on their way rather than missing, and the caller should come back.
+    analysis_pending: bool = False
 
 
 class FinancialFormSave(BaseModel):
