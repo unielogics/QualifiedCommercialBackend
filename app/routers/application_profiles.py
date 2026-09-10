@@ -4,6 +4,7 @@ from __future__ import annotations
 # this codebase. Ruff B008 is not applicable to those framework declarations.
 # ruff: noqa: B008
 import hashlib
+import logging
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -134,6 +135,8 @@ from app.services import (
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
 from app.services.user_access import is_audit_client, is_funding_client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/application-profiles", tags=["application-profiles"])
 
@@ -4969,6 +4972,76 @@ async def revoke_financial_form_packet(
     return {"revoked": True}
 
 
+async def _stored_form_document(
+    db: AsyncSession, profile: ApplicationProfile, kind: str
+) -> Response | None:
+    """The document sitting in this form's slot, when nobody typed the figures.
+
+    A borrower can answer any of these requests by uploading their own sheet,
+    and then there is nothing to render — but there is very much something to
+    hand a partner. Streamed through the API rather than redirected to a
+    presigned URL: the caller reads this as a blob, and a cross-origin redirect
+    to S3 turns a working download into a CORS question.
+
+    Newest first, because a re-upload is a correction.
+    """
+    slot = await _requested_slot(db, profile, kind)
+    if slot is None:
+        return None
+    file = (
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(
+                    BucketFile.requested_document_id == slot.id,
+                    BucketFile.deleted_at.is_(None),
+                )
+                .order_by(BucketFile.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if file is None:
+        return None
+
+    # Imported here rather than at module scope: these are buckets.py's storage
+    # helpers, and pulling them in at import time couples two routers that do
+    # not otherwise depend on each other.
+    from app.routers.buckets import _bucket_storage_config, _s3_client
+
+    bucket, _, _ = _bucket_storage_config()
+    try:
+        obj = _s3_client().get_object(Bucket=bucket, Key=file.s3_key)
+        content = obj["Body"].read()
+    except Exception:  # noqa: BLE001
+        logger.exception("financial form document fetch failed key=%s", file.s3_key)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "The stored document could not be retrieved. Open it from Evidence instead.",
+        ) from None
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", file.file_name).strip("-") or "document.pdf"
+    return Response(
+        content=content,
+        media_type=file.content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+async def _rendered_or_stored_404(
+    db: AsyncSession, profile: ApplicationProfile, kind: str, message: str
+) -> Response:
+    """Nothing typed. Hand back the uploaded answer if there is one, else say so."""
+    stored = await _stored_form_document(db, profile, kind)
+    if stored is not None:
+        return stored
+    raise HTTPException(status.HTTP_404_NOT_FOUND, message)
+
+
 @router.get("/{profile_id}/financial-forms/{kind}/pdf")
 async def financial_form_pdf(
     profile_id: UUID,
@@ -4985,8 +5058,10 @@ async def financial_form_pdf(
     correction, and before anything has been filed at all. A desk that can only
     get a PDF by filing one is a desk that files to look.
 
-    Both forms, one route. 404 when there is nothing filled in, because an empty
-    413 is not a document anyone wants to open.
+    One route for every form. When nothing was typed but the borrower answered
+    by uploading their own sheet, that document is returned instead — a desk
+    asking for the PDF wants what is on the file, not a lecture about which
+    route it arrived by. 404 only when there is genuinely nothing.
     """
     if kind not in _FORM_SLOT_CATEGORY:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
@@ -5002,8 +5077,8 @@ async def financial_form_pdf(
     if kind in business_statement_schema.KINDS:
         statement = await business_statements.latest_for_profile(db, profile.id, kind)
         if statement is None or not (statement.body or {}):
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
+            return await _rendered_or_stored_404(
+                db, profile, kind,
                 f"Nothing has been filled in on the {_FORM_LABEL[kind].lower()} yet.",
             )
         pdf = (
@@ -5016,9 +5091,8 @@ async def financial_form_pdf(
         body = await financial_statements.debt_body_for_profile(db, profile)
         rows = financial_statements.debt_rows_from_body(body)
         if not rows:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "Nothing has been filled in on the debt schedule yet.",
+            return await _rendered_or_stored_404(
+                db, profile, kind, "Nothing has been filled in on the debt schedule yet."
             )
         facts = financial_statements.debt_key_facts(rows)
         pdf = dealer_forms_pdf.render_debt_schedule_pdf(
@@ -5031,9 +5105,8 @@ async def financial_form_pdf(
     else:
         statement = await financial_statements.latest_for_profile(db, profile.id)
         if statement is None or not (statement.body or {}):
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "Nothing has been filled in on the financial statement yet.",
+            return await _rendered_or_stored_404(
+                db, profile, kind, "Nothing has been filled in on the financial statement yet."
             )
         statement_date = (
             statement.statement_date.isoformat() if statement.statement_date else "not stated"
