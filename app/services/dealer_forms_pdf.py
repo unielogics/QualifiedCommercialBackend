@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 from datetime import UTC, datetime
+from typing import Any
 
 FORM_DISCLAIMER = (
     "This form is provided for underwriting processing convenience only. It does not "
@@ -219,30 +220,138 @@ def render_pfs_413_pdf(*, body: dict, statement_date: str) -> bytes:
     return pdf
 
 
+# The full schedule needs eleven columns, which does not fit a portrait page at
+# a readable size. Landscape, and the notes hang under their own obligation as a
+# spanning row so a long one wraps instead of squeezing every other column.
+_SCHEDULE_STYLE = """
+  @page { size: Letter landscape; margin: 34px; }
+  body { font-family: Inter, Arial, sans-serif; color: #111827; margin: 0; }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .muted { color: #6b7280; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 7px; font-size: 9.5px; text-align: left; }
+  th { background: #f3f4f6; font-size: 9px; text-transform: uppercase; letter-spacing: .03em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.note td { background: #fafafa; color: #4b5563; font-style: italic; border-top: 0; }
+  .totals td { font-weight: 700; background: #f9fafb; }
+  .disclaimer { margin-top: 20px; font-size: 9px; color: #6b7280; border-top: 1px solid #d1d5db; padding-top: 8px; }
+"""
+
+_SCHEDULE_COLUMNS = (
+    "Lender",
+    "Type",
+    "Original",
+    "Balance",
+    "Rate",
+    "Monthly",
+    "Originated",
+    "Matures",
+    "Secured",
+    "Status",
+    "Collateral",
+)
+
+
+def _cell(value: Any) -> str:
+    """A cell, or an em dash. A blank looks like a rendering fault on a printed
+    schedule; a dash reads as "not stated", which is what it means."""
+    text = str(value if value is not None else "").strip()
+    return html.escape(text) if text else "&mdash;"
+
+
+def _money_cell(value: Any) -> str:
+    if value in (None, "", 0):
+        return "&mdash;"
+    try:
+        return f"${float(value):,.0f}"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def _schedule_row_html(row: dict[str, Any]) -> str:
+    rate = row.get("rate")
+    cells = [
+        f"<td>{_cell(row.get('lender'))}</td>",
+        f"<td>{_cell(row.get('debt_type'))}</td>",
+        f"<td class='num'>{_money_cell(row.get('original_amount'))}</td>",
+        f"<td class='num'>{_money_cell(row.get('balance'))}</td>",
+        f"<td class='num'>{(f'{float(rate):g}%' if rate not in (None, '') else '&mdash;')}</td>",
+        f"<td class='num'>{_money_cell(row.get('monthly_payment'))}</td>",
+        f"<td>{_cell(row.get('originated_on'))}</td>",
+        f"<td>{_cell(row.get('maturity_on'))}</td>",
+        f"<td>{_cell((row.get('secured') or '').title() or None)}</td>",
+        f"<td>{_cell((row.get('payment_status') or '').title() or None)}</td>",
+        f"<td>{_cell(row.get('collateral'))}</td>",
+    ]
+    out = f"<tr>{''.join(cells)}</tr>"
+    note = str(row.get("notes") or "").strip()
+    if note:
+        out += (
+            f"<tr class='note'><td colspan='{len(_SCHEDULE_COLUMNS)}'>"
+            f"Note: {html.escape(note)}</td></tr>"
+        )
+    return out
+
+
 def render_debt_schedule_pdf(
     *,
     business_name: str,
-    debts: list[tuple[str, float, float]],
     total_balance: float,
     total_monthly: float,
+    debts: list[tuple[str, float, float]] | None = None,
+    rows: list[dict[str, Any]] | None = None,
 ) -> bytes:
+    """The schedule as a lender reads it.
+
+    Two shapes in, because two kinds of caller produce them. `rows` carries the
+    full record — type, original amount, rate, both dates, secured, status,
+    collateral and any note — and is what the borrower's form and the desk's
+    editor both send. `debts` is the older three-tuple, still used where a
+    caller genuinely only holds lender, balance and payment; it renders the
+    narrow table rather than eleven columns of em dashes.
+    """
     from weasyprint import HTML
 
-    rows = "".join(
-        f"<tr><td>{html.escape(lender)}</td><td>${balance:,.2f}</td><td>${monthly:,.2f}</td></tr>"
-        for lender, balance, monthly in debts
-    )
+    if rows is not None:
+        header = "".join(f"<th>{column}</th>" for column in _SCHEDULE_COLUMNS)
+        body_rows = "".join(_schedule_row_html(row) for row in rows)
+        totals = (
+            "<tr class='totals'>"
+            "<td colspan='3'>Total</td>"
+            f"<td class='num'>${total_balance:,.0f}</td>"
+            "<td></td>"
+            f"<td class='num'>${total_monthly:,.0f}</td>"
+            f"<td colspan='{len(_SCHEDULE_COLUMNS) - 6}'></td>"
+            "</tr>"
+        )
+        count = len(rows)
+        style = _SCHEDULE_STYLE
+        table = f"<table><tr>{header}</tr>{body_rows}{totals}</table>"
+        summary = (
+            f"{count} obligation{'' if count == 1 else 's'} &middot; "
+            f"${total_monthly:,.0f} a month &middot; ${total_balance:,.0f} outstanding"
+        )
+    else:
+        style = _STYLE
+        narrow = "".join(
+            f"<tr><td>{html.escape(lender)}</td><td>${balance:,.2f}</td><td>${monthly:,.2f}</td></tr>"
+            for lender, balance, monthly in (debts or [])
+        )
+        table = (
+            "<table><tr><th>Lender</th><th>Current balance</th><th>Monthly payment</th></tr>"
+            f"{narrow}"
+            f"<tr class='totals'><td>Total</td><td>${total_balance:,.2f}</td>"
+            f"<td>${total_monthly:,.2f}</td></tr></table>"
+        )
+        summary = ""
+
     body = f"""
     <html>
-      <head><style>{_STYLE}</style></head>
+      <head><style>{style}</style></head>
       <body>
         <h1>Business Debt Schedule</h1>
-        <div class="muted">{html.escape(business_name)}</div>
-        <table>
-          <tr><th>Lender</th><th>Current balance</th><th>Monthly payment</th></tr>
-          {rows}
-          <tr class="totals"><td>Total</td><td>${total_balance:,.2f}</td><td>${total_monthly:,.2f}</td></tr>
-        </table>
+        <div class="muted">{html.escape(business_name)}{f" &middot; {summary}" if summary else ""}</div>
+        {table}
         <div class="disclaimer">
           {html.escape(FORM_DISCLAIMER)} Submitted electronically {datetime.now(UTC).isoformat()}.
         </div>

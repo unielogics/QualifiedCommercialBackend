@@ -4043,10 +4043,10 @@ async def submit_public_financial_form(
                 requested_document=slot,
                 pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
                     business_name=(payload.body or {}).get("business_name") or "the business",
-                    debts=[
-                        (row["lender"], float(row["balance"]), float(row["monthly_payment"]))
-                        for row in rows
-                    ],
+                    # The full row, not three columns of it. The borrower was
+                    # asked for type, rate, dates, collateral and status; a PDF
+                    # that drops them sends a partner back to ask again.
+                    rows=rows,
                     total_balance=facts["total_outstanding_balance"],
                     total_monthly=facts["total_monthly_debt_service"],
                 ),
@@ -4471,10 +4471,10 @@ async def save_debt_schedule(
                 requested_document=slot,
                 pdf_bytes=dealer_forms_pdf.render_debt_schedule_pdf(
                     business_name=(payload.body or {}).get("business_name") or "the business",
-                    debts=[
-                        (row["lender"], float(row["balance"]), float(row["monthly_payment"]))
-                        for row in rows
-                    ],
+                    # The full row, not three columns of it. The borrower was
+                    # asked for type, rate, dates, collateral and status; a PDF
+                    # that drops them sends a partner back to ask again.
+                    rows=rows,
                     total_balance=facts["total_outstanding_balance"],
                     total_monthly=facts["total_monthly_debt_service"],
                 ),
@@ -4506,6 +4506,81 @@ async def save_debt_schedule(
     )
     await db.commit()
     return {"row_count": len(rows), "submitted": bool(payload.submit)}
+
+
+@router.get("/{profile_id}/financial-forms/{kind}/pdf")
+async def financial_form_pdf(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The filled form as a PDF, rendered from the figures we hold right now.
+
+    Rendered on demand rather than served from the copy stored at submission.
+    Those are not the same document: filing writes a sheet onto the checklist,
+    which is the artifact a partner was sent and must not change underneath
+    them, while this is "show me what the file says today" — after a desk
+    correction, and before anything has been filed at all. A desk that can only
+    get a PDF by filing one is a desk that files to look.
+
+    Both forms, one route. 404 when there is nothing filled in, because an empty
+    413 is not a document anyone wants to open.
+    """
+    if kind not in _FORM_SLOT_CATEGORY:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+
+    prefill = await financial_statements.form_prefill(db, profile)
+    business = prefill.get("business_name") or "the business"
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
+    # A filename someone can find again in a downloads folder six weeks later.
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", business).strip("-").lower() or "business"
+
+    if kind == "debt_schedule":
+        body = await financial_statements.debt_body_for_profile(db, profile)
+        rows = financial_statements.debt_rows_from_body(body)
+        if not rows:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Nothing has been filled in on the debt schedule yet.",
+            )
+        facts = financial_statements.debt_key_facts(rows)
+        pdf = dealer_forms_pdf.render_debt_schedule_pdf(
+            business_name=business,
+            rows=rows,
+            total_balance=facts["total_outstanding_balance"],
+            total_monthly=facts["total_monthly_debt_service"],
+        )
+        filename = f"debt-schedule-{safe}-{stamp}.pdf"
+    else:
+        statement = await financial_statements.latest_for_profile(db, profile.id)
+        if statement is None or not (statement.body or {}):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Nothing has been filled in on the financial statement yet.",
+            )
+        statement_date = (
+            statement.statement_date.isoformat() if statement.statement_date else "not stated"
+        )
+        pdf = dealer_forms_pdf.render_pfs_413_pdf(
+            body=statement.body or {}, statement_date=statement_date
+        )
+        applicant = (statement.body or {}).get("applicant") or {}
+        who = re.sub(r"[^A-Za-z0-9]+", "-", str(applicant.get("name") or "")).strip("-").lower()
+        filename = f"personal-financial-statement-{who or safe}-{stamp}.pdf"
+
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            # inline, so a click opens it in the browser's viewer and the desk
+            # can read it without it landing in downloads first.
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.post("/{profile_id}/financial-forms/{kind}/request", status_code=status.HTTP_201_CREATED)

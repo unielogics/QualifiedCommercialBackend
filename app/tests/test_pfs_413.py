@@ -540,3 +540,55 @@ def test_key_facts_now_carry_the_figures_that_used_to_be_hardcoded_null():
     facts = fs.debt_key_facts(rows)
     assert facts["debts"][0]["original_amount"] == 250000.0
     assert facts["debts"][0]["maturity_date"] == "2029-03-01"
+
+
+# ---------------------------------------------------------------------------
+# The schedule PDF.
+#
+# write_pdf needs Pango, which is in the prod container and not on this host —
+# hence the HTML half being separable, the same split render_pfs_413_pdf uses.
+# ---------------------------------------------------------------------------
+
+
+def test_the_schedule_pdf_carries_every_column_the_borrower_filled():
+    from app.services import dealer_forms_pdf as pdf
+
+    row = pdf._schedule_row_html({
+        "lender": "Ally Financial", "debt_type": "Floorplan",
+        "original_amount": "250000", "balance": "180000", "rate": 7.25,
+        "monthly_payment": "4200", "originated_on": "2024-03-01",
+        "maturity_on": "2029-03-01", "secured": "secured",
+        "payment_status": "current", "collateral": "Inventory",
+    })
+    for expected in ("Ally Financial", "Floorplan", "$250,000", "$180,000",
+                     "7.25%", "$4,200", "2024-03-01", "2029-03-01",
+                     "Secured", "Current", "Inventory"):
+        assert expected in row, expected
+
+
+def test_a_note_hangs_under_its_own_obligation():
+    """Spanning the table rather than squeezing a twelfth column, so a long
+    note wraps without shrinking every figure on the row."""
+    from app.services import dealer_forms_pdf as pdf
+
+    row = pdf._schedule_row_html({"lender": "A", "notes": "Balloon due in 2027"})
+    assert "colspan='11'" in row
+    assert "Note: Balloon due in 2027" in row
+
+
+def test_a_field_the_borrower_left_blank_prints_a_dash():
+    """A blank cell on a printed schedule reads as a rendering fault. A dash
+    reads as "not stated", which is what it means."""
+    from app.services import dealer_forms_pdf as pdf
+
+    row = pdf._schedule_row_html({"lender": "A", "balance": "1000"})
+    assert row.count("&mdash;") >= 8
+
+
+def test_the_schedule_pdf_escapes_what_the_borrower_typed():
+    from app.services import dealer_forms_pdf as pdf
+
+    row = pdf._schedule_row_html({"lender": "<script>alert(1)</script>", "collateral": "A & B"})
+    assert "<script>" not in row
+    assert "&lt;script&gt;" in row
+    assert "A &amp; B" in row
