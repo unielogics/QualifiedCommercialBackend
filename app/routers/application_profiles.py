@@ -40,6 +40,7 @@ from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDoc
 from app.models.client import Client
 from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
+from app.models.financial_worksheet import FinancialFormLinkSheet, FinancialWorksheet
 from app.models.lender import Lender
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -117,6 +118,9 @@ from app.schemas.application_profile import (
     UnifiedAuditEvent,
     VerificationInvitationCreate,
     VerificationInvitationRead,
+    WorksheetCellWrite,
+    WorksheetLinkCreate,
+    WorksheetRowOp,
 )
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
@@ -131,6 +135,7 @@ from app.services import (
     pfs_schema,
     plaid_lifecycle,
     plaid_policy,
+    sheets,
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
@@ -4978,6 +4983,223 @@ async def revoke_financial_form_packet(
         db, profile, user, "financial_form.packet_revoked",
         "Closed a financial forms packet link",
         target_type="financial_form_packet", target_id=packet_id,
+    )
+    await db.commit()
+    return {"revoked": True}
+
+
+# ---------------------------------------------------------------------------
+# The worksheet: the four forms as one grid
+#
+# Staff-facing. The same body readers and the same save functions the stacked
+# forms use — this adds the workbook clock, per-cell writes, and links that
+# open part of the workbook rather than all of it. The no-login half of these
+# routes, and the live stream, land separately.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{profile_id}/sheets")
+async def read_worksheet(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """All four sheets in one answer: shape, values and computed figures.
+
+    One call rather than four. A tab bar that cannot see what the other three
+    hold cannot tell you which of them is still empty, and scope has to be
+    applied in one place on the server rather than four times over.
+
+    Opening the worksheet creates its row if the file has none. A read that
+    writes is unusual, but the workbook clock has to exist before anyone can
+    edit a cell or be handed a link joined to it, and the alternative is a
+    "create worksheet" button that would never mean anything to the desk.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    worksheet = await sheets.ensure_worksheet(db, profile, created_by=user.id)
+    payload = await sheets.read_sheets(
+        db, profile, kinds=sheets.KINDS, origin="admin", can_edit=True, worksheet=worksheet
+    )
+    await db.commit()
+    return payload
+
+
+@router.post("/{profile_id}/sheets/cells")
+async def write_worksheet_cells(
+    profile_id: UUID,
+    payload: WorksheetCellWrite,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Write the cells that changed.
+
+    The grain is a cell because the grain of the conflict is a cell: two people
+    typing in different lines of the same statement is the design, not a
+    collision, and a whole-body version check would 409 on both of them. The
+    body is loaded, the keys are patched onto it, and the existing save
+    function does the rest — so the draft→submitted latch, blank staying null,
+    and `save_debt_rows`' rule that a save writes only its own origin's rows
+    all still hold.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    result = await sheets.apply_cell_edits(
+        db,
+        profile,
+        [edit.model_dump() for edit in payload.edits],
+        base_rev=payload.base_rev,
+        origin="admin",
+        actor_user_id=user.id,
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/{profile_id}/sheets/rows")
+async def write_worksheet_row(
+    profile_id: UUID,
+    payload: WorksheetRowOp,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Add or remove a line on the debt schedule or a supporting schedule.
+
+    Rows are added here rather than by the browser inventing one, so two people
+    adding a line at the same moment get two lines instead of one collision.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    result = await sheets.apply_row_op(
+        db,
+        profile,
+        kind=payload.sheet,
+        op=payload.op,
+        row_id=payload.row_id,
+        after=payload.after,
+        block=payload.block,
+        origin="admin",
+        actor_user_id=user.id,
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/{profile_id}/worksheets/{worksheet_id}/links", status_code=status.HTTP_201_CREATED)
+async def mint_worksheet_link(
+    profile_id: UUID,
+    worksheet_id: UUID,
+    payload: WorksheetLinkCreate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """A link that opens some of the worksheet, to somebody with no login.
+
+    **Its token is drawn on its own.** The forms packet derives four child
+    tokens from one base (`{base}.{kind}`), which means any child yields the
+    base and the base yields all four children — under that scheme a link
+    advertised as "P&L and balance sheet only" would be a lie, because its
+    holder could reach the personal financial statement. Links here are joined
+    to each other by `worksheet_id`, which is data, and what each one opens is
+    stored as rows rather than encoded in a name.
+    """
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    worksheet = await db.get(FinancialWorksheet, worksheet_id)
+    if worksheet is None or worksheet.profile_id != profile.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Worksheet not found")
+
+    wanted = [kind for kind in sheets.KINDS if kind in set(payload.sheets)]
+    if not wanted:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A link has to open at least one sheet"
+        )
+    # Clamped, and never zero: `mint_link` reads a falsy TTL as "no expiry",
+    # and a worksheet link that never dies is exactly the permanent credential
+    # sitting in a forwarded inbox that `expires_at` exists to prevent.
+    ttl = payload.ttl_days if payload.ttl_days is not None else financial_statements.DEFAULT_LINK_TTL_DAYS
+    ttl = min(max(int(ttl), 1), 365)
+
+    link, token = await financial_statements.mint_link(
+        db,
+        profile,
+        kind="worksheet",
+        label=payload.label,
+        invitee_email=payload.invitee_email,
+        created_by=user.id,
+        ttl_days=ttl,
+        token=secrets.token_urlsafe(32),
+    )
+    link.worksheet_id = worksheet.id
+    link.packet_id = worksheet.packet_id
+    link.permission = payload.permission
+    for kind in wanted:
+        db.add(FinancialFormLinkSheet(link_id=link.id, sheet_kind=kind))
+
+    # A link that can be written to, or that opens the personal financial
+    # statement, gets a second factor. The URL is otherwise the entire
+    # credential, it lives for a month, and it is meant to be forwarded — the
+    # PIN is what keeps a mis-sent link from being a working one. Returned once,
+    # here, and never recoverable afterwards.
+    from app.services import worksheet_links
+
+    pin: str | None = None
+    if worksheet_links.pin_required_for(payload.permission, wanted):
+        pin = await worksheet_links.set_pin(link)
+    await db.flush()
+
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.worksheet_link_minted",
+        f"Shared {len(wanted)} worksheet sheet(s) as a {payload.permission} link"
+        + (" with a PIN" if pin else ""),
+        target_type="financial_worksheet", target_id=worksheet.id,
+        metadata={
+            "link_id": str(link.id), "sheets": wanted,
+            "permission": payload.permission, "pin_set": bool(pin),
+        },
+    )
+    await db.commit()
+    return {
+        "url": f"{get_settings().frontend_app_url.rstrip('/')}/forms/worksheet/{token}",
+        "expires_at": link.expires_at,
+        "worksheet_id": worksheet.id,
+        "link_id": link.id,
+        "permission": payload.permission,
+        "sheets": wanted,
+        # Shown once. Only the hash is stored, so a lost PIN is reset, not read.
+        "pin": pin,
+    }
+
+
+@router.post("/{profile_id}/worksheets/links/{link_id}/revoke")
+async def revoke_worksheet_link(
+    profile_id: UUID,
+    link_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Close one shared link. `is_open` already honours `revoked_at`, so an
+    open tab stops working on its next read or write."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    link = (
+        await db.execute(
+            select(FinancialFormLink).where(
+                FinancialFormLink.id == link_id,
+                FinancialFormLink.profile_id == profile.id,
+                FinancialFormLink.kind == "worksheet",
+            )
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Link not found")
+    if link.revoked_at is None:
+        link.revoked_at = datetime.now(UTC)
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.worksheet_link_revoked",
+        "Closed a worksheet share link",
+        target_type="financial_worksheet", target_id=link.worksheet_id,
+        metadata={"link_id": str(link.id)},
     )
     await db.commit()
     return {"revoked": True}

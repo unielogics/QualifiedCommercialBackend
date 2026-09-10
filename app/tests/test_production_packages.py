@@ -683,7 +683,11 @@ def _link_db(link, package=None, profile=None):
     async def get(model, key, with_for_update=False):
         return {"ProductionPackage": package, "ApplicationProfile": profile}.get(model.__name__)
 
-    return SimpleNamespace(execute=execute, get=get, flush=AsyncMock()), package
+    # `commit` is here because the real session has it and the resolver needs it:
+    # a wrong PIN is committed, not flushed, or `get_db`'s rollback on the raise
+    # that follows would discard the attempt counter. This fake having only
+    # `flush` is part of why that went unnoticed.
+    return SimpleNamespace(execute=execute, get=get, flush=AsyncMock(), commit=AsyncMock()), package
 
 
 def test_a_forwarded_link_can_edit_but_never_send():
@@ -744,6 +748,10 @@ async def test_the_pin_gates_the_link_and_locks_on_the_row():
                 await pkgs.resolve_public_share(db, "tok", pin="000000", client_ip=f"203.0.113.{n}")
             assert err.value.status_code == 401 and err.value.detail["code"] == "pin_invalid"
             assert link.pin_attempts == n and link.pin_locked_until is None
+            # Counted on the row AND committed. Flushing it would be rolled back
+            # by `get_db` when the 401 below propagates, so the lockout this
+            # test describes would never survive the request that earned it.
+            assert db.commit.await_count == 1, "the wrong-PIN counter was not committed"
         db, _ = _link_db(link)
         with pytest.raises(HTTPException):
             await pkgs.resolve_public_share(db, "tok", pin="000000", client_ip="203.0.113.5")

@@ -535,13 +535,17 @@ def test_the_link_check_admits_all_four_kinds_and_the_migration_agrees():
     from app.models.financial_form_link import FinancialFormLink
 
     checks = [c.sqltext.text for c in FinancialFormLink.__table__.constraints if getattr(c, "name", None) == "ck_financial_form_links_kind"]
-    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet')"]
+    # 'worksheet' joined the list in 0204 — a fifth kind of link, over all four
+    # forms at once. The four form kinds are still exactly these four.
+    assert checks == ["kind in ('pfs','debt_schedule','p_and_l','balance_sheet','worksheet')"]
     assert FinancialFormLink.__table__.c.packet_id.nullable
     migration = Path("alembic/versions/0203_business_statements_and_packets.py").read_text()
     assert "kind in ('pfs','debt_schedule','p_and_l','balance_sheet')" in migration
     assert 'down_revision = "0202_debt_schedule_full_row"' in migration
     assert "business_financial_statements" in migration
     assert "packet_id" in migration
+    widened = Path("alembic/versions/0204_financial_worksheets_and_link_scopes.py").read_text()
+    assert "'worksheet'" in widened
 
 
 def test_the_statement_table_is_its_own_and_pins_its_kinds():

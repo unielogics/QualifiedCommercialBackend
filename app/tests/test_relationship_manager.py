@@ -294,4 +294,4 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0203_business_statements_and_packets"]
+    assert heads == ["0205_worksheet_link_pins"]

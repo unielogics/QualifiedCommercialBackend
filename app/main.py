@@ -74,6 +74,7 @@ from app.routers import (
     reports,
     search,
     users,
+    worksheets,
 )
 from app.routers import (
     google as google_router,
@@ -251,6 +252,7 @@ for r in [
     pipeline_router.router,
     public_router.router,
     sms_router.router,
+    worksheets.router,  # /public/worksheets/{token} — no auth on any route
     webhooks_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)

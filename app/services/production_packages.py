@@ -411,7 +411,16 @@ async def resolve_public_share(
             if link.pin_attempts >= _PIN_MAX_ATTEMPTS:
                 link.pin_locked_until = now + _PIN_LOCKOUT
                 link.pin_attempts = 0
-            await db.flush()
+            # **Committed, not flushed.** `get_db` rolls the session back on any
+            # exception, and the next line raises — so a flushed counter was
+            # discarded on the way out and this lockout never actually held.
+            # The model comment promises attempts are counted on the row rather
+            # than in memory precisely so a restart cannot forget them; until
+            # this commit that promise was not kept, and a six-digit PIN faced
+            # only the in-process throttle. Nothing else in this path is
+            # pending: everything above is a read. `expire_on_commit=False`,
+            # so `link` stays usable afterwards.
+            await db.commit()
             _note_miss(throttle_key)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail={"code": "pin_invalid", "message": "That PIN is not right."})
         link.pin_attempts = 0

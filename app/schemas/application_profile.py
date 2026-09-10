@@ -870,3 +870,65 @@ class FinancialFormSave(BaseModel):
 class FinancialFormsRead(BaseModel):
     forms: list[FinancialFormStatus] = Field(default_factory=list)
     packets: list[FinancialFormPacket] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# The worksheet: the four forms as one grid
+# ---------------------------------------------------------------------------
+
+SheetKind = Literal["p_and_l", "balance_sheet", "debt_schedule", "pfs"]
+
+
+class WorksheetCellEdit(BaseModel):
+    """One cell. `key` is the save key the layout published for that cell —
+    never the row and column it was drawn at, so a client rendering a stale
+    layout cannot write a figure into the wrong line."""
+
+    sheet: SheetKind
+    key: str
+    #: Raw text, exactly as typed. Parsing money and dates is the schema's job
+    #: on save, not the browser's, so "1,250" and "(500)" mean the same here as
+    #: they do on the stacked form.
+    value: str | None = None
+
+
+class WorksheetCellWrite(BaseModel):
+    """A batch of cells and where the client believed the workbook stood.
+
+    `base_rev` is per sheet. It is not a lock: a stale one still lands, because
+    two people typing in different cells is the design, not a conflict. It is
+    read only to notice a client so far behind that patching it would show
+    figures nobody entered.
+    """
+
+    edits: list[WorksheetCellEdit] = Field(default_factory=list)
+    base_rev: dict[str, int] = Field(default_factory=dict)
+
+
+class WorksheetRowOp(BaseModel):
+    """Add or remove a line on one of the two list-shaped sheets."""
+
+    sheet: SheetKind
+    op: Literal["insert", "delete"]
+    #: The row to remove, or (on an insert) the row the new line follows.
+    row_id: str | None = None
+    after: str | None = None
+    #: Which supporting schedule, on the personal financial statement. The debt
+    #: schedule is one list and ignores it.
+    block: str | None = None
+
+
+class WorksheetLinkCreate(BaseModel):
+    """What a share link opens, and what it lets the holder do.
+
+    Both are stored on the link rather than derived from its token. The packet's
+    `{base}.{kind}` derivation means any child token yields the base and the
+    base yields every child, so "this link opens the P&L only" could not be
+    true; an independent token plus a stored scope makes it true.
+    """
+
+    permission: Literal["edit", "view"] = "view"
+    sheets: list[SheetKind] = Field(default_factory=list)
+    ttl_days: int | None = None
+    label: str | None = None
+    invitee_email: str | None = None

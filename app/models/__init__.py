@@ -131,6 +131,11 @@ from app.models.financial_statement import (  # noqa: F401
     FinancialStatement,
     FinancialStatementOwner,
 )
+from app.models.financial_worksheet import (  # noqa: F401
+    FinancialFormLinkSheet,
+    FinancialWorksheet,
+)
+from app.models.financial_worksheet_edit import FinancialWorksheetEdit  # noqa: F401
 from app.models.inline_image import InlineImage  # noqa: F401
 from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
