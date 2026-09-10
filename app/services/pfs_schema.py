@@ -92,33 +92,79 @@ CONTINGENT_ROWS: tuple[SummaryRow, ...] = (
 class Schedule:
     key: str
     label: str
-    columns: tuple[str, ...]
+    #: (key, label) per column, in print order. The key is what a stored row
+    #: is addressed by and what a worksheet cell is named after; the label is
+    #: what the 413 prints and is kept verbatim. Rows written before the keys
+    #: existed are keyed by label — `normalize_schedule_rows` reads both.
+    fields: tuple[tuple[str, str], ...]
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """The column labels, verbatim, in print order — what the PDF and the
+        review screen head their tables with."""
+        return tuple(label for _, label in self.fields)
+
+    @property
+    def column_keys(self) -> tuple[str, ...]:
+        return tuple(key for key, _ in self.fields)
 
 
 #: Sections 2 to 8. Each is a list the borrower adds rows to.
 SCHEDULES: tuple[Schedule, ...] = (
     Schedule("notes_payable", "Notes payable to banks and others", (
-        "Name and address of noteholder", "Original balance", "Current balance",
-        "Payment amount", "Frequency", "How secured or endorsed",
+        ("name_and_address_of_noteholder", "Name and address of noteholder"),
+        ("original_balance", "Original balance"),
+        ("current_balance", "Current balance"),
+        ("payment_amount", "Payment amount"),
+        ("frequency", "Frequency"),
+        ("how_secured_or_endorsed", "How secured or endorsed"),
     )),
     Schedule("stocks_and_bonds", "Stocks and bonds", (
-        "Number of shares", "Name of security", "Cost", "Market value", "Date of quotation",
+        ("number_of_shares", "Number of shares"),
+        ("name_of_security", "Name of security"),
+        ("cost", "Cost"),
+        ("market_value", "Market value"),
+        ("date_of_quotation", "Date of quotation"),
     )),
     Schedule("real_estate", "Real estate owned", (
-        "Property address", "Type", "Date purchased", "Original cost", "Present market value",
-        "Mortgage balance", "Mortgage payment", "Status",
+        ("property_address", "Property address"),
+        ("type", "Type"),
+        ("date_purchased", "Date purchased"),
+        ("original_cost", "Original cost"),
+        ("present_market_value", "Present market value"),
+        ("mortgage_balance", "Mortgage balance"),
+        ("mortgage_payment", "Mortgage payment"),
+        ("status", "Status"),
     )),
     Schedule("other_property", "Other personal property and other assets", (
-        "Description", "Present value", "Amount owing", "Payment", "Terms",
+        ("description", "Description"),
+        ("present_value", "Present value"),
+        ("amount_owing", "Amount owing"),
+        ("payment", "Payment"),
+        ("terms", "Terms"),
     )),
     Schedule("unpaid_taxes", "Unpaid taxes", (
-        "Description", "To whom payable", "Amount", "When due", "Property the lien attaches to",
+        ("description", "Description"),
+        ("to_whom_payable", "To whom payable"),
+        ("amount", "Amount"),
+        ("when_due", "When due"),
+        ("property_the_lien_attaches_to", "Property the lien attaches to"),
     )),
-    Schedule("other_liabilities", "Other liabilities", ("Description", "Amount")),
+    Schedule("other_liabilities", "Other liabilities", (
+        ("description", "Description"),
+        ("amount", "Amount"),
+    )),
     Schedule("life_insurance", "Life insurance held", (
-        "Face amount", "Cash surrender value", "Insurance company", "Beneficiary",
+        ("face_amount", "Face amount"),
+        ("cash_surrender_value", "Cash surrender value"),
+        ("insurance_company", "Insurance company"),
+        ("beneficiary", "Beneficiary"),
     )),
-    Schedule("retirement", "Retirement accounts", ("Account type", "Institution", "Present value")),
+    Schedule("retirement", "Retirement accounts", (
+        ("account_type", "Account type"),
+        ("institution", "Institution"),
+        ("present_value", "Present value"),
+    )),
 )
 
 ASSETS_BY_KEY = {row.key: row for row in ASSET_ROWS}
@@ -129,6 +175,9 @@ LIQUID_ASSET_KEYS = frozenset(row.key for row in ASSET_ROWS if row.liquid)
 
 #: What people actually type into a money field. Decimal accepts none of these.
 _MONEY_NOISE = re.compile(r"[,$\s]")
+#: Accounting notation: "(500)" is minus five hundred on every statement an
+#: accountant has ever handed us.
+_PARENTHESISED = re.compile(r"^\((.*)\)$")
 
 
 def _amount(value: Any) -> Decimal:
@@ -140,6 +189,10 @@ def _amount(value: Any) -> Decimal:
     gate programme eligibility. People type commas into money fields; a total
     that quietly disagrees is worse than one that is obviously blank.
 
+    Parentheses are the accountant's minus sign: "(500)" and "($500)" read as
+    -500, the same as "-500" and "-$500". Before this they parsed as nothing
+    and counted as zero, which turned a stated loss into a blank.
+
     Blank and genuinely unparseable still mean zero: a borrower leaving a line
     empty is the normal case, and a totals routine is the wrong place to reject
     a form. Validation belongs on save, where it can point at the field.
@@ -149,6 +202,11 @@ def _amount(value: Any) -> Decimal:
     if isinstance(value, (int, float)):
         return Decimal(str(value))
     cleaned = _MONEY_NOISE.sub("", str(value))
+    parenthesised = _PARENTHESISED.match(cleaned)
+    if parenthesised:
+        # The parentheses carry the sign; an inner minus is the same statement
+        # made twice, not a double negative.
+        cleaned = "-" + parenthesised.group(1).lstrip("-")
     if not cleaned or cleaned in {"-", "."}:
         return Decimal("0")
     try:
@@ -157,11 +215,68 @@ def _amount(value: Any) -> Decimal:
         return Decimal("0")
 
 
+def schedule_row_key_map(schedule_key: str) -> dict[str, str]:
+    """Column label → column key for one schedule: the map that reads a row
+    stored before the keys existed. Keys map to themselves so a caller can
+    look up either form without asking which it holds."""
+    spec = SCHEDULES_BY_KEY[schedule_key]
+    mapping = {key: key for key, _ in spec.fields}
+    mapping.update({label: key for key, label in spec.fields})
+    return mapping
+
+
+def normalize_schedule_rows(body: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Every schedule's rows, keyed by column key, whatever the stored row was
+    keyed by.
+
+    Rows written before `Schedule.fields` existed carry the column *label* as
+    the key ("Property address"); rows written since carry the column key
+    ("property_address"). This reads both into the keyed form, in memory, so
+    a reader never has to know which it was handed. Nothing is written back:
+    there is no migration, and the stored body is left exactly as it was. A
+    key the schema does not name (a row `id`, say) is carried through
+    untouched; a schedule the schema does not know is carried through as is.
+    Where a row somehow holds both forms of one column, the keyed one wins.
+    """
+    stored = body.get("schedules") or {}
+    if not isinstance(stored, dict):
+        stored = {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for schedule_key, rows in stored.items():
+        if not isinstance(rows, list):
+            continue
+        spec = SCHEDULES_BY_KEY.get(schedule_key)
+        if spec is None:
+            out[schedule_key] = [dict(row) for row in rows if isinstance(row, dict)]
+            continue
+        labels = {label: key for key, label in spec.fields}
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            keyed: dict[str, Any] = {}
+            for name, value in row.items():
+                keyed.setdefault(labels.get(name, name), value)
+            for key, label in spec.fields:
+                if key in row:
+                    keyed[key] = row[key]
+                elif label in row:
+                    keyed[key] = row[label]
+            normalized.append(keyed)
+        out[schedule_key] = normalized
+    for spec in SCHEDULES:
+        out.setdefault(spec.key, [])
+    return out
+
+
 def empty_body() -> dict[str, Any]:
     """A blank 413, for a form opened for the first time."""
     return {
         "schema_version": SCHEMA_VERSION,
         "applicant": {"name": "", "business_phone": "", "home_address": "", "business_name": ""},
+        # The "as of" date the 413 prints. Blank until typed; the statement's
+        # `statement_date` column falls back to it (see `key_facts`).
+        "as_of": "",
         "assets": {row.key: None for row in ASSET_ROWS},
         "liabilities": {row.key: None for row in LIABILITY_ROWS},
         "income": {row.key: None for row in INCOME_ROWS},
@@ -202,7 +317,22 @@ def totals(body: dict[str, Any]) -> dict[str, Decimal]:
     }
 
 
-def key_facts(body: dict[str, Any], *, statement_date: str) -> dict[str, Any]:
+#: What a caller passes when the statement row has no date. The body's own
+#: "as of" line is the better authority then.
+_NO_DATE = frozenset({None, "", "not stated"})
+
+
+def statement_date_for(body: dict[str, Any], statement_date: str | None) -> str | None:
+    """The explicit date when there is one, else what the borrower typed on
+    the form's "as of" line, else the explicit value as passed (so a caller's
+    "not stated" survives to the PDF that prints it)."""
+    if statement_date not in _NO_DATE:
+        return statement_date
+    typed = str(body.get("as_of") or "").strip()
+    return typed or statement_date
+
+
+def key_facts(body: dict[str, Any], *, statement_date: str | None = None) -> dict[str, Any]:
     """The contract the rest of the system already reads.
 
     Deliberately the same five keys, same names, same meaning as the old
@@ -212,7 +342,7 @@ def key_facts(body: dict[str, Any], *, statement_date: str) -> dict[str, Any]:
     """
     computed = totals(body)
     return {
-        "statement_date": statement_date,
+        "statement_date": statement_date_for(body, statement_date),
         "total_assets": float(computed["total_assets"]),
         "total_liabilities": float(computed["total_liabilities"]),
         "net_worth": float(computed["net_worth"]),
@@ -239,7 +369,15 @@ def describe() -> dict[str, Any]:
         "income": _rows(INCOME_ROWS),
         "contingent": _rows(CONTINGENT_ROWS),
         "schedules": [
-            {"key": s.key, "label": s.label, "columns": list(s.columns)} for s in SCHEDULES
+            {
+                "key": s.key,
+                "label": s.label,
+                # `columns` is the labels, as it always was; `fields` pairs
+                # each label with the key a stored row is addressed by.
+                "columns": list(s.columns),
+                "fields": [{"key": key, "label": label} for key, label in s.fields],
+            }
+            for s in SCHEDULES
         ],
         "collects_ssn": False,
     }

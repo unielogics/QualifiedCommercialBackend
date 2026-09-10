@@ -109,6 +109,30 @@ def test_money_typed_the_way_people_type_it_is_counted(typed, expected):
     assert facts["liquid_assets"] == expected
 
 
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("(500)", -500.0),          # the accountant's minus sign
+        ("($500)", -500.0),
+        ("( 1,250.50 )", -1250.50),
+        ("(-500)", -500.0),         # parentheses carry the sign; not a double negative
+        ("-500", -500.0),           # the plain forms still read as they did
+        ("-$500", -500.0),
+        ("$-500", -500.0),
+        ("()", 0.0),                # empty parentheses are a blank, not an error
+    ],
+)
+def test_amount_reads_accounting_parentheses_as_negative(typed, expected):
+    """"(500)" used to strip to "(500)", fail Decimal, and count as zero — a
+    stated loss silently became a blank. Every money field funnels through
+    `_amount`, so this is fixed once."""
+    from decimal import Decimal
+
+    assert pfs_schema._amount(typed) == Decimal(str(expected))
+    facts = pfs_schema.key_facts(_body(cash_on_hand=typed), statement_date="x")
+    assert facts["total_assets"] == expected
+
+
 def test_contingent_liabilities_stay_out_of_total_liabilities():
     """Section 1's right-hand column is a disclosure, not debt on the balance
     sheet. Folding it in would overstate leverage on every file that has one."""
@@ -129,6 +153,106 @@ def test_the_schema_is_served_so_the_browser_need_not_duplicate_it():
         row.key for row in pfs_schema.ASSET_ROWS
     ]
     assert any(row["liquid"] for row in described["assets"])
+
+
+# --- schedule columns: stable keys, verbatim labels -------------------------
+
+
+def test_schedule_columns_have_stable_keys_and_keep_their_labels_verbatim():
+    """A stored schedule row used to be keyed by its English column label, the
+    exact fragility this module's docstring says it removed for summary rows.
+    Each column now has a key; the label is unchanged, so the PDF and the
+    review screen print exactly what they printed."""
+    for spec in pfs_schema.SCHEDULES:
+        keys = spec.column_keys
+        assert len(set(keys)) == len(keys), spec.key
+        assert all(re.fullmatch(r"[a-z][a-z0-9_]*", key) for key in keys), spec.key
+        assert spec.columns == tuple(label for _, label in spec.fields)
+    real_estate = pfs_schema.SCHEDULES_BY_KEY["real_estate"]
+    assert real_estate.columns == (
+        "Property address", "Type", "Date purchased", "Original cost", "Present market value",
+        "Mortgage balance", "Mortgage payment", "Status",
+    )
+    assert real_estate.column_keys[:3] == ("property_address", "type", "date_purchased")
+
+    served = {s["key"]: s for s in pfs_schema.describe()["schedules"]}
+    for spec in pfs_schema.SCHEDULES:
+        assert served[spec.key]["columns"] == list(spec.columns)
+        assert served[spec.key]["fields"] == [
+            {"key": key, "label": label} for key, label in spec.fields
+        ]
+
+
+def test_the_row_key_map_reads_a_label_or_a_key():
+    mapping = pfs_schema.schedule_row_key_map("other_liabilities")
+    assert mapping["Description"] == "description"
+    assert mapping["Amount"] == "amount"
+    assert mapping["amount"] == "amount"
+    with pytest.raises(KeyError):
+        pfs_schema.schedule_row_key_map("no_such_schedule")
+
+
+def test_normalize_schedule_rows_reads_old_label_keyed_rows_without_writing():
+    """Rows written before the keys existed are read into the keyed shape in
+    memory. The stored body is untouched — no migration, no write — and a
+    key the schema does not name (a row id) survives the trip."""
+    body = pfs_schema.empty_body()
+    body["schedules"]["real_estate"] = [
+        {"Property address": "12 Main St", "Mortgage balance": "250,000", "id": "r1"},
+    ]
+    body["schedules"]["other_liabilities"] = [{"description": "Loan", "amount": "1"}]
+    body["schedules"]["not_a_schedule"] = [{"x": 1}]
+    frozen = repr(body)
+
+    rows = pfs_schema.normalize_schedule_rows(body)
+
+    assert rows["real_estate"] == [
+        {"property_address": "12 Main St", "mortgage_balance": "250,000", "id": "r1"}
+    ]
+    assert rows["other_liabilities"] == [{"description": "Loan", "amount": "1"}]  # already keyed
+    assert rows["not_a_schedule"] == [{"x": 1}]                                  # carried through
+    assert rows["unpaid_taxes"] == []                                             # every schedule present
+    assert repr(body) == frozen                                                   # nothing written
+
+
+def test_normalize_schedule_rows_is_idempotent_and_prefers_the_keyed_form():
+    body = pfs_schema.empty_body()
+    body["schedules"]["other_liabilities"] = [
+        {"Description": "old label", "description": "new key", "Amount": "5"},
+    ]
+    once = pfs_schema.normalize_schedule_rows(body)
+    assert once["other_liabilities"] == [{"description": "new key", "amount": "5"}]
+    twice = pfs_schema.normalize_schedule_rows({"schedules": once})
+    assert twice == once
+    # Junk shapes are dropped rather than raised on.
+    assert pfs_schema.normalize_schedule_rows({"schedules": "nope"})["retirement"] == []
+    assert pfs_schema.normalize_schedule_rows({"schedules": {"retirement": [1, "x"]}})["retirement"] == []
+
+
+# --- the "as of" line -------------------------------------------------------
+
+
+def test_as_of_is_blank_on_an_empty_body_and_backs_statement_date():
+    """The 413 prints an "as of" date, and every PDF read "not stated" because
+    nothing ever sent one. The body carries it now, and the statement date
+    falls back to it when the row has none."""
+    body = pfs_schema.empty_body()
+    assert body["as_of"] == ""
+
+    body["as_of"] = "2026-06-30"
+    assert pfs_schema.key_facts(body, statement_date="not stated")["statement_date"] == "2026-06-30"
+    assert pfs_schema.key_facts(body, statement_date=None)["statement_date"] == "2026-06-30"
+    assert pfs_schema.key_facts(body)["statement_date"] == "2026-06-30"
+    # An explicit date still wins over what was typed.
+    assert pfs_schema.key_facts(body, statement_date="2026-09-05")["statement_date"] == "2026-09-05"
+    # Neither: the caller's own placeholder survives to the PDF that prints it.
+    body["as_of"] = "  "
+    assert pfs_schema.key_facts(body, statement_date="not stated")["statement_date"] == "not stated"
+    assert pfs_schema.key_facts(body)["statement_date"] is None
+    # The five-key contract is unchanged by any of this.
+    assert set(pfs_schema.key_facts(body)) == {
+        "statement_date", "total_assets", "total_liabilities", "net_worth", "liquid_assets",
+    }
 
 
 # --- the rendered sheet ----------------------------------------------------

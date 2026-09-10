@@ -594,6 +594,37 @@ async def get_current_user(
     return user
 
 
+async def resolve_user_from_headers(
+    request: Request,
+    *,
+    authorization: str | None,
+    x_dev_user: str | None,
+    db: AsyncSession,
+) -> User:
+    """Resolve the caller outside the dependency graph.
+
+    A streaming route owns its own session: the request-scoped one from
+    `get_db` would otherwise stay open for the life of the stream, so the route
+    opens a short-lived session, authenticates, commits and closes it before a
+    single frame is sent. That is why it cannot declare `CurrentUser` and why
+    this seam exists rather than each such route reaching into the private
+    resolver: `get_current_user` was reduced to a one-parameter wrapper over
+    `_resolve_current_user` and the only direct caller — the communication
+    event stream — kept passing four keyword arguments. Nothing failed at
+    import; every connection failed at runtime with a `TypeError` swallowed
+    into a bare 500. A caller that goes through this function breaks at import
+    time on the next rename, and gets the same actor naming `get_current_user`
+    applies, which the stream had lost.
+
+    Same contract as `CurrentUser` — the four return paths of the resolver,
+    the account/boundary gates, the request context told who the actor is —
+    only the session is the caller's.
+    """
+    user = await _resolve_current_user(request, authorization, x_dev_user, db)
+    request_context.set_actor(user.id, actor_label=str(getattr(user, "role", "") or "user"))
+    return user
+
+
 def _enforce_account_active(user: User, request: Request) -> None:
     """Deny suspended accounts everywhere except the identity status read."""
 

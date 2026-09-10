@@ -1,8 +1,15 @@
 """Transaction-aware communication change events for Field Desk.
 
 Message rows and notifications remain the source of truth. PostgreSQL NOTIFY
-only tells connected browsers which scoped query became stale; payloads never
-contain message bodies or contact details.
+only tells connected browsers which scoped query became stale; payloads carry
+invalidation signals only, never message bodies or contact details — except on
+`sheet:` audiences, where the key is by construction identical to the read
+scope and the value is the point of the event.
+
+That exception holds on two invariants, and only on those two: the audience
+key equals the read scope (hence one key per worksheet *and* sheet, see
+`sheet_audience`), and no audience is ever derived from client input — it is
+computed server-side from the resolved link row or the staff user's access.
 """
 
 from __future__ import annotations
@@ -33,6 +40,13 @@ MAX_QUEUE_SIZE = 100
 
 def user_audience(user_id: uuid.UUID | str) -> str:
     return f"user:{user_id}"
+
+
+def sheet_audience(worksheet_id: uuid.UUID | str, sheet_kind: str) -> str:
+    """One key per (worksheet, sheet). NOT one per worksheet: a link that opens
+    the P&L and not the personal financial statement must not receive PFS cell
+    values, and the audience key is the only thing standing between them."""
+    return f"sheet:{worksheet_id}:{sheet_kind}"
 
 
 def _event_payload(
@@ -180,6 +194,21 @@ class CommunicationEventBroker:
 
 
 broker = CommunicationEventBroker()
+
+
+def publish_ephemeral(payload: dict[str, Any]) -> None:
+    """Presence and cursors: no row, nothing to commit, and worthless after a
+    restart, so they never touch pg_notify. In-process only — correct while the
+    API runs `--workers 1` (the Dockerfile CMD comment: APScheduler is
+    in-process and two workers would double-fire every cron tick), and the
+    first thing that breaks at two: subscribers on the other worker simply
+    never hear it, with no error anywhere. When that day comes, this is the one
+    function to move onto pg_notify with its own short-lived connection.
+
+    The payload must already carry its `audiences`; `dispatch` routes on them
+    and nothing else.
+    """
+    broker.dispatch(payload)
 
 
 async def publish_communication_event(

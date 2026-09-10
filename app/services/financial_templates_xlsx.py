@@ -7,6 +7,13 @@ here, by openpyxl, from the same row definitions the on-screen forms render
 (`business_statement_schema`, `pfs_schema`, `DEBT_COLUMNS`), so the spreadsheet
 a borrower downloads can never drift from the form their advisor sends.
 
+The rows themselves live in `sheet_layout`: one `Sheet` per kind, shared with
+the on-screen worksheet grid, whose row numbers are the numbers this module
+writes and whose `xlsx_name`s are the defined names it declares. This module
+is only the renderer — styles, protection, formulas resolved from keys to
+cell addresses, the hidden key column — and `test_sheet_layout.py` pins the
+two together row for row.
+
 What the generator fixes in the originals, deliberately:
 
 - dates are blank date cells with a comment, never a title string like
@@ -31,7 +38,7 @@ What the generator fixes in the originals, deliberately:
 There is a fifth download: the same four forms as four tabs of one workbook
 (`build_packet_workbook`, slug "financial-package"), the "one sheet we can
 forward the client or their accountant" the owner asked for. It is built from
-the very same builders — nothing about a form changes because it is a tab
+the very same renderer — nothing about a form changes because it is a tab
 rather than a file — so the packet cannot drift from the four singles either.
 
 A workbook written by openpyxl carries no cached formula values. The analyzer
@@ -59,8 +66,16 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.services import business_statement_schema as bss
-from app.services import pfs_schema
-from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
+from app.services import pfs_schema, sheet_layout
+from app.services.financial_statements import DEBT_COLUMNS
+from app.services.sheet_layout import (  # noqa: F401 — re-exported; callers read them here
+    DEBT_ROWS,
+    NAME_PREFIX,
+    SHEET_TITLES,
+    Cell,
+    Row,
+    Sheet,
+)
 
 MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -99,23 +114,6 @@ ATTACHMENT_FILENAMES: dict[str, str] = {
     "pfs": "Qualified Commercial - Personal Financial Statement.xlsx",
 }
 
-SHEET_TITLES: dict[str, str] = {
-    "p_and_l": "Profit and Loss",
-    "balance_sheet": "Balance Sheet",
-    "debt_schedule": "Business Debt Schedule",
-    "pfs": "Personal Financial Statement",
-}
-
-NAME_PREFIX: dict[str, str] = {
-    "p_and_l": "pl",
-    "balance_sheet": "bs",
-    "debt_schedule": "ds",
-    "pfs": "pfs",
-}
-
-#: Rows in the debt-schedule grid. The owner's template had fifteen.
-DEBT_ROWS = 15
-
 MONEY_FORMAT = '#,##0.00;(#,##0.00);"-"'
 DATE_FORMAT = "yyyy-mm-dd"
 RATE_FORMAT = "0.00"
@@ -134,6 +132,10 @@ _UNLOCKED = Protection(locked=False)
 _RIGHT = Alignment(horizontal="right")
 _WRAP = Alignment(wrap_text=True, vertical="top")
 
+#: A formula in the layout is written against keys in braces; the renderer
+#: turns each into the cell address the layout's (c, r) says.
+_FORMULA_REF = re.compile(r"\{([^{}]+)\}")
+
 
 def _sheet_for(wb: Workbook, kind: str, *, first: bool) -> Worksheet:
     """The sheet one form writes into.
@@ -151,43 +153,82 @@ def _sheet_for(wb: Workbook, kind: str, *, first: bool) -> Worksheet:
 
 
 class _Form:
-    """A label / input / hidden-key layout, one line per row."""
+    """The renderer for one `Sheet`: a label / input / hidden-key layout on
+    the form sheets, and a wide grid for the debt schedule and the PFS
+    schedule blocks.
+
+    Two key schemes, both a workbook detail the layout never sees. The form
+    sheets carry the schema key in hidden column C beside every input. The
+    debt schedule carries the column keys on a hidden row under its column
+    head and the line's ordinal in a hidden column past the last one.
+    """
 
     LABEL, INPUT, KEY = "A", "B", "C"
 
-    def __init__(self, wb: Workbook, kind: str, *, first: bool = True) -> None:
-        self.ws: Worksheet = _sheet_for(wb, kind, first=first)
+    def __init__(self, wb: Workbook, sheet: Sheet, *, first: bool = True) -> None:
+        self.ws: Worksheet = _sheet_for(wb, sheet.kind, first=first)
         self.wb = wb
-        self.prefix = NAME_PREFIX[kind]
+        self.sheet = sheet
+        self.prefix = sheet.name_prefix
         self.row = 0
         self.cells: dict[str, int] = {}
-        self.ws.column_dimensions[self.LABEL].width = 46
-        self.ws.column_dimensions[self.INPUT].width = 20
-        self.ws.column_dimensions[self.KEY].hidden = True
+        self.keys_beside_inputs = sheet.kind != "debt_schedule"
+        self.key_column = 3 if self.keys_beside_inputs else len(sheet.columns) + 1
+        self.last_column = max(column.c for column in sheet.columns)
+        self._validations: dict[tuple[str, ...], DataValidation] = {}
+        # Every keyed or named cell's address, from the layout's (c, r), so a
+        # formula can be resolved before the cell it points at is written.
+        self.refs: dict[str, str] = {}
+        for row in sheet.rows:
+            for cell in row.cells:
+                address = f"{get_column_letter(cell.c)}{row.r}"
+                if cell.key is not None:
+                    self.refs[cell.key] = address
+                if cell.xlsx_name is not None:
+                    self.refs.setdefault(cell.xlsx_name, address)
+        for column in sheet.columns:
+            self.ws.column_dimensions[get_column_letter(column.c)].width = column.width
+        self.ws.column_dimensions[get_column_letter(self.key_column)].hidden = True
 
-    def _name(self, key: str, row: int) -> None:
+    def resolve(self, formula: str) -> str:
+        return _FORMULA_REF.sub(lambda match: self.refs[match.group(1)], formula)
+
+    def band(self, colspan: int) -> list[int]:
+        """The first `colspan` sheet columns — what a heading fills and a
+        note merges across."""
+        return [column.c for column in self.sheet.columns[:colspan]]
+
+    def _name(self, key: str, row: int, column: int = 2) -> None:
         name = f"{self.prefix}.{key}"
         self.wb.defined_names[name] = DefinedName(
-            name=name, attr_text=f"'{self.ws.title}'!${self.INPUT}${row}"
+            name=name, attr_text=f"'{self.ws.title}'!${get_column_letter(column)}${row}"
         )
         self.cells[key] = row
 
-    def title(self, text: str, subtitle: str) -> None:
+    def _validation(self, options: tuple[str, ...]) -> DataValidation:
+        """One list validation per option set per sheet."""
+        found = self._validations.get(options)
+        if found is None:
+            found = DataValidation(
+                type="list", formula1='"' + ",".join(options) + '"', allow_blank=True
+            )
+            self.ws.add_data_validation(found)
+            self._validations[options] = found
+        return found
+
+    def line(self, text: str, font: Font) -> None:
+        """A title or subtitle: one styled cell in column A."""
         self.row += 1
         cell = self.ws.cell(row=self.row, column=1, value=text)
-        cell.font = _TITLE_FONT
-        self.row += 1
-        cell = self.ws.cell(row=self.row, column=1, value=subtitle)
-        cell.font = _MUTED
-        self.row += 1
+        cell.font = font
 
-    def heading(self, text: str) -> None:
+    def heading(self, text: str, columns: list[int]) -> None:
         self.row += 1
-        for column in (1, 2):
+        for column in columns:
             cell = self.ws.cell(row=self.row, column=column)
             cell.fill = _HEADING_FILL
             cell.font = _HEADING_FONT
-        self.ws.cell(row=self.row, column=1).value = text
+        self.ws.cell(row=self.row, column=columns[0]).value = text
 
     def text_field(self, key: str, label: str, *, input: str = "text", options=None, hint: str | None = None) -> None:
         self.row += 1
@@ -199,15 +240,12 @@ class _Form:
             cell.number_format = DATE_FORMAT
             cell.comment = Comment(hint or "Enter as a date (year-month-day).", _AUTHOR)
         elif input == "select" and options:
-            validation = DataValidation(
-                type="list", formula1='"' + ",".join(options) + '"', allow_blank=True
-            )
-            self.ws.add_data_validation(validation)
-            validation.add(cell)
+            self._validation(tuple(options)).add(cell)
             cell.comment = Comment(hint or "Choose: " + " or ".join(options) + ".", _AUTHOR)
         elif hint:
             cell.comment = Comment(hint, _AUTHOR)
-        self.ws.cell(row=self.row, column=3, value=key)
+        if self.keys_beside_inputs:
+            self.ws.cell(row=self.row, column=3, value=key)
         self._name(key, self.row)
 
     def money_row(self, key: str, label: str, *, hint: str | None = None) -> int:
@@ -237,12 +275,12 @@ class _Form:
         self._name(key, self.row)
         return self.row
 
-    def note(self, text: str) -> None:
+    def note(self, text: str, *, end_column: int = 2) -> None:
         self.row += 1
         cell = self.ws.cell(row=self.row, column=1, value=text)
         cell.font = _MUTED
         cell.alignment = _WRAP
-        self.ws.merge_cells(start_row=self.row, start_column=1, end_row=self.row, end_column=2)
+        self.ws.merge_cells(start_row=self.row, start_column=1, end_row=self.row, end_column=end_column)
 
     def blank(self) -> None:
         self.row += 1
@@ -250,283 +288,96 @@ class _Form:
     def ref(self, key: str) -> str:
         return f"{self.INPUT}{self.cells[key]}"
 
-    def section(self, section: bss.Section) -> int:
-        """A schema section: heading, one money row per line, a subtotal
-        formula that subtracts the contra rows."""
-        self.heading(section.label)
-        rows = [self.money_row(row.key, row.label, hint=row.hint) for row in section.rows]
-        contras = {row.key for row in section.rows if row.contra}
-        if not contras:
-            formula = f"=SUM({self.INPUT}{rows[0]}:{self.INPUT}{rows[-1]})"
-        else:
-            terms = [
-                ("-" if row.key in contras else "+") + f"{self.INPUT}{number}"
-                for row, number in zip(section.rows, rows, strict=True)
-            ]
-            formula = "=" + "".join(terms).lstrip("+")
-        return self.formula_row(section.subtotal_key, section.subtotal_label, formula)
+    # --- the grid rows: the debt schedule, and the PFS schedule blocks ------
+
+    def colhead(self, row: Row) -> None:
+        self.row += 1
+        for cell in row.cells:
+            target = self.ws.cell(row=self.row, column=cell.c, value=cell.label)
+            target.font = _HEADING_FONT
+            target.fill = _HEADING_FILL
+            target.alignment = _WRAP
+        if not self.keys_beside_inputs:
+            # The schema key under its label, on a hidden row.
+            for index, key in enumerate(DEBT_COLUMNS, start=1):
+                self.ws.cell(row=self.row + 1, column=index, value=key)
+            self.ws.row_dimensions[self.row + 1].hidden = True
+
+    def data(self, row: Row) -> None:
+        self.row += 1
+        if not self.keys_beside_inputs:
+            self.ws.cell(row=self.row, column=self.key_column, value=f"r{row.ordinal}")
+        for cell in row.cells:
+            target = self.ws.cell(row=self.row, column=cell.c)
+            target.protection = _UNLOCKED
+            target.fill = _INPUT_FILL
+            if cell.type == "money":
+                target.number_format = MONEY_FORMAT
+            elif cell.type == "rate":
+                target.number_format = RATE_FORMAT
+            elif cell.type == "date":
+                target.number_format = DATE_FORMAT
+            elif cell.type == "select" and cell.options:
+                self._validation(tuple(cell.options)).add(target)
+            self._name(cell.xlsx_name, self.row, cell.c)
+
+    def totals(self, row: Row) -> None:
+        self.row += 1
+        for cell in row.cells:
+            if cell.type == "label":
+                self.ws.cell(row=self.row, column=cell.c, value=cell.label).font = _BOLD
+                continue
+            target = self.ws.cell(row=self.row, column=cell.c, value=self.resolve(cell.formula))
+            target.number_format = MONEY_FORMAT
+            target.font = _BOLD
+            self._name(cell.xlsx_name, self.row, cell.c)
 
     def finish(self) -> None:
-        self.ws.print_area = f"A1:B{self.row}"
+        self.ws.print_area = f"A1:{get_column_letter(self.last_column)}{self.row}"
+        if self.last_column > 2:
+            self.ws.page_setup.orientation = "landscape"
         self.ws.protection.sheet = True
-        self.ws.sheet_view.showGridLines = True
+        if self.keys_beside_inputs:
+            self.ws.sheet_view.showGridLines = True
 
 
-def _header_fields(form: _Form, fields: tuple[bss.HeaderField, ...]) -> None:
-    for field in fields:
-        form.text_field(field.key, field.label, input=field.input, options=field.options)
-
-
-def _build_p_and_l(wb: Workbook, *, first: bool = True) -> None:
-    schema = bss.SCHEMA_FOR["p_and_l"]
-    form = _Form(wb, "p_and_l", first=first)
-    form.title(
-        "Profit and Loss Statement",
-        "Enter the figures for the period. Totals are calculated for you.",
-    )
-    _header_fields(form, schema.header)
-    by_key = {section.key: section for section in schema.sections}
-
-    form.blank()
-    form.section(by_key["revenue"])
-    form.blank()
-    form.section(by_key["operating_expenses"])
-    form.formula_row(
-        "operating_income",
-        "Operating income",
-        f"={form.ref('gross_profit')}-{form.ref('total_operating_expenses')}",
-    )
-    form.blank()
-    below = by_key["below_the_line"]
-    form.heading(below.label)
-    for row in below.rows:
-        form.money_row(row.key, row.label, hint=row.hint)
-    form.formula_row(
-        "net_income",
-        "Net income",
-        f"={form.ref('operating_income')}+{form.ref('other_income')}-{form.ref('income_taxes')}",
-    )
-
-    # The memo block: every row flagged addback, by the flag. taxes_and_licenses
-    # is not flagged and so never appears here.
-    form.blank()
-    form.heading("EBITDA (memo)")
-    addback_rows = [
-        row for section in schema.sections for row in section.rows if row.addback
-    ]
-    memo_refs = [form.ref("net_income")]
-    for row in addback_rows:
-        number = form.formula_row(
-            f"memo_{row.key}", f"Add: {row.label.lower()}", f"={form.ref(row.key)}", emphasis=False
-        )
-        memo_refs.append(f"{form.INPUT}{number}")
-    form.formula_row("ebitda", "EBITDA (memo)", "=" + "+".join(memo_refs))
-    owner_rows = [row for section in schema.sections for row in section.rows if row.owner_comp]
-    form.formula_row(
-        "owner_compensation",
-        "Owner compensation (add-back candidate, not added)",
-        "=" + "+".join(form.ref(row.key) for row in owner_rows),
-        emphasis=False,
-    )
-    form.note(
-        "Notes: describe what \"Other expenses\" covers, and anything a reader should know "
-        "about this period."
-    )
-    form.text_field("notes", "Notes")
+def _render(wb: Workbook, sheet: Sheet, *, first: bool = True) -> None:
+    """Write one layout's rows into a sheet of `wb`, in row order."""
+    form = _Form(wb, sheet, first=first)
+    for row in sheet.rows:
+        form.row = row.r - 1
+        if row.kind == "title":
+            form.line(row.label, _TITLE_FONT)
+        elif row.kind == "subtitle":
+            form.line(row.label, _MUTED)
+        elif row.kind == "blank":
+            form.blank()
+        elif row.kind == "heading":
+            form.heading(row.label, form.band(row.cells[0].colspan))
+        elif row.kind == "note":
+            form.note(row.label, end_column=form.band(row.cells[0].colspan)[-1])
+        elif row.kind == "field":
+            cell = next(cell for cell in row.cells if cell.key is not None)
+            if cell.type == "money":
+                form.money_row(cell.key, row.label, hint=cell.hint)
+            else:
+                form.text_field(cell.key, row.label, input=cell.type, options=cell.options, hint=cell.hint)
+        elif row.kind == "formula" and row.block is None:
+            cell = next(cell for cell in row.cells if cell.type == "formula")
+            form.formula_row(cell.xlsx_name, row.label, form.resolve(cell.formula), emphasis=cell.emphasis)
+        elif row.kind == "formula":
+            form.totals(row)
+        elif row.kind == "colhead":
+            form.colhead(row)
+        elif row.kind == "data":
+            form.data(row)
+        else:
+            raise ValueError(f"unknown row kind {row.kind!r}")
     form.finish()
 
 
-def _build_balance_sheet(wb: Workbook, *, first: bool = True) -> None:
-    schema = bss.SCHEMA_FOR["balance_sheet"]
-    form = _Form(wb, "balance_sheet", first=first)
-    form.title(
-        "Balance Sheet",
-        "Enter every balance as of one date. Totals are calculated for you.",
-    )
-    _header_fields(form, schema.header)
-    by_key = {section.key: section for section in schema.sections}
-
-    form.blank()
-    for key in ("current_assets", "fixed_assets", "other_assets"):
-        form.section(by_key[key])
-    form.formula_row(
-        "total_assets",
-        "Total assets",
-        f"={form.ref('total_current_assets')}+{form.ref('total_fixed_assets')}"
-        f"+{form.ref('total_other_assets')}",
-    )
-    form.blank()
-    for key in ("current_liabilities", "long_term_liabilities"):
-        form.section(by_key[key])
-    form.formula_row(
-        "total_liabilities",
-        "Total liabilities",
-        f"={form.ref('total_current_liabilities')}+{form.ref('total_long_term_liabilities')}",
-    )
-    form.blank()
-    equity = by_key["equity"]
-    form.heading(equity.label)
-    equity_rows = [form.money_row(row.key, row.label, hint=row.hint) for row in equity.rows]
-    typed = "".join(
-        ("-" if row.contra else "+") + f"{form.INPUT}{number}"
-        for row, number in zip(equity.rows, equity_rows, strict=True)
-    ).lstrip("+")
-    first, last = equity_rows[0], equity_rows[-1]
-    # Typed when any equity line is typed; implied from assets less liabilities
-    # when the whole section is blank — the same rule the on-screen form uses.
-    form.formula_row(
-        "total_equity",
-        "Total equity (implied from assets less liabilities when left blank)",
-        f"=IF(COUNT({form.INPUT}{first}:{form.INPUT}{last})=0,"
-        f"{form.ref('total_assets')}-{form.ref('total_liabilities')},{typed})",
-    )
-    form.blank()
-    form.formula_row(
-        "total_liabilities_and_equity",
-        "Total liabilities and equity",
-        f"={form.ref('total_liabilities')}+{form.ref('total_equity')}",
-    )
-    form.formula_row(
-        "imbalance",
-        "Unreconciled difference (assets less liabilities and equity)",
-        f"={form.ref('total_assets')}-{form.ref('total_liabilities_and_equity')}",
-        emphasis=False,
-    )
-    form.note(
-        "A difference other than zero means the sheet does not balance. Leave the equity "
-        "section blank to have equity implied."
-    )
-    form.text_field("notes", "Notes")
-    form.finish()
-
-
-def _build_pfs(wb: Workbook, *, first: bool = True) -> None:
-    form = _Form(wb, "pfs", first=first)
-    form.title(
-        "Personal Financial Statement",
-        "One statement per owner. Totals are calculated for you.",
-    )
-    form.text_field("name", "Name")
-    form.text_field("business_name", "Business name")
-    form.text_field("home_address", "Home address")
-    form.text_field("business_phone", "Business phone")
-    form.text_field("statement_date", "As of", input="date")
-
-    def block(heading: str, rows, total_key: str, total_label: str) -> None:
-        form.blank()
-        form.heading(heading)
-        numbers = [form.money_row(row.key, row.label) for row in rows]
-        form.formula_row(
-            total_key, total_label, f"=SUM({form.INPUT}{numbers[0]}:{form.INPUT}{numbers[-1]})"
-        )
-
-    block("Assets", pfs_schema.ASSET_ROWS, "total_assets", "Total assets")
-    block("Liabilities", pfs_schema.LIABILITY_ROWS, "total_liabilities", "Total liabilities")
-    form.formula_row(
-        "net_worth", "Net worth", f"={form.ref('total_assets')}-{form.ref('total_liabilities')}"
-    )
-    block("Source of income (annual)", pfs_schema.INCOME_ROWS, "total_income", "Total income")
-    block(
-        "Contingent liabilities",
-        pfs_schema.CONTINGENT_ROWS,
-        "total_contingent",
-        "Total contingent liabilities",
-    )
-    form.blank()
-    form.note(
-        "The supporting schedules (notes payable, stocks and bonds, real estate, other "
-        "property, unpaid taxes, other liabilities, life insurance, retirement accounts) are "
-        "completed on screen through the link your advisor sends. No Social Security Number "
-        "is collected on this form."
-    )
-    form.finish()
-
-
-def _build_debt_schedule(wb: Workbook, *, first: bool = True) -> None:
-    ws: Worksheet = _sheet_for(wb, "debt_schedule", first=first)
-    prefix = NAME_PREFIX["debt_schedule"]
-    columns = len(DEBT_COLUMNS)
-    key_column = columns + 1  # hidden, carries the row key
-
-    def name(key: str, column: int, row: int) -> None:
-        full = f"{prefix}.{key}"
-        wb.defined_names[full] = DefinedName(
-            name=full, attr_text=f"'{ws.title}'!${get_column_letter(column)}${row}"
-        )
-
-    ws.cell(row=1, column=1, value="Business Debt Schedule").font = _TITLE_FONT
-    ws.cell(
-        row=2,
-        column=1,
-        value="One line per outstanding business debt. Totals are calculated for you.",
-    ).font = _MUTED
-    ws.cell(row=3, column=1, value="Business name")
-    business = ws.cell(row=3, column=2)
-    business.protection = _UNLOCKED
-    business.fill = _INPUT_FILL
-    name("business_name", 2, 3)
-
-    header_row = 5
-    for index, (key, label) in enumerate(zip(DEBT_COLUMNS, DEBT_COLUMN_LABELS, strict=True), start=1):
-        cell = ws.cell(row=header_row, column=index, value=label)
-        cell.font = _HEADING_FONT
-        cell.fill = _HEADING_FILL
-        cell.alignment = _WRAP
-        # The schema key under its label, on a hidden row.
-        ws.cell(row=header_row + 1, column=index, value=key)
-    ws.row_dimensions[header_row + 1].hidden = True
-    ws.column_dimensions[get_column_letter(key_column)].hidden = True
-
-    secured = DataValidation(type="list", formula1='"secured,unsecured"', allow_blank=True)
-    paid = DataValidation(type="list", formula1='"current,delinquent"', allow_blank=True)
-    ws.add_data_validation(secured)
-    ws.add_data_validation(paid)
-
-    first = header_row + 2
-    last = first + DEBT_ROWS - 1
-    for number in range(1, DEBT_ROWS + 1):
-        row = first + number - 1
-        ws.cell(row=row, column=key_column, value=f"r{number}")
-        for index, key in enumerate(DEBT_COLUMNS, start=1):
-            cell = ws.cell(row=row, column=index)
-            cell.protection = _UNLOCKED
-            cell.fill = _INPUT_FILL
-            if key in {"original_amount", "balance", "monthly_payment"}:
-                cell.number_format = MONEY_FORMAT
-            elif key == "rate":
-                cell.number_format = RATE_FORMAT
-            elif key in {"originated_on", "maturity_on"}:
-                cell.number_format = DATE_FORMAT
-            elif key == "secured":
-                secured.add(cell)
-            elif key == "payment_status":
-                paid.add(cell)
-            name(f"r{number}.{key}", index, row)
-
-    totals_row = last + 1
-    ws.cell(row=totals_row, column=1, value="Total").font = _BOLD
-    for key in ("balance", "monthly_payment"):
-        column = DEBT_COLUMNS.index(key) + 1
-        letter = get_column_letter(column)
-        cell = ws.cell(row=totals_row, column=column, value=f"=SUM({letter}{first}:{letter}{last})")
-        cell.number_format = MONEY_FORMAT
-        cell.font = _BOLD
-        name(f"total_{key}", column, totals_row)
-
-    widths = {"lender": 28, "debt_type": 16, "collateral": 24, "notes": 30}
-    for index, key in enumerate(DEBT_COLUMNS, start=1):
-        ws.column_dimensions[get_column_letter(index)].width = widths.get(key, 15)
-    ws.print_area = f"A1:{get_column_letter(columns)}{totals_row}"
-    ws.page_setup.orientation = "landscape"
-    ws.protection.sheet = True
-
-
-_BUILDERS = {
-    "p_and_l": _build_p_and_l,
-    "balance_sheet": _build_balance_sheet,
-    "debt_schedule": _build_debt_schedule,
-    "pfs": _build_pfs,
-}
+def _build(wb: Workbook, kind: str, *, first: bool = True) -> None:
+    _render(wb, sheet_layout.layout(kind), first=first)
 
 
 #: `dcterms:modified` inside docProps/core.xml, whatever openpyxl put there.
@@ -583,10 +434,10 @@ def _finished_bytes(wb: Workbook) -> bytes:
 @functools.cache
 def build_workbook(kind: str) -> bytes:
     """The workbook for one kind, as bytes. Built once per process."""
-    if kind not in _BUILDERS:
+    if kind not in sheet_layout.KINDS:
         raise KeyError(kind)
     wb = _blank_workbook(SHEET_TITLES[kind])
-    _BUILDERS[kind](wb)
+    _build(wb, kind)
     return _finished_bytes(wb)
 
 
@@ -595,15 +446,15 @@ def build_packet_workbook() -> bytes:
     """All four forms as four tabs of one workbook, as bytes.
 
     The "one sheet we can forward the client or their accountant": a client or
-    their accountant fills one file instead of four. Same builders, same rows,
+    their accountant fills one file instead of four. Same renderer, same rows,
     same defined names — the prefixes (`pl.` / `bs.` / `ds.` / `pfs.`) and the
     sheet title inside each name keep them apart in one workbook. Four sheets
-    of 50/56/22/49 rows sits inside the analyzer's budget, so a filled copy
+    of 50/56/22/80 rows sits inside the analyzer's budget, so a filled copy
     uploaded back is still read whole. Built once per process.
     """
     wb = _blank_workbook(PACKET_TITLE)
     for index, kind in enumerate(PACKET_KINDS):
-        _BUILDERS[kind](wb, first=index == 0)
+        _build(wb, kind, first=index == 0)
     return _finished_bytes(wb)
 
 

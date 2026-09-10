@@ -86,11 +86,78 @@ def test_other_income_sits_below_gross_profit_and_net_income_is_unchanged():
 
 
 def test_owner_lines_are_kept_in_the_owners_order_with_the_two_corrections():
-    keys = [row.key for row in bss.PL_SECTIONS[1].rows]
+    keys = [row.key for row in bss.PL_SECTIONS[1].rows if not row.text]
     assert keys[:2] == ["supplies", "depreciation_and_amortization"]
     assert keys[10] == "taxes_and_licenses"
     assert keys[-1] == "other"
     assert len(keys) == 19
+
+
+def test_the_other_expenses_description_is_a_text_row_beside_the_line_it_describes():
+    """It used to be written into the body by hand and absent from the schema,
+    so `describe()` never served it and nothing rendered it. Now it is a row
+    like any other, flagged as words rather than money."""
+    rows = bss.PL_SECTIONS[1].rows
+    assert [row.key for row in rows][-2:] == ["other", "other_description"]
+    description = rows[-1]
+    assert description.text is True
+    assert not (description.addback or description.contra or description.owner_comp)
+    # Seeded by the schema, not by a special case in pl_empty_body.
+    assert "other_description" in bss.pl_empty_body()["sections"]["operating_expenses"]
+    served = bss.describe("p_and_l")
+    opex = next(section for section in served["sections"] if section["key"] == "operating_expenses")
+    assert {row["key"]: row["text"] for row in opex["rows"]}["other_description"] is True
+    assert sum(row["text"] for row in opex["rows"]) == 1
+
+
+def test_a_number_typed_in_the_description_row_is_never_summed():
+    """Safe before only because `_amount("words") == 0`. A borrower who types
+    "500" there must not add $500 to operating expenses, nor to any add-back."""
+    body = _pl(gross_revenue="10000", supplies="100", other="50", other_description="500")
+    totals = bss.pl_totals(body)
+    assert totals["total_operating_expenses"] == Decimal("150")
+    assert totals["addbacks"] == Decimal("0")
+    assert totals["owner_compensation"] == Decimal("0")
+    assert totals["net_income"] == Decimal("9850")
+
+
+def test_every_section_declares_what_it_is():
+    """The browser rolled the balance sheet up by sniffing section keys for
+    "liabilit" and "_equity". The role is a fact on the section now."""
+    by_key = {section.key: section.role for section in bss.BS_SECTIONS}
+    assert by_key == {
+        "current_assets": "asset",
+        "fixed_assets": "asset",
+        "other_assets": "asset",
+        "current_liabilities": "liability",
+        "long_term_liabilities": "liability",
+        "equity": "equity",
+    }
+    assert {section.key: section.role for section in bss.PL_SECTIONS} == {
+        "revenue": "income",
+        "operating_expenses": "expense",
+        "below_the_line": "other",
+    }
+    for kind in bss.KINDS:
+        served = {section["key"]: section["role"] for section in bss.describe(kind)["sections"]}
+        assert served == {section.key: section.role for section in bss.SCHEMA_FOR[kind].sections}
+
+
+def test_computed_lines_say_how_they_are_shown():
+    """A ratio through a currency formatter is "$1.50", which is why the
+    ratios and the month count were quietly dropped by the renderer."""
+    formats = {item.key: item.format for item in bss.PL_COMPUTED + bss.BS_COMPUTED}
+    assert formats["months_covered"] == "count"
+    assert formats["current_ratio"] == "ratio"
+    assert formats["debt_to_equity"] == "ratio"
+    assert all(
+        fmt == "money"
+        for key, fmt in formats.items()
+        if key not in {"months_covered", "current_ratio", "debt_to_equity"}
+    )
+    for kind in bss.KINDS:
+        served = {item["key"]: item["format"] for item in bss.describe(kind)["computed"]}
+        assert served == {item.key: item.format for item in bss.SCHEMA_FOR[kind].computed}
 
 
 @pytest.mark.parametrize(
@@ -179,12 +246,16 @@ def test_describe_carries_every_key_the_form_renders():
             if field["input"] == "select":
                 assert field["options"]
         for section in served["sections"]:
-            assert set(section) == {"key", "label", "rows", "subtotal"}
+            assert set(section) == {"key", "label", "role", "rows", "subtotal"}
+            assert section["role"] in {"asset", "liability", "equity", "income", "expense", "other"}
             assert set(section["subtotal"]) == {"key", "label"}
             for row in section["rows"]:
-                assert set(row) == {"key", "label", "addback", "contra", "owner_comp", "hint"}
+                assert set(row) == {
+                    "key", "label", "addback", "contra", "owner_comp", "text", "hint",
+                }
         for item in served["computed"]:
-            assert set(item) == {"key", "label", "emphasis"}
+            assert set(item) == {"key", "label", "emphasis", "format"}
+            assert item["format"] in {"money", "ratio", "count"}
         body = bss.empty_body(kind)
         assert set(body["header"]) == {field["key"] for field in served["header"]}
         assert set(body["sections"]) == {section["key"] for section in served["sections"]}

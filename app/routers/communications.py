@@ -4,6 +4,7 @@ from __future__ import annotations
 # ruff: noqa: B008
 import asyncio
 import json
+import logging
 from collections import Counter
 from datetime import UTC, datetime
 from typing import Annotated
@@ -23,7 +24,7 @@ from app.dealer_os.models import (
     DealerRepInboxMessage,
     DealerRepInboxThread,
 )
-from app.deps import CurrentUser, get_current_user
+from app.deps import CurrentUser, resolve_user_from_headers
 from app.enums import MessageFrom, Role
 from app.models.bucket import Bucket, BucketAIMessage, BucketNote, BucketUploadLink
 from app.models.client import Client
@@ -54,6 +55,8 @@ from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
 from app.services.user_access import is_audit_client
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/communications", tags=["communications"])
 SCAN_LIMIT = 750
 
@@ -64,19 +67,34 @@ async def stream_communication_events(
     authorization: Annotated[str | None, Header()] = None,
     x_dev_user: Annotated[str | None, Header()] = None,
 ) -> StreamingResponse:
-    """Stream scoped invalidation signals; message content stays in read APIs."""
+    """Stream scoped invalidation signals; message content stays in read APIs.
+
+    Authentication runs on a session this route opens and closes itself — a
+    request-scoped one would stay open for the life of the stream — so it goes
+    through `resolve_user_from_headers`, never `CurrentUser`.
+    """
     async with SessionLocal() as auth_db:
         try:
-            user = await get_current_user(
-                request=request,
+            user = await resolve_user_from_headers(
+                request,
                 authorization=authorization,
                 x_dev_user=x_dev_user,
                 db=auth_db,
             )
             user_id = user.id
             await auth_db.commit()
-        except Exception:
+        except HTTPException as exc:
+            # A refused credential is ordinary (expired token on reconnect):
+            # one line, no traceback.
             await auth_db.rollback()
+            log.warning("communication event stream refused: status=%s", exc.status_code)
+            raise
+        except Exception:
+            # Anything else is a bug in the auth path. This used to be a bare
+            # rollback-and-raise, which turned a TypeError into an opaque 500
+            # with no log line on every connection for weeks.
+            await auth_db.rollback()
+            log.exception("communication event stream auth failed")
             raise
 
     async def stream():

@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Literal
 
 from app.services.pfs_schema import _amount
 
@@ -55,7 +55,16 @@ class LineRow:
     contra: bool = False
     #: Owner compensation — the SDE add-back candidate. Shown, never added.
     owner_comp: bool = False
+    #: Words, not money — "what does Other expenses cover". Never summed, never
+    #: flagged, rendered as a text input. A property of the row, not of its
+    #: key's suffix.
+    text: bool = False
     hint: str | None = None
+
+
+#: What a section *is* on the statement, so a reader rolls it up by kind
+#: rather than by sniffing its key for "liabilit" or "_equity".
+SectionRole = Literal["asset", "liability", "equity", "income", "expense", "other"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +83,13 @@ class Section:
     rows: tuple[LineRow, ...]
     subtotal_key: str
     subtotal_label: str
+    role: SectionRole = "other"
+
+
+#: How a computed line is shown: dollars, a ratio to two places, or a plain
+#: count. A ratio through a currency formatter is "$1.50" — which is why the
+#: ratios were never rendered before this existed.
+ComputedFormat = Literal["money", "ratio", "count"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +97,7 @@ class Computed:
     key: str
     label: str
     emphasis: bool = False
+    format: ComputedFormat = "money"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +128,7 @@ PL_SECTIONS: tuple[Section, ...] = (
         ),
         "gross_profit",
         "Gross profit",
+        role="income",
     ),
     Section(
         "operating_expenses",
@@ -146,9 +164,12 @@ PL_SECTIONS: tuple[Section, ...] = (
             LineRow("security", "Security"),
             LineRow("professional_fees", "Professional fees / accountant"),
             LineRow("other", "Other expenses", hint="Describe what this covers in the notes"),
+            # Free text beside "Other expenses". A text row: never summed.
+            LineRow("other_description", "What the other expenses cover", text=True),
         ),
         "total_operating_expenses",
         "Total operating expenses",
+        role="expense",
     ),
     Section(
         "below_the_line",
@@ -159,6 +180,7 @@ PL_SECTIONS: tuple[Section, ...] = (
         ),
         "net_income",
         "Net income",
+        role="other",
     ),
 )
 
@@ -170,7 +192,7 @@ PL_COMPUTED: tuple[Computed, ...] = (
     Computed("addbacks", "Add-backs (interest, income taxes, depreciation and amortization)"),
     Computed("ebitda", "EBITDA (memo)", emphasis=True),
     Computed("owner_compensation", "Owner compensation (add-back candidate, not added)"),
-    Computed("months_covered", "Months covered"),
+    Computed("months_covered", "Months covered", format="count"),
 )
 
 
@@ -198,6 +220,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_current_assets",
         "Total current assets",
+        role="asset",
     ),
     Section(
         "fixed_assets",
@@ -215,6 +238,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_fixed_assets",
         "Total fixed assets",
+        role="asset",
     ),
     Section(
         "other_assets",
@@ -226,6 +250,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_other_assets",
         "Total other assets",
+        role="asset",
     ),
     Section(
         "current_liabilities",
@@ -240,6 +265,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_current_liabilities",
         "Total current liabilities",
+        role="liability",
     ),
     Section(
         "long_term_liabilities",
@@ -253,6 +279,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_long_term_liabilities",
         "Total long-term liabilities",
+        role="liability",
     ),
     Section(
         "equity",
@@ -270,6 +297,7 @@ BS_SECTIONS: tuple[Section, ...] = (
         ),
         "total_equity",
         "Total equity",
+        role="equity",
     ),
 )
 
@@ -281,8 +309,8 @@ BS_COMPUTED: tuple[Computed, ...] = (
     Computed("total_liabilities_and_equity", "Total liabilities and equity", emphasis=True),
     Computed("imbalance", "Unreconciled difference"),
     Computed("working_capital", "Working capital"),
-    Computed("current_ratio", "Current ratio"),
-    Computed("debt_to_equity", "Debt to equity"),
+    Computed("current_ratio", "Current ratio", format="ratio"),
+    Computed("debt_to_equity", "Debt to equity", format="ratio"),
 )
 
 
@@ -304,15 +332,20 @@ def _section_total(body: dict[str, Any], section: Section) -> Decimal:
     values = _section_values(body, section)
     total = _ZERO
     for row in section.rows:
+        if row.text:
+            # Words, never money — even when someone types a number there.
+            continue
         amount = _amount(values.get(row.key))
         total = total - amount if row.contra else total + amount
     return total
 
 
 def _section_is_blank(body: dict[str, Any], section: Section) -> bool:
-    """Nothing typed on any line — not even a zero."""
+    """Nothing typed on any money line — not even a zero."""
     values = _section_values(body, section)
-    return all(str(values.get(row.key) or "").strip() == "" for row in section.rows)
+    return all(
+        str(values.get(row.key) or "").strip() == "" for row in section.rows if not row.text
+    )
 
 
 def _flagged_total(body: dict[str, Any], sections: tuple[Section, ...], flag: str) -> Decimal:
@@ -320,6 +353,8 @@ def _flagged_total(body: dict[str, Any], sections: tuple[Section, ...], flag: st
     for section in sections:
         values = _section_values(body, section)
         for row in section.rows:
+            if row.text:
+                continue
             if getattr(row, flag):
                 total += _amount(values.get(row.key))
     return total
@@ -378,10 +413,9 @@ def months_between(start: Any, end: Any) -> int | None:
 
 
 def pl_empty_body() -> dict[str, Any]:
-    body = _empty_body(PL_SCHEMA_VERSION, PL_HEADER, PL_SECTIONS)
-    # Free text beside "Other expenses". Not a line row, so it is never summed.
-    body["sections"]["operating_expenses"]["other_description"] = None
-    return body
+    # `other_description` is seeded like any other line: it is a text row of
+    # the operating-expenses section, and `_section_total` skips text rows.
+    return _empty_body(PL_SCHEMA_VERSION, PL_HEADER, PL_SECTIONS)
 
 
 def pl_totals(body: dict[str, Any]) -> dict[str, Any]:
@@ -633,6 +667,7 @@ def describe(kind: str) -> dict[str, Any]:
             {
                 "key": section.key,
                 "label": section.label,
+                "role": section.role,
                 "rows": [
                     {
                         "key": row.key,
@@ -640,6 +675,7 @@ def describe(kind: str) -> dict[str, Any]:
                         "addback": row.addback,
                         "contra": row.contra,
                         "owner_comp": row.owner_comp,
+                        "text": row.text,
                         "hint": row.hint,
                     }
                     for row in section.rows
@@ -649,7 +685,12 @@ def describe(kind: str) -> dict[str, Any]:
             for section in schema.sections
         ],
         "computed": [
-            {"key": item.key, "label": item.label, "emphasis": item.emphasis}
+            {
+                "key": item.key,
+                "label": item.label,
+                "emphasis": item.emphasis,
+                "format": item.format,
+            }
             for item in schema.computed
         ],
         "collects_ssn": False,

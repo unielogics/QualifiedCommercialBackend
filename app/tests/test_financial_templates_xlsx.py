@@ -14,6 +14,7 @@ from openpyxl import load_workbook
 
 from app.services import business_statement_schema as bss
 from app.services import financial_templates_xlsx as templates
+from app.services import pfs_schema
 from app.services.bucket_ai import MAX_SPREADSHEET_ROWS, MAX_SPREADSHEET_SHEETS
 from app.services.bucket_evidence import filename_evidence_classification
 from app.services.financial_statements import DEBT_COLUMN_LABELS, DEBT_COLUMNS
@@ -96,6 +97,8 @@ def test_inputs_are_unlocked_and_money_inputs_share_one_format(kind):
     if kind in bss.KINDS:
         for section in bss.SCHEMA_FOR[kind].sections:
             for row in section.rows:
+                if getattr(row, "text", False):
+                    continue   # words, not money: a text input, never summed
                 assert _named_cell(wb, f"{prefix}.{row.key}").number_format == templates.MONEY_FORMAT
 
 
@@ -134,10 +137,28 @@ def test_the_debt_schedule_header_is_the_column_labels_with_keys_beneath():
     assert _named_cell(wb, "ds.r15.notes").protection.locked is False
 
 
-def test_the_pfs_sheet_says_the_schedules_are_on_screen():
-    texts = [cell.value for cell in _cells(_open("pfs").active) if isinstance(cell.value, str)]
-    assert any("completed on screen" in text for text in texts)
+def test_the_pfs_sheet_carries_the_eight_schedules_and_still_collects_no_ssn():
+    """Sections 2 to 8 of Form 413 used to be a note pointing at the on-screen
+    form. Now the workbook and the worksheet grid render the same rows, so the
+    download carries every schedule — inside the analyzer's row budget."""
+    wb = _open("pfs")
+    ws = wb.active
+    texts = [cell.value for cell in _cells(ws) if isinstance(cell.value, str)]
+    for spec in pfs_schema.SCHEDULES:
+        assert spec.label in texts, spec.key
+        for column in spec.columns:
+            assert column in texts, column
+    first = _named_cell(wb, "pfs.notes_payable.r1.name_and_address_of_noteholder")
+    assert first.protection.locked is False and first.value is None
+    money = _named_cell(wb, "pfs.real_estate.r2.mortgage_balance")
+    assert money.protection.locked is False and money.number_format == templates.MONEY_FORMAT
+    # Column C is the hidden key column beside the summary inputs; no schedule
+    # column may land there or it would be invisible in Excel.
+    assert ws.column_dimensions["C"].hidden
+    assert all(cell.value is None for cell in ws["C"][47:])
     assert any("No Social Security Number" in text for text in texts)
+    assert not any("completed on screen" in text for text in texts)
+    assert ws.max_row <= MAX_SPREADSHEET_ROWS
 
 
 def test_the_bytes_are_deterministic():

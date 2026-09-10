@@ -78,7 +78,21 @@ ${DOMAIN} {
     }
 
     reverse_proxy 127.0.0.1:8000
-    encode gzip
+    # Compress only these types. Caddy's default encode match is text/*,
+    # which includes text/event-stream: a gzip'd SSE stream buffers frames
+    # and the API's Cache-Control: no-transform is not honoured by the
+    # encoder. The event stream (/api/v1/communications/events) must reach
+    # the browser one frame at a time, uncompressed.
+    encode gzip {
+        match {
+            header Content-Type text/html*
+            header Content-Type text/plain*
+            header Content-Type text/css*
+            header Content-Type application/json*
+            header Content-Type application/javascript*
+            header Content-Type image/svg+xml*
+        }
+    }
     log {
         output stdout
         format console
