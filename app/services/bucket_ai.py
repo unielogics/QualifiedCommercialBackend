@@ -37,6 +37,7 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
+from app.services import merchant_processing
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 from app.services.bucket_evidence import classifications_for_requested_doc, reconcile_uploaded_file
@@ -175,7 +176,7 @@ Uploaded files may be random or miscategorized by the client. Classify documents
 For incomplete reviews, structure the judgment like a senior banking underwriter: (1) what the uploaded files prove, (2) whether the file appears fundable, preliminarily fundable subject to confirmation, not fundable, or cannot be determined, (3) what still blocks a credit decision, and (4) the single next best clarification or baseline upload. Do not automatically jump to LLC/entity clarification unless the uploaded evidence or user's message makes entity/account relationships the immediate blocker. Do not use robotic "all categories missing" language when collateral/debt evidence exists.
 With strong collateral, tax, wage, cash-flow, or asset evidence but missing confirmation documents, use "Incomplete - cannot determine" as the formal status but explicitly say whether the file appears "preliminarily fundable subject to confirmation" in the reason/summary. Separate missing confirmation documents from true not-bankable blockers.
 Where multiple LLCs, owner entities, real-estate entities, or dealership entities appear, ask for one written explanation that covers: primary operating LLC, main operating bank account, which LLCs own the real estate, how money transfers between entities, and whether dealership revenue supports property debt. This should be a conversational underwriting question, not a form or widget.
-For client-facing summaries, organize the content as a short underwriting memo, not a dense paragraph. The JSON fields should support this order: status, what the files prove, what still blocks a decision, and one next step. Do not combine multiple client tasks into one next_best_action. If LLC/entity workflow is unclear, make the immediate next step only the first clarification: primary operating LLC and main operating bank account. The follow-up about related LLC money flow should come after the client answers."""
+For client-facing summaries, organize the content as a short underwriting memo, not a dense paragraph. The JSON fields should support this order: status, what the files prove, what still blocks a decision, and one next step. Do not combine multiple client tasks into one next_best_action. If LLC/entity workflow is unclear, make the immediate next step only the first clarification: primary operating LLC and main operating bank account. The follow-up about related LLC money flow should come after the client answers. If context.merchant_processing_offer is present, an accepted merchant processing offer lowers operating cost by estimated_annual_savings per year; treat it as a pro-forma add-back when discussing capacity, never as filed income, and never as an approval."""
 
 # Real-estate/DSCR-only review rules. Never combined with the dealer rules above.
 RE_REVIEW_RULES = """Act as a strict real-estate investor / DSCR underwriter. This is not a car dealer review. Never ask about dealership name, floorplan, MCA, inventory, dealer gross receipts, or dealer LLC workflow. Screen purchase, refinance, and cash-out investor files using rent support, PITIA, DSCR, LTV, equity, cash to close, property condition, occupancy, lease/rent roll, purchase contract or payoff, taxes, insurance, HOA, entity/vesting, and estimated credit tier.
@@ -192,7 +193,7 @@ Set screening_stage to "stage_1_operating_business" and choose exactly one proba
 ALWAYS calculate key_metrics as NUMBERS when the documents support them. From bank statements compute annualized_adjusted_deposits (average monthly total deposits x 12), estimated_ebitda_or_cash_flow (average monthly deposits minus withdrawals x 12), and count distinct statement months and any NSF/overdraft occurrences. From tax returns set ytd_annualized_revenue to the most recent year's gross receipts, describe revenue_trend across the two years, and count distinct filed years. Populate estimated_debt_burden and estimated_dscr from the debt schedule or bank-visible loan payments. Where merchant processing statements are present, also capture annualized card volume and the current effective rate. Every key_metrics number MUST be a bare number, no currency symbol and no commas.
 Time in business, industry, and whether the borrower owns or leases the operating location are decisive for this vertical and are frequently missing. When they are, name them as the blocking gap rather than asking for more documents.
 Uploaded files are often miscategorized. Classify from readable content and filename first, not from requested_document_id. Say exactly what the uploaded files prove and what is still missing, rather than reporting that every category is absent when some evidence exists.
-For client-facing summaries use short sections: what the files prove, whether the file appears fundable or cannot yet be determined, what still blocks a decision, and one next step. Ask for one thing at a time."""
+For client-facing summaries use short sections: what the files prove, whether the file appears fundable or cannot yet be determined, what still blocks a decision, and one next step. Ask for one thing at a time. If context.merchant_processing_offer is present, an accepted merchant processing offer lowers operating cost by estimated_annual_savings per year; treat it as a pro-forma add-back when discussing capacity, never as filed income, and never as an approval."""
 
 # MCA-refinance rules. The narrowest persona in the system BY DESIGN: this
 # intake collects exactly three things — six months of bank statements, a
@@ -296,11 +297,11 @@ MAIN_STREET_CHAT_RULES = """- Answer like an underwriter screening an ordinary o
 # For audience="admin" the borrower chat rules are structurally absent.
 _ADMIN_PRODUCT_NOTES = {
     "dealer_gatekeeper_v1": """Product: car-dealer financing file (working capital / floorplan / MCA relief).
-Baseline evidence: last 2 years business tax returns, YTD P&L, last 6 months operating bank statements; screening facts on file: requested amount, use of funds breakdown, monthly debt obligations, credit tier. These are facts to READ from the file/context — when one is missing, say it is missing.""",
+Baseline evidence: last 2 years business tax returns, YTD P&L, last 6 months operating bank statements; screening facts on file: requested amount, use of funds breakdown, monthly debt obligations, credit tier. These are facts to READ from the file/context — when one is missing, say it is missing. If context.merchant_processing_offer is present it is the file's merchant processing offer (partner, rates, estimated annual saving, the client's answer); an accepted offer is a pro-forma add-back to capacity, never filed income and never an approval.""",
     "real_estate_dscr_v1": """Product: real-estate / DSCR investor file.
 Baseline evidence: lease/rent roll, appraisal or value support, purchase contract or payoff statement, entity docs; key math: DSCR, LTV, PITIA, NOI (context.dscr_potential carries deterministic figures — prefer them).""",
     "main_street_v1": """Product: operating-business (Main Street) financing file.
-Baseline evidence: 6 months bank statements, 2 years business tax returns, YTD P&L and balance sheet, business debt schedule (+ industry-conditional items). Program fit is computed deterministically and lives in context.""",
+Baseline evidence: 6 months bank statements, 2 years business tax returns, YTD P&L and balance sheet, business debt schedule (+ industry-conditional items). Program fit is computed deterministically and lives in context. If context.merchant_processing_offer is present it is the file's merchant processing offer (partner, rates, estimated annual saving, the client's answer); an accepted offer is a pro-forma add-back to capacity, never filed income and never an approval.""",
     "mca_refi_v1": """Product: merchant-cash-advance refinance file.
 The complete file is three items: 6 months business bank statements, signed credit authorization, current advance terms (agreements/payoff letters or the terms form). Key analysis: per-advance funder, payback remaining, payment amount/frequency, factor rate, paydown percentage; pricing comes from the desk, never from this thread.""",
 }
@@ -503,6 +504,18 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _client_visible_offer(context: dict[str, Any]) -> dict[str, Any] | None:
+    """The merchant-processing offer summary, for the client-facing thread,
+    only once the desk has sent it — before that the read is unconfirmed and
+    the client must not hear a number."""
+    offer = context.get("merchant_processing_offer")
+    if not isinstance(offer, dict):
+        return None
+    if offer.get("status") not in merchant_processing.CLIENT_VISIBLE_STATUSES:
+        return None
+    return offer
+
+
 def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
     context = bucket.ai_context or {}
     review_type = context.get("review_type")
@@ -549,6 +562,7 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
             "collateral_type": context.get("collateral_type") or "business cash flow",
             "industry": context.get("industry"),
             "intent": context.get("intent"),
+            "merchant_processing_offer": _client_visible_offer(context),
             "underwriter_persona": (
                 "Speak like a senior commercial underwriter screening an ordinary "
                 "operating business. Be practical, direct and evidence-driven, and "
@@ -636,6 +650,7 @@ def _public_ai_context(bucket: Bucket) -> dict[str, Any]:
         "deal_type": context.get("deal_type") or "dealer financing with real estate collateral",
         "documentation_level": context.get("documentation_level") or "full doc",
         "collateral_type": context.get("collateral_type") or "real estate collateral and business assets",
+        "merchant_processing_offer": _client_visible_offer(context),
         "underwriter_persona": (
             "Speak like a senior banking underwriter for used-car dealership financing. "
             "Be conversational but strict, practical, and evidence-driven."
@@ -2063,11 +2078,16 @@ async def analyze_bucket_file(
         cached = await _cached_file_analysis(db, file, content_hash)
         if cached is not None:
             await reconcile_uploaded_file(db, file, cached)
+            if merchant_processing.is_offer_document(file):
+                # A re-dropped terms PDF hits the cache; its new offer row
+                # still needs the numbers.
+                await merchant_processing.absorb_analysis(db, file, cached)
             return cached
 
     row = await _get_or_create_analysis_row(db, file, content_hash)
     row.status = "running"
     await db.flush()
+    offer_document = merchant_processing.is_offer_document(file)
 
     # Build a single-file content list, reusing the exact extraction helpers the
     # whole-bucket review uses (PDF/xlsx/csv/text/image + zip).
@@ -2118,6 +2138,8 @@ async def analyze_bucket_file(
         row.classification = "unreadable"
         row.analyzed_at = _now()
         await db.flush()
+        if offer_document:
+            await merchant_processing.absorb_analysis(db, file, row)
         return row
 
     try:
@@ -2129,7 +2151,13 @@ async def analyze_bucket_file(
             model=model,
             metadata={"bucket_id": str(file.bucket_id), "bucket_file_id": str(file.id)},
             max_tokens=3000,
-            system=build_file_analysis_system(review_type),
+            # The partner's terms sheet is read with its own prompt, chosen by
+            # the file's marker before any product persona is consulted.
+            system=(
+                merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
+                if offer_document
+                else build_file_analysis_system(review_type)
+            ),
             messages=[{"role": "user", "content": content}],
         )
         parsed = _json_or_fallback(_text_from_response(resp), "summary")
@@ -2148,18 +2176,28 @@ async def analyze_bucket_file(
             "key_facts": parsed.get("key_facts") if isinstance(parsed.get("key_facts"), dict) else {},
             "profile_facts": parsed.get("profile_facts") if isinstance(parsed.get("profile_facts"), dict) else {},
         }
+        if offer_document:
+            row.classification = merchant_processing.OFFER_CLASSIFICATION
+            row.analysis["desk_only"] = parsed.get("desk_only") if isinstance(parsed.get("desk_only"), dict) else {}
+            # The partner's name is not the borrower's legal entity.
+            row.analysis["profile_facts"] = {}
         row.input_tokens = input_tokens
         row.output_tokens = output_tokens
         row.error = None
         row.analyzed_at = _now()
         await reconcile_uploaded_file(db, file, row)
-        from app.services.application_profiles import capture_extracted_profile_facts
+        if offer_document:
+            await merchant_processing.absorb_analysis(db, file, row)
+        else:
+            from app.services.application_profiles import capture_extracted_profile_facts
 
-        await capture_extracted_profile_facts(db, file=file, analysis=row)
+            await capture_extracted_profile_facts(db, file=file, analysis=row)
     except Exception as exc:  # noqa: BLE001
         log.exception("analyze_bucket_file failed file=%s", file.id)
         row.status = "failed"
         row.error = str(exc)[:2000]
+        if offer_document:
+            await merchant_processing.absorb_analysis(db, file, row)
     await db.flush()
     return row
 
@@ -2296,6 +2334,12 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     for file in files:
         if file.id in extracted_zip_parent_ids:
             skipped.append(_skip_file(file, "zip_parent_archive", "ZIP contents were extracted into bucket files, so the archive itself was not re-read by AI review."))
+            continue
+        if merchant_processing.is_offer_document(file):
+            # The partner's pricing proposal is not evidence about the
+            # business. The review learns about the offer from its context
+            # summary, never from the sheet's own figures — which would
+            # otherwise read as card volume, revenue or a saving to claim.
             continue
         await _set_progress("analyzing", f"Analyzing {file.file_name}…", files_done)
         analysis = await analyze_bucket_file(db, file, review_type=review_type)

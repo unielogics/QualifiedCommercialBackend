@@ -42,8 +42,8 @@ from app.models.lender import Lender
 from app.models.loan import Loan
 from app.models.loan_scenario import LoanScenario
 from app.models.user import User
-from app.services.lender_thread import LenderThreadError, inject_inbound_lender_email
 from app.services.ai.usage import load_ai_spend_settings
+from app.services.lender_thread import LenderThreadError, inject_inbound_lender_email
 
 log = logging.getLogger(__name__)
 
@@ -467,9 +467,9 @@ async def gmail_test(user: CurrentUser) -> GmailTestResult:
 
     from app.services.email.gmail_client import (
         acquire_token,
+        explain_http_error,
         get_profile,
         gmail_config,
-        explain_http_error,
     )
 
     cfg = gmail_config()
@@ -729,16 +729,20 @@ class CapitalPartnerDecisionPayload(BaseModel):
 
 
 def _to_lender_products(loan_types: list[str]) -> list[str]:
-    """Loose normalisation of the application's free-form loan_types
-    list to the dropdown values used by the existing Lender.products
-    field. Unknown entries are passed through (operator can edit
-    later in the lender roster)."""
-    keep = []
+    """Normalise the application's free-form loan_types onto the roster's
+    product keys. The public form offers ids the roster never had (sba_7a,
+    commercial, multifamily, other); the honest ones are mapped and the rest
+    are dropped — an unknown key used to be passed through and then broke
+    the roster on read."""
+    from app.services.lender_products import CAPITAL_PARTNER_ALIASES, is_known_product
+
+    keep: list[str] = []
     for t in loan_types or []:
         if not isinstance(t, str):
             continue
         s = t.strip().lower().replace("&", "and").replace(" ", "_").replace("-", "_")
-        if s and s not in keep:
+        s = CAPITAL_PARTNER_ALIASES.get(s, s)
+        if s and is_known_product(s) and s not in keep:
             keep.append(s)
     return keep
 

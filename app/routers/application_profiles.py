@@ -38,6 +38,7 @@ from app.models.application_profile import (
 from app.models.bucket import BucketFile, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
+from app.models.lender import Lender
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
@@ -59,6 +60,8 @@ from app.schemas.application_profile import (
     ApplicationProfileResolve,
     ApplicationRoomAccess,
     ApplicationRoomConsentGrant,
+    ApplicationRoomMerchantOfferRespond,
+    ApplicationRoomMerchantOfferSummary,
     ApplicationRoomPlaidExchange,
     ApplicationRoomPlaidUpdate,
     ApplicationRoomPrimaryBank,
@@ -117,6 +120,7 @@ from app.services import (
     dealer_forms_pdf,
     drafted_forms,
     financial_statements,
+    merchant_processing,
     pfs_schema,
     plaid_lifecycle,
     plaid_policy,
@@ -1832,7 +1836,113 @@ async def public_application_room_state(
         capabilities=["documents", "business_banking", "agreements"],
         banking=await _application_bank_state(db, profile),
         signable=await _application_room_signables(db, link.bucket_id),
+        merchant_offer=await _room_merchant_offer_summary(db, profile),
     )
+
+
+async def _room_merchant_offer_summary(
+    db: AsyncSession, profile: ApplicationProfile
+) -> ApplicationRoomMerchantOfferSummary | None:
+    offer = await merchant_processing.current_offer(db, profile.id)
+    if offer is None or offer.status not in merchant_processing.CLIENT_VISIBLE_STATUSES:
+        return None
+    return ApplicationRoomMerchantOfferSummary(
+        id=offer.id,
+        status=offer.status,
+        estimated_annual_savings=float(offer.estimated_annual_savings) if offer.estimated_annual_savings is not None else None,
+        client_response=offer.client_response,
+    )
+
+
+async def _room_visible_offer(db: AsyncSession, profile: ApplicationProfile):
+    """The offer the client may see, or 404. Nothing is shown before the desk
+    presses Send, so an unconfirmed read never reaches a client."""
+    offer = await merchant_processing.current_offer(db, profile.id)
+    if offer is None or offer.status not in merchant_processing.CLIENT_VISIBLE_STATUSES:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No processing offer is waiting on this room")
+    return offer
+
+
+async def _room_offer_partner_name(db: AsyncSession, offer) -> str | None:
+    if offer.lender_id is None:
+        return None
+    lender = await db.get(Lender, offer.lender_id)
+    return lender.name if lender else None
+
+
+@router.post("/public/room/{token}/merchant-offer")
+async def public_application_room_merchant_offer(
+    token: str,
+    payload: ApplicationRoomAccess,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The client's view of the processing offer: an allowlist built in
+    services/merchant_processing.client_view, never the desk's terms."""
+    _link, profile = await _public_application_room(db, token, payload.passcode, request)
+    offer = await _room_visible_offer(db, profile)
+    return merchant_processing.client_view(offer, partner_name=await _room_offer_partner_name(db, offer))
+
+
+@router.post("/public/room/{token}/merchant-offer/respond")
+async def public_application_room_merchant_offer_respond(
+    token: str,
+    payload: ApplicationRoomMerchantOfferRespond,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """One click. The answer is written with the same evidence a signature
+    carries, audited, and committed BEFORE the partner is emailed, so a
+    failed send can never undo what the client said."""
+    link, profile = await _public_application_room(db, token, payload.passcode, request)
+    offer = await _room_visible_offer(db, profile)
+    if offer.status != merchant_processing.STATUS_SENT:
+        raise HTTPException(status.HTTP_409_CONFLICT, "already_responded")
+    if payload.terms_version != offer.terms_version:
+        raise HTTPException(status.HTTP_409_CONFLICT, "stale")
+    accepted = payload.response == "accepted"
+    now = datetime.now(UTC)
+    ip = _client_ip(request)
+    offer.status = merchant_processing.STATUS_ACCEPTED if accepted else merchant_processing.STATUS_DECLINED
+    offer.client_response = offer.status
+    offer.client_response_at = now
+    offer.client_response_reason = (payload.reason or "").strip() or None
+    offer.client_response_name = payload.responder_name.strip()
+    offer.client_response_ip = ip
+    offer.client_response_user_agent = (request.headers.get("user-agent") or "")[:500] or None
+    offer.disclaimer_version = merchant_processing.DISCLAIMER_VERSION
+    await merchant_processing.sync_intake_state(db, offer)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        f"merchant_offer.{offer.status}",
+        (
+            f"Client {'accepted' if accepted else 'declined'} the processing offer — "
+            f"{offer.client_response_name} from {ip or 'unknown IP'}"
+            + (f"; reason: {offer.client_response_reason}" if offer.client_response_reason else "")
+        ),
+        target_type="merchant_processing_offer",
+        target_id=offer.id,
+    )
+    await db.commit()
+
+    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    client = await db.get(Client, profile.client_id) if profile.client_id else None
+    await merchant_processing.notify_partner(
+        db, offer, profile=profile, intake=intake, business_name=_business_label(profile, intake, client)
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "merchant_offer.partner_emailed" if offer.partner_email_status == "sent" else "merchant_offer.partner_email_failed",
+        f"Partner email {offer.partner_email_status}" + (f": {offer.partner_email_error}" if offer.partner_email_error else ""),
+        target_type="merchant_processing_offer",
+        target_id=offer.id,
+    )
+    await db.commit()
+    return merchant_processing.client_view(offer, partner_name=await _room_offer_partner_name(db, offer))
 
 
 @router.post("/public/room/{token}/bank-consent", response_model=ApplicationRoomState)

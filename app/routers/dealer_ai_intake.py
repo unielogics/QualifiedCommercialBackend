@@ -88,7 +88,13 @@ from app.schemas.bucket import (
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
 from app.services import application_profiles as profiles_service
-from app.services import booking_notify, booking_reminders, inline_images, provenance
+from app.services import (
+    booking_notify,
+    booking_reminders,
+    inline_images,
+    merchant_processing,
+    provenance,
+)
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.usage import json_safe_metadata, tracked_messages_create
@@ -1778,6 +1784,16 @@ def _key_metrics(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     return km if isinstance(km, dict) else {}
 
 
+def _merchant_processing_offer(intake: PublicUnderwritingIntake) -> dict[str, Any]:
+    """The client-safe summary of the file's merchant-processing offer,
+    written by services/merchant_processing.sync_intake_state on every
+    status change — the same intake_state pattern as loan_program_fit,
+    because these context builders are synchronous and hold only the
+    intake. Nothing from the offer's desk-only terms is ever in it."""
+    raw = _intake_state(intake).get("merchant_processing_offer")
+    return raw if isinstance(raw, dict) else {}
+
+
 def _loan_program_fit(intake: PublicUnderwritingIntake) -> dict[str, Any]:
     """The deterministically-computed program-fit signal written by
     _compute_loan_program_fit — same intake_state sub-object pattern as
@@ -2847,6 +2863,7 @@ def _dealer_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "asset_rows": _asset_rows(intake),
         "dealer_details": _dealer_details(intake) or None,
         "loan_program_fit": _loan_program_fit(intake) or None,
+        "merchant_processing_offer": _merchant_processing_offer(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
         "baseline_document_policy": {
             "stage": "stage_1_bankability",
@@ -2939,6 +2956,7 @@ def _main_street_context(intake: PublicUnderwritingIntake) -> dict[str, Any]:
         "referral_source": intake.referral_source,
         "entity_structure": _entity_structure(intake),
         "main_street_details": details or None,
+        "merchant_processing_offer": _merchant_processing_offer(intake) or None,
         "chat_facts": state.get("chat_facts") if isinstance(state.get("chat_facts"), list) else [],
     }
 
@@ -9060,7 +9078,12 @@ async def build_package_zip_bytes(
     )
 
     label = _safe_filename(intake.business_name or intake.full_name or "lead")
-    files = sorted(_active_files(intake.bucket), key=lambda f: f.file_name.lower())
+    # The processing partner's proposal (residual lines and all) is not a
+    # borrower document and never ships to a lender.
+    files = sorted(
+        (f for f in _active_files(intake.bucket) if not merchant_processing.is_offer_document(f)),
+        key=lambda f: f.file_name.lower(),
+    )
     manifest_lines = [
         "Qualified Commercial — Underwriting Package",
         f"Borrower/entity: {intake.business_name or intake.full_name or '-'}",

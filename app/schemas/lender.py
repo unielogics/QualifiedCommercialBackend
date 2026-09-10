@@ -3,10 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from app.enums import LoanType
 from app.schemas.common import ORMModel
+from app.services.lender_products import normalize_products
 
 
 class LenderRead(ORMModel):
@@ -19,7 +19,9 @@ class LenderRead(ORMModel):
     contact_phone: str | None = None
     contact_title: str | None = None
 
-    products: list[LoanType] = Field(default_factory=list)
+    # Plain strings, never validated on read: one legacy row holding a value
+    # the roster no longer knows must not take the whole list down with it.
+    products: list[str] = Field(default_factory=list)
     email_domain: str | None = None
     notes: str | None = None
     is_active: bool = True
@@ -34,8 +36,13 @@ class LenderCreate(BaseModel):
     contact / submission details later."""
 
     name: str = Field(min_length=1, max_length=160)
-    products: list[LoanType] = Field(default_factory=list)
+    products: list[str] = Field(default_factory=list)
     submission_email: EmailStr | None = None
+
+    @field_validator("products")
+    @classmethod
+    def _known_products(cls, value: list[str]) -> list[str]:
+        return normalize_products(value)
 
     contact_name: str | None = Field(default=None, max_length=160)
     contact_email: EmailStr | None = None
@@ -53,8 +60,13 @@ class LenderUpdate(BaseModel):
     'clear'."""
 
     name: str | None = Field(default=None, min_length=1, max_length=160)
-    products: list[LoanType] | None = None
+    products: list[str] | None = None
     submission_email: EmailStr | None = None
+
+    @field_validator("products")
+    @classmethod
+    def _known_products(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else normalize_products(value)
 
     contact_name: str | None = Field(default=None, max_length=160)
     contact_email: EmailStr | None = None

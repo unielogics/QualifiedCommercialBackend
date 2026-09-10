@@ -8,6 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDocument
 
+#: Mirrors services/merchant_processing.OFFER_SOURCE_DETAIL, kept as a literal
+#: here so this module stays import-light.
+OFFER_SOURCE_DETAIL = "Merchant processing offer"
+
 CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
     "bank statement": {"bank_statement"},
     "tax return": {"tax_return"},
@@ -161,6 +165,10 @@ async def reconcile_uploaded_file(
 ) -> BucketRequestedDocument | None:
     """Route an unassigned upload only when one checklist destination is unambiguous."""
     if file.deleted_at is not None or file.status != "uploaded":
+        return None
+    if (file.source_detail or "") == OFFER_SOURCE_DETAIL:
+        # The processing partner's proposal is not the borrower's processing
+        # statement; by filename it would satisfy that checklist slot.
         return None
     classification = effective_file_classification(file.file_name, analysis)
     if classification == "bank_statement" and not file.statement_period:

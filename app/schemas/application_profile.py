@@ -561,6 +561,15 @@ class ApplicationRoomSignResult(BaseModel):
     message: str
 
 
+class ApplicationRoomMerchantOfferSummary(BaseModel):
+    """Enough for the room to show its "Your offer" tab; the offer itself is
+    fetched from its own endpoint."""
+    id: UUID
+    status: str
+    estimated_annual_savings: float | None = None
+    client_response: str | None = None
+
+
 class ApplicationRoomState(BaseModel):
     profile_id: UUID
     business_name: str
@@ -568,6 +577,15 @@ class ApplicationRoomState(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     banking: ApplicationBankState
     signable: list[ApplicationRoomSignable] = Field(default_factory=list)
+    merchant_offer: ApplicationRoomMerchantOfferSummary | None = None
+
+
+class ApplicationRoomMerchantOfferRespond(ApplicationRoomAccess):
+    response: Literal["accepted", "declined"]
+    responder_name: str = Field(min_length=1, max_length=160)
+    reason: str | None = Field(default=None, max_length=2000)
+    #: The version the client was looking at; a stale one is refused.
+    terms_version: int = Field(ge=1)
 
 
 class PublicBankVerificationRead(BaseModel):

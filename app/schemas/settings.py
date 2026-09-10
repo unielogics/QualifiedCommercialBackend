@@ -292,6 +292,15 @@ class AdminNotificationSettings(BaseModel):
     max_lookback_hours: int = Field(default=24, ge=1, le=168)
 
 
+class MerchantProcessingSettings(BaseModel):
+    """The merchant-processing offer (services/merchant_processing.py).
+    `partner_email_enabled` is the kill switch on the one lender-bound email
+    that goes out with no operator in the loop — the partner is told the
+    moment a client accepts or declines. Off, the answer is still recorded
+    and the desk sees "skipped" with a Resend button."""
+    partner_email_enabled: bool = True
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -314,6 +323,7 @@ class AppSettingsData(BaseModel):
     property_intelligence: PropertyIntelligenceSettings = Field(default_factory=PropertyIntelligenceSettings)
     dscr_pricing: DscrPricingSettings = Field(default_factory=DscrPricingSettings)
     admin_notifications: AdminNotificationSettings = Field(default_factory=AdminNotificationSettings)
+    merchant_processing: MerchantProcessingSettings = Field(default_factory=MerchantProcessingSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -336,6 +346,7 @@ class AppSettingsUpdate(BaseModel):
     property_intelligence: PropertyIntelligenceSettings | None = None
     dscr_pricing: DscrPricingSettings | None = None
     admin_notifications: AdminNotificationSettings | None = None
+    merchant_processing: MerchantProcessingSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------

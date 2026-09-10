@@ -123,6 +123,7 @@ from app.services.bucket_ai import (
     vendor_visible_summary,
     visible_action_items,
 )
+from app.services.merchant_processing import is_offer_document
 
 router = APIRouter(prefix="/buckets", tags=["buckets"])
 logger = logging.getLogger(__name__)
@@ -2475,7 +2476,11 @@ async def request_link_access(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     await _log(db, link.bucket_id, "upload_link_accessed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
     files = sorted(
-        (file for file in link.bucket.files if file.status == "uploaded" and file.deleted_at is None),
+        (
+            file
+            for file in link.bucket.files
+            if file.status == "uploaded" and file.deleted_at is None and not is_offer_document(file)
+        ),
         key=lambda file: file.created_at,
         reverse=True,
     )

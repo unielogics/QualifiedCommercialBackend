@@ -1,8 +1,10 @@
 """Lender CRUD — super-admin only.
 
 Backs the desktop /admin/lenders page. The list endpoint also
-supports `?product=<LoanType>` filtering so the loan page's
-Connect-Lender dropdown can show only matching active lenders.
+supports `?product=<key>` filtering — any key in
+app/services/lender_products — so the loan page's Connect-Lender dropdown
+can show only matching active lenders, and the Underwriting panel can list
+the merchant-processing partners.
 
 Soft-delete is the default: operators flip `is_active=False` to
 hide a lender from new connections without orphaning historical
@@ -15,17 +17,17 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pydantic import BaseModel
-
 from app.db import get_db
 from app.deps import CurrentUser
-from app.enums import LoanStage, LoanType, Role
+from app.enums import LoanStage, Role
 from app.models.lender import Lender
 from app.models.loan import Loan
 from app.schemas.lender import LenderCreate, LenderRead, LenderUpdate
+from app.services.lender_products import is_known_product
 
 router = APIRouter(prefix="/lenders", tags=["lenders"])
 
@@ -44,19 +46,22 @@ def _require_lender_read(user) -> None:
 async def list_lenders(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    product: LoanType | None = Query(default=None),
+    product: str | None = Query(default=None),
     active_only: bool = Query(default=False),
 ) -> list[LenderRead]:
     """List lenders. `product` filters to lenders whose `products`
-    array contains that LoanType (used by the Connect-Lender
-    dropdown). `active_only=True` hides soft-deleted rows."""
+    array contains that key (the Connect-Lender dropdown passes the
+    loan's type; the Underwriting panel passes `merchant_processing`).
+    `active_only=True` hides soft-deleted rows."""
     _require_lender_read(user)
+    if product is not None and not is_known_product(product):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"Unknown lender product: {product!r}")
     stmt = select(Lender).order_by(Lender.name.asc())
     if active_only:
         stmt = stmt.where(Lender.is_active.is_(True))
     rows = (await db.execute(stmt)).scalars().all()
     if product is not None:
-        rows = [r for r in rows if product.value in (r.products or [])]
+        rows = [r for r in rows if product in (r.products or [])]
     return [LenderRead.model_validate(r) for r in rows]
 
 

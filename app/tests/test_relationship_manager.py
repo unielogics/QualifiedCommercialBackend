@@ -289,4 +289,4 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0199_user_phone_reconciliation"]
+    assert heads == ["0200_merchant_processing_offers"]
