@@ -984,15 +984,14 @@ class DealerDebt(TimestampMixin, Base):
     rate: Mapped[float | None] = mapped_column(Numeric(6, 3))
     term_months: Mapped[int | None] = mapped_column(Integer)
     maturity_on: Mapped[date | None] = mapped_column(Date)
-    # What a lender actually asks for on a schedule, beyond the balance: what
-    # the debt is, what it started at and when, whether it is secured and by
-    # what, and whether it is being paid on time. All nullable — a row nobody
-    # was asked these questions must not claim an answer.
+    # What a lender asks for on a schedule beyond the balance: what the debt
+    # is, what it started at and when, and whether it is being paid on time.
+    # `collateral` is declared further down and predates this. All nullable —
+    # a row nobody was asked these questions must not claim an answer.
     original_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     originated_on: Mapped[date | None] = mapped_column(Date)
     secured: Mapped[str | None] = mapped_column(String(16))
     payment_status: Mapped[str | None] = mapped_column(String(16))
-    collateral: Mapped[str | None] = mapped_column(Text)
     origin: Mapped[str] = mapped_column(String(16), default="ai_draft", server_default="ai_draft")
     status: Mapped[str] = mapped_column(String(16), default="active", server_default="active")
     vendor_key: Mapped[str | None] = mapped_column(String(60))

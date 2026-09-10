@@ -1,15 +1,18 @@
 """The five debt-schedule fields a lender asks for and we had nowhere to put.
 
 `dos_debts` already carried lender, balance, monthly payment, rate, term,
-maturity and notes. A real schedule also states what the debt IS (term loan,
-line of credit, equipment), what it started at, when it started, whether it is
-secured and by what, and whether it is being paid on time. Without those the
-borrower's answer had to be squeezed into the notes field or lost, and the
-underwriter went back to ask for a schedule they had already been sent.
+maturity, collateral and notes. A real schedule also states what the debt IS
+(term loan, line of credit, equipment), what it started at, when it started,
+and whether it is secured and being paid on time. Without those the borrower's
+answer had to be squeezed into the notes field or lost, and the underwriter
+went back to ask for a schedule they had already been sent.
 
-All five are nullable with no default: every existing row is a row nobody was
-asked these questions, and inventing "current" or "unsecured" for it would be
-stating something we were never told.
+Four columns, not five: `collateral` has been on this table since 0138 and the
+form simply never collected it.
+
+All nullable with no default: every existing row is a row nobody was asked
+these questions, and inventing "current" or "unsecured" for it would be stating
+something we were never told.
 """
 
 from alembic import op
@@ -28,11 +31,9 @@ def upgrade() -> None:
     # "partially secured" should be recorded, not rejected at the boundary.
     op.add_column("dos_debts", sa.Column("secured", sa.String(16), nullable=True))
     op.add_column("dos_debts", sa.Column("payment_status", sa.String(16), nullable=True))
-    op.add_column("dos_debts", sa.Column("collateral", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column("dos_debts", "collateral")
     op.drop_column("dos_debts", "payment_status")
     op.drop_column("dos_debts", "secured")
     op.drop_column("dos_debts", "originated_on")

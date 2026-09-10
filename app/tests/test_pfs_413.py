@@ -592,3 +592,42 @@ def test_the_schedule_pdf_escapes_what_the_borrower_typed():
     assert "<script>" not in row
     assert "&lt;script&gt;" in row
     assert "A &amp; B" in row
+
+
+def test_no_model_declares_the_same_column_twice():
+    """SQLAlchemy lets a second `x: Mapped[...]` in one class silently replace
+    the first, so a column that already exists reads as missing to anyone
+    grepping a window of the class — and the migration written to "add" it
+    fails on deploy with DuplicateColumn, after the image has been built and
+    pulled. Which is exactly how `collateral` got added to dos_debts twice.
+
+    Parsed rather than introspected: `__table__.columns` deduplicates, so by
+    the time SQLAlchemy has built the table the evidence is gone.
+    """
+    import ast
+    from pathlib import Path
+
+    offenders: list[str] = []
+    for path in sorted(Path("app").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover - not our files to fix
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            seen: set[str] = set()
+            for item in node.body:
+                if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                    continue
+                # Only mapped columns: a plain annotation may legitimately be
+                # narrowed twice in a class body.
+                source = ast.unparse(item.annotation)
+                if "Mapped[" not in source:
+                    continue
+                name = item.target.id
+                if name in seen:
+                    offenders.append(f"{path}:{item.lineno} {node.name}.{name}")
+                seen.add(name)
+
+    assert not offenders, "column declared twice: " + "; ".join(offenders)
