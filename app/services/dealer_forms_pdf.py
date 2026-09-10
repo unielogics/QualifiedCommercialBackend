@@ -88,6 +88,70 @@ def render_pfs_pdf(
     return pdf
 
 
+# The 413 is a document a lender reads, not a spreadsheet they audit. The old
+# style boxed every cell in a 1px grid, which on a form where most lines are
+# zero produced a page of borders with figures hiding inside them. Rules run
+# horizontally only, hairline, and the eye follows the numbers instead.
+_PFS_STYLE = """
+  @page {
+    size: Letter;
+    margin: 46px 52px 54px;
+    @bottom-right {
+      content: counter(page) " of " counter(pages);
+      font-family: Inter, Arial, sans-serif;
+      font-size: 8.5px;
+      color: #9aa4b2;
+    }
+  }
+  body { font-family: Inter, Arial, sans-serif; color: #14202e; margin: 0; font-size: 11px; line-height: 1.45; }
+
+  .masthead { border-bottom: 2px solid #14202e; padding-bottom: 10px; margin-bottom: 4px; }
+  .firm { font-size: 8.5px; letter-spacing: .16em; text-transform: uppercase; color: #6b7787; }
+  h1 { font-size: 21px; font-weight: 650; margin: 3px 0 0; letter-spacing: -.01em; }
+
+  /* Who and when, as labelled facts rather than a run-on line. A blank value
+     is dropped by the builder, so "as of not stated" never prints. */
+  .meta { display: flex; gap: 28px; margin: 12px 0 20px; }
+  .meta div { }
+  .meta dt { font-size: 8.5px; letter-spacing: .1em; text-transform: uppercase; color: #8b95a3; margin: 0; }
+  .meta dd { font-size: 11.5px; margin: 2px 0 0; font-weight: 550; }
+
+  h2 {
+    font-size: 9px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase;
+    color: #46536380; color: #465363; margin: 20px 0 0; padding-bottom: 5px;
+    border-bottom: 1px solid #14202e;
+  }
+
+  table { width: 100%; border-collapse: collapse; margin: 0; }
+  /* No verticals, no outer box: one hairline under each line, and nothing else. */
+  td, th { border: 0; border-bottom: 1px solid #edf0f4; padding: 6px 2px; font-size: 11px; text-align: left; }
+  th { font-size: 8.5px; letter-spacing: .08em; text-transform: uppercase; color: #8b95a3; font-weight: 600; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* A form is mostly zeros until it is filled. Dimming them lets the figures
+     that were actually entered carry the page. */
+  .zero { color: #b3bcc8; }
+  tr.totals td { border-bottom: 0; border-top: 1.5px solid #14202e; font-weight: 650; padding-top: 7px; }
+
+  .cols { display: flex; gap: 30px; }
+  .cols > div { flex: 1; }
+
+  /* The one figure a reader is looking for. Tinted band, still no border. */
+  .networth {
+    display: flex; justify-content: space-between; align-items: baseline;
+    background: #f2f5fa; padding: 13px 16px; margin: 22px 0 4px; border-radius: 3px;
+  }
+  .networth .k { font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: #465363; font-weight: 650; }
+  .networth .v { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.015em; }
+  .networth .v.negative { color: #b42318; }
+
+  .schedules { margin-top: 4px; }
+  .disclaimer {
+    margin-top: 28px; font-size: 8.5px; line-height: 1.55; color: #8b95a3;
+    border-top: 1px solid #edf0f4; padding-top: 10px;
+  }
+"""
+
+
 def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
     """The Form 413 statement, laid out the way a lender expects to read it.
 
@@ -111,10 +175,19 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
     def _money(value) -> str:
         return f"${float(value or 0):,.2f}"
 
+    def _amount_cell(value) -> str:
+        """A figure, dimmed when it is zero.
+
+        Most lines on a 413 are zero until someone fills them in. Printing all
+        of them at the same weight buries the four that were answered.
+        """
+        number = float(value or 0)
+        klass = "num zero" if number == 0 else "num"
+        return f"<td class='{klass}'>{_money(number)}</td>"
+
     def _summary(rows, values) -> str:
         return "".join(
-            f"<tr><td>{html.escape(row.label)}</td>"
-            f"<td class='num'>{_money(values.get(row.key))}</td></tr>"
+            f"<tr><td>{html.escape(row.label)}</td>{_amount_cell(values.get(row.key))}</tr>"
             for row in rows
         )
 
@@ -136,26 +209,37 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
         return f"<h2>{html.escape(spec.label)}</h2><table><tr>{head}</tr>{cells}</table>"
 
     schedules = "".join(_schedule(spec.key) for spec in pfs_schema.SCHEDULES)
-    name = applicant.get("name") or ""
+
+    # Labelled facts, and only the ones we hold. The old header ran these
+    # together, so an unfilled date printed as "— as of not stated".
+    meta_pairs = [
+        ("Applicant", applicant.get("name")),
+        ("Business", applicant.get("business_name")),
+        ("As of", None if statement_date in (None, "", "not stated") else statement_date),
+    ]
+    meta = "".join(
+        f"<div><dt>{label}</dt><dd>{html.escape(str(value))}</dd></div>"
+        for label, value in meta_pairs
+        if str(value or "").strip()
+    )
+
+    net_worth = float(totals["net_worth"] or 0)
+    net_class = "v negative" if net_worth < 0 else "v"
 
     doc = f"""
     <html>
-      <head><style>{_STYLE}
-        .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-        .cols {{ display: flex; gap: 18px; }}
-        .cols > div {{ flex: 1; }}
-      </style></head>
+      <head><style>{_PFS_STYLE}</style></head>
       <body>
-        <h1>Personal Financial Statement</h1>
-        <div class="muted">
-          {html.escape(name)} — as of {html.escape(statement_date)}<br />
-          {html.escape(applicant.get("business_name") or "")}
+        <div class="masthead">
+          <div class="firm">Qualified Commercial</div>
+          <h1>Personal Financial Statement</h1>
         </div>
+        <dl class="meta">{meta}</dl>
+
         <div class="cols">
           <div>
             <h2>Assets</h2>
             <table>
-              <tr><th>Category</th><th class="num">Amount</th></tr>
               {_summary(pfs_schema.ASSET_ROWS, assets)}
               <tr class="totals"><td>Total assets</td>
                 <td class="num">{_money(totals["total_assets"])}</td></tr>
@@ -164,17 +248,18 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
           <div>
             <h2>Liabilities</h2>
             <table>
-              <tr><th>Category</th><th class="num">Amount</th></tr>
               {_summary(pfs_schema.LIABILITY_ROWS, liabilities)}
               <tr class="totals"><td>Total liabilities</td>
                 <td class="num">{_money(totals["total_liabilities"])}</td></tr>
             </table>
           </div>
         </div>
-        <table>
-          <tr class="totals"><td>Net worth</td>
-            <td class="num">{_money(totals["net_worth"])}</td></tr>
-        </table>
+
+        <div class="networth">
+          <span class="k">Net worth</span>
+          <span class="{net_class}">{_money(net_worth)}</span>
+        </div>
+
         <div class="cols">
           <div>
             <h2>Source of income (annual)</h2>
@@ -193,7 +278,9 @@ def build_pfs_413_html(*, body: dict, statement_date: str) -> str:
             </table>
           </div>
         </div>
-        {schedules}
+
+        <div class="schedules">{schedules}</div>
+
         <div class="disclaimer">
           {html.escape(FORM_DISCLAIMER)} Submitted electronically
           {datetime.now(UTC).isoformat()}.

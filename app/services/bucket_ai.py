@@ -971,6 +971,7 @@ def _merge_per_file_analyses(
     result: dict[str, Any],
     per_file_analyses: list[dict[str, Any]],
     requested_documents: list[dict[str, Any]] | None = None,
+    slot_files: dict[str, list[str]] | None = None,
 ) -> None:
     """Ensure the review result's per-file sections reflect the durable per-file
     analyses (the source of truth). Populates document_evidence_map.files,
@@ -1012,12 +1013,39 @@ def _merge_per_file_analyses(
             category = doc.get("category")
             wanted = classifications_for_requested_doc(name, category)
             evidence_files = [fn for cls in wanted for fn in present_classes.get(cls, [])]
+            gap = "" if evidence_files else "No matching document analyzed yet."
+
+            # A slot the borrower has actually satisfied counts, whatever the
+            # analyzer decided the document was. All four routes end here — an
+            # upload, a form filled through a link, a form the desk completed,
+            # each of which marks the slot `uploaded` — and coverage that keyed
+            # only on classification called them all missing. A debt schedule
+            # that reads as an MCA contract, or a file not yet analyzed, still
+            # answers the request that was made.
+            if not evidence_files and str(doc.get("status") or "") == "uploaded":
+                attached = (slot_files or {}).get(str(doc.get("id") or "")) or []
+                evidence_files = attached
+                gap = (
+                    ""
+                    if attached
+                    else "Marked satisfied on the checklist; the document is not analyzed yet."
+                )
+                coverage.append(
+                    {
+                        "category": name,
+                        "status": "satisfied",
+                        "evidence": evidence_files,
+                        "gap": gap,
+                    }
+                )
+                continue
+
             coverage.append(
                 {
                     "category": name,
                     "status": "satisfied" if evidence_files else "missing",
                     "evidence": evidence_files,
-                    "gap": "" if evidence_files else "No matching document analyzed yet.",
+                    "gap": gap,
                 }
             )
         if coverage:
@@ -2518,7 +2546,16 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
         # stays complete even if the synthesis omitted them (source of truth is the
         # per-file rows, not the synthesis). Also builds baseline_coverage against
         # the requested-document checklist from what the files were classified as.
-        _merge_per_file_analyses(result, per_file_analyses, requested_documents=requested)
+        # Which files sit in which checklist slot, so a slot satisfied by a
+        # document the analyzer read as something else can still name what
+        # answered it.
+        slot_files: dict[str, list[str]] = {}
+        for file in files:
+            if file.deleted_at is None and file.requested_document_id:
+                slot_files.setdefault(str(file.requested_document_id), []).append(file.file_name)
+        _merge_per_file_analyses(
+            result, per_file_analyses, requested_documents=requested, slot_files=slot_files
+        )
         # Reconcile the requested-document checklist: mark a requested doc as
         # uploaded when an analyzed file satisfies its category, so satisfied
         # baseline items stop showing as "missing" in the UI.

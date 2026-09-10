@@ -113,3 +113,67 @@ def test_non_bank_statements_do_not_satisfy_business_bank_request() -> None:
     assert "bank_statement" in classifications_for_requested_doc(
         "Last 6 months business bank statements", "Bank Statements"
     )
+
+
+# ---------------------------------------------------------------------------
+# Coverage against a slot the borrower has actually satisfied.
+# ---------------------------------------------------------------------------
+
+
+def _coverage(requested, analyses, slot_files=None):
+    from app.services.bucket_ai import _merge_per_file_analyses
+
+    result: dict = {}
+    _merge_per_file_analyses(
+        result, analyses, requested_documents=requested, slot_files=slot_files or {}
+    )
+    return {
+        row["category"]: row
+        for row in result["document_evidence_map"]["baseline_coverage"]
+    }
+
+
+def test_a_satisfied_slot_is_covered_even_when_the_file_reads_as_something_else():
+    """A borrower dropped an MCA agreement into the Debts slot. The analyzer
+    classified it correctly — it is an advance contract, not a schedule — and
+    coverage then reported the request as missing, which it is not. All four
+    routes to satisfying a form end at `status == "uploaded"`."""
+    rows = _coverage(
+        requested=[{"id": "slot-1", "name": "Debt schedule", "category": "Debts", "status": "uploaded"}],
+        analyses=[{"file_id": "f1", "file_name": "advance.pdf", "ai_classification": "floorplan_mca_inventory"}],
+        slot_files={"slot-1": ["advance.pdf"]},
+    )
+    assert rows["Debt schedule"]["status"] == "satisfied"
+    # And names what answered it, so the desk can see what actually arrived.
+    assert rows["Debt schedule"]["evidence"] == ["advance.pdf"]
+
+
+def test_a_slot_satisfied_before_analysis_says_so_rather_than_going_quiet():
+    rows = _coverage(
+        requested=[{"id": "slot-2", "name": "Personal financial statement", "category": "Personal Financials", "status": "uploaded"}],
+        analyses=[{"file_id": "f9", "file_name": "unrelated.pdf", "ai_classification": "bank_statement"}],
+        slot_files={},
+    )
+    row = rows["Personal financial statement"]
+    assert row["status"] == "satisfied"
+    assert "not analyzed yet" in row["gap"]
+
+
+def test_an_outstanding_slot_is_still_missing():
+    """The change must not turn the checklist into a row of green ticks."""
+    rows = _coverage(
+        requested=[{"id": "slot-3", "name": "Debt schedule", "category": "Debts", "status": "requested"}],
+        analyses=[{"file_id": "f1", "file_name": "bank.pdf", "ai_classification": "bank_statement"}],
+        slot_files={},
+    )
+    assert rows["Debt schedule"]["status"] == "missing"
+    assert rows["Debt schedule"]["gap"] == "No matching document analyzed yet."
+
+
+def test_a_classification_match_still_wins_and_names_the_file():
+    rows = _coverage(
+        requested=[{"id": "slot-4", "name": "Debt schedule", "category": "Debts", "status": "uploaded"}],
+        analyses=[{"file_id": "f2", "file_name": "schedule.pdf", "ai_classification": "debt_schedule"}],
+        slot_files={"slot-4": ["schedule.pdf", "stray.pdf"]},
+    )
+    assert rows["Debt schedule"]["evidence"] == ["schedule.pdf"]
