@@ -382,29 +382,55 @@ def _rate(value: Any) -> float | None:
         return None
 
 
-def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
+def _blank_or_amount(value: Any) -> Any:
+    """A typed figure, or None when the field was left empty."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return pfs_schema._amount(value)
+
+
+def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]] | None:
     """The rows out of a submitted debt-schedule form, cleaned.
 
     A row with no lender and no figures is someone tabbing through an empty
     line, not an obligation; it is dropped rather than stored as a blank.
+
+    Returns None when the body carries no `debts` key at all, or a null one. That is a client
+    that sent nothing — an autosave that fired before the form finished
+    loading, say — and it must not be read as "this borrower owes nobody".
+    An explicit empty list is an answer and comes back as `[]`.
     """
+    if (body or {}).get("debts") is None:
+        return None
     out: list[dict[str, Any]] = []
     for raw in (body or {}).get("debts") or []:
         if not isinstance(raw, dict):
             continue
         lender = str(raw.get("lender") or "").strip()
-        balance = pfs_schema._amount(raw.get("balance"))
-        monthly = pfs_schema._amount(raw.get("monthly_payment"))
+        # A figure nobody typed is unknown, not nought. Writing 0 into
+        # `monthly_payment` tells the DSCR engine this obligation costs nothing
+        # a month, which is how a daily-paying advance disappears out of the
+        # denominator and makes coverage look better than it is.
+        balance = _blank_or_amount(raw.get("balance"))
+        monthly = _blank_or_amount(raw.get("monthly_payment"))
         if not lender and not balance and not monthly:
             continue
         out.append(
             {
+                # Which stored row this line came from, when the form was
+                # seeded from one. This is what lets a save update rows in
+                # place instead of deleting and recreating them.
+                "id": str(raw.get("id") or "").strip() or None,
                 "lender": (lender or "Unnamed lender")[:180],
                 "debt_type": (str(raw.get("debt_type") or "").strip() or None),
                 "original_amount": pfs_schema._amount(raw.get("original_amount")) or None,
                 "balance": balance,
                 "rate": _rate(raw.get("rate")),
                 "monthly_payment": monthly,
+                # Which stored row this line came from, when the form was seeded
+                # from one. Identity is what lets a save update a row in place
+                # instead of deleting it and inserting a copy — the copy was the
+                # duplicate that doubled the schedule.
                 "originated_on": _date(raw.get("originated_on")),
                 "maturity_on": _date(raw.get("maturity_on")),
                 "secured": _choice(raw.get("secured"), _SECURED_CHOICES),
@@ -428,73 +454,187 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "original_amount": (
                     float(row["original_amount"]) if row.get("original_amount") else None
                 ),
-                "current_balance": float(row["balance"]),
-                "monthly_payment": float(row["monthly_payment"]),
+                "current_balance": float(row["balance"]) if row.get("balance") is not None else None,
+                "monthly_payment": float(row["monthly_payment"]) if row.get("monthly_payment") is not None else None,
                 "maturity_date": row["maturity_on"].isoformat() if row.get("maturity_on") else None,
             }
             for row in rows
         ],
-        "total_monthly_debt_service": float(sum(row["monthly_payment"] for row in rows)),
-        "total_outstanding_balance": float(sum(row["balance"] for row in rows)),
+        "total_monthly_debt_service": float(sum((row["monthly_payment"] or 0) for row in rows)),
+        "total_outstanding_balance": float(sum((row["balance"] or 0) for row in rows)),
     }
 
 
-async def replace_debt_rows(
-    db: AsyncSession, profile: ApplicationProfile, rows: list[dict[str, Any]], *, origin: str
-) -> None:
-    """Put the borrower's answer on the file's actual debt schedule.
+#: Everything the schedule form is allowed to write. Every other column on
+#: DealerDebt belongs to somebody else — `count_in_dscr` is toggled from the
+#: DSCR composer, `term_months` / `payment_amount` / `payment_frequency` /
+#: `factor_rate` / `payoff_amount` come from the refinance workbench, and
+#: `vendor_key` / `evidence` / `document_id` record where a row was read from.
+#: `dealer_id` and `origin` are identity, not answers. A save must leave all of
+#: them exactly as it found them.
+def _apply_debt_form_fields(target: Any, row: dict[str, Any]) -> None:
+    target.lender = row["lender"]
+    # `category` is the column that already existed for this; the form calls it
+    # "type of debt" because that is what a schedule calls it. Falls back to the
+    # old default so nothing downstream meets a null it never had to handle.
+    target.category = (row.get("debt_type") or "loan")[:24]
+    target.original_amount = row.get("original_amount")
+    target.balance = row.get("balance")
+    target.rate = row.get("rate")
+    target.monthly_payment = row.get("monthly_payment")
+    target.originated_on = row.get("originated_on")
+    target.maturity_on = row.get("maturity_on")
+    target.secured = row.get("secured")
+    target.payment_status = row.get("payment_status")
+    target.collateral = row.get("collateral")
+    target.notes = row.get("notes")
 
-    Replaces this source's previous rows rather than appending: the form is the
-    whole answer, and submitting it twice should not leave the file claiming
-    double the debt. Rows from other sources — an AI draft, a desk edit, a
-    document — are untouched.
+
+def _lender_key(value: Any) -> str:
+    text = " ".join(str(value or "").split()).casefold()
+    return "" if text in {"", "unnamed lender"} else text
+
+
+def _same_money(a: Any, b: Any) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) < 0.005
+    except (TypeError, ValueError):
+        return False
+
+
+async def save_debt_rows(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    rows: list[dict[str, Any]] | None,
+    *,
+    origin: str,
+) -> None:
+    """Put a form's answer on the file's debt schedule, touching only what the
+    saver owns.
+
+    **The rule.** A form is seeded with every active row on the file so the
+    person sees the whole schedule. A save may only *write* rows its own
+    `origin` owns. A row another origin owns is matched — so it is never
+    inserted a second time — and otherwise left completely alone: not updated,
+    not deleted. That is what stops the schedule doubling, and it keeps the
+    precedence the rest of the system relies on (`dealer_os` never lets
+    extraction overwrite an `admin` row; a borrower's link must not either).
+
+    **Why this shape.** The old save deleted only its own origin's rows and
+    then inserted everything the form sent back — including the other
+    origins' rows it had been seeded with. Three borrower debts plus one desk
+    save made six, and `count_in_dscr` defaults to true, so the phantom rows
+    went into the debt-service denominator. A first repair widened the delete
+    to the whole file; that let an empty autosave from a no-login link wipe
+    every row on the file, and let a borrower delete desk rows. The duplicate
+    was never the delete's fault. It was the re-insert. So rows are matched
+    and updated in place, and the delete scope stays exactly where it was.
+
+    Matching is by the `id` the form was given. An id that resolves to nothing
+    carries no claim and falls through to content matching among unclaimed
+    rows on lender, with the figures as a tie-break, so a page loaded before
+    ids existed still updates rather than re-creates. `rows is None` means the
+    client sent no `debts` key at all — nothing was submitted, and nothing
+    happens.
     """
+    if rows is None:
+        return
+
     from app.dealer_os.models import DealerDebt
 
-    existing = (
+    existing = list(
         (
             await db.execute(
-                select(DealerDebt).where(
-                    DealerDebt.profile_id == profile.id, DealerDebt.origin == origin
+                select(DealerDebt)
+                .where(
+                    DealerDebt.profile_id == profile.id,
+                    DealerDebt.status == "active",
                 )
+                .order_by(DealerDebt.created_at.asc(), DealerDebt.id.asc())
             )
         )
         .scalars()
         .all()
     )
-    for row in existing:
-        await db.delete(row)
-    await db.flush()
+    by_id = {str(row.id): row for row in existing}
+    claimed: set[str] = set()
+    pairs: list[tuple[dict[str, Any], Any]] = []
 
+    # Explicit identity first, so content matching can never steal a row out
+    # from under a form that named it.
     for row in rows:
-        db.add(
-            DealerDebt(
+        target = by_id.get(row.get("id") or "")
+        if target is not None and str(target.id) not in claimed:
+            claimed.add(str(target.id))
+            pairs.append((row, target))
+        else:
+            pairs.append((row, None))
+
+    # Then the rest by content. Lender is the identity; the figures only break
+    # a tie, because correcting a figure is the whole point of the form and
+    # must not turn a row into a stranger.
+    for index, (row, target) in enumerate(pairs):
+        if target is not None:
+            continue
+        wanted = _lender_key(row["lender"])
+        same_lender = [
+            candidate
+            for candidate in existing
+            if str(candidate.id) not in claimed and _lender_key(candidate.lender) == wanted
+        ]
+        if not same_lender:
+            continue
+
+        def _figures_match(candidate: Any, line: dict[str, Any] = row) -> bool:
+            return _same_money(candidate.balance, line.get("balance")) and _same_money(
+                candidate.monthly_payment, line.get("monthly_payment")
+            )
+
+        # A row this origin owns is the same debt whatever the figures say —
+        # correcting a figure is what the form is for. A row another origin
+        # owns is only "the copy I was shown" when the figures still agree;
+        # otherwise this is a new debt at the same lender and must be inserted,
+        # not swallowed by a row the saver could not have changed anyway.
+        owned = [c for c in same_lender if c.origin == origin]
+        chosen = None
+        if owned:
+            exact = [c for c in owned if _figures_match(c)]
+            chosen = (exact or owned)[0]
+        else:
+            foreign_exact = [c for c in same_lender if _figures_match(c)]
+            chosen = foreign_exact[0] if foreign_exact else None
+        if chosen is None:
+            continue
+        claimed.add(str(chosen.id))
+        pairs[index] = (row, chosen)
+
+    for row, target in pairs:
+        if target is None:
+            fresh = DealerDebt(
                 profile_id=profile.id,
                 dealer_id=profile.dealer_id,
-                lender=row["lender"],
-                # `category` is the column that already existed for this; the
-                # form calls it "type of debt" because that is what a schedule
-                # calls it. Falls back to the old default so nothing downstream
-                # meets a null it never had to handle.
-                category=(row.get("debt_type") or "loan")[:24],
-                original_amount=row.get("original_amount"),
-                balance=row["balance"],
-                rate=row.get("rate"),
-                monthly_payment=row["monthly_payment"],
-                originated_on=row.get("originated_on"),
-                maturity_on=row.get("maturity_on"),
-                secured=row.get("secured"),
-                payment_status=row.get("payment_status"),
-                collateral=row.get("collateral"),
-                notes=row.get("notes"),
                 origin=origin,
                 status="active",
             )
-        )
+            _apply_debt_form_fields(fresh, row)
+            db.add(fresh)
+        elif target.origin == origin:
+            _apply_debt_form_fields(target, row)
+        # else: somebody else's row. Seen, matched, left alone.
+
+    for row in existing:
+        if str(row.id) not in claimed and row.origin == origin:
+            await db.delete(row)
     await db.flush()
 
 
-async def debt_body_for_profile(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+async def debt_body_for_profile(
+    db: AsyncSession, profile: ApplicationProfile, *, origin: str | None = None
+) -> dict[str, Any]:
     """The file's current schedule, shaped for the form.
 
     Seeded from whatever is already on the file — an AI draft, rows the desk
@@ -517,6 +657,13 @@ async def debt_body_for_profile(db: AsyncSession, profile: ApplicationProfile) -
     return {
         "debts": [
             {
+                "id": str(row.id),
+                # Whether the caller's save will write this row. A desk row is
+                # shown to a borrower for context; their save leaves it alone,
+                # and the form should say so rather than accept an edit it will
+                # discard. None (no origin given) means the caller is not a form.
+                "editable": origin is None or row.origin == origin,
+                "owner": row.origin,
                 "lender": row.lender,
                 # "loan" is the column's historic default, not something anyone
                 # typed, so it seeds as blank rather than as an answer.

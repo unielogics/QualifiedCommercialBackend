@@ -3963,7 +3963,7 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
     if link.kind == "debt_schedule":
         # Seeded from what the file already holds, so the borrower confirms and
         # corrects rather than retyping what we know.
-        body = await financial_statements.debt_body_for_profile(db, profile)
+        body = await financial_statements.debt_body_for_profile(db, profile, origin="client_form")
         if not str(body.get("business_name") or "").strip() and prefill.get("business_name"):
             body = {**body, "business_name": prefill["business_name"]}
         schema = {"columns": list(financial_statements.DEBT_COLUMNS)}
@@ -4013,7 +4013,7 @@ async def save_public_financial_form_draft(
     profile = await db.get(ApplicationProfile, link.profile_id)
 
     if link.kind == "debt_schedule":
-        await financial_statements.replace_debt_rows(
+        await financial_statements.save_debt_rows(
             db,
             profile,
             financial_statements.debt_rows_from_body(payload.body),
@@ -4061,7 +4061,11 @@ async def submit_public_financial_form(
 
     if link.kind == "debt_schedule":
         rows = financial_statements.debt_rows_from_body(payload.body)
-        await financial_statements.replace_debt_rows(
+        if rows is None:
+            # The page sent no schedule at all. Filing an empty one would
+            # tell the file this borrower owes nobody.
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No debt schedule was sent")
+        await financial_statements.save_debt_rows(
             db, profile, rows, origin="client_form"
         )
         slot = await _requested_slot(db, profile, "debt_schedule")
@@ -4695,7 +4699,7 @@ async def read_debt_schedule_body(
     """
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
-    return await financial_statements.debt_body_for_profile(db, profile)
+    return await financial_statements.debt_body_for_profile(db, profile, origin="admin")
 
 
 @router.put("/{profile_id}/financial-forms/debt-schedule")
@@ -4707,16 +4711,23 @@ async def save_debt_schedule(
 ) -> dict:
     """Write the desk's version of the schedule.
 
-    Saved under `origin='admin'`, which the existing precedence law already
-    protects from being overwritten by a re-draft — a desk edit outranks an AI
-    draft, and that rule predates this form. Rows a borrower submitted through
-    their own link carry `client_form` and are left alone here, so the two
-    sources stay distinguishable rather than one silently eating the other.
+    The form is seeded with every active row on the file, so the desk sees the
+    borrower's rows beside its own. The save writes only what `origin='admin'`
+    owns: matched admin rows are updated in place, new lines are inserted as
+    admin, admin rows the form no longer lists are deleted. A row a borrower
+    submitted through their own link carries `client_form`; it is shown here,
+    matched so it is never re-created, and otherwise left exactly as it was.
+    That is what keeps one source from silently eating the other — and it is
+    the reason a save can no longer double the schedule.
     """
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
     rows = financial_statements.debt_rows_from_body(payload.body)
-    await financial_statements.replace_debt_rows(db, profile, rows, origin="admin")
+    if rows is None:
+        # Nothing was sent — an editor that never finished loading. Not a
+        # clear, and not something to file.
+        return {"row_count": 0, "submitted": False}
+    await financial_statements.save_debt_rows(db, profile, rows, origin="admin")
 
     if payload.submit:
         slot = await _requested_slot(db, profile, "debt_schedule")
