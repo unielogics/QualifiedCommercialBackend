@@ -119,6 +119,7 @@ from app.services import application_profiles as profiles
 from app.services import (
     dealer_forms_pdf,
     drafted_forms,
+    file_events,
     financial_statements,
     merchant_processing,
     pfs_schema,
@@ -196,6 +197,25 @@ UNDERWRITING_TO_LOAN_STAGE: dict[str, LoanStage] = {
     "approved": LoanStage.CLOSING,
     "closed_won": LoanStage.FUNDED,
 }
+
+#: What the client reads on the file's timeline when the lifecycle moves —
+#: plain words, never the desk's vocabulary. The pipeline move in
+#: routers/operator_files writes the same field and borrows this.
+UNDERWRITING_STATUS_TITLES: dict[str, str] = {
+    "submitted": "Your file was submitted",
+    "collecting_docs": "We are collecting your documents",
+    "in_underwriting": "Your file moved to underwriting",
+    "term_sheet_provided": "Term sheet provided",
+    "approved": "Approved",
+    "closed_won": "Closed and funded",
+    "closed_lost": "Closed",
+    "denied": "Denied",
+}
+
+
+def underwriting_status_title(status_value: str | None) -> str:
+    key = status_value or ""
+    return UNDERWRITING_STATUS_TITLES.get(key, f"Your file moved to {key.replace('_', ' ')}")
 
 
 def _normalize_label(value: str) -> str:
@@ -713,6 +733,8 @@ async def apply_underwriting_changes(
     """Write underwriting fields, sync the loan stage and audit. Flushes; the caller commits.
     Shared by the PATCH above and the Production Package term sheet (write-through)."""
     now = datetime.now(UTC)
+    before_status = profile.underwriting_status
+    before_notes = profile.underwriting_notes
     status_value = changes.get("underwriting_status")
     if status_value is not None:
         profile.underwriting_status = status_value
@@ -758,6 +780,29 @@ async def apply_underwriting_changes(
             "loan_stage": loan.stage.value if loan else None,
         },
     )
+    if profile.underwriting_status != before_status:
+        await file_events.emit(
+            db,
+            profile=profile,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=underwriting_status_title(profile.underwriting_status),
+            actor=user,
+            target_type="application_profile",
+            target_id=profile.id,
+            meta={"from": before_status, "to": profile.underwriting_status},
+        )
+    if "reviewer_notes" in changes and profile.underwriting_notes != before_notes:
+        await file_events.emit(
+            db,
+            profile=profile,
+            kind="note.added",
+            visibility=file_events.VISIBILITY_DESK,
+            title="Reviewer notes updated",
+            actor=user,
+            target_type="application_profile",
+            target_id=profile.id,
+        )
     await db.flush()
     return loan
 
@@ -1059,6 +1104,16 @@ async def create_application_room_request(
         target_type="requested_document",
         target_id=requested.id,
         metadata={"delivery_status": overall, "channels": [row.channel for row in rows]},
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {requested.name}",
+        actor=user,
+        target_type="requested_document",
+        target_id=requested.id,
     )
     await db.commit()
     return RoomRequestResult(
@@ -1922,6 +1977,16 @@ async def public_application_room_merchant_offer_respond(
             f"{offer.client_response_name} from {ip or 'unknown IP'}"
             + (f"; reason: {offer.client_response_reason}" if offer.client_response_reason else "")
         ),
+        target_type="merchant_processing_offer",
+        target_id=offer.id,
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="offer.answered",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title="Processing offer accepted" if accepted else "Processing offer declined",
+        actor=None,
         target_type="merchant_processing_offer",
         target_id=offer.id,
     )
@@ -3798,6 +3863,16 @@ async def submit_financial_statement(
         "Filed a personal financial statement on the borrower's behalf",
         target_type="financial_statement", target_id=statement.id,
     )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"{_FORM_LABEL['pfs']} was submitted",
+        actor=user,
+        target_type="financial_statement",
+        target_id=statement.id,
+    )
     await db.commit()
     await db.refresh(statement)
     return await _statement_read(db, profile, statement)
@@ -3969,6 +4044,17 @@ async def submit_public_financial_form(
                 summary="Business Debt Schedule submitted by the borrower through their own link.",
             )
         link.completed_at = datetime.now(UTC)
+        await file_events.emit(
+            db,
+            profile=profile,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{_FORM_LABEL['debt_schedule']} was submitted",
+            actor=None,
+            target_type="financial_form",
+            target_id=profile.id,
+            meta={"kind": "debt_schedule"},
+        )
         await db.commit()
         return {"completed": True}
 
@@ -3999,6 +4085,16 @@ async def submit_public_financial_form(
         summary_suffix="submitted by the borrower through their own link.",
     )
     link.completed_at = datetime.now(UTC)
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"{_FORM_LABEL['pfs']} was submitted",
+        actor=None,
+        target_type="financial_statement",
+        target_id=saved.id,
+    )
     await db.commit()
     return {"completed": True}
 
@@ -4215,6 +4311,17 @@ async def save_debt_schedule(
                     "on the borrower's behalf."
                 ),
             )
+        await file_events.emit(
+            db,
+            profile=profile,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{_FORM_LABEL['debt_schedule']} was submitted",
+            actor=user,
+            target_type="financial_form",
+            target_id=profile.id,
+            meta={"kind": "debt_schedule"},
+        )
     await profiles.log_profile_action(
         db, profile, user, "financial_form.debt_schedule_saved",
         f"Saved {len(rows)} obligation(s) on the business debt schedule",
@@ -4266,6 +4373,17 @@ async def request_financial_form(
         db, profile, user, "financial_form.requested",
         f"Requested the {_FORM_LABEL[kind].lower()}",
         target_type="financial_form", target_id=profile.id,
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for the {_FORM_LABEL[kind].lower()}",
+        actor=user,
+        target_type="financial_form",
+        target_id=profile.id,
+        meta={"kind": kind},
     )
     await db.commit()
     return {"requested": True, "already": False}

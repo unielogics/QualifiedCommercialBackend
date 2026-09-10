@@ -33,7 +33,7 @@ from app.schemas.document import (
 )
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition, TodoItemRead
 from app.models.app_settings import AppSettings
-from app.services import calendar_emitter
+from app.services import calendar_emitter, file_events
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.lender_connect import (
@@ -79,6 +79,7 @@ async def list_loans(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> l
     client_name on each row so the operator pipeline can show the
     owner reference in its header without an extra round-trip per row."""
     from sqlalchemy.orm import selectinload
+
     from app.models.broker import Broker
     from app.models.client import Client as _Client
 
@@ -126,9 +127,9 @@ async def list_required_documents(
     hatch."""
     from datetime import date as _date_type
 
+    from app.enums import DocStatus as _DocStatus
     from app.models.app_settings import AppSettings as _AppSettings
     from app.models.document import Document as _Document
-    from app.enums import DocStatus as _DocStatus
     from app.services.loan_intake_automation import _checklist_for, _coerce_settings
 
     scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
@@ -224,17 +225,24 @@ async def list_loan_todo(
       - "completed"          → finished only
       - "all"                → both
     """
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
-    from app.models.document import Document as _Document
-    from app.models.event import CalendarEvent as _Cal
-    from app.models.ai_task import AITask as _AITask
     from app.enums import (
-        DocStatus as _DocStatus,
-        CalendarEventKind as _CalKind,
-        CalendarEventStatus as _CalStatus,
         AITaskStatus as _TaskStatus,
     )
+    from app.enums import (
+        CalendarEventKind as _CalKind,
+    )
+    from app.enums import (
+        CalendarEventStatus as _CalStatus,
+    )
+    from app.enums import (
+        DocStatus as _DocStatus,
+    )
+    from app.models.ai_task import AITask as _AITask
+    from app.models.document import Document as _Document
+    from app.models.event import CalendarEvent as _Cal
     from app.routers.calendar import _scope_calendar_for_audience
 
     sf = (status_filter or "pending").lower()
@@ -349,14 +357,15 @@ async def list_loan_workflow(
     PATCH /documents/{id}; manual reminder dispatch is
     POST /loans/{id}/run-doc-reminders below.
     """
-    from datetime import date as _date_type, timedelta as _timedelta
+    from datetime import date as _date_type
+    from datetime import timedelta as _timedelta
 
     from app.models.app_settings import AppSettings as _AppSettings
     from app.models.document import Document as _Document
     from app.services.doc_collection_ai import classify as _classify
     from app.services.loan_intake_automation import (
-        _coerce_settings,
         _DEFAULT_FIRST_DAYS,
+        _coerce_settings,
     )
 
     scope = _scope_query(user, select(Loan).where(Loan.id == loan_id))
@@ -466,8 +475,9 @@ async def create_custom_document(
     lever (it implies "we're collecting this from you").
     """
     from datetime import date as _date_type
-    from app.models.document import Document as _Document
+
     from app.enums import DocStatus as _DocStatus
+    from app.models.document import Document as _Document
 
     if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER}:
         raise HTTPException(
@@ -615,6 +625,26 @@ async def create_loan(
     return LoanRead.model_validate(loan)
 
 
+#: What the client reads on the file's timeline when the loan moves stage.
+LOAN_STAGE_EVENT_TITLES: dict[str, str] = {
+    "prequalified": "Your file is pre-qualified",
+    "collecting_docs": "We are collecting your documents",
+    "lender_connected": "Lender connected",
+    "processing": "Your file is in processing",
+    "closing": "Your file moved to closing",
+    "funded": "Funded",
+}
+
+
+def _stage_key(stage: object) -> str:
+    return str(getattr(stage, "value", stage) or "")
+
+
+def _stage_event_title(stage: object) -> str:
+    key = _stage_key(stage)
+    return LOAN_STAGE_EVENT_TITLES.get(key, f"Your file moved to {key.replace('_', ' ')}")
+
+
 @router.patch("/{loan_id}", response_model=LoanRead)
 async def update_loan(
     loan_id: UUID,
@@ -631,8 +661,9 @@ async def update_loan(
 
     # Snapshot BEFORE the mutation so the diff helper can compute
     # field-level changes for the activity payload.
-    from app.services.activity_log import log_loan_diff, loan_snapshot
+    from app.services.activity_log import loan_snapshot, log_loan_diff
     before = loan_snapshot(loan)
+    before_stage = loan.stage
 
     changes = payload.model_dump(exclude_none=True)
     for k, v in changes.items():
@@ -687,6 +718,15 @@ async def update_loan(
     # (internal-only) with structured before→after payload. Returns
     # None when nothing in LOAN_DIFF_FIELDS actually changed (e.g. PATCH
     # touched only `status_summary` or another non-diffed field).
+    if "broker_id" in changes:
+        # The file's agent seat follows the broker (services/file_team).
+        from app.services import application_profiles as _profiles
+        from app.services import file_team as _file_team
+
+        _profile = await _profiles.find_profile(db, loan_id=loan.id)
+        if _profile is not None:
+            await _file_team.refresh_agent_seat(db, _profile, actor=user)
+
     await log_loan_diff(db, loan=loan, before=before, actor=user, source="operator_edit")
 
     # If close_date moved (and the loan is at CLOSING, or already
@@ -697,6 +737,18 @@ async def update_loan(
         await calendar_emitter.emit_for_loan_close(db, loan)
     # Phase 6 — flag dirty so the next drain picks up the change.
     await mark_loan_dirty(db, loan.id)
+    if "stage" in changes and loan.stage != before_stage:
+        await file_events.emit(
+            db,
+            loan_id=loan.id,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=_stage_event_title(loan.stage),
+            actor=user,
+            target_type="loan",
+            target_id=loan.id,
+            meta={"from": _stage_key(before_stage), "to": _stage_key(loan.stage)},
+        )
     await db.flush()
     await db.refresh(loan)
     return LoanRead.model_validate(loan)
@@ -722,6 +774,7 @@ async def download_term_sheet_pdf(
     # Generate PDF in a thread so we don't block the event loop on the
     # CPU-heavy WeasyPrint render.
     import asyncio
+
     from app.services.term_sheet_pdf import render_term_sheet_pdf
 
     def _render() -> bytes:
@@ -842,6 +895,20 @@ async def transition_stage(
             payload={"from": old, "to": payload.new_stage, "note": payload.note},
         )
     )
+    if loan.stage != old:
+        # The file's timeline hears about a stage move made here as well as
+        # through the generic PATCH (services/file_events).
+        await file_events.emit(
+            db,
+            loan_id=loan.id,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=_stage_event_title(loan.stage),
+            actor=user,
+            target_type="loan",
+            target_id=loan.id,
+            meta={"from": _stage_key(old), "to": _stage_key(loan.stage)},
+        )
     await vector_log(
         db,
         loan_id=loan.id,

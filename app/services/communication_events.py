@@ -45,12 +45,16 @@ def _event_payload(
     notification_id: uuid.UUID | str | None = None,
     channel: str | None = None,
     direction: str | None = None,
+    profile_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": str(uuid.uuid4()),
         "type": event_type,
         "audiences": sorted(set(audiences)),
         "dealer_id": str(dealer_id) if dealer_id else None,
+        # The file a timeline event is about (file_event.created), so a
+        # subscriber refreshes one timeline rather than everything.
+        "profile_id": str(profile_id) if profile_id else None,
         "thread_id": str(thread_id) if thread_id else None,
         "message_id": str(message_id) if message_id else None,
         "notification_id": str(notification_id) if notification_id else None,
@@ -189,6 +193,7 @@ async def publish_communication_event(
     notification_id: uuid.UUID | str | None = None,
     channel: str | None = None,
     direction: str | None = None,
+    profile_id: uuid.UUID | str | None = None,
 ) -> None:
     audiences = [user_audience(value) for value in recipient_user_ids if value]
     if not audiences:
@@ -202,6 +207,7 @@ async def publish_communication_event(
         notification_id=notification_id,
         channel=channel,
         direction=direction,
+        profile_id=profile_id,
     )
     get_bind = getattr(db, "get_bind", None)
     if get_bind is None:

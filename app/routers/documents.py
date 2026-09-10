@@ -21,7 +21,6 @@ from app.models.client import Client
 from app.models.document import Document
 from app.models.document_analysis_result import DocumentAnalysisResult
 from app.models.loan import Loan
-from app.scoping import scope_loan_query
 from app.schemas.document import (
     DocumentCustomCreate,
     DocumentPatch,
@@ -35,7 +34,8 @@ from app.schemas.document import (
     VaultLoanSummary,
     VaultTotals,
 )
-from app.services import calendar_emitter
+from app.scoping import scope_loan_query
+from app.services import calendar_emitter, file_events
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 
@@ -446,6 +446,17 @@ async def request_document(
     )
     await db.flush()
     await db.refresh(doc)
+    # File timeline: the client is asked for a document.
+    await file_events.emit(
+        db,
+        loan_id=loan.id,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {doc.name}",
+        actor=user,
+        target_type="document",
+        target_id=doc.id,
+    )
     # Emit a calendar reminder so the borrower / operator sees the
     # doc on their agenda. Default 7-day cadence; Phase 4 swaps the
     # constant for the per-loan-type checklist's first_reminder_days.
@@ -570,6 +581,22 @@ async def upload_init(
     return DocumentUploadInitResponse(document_id=doc.id, upload_url=upload_url, s3_key=s3_key)
 
 
+async def _document_upload_notice_reached(db: AsyncSession, loan: Loan) -> set[UUID]:
+    """The seats `notify_document_uploaded` reaches — the loan's agents and,
+    for a deal-sourced loan, the desk — so the file timeline does not tell
+    them twice."""
+    from app.services.notifications import loan_agent_user_ids, users_with_roles
+
+    try:
+        reached = await loan_agent_user_ids(db, loan)
+        if loan.source_deal_id is not None:
+            reached.update(user.id for user in await users_with_roles(db, Role.LOAN_EXEC, Role.SUPER_ADMIN))
+        return reached
+    except Exception:  # noqa: BLE001
+        log.exception("upload_complete: notice recipients failed loan=%s", loan.id)
+        return set()
+
+
 @router.post("/upload-complete", response_model=DocumentRead)
 async def upload_complete(
     payload: DocumentUploadComplete,
@@ -651,6 +678,20 @@ async def upload_complete(
             await notify_document_uploaded(db, loan=loan, document_name=doc.name, actor=user)
         except Exception:  # noqa: BLE001
             log.exception("upload_complete: notification failed loan=%s doc=%s", loan.deal_id, doc.id)
+    if not already_received:
+        # File timeline: the document landed. The upload notice above already
+        # reached the loan's agents and, for a deal-sourced loan, the desk.
+        await file_events.emit(
+            db,
+            loan_id=loan.id,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{doc.name} was received",
+            actor=user,
+            target_type="document",
+            target_id=doc.id,
+            already_notified=await _document_upload_notice_reached(db, loan),
+        )
     await db.flush()
     await db.refresh(doc)
     return DocumentRead.model_validate(doc)

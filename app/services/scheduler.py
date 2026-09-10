@@ -176,6 +176,15 @@ def start_scheduler() -> None:
         max_instances=1,
     )
     scheduler.add_job(
+        _wrap(job_file_updates_drain),
+        "interval",
+        minutes=1,
+        id="file_updates_drain",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
         _wrap(job_booking_reminders),
         "interval",
         minutes=1,
@@ -492,6 +501,17 @@ async def job_calendar_lookahead() -> None:
             emitted += 1
         await db.commit()
         log.info("calendar_lookahead emitted=%d horizon=24h", emitted)
+
+
+async def job_file_updates_drain() -> None:
+    """Batch a file's pending timeline events into one email per person."""
+    from app.db import SessionLocal
+    from app.services.file_events import drain_notices
+
+    async with SessionLocal() as db:
+        sent = await drain_notices(db)
+        if sent:
+            log.info("file_updates_drain emails=%d", sent)
 
 
 async def job_booking_reminders() -> None:

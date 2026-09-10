@@ -49,7 +49,7 @@ from app.schemas.communication import (
     UnifiedContactPage,
 )
 from app.scoping import scope_client_query, scope_loan_query
-from app.services import inline_images
+from app.services import file_events, inline_images
 from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
 from app.services.user_access import is_audit_client
@@ -1175,6 +1175,16 @@ def _bucket_sender_type(row: BucketAIMessage, channel: str) -> str:
     return "client" if channel == "client" and row.user_id is None else "operator"
 
 
+def _loan_reply_event_title(user: User) -> str:
+    """What the timeline says about a reply on the loan thread — who wrote,
+    never what they wrote."""
+    if user.role == Role.CLIENT:
+        return f"Message from {user.name or 'your client'}"
+    if user.role in (Role.BROKER, Role.REGIONAL_MANAGER, Role.FIELD_REP):
+        return "Reply from your agent"
+    return "Reply from the desk"
+
+
 @router.post("/threads/{thread_id:path}/messages", response_model=UnifiedCommunicationThreadDetail)
 async def reply_unified_communication_thread(
     thread_id: str,
@@ -1191,6 +1201,17 @@ async def reply_unified_communication_thread(
     if parts[0] == "loan":
         role = MessageFrom.CLIENT if user.role == Role.CLIENT else MessageFrom.BROKER
         db.add(Message(loan_id=UUID(parts[1]), from_role=role, body=body))
+        # File timeline: one line for the reply, never its body.
+        await file_events.emit(
+            db,
+            loan_id=UUID(parts[1]),
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=_loan_reply_event_title(user),
+            actor=user,
+            target_type="communication_thread",
+            target_id=thread_id,
+        )
         await db.commit()
     elif parts[0] == "intake":
         intake = await db.get(PublicUnderwritingIntake, UUID(parts[1]))
@@ -1234,11 +1255,43 @@ async def reply_unified_communication_thread(
                 )
         else:
             db.add(BucketNote(bucket_id=intake.bucket_id, author_name=user.name or user.email, author_role=str(user.role), visibility="admin", channel="internal" if channel == "internal" else "partner", content=body))
+            # File timeline: a note on the partner channel is the team's; an
+            # internal note stays with the desk.
+            await file_events.emit(
+                db,
+                intake_id=intake.id,
+                kind="message.sent",
+                visibility=file_events.VISIBILITY_DESK if channel == "internal" else file_events.VISIBILITY_TEAM,
+                title="Internal note" if channel == "internal" else "Note to the partner channel",
+                actor=user,
+                target_type="communication_thread",
+                target_id=thread_id,
+            )
         intake.last_message_at = datetime.now(UTC)
         await db.commit()
     elif parts[0] == "dealer":
         dealer_id, channel = UUID(parts[1]), parts[2]
         db.add(DealerMessage(dealer_id=dealer_id, author_user_id=user.id, author_name=user.name, body=body, internal=channel != "client", channel="client" if channel == "client" else "desk"))
+        # File timeline: the client channel at the client tier, the desk
+        # channel at the team tier — the same words the file's own message
+        # route uses for this thread.
+        author = user.name or user.email or "someone"
+        await file_events.emit(
+            db,
+            dealer_id=dealer_id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT if channel == "client" else file_events.VISIBILITY_TEAM,
+            title=(
+                f"Message from {author}"
+                if is_audit_client(user)
+                else f"Reply to the client from {author}"
+                if channel == "client"
+                else f"Desk message from {author}"
+            ),
+            actor=user,
+            target_type="communication_thread",
+            target_id=thread_id,
+        )
         await db.commit()
     elif parts[0] == "rep":
         from app.dealer_os.router import create_rep_inbox_message

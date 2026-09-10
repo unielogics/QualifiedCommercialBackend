@@ -1498,6 +1498,13 @@ async def reassign_agent(
         for loan in loans:
             loan.broker_id = to_broker.id
 
+    # Every file on this client re-derives its agent seat (services/file_team).
+    from app.models.application_profile import ApplicationProfile as _Profile
+    from app.services import file_team as _file_team
+
+    for _profile in (await db.execute(select(_Profile).where(_Profile.client_id == client_id))).scalars().all():
+        await _file_team.refresh_agent_seat(db, _profile, actor=user)
+
     await db.flush()
     await db.refresh(client)
     return ClientRead.model_validate(client)

@@ -39,6 +39,7 @@ from app.routers.application_profiles import (
 )
 from app.schemas.bucket import BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
+from app.services import file_events
 from app.services import merchant_processing as mp
 from app.services.lender_products import MERCHANT_PROCESSING
 
@@ -460,6 +461,16 @@ async def send_merchant_offer(
         db, profile, user, "merchant_offer.sent",
         f"Sent the processing offer to the client (estimated annual saving {mp._usd(offer.estimated_annual_savings)})",
         target_type=TARGET, target_id=offer.id,
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="offer.sent",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"Processing offer sent: estimated annual savings {mp._usd(offer.estimated_annual_savings)}",
+        actor=user,
+        target_type=TARGET,
+        target_id=offer.id,
     )
     await db.commit()
     return await _panel(db, profile)

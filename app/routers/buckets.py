@@ -112,6 +112,7 @@ from app.schemas.bucket import (
     BucketVendorRead,
 )
 from app.services import clerk as clerk_service
+from app.services import file_events
 from app.services.ai import engagement
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
@@ -1998,6 +1999,18 @@ async def admin_upload_init(
     return BucketFileUploadInitResponse(file_id=file.id, upload_url=upload_url, s3_key=s3_key, required_headers=headers)
 
 
+async def _bucket_upload_notice_reached(db: AsyncSession, bucket: Bucket) -> set[UUID]:
+    """The seats `notify_bucket_file_uploaded` reaches — the bucket's creator
+    and every super admin — so the file timeline does not tell them twice."""
+    from app.services.notifications import users_with_roles
+
+    try:
+        return {bucket.created_by_id, *(user.id for user in await users_with_roles(db, Role.SUPER_ADMIN))}
+    except Exception:  # noqa: BLE001
+        logger.exception("bucket upload notice recipients failed bucket=%s", bucket.id)
+        return set()
+
+
 @router.post("/admin/{bucket_id}/files/complete", response_model=BucketFileRead)
 async def admin_upload_complete(
     bucket_id: UUID,
@@ -2053,6 +2066,20 @@ async def admin_upload_complete(
         import logging
 
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", bucket_id, file.id)
+    # File timeline: a desk-side upload, at the team tier. The upload notice
+    # above already reached the bucket's creator and every super admin.
+    if not is_offer_document(file):
+        await file_events.emit(
+            db,
+            bucket_id=bucket_id,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_TEAM,
+            title=f"{file.file_name} was received",
+            actor=user,
+            target_type="bucket_file",
+            target_id=file.id,
+            already_notified=await _bucket_upload_notice_reached(db, bucket),
+        )
     try:
         from app.services.bucket_ai import enqueue_file_analysis
         from app.services.bucket_evidence import reconcile_uploaded_file
@@ -2622,6 +2649,22 @@ async def request_upload_complete(
         import logging
 
         logging.getLogger(__name__).exception("bucket upload notification failed bucket=%s file=%s", link.bucket_id, file.id)
+    # File timeline: the client's upload from the PIN room. Nobody is signed
+    # in, so the line carries the uploader's name and no actor. The upload
+    # notice above already reached the bucket's creator and every super admin.
+    if not is_offer_document(file):
+        await file_events.emit(
+            db,
+            bucket_id=link.bucket_id,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{file.file_name} was received",
+            actor=None,
+            actor_label=file.uploaded_by_name or link.recipient_name,
+            target_type="bucket_file",
+            target_id=file.id,
+            already_notified=await _bucket_upload_notice_reached(db, link.bucket),
+        )
     try:
         from app.services.bucket_ai import enqueue_file_analysis
         from app.services.bucket_evidence import reconcile_uploaded_file

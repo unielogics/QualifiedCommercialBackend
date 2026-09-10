@@ -57,6 +57,7 @@ from app.services import calendar_v2
 from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.notifications import notify_inbound_communication, notify_users
+from app.services import file_events, merchant_processing
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 from app.services import plaid_lifecycle, plaid_policy
 from app.services.email import ses_client
@@ -4678,6 +4679,20 @@ async def _auto_fulfill_doc_request(
         before={"status": "open"},
         after={"status": "fulfilled", "fulfilled_document_id": str(doc.id), "title": match.title},
     )
+    # Timeline: one line per fulfilled request — never per archive child, and
+    # never for the partner's offer sheet.
+    if not merchant_processing.is_offer_document(doc):
+        await file_events.emit(
+            db,
+            dealer_id=dealer_id,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{match.title} was received",
+            actor=user,
+            target_type="doc_request",
+            target_id=match.id,
+            meta={"document_id": str(doc.id)},
+        )
     return match
 
 
@@ -7574,6 +7589,24 @@ async def _append_rep_inbox_message(
             message_id=str(msg.id),
             subject=subject,
         )
+    # Timeline: a client writing in from outside lands on the file. The file
+    # thread's own mirror (provider="file_message") is already on the timeline
+    # from create_message, so it is not written twice.
+    if direction == "inbound" and thread.dealer_id is not None and provider != "file_message":
+        from_label = ((contact.full_name or contact.company) if contact is not None else None) or sender
+        await file_events.emit(
+            db,
+            dealer_id=thread.dealer_id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"Message received from {from_label or 'the client'}",
+            actor=None,
+            actor_label=from_label,
+            target_type="inbox_message",
+            target_id=msg.id,
+            meta={"channel": channel, "thread_id": str(thread.id)},
+            already_notified={thread.owner_user_id},
+        )
     return msg
 
 
@@ -8265,6 +8298,23 @@ async def get_submission_readiness(
     return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
 
 
+# What the desk's decisions are called on the file's timeline — the state in
+# plain words, never the note that came with it.
+_HUMAN_REVIEW_EVENT_TITLES: dict[str, str] = {
+    "fundable": "Desk review: approved",
+    "not_fundable": "Desk review: not yet fundable",
+    "pending": "Desk review: pending",
+}
+_FINALIZATION_EVENT_TITLES: dict[str, str] = {
+    "active": "Active",
+    "decision_ready": "Decision ready",
+    "forms_out": "Forms out",
+    "signed": "Signed",
+    "complete": "Complete",
+    "declined": "Declined",
+}
+
+
 @router.patch(
     "/dealers/{dealer_id}/submission-readiness/human-review",
     response_model=SubmissionReadinessRead,
@@ -8337,6 +8387,18 @@ async def patch_submission_human_review(
         before=before,
         after={"status": row.human_review_status, "note": row.human_review_note},
     )
+    if row.human_review_status != before["status"]:
+        await file_events.emit(
+            db,
+            dealer_id=dealer.id,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_TEAM,
+            title=_HUMAN_REVIEW_EVENT_TITLES.get(row.human_review_status, f"Desk review: {row.human_review_status}"),
+            actor=user,
+            target_type="application_profile",
+            target_id=row.id,
+            meta={"from": before["status"], "to": row.human_review_status},
+        )
     await db.commit()
     _, context = await _current_qc_context(db, dealer)
     return SubmissionReadinessRead(**qc_master_application.build_readiness(context))
@@ -8436,6 +8498,18 @@ async def patch_application_finalization(
             "funded_amount": float(dealer.funded_amount) if dealer.funded_amount is not None else None,
         },
     )
+    if dealer.status != before["status"]:
+        await file_events.emit(
+            db,
+            dealer_id=dealer.id,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_TEAM,
+            title=_FINALIZATION_EVENT_TITLES.get(dealer.status, f"Status: {dealer.status}"),
+            actor=user,
+            target_type="dealer",
+            target_id=dealer.id,
+            meta={"from": before["status"], "to": dealer.status},
+        )
     await db.commit()
     await db.refresh(dealer)
     return await _dealer_read(db, dealer)
@@ -12314,6 +12388,18 @@ async def create_rep_inbox_thread(
                 "subject": payload.subject,
             },
         )
+        # Timeline: one line for the conversation, not one per channel.
+        await file_events.emit(
+            db,
+            dealer_id=dealer.id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"Message sent to {payload.recipient_name or dealer.name}",
+            actor=user,
+            target_type="inbox_thread",
+            target_id=result_threads[0].id if result_threads else None,
+            meta={"channels": channels},
+        )
     await db.commit()
     for msg in result_messages:
         await db.refresh(msg)
@@ -12558,6 +12644,17 @@ async def _send_rep_inbox_message(
                 channel="client",
             )
         )
+        await file_events.emit(
+            db,
+            dealer_id=dealer.id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"Message sent to {((contact.full_name or contact.company) if contact is not None else None) or dealer.name}",
+            actor=user,
+            target_type="inbox_message",
+            target_id=msg.id,
+            meta={"channel": channel, "thread_id": str(thread.id)},
+        )
     await db.commit()
     await db.refresh(msg)
     return msg
@@ -12740,6 +12837,34 @@ async def create_message(
         user_id=user.id,
     )
     await _mirror_file_message_to_rep_inbox(db, dealer=dealer, user=user, message=message)
+    # Timeline: who wrote, on which thread — never what they wrote. The rep
+    # inbox mirror above already told the owning rep about a client's message.
+    author_name = message.author_name or user.email or "someone"
+    if is_audit_client(user):
+        event_title = f"Message from {author_name}"
+    elif channel == "client":
+        event_title = f"Reply to the client from {author_name}"
+    elif channel == "desk":
+        event_title = f"Desk message from {author_name}"
+    else:
+        event_title = f"Internal note from {author_name}"
+    await file_events.emit(
+        db,
+        dealer_id=dealer.id,
+        kind="message.sent",
+        visibility=(
+            file_events.VISIBILITY_CLIENT
+            if channel == "client"
+            else file_events.VISIBILITY_TEAM
+            if channel == "desk"
+            else file_events.VISIBILITY_DESK
+        ),
+        title=event_title,
+        actor=user,
+        target_type="dealer_message",
+        target_id=message.id,
+        already_notified={dealer.owner_user_id} if is_audit_client(user) else (),
+    )
     await db.commit()
     await db.refresh(message)
     return {
@@ -13947,6 +14072,16 @@ async def create_doc_request(
         )
     except Exception:
         logger.exception("dealer-os: could not notify client of doc request %s", req.id)
+    await file_events.emit(
+        db,
+        dealer_id=dealer.id,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {req.title}",
+        actor=user,
+        target_type="doc_request",
+        target_id=req.id,
+    )
     await db.commit()
     await db.refresh(req)
     return req
@@ -13981,6 +14116,18 @@ async def update_doc_request(
         db, dealer.id, user, "doc_request.update", "doc_request",
         entity_id=req.id, before=before, after=changes,
     )
+    if req.status == "fulfilled" and before.get("status") != "fulfilled":
+        # Pinned by hand on the desk: the client still sees it land.
+        await file_events.emit(
+            db,
+            dealer_id=dealer.id,
+            kind="document.received",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"{req.title} was received",
+            actor=user,
+            target_type="doc_request",
+            target_id=req.id,
+        )
     await db.commit()
     await db.refresh(req)
     return req

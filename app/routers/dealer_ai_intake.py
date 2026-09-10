@@ -91,6 +91,7 @@ from app.services import application_profiles as profiles_service
 from app.services import (
     booking_notify,
     booking_reminders,
+    file_events,
     inline_images,
     merchant_processing,
     provenance,
@@ -551,6 +552,15 @@ class BrokerLeadCreate(BaseModel):
 
 class OutcomeStatusUpdate(BaseModel):
     outcome_status: Literal["submitted", "closed", "denied"]
+
+
+# What the file's timeline says when the firm's decision changes — the new
+# outcome in plain words, never the reason.
+_OUTCOME_EVENT_TITLES: dict[str, str] = {
+    "closed": "File closed",
+    "denied": "File denied",
+    "submitted": "File reopened",
+}
 
 
 class LanguageUpdate(BaseModel):
@@ -1723,6 +1733,7 @@ async def _ensure_requested_document(
     category: str,
     description: str | None = None,
     allow_multiple_files: bool = False,
+    actor: Any = None,
 ) -> BucketRequestedDocument:
     """Idempotent get-or-create by (bucket_id, name) — lets the dealer chat
     add a new baseline document mid-conversation (e.g. a newly-named owner's
@@ -1745,6 +1756,16 @@ async def _ensure_requested_document(
     db.add(doc)
     await db.flush()
     bucket.requested_documents.append(doc)
+    await file_events.emit(
+        db,
+        bucket_id=bucket.id,
+        kind="document.requested",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title=f"We asked for {name}",
+        actor=actor,
+        target_type="requested_document",
+        target_id=doc.id,
+    )
     return doc
 
 
@@ -5262,6 +5283,24 @@ async def _complete_upload(
             await enqueue_file_analysis(db, target)
     except Exception:  # noqa: BLE001
         log.exception("enqueue file analysis failed intake=%s file=%s", intake.id, file.id)
+    # One timeline line for the upload itself; files extracted from a zip
+    # ride on their parent's line. The partner's offer sheet is not evidence.
+    if not merchant_processing.is_offer_document(file):
+        await file_events.emit(
+            db,
+            intake_id=intake.id,
+            kind="document.received",
+            visibility=(
+                file_events.VISIBILITY_CLIENT
+                if file.source_kind in ("client_room", "public_form")
+                else file_events.VISIBILITY_TEAM
+            ),
+            title=f"{file.file_name} was received",
+            actor=file.uploaded_by_user_id,
+            actor_label=actor_name,
+            target_type="file",
+            target_id=file.id,
+        )
     await db.commit()
     await db.refresh(file)
     return file
@@ -5539,6 +5578,17 @@ async def _submit_pfs_form(
         actor_email=actor_email,
     )
     await _persist_pfs_statement(db, intake, payload, bucket_file=stored)
+    await file_events.emit(
+        db,
+        intake_id=intake.id,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title="Personal financial statement was submitted",
+        actor=stored.uploaded_by_user_id,
+        actor_label=actor_name,
+        target_type="file",
+        target_id=stored.id,
+    )
     return stored
 
 
@@ -5626,6 +5676,17 @@ async def _submit_debt_schedule_form(
         actor_email=actor_email,
     )
     await _persist_client_debt_rows(db, intake, payload)
+    await file_events.emit(
+        db,
+        intake_id=intake.id,
+        kind="document.received",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title="Debt schedule was submitted",
+        actor=stored.uploaded_by_user_id,
+        actor_label=actor_name,
+        target_type="file",
+        target_id=stored.id,
+    )
     return stored
 
 
@@ -6711,6 +6772,12 @@ async def assign_lead_partner(
     else:
         partner = await _load_dealer_partner_user(db, payload.broker_user_id)
         intake.broker_id = partner.id
+    # The file's agent seat follows the partner (services/file_team).
+    _profile = await profiles_service.find_profile(db, intake_id=intake.id)
+    if _profile is not None:
+        from app.services import file_team as _file_team
+
+        await _file_team.refresh_agent_seat(db, _profile, actor=user)
     await _log(
         db, intake.bucket_id, "dealer_ai_lead_partner_assigned", request=request, user=user,
         target_type="public_underwriting_intake", target_id=str(intake.id),
@@ -6924,6 +6991,16 @@ async def create_admin_lead_note(
         user_id=user.id,
     )
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
+    await file_events.emit(
+        db,
+        intake_id=intake.id,
+        kind="message.sent",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Note to the partner channel from {user.name or user.email}",
+        actor=user,
+        target_type="note",
+        target_id=note.id,
+    )
     await db.commit()
     await db.refresh(note)
     return BucketNoteRead.model_validate(note).model_copy(
@@ -6944,11 +7021,24 @@ async def update_lead_outcome_status(
     the loan outcome is the firm's call, not the referring partner's."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
+    previous_outcome = intake.outcome_status
     intake.outcome_status = payload.outcome_status
     await _log(
         db, intake.bucket_id, "dealer_ai_lead_outcome_status_changed", request=request, user=user,
         target_type="public_underwriting_intake", target_id=str(intake.id), detail=payload.outcome_status,
     )
+    if payload.outcome_status != previous_outcome:
+        await file_events.emit(
+            db,
+            intake_id=intake.id,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=_OUTCOME_EVENT_TITLES.get(payload.outcome_status, f"File {payload.outcome_status}"),
+            actor=user,
+            target_type="public_underwriting_intake",
+            target_id=intake.id,
+            meta={"from": previous_outcome, "to": payload.outcome_status},
+        )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
     return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
@@ -7632,6 +7722,16 @@ async def create_broker_lead_note(
         user_id=user.id,
     )
     await _log(db, intake.bucket_id, "dealer_ai_lead_note_created", request=request, user=user, target_type="note", target_id=str(note.id))
+    await file_events.emit(
+        db,
+        intake_id=intake.id,
+        kind="message.sent",
+        visibility=file_events.VISIBILITY_TEAM,
+        title=f"Note from the partner {user.name or user.email}",
+        actor=user,
+        target_type="note",
+        target_id=note.id,
+    )
     await db.commit()
     await db.refresh(note)
     return BucketNoteRead.model_validate(note).model_copy(
@@ -7818,7 +7918,7 @@ async def broker_request_lead_pfs(
 ) -> BucketRequestedDocument:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
-    return await _request_pfs(db, intake, payload.owner_name)
+    return await _request_pfs(db, intake, payload.owner_name, actor=user)
 
 
 @broker_router.post("/{intake_id}/request-debt-schedule", response_model=BucketRequestedDocumentRead)
@@ -7829,7 +7929,7 @@ async def broker_request_lead_debt_schedule(
 ) -> BucketRequestedDocument:
     await _require_dealer_partner(user, db)
     intake = await _load_broker_dealer_lead(db, user, intake_id)
-    return await _request_debt_schedule(db, intake)
+    return await _request_debt_schedule(db, intake, actor=user)
 
 
 @admin_router.post("/from-bucket/{bucket_id}", response_model=DealerIntakeResponse, status_code=status.HTTP_201_CREATED)
@@ -8134,7 +8234,7 @@ async def request_lead_credit_authorization(
     return doc
 
 
-async def _request_pfs(db: AsyncSession, intake: PublicUnderwritingIntake, owner_name: str | None) -> BucketRequestedDocument:
+async def _request_pfs(db: AsyncSession, intake: PublicUnderwritingIntake, owner_name: str | None, *, actor: Any = None) -> BucketRequestedDocument:
     """Shared by admin+broker request-pfs endpoints. Idempotent via
     _ensure_requested_document — requesting the baseline PFS again (no
     owner_name) returns the existing row rather than duplicating; a distinct
@@ -8146,12 +8246,12 @@ async def _request_pfs(db: AsyncSession, intake: PublicUnderwritingIntake, owner
         if owner_name
         else "Upload a completed personal financial statement (PFS) for each owner. Use the blank form below if you need one."
     )
-    doc = await _ensure_requested_document(db, intake.bucket, name=name, category="Personal Financials", description=description, allow_multiple_files=True)
+    doc = await _ensure_requested_document(db, intake.bucket, name=name, category="Personal Financials", description=description, allow_multiple_files=True, actor=actor)
     await db.commit()
     return doc
 
 
-async def _request_debt_schedule(db: AsyncSession, intake: PublicUnderwritingIntake) -> BucketRequestedDocument:
+async def _request_debt_schedule(db: AsyncSession, intake: PublicUnderwritingIntake, *, actor: Any = None) -> BucketRequestedDocument:
     """Shared by admin+broker request-debt-schedule endpoints. Idempotent via
     _ensure_requested_document — a lead only ever has one debt schedule, so
     there is no owner_name variant here (unlike PFS)."""
@@ -8161,6 +8261,7 @@ async def _request_debt_schedule(db: AsyncSession, intake: PublicUnderwritingInt
         name="Debt schedule",
         category="Debts",
         description="Upload a schedule of all outstanding business debt: lender, balance, and monthly payment for each.",
+        actor=actor,
     )
     await db.commit()
     return doc
@@ -8182,7 +8283,7 @@ async def admin_request_lead_pfs(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     _require_dealer_intake(intake)
-    return await _request_pfs(db, intake, payload.owner_name)
+    return await _request_pfs(db, intake, payload.owner_name, actor=user)
 
 
 @admin_router.post("/{intake_id}/request-debt-schedule", response_model=BucketRequestedDocumentRead)
@@ -8194,7 +8295,7 @@ async def admin_request_lead_debt_schedule(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     _require_dealer_intake(intake)
-    return await _request_debt_schedule(db, intake)
+    return await _request_debt_schedule(db, intake, actor=user)
 
 
 _CONTRACT_DOC_NAME: dict[ContractType, str] = {

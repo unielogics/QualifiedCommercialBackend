@@ -47,6 +47,7 @@ from app.routers import (
     devices,
     documents,
     email_drafts,
+    file_team,
     fix_flip,
     fred,
     inbox,
@@ -213,6 +214,7 @@ for r in [
     ai_feedback.router,
     ai_preview.router,
     analysis.router,
+    file_team.router,  # before application_profiles: /find and /team/candidates are not profile ids
     application_profiles.router,
     merchant_offers.router,
     production_packages.link_router,  # before the package router: /link/{token} is not a package id

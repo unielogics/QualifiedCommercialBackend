@@ -152,6 +152,12 @@ class UnifiedFileRow(BaseModel):
     owner_name: str | None = None
     rep_name: str | None = None
     dealer_name: str | None = None
+    # The file's team (services/file_team): the agent seat, the underwriter
+    # seats and the company. Filled from the profile decoration; empty for a
+    # row with no profile yet.
+    agent_name: str | None = None
+    underwriter_names: list[str] = Field(default_factory=list)
+    company_name: str | None = None
     case_ref: str | None = None
     linked_bucket_ids: list[UUID] = Field(default_factory=list)
     linked_intake_ids: list[UUID] = Field(default_factory=list)

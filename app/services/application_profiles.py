@@ -457,6 +457,70 @@ async def _seed_primary_owner(
     profile.backfill_needs_review = True
 
 
+async def find_profile(
+    db: AsyncSession,
+    *,
+    loan_id: UUID | None = None,
+    intake_id: UUID | None = None,
+    dealer_id: UUID | None = None,
+    deal_id: UUID | None = None,
+    bucket_id: UUID | None = None,
+) -> ApplicationProfile | None:
+    """The file behind a source, read-only.
+
+    The same lineage `resolve_profile` walks — a loan reached through its deal
+    or intake, an intake and a dealer joined by the handoff, a bucket by the
+    profile that owns it — without a user, without visibility, and without
+    creating anything. For the hooks that fire from webhooks, cron and public
+    rooms: a source nobody has opened as a file yet simply has no profile.
+    """
+
+    async def _by(column, value: UUID | None) -> ApplicationProfile | None:
+        if value is None:
+            return None
+        return (
+            await db.execute(select(ApplicationProfile).where(column == value).limit(1))
+        ).scalar_one_or_none()
+
+    if loan_id is not None:
+        found = await _by(ApplicationProfile.loan_id, loan_id)
+        if found is None:
+            loan = await db.get(Loan, loan_id)
+            if loan is not None:
+                found = await _by(ApplicationProfile.deal_id, loan.source_deal_id) or await _by(
+                    ApplicationProfile.intake_id, loan.source_intake_id
+                )
+        if found is not None:
+            return found
+    if intake_id is not None:
+        found = await _by(ApplicationProfile.intake_id, intake_id)
+        if found is None:
+            dealer_pk = (
+                await db.execute(
+                    select(DealerBusiness.id).where(DealerBusiness.handoff_intake_id == intake_id).limit(1)
+                )
+            ).scalar_one_or_none()
+            found = await _by(ApplicationProfile.dealer_id, dealer_pk)
+        if found is not None:
+            return found
+    if dealer_id is not None:
+        found = await _by(ApplicationProfile.dealer_id, dealer_id)
+        if found is None:
+            handoff = (
+                await db.execute(select(DealerBusiness.handoff_intake_id).where(DealerBusiness.id == dealer_id))
+            ).scalar_one_or_none()
+            found = await _by(ApplicationProfile.intake_id, handoff)
+        if found is not None:
+            return found
+    if deal_id is not None:
+        found = await _by(ApplicationProfile.deal_id, deal_id)
+        if found is not None:
+            return found
+    if bucket_id is not None:
+        return await _by(ApplicationProfile.primary_bucket_id, bucket_id)
+    return None
+
+
 async def resolve_profile(
     db: AsyncSession, source_kind: str, source_id: UUID, user: User
 ) -> ApplicationProfile:

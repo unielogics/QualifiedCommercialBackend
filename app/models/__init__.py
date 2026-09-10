@@ -123,6 +123,8 @@ from app.models.loan_participant import LoanParticipant  # noqa: F401
 from app.models.loan_scenario import LoanScenario  # noqa: F401
 from app.models.message import Message  # noqa: F401
 from app.models.financial_form_link import FinancialFormLink  # noqa: F401
+from app.models.file_event import FileEvent  # noqa: F401
+from app.models.file_team_member import FileTeamMember  # noqa: F401
 from app.models.merchant_processing_offer import MerchantProcessingOffer  # noqa: F401
 from app.models.financial_statement import (  # noqa: F401
     FinancialStatement,

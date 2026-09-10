@@ -301,6 +301,17 @@ class MerchantProcessingSettings(BaseModel):
     partner_email_enabled: bool = True
 
 
+class FileUpdatesSettings(BaseModel):
+    """Email notices from a file's timeline (services/file_events.py). In-app
+    and push notices always go; these switches govern the batched emails the
+    one-minute drain sends. The company address is a legal-notice address from
+    the signed referral agreement, not a working inbox, so it is off until a
+    partner asks for it."""
+    client_email_enabled: bool = True
+    team_email_enabled: bool = True
+    company_email_enabled: bool = False
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
@@ -324,6 +335,7 @@ class AppSettingsData(BaseModel):
     dscr_pricing: DscrPricingSettings = Field(default_factory=DscrPricingSettings)
     admin_notifications: AdminNotificationSettings = Field(default_factory=AdminNotificationSettings)
     merchant_processing: MerchantProcessingSettings = Field(default_factory=MerchantProcessingSettings)
+    file_updates: FileUpdatesSettings = Field(default_factory=FileUpdatesSettings)
 
 
 class AppSettingsRead(BaseModel):
@@ -347,6 +359,7 @@ class AppSettingsUpdate(BaseModel):
     dscr_pricing: DscrPricingSettings | None = None
     admin_notifications: AdminNotificationSettings | None = None
     merchant_processing: MerchantProcessingSettings | None = None
+    file_updates: FileUpdatesSettings | None = None
 
 
 # --- Signature image upload ---------------------------------------------

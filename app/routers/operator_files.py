@@ -72,6 +72,7 @@ from app.schemas.operator_file import (
 )
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services import application_profiles as profiles
+from app.services import file_events
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.operator_file_links import (
     active_links_for_sources,
@@ -966,6 +967,48 @@ async def _profile_map_for_rows(
     return result
 
 
+async def _team_names_for_profiles(db: AsyncSession, profile_ids: set[UUID]) -> dict[UUID, dict[str, Any]]:
+    """Persisted seats and the company for many files in three queries."""
+    if not profile_ids:
+        return {}
+    from app.models.file_team_member import SEAT_AGENT, FileTeamMember
+    from app.models.referral_partner_company import ReferralPartnerCompany
+
+    seats = list(
+        (
+            await db.execute(
+                select(FileTeamMember.profile_id, FileTeamMember.seat, User.name, User.email)
+                .join(User, User.id == FileTeamMember.user_id)
+                .where(FileTeamMember.profile_id.in_(profile_ids), User.deleted_at.is_(None))
+            )
+        ).all()
+    )
+    out: dict[UUID, dict[str, Any]] = {}
+    for profile_id, seat, name, email in seats:
+        entry = out.setdefault(profile_id, {"agent": None, "underwriters": [], "company": None})
+        label = name or email
+        if seat == SEAT_AGENT:
+            entry["agent"] = label
+        else:
+            entry["underwriters"].append(label)
+    company_ids = {
+        p.company_id
+        for p in (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id.in_(profile_ids)))).scalars().all()
+        if p.company_id
+    }
+    company_names = {}
+    if company_ids:
+        company_names = {
+            c.id: c.name
+            for c in (await db.execute(select(ReferralPartnerCompany).where(ReferralPartnerCompany.id.in_(company_ids)))).scalars().all()
+        }
+    if company_names:
+        for p in (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id.in_(profile_ids)))).scalars().all():
+            if p.company_id in company_names:
+                out.setdefault(p.id, {"agent": None, "underwriters": [], "company": None})["company"] = company_names[p.company_id]
+    return out
+
+
 def _profile_for_row(
     row: UnifiedFileRow,
     profile_map: dict[tuple[str, UUID], ApplicationProfile],
@@ -999,9 +1042,17 @@ async def _decorate_pipeline_state(
     db: AsyncSession,
 ) -> None:
     profile_map = await _profile_map_for_rows(rows, db)
+    team_map = await _team_names_for_profiles(db, {p.id for p in profile_map.values()})
     for row in rows:
         profile = _profile_for_row(row, profile_map)
         status_value = _pipeline_status_for_row(row, profile)
+        team = team_map.get(profile.id) if profile else None
+        # The file's team (services/file_team). A seat is persisted the first
+        # time the desk opens the file; until then the row's own owner/rep
+        # name is the best answer for the agent column.
+        row.agent_name = (team or {}).get("agent") or row.owner_name or row.rep_name
+        row.underwriter_names = list((team or {}).get("underwriters") or [])
+        row.company_name = (team or {}).get("company")
         row.pipeline_status = status_value  # type: ignore[assignment]
         row.underwriting_status = status_value  # type: ignore[assignment]
         row.approved_amount = _money(profile.underwriting_approved_amount) if profile else None
@@ -1189,6 +1240,7 @@ async def move_operator_file_pipeline(
     _require_internal(user)
     normalized_kind = _normalize_pipeline_source_kind(source_kind)
     profile = await profiles.resolve_profile(db, normalized_kind, source_id, user)
+    before_status = profile.underwriting_status
     current_status = (
         profile.underwriting_status
         if profile.underwriting_status in PIPELINE_LIFECYCLE
@@ -1262,6 +1314,22 @@ async def move_operator_file_pipeline(
             "note": payload.note,
         },
     )
+    if profile.underwriting_status != before_status:
+        # Same words as the Underwriting tab's write (apply_underwriting_changes);
+        # imported here so the two routers never disagree about a title.
+        from app.routers.application_profiles import underwriting_status_title
+
+        await file_events.emit(
+            db,
+            profile=profile,
+            kind="status.changed",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=underwriting_status_title(profile.underwriting_status),
+            actor=user,
+            target_type="application_profile",
+            target_id=profile.id,
+            meta={"from": before_status, "to": profile.underwriting_status},
+        )
     await db.commit()
     await db.refresh(profile)
     if profile.loan_id and loan is None:

@@ -65,6 +65,15 @@ class ApplicationProfile(TimestampMixin, Base):
     primary_bucket_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="SET NULL")
     )
+    # The company on the file: the agent's referral partner company, derived
+    # from the agent's link unless the desk set it (company_set_by_user_id).
+    # The house row is never a company on a file. See services/file_team.py.
+    company_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("referral_partner_companies.id", ondelete="SET NULL")
+    )
+    company_set_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
     # Standalone Funding files own this policy. Linked profiles defer to the
     # DealerBusiness row while retaining this snapshot for future handoffs.
     plaid_assets_enabled: Mapped[bool] = mapped_column(

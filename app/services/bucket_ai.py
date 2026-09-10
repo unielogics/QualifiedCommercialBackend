@@ -2448,6 +2448,21 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             "files_done": files_done,
         }
         await log_bucket_ai_activity(db, bucket.id, "ai_review_failed", target_type="ai_review", target_id=str(review.id), detail=review.error)
+    if review.status == "completed":
+        # The timeline learns that a review finished and where it landed —
+        # never what it said.
+        from app.services import file_events
+
+        probability = str((review.result or {}).get("probability_status") or "").strip()
+        await file_events.emit(
+            db,
+            bucket_id=bucket.id,
+            kind="review.completed",
+            visibility=file_events.VISIBILITY_TEAM,
+            title=f"Review completed: {probability}" if probability else "Review completed",
+            target_type="ai_review",
+            target_id=review.id,
+        )
     await db.flush()
     return review
 
@@ -2858,6 +2873,22 @@ async def create_human_message(
         actor_role=sender_kind,
         detail=f"{actor_name} sent a message in the {audience} thread",
     )
+    if audience == "uploader":
+        # The client's thread is the only one on the file's timeline; the
+        # private admin, share and vendor threads are not the client's.
+        from app.services import file_events
+
+        await file_events.emit(
+            db,
+            bucket_id=bucket.id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"Message from {actor_name}" if sender_kind == "client" else "Reply from the desk",
+            actor=user,
+            actor_label=actor_name,
+            target_type="bucket_ai_message",
+            target_id=row.id,
+        )
     return row
 
 
@@ -2890,6 +2921,22 @@ async def create_chat_reply(
     )
     db.add(user_row)
     await db.flush()
+    if audience == "uploader":
+        # The client's thread is the only one on the file's timeline; the
+        # private admin, share and vendor threads are not the client's.
+        from app.services import file_events
+
+        await file_events.emit(
+            db,
+            bucket_id=bucket.id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title=f"Message from {actor_name}" if sender_kind == "client" else "Reply from the desk",
+            actor=user,
+            actor_label=actor_name,
+            target_type="bucket_ai_message",
+            target_id=user_row.id,
+        )
 
     context = await _chat_context(
         db,

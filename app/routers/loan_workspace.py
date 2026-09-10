@@ -30,8 +30,8 @@ from app.enums import (
     DealChatRole,
     FeedbackOutputType,
     FeedbackRating,
-    LoanType,
     LoanPurpose,
+    LoanType,
     PropertyType,
     Role,
 )
@@ -39,13 +39,14 @@ from app.models.activity import Activity
 from app.models.ai_feedback import AIFeedback
 from app.models.ai_modify_correction import AIModifyCorrection
 from app.models.ai_task import AITask
+from app.models.client import Client as ClientModel
 from app.models.hud import HudLineItem
+from app.models.hud_share_link import HudShareLink
 from app.models.loan import Loan
 from app.models.loan_chat_message import LoanChatMessage
 from app.models.loan_instruction import LoanInstruction
 from app.models.loan_scenario import LoanScenario
 from app.models.user import User
-from app.models.hud_share_link import HudShareLink
 from app.schemas.loan_workspace import (
     ChatMessageRead,
     ChatSendRequest,
@@ -64,17 +65,18 @@ from app.schemas.loan_workspace import (
     ScenarioRead,
     WorkspaceState,
 )
-from app.services.chat_names import serialize_chat, serialize_chat_one
+from app.scoping import scope_loan_query
+from app.services import file_events
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
 from app.services.ai.usage import tracked_messages_create
+from app.services.chat_names import serialize_chat, serialize_chat_one
+from app.services.hud_template import build_hud_draft
 from app.services.math import dscr as dscr_calc
 from app.services.math import monthly_payment, pricing_quote
-from app.services.math.cash_to_close import borrower_equity_required, total_cash_to_close as compute_total_cash_to_close
-from app.services.hud_template import build_hud_draft
-from app.models.client import Client as ClientModel
-from app.scoping import scope_loan_query
+from app.services.math.cash_to_close import borrower_equity_required
+from app.services.math.cash_to_close import total_cash_to_close as compute_total_cash_to_close
 
 
 # Phase 7.5 — Push fan-out helper for workspace chat.
@@ -147,8 +149,9 @@ def _trim_preview(body: str, max_chars: int = 100) -> str:
 # in a follow-up if the scheduled-job path proves insufficient.
 def _schedule_resume_followup(*, loan_id: UUID, paused_until: datetime) -> None:
     try:
-        from app.services.scheduler import scheduler
         from datetime import timedelta
+
+        from app.services.scheduler import scheduler
         # Small jitter so we don't fire at the literal microsecond the
         # pause clears — gives engagement.is_paused a chance to settle.
         run_date = paused_until + timedelta(seconds=30)
@@ -176,8 +179,9 @@ async def _ai_followup_job(loan_id_str: str) -> None:
     """One-shot APScheduler callback. Opens a fresh DB session, loads the
     loan, and runs the AI against the current thread so it posts a
     closing follow-up after the operator's takeover window ends."""
-    from app.db import SessionLocal
     from uuid import UUID as _UUID
+
+    from app.db import SessionLocal
 
     try:
         loan_uuid = _UUID(loan_id_str)
@@ -233,7 +237,8 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
     settings = get_settings()
 
     # Recent chat (client-visible only) — windowed to WINDOW turns.
-    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW, maybe_rollup as _chat_rollup
+    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW
+    from app.services.ai.chat_rollup import maybe_rollup as _chat_rollup
 
     history_stmt = (
         select(LoanChatMessage)
@@ -285,6 +290,8 @@ async def _generate_ai_followup(db: AsyncSession, loan: Loan) -> LoanChatMessage
         system += "\n\nPRIOR CONVERSATION SUMMARY:\n" + new_summary
     from app.services.ai.task_training import (
         load_task_config as _load_tc,
+    )
+    from app.services.ai.task_training import (
         render_training_block as _render_tb,
     )
 
@@ -626,6 +633,19 @@ async def send_chat(
             actor_role=actor_role.value,
             body=payload.body,
         )
+        # File timeline: a person answered in the client's thread. The push
+        # above already reached the client, so they are not told twice.
+        await file_events.emit(
+            db,
+            loan_id=loan.id,
+            kind="message.sent",
+            visibility=file_events.VISIBILITY_CLIENT,
+            title="Reply from your agent" if actor_role == DealChatRole.BROKER else "Reply from the desk",
+            actor=user,
+            target_type="loan_chat_message",
+            target_id=msg.id,
+            already_notified={getattr(client, "user_id", None)},
+        )
         _schedule_resume_followup(loan_id=loan.id, paused_until=paused_until)
 
         return ChatSendResponse(
@@ -648,6 +668,18 @@ async def send_chat(
     db.add(msg)
     await db.flush()
     await db.refresh(msg)
+    # File timeline: the client's message at the client tier; an agent's
+    # question to the desk at the team tier. The AI's reply is not hooked.
+    await file_events.emit(
+        db,
+        loan_id=loan.id,
+        kind="message.sent",
+        visibility=file_events.VISIBILITY_TEAM if is_broker_q else file_events.VISIBILITY_CLIENT,
+        title="Agent question to the desk" if is_broker_q else f"Message from {user.name or 'your client'}",
+        actor=user,
+        target_type="loan_chat_message",
+        target_id=msg.id,
+    )
 
     paused_now = engagement.is_paused(loan)
     if paused_now and not is_broker_q:
@@ -703,7 +735,8 @@ async def _generate_ai_reply(
     # Full conversation in ascending order (capped so an enormous
     # thread can't dominate the rollup query). The recent WINDOW is
     # sent verbatim; everything older folds into a rolling summary.
-    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW, maybe_rollup as _chat_rollup
+    from app.services.ai.chat_rollup import WINDOW as _CHAT_WINDOW
+    from app.services.ai.chat_rollup import maybe_rollup as _chat_rollup
 
     history_stmt = (
         select(LoanChatMessage)
