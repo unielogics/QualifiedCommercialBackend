@@ -5096,6 +5096,12 @@ async def write_worksheet_cells(
         actor_user_id=user.id,
     )
     await db.commit()
+    # After the commit: the document the AI reads should carry what was just
+    # typed, and re-rendering it must never be able to fail the save.
+    await sheets.refresh_touched_pdfs(
+        db, profile, [edit.sheet for edit in payload.edits],
+        actor_name=getattr(user, "name", None), actor_email=getattr(user, "email", None),
+    )
     return result
 
 
@@ -5125,6 +5131,10 @@ async def write_worksheet_row(
         actor_user_id=user.id,
     )
     await db.commit()
+    await sheets.refresh_touched_pdfs(
+        db, profile, [payload.sheet],
+        actor_name=getattr(user, "name", None), actor_email=getattr(user, "email", None),
+    )
     return result
 
 

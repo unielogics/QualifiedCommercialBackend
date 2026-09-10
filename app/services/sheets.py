@@ -29,6 +29,14 @@ documents cannot have:
   holds — the draft→submitted latch, blank staying null, and above all
   `save_debt_rows`' law that a save writes only the rows its own origin owns.
 
+- **A write that announces itself.** Once a batch is accepted, every cell it
+  changed is published to `sheet:{worksheet}:{kind}` — the audience for that
+  one sheet, built from the kind that was written rather than from anything the
+  request named — carrying the value as *stored*, so the other grids paint what
+  is on the file and not what somebody typed. It goes out on `pg_notify` inside
+  this transaction: a save that rolls back on the way out announces nothing.
+  See `services/worksheet_presence.py` for both lanes.
+
 **Staleness is not a conflict.** A whole-body `version` check is right for a
 form somebody fills in and saves once; on a live sheet two people editing
 different cells would collide on it constantly and there would be nothing
@@ -41,6 +49,7 @@ it to reload.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
@@ -106,6 +115,9 @@ class _Loaded:
         self.completed = completed
         self.rev = rev
 
+
+
+log = logging.getLogger(__name__)
 
 def _json(value: Any) -> Any:
     """A computed figure as JSON. Decimal is the only surprise — every total in
@@ -444,6 +456,52 @@ async def read_sheets(
 # ---------------------------------------------------------------------------
 
 
+def _by(
+    worksheet: FinancialWorksheet | None,
+    *,
+    participant_id: str | None,
+    actor_user_id: uuid.UUID | None,
+) -> dict[str, Any] | None:
+    """Who to put on the cell label, if they have a stream open.
+
+    A guest names their own tab; a staff writer is looked up by user id,
+    because the write endpoint knows who the actor is but not which tab they
+    are in. Nobody streaming means no label — the value still lands, it just
+    arrives unattributed, which is the right answer for a write that came from
+    a script or a second window that is not watching.
+    """
+    if worksheet is None or getattr(worksheet, "id", None) is None:
+        return None
+    from app.services import worksheet_presence
+
+    participant = None
+    if participant_id:
+        participant = worksheet_presence.touch(worksheet.id, participant_id)
+    if participant is None:
+        participant = worksheet_presence.by_user(worksheet.id, actor_user_id)
+    return participant.by() if participant is not None else None
+
+
+async def _announce(
+    db: AsyncSession, worksheet: FinancialWorksheet | None, events: Sequence[dict[str, Any]]
+) -> None:
+    """Broadcast what was just written — **after** it was accepted, never before.
+
+    The carrier is `pg_notify` on this session, so these ride the same
+    transaction as the write itself: a save that rolls back on the way out
+    announces nothing, and every other browser is spared a value that does not
+    exist. The audience on each event is `sheet:{worksheet}:{kind}` for the one
+    sheet the cell is on, built server-side in `worksheet_presence` from the
+    kind that was actually written — never from anything the request named.
+    """
+    if worksheet is None or getattr(worksheet, "id", None) is None or not events:
+        return
+    from app.services import worksheet_presence
+
+    for event in events:
+        await worksheet_presence.publish_sheet_event(db, event)
+
+
 def _group(edits: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     """`[{sheet, key, value}]` as `{kind: {key: value}}`, later edits winning.
 
@@ -547,6 +605,42 @@ async def _stored_body(
     return dict(getattr(saved, "body", None) or body)
 
 
+async def refresh_touched_pdfs(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    kinds: Sequence[str],
+    *,
+    actor_name: str | None = None,
+    actor_email: str | None = None,
+) -> None:
+    """Put today's figures behind each form's PDF, after the save is committed.
+
+    The AI reads a form through the document filed for it — `classification`
+    and `key_facts` on the analysis row, never the statement table — so a
+    worksheet that only wrote the database would leave the extractors, the
+    intelligence cards and the lender packet reading whatever the borrower had
+    when they last pressed Send. Refreshing here keeps them current.
+
+    **After the commit, never inside it.** Rendering a PDF is WeasyPrint and an
+    S3 put; neither belongs in the transaction that holds the cell the person
+    just typed. It is also allowed to fail: a document that could not be
+    re-rendered is a stale document, which is a far smaller problem than a save
+    that came back as an error because a renderer did.
+    """
+    from app.services import drafted_forms
+
+    for kind in dict.fromkeys(kinds):
+        if kind not in KINDS:
+            continue
+        try:
+            await drafted_forms.refresh_saved_form(
+                db, profile, kind, actor_name=actor_name, actor_email=actor_email
+            )
+        except Exception:  # noqa: BLE001 - a stale PDF must never fail a save
+            log.exception("sheets: could not refresh the %s document", kind)
+            await db.rollback()
+
+
 async def apply_cell_edits(
     db: AsyncSession,
     profile: ApplicationProfile,
@@ -556,6 +650,8 @@ async def apply_cell_edits(
     origin: str = "admin",
     actor_user_id: uuid.UUID | None = None,
     worksheet: FinancialWorksheet | None = None,
+    participant_id: str | None = None,
+    client_id: str | None = None,
 ) -> dict[str, Any]:
     """Write a handful of cells and say where the workbook now stands.
 
@@ -577,6 +673,9 @@ async def apply_cell_edits(
     revs: dict[str, int] = {}
     computed: dict[str, dict[str, Any]] = {}
     resync: list[str] = []
+    by = _by(worksheet, participant_id=participant_id, actor_user_id=actor_user_id)
+    events: list[dict[str, Any]] = []
+    from app.services import worksheet_presence
 
     for kind, values in grouped.items():
         loaded = await _load(
@@ -602,8 +701,26 @@ async def apply_cell_edits(
         await _stamp_sheet_rev(db, kind, statement_id, new_rev)
         revs[kind] = new_rev
 
+        for key, value in values.items():
+            # What is stored, not what was typed: a figure the save normalised
+            # or refused would otherwise be broadcast as though it had been
+            # kept. An appended row is addressed by its ordinal key until it
+            # exists, so the typed text is the fallback for exactly that case.
+            events.append(
+                worksheet_presence.cell_event(
+                    worksheet.id,
+                    sheet_kind=kind,
+                    key=key,
+                    value=flat.get(key, sheet_layout._as_text(value)),
+                    revision=new_rev,
+                    by=by,
+                    origin_client_id=client_id,
+                )
+            )
+
     worksheet.revision = new_rev
     await db.flush()
+    await _announce(db, worksheet, events)
     # The debt schedule reads the clock rather than a stored rev, so it is
     # always reported: otherwise a client that only ever edits the P&L would
     # drift behind on it until it tripped the stale limit for no reason.
@@ -623,6 +740,8 @@ async def apply_row_op(
     origin: str = "admin",
     actor_user_id: uuid.UUID | None = None,
     worksheet: FinancialWorksheet | None = None,
+    participant_id: str | None = None,
+    client_id: str | None = None,
 ) -> dict[str, Any]:
     """Add or remove a line on one of the two list-shaped sheets.
 
@@ -643,6 +762,22 @@ async def apply_row_op(
     worksheet = await _lock(db, worksheet)
     prefill = await financial_statements.form_prefill(db, profile)
     loaded = await _load(db, profile, kind, origin=origin, prefill=prefill, worksheet=worksheet)
+    from app.services import worksheet_presence
+
+    by = _by(worksheet, participant_id=participant_id, actor_user_id=actor_user_id)
+
+    def _row_announcement(row_id: str | None, revision: int) -> dict[str, Any]:
+        return worksheet_presence.row_event(
+            worksheet.id,
+            event_type="row.inserted" if op == "insert" else "row.deleted",
+            sheet_kind=kind,
+            row_id=row_id,
+            block=block,
+            after=after,
+            revision=revision,
+            by=by,
+            origin_client_id=client_id,
+        )
 
     if kind == "pfs":
         spec = pfs_schema.SCHEDULES_BY_KEY.get(str(block or ""))
@@ -651,7 +786,16 @@ async def apply_row_op(
         body = dict(loaded.body)
         schedules = dict(pfs_schema.normalize_schedule_rows(body))
         rows = list(schedules.get(spec.key) or [])
+        was = [str((row or {}).get("id") or "") for row in rows]
         rows = _apply_rows(rows, op=op, row_id=row_id, after=after)
+        # Which line this was about, for the broadcast: on a delete it is the
+        # one asked for, on an insert it is the id `_apply_rows` minted, and
+        # the only honest way to learn that is to diff.
+        touched = row_id or next(
+            (str((row or {}).get("id") or "") for row in rows
+             if str((row or {}).get("id") or "") not in was),
+            None,
+        )
         schedules[spec.key] = rows
         body["schedules"] = schedules
         saved = await financial_statements.save_statement(
@@ -665,6 +809,7 @@ async def apply_row_op(
         worksheet.revision = int(worksheet.revision) + 1
         await _stamp_sheet_rev(db, kind, getattr(saved, "id", None), worksheet.revision)
         await db.flush()
+        await _announce(db, worksheet, [_row_announcement(touched, worksheet.revision)])
         stored = dict(getattr(saved, "body", None) or body)
         return {
             "rows": _row_payloads(kind, stored),
@@ -680,6 +825,10 @@ async def apply_row_op(
         # first keystroke, through the same `save_debt_rows` every other edit
         # takes, which will insert it under this origin.
         body = {**loaded.body, "debts": rows}
+        # Announced anyway, and at the unchanged revision: the other grids draw
+        # the same blank line under the same id, so the first keystroke lands
+        # in a row everybody already has rather than appearing out of nowhere.
+        await _announce(db, worksheet, [_row_announcement(fresh["id"], worksheet.revision)])
         return {
             "rows": _row_payloads(kind, body),
             "row_meta": _row_meta(kind, body),
@@ -695,6 +844,7 @@ async def apply_row_op(
     )
     worksheet.revision = int(worksheet.revision) + 1
     await db.flush()
+    await _announce(db, worksheet, [_row_announcement(row_id, worksheet.revision)])
     stored = await financial_statements.debt_body_for_profile(db, profile, origin=origin)
     return {
         "rows": _row_payloads(kind, stored),

@@ -145,10 +145,19 @@ async def startup() -> None:
     start_scheduler()
     from app.services.communication_events import broker as communication_event_broker
     await communication_event_broker.start()
+    # A plain asyncio task, deliberately not an APScheduler job: APScheduler is
+    # the reason this process runs `--workers 1`, and presence housekeeping —
+    # which sweeps a dictionary that is worker-local by nature — must not be
+    # added to that pile. It drops anyone whose worksheet stream went half-open
+    # (a closed laptop lid holds the socket for minutes) and announces them out.
+    from app.services.worksheet_presence import sweeper as worksheet_presence_sweeper
+    await worksheet_presence_sweeper.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    from app.services.worksheet_presence import sweeper as worksheet_presence_sweeper
+    await worksheet_presence_sweeper.stop()
     from app.services.communication_events import broker as communication_event_broker
     await communication_event_broker.stop()
     from app.services.scheduler import shutdown_scheduler
@@ -253,6 +262,7 @@ for r in [
     public_router.router,
     sms_router.router,
     worksheets.router,  # /public/worksheets/{token} — no auth on any route
+    worksheets.staff_router,  # the desk's live worksheet stream and cursor
     webhooks_router.router,
 ]:
     app.include_router(r, prefix=api_prefix)

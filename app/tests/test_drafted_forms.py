@@ -367,3 +367,25 @@ async def test_a_draft_save_then_a_submit_leaves_one_document_not_two():
             "a submit that creates its own document leaves the draft's behind"
         )
         assert "refresh_form_pdf(" in source and "mark_uploaded=True" in source
+
+
+def test_every_worksheet_write_refreshes_the_document_the_ai_reads():
+    """A figure typed in the grid has to reach the PDF, exactly as one typed in
+    the stacked forms does — otherwise the extractors, the intelligence cards
+    and the lender packet read whatever was there at the last submit."""
+    import inspect
+
+    from app.routers import application_profiles as ap
+    from app.routers import worksheets as ws
+
+    for handler in (
+        ap.write_worksheet_cells, ap.write_worksheet_row,
+        ws.write_worksheet_cells, ws.write_worksheet_rows,
+    ):
+        source = inspect.getsource(handler)
+        assert "refresh_touched_pdfs(" in source, handler.__qualname__
+        # After the commit, never inside it: rendering is WeasyPrint and an S3
+        # put, and neither belongs in the transaction holding the typed cell.
+        assert source.index("await db.commit()") < source.index("refresh_touched_pdfs("), (
+            f"{handler.__qualname__} refreshes before it commits"
+        )
