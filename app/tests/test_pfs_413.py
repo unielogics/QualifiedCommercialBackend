@@ -455,3 +455,88 @@ def test_amounts_survive_currency_formatting():
     assert _form_amount(300) == 300.0
     assert _form_amount(None) == 0.0
     assert _form_amount("not a number") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Prefill, and the fuller debt row.
+# ---------------------------------------------------------------------------
+
+
+def test_prefill_seeds_blanks_and_never_overwrites_what_was_typed():
+    """The file's copy of a name can be stale. The person on the form is the
+    better authority, so their typing wins and a correction must survive a
+    reload of the link."""
+    from app.services import financial_statements as fs
+
+    prefill = {
+        "owner_name": "Ashraf Kassim",
+        "business_name": "Kassim Motors LLC",
+        "home_address": "12 Main St, Miami, FL 33101",
+        "business_phone": "305-555-0100",
+    }
+    seeded = fs.seed_pfs_applicant(pfs_schema.empty_body(), prefill)
+    assert seeded["applicant"]["name"] == "Ashraf Kassim"
+    assert seeded["applicant"]["business_name"] == "Kassim Motors LLC"
+
+    corrected = {**seeded, "applicant": {**seeded["applicant"], "name": "Karim Kassim"}}
+    again = fs.seed_pfs_applicant(corrected, prefill)
+    assert again["applicant"]["name"] == "Karim Kassim"
+
+
+def test_a_debt_row_carries_everything_a_schedule_states():
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body({"debts": [{
+        "lender": "Ally", "debt_type": "Floorplan",
+        "original_amount": "$250,000", "balance": "180,000",
+        "rate": "7.25%", "monthly_payment": "4,200",
+        "originated_on": "2024-03-01", "maturity_on": "2029-03-01",
+        "secured": "Secured", "payment_status": "CURRENT",
+        "collateral": "Inventory", "notes": "Curtailment monthly",
+    }]})
+    row = rows[0]
+    assert float(row["original_amount"]) == 250000.0
+    # "7.25%" and "7.25" mean the same thing to someone filling in a form.
+    assert row["rate"] == 7.25
+    assert row["originated_on"].isoformat() == "2024-03-01"
+    assert row["maturity_on"].isoformat() == "2029-03-01"
+    # Case is the borrower's business, not the schema's.
+    assert row["secured"] == "secured"
+    assert row["payment_status"] == "current"
+    assert row["collateral"] == "Inventory"
+
+
+def test_the_two_choice_fields_refuse_anything_they_do_not_recognize():
+    """These render on a schedule we hand a lender. A stray value must not
+    arrive there looking like something the borrower stated."""
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body({"debts": [{
+        "lender": "A", "balance": "1000", "monthly_payment": "50",
+        "secured": "probably", "payment_status": "<script>",
+    }]})
+    assert rows[0]["secured"] is None
+    assert rows[0]["payment_status"] is None
+
+
+def test_an_unparseable_date_is_dropped_rather_than_raised():
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body({"debts": [{
+        "lender": "A", "balance": "1000", "monthly_payment": "50",
+        "originated_on": "last spring", "maturity_on": "",
+    }]})
+    assert rows[0]["originated_on"] is None
+    assert rows[0]["maturity_on"] is None
+
+
+def test_key_facts_now_carry_the_figures_that_used_to_be_hardcoded_null():
+    from app.services import financial_statements as fs
+
+    rows = fs.debt_rows_from_body({"debts": [{
+        "lender": "Ally", "original_amount": "250000", "balance": "180000",
+        "monthly_payment": "4200", "maturity_on": "2029-03-01",
+    }]})
+    facts = fs.debt_key_facts(rows)
+    assert facts["debts"][0]["original_amount"] == 250000.0
+    assert facts["debts"][0]["maturity_date"] == "2029-03-01"

@@ -15,7 +15,7 @@ and the richer form can land behind it.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -305,7 +305,57 @@ async def link_for_token(db: AsyncSession, token: str):
 #: What the borrower is asked for per obligation. Deliberately short: a debt
 #: schedule someone abandons halfway is worth less than a complete one with
 #: four columns, and the desk can enrich a row afterwards.
-DEBT_COLUMNS = ("lender", "balance", "monthly_payment", "maturity_on", "notes")
+DEBT_COLUMNS = (
+    "lender",
+    "debt_type",
+    "original_amount",
+    "balance",
+    "rate",
+    "monthly_payment",
+    "originated_on",
+    "maturity_on",
+    "secured",
+    "payment_status",
+    "collateral",
+    "notes",
+)
+
+#: What the row's two choice fields accept. Anything else is discarded rather
+#: than stored, so a stray value cannot end up rendered on a schedule we send
+#: to a lender as though the borrower had said it.
+_SECURED_CHOICES = {"secured", "unsecured"}
+_PAYMENT_STATUS_CHOICES = {"current", "delinquent"}
+
+
+def _choice(value: Any, allowed: set[str]) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else None
+
+
+def _date(value: Any) -> date | None:
+    """An ISO date off a date input, or nothing.
+
+    The browser sends yyyy-mm-dd and nothing else, but a hand-built request or
+    a paste can send anything, and an unparseable date is not worth a 500.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _rate(value: Any) -> float | None:
+    """An interest rate as a number. "7.25%" and "7.25" mean the same thing."""
+    text = str(value or "").strip().rstrip("%").replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -326,8 +376,16 @@ def debt_rows_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
         out.append(
             {
                 "lender": (lender or "Unnamed lender")[:180],
+                "debt_type": (str(raw.get("debt_type") or "").strip() or None),
+                "original_amount": pfs_schema._amount(raw.get("original_amount")) or None,
                 "balance": balance,
+                "rate": _rate(raw.get("rate")),
                 "monthly_payment": monthly,
+                "originated_on": _date(raw.get("originated_on")),
+                "maturity_on": _date(raw.get("maturity_on")),
+                "secured": _choice(raw.get("secured"), _SECURED_CHOICES),
+                "payment_status": _choice(raw.get("payment_status"), _PAYMENT_STATUS_CHOICES),
+                "collateral": (str(raw.get("collateral") or "").strip() or None),
                 "notes": str(raw.get("notes") or "").strip() or None,
             }
         )
@@ -340,10 +398,15 @@ def debt_key_facts(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "debts": [
             {
                 "lender": row["lender"],
-                "original_amount": None,
+                # These two were hardcoded null because the form had nowhere to
+                # collect them. It does now, and the analyzer's own schedule
+                # extraction reads both by name.
+                "original_amount": (
+                    float(row["original_amount"]) if row.get("original_amount") else None
+                ),
                 "current_balance": float(row["balance"]),
                 "monthly_payment": float(row["monthly_payment"]),
-                "maturity_date": None,
+                "maturity_date": row["maturity_on"].isoformat() if row.get("maturity_on") else None,
             }
             for row in rows
         ],
@@ -385,8 +448,20 @@ async def replace_debt_rows(
                 profile_id=profile.id,
                 dealer_id=profile.dealer_id,
                 lender=row["lender"],
+                # `category` is the column that already existed for this; the
+                # form calls it "type of debt" because that is what a schedule
+                # calls it. Falls back to the old default so nothing downstream
+                # meets a null it never had to handle.
+                category=(row.get("debt_type") or "loan")[:24],
+                original_amount=row.get("original_amount"),
                 balance=row["balance"],
+                rate=row.get("rate"),
                 monthly_payment=row["monthly_payment"],
+                originated_on=row.get("originated_on"),
+                maturity_on=row.get("maturity_on"),
+                secured=row.get("secured"),
+                payment_status=row.get("payment_status"),
+                collateral=row.get("collateral"),
                 notes=row.get("notes"),
                 origin=origin,
                 status="active",
@@ -419,10 +494,122 @@ async def debt_body_for_profile(db: AsyncSession, profile: ApplicationProfile) -
         "debts": [
             {
                 "lender": row.lender,
+                # "loan" is the column's historic default, not something anyone
+                # typed, so it seeds as blank rather than as an answer.
+                "debt_type": "" if (row.category or "loan") == "loan" else row.category,
+                "original_amount": str(row.original_amount or ""),
                 "balance": str(row.balance or ""),
+                "rate": str(row.rate or ""),
                 "monthly_payment": str(row.monthly_payment or ""),
+                "originated_on": row.originated_on.isoformat() if row.originated_on else "",
+                "maturity_on": row.maturity_on.isoformat() if row.maturity_on else "",
+                "secured": row.secured or "",
+                "payment_status": row.payment_status or "",
+                "collateral": row.collateral or "",
                 "notes": row.notes or "",
             }
             for row in rows
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# What the file already knows about who is filling the form in.
+# ---------------------------------------------------------------------------
+
+
+async def form_prefill(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
+    """Business and owner identity, for seeding a form before anyone types.
+
+    A borrower opening a link we sent them should not be asked their own
+    business name. We already hold it — from the dealer record, the intake they
+    completed, or a document the analyzer read — and asking again reads as a
+    system that is not paying attention, on the first field of a long form.
+
+    Everything returned here is a suggestion. It seeds blanks only, is fully
+    editable, and the borrower's typing always wins: the file's copy of a name
+    can be stale, and the person on the form is the better authority on it.
+
+    Precedence matches `production_prefill`: the dealer record, then the intake,
+    then facts read off uploaded documents.
+    """
+    from app.dealer_os.models import DealerBusiness
+    from app.models.application_profile import ApplicationExtractedFact
+    from app.models.public_underwriting_intake import PublicUnderwritingIntake
+    from app.services import application_profiles as profiles
+
+    def text(value: Any) -> str:
+        return str(value or "").strip()
+
+    business = ""
+    if profile.dealer_id:
+        dealer = await db.get(DealerBusiness, profile.dealer_id)
+        if dealer is not None:
+            business = text(dealer.legal_name) or text(dealer.name)
+    if not business and profile.intake_id:
+        intake = await db.get(PublicUnderwritingIntake, profile.intake_id)
+        if intake is not None:
+            business = text(intake.business_name)
+    if not business:
+        fact = (
+            await db.execute(
+                select(ApplicationExtractedFact)
+                .where(
+                    ApplicationExtractedFact.profile_id == profile.id,
+                    ApplicationExtractedFact.field_key == "legal_entity_name",
+                    ApplicationExtractedFact.status != "rejected",
+                )
+                .order_by(ApplicationExtractedFact.created_at.desc())
+            )
+        ).scalars().first()
+        if fact is not None:
+            raw = fact.normalized_value or (
+                fact.value if isinstance(fact.value, str) else (fact.value or {}).get("value")
+            )
+            business = text(raw)
+
+    owners = await profiles.owner_rows(db, profile)
+    owner = next((row for row in owners if getattr(row, "is_primary", False)), None)
+    owner = owner or (owners[0] if owners else None)
+
+    name = ""
+    address = ""
+    phone = ""
+    if owner is not None:
+        name = " ".join(part for part in (text(owner.first_name), text(owner.last_name)) if part)
+        # One line, the way an address goes on a form, and only the parts we
+        # actually hold — "Miami, , 33101" is worse than nothing to type over.
+        street = text(owner.street)
+        locality = ", ".join(part for part in (text(owner.city), text(owner.state)) if part)
+        locality = " ".join(part for part in (locality, text(owner.zip)) if part)
+        address = ", ".join(part for part in (street, locality) if part)
+        phone = text(owner.phone)
+
+    return {
+        "business_name": business or None,
+        "owner_name": name or None,
+        "home_address": address or None,
+        "business_phone": phone or None,
+        #: How many owners the file carries. A PFS belongs to one person, and a
+        #: form seeded with the primary owner's name on a two-owner file should
+        #: say so rather than let the second owner file under the first's name.
+        "owner_count": len(owners),
+    }
+
+
+def seed_pfs_applicant(body: dict[str, Any], prefill: dict[str, Any]) -> dict[str, Any]:
+    """Fill the 413's identity block from the file, without ever overwriting.
+
+    Blanks only. A borrower who corrected their address on a draft must not find
+    it reverted the next time they open the link.
+    """
+    applicant = dict(body.get("applicant") or {})
+    for field, key in (
+        ("name", "owner_name"),
+        ("business_name", "business_name"),
+        ("home_address", "home_address"),
+        ("business_phone", "business_phone"),
+    ):
+        if not str(applicant.get(field) or "").strip() and prefill.get(key):
+            applicant[field] = prefill[key]
+    return {**body, "applicant": applicant}

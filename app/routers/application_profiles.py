@@ -3939,16 +3939,23 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
     profile = await db.get(ApplicationProfile, link.profile_id)
     link.last_used_at = datetime.now(UTC)
 
+    # Who the file says this is. Seeds blanks on both forms so a borrower is not
+    # asked their own business name by the people already lending to them.
+    prefill = await financial_statements.form_prefill(db, profile)
+
     if link.kind == "debt_schedule":
         # Seeded from what the file already holds, so the borrower confirms and
         # corrects rather than retyping what we know.
         body = await financial_statements.debt_body_for_profile(db, profile)
+        if not str(body.get("business_name") or "").strip() and prefill.get("business_name"):
+            body = {**body, "business_name": prefill["business_name"]}
         schema = {"columns": list(financial_statements.DEBT_COLUMNS)}
     else:
         statement = (
             await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
         )
         body = (statement.body if statement else None) or pfs_schema.empty_body()
+        body = financial_statements.seed_pfs_applicant(body, prefill)
         schema = pfs_schema.describe()
 
     await db.commit()
@@ -3959,7 +3966,13 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         # Drives the thank-you state, so a reload returns to it rather than to
         # a form the borrower has already finished with.
         "completed": link.completed_at is not None,
-        "business_name": getattr(profile, "legal_entity_name", None),
+        # This read `getattr(profile, "legal_entity_name", None)` against an
+        # attribute the model does not have, so it was always null and the form
+        # never named the business it was for.
+        "business_name": prefill.get("business_name"),
+        # Returned whole so the page can say which fields it filled in and
+        # invite the borrower to correct them.
+        "prefill": prefill,
     }
 
 
