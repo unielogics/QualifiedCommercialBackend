@@ -266,7 +266,7 @@ async def file_pdf(
         if actor_user_id is None
         else f"{label} completed by {actor_name} on the borrower's behalf."
     )
-    stored = await drafted_forms.store_form_pdf(
+    stored = await drafted_forms.refresh_form_pdf(
         db,
         bucket_id=profile.primary_bucket_id,
         upload_link_id=None,
@@ -278,7 +278,10 @@ async def file_pdf(
         actor_name=actor_name,
         actor_email=actor_email,
         summary=summary,
-    )
+                       # Submit is what marks the requirement met; a draft save
+                       # refreshes the same document without flipping it.
+                       mark_uploaded=True,
+                   )
     statement.bucket_file_id = stored.id
     await file_events.emit(
         db,

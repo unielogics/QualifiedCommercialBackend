@@ -251,7 +251,11 @@ def test_describe_carries_every_key_the_form_renders():
             assert set(section["subtotal"]) == {"key", "label"}
             for row in section["rows"]:
                 assert set(row) == {
-                    "key", "label", "addback", "contra", "owner_comp", "text", "hint",
+                    "key", "label", "addback", "contra", "owner_comp", "text",
+                    # Which balance-sheet rows are interest-bearing debt, so the
+                    # cross-check against the debt schedule reads the schema
+                    # instead of a hand-kept list that would drift from it.
+                    "interest_bearing", "hint",
                 }
         for item in served["computed"]:
             assert set(item) == {"key", "label", "emphasis", "format"}
@@ -489,7 +493,7 @@ def test_file_pdf_files_the_sheet_with_typed_key_facts_and_tells_the_timeline():
     slot = _slot("Year-to-date P&L and balance sheet")
     stored = SimpleNamespace(id=uuid.uuid4())
     with (
-        patch.object(drafted_forms, "store_form_pdf", AsyncMock(return_value=stored)) as store,
+        patch.object(drafted_forms, "refresh_form_pdf", AsyncMock(return_value=stored)) as store,
         patch.object(dealer_forms_pdf, "render_p_and_l_pdf", return_value=b"%PDF") as render,
         patch.object(file_events, "emit", AsyncMock()) as emit,
     ):
@@ -517,7 +521,7 @@ def test_file_pdf_names_the_staff_member_when_the_desk_did_it():
     statement = SimpleNamespace(id=uuid.uuid4(), kind="balance_sheet", body=_bs(cash_in_bank="1"), bucket_file_id=None)
     user = SimpleNamespace(id=uuid.uuid4())
     with (
-        patch.object(drafted_forms, "store_form_pdf", AsyncMock(return_value=SimpleNamespace(id=uuid.uuid4()))) as store,
+        patch.object(drafted_forms, "refresh_form_pdf", AsyncMock(return_value=SimpleNamespace(id=uuid.uuid4()))) as store,
         patch.object(dealer_forms_pdf, "render_balance_sheet_pdf", return_value=b"%PDF"),
         patch.object(file_events, "emit", AsyncMock()) as emit,
     ):

@@ -3712,7 +3712,7 @@ async def _file_statement(
     applicant = (statement.body or {}).get("applicant") or {}
     label = f"Personal Financial Statement — {applicant.get('name') or 'applicant'}"
 
-    stored = await drafted_forms.store_form_pdf(
+    stored = await drafted_forms.refresh_form_pdf(
         db,
         bucket_id=profile.primary_bucket_id,
         upload_link_id=None,
@@ -3726,7 +3726,10 @@ async def _file_statement(
         actor_name=actor_name,
         actor_email=actor_email,
         summary=f"{label} {summary_suffix}",
-    )
+                       # Submit is what marks the requirement met; a draft save
+                       # refreshes the same document without flipping it.
+                       mark_uploaded=True,
+                   )
     await financial_statements.save_statement(
         db,
         profile,
@@ -3822,10 +3825,11 @@ async def update_financial_statement(
 ) -> FinancialStatementRead:
     """Correct a statement, including one already submitted.
 
-    A submitted statement stays submitted: the PDF on the checklist is the one
-    the borrower signed off, and silently swapping it because someone fixed a
-    typo would change what a partner was sent without saying so. Re-submitting
-    is an explicit act.
+    A submitted statement stays submitted: the checklist row is not re-flipped
+    and `submitted_at` is not moved, because re-submitting is an explicit act.
+    The filed PDF and its key facts are refreshed, though — the figures the
+    desk and the AI read come out of that analysis, and leaving them at the
+    typo means every reader downstream keeps reading the typo.
     """
     profile = await profiles.load_profile(db, profile_id, user)
     _require_statement_staff(user)
@@ -3847,6 +3851,12 @@ async def update_financial_statement(
     )
     await db.commit()
     await db.refresh(statement)
+    # After the commit and never able to fail it: the PDF behind the statement
+    # is redrawn from what was just saved. Does not satisfy the checklist row.
+    await drafted_forms.refresh_saved_form(
+        db, profile, "pfs", body=payload.body, statement=statement,
+        actor_name=user.name or user.email, actor_email=user.email,
+    )
     return await _statement_read(db, profile, statement)
 
 
@@ -4025,6 +4035,11 @@ async def save_public_financial_form_draft(
             origin="client_form",
         )
         await db.commit()
+        await drafted_forms.refresh_saved_form(
+            db, profile, "debt_schedule", body=payload.body,
+            actor_name=link.invitee_email or "Borrower",
+            actor_email=link.invitee_email or "",
+        )
         return {"saved": True}
 
     if link.kind in business_statement_schema.KINDS:
@@ -4032,6 +4047,11 @@ async def save_public_financial_form_draft(
             db, profile, kind=link.kind, body=payload.body or {}, status="draft"
         )
         await db.commit()
+        await drafted_forms.refresh_saved_form(
+            db, profile, link.kind, body=payload.body or {},
+            actor_name=link.invitee_email or "Borrower",
+            actor_email=link.invitee_email or "",
+        )
         return {"saved": True}
 
     statement = (
@@ -4047,6 +4067,11 @@ async def save_public_financial_form_draft(
     )
     link.statement_id = saved.id
     await db.commit()
+    await drafted_forms.refresh_saved_form(
+        db, profile, "pfs", body=payload.body, statement=saved,
+        actor_name=link.invitee_email or "Borrower",
+        actor_email=link.invitee_email or "",
+    )
     return {"saved": True}
 
 
@@ -4076,7 +4101,7 @@ async def submit_public_financial_form(
         slot = await _requested_slot(db, profile, "debt_schedule")
         if slot is not None:
             facts = financial_statements.debt_key_facts(rows)
-            await drafted_forms.store_form_pdf(
+            await drafted_forms.refresh_form_pdf(
                 db,
                 bucket_id=profile.primary_bucket_id,
                 upload_link_id=None,
@@ -4096,7 +4121,10 @@ async def submit_public_financial_form(
                 actor_name=link.invitee_email or "Borrower",
                 actor_email=link.invitee_email or "",
                 summary="Business Debt Schedule submitted by the borrower through their own link.",
-            )
+                      # Submit is what marks the requirement met; a draft save
+                      # refreshes the same document without flipping it.
+                      mark_uploaded=True,
+                  )
         link.completed_at = datetime.now(UTC)
         await file_events.emit(
             db,
@@ -4738,7 +4766,7 @@ async def save_debt_schedule(
         slot = await _requested_slot(db, profile, "debt_schedule")
         if slot is not None:
             facts = financial_statements.debt_key_facts(rows)
-            await drafted_forms.store_form_pdf(
+            await drafted_forms.refresh_form_pdf(
                 db,
                 bucket_id=profile.primary_bucket_id,
                 upload_link_id=None,
@@ -4761,7 +4789,10 @@ async def save_debt_schedule(
                     f"Business Debt Schedule completed by {user.name or user.email} "
                     "on the borrower's behalf."
                 ),
-            )
+                      # Submit is what marks the requirement met; a draft save
+                      # refreshes the same document without flipping it.
+                      mark_uploaded=True,
+                  )
         await file_events.emit(
             db,
             profile=profile,
@@ -4779,6 +4810,13 @@ async def save_debt_schedule(
         target_type="financial_form", target_id=profile.id,
     )
     await db.commit()
+    if not payload.submit:
+        # A submit has just filed the sheet through `refresh_form_pdf`; only a
+        # draft save needs the standing PDF brought up to date.
+        await drafted_forms.refresh_saved_form(
+            db, profile, "debt_schedule", body=payload.body,
+            actor_name=user.name or user.email, actor_email=user.email,
+        )
     return {"row_count": len(rows), "submitted": bool(payload.submit)}
 
 
@@ -4849,6 +4887,11 @@ async def save_business_statement(
         target_type="business_financial_statement", target_id=statement.id,
     )
     await db.commit()
+    if not payload.submit:
+        await drafted_forms.refresh_saved_form(
+            db, profile, kind, body=payload.body, statement=statement,
+            actor_name=user.name or user.email, actor_email=user.email,
+        )
     return {
         "statement_id": statement.id,
         "status": statement.status,

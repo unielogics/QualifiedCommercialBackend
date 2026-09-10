@@ -59,6 +59,14 @@ class LineRow:
     #: flagged, rendered as a text input. A property of the row, not of its
     #: key's suffix.
     text: bool = False
+    #: An interest-bearing obligation — a balance that also belongs on the
+    #: business debt schedule. Marked on the row for the same reason `liquid`
+    #: is marked on a 413 row: `form_sync` cross-checks the schedule's total
+    #: against these lines, and a hand-kept list of eight keys somewhere else
+    #: drifts the first time a liability line is added or renamed. Trade
+    #: payables, accrued taxes and "other" liabilities are debts but carry no
+    #: lender and no monthly payment, so they are not flagged.
+    interest_bearing: bool = False
     hint: str | None = None
 
 
@@ -256,11 +264,11 @@ BS_SECTIONS: tuple[Section, ...] = (
         "current_liabilities",
         "Current liabilities",
         (
-            LineRow("credit_cards", "Credit cards"),
-            LineRow("lines_of_credit", "Lines of credit"),
-            LineRow("short_term_loans", "Short-term loans, including merchant cash advances"),
+            LineRow("credit_cards", "Credit cards", interest_bearing=True),
+            LineRow("lines_of_credit", "Lines of credit", interest_bearing=True),
+            LineRow("short_term_loans", "Short-term loans, including merchant cash advances", interest_bearing=True),
             LineRow("accounts_payable", "Accounts payable"),
-            LineRow("current_portion_long_term_debt", "Current portion of long-term debt"),
+            LineRow("current_portion_long_term_debt", "Current portion of long-term debt", interest_bearing=True),
             LineRow("other_current_liabilities", "Other current liabilities"),
         ),
         "total_current_liabilities",
@@ -271,10 +279,10 @@ BS_SECTIONS: tuple[Section, ...] = (
         "long_term_liabilities",
         "Long-term liabilities",
         (
-            LineRow("long_term_loans", "Long-term loans"),
-            LineRow("equipment_loans", "Equipment loans"),
-            LineRow("vehicle_loans", "Vehicle loans"),
-            LineRow("real_estate_loans", "Real estate loans"),
+            LineRow("long_term_loans", "Long-term loans", interest_bearing=True),
+            LineRow("equipment_loans", "Equipment loans", interest_bearing=True),
+            LineRow("vehicle_loans", "Vehicle loans", interest_bearing=True),
+            LineRow("real_estate_loans", "Real estate loans", interest_bearing=True),
             LineRow("other_long_term_liabilities", "Other long-term liabilities"),
         ),
         "total_long_term_liabilities",
@@ -397,6 +405,13 @@ def _empty_body(version: str, header: tuple[HeaderField, ...], sections: tuple[S
     }
 
 
+def parse_date(value: Any) -> date | None:
+    """The ISO date a header field holds, or None when it is blank or is not a
+    date. Public so a reader comparing two forms parses "as of" and "period
+    end" exactly the way the statement itself does."""
+    return _iso_date(value)
+
+
 def months_between(start: Any, end: Any) -> int | None:
     """Inclusive calendar months between two ISO dates; None when either is
     blank, unparseable, or the period runs backwards."""
@@ -491,6 +506,14 @@ def pl_key_facts(body: dict[str, Any]) -> dict[str, Any]:
 # Balance sheet
 # ---------------------------------------------------------------------------
 
+#: The balance-sheet lines that carry a lender and a balance, read off the
+#: `interest_bearing` flag rather than restated. This is the set the business
+#: debt schedule is cross-checked against; a liability line added above joins
+#: it by carrying the flag, and nothing else has to be edited.
+BS_INTEREST_BEARING_KEYS: tuple[str, ...] = tuple(
+    row.key for section in BS_SECTIONS for row in section.rows if row.interest_bearing
+)
+
 #: |assets − liabilities − equity| within this is "balances": rounding and a
 #: forgotten petty-cash line, not a sheet that is wrong.
 BALANCE_TOLERANCE_FLOOR = Decimal("100")
@@ -541,6 +564,7 @@ def bs_totals(body: dict[str, Any]) -> dict[str, Any]:
         "total_liabilities_and_equity": total_liabilities + total_equity,
         "imbalance": imbalance,
         "balances": abs(imbalance) <= tolerance,
+        "interest_bearing_debt": _flagged_total(body, BS_SECTIONS, "interest_bearing"),
         "working_capital": tca - tcl,
         "current_ratio": _ratio(tca, tcl),
         "debt_to_equity": _ratio(total_liabilities, total_equity) if total_equity > 0 else None,
@@ -578,6 +602,19 @@ def bs_key_facts(body: dict[str, Any]) -> dict[str, Any]:
         "imbalance": float(computed["imbalance"]),
         "source_form": BS_SCHEMA_VERSION,
     }
+
+
+def has_typed_figures(kind: str, body: dict[str, Any]) -> bool:
+    """Whether anybody has typed a money figure on this statement — not even a
+    zero counts as blank.
+
+    A cross-form check reads this before it says anything: a form nobody has
+    started disagrees with everything, and a file opened for the first time
+    must not greet the desk with warnings about it.
+    """
+    return not all(
+        _section_is_blank(body, section) for section in SCHEMA_FOR[kind].sections
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +712,7 @@ def describe(kind: str) -> dict[str, Any]:
                         "addback": row.addback,
                         "contra": row.contra,
                         "owner_comp": row.owner_comp,
+                        "interest_bearing": row.interest_bearing,
                         "text": row.text,
                         "hint": row.hint,
                     }
