@@ -116,7 +116,7 @@ Return ONLY JSON in this shape. Do not wrap the JSON in markdown fences.
       {
         "file_id": "...",
         "file_name": "...",
-        "ai_classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|other|unreadable",
+        "ai_classification": "tax_return|current_p_and_l|balance_sheet|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|other|unreadable",
         "supports": ["..."],
         "baseline_categories_supported": ["..."],
         "confidence": "high|medium|low",
@@ -443,7 +443,7 @@ FILE_ANALYSIS_PREAMBLE = """You are a senior commercial lending underwriter clas
 
 Return ONLY JSON in this exact shape. Do not wrap it in markdown fences.
 {
-  "classification": "tax_return|current_p_and_l|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|debt_schedule|personal_financial_statement|other|unreadable",
+  "classification": "tax_return|current_p_and_l|balance_sheet|bank_statement|collateral_debt_evidence|real_estate_schedule|floorplan_mca_inventory|merchant_processing_statement|equipment_quote_or_invoice|fleet_or_vehicle_schedule|transportation_authority|business_license_or_permit|franchise_agreement|commercial_lease|accounts_receivable_aging|inventory_or_purchase_ledger|payroll_report|lease_or_rent|purchase_contract|payoff_or_mortgage_statement|insurance|hoa|entity_or_vesting|identity|debt_schedule|personal_financial_statement|other|unreadable",
   "confidence": "high|medium|low",
   "summary": "1-3 sentence plain-English summary of what this document is and what it proves for underwriting",
   "supports": ["short phrases naming what this file supports"],
@@ -473,6 +473,43 @@ If this document is a BANK STATEMENT (or contains multiple statement periods), p
 If this document is a DEBT SCHEDULE (a listing of outstanding business debts), populate key_facts with a "debts" array, one object per debt line: lender, original_amount, current_balance, monthly_payment, and maturity_date when shown. Also populate total_monthly_debt_service (the sum of every monthly_payment on the schedule) and total_outstanding_balance as top-level key_facts numbers — never estimate these from anywhere else, only sum what the document actually lists.
 
 If this document is a PERSONAL FINANCIAL STATEMENT (a PFS listing an individual's assets, liabilities, and net worth), populate key_facts with: statement_date, total_assets, total_liabilities, net_worth, and liquid_assets (cash, checking/savings, marketable securities — exclude real estate, retirement accounts, and business equity, which are not liquid). Use null for any figure not shown on the statement."""
+
+# The key_facts fields the typed profit-and-loss / balance-sheet blocks ask the
+# model for. business_statement_schema.PROMPT_KEYS exports the same tuples (the
+# subset of each form's key_facts the model can read off a document); the
+# prompt-pin test asserts every entry below appears in its block. The extractors
+# in public_underwriting_packet_pdf read exactly these keys back.
+PL_PROMPT_KEYS = (
+    "business_name", "period_start", "period_end", "basis",
+    "gross_revenue", "cost_of_goods_sold", "gross_profit", "other_income",
+    "total_operating_expenses", "operating_income", "depreciation_and_amortization",
+    "interest", "income_taxes", "taxes_and_licenses", "owner_salaries", "net_income",
+)
+BS_PROMPT_KEYS = (
+    "business_name", "as_of_date", "basis",
+    "cash", "accounts_receivable", "inventory", "total_current_assets",
+    "total_fixed_assets", "total_other_assets", "total_assets",
+    "accounts_payable", "current_portion_long_term_debt", "total_current_liabilities",
+    "total_long_term_liabilities", "total_liabilities", "total_equity",
+)
+
+# Appended by concatenation: the preamble above holds literal JSON braces and
+# must never become an f-string.
+P_AND_L_ANALYSIS_BLOCK = (
+    "\n\nIf this document is a PROFIT AND LOSS STATEMENT (an income statement for a period — "
+    "year-to-date, a fiscal year or interim months — including one on the Qualified Commercial "
+    "template), classify it current_p_and_l and populate key_facts with: "
+    + ", ".join(PL_PROMPT_KEYS)
+    + ". period_start and period_end are ISO dates. Copy the lines the document prints; when it "
+    "prints no total, leave the total null rather than computing it; never compute EBITDA or annualize."
+)
+BALANCE_SHEET_ANALYSIS_BLOCK = (
+    "\n\nIf this document is a BALANCE SHEET (assets, liabilities and equity as of one date), "
+    "classify it balance_sheet and populate key_facts with: "
+    + ", ".join(BS_PROMPT_KEYS)
+    + ". Use null for any figure not shown; never balance the sheet yourself."
+)
+FILE_ANALYSIS_PREAMBLE = FILE_ANALYSIS_PREAMBLE + P_AND_L_ANALYSIS_BLOCK + BALANCE_SHEET_ANALYSIS_BLOCK
 
 DEALER_FILE_ANALYSIS_HINT = """This document belongs to a car-dealer financing file. Read it as bank-statement / tax-return / P&L / floorplan / MCA / real-estate-collateral evidence where applicable. Do not ask DSCR/rent questions."""
 
@@ -1008,8 +1045,10 @@ def _compute_key_metrics_from_cache(
     Only fills a metric the synthesis left null/empty — an AI-provided value is
     never overwritten. Reuses the same extractors the lender packet uses."""
     from app.services.public_underwriting_packet_pdf import (
+        extract_balance_sheet,
         extract_bank_months,
         extract_debt_schedule,
+        extract_profit_and_loss,
         extract_tax_years,
     )
 
@@ -1025,6 +1064,23 @@ def _compute_key_metrics_from_cache(
     months = extract_bank_months(normalized)
     years = extract_tax_years(normalized)
     debt_schedule = extract_debt_schedule(normalized)
+    p_and_l = extract_profit_and_loss(normalized)
+    balance_sheet = extract_balance_sheet(normalized)
+
+    # A profit-and-loss statement may stand in for the tax-return figures below
+    # ONLY as a labelled fallback, and only when it was read through the typed
+    # block (or filed from our own form), covers at least six months, ended
+    # within the last 15 months and shows revenue. Model-invented P&L facts,
+    # a short interim statement or an unknown period never touch the frozen keys.
+    pl_annualized_revenue = p_and_l.get("annualized_revenue") if p_and_l else None
+    pl_annualized_ebitda = p_and_l.get("annualized_ebitda") if p_and_l else None
+    pl_fallback_ok = bool(
+        p_and_l
+        and p_and_l.get("typed")
+        and (p_and_l.get("months_covered") or 0) >= 6
+        and (p_and_l.get("gross_revenue") or 0) > 0
+        and _period_end_is_recent(p_and_l.get("period_end"))
+    )
 
     km = result.get("key_metrics")
     if not isinstance(km, dict):
@@ -1055,10 +1111,18 @@ def _compute_key_metrics_from_cache(
     # "needs tax returns" hint instead of a misleading number.
     if _blank("ytd_annualized_revenue") and tax_revenue is not None:
         km["ytd_annualized_revenue"] = round(tax_revenue)
+        km["revenue_source"] = "tax_return"
+    elif tax_revenue is None and _blank("ytd_annualized_revenue") and pl_fallback_ok and pl_annualized_revenue is not None:
+        km["ytd_annualized_revenue"] = round(pl_annualized_revenue)
+        km["revenue_source"] = "profit_and_loss"
     # EBITDA/cash-flow proxy is a tax net-income figure, NOT deposits minus
     # withdrawals (that is only the net change in the bank balance).
     if _blank("estimated_ebitda_or_cash_flow") and tax_net_income is not None:
         km["estimated_ebitda_or_cash_flow"] = round(tax_net_income)
+        km["ebitda_source"] = "tax_return"
+    elif tax_net_income is None and _blank("estimated_ebitda_or_cash_flow") and pl_fallback_ok and pl_annualized_ebitda is not None:
+        km["estimated_ebitda_or_cash_flow"] = round(pl_annualized_ebitda)
+        km["ebitda_source"] = "profit_and_loss"
     # estimated_debt_burden and estimated_dscr are intentionally NOT derived from
     # bank withdrawals — total operating outflow (inventory, payroll, floorplan
     # paydowns) is not debt service, so a withdrawals-based DSCR would badly
@@ -1070,6 +1134,16 @@ def _compute_key_metrics_from_cache(
             km["estimated_debt_burden"] = round(annual_debt_service)
         if _blank("estimated_dscr") and annual_debt_service and tax_net_income is not None:
             km["estimated_dscr"] = round(tax_net_income / annual_debt_service, 2)
+            km["dscr_basis"] = "tax_return"
+        elif (
+            tax_net_income is None
+            and _blank("estimated_dscr")
+            and annual_debt_service
+            and pl_fallback_ok
+            and pl_annualized_ebitda is not None
+        ):
+            km["estimated_dscr"] = round(pl_annualized_ebitda / annual_debt_service, 2)
+            km["dscr_basis"] = "profit_and_loss_ebitda"
     if _blank("revenue_trend") and tax_latest and tax_prior:
         a = tax_prior.get("gross_receipts")
         b = tax_latest.get("gross_receipts")
@@ -1088,7 +1162,50 @@ def _compute_key_metrics_from_cache(
     if _blank("pfs_total_liquid_assets") and liquid_vals:
         km["pfs_total_liquid_assets"] = round(sum(liquid_vals), 2)
 
+    # Informational statement figures for the cards and the panel. Written only
+    # when the extractor recognised a statement and only for figures it has —
+    # a key is never written as None, so a file without either document gains
+    # no keys at all.
+    if p_and_l:
+        period_parts = [str(p_and_l[k]) for k in ("period_start", "period_end") if p_and_l.get(k)]
+        informational = {
+            "pl_period": " to ".join(period_parts) if period_parts else None,
+            "pl_months": p_and_l.get("months_covered"),
+            "pl_revenue": p_and_l.get("gross_revenue"),
+            "pl_net_income": p_and_l.get("net_income"),
+            "pl_ebitda": p_and_l.get("ebitda"),
+            "pl_annualized_revenue": p_and_l.get("annualized_revenue"),
+            "pl_annualized_ebitda": p_and_l.get("annualized_ebitda"),
+        }
+        for key, value in informational.items():
+            if value is not None and _blank(key):
+                km[key] = round(value, 2) if isinstance(value, float) else value
+    if balance_sheet:
+        informational = {
+            "balance_sheet_as_of": balance_sheet.get("as_of_date"),
+            "balance_sheet_total_assets": balance_sheet.get("total_assets"),
+            "balance_sheet_total_liabilities": balance_sheet.get("total_liabilities"),
+            "balance_sheet_equity": balance_sheet.get("total_equity"),
+            "balance_sheet_current_ratio": balance_sheet.get("current_ratio"),
+        }
+        for key, value in informational.items():
+            if value is not None and _blank(key):
+                km[key] = round(value, 2) if isinstance(value, float) else value
+
     result["key_metrics"] = km
+
+
+def _period_end_is_recent(period_end: Any, *, max_months: int = 15) -> bool:
+    """True when an ISO period_end falls within the last `max_months` calendar
+    months (a statement ending later this month counts; a future or unparseable
+    period does not)."""
+    try:
+        end = datetime.fromisoformat(str(period_end or "")[:10]).date()
+    except ValueError:
+        return False
+    today = datetime.now(UTC).date()
+    diff = (today.year - end.year) * 12 + (today.month - end.month)
+    return 0 <= diff <= max_months
 
 
 # Stage-1 baseline categories a dealer file needs before it is "ready for lending".

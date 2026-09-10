@@ -254,6 +254,226 @@ def extract_personal_financial_statements(analyses: list[dict[str, Any]]) -> lis
     return statements
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Profit-and-loss and balance-sheet statements
+# ─────────────────────────────────────────────────────────────────────────────
+# The typed prompt block (bucket_ai.PL_PROMPT_KEYS) and the filed form both emit
+# gross_revenue / net_income; older analyses carry model-invented names, which
+# these aliases recover for the informational figures only. The `typed` flag is
+# what gates the frozen key_metrics fallback in bucket_ai.
+_PL_REVENUE_ALIASES = (
+    "gross_revenue", "total_revenue", "revenue", "gross_receipts", "gross_sales", "total_sales", "sales",
+)
+_PL_NET_INCOME_ALIASES = ("net_income", "net_profit", "net_income_loss", "net_profit_loss", "net_profit_or_loss")
+_PL_FIGURE_KEYS = (
+    "gross_revenue", "cost_of_goods_sold", "gross_profit", "other_income", "total_operating_expenses",
+    "operating_income", "depreciation_and_amortization", "interest", "income_taxes", "taxes_and_licenses",
+    "owner_salaries", "net_income",
+)
+_BS_FIGURE_KEYS = (
+    "cash", "accounts_receivable", "inventory", "total_current_assets", "total_fixed_assets",
+    "total_other_assets", "total_assets", "accounts_payable", "current_portion_long_term_debt",
+    "total_current_liabilities", "total_long_term_liabilities", "total_liabilities", "total_equity",
+)
+
+
+def _first_fact_num(facts: dict[str, Any], aliases: tuple[str, ...]) -> float | None:
+    for k in aliases:
+        v = _num(facts.get(k))
+        if v is not None:
+            return v
+    return None
+
+
+def _iso_date(value: Any) -> str | None:
+    """YYYY-MM-DD when the value starts with a real ISO date, else None."""
+    if value is None:
+        return None
+    m = re.match(r"\s*(\d{4}-\d{2}-\d{2})", str(value))
+    if not m:
+        return None
+    try:
+        datetime.strptime(m.group(1), "%Y-%m-%d")
+    except ValueError:
+        return None
+    return m.group(1)
+
+
+def _months_covered(period_start: str | None, period_end: str | None) -> int | None:
+    """Inclusive calendar months between two ISO dates; None when either is missing."""
+    if not period_start or not period_end:
+        return None
+    start = datetime.strptime(period_start, "%Y-%m-%d")
+    end = datetime.strptime(period_end, "%Y-%m-%d")
+    months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+    return months if months >= 1 else None
+
+
+def _annualize(value: float | None, months: int | None) -> float | None:
+    """×12/months for a 6–11 month period, the figure itself at 12 months,
+    None otherwise (a short interim statement is never annualized)."""
+    if value is None or months is None:
+        return None
+    if months == 12:
+        return value
+    if 6 <= months <= 11:
+        return round(value * 12 / months, 2)
+    return None
+
+
+def _looks_like_balance_sheet(facts: dict[str, Any]) -> bool:
+    """The shape a balance sheet misfiled as current_p_and_l (before the
+    balance_sheet classification existed) leaves behind: both totals, no revenue."""
+    return (
+        _num(facts.get("total_assets")) is not None
+        and _num(facts.get("total_liabilities")) is not None
+        and _first_fact_num(facts, _PL_REVENUE_ALIASES) is None
+    )
+
+
+def _populated(record: dict[str, Any], keys: tuple[str, ...]) -> int:
+    return sum(1 for k in keys if record.get(k) is not None)
+
+
+def extract_profit_and_loss(analyses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The best analyzed profit-and-loss statement (latest period_end, most
+    populated on a tie) with every statement under `statements`. Totals the
+    document did not print are computed from the lines it did; EBITDA is net
+    income + interest + income taxes + depreciation and amortization (a
+    taxes-and-licenses line is an operating cost, never added back);
+    annualization happens only for a 6–11 month period. Nothing is summed
+    across documents. None when no P&L was analyzed."""
+    statements: list[dict[str, Any]] = []
+    for item in analyses:
+        if item.get("classification") != "current_p_and_l":
+            continue
+        facts = item.get("key_facts") or {}
+        if not isinstance(facts, dict):
+            continue
+        if _looks_like_balance_sheet(facts):
+            continue  # a misfiled balance sheet; extract_balance_sheet reads it
+        gross_revenue = _first_fact_num(facts, _PL_REVENUE_ALIASES)
+        cost_of_goods_sold = _num(facts.get("cost_of_goods_sold"))
+        gross_profit = _num(facts.get("gross_profit"))
+        other_income = _num(facts.get("other_income"))
+        total_operating_expenses = _num(facts.get("total_operating_expenses"))
+        operating_income = _num(facts.get("operating_income"))
+        depreciation = _num(facts.get("depreciation_and_amortization"))
+        interest = _num(facts.get("interest"))
+        income_taxes = _num(facts.get("income_taxes"))
+        net_income = _first_fact_num(facts, _PL_NET_INCOME_ALIASES)
+        # Totals the document did not print, from the lines it did.
+        if gross_profit is None and gross_revenue is not None and cost_of_goods_sold is not None:
+            gross_profit = gross_revenue - cost_of_goods_sold
+        if total_operating_expenses is None and gross_profit is not None and operating_income is not None:
+            total_operating_expenses = gross_profit - operating_income
+        if operating_income is None and gross_profit is not None and total_operating_expenses is not None:
+            operating_income = gross_profit - total_operating_expenses
+        if net_income is None and operating_income is not None:
+            net_income = operating_income + (other_income or 0.0) - (income_taxes or 0.0)
+        period_start = _iso_date(facts.get("period_start"))
+        period_end = _iso_date(facts.get("period_end"))
+        months = _months_covered(period_start, period_end)
+        ebitda = None
+        if net_income is not None:
+            ebitda = net_income + (interest or 0.0) + (income_taxes or 0.0) + (depreciation or 0.0)
+        typed = bool(facts.get("source_form")) or (
+            _num(facts.get("gross_revenue")) is not None
+            and _num(facts.get("net_income")) is not None
+            and period_end is not None
+        )
+        statements.append(
+            {
+                "file_id": item.get("file_id"),
+                "business_name": _text(facts.get("business_name"), fallback="") or None,
+                "basis": _text(facts.get("basis"), fallback="") or None,
+                "period_start": period_start,
+                "period_end": period_end,
+                "months_covered": months,
+                "gross_revenue": gross_revenue,
+                "cost_of_goods_sold": cost_of_goods_sold,
+                "gross_profit": gross_profit,
+                "other_income": other_income,
+                "total_operating_expenses": total_operating_expenses,
+                "operating_income": operating_income,
+                "depreciation_and_amortization": depreciation,
+                "interest": interest,
+                "income_taxes": income_taxes,
+                "taxes_and_licenses": _num(facts.get("taxes_and_licenses")),
+                "owner_salaries": _num(facts.get("owner_salaries")),
+                "net_income": net_income,
+                "ebitda": ebitda,
+                "annualized_revenue": _annualize(gross_revenue, months),
+                "annualized_ebitda": _annualize(ebitda, months),
+                "typed": typed,
+            }
+        )
+    if not statements:
+        return None
+    best = max(statements, key=lambda s: (s["period_end"] or "", _populated(s, _PL_FIGURE_KEYS)))
+    return {**best, "statements": statements}
+
+
+def extract_balance_sheet(analyses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The newest analyzed balance sheet (latest as_of_date, most populated on
+    a tie) with every statement under `statements`. Also reads a document cached
+    as current_p_and_l whose facts carry both totals and no revenue — a balance
+    sheet filed before the classification existed. Totals absent from the
+    document come from its subtotals; equity is implied from assets − liabilities
+    only when the sheet prints none. Nothing is summed across documents."""
+    statements: list[dict[str, Any]] = []
+    for item in analyses:
+        cls = item.get("classification")
+        facts = item.get("key_facts") or {}
+        if not isinstance(facts, dict):
+            continue
+        if cls != "balance_sheet" and not (cls == "current_p_and_l" and _looks_like_balance_sheet(facts)):
+            continue
+        vals: dict[str, float | None] = {k: _num(facts.get(k)) for k in _BS_FIGURE_KEYS}
+        asset_parts = ("total_current_assets", "total_fixed_assets", "total_other_assets")
+        if vals["total_assets"] is None and any(vals[k] is not None for k in asset_parts):
+            vals["total_assets"] = sum(vals[k] or 0.0 for k in asset_parts)
+        liability_parts = ("total_current_liabilities", "total_long_term_liabilities")
+        if vals["total_liabilities"] is None and any(vals[k] is not None for k in liability_parts):
+            vals["total_liabilities"] = sum(vals[k] or 0.0 for k in liability_parts)
+        if vals["total_equity"] is None and vals["total_assets"] is not None and vals["total_liabilities"] is not None:
+            vals["total_equity"] = vals["total_assets"] - vals["total_liabilities"]
+        current_assets = vals["total_current_assets"]
+        current_liabilities = vals["total_current_liabilities"]
+        working_capital = None
+        current_ratio = None
+        if current_assets is not None and current_liabilities is not None:
+            working_capital = current_assets - current_liabilities
+            if current_liabilities > 0:
+                current_ratio = round(current_assets / current_liabilities, 2)
+        debt_to_equity = None
+        if vals["total_liabilities"] is not None and vals["total_equity"] is not None and vals["total_equity"] > 0:
+            debt_to_equity = round(vals["total_liabilities"] / vals["total_equity"], 2)
+        as_of_date = _iso_date(facts.get("as_of_date")) or _iso_date(facts.get("statement_date")) or _iso_date(facts.get("date"))
+        typed = bool(facts.get("source_form")) or (
+            _num(facts.get("total_assets")) is not None
+            and _num(facts.get("total_liabilities")) is not None
+            and as_of_date is not None
+        )
+        statements.append(
+            {
+                "file_id": item.get("file_id"),
+                "business_name": _text(facts.get("business_name"), fallback="") or None,
+                "basis": _text(facts.get("basis"), fallback="") or None,
+                "as_of_date": as_of_date,
+                **vals,
+                "working_capital": working_capital,
+                "current_ratio": current_ratio,
+                "debt_to_equity": debt_to_equity,
+                "typed": typed,
+            }
+        )
+    if not statements:
+        return None
+    best = max(statements, key=lambda s: (s["as_of_date"] or "", _populated(s, _BS_FIGURE_KEYS)))
+    return {**best, "statements": statements}
+
+
 _TAX_KEYS = (
     "gross_receipts", "gross_income", "total_income", "net_income", "taxable_income",
     "ordinary_business_income", "total_revenue", "cost_of_goods_sold", "depreciation",
@@ -283,7 +503,7 @@ _TOTAL_INCOME_ALIASES = ("total_income", "total_income_current", "total_income_l
 # _TAX_KEYS content heuristic must not misclassify them (e.g. a YTD P&L has
 # gross_receipts but is not a filed return).
 _NON_TAX_CLASSES = {
-    "bank_statement", "current_p_and_l", "profit_and_loss", "p_and_l", "pnl",
+    "bank_statement", "current_p_and_l", "balance_sheet", "profit_and_loss", "p_and_l", "pnl",
     "floorplan_mca_inventory", "identity", "other",
 }
 
@@ -707,6 +927,90 @@ def _tax_section(years: list[dict[str, Any]]) -> str:
     )
 
 
+def _figure_rows(rows: list[tuple[str, str]]) -> str:
+    return "".join(
+        f'<tr><td class="rowhead">{escape(label)}</td><td class="num">{value}</td></tr>' for label, value in rows
+    )
+
+
+def _pl_bs_section(p_and_l: dict[str, Any] | None, balance_sheet: dict[str, Any] | None) -> str:
+    """Profit-and-loss and balance-sheet figures read from uploaded (or filed)
+    statements — one card each, side by side when both exist, nothing at all
+    when neither does (unlike the bank and tax cards, this is not a baseline
+    item and shows no 'awaiting' placeholder)."""
+    if not p_and_l and not balance_sheet:
+        return ""
+    cards: list[str] = []
+    if p_and_l:
+        period = " to ".join(str(p_and_l[k]) for k in ("period_start", "period_end") if p_and_l.get(k))
+        months = p_and_l.get("months_covered")
+        rows = [
+            ("Gross revenue", _fmt_full(p_and_l.get("gross_revenue"))),
+            ("Cost of goods sold", _fmt_full(p_and_l.get("cost_of_goods_sold"))),
+            ("Gross profit", _fmt_full(p_and_l.get("gross_profit"))),
+            ("Total operating expenses", _fmt_full(p_and_l.get("total_operating_expenses"))),
+            ("Operating income", _fmt_full(p_and_l.get("operating_income"))),
+            ("Other income", _fmt_full(p_and_l.get("other_income"))),
+            ("Income taxes", _fmt_full(p_and_l.get("income_taxes"))),
+            ("Net income", _fmt_full(p_and_l.get("net_income"))),
+            ("EBITDA (net income + interest + income taxes + D&A)", _fmt_full(p_and_l.get("ebitda"))),
+        ]
+        if p_and_l.get("annualized_revenue") is not None:
+            rows.append(("Annualized revenue", _fmt_full(p_and_l.get("annualized_revenue"))))
+        if p_and_l.get("annualized_ebitda") is not None:
+            rows.append(("Annualized EBITDA", _fmt_full(p_and_l.get("annualized_ebitda"))))
+        notes = []
+        if months:
+            notes.append(f"{months} month{'s' if months != 1 else ''} covered")
+        if p_and_l.get("basis"):
+            notes.append(f"{p_and_l['basis']} basis")
+        notes.append(
+            "read from the statement through the typed extraction" if p_and_l.get("typed") else "figures as the document labels them"
+        )
+        count = len(p_and_l.get("statements") or [])
+        if count > 1:
+            notes.append(f"latest of {count} statements on file")
+        cards.append(
+            '<section class="card"><h2>Profit &amp; loss'
+            + (f" — {escape(period)}" if period else "")
+            + "</h2>"
+            + f'<table class="grid-table"><tbody>{_figure_rows(rows)}</tbody></table>'
+            + f'<p class="note">{escape("; ".join(notes))}.</p>'
+            + "</section>"
+        )
+    if balance_sheet:
+        ratio = balance_sheet.get("current_ratio")
+        d_to_e = balance_sheet.get("debt_to_equity")
+        rows = [
+            ("Cash", _fmt_full(balance_sheet.get("cash"))),
+            ("Accounts receivable", _fmt_full(balance_sheet.get("accounts_receivable"))),
+            ("Inventory", _fmt_full(balance_sheet.get("inventory"))),
+            ("Total current assets", _fmt_full(balance_sheet.get("total_current_assets"))),
+            ("Total assets", _fmt_full(balance_sheet.get("total_assets"))),
+            ("Accounts payable", _fmt_full(balance_sheet.get("accounts_payable"))),
+            ("Total current liabilities", _fmt_full(balance_sheet.get("total_current_liabilities"))),
+            ("Total liabilities", _fmt_full(balance_sheet.get("total_liabilities"))),
+            ("Total equity", _fmt_full(balance_sheet.get("total_equity"))),
+            ("Working capital", _fmt_full(balance_sheet.get("working_capital"))),
+            ("Current ratio", "—" if ratio is None else f"{ratio:.2f}x"),
+            ("Debt to equity", "—" if d_to_e is None else f"{d_to_e:.2f}x"),
+        ]
+        as_of = balance_sheet.get("as_of_date")
+        count = len(balance_sheet.get("statements") or [])
+        note = f"newest of {count} balance sheets on file" if count > 1 else "read from the uploaded balance sheet"
+        cards.append(
+            '<section class="card"><h2>Balance sheet'
+            + (f" — as of {escape(str(as_of))}" if as_of else "")
+            + "</h2>"
+            + f'<table class="grid-table"><tbody>{_figure_rows(rows)}</tbody></table>'
+            + f'<p class="note">{escape(note)}.</p>'
+            + "</section>"
+        )
+    if len(cards) == 2:
+        return f'<table class="cols"><tr><td>{cards[0]}</td><td>{cards[1]}</td></tr></table>'
+    return cards[0]
+
+
 def _credit_section(credit: dict[str, Any] | None) -> str:
     """Renders the soft-pull credit summary when one exists on the lead.
     Same section for dealer AND real-estate leads — the underlying data
@@ -914,6 +1218,8 @@ def render_underwriting_packet_pdf(
     financials = financials or {}
     bank_months = financials.get("bank_months") or []
     tax_years = financials.get("tax_years") or []
+    p_and_l = _record(financials.get("p_and_l")) or None
+    balance_sheet = _record(financials.get("balance_sheet")) or None
     credit = financials.get("credit")
     loan_program_fit = financials.get("program_fit")
 
@@ -1002,7 +1308,12 @@ def render_underwriting_packet_pdf(
                     metric_rows.append({"metric": label or "Metric", "value": value, "source": note or "AI extraction"})
     else:
         for key, value in key_metrics.items():
-            metric_rows.append({"metric": str(key).replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
+            key_text = str(key)
+            # Provenance stamps (*_source / *_basis) label other rows; the
+            # statement figures (pl_* / balance_sheet_*) have their own section.
+            if key_text.endswith(("_source", "_basis")) or key_text.startswith(("pl_", "balance_sheet_")):
+                continue
+            metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
 
     def _prose(value: Any) -> str | None:
         text = _text(value, fallback="")
@@ -1139,6 +1450,7 @@ def render_underwriting_packet_pdf(
   {_program_fit_section(loan_program_fit)}
   {_bank_section(bank_months)}
   {_tax_section(tax_years)}
+  {_pl_bs_section(p_and_l, balance_sheet)}
 
   {_metric_table(metric_rows)}
 

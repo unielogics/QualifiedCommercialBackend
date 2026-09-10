@@ -13,6 +13,13 @@ logged-in user):
                                  emails the lead to franco@ and logs an
                                  Activity row so nothing is lost even if
                                  mail delivery is unconfigured.
+  * GET  /public/financial-templates/{slug}.xlsx — the four financial
+                                 templates the resources page links to
+                                 (profit-and-loss, balance-sheet,
+                                 business-debt-schedule,
+                                 personal-financial-statement), generated
+                                 from the form schemas and served as an
+                                 attachment. Free, no form, cached a day.
 
 Kept deliberately small + defensive (length caps, consent gate, a
 best-effort per-IP throttle). No DB writes other than the Activity log.
@@ -27,7 +34,7 @@ import uuid
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +73,34 @@ CAPITAL_PARTNER_NOTIFY = ("franco@qualifiedcommercial.com", "support@qualifiedco
 # note in app/services/scheduler.py). Maps client IP → last submit ts.
 _LAST_SUBMIT: dict[str, float] = {}
 _THROTTLE_SECONDS = 20.0
+
+
+@router.get("/financial-templates/{slug}.xlsx")
+async def financial_template_download(slug: str) -> Response:
+    """One of the four financial templates, as an Excel workbook.
+
+    Generated from the same schemas the on-screen forms render, never a
+    committed binary, so the spreadsheet a borrower downloads cannot drift from
+    the form their advisor sends. The attachment filename is chosen so a filled
+    copy uploaded back to a room routes to its checklist row by name before
+    analysis runs. Bytes are built once per process and cached a day at the
+    edge; nothing here reads or writes the database.
+    """
+    from app.services import financial_templates_xlsx
+
+    found = financial_templates_xlsx.workbook_for_slug(slug)
+    if found is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such template")
+    filename, raw = found
+    log.info("financial template download slug=%s bytes=%d", slug, len(raw))
+    return Response(
+        content=raw,
+        media_type=financial_templates_xlsx.MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 
 @router.get("/fred/series", response_model=list[FredSeriesSummary])

@@ -220,6 +220,215 @@ def render_pfs_413_pdf(*, body: dict, statement_date: str) -> bytes:
     return pdf
 
 
+def _statement_money(value: Any) -> str:
+    amount = float(value or 0)
+    return f"(${abs(amount):,.2f})" if amount < 0 else f"${amount:,.2f}"
+
+
+def _statement_section_html(section: Any, values: dict[str, Any], subtotal: Any) -> str:
+    """One schema section as a table: its lines, then its subtotal. A contra
+    line is labelled as the schema labels it ("Less: …") and shown as typed."""
+    from app.services.pfs_schema import _amount
+
+    lines = "".join(
+        f"<tr><td>{html.escape(row.label)}"
+        f"{' <span class=chip>add-back</span>' if row.addback else ''}</td>"
+        f"<td class='num'>{_statement_money(_amount(values.get(row.key)))}</td></tr>"
+        for row in section.rows
+    )
+    return (
+        f"<h2>{html.escape(section.label)}</h2><table>{lines}"
+        f"<tr class='totals'><td>{html.escape(section.subtotal_label)}</td>"
+        f"<td class='num'>{_statement_money(subtotal)}</td></tr></table>"
+    )
+
+
+_STATEMENT_STYLE = """
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .chip { font-size: 9px; color: #6b7280; border: 1px solid #d1d5db; border-radius: 8px; padding: 0 5px; margin-left: 4px; }
+  .memo td { background: #f9fafb; }
+  .warn td { color: #b91c1c; font-weight: 700; }
+  .notes { margin-top: 14px; font-size: 12px; white-space: pre-wrap; }
+"""
+
+
+def _statement_header_html(schema: Any, header: dict[str, Any]) -> str:
+    parts = []
+    for field in schema.header:
+        value = str(header.get(field.key) or "").strip()
+        if value and field.key != "business_name":
+            parts.append(f"{html.escape(field.label)}: {html.escape(value)}")
+    return " &middot; ".join(parts)
+
+
+def _statement_notes_html(body: dict) -> str:
+    notes = str(body.get("notes") or "").strip()
+    return f"<div class='notes'><strong>Notes.</strong> {html.escape(notes)}</div>" if notes else ""
+
+
+def build_p_and_l_html(*, body: dict) -> str:
+    """The profit and loss statement as a lender reads it: revenue, operating
+    expenses, the line below, then the EBITDA memo built from the add-back
+    flags. Split from the render so the layout can be tested without
+    WeasyPrint's native libraries, as `build_pfs_413_html` is."""
+    from app.services import business_statement_schema as bss
+
+    schema = bss.SCHEMA_FOR["p_and_l"]
+    totals = schema.totals(body)
+    header = body.get("header") or {}
+    sections = body.get("sections") or {}
+    by_key = {section.key: section for section in schema.sections}
+    period = bss.period_label("p_and_l", body) or "period not stated"
+
+    revenue = _statement_section_html(
+        by_key["revenue"], sections.get("revenue") or {}, totals["gross_profit"]
+    )
+    opex = _statement_section_html(
+        by_key["operating_expenses"],
+        sections.get("operating_expenses") or {},
+        totals["total_operating_expenses"],
+    )
+    other_description = str((sections.get("operating_expenses") or {}).get("other_description") or "").strip()
+    below = _statement_section_html(
+        by_key["below_the_line"], sections.get("below_the_line") or {}, totals["net_income"]
+    )
+    addbacks = [row for section in schema.sections for row in section.rows if row.addback]
+    memo_rows = "".join(
+        f"<tr class='memo'><td>Add: {html.escape(row.label.lower())}</td>"
+        f"<td class='num'>{_statement_money(bss._amount((sections.get(section.key) or {}).get(row.key)))}</td></tr>"
+        for section in schema.sections
+        for row in section.rows
+        if row in addbacks
+    )
+    doc = f"""
+    <html>
+      <head><style>{_STYLE}{_STATEMENT_STYLE}</style></head>
+      <body>
+        <h1>Profit and Loss Statement</h1>
+        <div class="muted">
+          {html.escape(str(header.get("business_name") or ""))} &mdash; {html.escape(period)}<br />
+          {_statement_header_html(schema, header)}
+        </div>
+        {revenue}
+        {opex}
+        {f"<div class='muted'>Other expenses: {html.escape(other_description)}</div>" if other_description else ""}
+        <table>
+          <tr class="totals"><td>Operating income</td>
+            <td class="num">{_statement_money(totals["operating_income"])}</td></tr>
+        </table>
+        {below}
+        <h2>EBITDA (memo)</h2>
+        <table>
+          <tr class="memo"><td>Net income</td>
+            <td class="num">{_statement_money(totals["net_income"])}</td></tr>
+          {memo_rows}
+          <tr class="totals"><td>EBITDA</td>
+            <td class="num">{_statement_money(totals["ebitda"])}</td></tr>
+          <tr class="memo"><td>Owner compensation (add-back candidate, not added)</td>
+            <td class="num">{_statement_money(totals["owner_compensation"])}</td></tr>
+        </table>
+        {_statement_notes_html(body)}
+        <div class="disclaimer">
+          {html.escape(FORM_DISCLAIMER)} Submitted electronically {datetime.now(UTC).isoformat()}.
+        </div>
+      </body>
+    </html>
+    """
+    return doc
+
+
+def render_p_and_l_pdf(*, body: dict) -> bytes:
+    from weasyprint import HTML
+
+    pdf = HTML(string=build_p_and_l_html(body=body)).write_pdf()
+    if pdf is None:
+        raise RuntimeError("weasyprint returned no PDF bytes")
+    return pdf
+
+
+def build_balance_sheet_html(*, body: dict) -> str:
+    """The balance sheet with the identity line and any unreconciled
+    difference printed, so a reader sees what the borrower saw."""
+    from app.services import business_statement_schema as bss
+
+    schema = bss.SCHEMA_FOR["balance_sheet"]
+    totals = schema.totals(body)
+    header = body.get("header") or {}
+    sections = body.get("sections") or {}
+    by_key = {section.key: section for section in schema.sections}
+    as_of = bss.period_label("balance_sheet", body) or "date not stated"
+
+    def part(key: str) -> str:
+        return _statement_section_html(
+            by_key[key], sections.get(key) or {}, totals[by_key[key].subtotal_key]
+        )
+
+    equity_note = (
+        "<div class='muted'>Equity implied from assets less liabilities; the section was left blank.</div>"
+        if totals["equity_implied"]
+        else ""
+    )
+    imbalance = (
+        ""
+        if totals["balances"]
+        else f"<tr class='warn'><td>Unreconciled difference</td>"
+        f"<td class='num'>{_statement_money(totals['imbalance'])}</td></tr>"
+    )
+    doc = f"""
+    <html>
+      <head><style>{_STYLE}{_STATEMENT_STYLE}</style></head>
+      <body>
+        <h1>Balance Sheet</h1>
+        <div class="muted">
+          {html.escape(str(header.get("business_name") or ""))} &mdash; {html.escape(as_of)}<br />
+          {_statement_header_html(schema, header)}
+        </div>
+        {part("current_assets")}
+        {part("fixed_assets")}
+        {part("other_assets")}
+        <table>
+          <tr class="totals"><td>Total assets</td>
+            <td class="num">{_statement_money(totals["total_assets"])}</td></tr>
+        </table>
+        {part("current_liabilities")}
+        {part("long_term_liabilities")}
+        <table>
+          <tr class="totals"><td>Total liabilities</td>
+            <td class="num">{_statement_money(totals["total_liabilities"])}</td></tr>
+        </table>
+        {part("equity")}
+        {equity_note}
+        <h2>Total liabilities and equity</h2>
+        <table>
+          <tr class="totals"><td>Total liabilities and equity</td>
+            <td class="num">{_statement_money(totals["total_liabilities_and_equity"])}</td></tr>
+          <tr><td>Total assets</td>
+            <td class="num">{_statement_money(totals["total_assets"])}</td></tr>
+          {imbalance}
+          <tr class="memo"><td>Working capital</td>
+            <td class="num">{_statement_money(totals["working_capital"])}</td></tr>
+          <tr class="memo"><td>Current ratio</td>
+            <td class="num">{html.escape(str(totals["current_ratio"]) if totals["current_ratio"] is not None else "&mdash;")}</td></tr>
+        </table>
+        {_statement_notes_html(body)}
+        <div class="disclaimer">
+          {html.escape(FORM_DISCLAIMER)} Submitted electronically {datetime.now(UTC).isoformat()}.
+        </div>
+      </body>
+    </html>
+    """
+    return doc
+
+
+def render_balance_sheet_pdf(*, body: dict) -> bytes:
+    from weasyprint import HTML
+
+    pdf = HTML(string=build_balance_sheet_html(body=body)).write_pdf()
+    if pdf is None:
+        raise RuntimeError("weasyprint returned no PDF bytes")
+    return pdf
+
+
 # The full schedule needs eleven columns, which does not fit a portrait page at
 # a readable size. Landscape, and the notes hang under their own obligation as a
 # spanning row so a long one wraps instead of squeezing every other column.

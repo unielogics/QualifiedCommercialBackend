@@ -7,7 +7,7 @@ import hashlib
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -37,6 +37,7 @@ from app.models.application_profile import (
 )
 from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDocument, BucketUploadLink
 from app.models.client import Client
+from app.models.financial_form_link import FinancialFormLink
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.models.lender import Lender
 from app.models.loan import Loan
@@ -83,6 +84,7 @@ from app.schemas.application_profile import (
     FileOwnerPatch,
     FileOwnerRead,
     FileOwnerRequirementState,
+    FinancialFormPacket,
     FinancialFormSave,
     FinancialFormsRead,
     FinancialFormStatus,
@@ -118,6 +120,8 @@ from app.schemas.application_profile import (
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import (
+    business_statement_schema,
+    business_statements,
     dealer_forms_pdf,
     drafted_forms,
     file_events,
@@ -3738,6 +3742,16 @@ async def financial_statement_schema(user: CurrentUser) -> dict:
     return pfs_schema.describe()
 
 
+@router.get("/financial-forms/schema/{kind}")
+async def business_statement_form_schema(kind: str, user: CurrentUser) -> dict:
+    """The profit-and-loss or balance-sheet field set, served so the browser
+    renders from it rather than duplicating it. Same reasoning as the 413."""
+    _require_statement_staff(user)
+    if kind not in business_statement_schema.KINDS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    return business_statement_schema.describe(kind)
+
+
 @router.get("/{profile_id}/financial-statements", response_model=list[FinancialStatementRead])
 async def list_financial_statements(
     profile_id: UUID,
@@ -3950,6 +3964,13 @@ async def public_financial_form(token: str, db: AsyncSession = Depends(get_db)) 
         if not str(body.get("business_name") or "").strip() and prefill.get("business_name"):
             body = {**body, "business_name": prefill["business_name"]}
         schema = {"columns": list(financial_statements.DEBT_COLUMNS)}
+    elif link.kind in business_statement_schema.KINDS:
+        # No statement id on these links: the latest row of the kind is the
+        # form, seeded with the business name when it is blank.
+        body, _statement = await business_statements.body_for_profile(
+            db, profile, link.kind, prefill
+        )
+        schema = business_statement_schema.describe(link.kind)
     else:
         statement = (
             await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
@@ -3994,6 +4015,13 @@ async def save_public_financial_form_draft(
             profile,
             financial_statements.debt_rows_from_body(payload.body),
             origin="client_form",
+        )
+        await db.commit()
+        return {"saved": True}
+
+    if link.kind in business_statement_schema.KINDS:
+        await business_statements.save(
+            db, profile, kind=link.kind, body=payload.body or {}, status="draft"
         )
         await db.commit()
         return {"saved": True}
@@ -4072,6 +4100,34 @@ async def submit_public_financial_form(
         await db.commit()
         return {"completed": True}
 
+    if link.kind in business_statement_schema.KINDS:
+        # Files the sheet the way the desk does; the service emits the timeline
+        # line. A checklist row is created if the file has none, so a borrower
+        # on a link is never stranded — the one behaviour change for these two
+        # kinds, named in the plan.
+        saved = await business_statements.save(
+            db, profile, kind=link.kind, body=payload.body or {}, status="submitted",
+            actor_user_id=None,
+        )
+        slot = await business_statements.ensure_slot(db, profile, link.kind, required=False)
+        header = (payload.body or {}).get("header") or {}
+        await business_statements.file_pdf(
+            db,
+            profile,
+            saved,
+            slot=slot,
+            # Null: the borrower filled this in themselves.
+            actor_user_id=None,
+            actor_name=str(header.get("prepared_by") or "").strip()
+            or link.invitee_email
+            or "Borrower",
+            actor_email=link.invitee_email or "",
+            actor=None,
+        )
+        link.completed_at = datetime.now(UTC)
+        await db.commit()
+        return {"completed": True}
+
     statement = (
         await db.get(FinancialStatement, link.statement_id) if link.statement_id else None
     )
@@ -4117,13 +4173,30 @@ async def submit_public_financial_form(
 # Both financial forms, and where each one stands.
 # ---------------------------------------------------------------------------
 
-_FORM_SLOT_CATEGORY = {"pfs": "Personal Financials", "debt_schedule": "Debts"}
-_FORM_LABEL = {"pfs": "Personal financial statement", "debt_schedule": "Business debt schedule"}
+_FORM_SLOT_CATEGORY = {
+    "pfs": "Personal Financials",
+    "debt_schedule": "Debts",
+    "p_and_l": business_statements.SLOT_CATEGORY,
+    "balance_sheet": business_statements.SLOT_CATEGORY,
+}
+_FORM_LABEL = {
+    "pfs": "Personal financial statement",
+    "debt_schedule": "Business debt schedule",
+    "p_and_l": business_statement_schema.SCHEMA_FOR["p_and_l"].label,
+    "balance_sheet": business_statement_schema.SCHEMA_FOR["balance_sheet"].label,
+}
+
+#: The four forms one packet link opens, in the order the page shows them.
+PACKET_KINDS = ("p_and_l", "balance_sheet", "debt_schedule", "pfs")
 
 
 async def _requested_slot(
     db: AsyncSession, profile: ApplicationProfile, kind: str
 ) -> BucketRequestedDocument | None:
+    if kind in business_statement_schema.KINDS:
+        # Both business statements share the "Financials" category with the
+        # tax returns, so a category match would find the wrong row.
+        return await business_statements.slot_for_kind(db, profile, kind)
     if profile.primary_bucket_id is None:
         return None
     return (
@@ -4377,7 +4450,183 @@ async def financial_forms_status(
         )
     )
 
-    return FinancialFormsRead(forms=forms)
+    # --- profit and loss, balance sheet -----------------------------------
+    for kind in business_statement_schema.KINDS:
+        forms.append(await _business_statement_status(db, profile, kind))
+
+    return FinancialFormsRead(forms=forms, packets=await _packets_for_profile(db, profile))
+
+
+async def _bucket_analyses(db: AsyncSession, bucket_id: UUID) -> list[dict]:
+    """Every completed analysis in the room, newest per file — for a form with
+    no checklist row of its own (the dealer checklist has no balance-sheet
+    row), whose upload can still be anywhere in the bucket."""
+    files = list(
+        (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.bucket_id == bucket_id, BucketFile.deleted_at.is_(None)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not files:
+        return []
+    rows = list(
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(BucketFileAnalysis.bucket_file_id.in_([f.id for f in files]))
+                .order_by(BucketFileAnalysis.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest: dict[UUID, BucketFileAnalysis] = {}
+    for row in rows:
+        latest.setdefault(row.bucket_file_id, row)
+    return [
+        {"classification": row.classification, "key_facts": (row.analysis or {}).get("key_facts") or {}}
+        for row in latest.values()
+        if row.status == "completed"
+    ]
+
+
+def _recognised_business_statement(kind: str, analyses: list[dict]) -> dict | None:
+    """A P&L or balance sheet the extractor recognised among these analyses.
+
+    "Uploaded" for these two forms means recognised, never "the slot has a
+    file": Main Street asks for both on one row, and a P&L alone must not
+    flip the balance-sheet row. Imported lazily, as `_uploaded_statements`
+    does; None when the extractors are not there yet.
+    """
+    try:
+        from app.services.public_underwriting_packet_pdf import (
+            extract_balance_sheet,
+            extract_profit_and_loss,
+        )
+    except ImportError:
+        return None
+    extractor = extract_profit_and_loss if kind == "p_and_l" else extract_balance_sheet
+    return extractor(analyses) or None
+
+
+def _statement_figures(kind: str, facts: dict) -> dict:
+    """The panel's headline figures, from a form's totals or an extractor's
+    dict — both carry the same names."""
+    header = {
+        "period_start": facts.get("period_start"),
+        "period_end": facts.get("period_end"),
+        "as_of_date": facts.get("as_of_date"),
+    }
+
+    def number(key: str) -> float | None:
+        value = facts.get(key)
+        return float(value) if value is not None else None
+
+    out: dict = {"period_label": business_statement_schema.period_label(kind, {"header": header})}
+    if kind == "p_and_l":
+        out.update(net_income=number("net_income"), ebitda=number("ebitda"))
+    else:
+        assets, liabilities, equity = (
+            number("total_assets"), number("total_liabilities"), number("total_equity")
+        )
+        out.update(total_assets=assets, total_liabilities=liabilities, total_equity=equity)
+        if "balances" in facts:
+            out["balances"] = bool(facts["balances"])
+        elif None not in (assets, liabilities, equity):
+            tolerance = max(
+                float(business_statement_schema.BALANCE_TOLERANCE_FLOOR),
+                abs(assets) * float(business_statement_schema.BALANCE_TOLERANCE_SHARE),
+            )
+            out["balances"] = abs(assets - liabilities - equity) <= tolerance
+    return out
+
+
+async def _business_statement_status(
+    db: AsyncSession, profile: ApplicationProfile, kind: str
+) -> FinancialFormStatus:
+    """One of the two business statements: filled, recognised on an upload,
+    or nothing. Satisfied follows the source, never the slot's own status."""
+    schema = business_statement_schema.SCHEMA_FOR[kind]
+    slot = await business_statements.slot_for_kind(db, profile, kind)
+    statement = await business_statements.latest_for_profile(db, profile.id, kind)
+    submitted = statement if statement and statement.status == "submitted" else None
+
+    pending = False
+    figures: dict = {}
+    figures_from = None
+    if submitted is not None:
+        source = "filled"
+        figures_from = "form"
+        figures = _statement_figures(kind, schema.key_facts(submitted.body or {}))
+    else:
+        if slot is not None:
+            analyses, pending = await _slot_analyses(db, slot)
+        elif profile.primary_bucket_id is not None:
+            analyses = await _bucket_analyses(db, profile.primary_bucket_id)
+        else:
+            analyses = []
+        recognised = _recognised_business_statement(kind, analyses)
+        if recognised:
+            source = "uploaded"
+            figures_from = "document"
+            figures = _statement_figures(kind, recognised)
+        else:
+            source = "none"
+
+    return FinancialFormStatus(
+        kind=kind,
+        label=schema.label,
+        requested=slot is not None,
+        satisfied=source != "none",
+        source=source,
+        statement_id=statement.id if statement else None,
+        figures_from=figures_from,
+        analysis_pending=pending,
+        updated_at=statement.updated_at if statement else None,
+        filled_by_staff=bool(statement and statement.submitted_by_user_id),
+        **figures,
+    )
+
+
+async def _packets_for_profile(
+    db: AsyncSession, profile: ApplicationProfile
+) -> list[FinancialFormPacket]:
+    """Every packet minted on the file, grouped from its four child links."""
+    links = list(
+        (
+            await db.execute(
+                select(FinancialFormLink)
+                .where(
+                    FinancialFormLink.profile_id == profile.id,
+                    FinancialFormLink.packet_id.is_not(None),
+                )
+                .order_by(FinancialFormLink.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    grouped: dict[UUID, list[FinancialFormLink]] = {}
+    for link in links:
+        grouped.setdefault(link.packet_id, []).append(link)
+    packets: list[FinancialFormPacket] = []
+    for packet_id, children in grouped.items():
+        packets.append(
+            FinancialFormPacket(
+                packet_id=packet_id,
+                created_at=min((c.created_at for c in children if c.created_at), default=None),
+                expires_at=min((c.expires_at for c in children if c.expires_at), default=None),
+                completed_kinds=[c.kind for c in children if c.completed_at is not None],
+                revoked=all(c.revoked_at is not None for c in children),
+            )
+        )
+    packets.sort(key=lambda p: (p.created_at is None, p.created_at), reverse=True)
+    return packets
 
 
 @router.post("/{profile_id}/financial-forms/{kind}/link", status_code=status.HTTP_201_CREATED)
@@ -4394,6 +4643,12 @@ async def mint_financial_form_link(
     somewhere to share it. The debt schedule writes its rows straight to the
     file's schedule, so it needs no placeholder.
     """
+    if kind == "packet":
+        # One link that opens all four forms. Not a kind: four ordinary links
+        # whose tokens derive from one base. Never reaches the category guard.
+        profile = await profiles.load_profile(db, profile_id, user)
+        _require_statement_staff(user)
+        return await _mint_packet(db, profile, user)
     if kind not in _FORM_SLOT_CATEGORY:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
     profile = await profiles.load_profile(db, profile_id, user)
@@ -4508,6 +4763,212 @@ async def save_debt_schedule(
     return {"row_count": len(rows), "submitted": bool(payload.submit)}
 
 
+@router.get("/{profile_id}/financial-forms/{kind}/body")
+async def read_business_statement_body(
+    profile_id: UUID,
+    kind: str,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The file's profit and loss or balance sheet, shaped for the form —
+    the latest row, or a blank one seeded with the business name."""
+    if kind not in business_statement_schema.KINDS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    prefill = await financial_statements.form_prefill(db, profile)
+    body, statement = await business_statements.body_for_profile(db, profile, kind, prefill)
+    return {
+        **body,
+        "status": statement.status if statement else None,
+        "statement_id": statement.id if statement else None,
+    }
+
+
+@router.put("/{profile_id}/financial-forms/{kind}")
+async def save_business_statement(
+    profile_id: UUID,
+    kind: str,
+    payload: FinancialFormSave,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Write the desk's version of a business statement.
+
+    Saved as a draft; with `submit`, the checklist row is ensured (created
+    unrequired when the file has none), the sheet is filed on it and the
+    statement becomes submitted — after which later saves keep that status,
+    as the PFS does.
+    """
+    if kind not in business_statement_schema.KINDS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown form")
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+
+    statement = await business_statements.save(
+        db, profile, kind=kind, body=payload.body, status="draft", actor_user_id=user.id
+    )
+    if payload.submit:
+        slot = await business_statements.ensure_slot(db, profile, kind, required=False)
+        statement = await business_statements.save(
+            db, profile, kind=kind, body=payload.body, status="submitted",
+            actor_user_id=user.id, statement=statement,
+        )
+        await business_statements.file_pdf(
+            db,
+            profile,
+            statement,
+            slot=slot,
+            actor_user_id=user.id,
+            actor_name=user.name or user.email,
+            actor_email=user.email,
+            actor=user,
+        )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.statement_saved",
+        f"{'Filed' if payload.submit else 'Saved'} the {_FORM_LABEL[kind].lower()}",
+        target_type="business_financial_statement", target_id=statement.id,
+    )
+    await db.commit()
+    return {
+        "statement_id": statement.id,
+        "status": statement.status,
+        "submitted": bool(payload.submit),
+    }
+
+
+async def _ensure_legacy_form_slot(
+    db: AsyncSession, profile: ApplicationProfile, kind: str
+) -> None:
+    """The PFS or debt-schedule checklist row, created silently when missing —
+    the same row the request route creates, without its event and not marked
+    required. So a packet child's submit can always file."""
+    if await _requested_slot(db, profile, kind) is not None:
+        return
+    db.add(
+        BucketRequestedDocument(
+            bucket_id=profile.primary_bucket_id,
+            name=_FORM_LABEL[kind],
+            category=_FORM_SLOT_CATEGORY[kind],
+            description=(
+                "Fill this in online or upload your own — either satisfies the request."
+            ),
+            required=False,
+            status="requested",
+        )
+    )
+    await db.flush()
+
+
+async def _mint_packet(db: AsyncSession, profile: ApplicationProfile, user: User) -> dict:
+    """One forwardable link that opens all four forms.
+
+    Four ordinary links — pfs, debt_schedule, p_and_l, balance_sheet — whose
+    tokens are `{base}.{kind}`, sharing a `packet_id`, hashed at rest, with the
+    usual TTL. Every child's checklist row is ensured first, silently, so a
+    submit on any of the four can file on Main Street, dealer and real-estate
+    files alike. The PFS child attaches the latest PFS statement exactly as a
+    `pfs` link does; when that statement is already submitted the child is
+    minted complete, so the packet shows the step as done rather than
+    reopening a filed statement. One client-tier event, not four.
+    """
+    if profile.primary_bucket_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This file has no document room to file the forms in"
+        )
+    for kind in ("pfs", "debt_schedule"):
+        await _ensure_legacy_form_slot(db, profile, kind)
+    for kind in business_statement_schema.KINDS:
+        await business_statements.ensure_slot(db, profile, kind, required=False)
+
+    statement = await financial_statements.latest_for_profile(db, profile.id)
+    if statement is None:
+        statement = await financial_statements.save_statement(
+            db, profile, body=pfs_schema.empty_body(), actor_user_id=user.id
+        )
+
+    base = secrets.token_urlsafe(32)
+    packet_id = uuid4()
+    now = datetime.now(UTC)
+    expires_at = None
+    for kind in PACKET_KINDS:
+        link, _token = await financial_statements.mint_link(
+            db,
+            profile,
+            kind=kind,
+            statement_id=statement.id if kind == "pfs" else None,
+            created_by=user.id,
+            token=f"{base}.{kind}",
+        )
+        link.packet_id = packet_id
+        if kind == "pfs" and statement.status == "submitted":
+            link.completed_at = now
+        expires_at = link.expires_at
+    await db.flush()
+
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="forms.packet_sent",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title="Financial forms packet was sent",
+        actor=user,
+        target_type="financial_form_packet",
+        target_id=packet_id,
+        meta={"packet_id": str(packet_id), "kinds": list(PACKET_KINDS)},
+    )
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.packet_link_minted",
+        "Created a packet link that opens all four financial forms",
+        target_type="financial_form_packet", target_id=packet_id,
+    )
+    await db.commit()
+    return {
+        "url": f"{get_settings().frontend_app_url.rstrip('/')}/forms/packet/{base}",
+        "expires_at": expires_at,
+        "packet_id": packet_id,
+    }
+
+
+@router.post("/{profile_id}/financial-forms/packets/{packet_id}/revoke")
+async def revoke_financial_form_packet(
+    profile_id: UUID,
+    packet_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Close a forwarded packet: every child link stops working at once.
+    `is_open` already honours `revoked_at`, so an open tab flips to "no longer
+    available" on its next save."""
+    profile = await profiles.load_profile(db, profile_id, user)
+    _require_statement_staff(user)
+    children = list(
+        (
+            await db.execute(
+                select(FinancialFormLink).where(
+                    FinancialFormLink.profile_id == profile.id,
+                    FinancialFormLink.packet_id == packet_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not children:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Packet not found")
+    now = datetime.now(UTC)
+    for link in children:
+        if link.revoked_at is None:
+            link.revoked_at = now
+    await profiles.log_profile_action(
+        db, profile, user, "financial_form.packet_revoked",
+        "Closed a financial forms packet link",
+        target_type="financial_form_packet", target_id=packet_id,
+    )
+    await db.commit()
+    return {"revoked": True}
+
+
 @router.get("/{profile_id}/financial-forms/{kind}/pdf")
 async def financial_form_pdf(
     profile_id: UUID,
@@ -4538,7 +4999,20 @@ async def financial_form_pdf(
     # A filename someone can find again in a downloads folder six weeks later.
     safe = re.sub(r"[^A-Za-z0-9]+", "-", business).strip("-").lower() or "business"
 
-    if kind == "debt_schedule":
+    if kind in business_statement_schema.KINDS:
+        statement = await business_statements.latest_for_profile(db, profile.id, kind)
+        if statement is None or not (statement.body or {}):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"Nothing has been filled in on the {_FORM_LABEL[kind].lower()} yet.",
+            )
+        pdf = (
+            dealer_forms_pdf.render_p_and_l_pdf(body=statement.body or {})
+            if kind == "p_and_l"
+            else dealer_forms_pdf.render_balance_sheet_pdf(body=statement.body or {})
+        )
+        filename = f"{kind.replace('_', '-')}-{safe}-{stamp}.pdf"
+    elif kind == "debt_schedule":
         body = await financial_statements.debt_body_for_profile(db, profile)
         rows = financial_statements.debt_rows_from_body(body)
         if not rows:
@@ -4609,18 +5083,21 @@ async def request_financial_form(
     if existing is not None:
         return {"requested": True, "already": True}
 
-    db.add(
-        BucketRequestedDocument(
-            bucket_id=profile.primary_bucket_id,
-            name=_FORM_LABEL[kind],
-            category=_FORM_SLOT_CATEGORY[kind],
-            description=(
-                "Fill this in online or upload your own — either satisfies the request."
-            ),
-            required=True,
-            status="requested",
+    if kind in business_statement_schema.KINDS:
+        await business_statements.ensure_slot(db, profile, kind, required=True)
+    else:
+        db.add(
+            BucketRequestedDocument(
+                bucket_id=profile.primary_bucket_id,
+                name=_FORM_LABEL[kind],
+                category=_FORM_SLOT_CATEGORY[kind],
+                description=(
+                    "Fill this in online or upload your own — either satisfies the request."
+                ),
+                required=True,
+                status="requested",
+            )
         )
-    )
     await profiles.log_profile_action(
         db, profile, user, "financial_form.requested",
         f"Requested the {_FORM_LABEL[kind].lower()}",

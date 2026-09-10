@@ -142,6 +142,27 @@ def _tile(label: str, value: str, *, hint: str = "") -> str:
     )
 
 
+# Provenance stamps bucket_ai._compute_key_metrics_from_cache writes beside the
+# earnings figures it fills (ebitda_source / revenue_source / dscr_basis).
+_SOURCE_LABELS = {
+    "tax_return": "from tax return",
+    "profit_and_loss": "from P&L",
+    "profit_and_loss_ebitda": "from P&L",
+}
+
+
+def _source_note(key_metrics: dict[str, Any], key: str) -> str:
+    """'from P&L, 2026-01-01 to 2026-06-30' / 'from tax return' / '' for a
+    key_metrics provenance stamp; empty when the figure carries none."""
+    label = _SOURCE_LABELS.get(str(key_metrics.get(key) or "").strip().lower(), "")
+    if not label:
+        return ""
+    period = str(key_metrics.get("pl_period") or "").strip()
+    if label == "from P&L" and period:
+        return f"{label}, {period}"
+    return label
+
+
 def _fact(label: str, value: Any) -> str:
     text = str(value).strip() if value not in (None, "") else "—"
     return f'<div class="fact"><span>{escape(label)}</span><strong>{escape(text)}</strong></div>'
@@ -411,9 +432,9 @@ def render_dealer_intelligence_pdf(
         tiles = [
             _tile("Requested capital", _money(requested), hint="" if requested is not None else "Not yet on the file — confirm in chat"),
             _tile("Annualized revenue", _money(annualized)),
-            _tile("Cash flow (est.)", _money(cash_flow)),
+            _tile("Cash flow (est.)", _money(cash_flow), hint=_source_note(key_metrics, "ebitda_source") if cash_flow is not None else ""),
             _tile("Debt burden", _money(debt), hint="" if debt is not None else "Debt schedule unlocks this"),
-            _tile("DSCR estimate", _ratio(dscr), hint="" if dscr is not None else "Debt schedule unlocks this"),
+            _tile("DSCR estimate", _ratio(dscr), hint=_source_note(key_metrics, "dscr_basis") if dscr is not None else "Debt schedule unlocks this"),
             _tile("Collateral equity", _money(equity), hint="" if equity is not None else "Real-estate schedule unlocks this"),
             _tile("Proposed LTV", _percent(ltv, already_percent=True)),
             _tile("Files uploaded", str(len(files))),
@@ -439,7 +460,11 @@ def render_dealer_intelligence_pdf(
         cash_rows = [
             ("Annualized revenue", _num(key_metrics.get("ytd_annualized_revenue")), BRAND_TEAL),
             ("Adjusted deposits (annualized)", _num(key_metrics.get("annualized_adjusted_deposits")), "#2563eb"),
-            ("Estimated cash flow", _num(key_metrics.get("estimated_ebitda_or_cash_flow")), GOOD),
+            (
+                "Estimated cash flow" + (f" ({_source_note(key_metrics, 'ebitda_source')})" if _source_note(key_metrics, "ebitda_source") else ""),
+                _num(key_metrics.get("estimated_ebitda_or_cash_flow")),
+                GOOD,
+            ),
             ("Debt burden", _num(key_metrics.get("estimated_debt_burden")), "#d97706"),
         ]
         evidenced = [(label, value, color) for label, value, color in cash_rows if value is not None]

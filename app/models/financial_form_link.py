@@ -42,7 +42,14 @@ class FinancialFormLink(TimestampMixin, Base):
     )
     #: pfs — a personal financial statement, per person.
     #: debt_schedule — the business debt schedule, one per file.
+    #: p_and_l — the business profit and loss statement, one per file.
+    #: balance_sheet — the business balance sheet, one per file.
+    #: The forms packet is not a kind: it is four links of these kinds whose
+    #: tokens derive from one base and which share a `packet_id`.
     kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    #: Set on the four children of one packet, so the desk can list a packet
+    #: and close all four in one action. Null on a link minted on its own.
+    packet_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), index=True)
     #: The statement this link edits. Set when a link is minted for an existing
     #: draft so a borrower resumes rather than starting a second sheet.
     statement_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -63,7 +70,10 @@ class FinancialFormLink(TimestampMixin, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
-        CheckConstraint("kind in ('pfs','debt_schedule')", name="ck_financial_form_links_kind"),
+        CheckConstraint(
+            "kind in ('pfs','debt_schedule','p_and_l','balance_sheet')",
+            name="ck_financial_form_links_kind",
+        ),
         Index("ix_financial_form_links_profile_kind", "profile_id", "kind"),
     )
 

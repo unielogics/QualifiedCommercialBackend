@@ -59,6 +59,7 @@ from app.models.billing import (  # noqa: F401
 )
 from app.models.booking_settings import BookingSettings  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
+from app.models.business_financial_statement import BusinessFinancialStatement  # noqa: F401
 from app.models.bucket import (  # noqa: F401
     Bucket,
     BucketActivityLog,

@@ -18,6 +18,8 @@ CATEGORY_CLASSIFICATIONS: dict[str, set[str]] = {
     "p&l": {"current_p_and_l"},
     "profit and loss": {"current_p_and_l"},
     "profit & loss": {"current_p_and_l"},
+    "income statement": {"current_p_and_l"},
+    "balance sheet": {"balance_sheet"},
     "lease": {"lease_or_rent", "commercial_lease"},
     "rent": {"lease_or_rent"},
     "rent roll": {"lease_or_rent"},
@@ -65,7 +67,9 @@ def filename_evidence_classification(file_name: str) -> str | None:
     compact = value.replace(" ", "")
     if "taxreturn" in compact or "business tax return" in value:
         return "tax_return"
-    if any(token in compact for token in ("profitandloss", "profitloss", "balancesheet")) or "p l" in value:
+    if "balancesheet" in compact:
+        return "balance_sheet"
+    if any(token in compact for token in ("profitandloss", "profitloss")) or "p l" in value:
         return "current_p_and_l"
     if "debt schedule" in value or "debtschedule" in compact:
         return "debt_schedule"

@@ -253,18 +253,23 @@ async def mint_link(
     invitee_email: str | None = None,
     created_by: UUID | None = None,
     ttl_days: int = DEFAULT_LINK_TTL_DAYS,
+    token: str | None = None,
 ) -> tuple[Any, str]:
     """A new link, and the only time its token exists in readable form.
 
     Returns `(link, token)`. Only the hash is stored, so this token cannot be
     recovered later — a lost link is reminted, not looked up.
+
+    `token` lets a caller supply the token instead of drawing one — the forms
+    packet derives four child tokens from one base so a single link opens all
+    four forms. Storage is unchanged: the hash, never the token.
     """
     import secrets
     from datetime import timedelta
 
     from app.models.financial_form_link import FinancialFormLink
 
-    token = secrets.token_urlsafe(_TOKEN_BYTES)
+    token = token or secrets.token_urlsafe(_TOKEN_BYTES)
     link = FinancialFormLink(
         profile_id=profile.id,
         kind=kind,
@@ -319,6 +324,25 @@ DEBT_COLUMNS = (
     "collateral",
     "notes",
 )
+
+#: The same columns, worded for a header row — the downloadable workbook and
+#: anything else that prints the schedule read these beside `DEBT_COLUMNS`,
+#: one to one, so a column added above is added here or the zip fails loudly.
+DEBT_COLUMN_LABELS = (
+    "Lender",
+    "Type of debt",
+    "Original amount",
+    "Current balance",
+    "Interest rate (%)",
+    "Monthly payment",
+    "Date originated",
+    "Maturity date",
+    "Secured or unsecured",
+    "Payment status",
+    "Collateral",
+    "Notes",
+)
+assert len(DEBT_COLUMN_LABELS) == len(DEBT_COLUMNS)
 
 #: What the row's two choice fields accept. Anything else is discarded rather
 #: than stored, so a stray value cannot end up rendered on a schedule we send

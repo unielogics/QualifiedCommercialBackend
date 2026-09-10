@@ -808,7 +808,7 @@ class FinancialFormStatus(BaseModel):
     reopened, corrected, or handed back to the borrower to finish.
     """
 
-    kind: Literal["pfs", "debt_schedule"]
+    kind: Literal["pfs", "debt_schedule", "p_and_l", "balance_sheet"]
     label: str
     #: Whether the checklist actually asks for it on this file. A form nobody
     #: has requested is not outstanding — it is simply not part of this deal.
@@ -836,6 +836,27 @@ class FinancialFormStatus(BaseModel):
     #: A document satisfies the slot but has not been read yet. The figures are
     #: on their way rather than missing, and the caller should come back.
     analysis_pending: bool = False
+    #: The two business statements. "Jan–Jun 2026" / "as of 2026-06-30", the
+    #: headline figures, and for a balance sheet whether it balances — from the
+    #: form when filled, from the extractor when an upload was recognised.
+    period_label: str | None = None
+    net_income: float | None = None
+    ebitda: float | None = None
+    total_assets: float | None = None
+    total_liabilities: float | None = None
+    total_equity: float | None = None
+    balances: bool | None = None
+
+
+class FinancialFormPacket(BaseModel):
+    """One forwardable link that opens all four forms: four child links that
+    share a `packet_id`. Listed so the desk can see what is out and close it."""
+
+    packet_id: UUID
+    created_at: datetime | None = None
+    expires_at: datetime | None = None
+    completed_kinds: list[str] = Field(default_factory=list)
+    revoked: bool = False
 
 
 class FinancialFormSave(BaseModel):
@@ -848,3 +869,4 @@ class FinancialFormSave(BaseModel):
 
 class FinancialFormsRead(BaseModel):
     forms: list[FinancialFormStatus] = Field(default_factory=list)
+    packets: list[FinancialFormPacket] = Field(default_factory=list)

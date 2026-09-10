@@ -4203,7 +4203,14 @@ async def _collect_packet_financials(
     program_fit = _loan_program_fit(intake) if intake.variant != FUNDING_VARIANT else None
     active_ids = {file.id for file in _active_files(intake.bucket)}
     if not active_ids:
-        return {"bank_months": [], "tax_years": [], "credit": credit, "program_fit": program_fit}
+        return {
+            "bank_months": [],
+            "tax_years": [],
+            "p_and_l": None,
+            "balance_sheet": None,
+            "credit": credit,
+            "program_fit": program_fit,
+        }
     rows = (
         await db.execute(
             select(BucketFileAnalysis)
@@ -4217,7 +4224,9 @@ async def _collect_packet_financials(
     ).scalars().all()
 
     from app.services.public_underwriting_packet_pdf import (
+        extract_balance_sheet,
         extract_bank_months,
+        extract_profit_and_loss,
         extract_tax_years,
     )
 
@@ -4233,6 +4242,8 @@ async def _collect_packet_financials(
     return {
         "bank_months": extract_bank_months(analyses),
         "tax_years": extract_tax_years(analyses),
+        "p_and_l": extract_profit_and_loss(analyses),
+        "balance_sheet": extract_balance_sheet(analyses),
         "credit": credit,
         "program_fit": program_fit,
     }

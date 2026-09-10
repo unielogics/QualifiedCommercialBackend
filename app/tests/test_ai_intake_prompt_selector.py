@@ -163,6 +163,34 @@ def test_main_street_classification_tokens_are_in_both_enums():
     assert "floorplan_mca_inventory" in ai.REVIEW_PREAMBLE
 
 
+def test_balance_sheet_token_is_in_both_enums_beside_the_pl_token():
+    """An uploaded balance sheet used to be filed as a P&L; it now has its own
+    token in the review AND per-file enums (current_p_and_l is kept)."""
+    for enum in (ai.REVIEW_PREAMBLE, ai.FILE_ANALYSIS_PREAMBLE):
+        assert "current_p_and_l|balance_sheet|" in enum
+    assert len("balance_sheet") <= 48
+
+
+def test_the_typed_statement_blocks_name_every_prompt_key_and_no_persona():
+    """The P&L and balance-sheet blocks ask for exactly the keys the extractors
+    read back (the way test_merchant_offer pins TERM_KEYS), sit inside the shared
+    preamble, and carry no product persona."""
+    for keys, block, token in (
+        (ai.PL_PROMPT_KEYS, ai.P_AND_L_ANALYSIS_BLOCK, "classify it current_p_and_l"),
+        (ai.BS_PROMPT_KEYS, ai.BALANCE_SHEET_ANALYSIS_BLOCK, "classify it balance_sheet"),
+    ):
+        assert block in ai.FILE_ANALYSIS_PREAMBLE
+        assert token in block
+        for key in keys:
+            assert key in block, key
+        assert not _personas_in(_normalize(block)), block
+    assert len(ai.PL_PROMPT_KEYS) == 16 and len(ai.BS_PROMPT_KEYS) == 16
+    # The preamble keeps its literal JSON braces — it was concatenated, not formatted.
+    assert '"key_facts": {"note"' in ai.FILE_ANALYSIS_PREAMBLE
+    assert "never compute EBITDA or annualize" in ai.P_AND_L_ANALYSIS_BLOCK
+    assert "never balance the sheet yourself" in ai.BALANCE_SHEET_ANALYSIS_BLOCK
+
+
 def test_classification_tokens_fit_the_database_column():
     """BucketFileAnalysis.classification is String(48)."""
     tokens = [
