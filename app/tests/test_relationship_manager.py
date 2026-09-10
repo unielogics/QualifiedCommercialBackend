@@ -285,8 +285,13 @@ def test_the_phone_backfill_never_overwrites_a_number_someone_typed():
 
 
 def test_the_migration_chain_has_one_head():
+    """Two heads means `alembic upgrade head` refuses to run, which on this
+    deployment means the container does not come up. The name is pinned rather
+    than just counted so that adding a migration is a deliberate edit here —
+    a branch created by two people working in parallel would otherwise pass a
+    bare length check right up until it took production down."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0201_file_team_and_timeline"]
+    assert heads == ["0202_debt_schedule_full_row"]
