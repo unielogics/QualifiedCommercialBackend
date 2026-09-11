@@ -254,6 +254,63 @@ class ApplicationRequirementState(TimestampMixin, Base):
     )
 
 
+class ApplicationRequirementEvidence(TimestampMixin, Base):
+    """One evidence document linked to one shared program requirement.
+
+    The legacy ``ApplicationRequirementState.evidence_file_id`` remains as a
+    compatibility pointer to the first active document. This table is the
+    authoritative collection and allows statements, tax returns, and split
+    financial packages to be reviewed as a set.
+    """
+
+    __tablename__ = "application_requirement_evidence_files"
+    __table_args__ = (
+        Index(
+            "uq_application_requirement_evidence_active",
+            "requirement_state_id",
+            "file_id",
+            unique=True,
+            postgresql_where=text("removed_at IS NULL"),
+        ),
+        Index(
+            "ix_application_requirement_evidence_state",
+            "requirement_state_id",
+            "removed_at",
+        ),
+        CheckConstraint(
+            "source IN ('automatic','filename_suggestion','operator')",
+            name="ck_application_requirement_evidence_source",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    requirement_state_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_requirement_states.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="CASCADE"), nullable=False
+    )
+    source: Mapped[str] = mapped_column(String(24), nullable=False, default="automatic", server_default="automatic")
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    linked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    provenance: Mapped[dict | None] = mapped_column(JSONB)
+
+
 class ApplicationProgramRequirementOverride(TimestampMixin, Base):
     __tablename__ = "application_program_requirement_overrides"
     __table_args__ = (

@@ -1,14 +1,19 @@
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.enums import Role
-from app.models.application_profile import ApplicationOwner, ApplicationPlaidItem
+from app.models.application_profile import (
+    ApplicationOwner,
+    ApplicationPlaidItem,
+    ApplicationRequirementEvidence,
+)
 from app.routers.application_profiles import _require_profile_bank_client
 from app.routers.communications import _intake_allowed_channels
-from app.schemas.application_profile import FileOwnerPatch
+from app.schemas.application_profile import ApplicationRequirementPatch, FileOwnerPatch
 from app.services.application_profiles import _statement_months_from_analysis
 from app.services.underwriting_intelligence import calculate_dscr
 
@@ -35,13 +40,31 @@ def test_owner_patch_allows_omitted_names_but_rejects_clearing_them() -> None:
         FileOwnerPatch(last_name="   ")
 
 
+def test_requirement_patch_accepts_multiple_evidence_files() -> None:
+    file_ids = [uuid4(), uuid4()]
+
+    payload = ApplicationRequirementPatch(
+        action="link_evidence",
+        evidence_file_ids=file_ids,
+        confirmed=True,
+    )
+
+    assert set(payload.evidence_file_ids) == set(file_ids)
+    with pytest.raises(ValidationError):
+        ApplicationRequirementPatch(action="unlink_evidence", confirmed=True)
+
+
 def test_model_metadata_contains_partial_uniqueness_contracts() -> None:
     owner_indexes = {index.name for index in ApplicationOwner.__table__.indexes}
     bank_indexes = {index.name for index in ApplicationPlaidItem.__table__.indexes}
+    requirement_evidence_indexes = {
+        index.name for index in ApplicationRequirementEvidence.__table__.indexes
+    }
 
     assert "uq_application_owners_primary" in owner_indexes
     assert "uq_application_owners_email" in owner_indexes
     assert "uq_application_plaid_items_primary" in bank_indexes
+    assert "uq_application_requirement_evidence_active" in requirement_evidence_indexes
 
 
 @pytest.mark.parametrize(

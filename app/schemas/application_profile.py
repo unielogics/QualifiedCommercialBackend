@@ -115,6 +115,23 @@ class ApplicationProgramSelectionRead(BaseModel):
     selected_at: datetime
 
 
+class ApplicationRequirementEvidenceRead(BaseModel):
+    file_id: UUID
+    file_name: str
+    bucket_id: UUID
+    created_at: datetime
+    source: Literal["automatic", "filename_suggestion", "operator"]
+    verified: bool = False
+    verified_at: datetime | None = None
+
+
+class ApplicationEvidenceOptionRead(BaseModel):
+    file_id: UUID
+    file_name: str
+    bucket_id: UUID
+    created_at: datetime
+
+
 class ApplicationRequirementRead(BaseModel):
     requirement_key: str
     label: str
@@ -124,6 +141,14 @@ class ApplicationRequirementRead(BaseModel):
     requested_document_id: UUID | None = None
     evidence_file_id: UUID | None = None
     evidence_file_name: str | None = None
+    evidence_files: list[ApplicationRequirementEvidenceRead] = Field(default_factory=list)
+    evidence_count: int = 0
+    verified_evidence_count: int = 0
+    coverage: dict = Field(default_factory=dict)
+    verified_coverage: dict = Field(default_factory=dict)
+    coverage_complete: bool = False
+    verified_coverage_complete: bool = False
+    allow_multiple_files: bool = True
     verification_required: bool = False
     source_program_keys: list[str] = Field(default_factory=list)
     program_overrides: dict[str, str] = Field(default_factory=dict)
@@ -167,6 +192,7 @@ class ApplicationProgramReadiness(BaseModel):
     candidates: list[ProgramFitCandidate] = Field(default_factory=list)
     programs: list[ProgramReadinessItem] = Field(default_factory=list)
     requirements: list[ApplicationRequirementRead] = Field(default_factory=list)
+    available_evidence_files: list[ApplicationEvidenceOptionRead] = Field(default_factory=list)
     can_advance: bool = False
     automation: MissingItemAutomationRead
 
@@ -187,6 +213,7 @@ class ApplicationProgramsPatch(BaseModel):
 class ApplicationRequirementPatch(BaseModel):
     action: Literal[
         "link_evidence",
+        "unlink_evidence",
         "verify",
         "unverify",
         "waive",
@@ -195,6 +222,7 @@ class ApplicationRequirementPatch(BaseModel):
         "failed",
     ]
     evidence_file_id: UUID | None = None
+    evidence_file_ids: list[UUID] = Field(default_factory=list, max_length=100)
     program_keys: list[str] = Field(default_factory=list)
     all_programs: bool = False
     reason: str | None = Field(default=None, max_length=2000)
@@ -202,8 +230,12 @@ class ApplicationRequirementPatch(BaseModel):
 
     @model_validator(mode="after")
     def _validate_requirement_action(self) -> ApplicationRequirementPatch:
-        if self.action == "link_evidence" and self.evidence_file_id is None:
-            raise ValueError("Select an evidence file")
+        selected_ids = set(self.evidence_file_ids)
+        if self.evidence_file_id is not None:
+            selected_ids.add(self.evidence_file_id)
+        if self.action in {"link_evidence", "unlink_evidence"} and not selected_ids:
+            raise ValueError("Select at least one evidence file")
+        self.evidence_file_ids = list(selected_ids)
         if self.action in {"waive", "not_applicable"} and len((self.reason or "").strip()) < 8:
             raise ValueError("A reason of at least eight characters is required")
         if self.all_programs and self.program_keys:

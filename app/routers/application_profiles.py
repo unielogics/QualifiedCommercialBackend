@@ -909,6 +909,7 @@ async def update_application_requirement(
             "requirement_key": requirement_key,
             "action": payload.action,
             "evidence_file_id": str(payload.evidence_file_id) if payload.evidence_file_id else None,
+            "evidence_file_ids": [str(file_id) for file_id in payload.evidence_file_ids],
             "program_keys": payload.program_keys,
             "all_programs": payload.all_programs,
             "reason": payload.reason,

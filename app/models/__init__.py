@@ -46,6 +46,7 @@ from app.models.application_profile import (  # noqa: F401
     ApplicationProgramRequirementOverride,
     ApplicationProgramSelection,
     ApplicationProfile,
+    ApplicationRequirementEvidence,
     ApplicationRequirementState,
     ApplicationRoomDelivery,
     ApplicationTaxonomyEntry,

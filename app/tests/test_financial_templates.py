@@ -8,7 +8,12 @@ from uuid import uuid4
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
-from app.services.application_programs import _matching_evidence
+from app.services.application_programs import (
+    _coverage_for_files,
+    _filename_suggestions,
+    _matching_evidence,
+    _matching_evidence_files,
+)
 from app.services.financial_templates import TEMPLATE_VERSION, template_for_requirement
 
 
@@ -84,6 +89,53 @@ def test_combined_financial_requirement_needs_both_statements() -> None:
     assert selected is pnl or selected is balance
     assert complete is True
     assert coverage["balance_sheet"] is True
+
+    matches, complete, coverage = _matching_evidence_files(
+        requirement,
+        None,
+        [pnl, balance],
+        {
+            pnl.id: _analysis("profit_and_loss"),
+            balance.id: _analysis("balance_sheet"),
+        },
+    )
+    assert {file.id for file in matches} == {pnl.id, balance.id}
+    assert complete is True
+    assert coverage["current"] == coverage["required"] == 2
+
+
+def test_bank_and_tax_coverage_count_distinct_periods_across_documents() -> None:
+    bank_requirement = _requirement(
+        "business_bank_statements_6_months", "Last 6 months business bank statements"
+    )
+    bank_files = [_file(f"statement-2026-{month:02d}.pdf") for month in range(1, 7)]
+    complete, coverage = _coverage_for_files(bank_requirement, bank_files, {})
+
+    assert complete is True
+    assert coverage["months"] == [f"2026-{month:02d}" for month in range(1, 7)]
+    assert coverage["current"] == coverage["required"] == 6
+
+    tax_requirement = _requirement(
+        "business_tax_returns_2_years", "Last 2 years business tax returns"
+    )
+    tax_files = [_file("business-tax-return-2024.pdf"), _file("business-tax-return-2025.pdf")]
+    complete, coverage = _coverage_for_files(tax_requirement, tax_files, {})
+
+    assert complete is True
+    assert coverage["years"] == ["2024", "2025"]
+    assert coverage["current"] == coverage["required"] == 2
+
+
+def test_high_signal_legacy_upload_is_suggested_but_not_content_verified() -> None:
+    requirement = _requirement("business_debt_schedule", "Business debt schedule")
+    legacy = _file("Business Debt Schedule.xlsx")
+
+    selected, complete, _coverage = _matching_evidence(requirement, None, [legacy], {})
+    suggestions = _filename_suggestions(requirement, [legacy], {})
+
+    assert selected is None
+    assert complete is False
+    assert suggestions == [legacy]
 
 
 def test_staff_linked_evidence_remains_the_selected_file() -> None:

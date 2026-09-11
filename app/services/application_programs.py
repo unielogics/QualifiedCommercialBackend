@@ -17,6 +17,7 @@ from app.models.application_profile import (
     ApplicationProfile,
     ApplicationProgramRequirementOverride,
     ApplicationProgramSelection,
+    ApplicationRequirementEvidence,
     ApplicationRequirementState,
 )
 from app.models.bucket import (
@@ -30,9 +31,11 @@ from app.models.client_ai_plan import ClientAIPlan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
+    ApplicationEvidenceOptionRead,
     ApplicationProgramReadiness,
     ApplicationProgramSelectionRead,
     ApplicationProgramsPatch,
+    ApplicationRequirementEvidenceRead,
     ApplicationRequirementPatch,
     ApplicationRequirementRead,
     MissingItemAutomationRead,
@@ -511,10 +514,7 @@ async def _requested_document(
             category=requirement.category,
             description=requirement.objective_text or requirement.ai_request_message_template,
             required=requirement.required_level == "required",
-            allow_multiple_files=requirement.requirement_key in {
-                "business_bank_statements_6_months",
-                "business_tax_returns_2_years",
-            },
+            allow_multiple_files=True,
             status="requested",
             is_custom=False,
             requirement_key=requirement.requirement_key,
@@ -529,10 +529,7 @@ async def _requested_document(
             requirement.objective_text or requirement.ai_request_message_template
         )
         requested.required = requirement.required_level == "required"
-        requested.allow_multiple_files = requirement.requirement_key in {
-            "business_bank_statements_6_months",
-            "business_tax_returns_2_years",
-        }
+        requested.allow_multiple_files = True
         requested.requirement_key = requirement.requirement_key
         requested.requirement_source = source
         if requested.status == "not_applicable":
@@ -557,16 +554,108 @@ def _tax_years(file: BucketFile, analysis: BucketFileAnalysis | None) -> set[str
     return years
 
 
-def _matching_evidence(
+def _coverage_for_files(
+    requirement: AICollectionRequirement,
+    files: list[BucketFile],
+    analyses: dict[uuid.UUID, BucketFileAnalysis],
+) -> tuple[bool, dict[str, Any]]:
+    expected = _expected_classes(requirement)
+    coverage: dict[str, Any] = {
+        "matched_files": len(files),
+        "expected_classifications": sorted(expected),
+        "current": len(files),
+        "required": 1,
+        "unit": "documents",
+    }
+    complete = bool(files)
+    if requirement.requirement_key == "business_bank_statements_6_months":
+        months: set[str] = set()
+        unknown_period_files = 0
+        for file in files:
+            file_months: set[str] = set()
+            if file.statement_period:
+                file_months.add(file.statement_period)
+            file_months.update(statement_months_from_filename(file.file_name))
+            analysis = analyses.get(file.id)
+            file_months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
+            if file_months:
+                months.update(file_months)
+            else:
+                unknown_period_files += 1
+        current = len(months) + unknown_period_files
+        coverage.update(
+            {
+                "months": sorted(months),
+                "unknown_period_files": unknown_period_files,
+                "required_months": 6,
+                "current": current,
+                "required": 6,
+                "unit": "months",
+            }
+        )
+        complete = current >= 6
+    elif requirement.requirement_key == "business_tax_returns_2_years":
+        years: set[str] = set()
+        unknown_year_files = 0
+        for file in files:
+            file_years = _tax_years(file, analyses.get(file.id))
+            if file_years:
+                years.update(file_years)
+            else:
+                unknown_year_files += 1
+        current = len(years) + unknown_year_files
+        coverage.update(
+            {
+                "years": sorted(years),
+                "unknown_year_files": unknown_year_files,
+                "required_years": 2,
+                "current": current,
+                "required": 2,
+                "unit": "years",
+            }
+        )
+        complete = current >= 2
+    elif requirement.requirement_key == "ytd_p_and_l_balance_sheet":
+        classifications = {
+            effective_file_classification(file.file_name, analyses.get(file.id))
+            for file in files
+        }
+        has_profit_and_loss = bool(
+            {"current_p_and_l", "profit_and_loss"}.intersection(classifications)
+        )
+        has_balance_sheet = "balance_sheet" in classifications
+        combined_template = any(
+            "profit-loss-balance-sheet" in file.file_name.casefold()
+            or "p&l and balance sheet" in file.file_name.casefold()
+            for file in files
+        )
+        current = 2 if combined_template else int(has_profit_and_loss) + int(has_balance_sheet)
+        coverage.update(
+            {
+                "classifications": sorted(value for value in classifications if value),
+                "profit_and_loss": has_profit_and_loss or combined_template,
+                "balance_sheet": has_balance_sheet or combined_template,
+                "current": current,
+                "required": 2,
+                "unit": "document types",
+            }
+        )
+        complete = current >= 2
+    coverage["complete"] = complete
+    return complete, coverage
+
+
+def _matching_evidence_files(
     requirement: AICollectionRequirement,
     requested: BucketRequestedDocument | None,
     files: list[BucketFile],
     analyses: dict[uuid.UUID, BucketFileAnalysis],
     *,
-    preferred_file_id: uuid.UUID | None = None,
+    preferred_file_ids: set[uuid.UUID] | None = None,
     trust_preferred: bool = False,
-) -> tuple[BucketFile | None, bool, dict[str, Any]]:
+) -> tuple[list[BucketFile], bool, dict[str, Any]]:
     expected = _expected_classes(requirement)
+    preferred_ids = preferred_file_ids or set()
     explicit = []
     for file in files:
         if not requested or file.requested_document_id != requested.id:
@@ -589,56 +678,112 @@ def _matching_evidence(
         and analysis.classification in expected
     ]
     matches = list({file.id: file for file in [*explicit, *classified]}.values())
-    preferred = next((file for file in files if file.id == preferred_file_id), None)
-    if preferred and trust_preferred:
-        matches = list({file.id: file for file in [preferred, *matches]}.values())
+    if trust_preferred:
+        preferred = [file for file in files if file.id in preferred_ids]
+        matches = list({file.id: file for file in [*preferred, *matches]}.values())
     matches.sort(
-        key=lambda file: (file.id == preferred_file_id, file.created_at),
+        key=lambda file: (file.id in preferred_ids, file.created_at),
         reverse=True,
     )
     if not matches:
-        return None, False, {"expected_classifications": sorted(expected), "matched_files": 0}
-    complete = True
-    coverage: dict[str, Any] = {"matched_files": len(matches), "expected_classifications": sorted(expected)}
-    if requirement.requirement_key == "business_bank_statements_6_months":
-        months: set[str] = set()
-        for file in matches:
-            if file.statement_period:
-                months.add(file.statement_period)
-            months.update(statement_months_from_filename(file.file_name))
-            analysis = analyses.get(file.id)
-            months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
-        coverage.update({"months": sorted(months), "required_months": 6})
-        complete = len(months) >= 6
-    elif requirement.requirement_key == "business_tax_returns_2_years":
-        years: set[str] = set()
-        for file in matches:
-            years.update(_tax_years(file, analyses.get(file.id)))
-        coverage.update({"years": sorted(years), "required_years": 2})
-        complete = len(years) >= 2 or len(matches) >= 2
-    elif requirement.requirement_key == "ytd_p_and_l_balance_sheet":
-        classifications = {
-            effective_file_classification(file.file_name, analyses.get(file.id))
-            for file in matches
-        }
-        has_profit_and_loss = bool(
-            {"current_p_and_l", "profit_and_loss"}.intersection(classifications)
-        )
-        has_balance_sheet = "balance_sheet" in classifications
-        combined_template = any(
-            "profit-loss-balance-sheet" in file.file_name.casefold()
-            or "p&l and balance sheet" in file.file_name.casefold()
-            for file in matches
-        )
-        coverage.update(
-            {
-                "classifications": sorted(value for value in classifications if value),
-                "profit_and_loss": has_profit_and_loss or combined_template,
-                "balance_sheet": has_balance_sheet or combined_template,
-            }
-        )
-        complete = (has_profit_and_loss and has_balance_sheet) or combined_template
-    return matches[0], complete, coverage
+        complete, coverage = _coverage_for_files(requirement, [], analyses)
+        return [], complete, coverage
+    complete, coverage = _coverage_for_files(requirement, matches, analyses)
+    return matches, complete, coverage
+
+
+def _matching_evidence(
+    requirement: AICollectionRequirement,
+    requested: BucketRequestedDocument | None,
+    files: list[BucketFile],
+    analyses: dict[uuid.UUID, BucketFileAnalysis],
+    *,
+    preferred_file_id: uuid.UUID | None = None,
+    trust_preferred: bool = False,
+) -> tuple[BucketFile | None, bool, dict[str, Any]]:
+    """Compatibility wrapper for callers that only need the primary match."""
+
+    matches, complete, coverage = _matching_evidence_files(
+        requirement,
+        requested,
+        files,
+        analyses,
+        preferred_file_ids={preferred_file_id} if preferred_file_id else set(),
+        trust_preferred=trust_preferred,
+    )
+    return (matches[0] if matches else None), complete, coverage
+
+
+def _filename_suggestions(
+    requirement: AICollectionRequirement,
+    files: list[BucketFile],
+    analyses: dict[uuid.UUID, BucketFileAnalysis],
+) -> list[BucketFile]:
+    """Surface high-signal legacy uploads without silently verifying them."""
+
+    expected = _expected_classes(requirement)
+    suggestions: list[BucketFile] = []
+    for file in files:
+        analysis = analyses.get(file.id)
+        if analysis and analysis.status == "completed" and analysis.classification:
+            continue
+        if effective_file_classification(file.file_name) in expected:
+            suggestions.append(file)
+    return suggestions
+
+
+async def _sync_requirement_evidence(
+    db: AsyncSession,
+    state: ApplicationRequirementState,
+    inventory: dict[uuid.UUID, BucketFile],
+    desired_sources: dict[uuid.UUID, str],
+) -> list[ApplicationRequirementEvidence]:
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementEvidence).where(
+                    ApplicationRequirementEvidence.requirement_state_id == state.id
+                )
+            )
+        ).scalars().all()
+    )
+    active = {row.file_id: row for row in rows if row.removed_at is None}
+    excluded = {
+        row.file_id
+        for row in rows
+        if row.removed_at is not None and row.removed_by_user_id is not None
+    }
+    timestamp = now()
+    for file_id, row in list(active.items()):
+        if file_id not in inventory or (
+            row.source != "operator" and file_id not in desired_sources
+        ):
+            row.removed_at = timestamp
+            row.reason = "Evidence no longer matches this requirement"
+            active.pop(file_id)
+    for file_id, source in desired_sources.items():
+        if file_id in excluded and file_id not in active:
+            continue
+        row = active.get(file_id)
+        if row is None:
+            row = ApplicationRequirementEvidence(
+                requirement_state_id=state.id,
+                file_id=file_id,
+                source=source,
+                linked_at=timestamp,
+                provenance={"source": source},
+            )
+            db.add(row)
+            active[file_id] = row
+        elif row.source == "filename_suggestion" and source == "automatic":
+            row.source = "automatic"
+            row.provenance = {"source": source}
+    await db.flush()
+    return sorted(
+        active.values(),
+        key=lambda row: inventory[row.file_id].created_at,
+        reverse=True,
+    )
 
 
 async def _materialize_requirements(
@@ -648,6 +793,7 @@ async def _materialize_requirements(
     grouped: dict[uuid.UUID, list[AICollectionRequirement]],
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     files, analyses, _classifications = await _evidence_inventory(db, profile)
+    inventory = {file.id: file for file in files}
     existing = {
         item.requirement_key: item
         for item in (
@@ -662,7 +808,13 @@ async def _materialize_requirements(
         for requirement in grouped.get(selection.playbook_id, []):
             per_selection[selection.id].append(requirement.requirement_key)
             current = merged.get(requirement.requirement_key)
-            if current is None or LEVEL_RANK.get(requirement.required_level, 0) > LEVEL_RANK.get(current[0].required_level, 0):
+            if current is None or (
+                LEVEL_RANK.get(requirement.required_level, 0),
+                bool(requirement.verification_required),
+            ) > (
+                LEVEL_RANK.get(current[0].required_level, 0),
+                bool(current[0].verification_required),
+            ):
                 prior_sources = current[1] if current else set()
                 merged[requirement.requirement_key] = (
                     requirement,
@@ -712,54 +864,113 @@ async def _materialize_requirements(
         state.source_program_keys = sorted(source_programs)
         if requested:
             state.requested_document_id = requested.id
-        prior_provenance = dict(state.provenance or {}) if state else {}
-        preserve_operator_choice = prior_provenance.get("source") == "operator_link"
-        file, coverage_complete, provenance = _matching_evidence(
+
+        prior_links = list(
+            (
+                await db.execute(
+                    select(ApplicationRequirementEvidence).where(
+                        ApplicationRequirementEvidence.requirement_state_id == state.id,
+                        ApplicationRequirementEvidence.removed_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        prior_link_ids = {row.file_id for row in prior_links}
+        manual_ids = {row.file_id for row in prior_links if row.source == "operator"}
+        matched_files, _matched_complete, matched_provenance = _matching_evidence_files(
             requirement,
             requested,
             files,
             analyses,
-            preferred_file_id=state.evidence_file_id if state else None,
-            trust_preferred=preserve_operator_choice or bool(state and state.status == "verified"),
+            preferred_file_ids=manual_ids,
+            trust_preferred=True,
         )
+        desired_sources = {file.id: "automatic" for file in matched_files}
+        for file in _filename_suggestions(requirement, files, analyses):
+            desired_sources.setdefault(file.id, "filename_suggestion")
+        links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
+        linked_files = [inventory[row.file_id] for row in links]
+        coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
+        if requested and not requested.requires_signature:
+            requested.status = "uploaded" if coverage_complete else "requested"
+
+        automatic_files = [
+            inventory[row.file_id]
+            for row in links
+            if row.source == "automatic"
+        ]
+        automatic_complete, _automatic_coverage = _coverage_for_files(
+            requirement, automatic_files, analyses
+        )
+        if automatic_complete and not requirement.verification_required:
+            for row in links:
+                if row.source == "automatic" and row.verified_at is None:
+                    row.verified_at = now()
+                    row.verified_by_user_id = None
+                    row.reason = "Verified automatically by published criteria"
+
+        verified_files = [inventory[row.file_id] for row in links if row.verified_at]
+        verified_complete, verified_coverage = _coverage_for_files(
+            requirement, verified_files, analyses
+        )
+        state.evidence_file_id = linked_files[0].id if linked_files else None
+        state.provenance = {
+            **matched_provenance,
+            "source": "multi_evidence",
+            "linked_file_ids": [str(file.id) for file in linked_files],
+            "automatic_file_ids": [
+                str(row.file_id) for row in links if row.source == "automatic"
+            ],
+            "suggested_file_ids": [
+                str(row.file_id) for row in links if row.source == "filename_suggestion"
+            ],
+            "coverage": coverage,
+            "verified_coverage": verified_coverage,
+        }
         if state.status not in {"waived", "not_applicable"}:
-            if file:
-                prior_file_id = state.evidence_file_id
-                was_verified = state.status == "verified" and prior_file_id == file.id
-                state.evidence_file_id = file.id
-                state.received_at = state.received_at or file.created_at
-                source = (
-                    prior_provenance.get("source")
-                    if prior_file_id == file.id and prior_provenance.get("source")
-                    else "explicit_request_or_content_classification"
+            if linked_files:
+                state.received_at = state.received_at or min(
+                    file.created_at for file in linked_files
                 )
-                state.provenance = {
-                    **provenance,
-                    "source": source,
-                    "analysis_id": str(analyses[file.id].id) if file.id in analyses else None,
-                }
-                if requirement.expiration_days and file.created_at < now() - timedelta(days=requirement.expiration_days):
+                if requirement.expiration_days and all(
+                    file.created_at < now() - timedelta(days=requirement.expiration_days)
+                    for file in linked_files
+                ):
                     state.status = "stale"
                     state.state_reason = "Evidence is older than the published program allows"
-                elif state.status == "failed" and prior_file_id == file.id:
+                elif state.status == "failed" and prior_link_ids == {row.file_id for row in links}:
                     pass
-                elif coverage_complete and not requirement.verification_required:
+                elif verified_complete:
                     state.status = "verified"
-                    state.verified_at = state.verified_at or now()
-                    state.verified_by_user_id = None
-                    state.state_reason = "Verified automatically by published criteria"
-                elif not was_verified:
+                    newest_verification = max(
+                        (row for row in links if row.verified_at),
+                        key=lambda row: row.verified_at or datetime.min.replace(tzinfo=UTC),
+                    )
+                    state.verified_at = newest_verification.verified_at
+                    state.verified_by_user_id = newest_verification.verified_by_user_id
+                    state.state_reason = (
+                        "Verified automatically by published criteria"
+                        if all(row.source == "automatic" for row in links if row.verified_at)
+                        else "Required evidence set verified by underwriting staff"
+                    )
+                else:
                     state.status = "received_unverified"
+                    state.verified_at = None
+                    state.verified_by_user_id = None
+                    current = int(coverage.get("current") or 0)
+                    required = int(coverage.get("required") or 1)
+                    unit = str(coverage.get("unit") or "documents")
                     state.state_reason = (
                         "Evidence received; staff verification required"
                         if coverage_complete
-                        else "Evidence received but required period coverage is incomplete"
+                        else f"Evidence received; {current} of {required} required {unit} linked"
                     )
             else:
                 state.evidence_file_id = None
-                state.provenance = provenance
                 if state.status != "failed":
                     state.status = "requested" if requested else "missing"
+                    state.verified_at = None
+                    state.verified_by_user_id = None
                     state.state_reason = "Awaiting client evidence"
         result.append(state)
     await db.flush()
@@ -951,15 +1162,25 @@ async def get_program_readiness(
         visibility,
         effectively_satisfied,
     )
-    file_names = {}
-    evidence_ids = [item.evidence_file_id for item in states if item.evidence_file_id]
-    if evidence_ids:
-        file_names = {
-            file_id: file_name
-            for file_id, file_name in (
-                await db.execute(select(BucketFile.id, BucketFile.file_name).where(BucketFile.id.in_(evidence_ids)))
-            ).all()
-        }
+    links_by_state: dict[uuid.UUID, list[tuple[ApplicationRequirementEvidence, BucketFile]]] = defaultdict(list)
+    state_ids = [item.id for item in states]
+    if state_ids:
+        evidence_rows = (
+            await db.execute(
+                select(ApplicationRequirementEvidence, BucketFile)
+                .join(BucketFile, BucketFile.id == ApplicationRequirementEvidence.file_id)
+                .where(
+                    ApplicationRequirementEvidence.requirement_state_id.in_(state_ids),
+                    ApplicationRequirementEvidence.removed_at.is_(None),
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.status == "uploaded",
+                )
+                .order_by(BucketFile.created_at.desc())
+            )
+        ).all()
+        for link, file in evidence_rows:
+            links_by_state[link.requirement_state_id].append((link, file))
+    available_files, _available_analyses, _available_classes = await _evidence_inventory(db, profile)
     return ApplicationProgramReadiness(
         profile_id=profile.id,
         lending_applicable=lending_applicable,
@@ -990,7 +1211,39 @@ async def get_program_readiness(
                 status=item.status,
                 requested_document_id=item.requested_document_id,
                 evidence_file_id=item.evidence_file_id,
-                evidence_file_name=file_names.get(item.evidence_file_id),
+                evidence_file_name=(
+                    links_by_state[item.id][0][1].file_name
+                    if links_by_state.get(item.id)
+                    else None
+                ),
+                evidence_files=[
+                    ApplicationRequirementEvidenceRead(
+                        file_id=file.id,
+                        file_name=file.file_name,
+                        bucket_id=file.bucket_id,
+                        created_at=file.created_at,
+                        source=link.source,
+                        verified=link.verified_at is not None,
+                        verified_at=link.verified_at,
+                    )
+                    for link, file in links_by_state.get(item.id, [])
+                ],
+                evidence_count=len(links_by_state.get(item.id, [])),
+                verified_evidence_count=sum(
+                    link.verified_at is not None
+                    for link, _file in links_by_state.get(item.id, [])
+                ),
+                coverage=dict((item.provenance or {}).get("coverage") or {}),
+                verified_coverage=dict(
+                    (item.provenance or {}).get("verified_coverage") or {}
+                ),
+                coverage_complete=bool(
+                    ((item.provenance or {}).get("coverage") or {}).get("complete")
+                ),
+                verified_coverage_complete=bool(
+                    ((item.provenance or {}).get("verified_coverage") or {}).get("complete")
+                ),
+                allow_multiple_files=True,
                 verification_required=item.verification_required,
                 source_program_keys=list(item.source_program_keys or []),
                 program_overrides={
@@ -1007,6 +1260,15 @@ async def get_program_readiness(
                 provenance=dict(item.provenance or {}),
             )
             for item in states
+        ],
+        available_evidence_files=[
+            ApplicationEvidenceOptionRead(
+                file_id=file.id,
+                file_name=file.file_name,
+                bucket_id=file.bucket_id,
+                created_at=file.created_at,
+            )
+            for file in sorted(available_files, key=lambda row: row.created_at, reverse=True)
         ],
         can_advance=lending_applicable and any(item.complete for item in programs),
         automation=automation,
@@ -1038,24 +1300,87 @@ async def patch_requirement(
     )
     if requirement_read is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Requirement not found")
+    selected_file_ids = set(payload.evidence_file_ids)
+    if payload.evidence_file_id is not None:
+        selected_file_ids.add(payload.evidence_file_id)
+    link_rows = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementEvidence).where(
+                    ApplicationRequirementEvidence.requirement_state_id == state.id,
+                    ApplicationRequirementEvidence.removed_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    )
+    active_links = {row.file_id: row for row in link_rows}
     if payload.action == "link_evidence":
         evidence = await profiles.evidence_state(db, profile)
-        if payload.evidence_file_id not in {item.id for item in evidence.files}:
+        allowed_ids = {item.id for item in evidence.files}
+        if selected_file_ids.difference(allowed_ids):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
-        state.evidence_file_id = payload.evidence_file_id
+        for file_id in selected_file_ids:
+            row = active_links.get(file_id)
+            if row is None:
+                row = ApplicationRequirementEvidence(
+                    requirement_state_id=state.id,
+                    file_id=file_id,
+                    source="operator",
+                    linked_at=timestamp,
+                    linked_by_user_id=user.id,
+                    reason=payload.reason or "Linked by underwriting staff",
+                    provenance={"source": "operator", "actor_id": str(user.id)},
+                )
+                db.add(row)
+                active_links[file_id] = row
+            else:
+                row.source = "operator"
+                row.linked_by_user_id = user.id
+                row.reason = payload.reason or "Confirmed by underwriting staff"
+                row.provenance = {"source": "operator", "actor_id": str(user.id)}
+        state.evidence_file_id = next(iter(selected_file_ids), state.evidence_file_id)
         state.received_at = timestamp
         state.status = "received_unverified"
         state.state_reason = payload.reason or "Evidence linked by underwriting staff"
-        state.provenance = {"source": "operator_link", "actor_id": str(user.id)}
+    elif payload.action == "unlink_evidence":
+        if selected_file_ids.difference(active_links):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked evidence file not found")
+        for file_id in selected_file_ids:
+            row = active_links[file_id]
+            row.removed_at = timestamp
+            row.removed_by_user_id = user.id
+            row.reason = payload.reason or "Unlinked by underwriting staff"
+            active_links.pop(file_id)
+        state.evidence_file_id = next(iter(active_links), None)
+        state.status = "received_unverified" if active_links else "requested"
+        state.verified_at = None
+        state.verified_by_user_id = None
+        state.state_reason = payload.reason or "Evidence link removed by underwriting staff"
     elif payload.action == "verify":
-        if state.evidence_file_id is None:
+        target_ids = selected_file_ids or set(active_links)
+        if not target_ids:
             raise HTTPException(status.HTTP_409_CONFLICT, "Link evidence before verifying this requirement")
-        state.status = "verified"
-        state.verified_at = timestamp
-        state.verified_by_user_id = user.id
+        if target_ids.difference(active_links):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked evidence file not found")
+        for file_id in target_ids:
+            row = active_links[file_id]
+            row.verified_at = timestamp
+            row.verified_by_user_id = user.id
+            row.reason = payload.reason or "Verified by underwriting staff"
+        # The subsequent deterministic materialization decides whether the
+        # verified set meets periods, years, or document-type coverage.
+        state.status = "received_unverified"
         state.state_reason = payload.reason or "Verified by underwriting staff"
     elif payload.action == "unverify":
-        state.status = "received_unverified" if state.evidence_file_id else "requested"
+        target_ids = selected_file_ids or set(active_links)
+        if target_ids.difference(active_links):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked evidence file not found")
+        for file_id in target_ids:
+            row = active_links[file_id]
+            row.verified_at = None
+            row.verified_by_user_id = None
+            row.reason = payload.reason or "Verification removed by underwriting staff"
+        state.status = "received_unverified" if active_links else "requested"
         state.verified_at = None
         state.verified_by_user_id = None
         state.state_reason = payload.reason or "Verification removed by underwriting staff"
@@ -1132,7 +1457,7 @@ async def patch_requirement(
         for override in overrides:
             override.restored_at = timestamp
             override.restored_by_user_id = user.id
-        state.status = "received_unverified" if state.evidence_file_id else "requested"
+        state.status = "received_unverified" if active_links else "requested"
         state.state_reason = payload.reason or "Requirement restored"
     await db.flush()
 
