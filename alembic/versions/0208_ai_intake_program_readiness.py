@@ -354,12 +354,13 @@ def _seed_baseline_playbooks() -> None:
                 INSERT INTO ai_playbook_templates
                     (id, owner_type, owner_id, playbook_type, product_key, name, description,
                      rules, version, status, published_at, is_active, created_at, updated_at)
-                SELECT :id, 'platform', NULL, 'loan_product', :key, :name,
+                SELECT :id, 'platform', NULL, 'loan_product', CAST(:key AS VARCHAR(64)), :name,
                        'System baseline seeded by migration 0182', CAST(:rules AS jsonb),
                        1, 'published', now(), true, now(), now()
                 WHERE NOT EXISTS (
                     SELECT 1 FROM ai_playbook_templates
-                     WHERE playbook_type = 'loan_product' AND product_key = :key
+                     WHERE playbook_type = 'loan_product'
+                       AND product_key = CAST(:key AS VARCHAR(64))
                        AND status = 'published' AND is_active = true
                 )
                 """
@@ -370,7 +371,8 @@ def _seed_baseline_playbooks() -> None:
             sa.text(
                 """
                 SELECT id FROM ai_playbook_templates
-                 WHERE playbook_type = 'loan_product' AND product_key = :key
+                 WHERE playbook_type = 'loan_product'
+                   AND product_key = CAST(:key AS VARCHAR(64))
                    AND status = 'published' AND is_active = true
                  ORDER BY version DESC LIMIT 1
                 """
@@ -394,16 +396,19 @@ def _seed_baseline_playbooks() -> None:
                          default_channels, default_cadence_hours, objective_text,
                          completion_criteria, completion_mode, depends_on,
                          inferred_depends_on, deps_confirmed, created_at, updated_at)
-                    SELECT :id, :playbook_id, :req_key, :label, 'financials', :level,
+                    SELECT :id, :playbook_id, CAST(:req_key AS TEXT),
+                           CAST(:label AS VARCHAR(200)), 'financials', :level,
                            NULL, 'underwriting', '["borrower","underwriter"]'::jsonb,
                            false, true, true, NULL,
                            'Please provide {label}.', :display_order, 'human',
                            '["portal","email"]'::jsonb, 24,
-                           'Collect ' || :label, 'A readable ' || :classification || ' document is linked and verified.',
+                           'Collect ' || CAST(:label AS VARCHAR(200)),
+                           'A readable ' || :classification || ' document is linked and verified.',
                            'requires_human_verify', '[]'::jsonb, '[]'::jsonb, true, now(), now()
                     WHERE NOT EXISTS (
                         SELECT 1 FROM ai_collection_requirements
-                         WHERE playbook_id = :playbook_id AND requirement_key = :req_key
+                         WHERE playbook_id = :playbook_id
+                           AND requirement_key = CAST(:req_key AS TEXT)
                     )
                     """
                 ),

@@ -16,6 +16,15 @@ from app.models.inline_image import InlineImage
 from app.services import inline_images
 
 
+@pytest.fixture(autouse=True)
+def _stub_s3_signing(monkeypatch):
+    class _Client:
+        def generate_presigned_url(self, *_args, **_kwargs):
+            return "https://uploads.example.test/signed"
+
+    monkeypatch.setattr(inline_images, "_s3_client", lambda: _Client())
+
+
 class _FakeResult:
     def __init__(self, rows):
         self._rows = rows
