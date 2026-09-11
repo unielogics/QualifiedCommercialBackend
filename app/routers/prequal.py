@@ -184,9 +184,9 @@ async def _spawn_loan_from_approved_request(
         property_type=PropertyType.SFR,
         type=loan_type_enum,
         purpose=loan_purpose,
-        # Stage starts at PREQUALIFIED — this IS the prequalified loan
-        # entering the pipeline. Operator moves it forward from there.
-        stage=LoanStage.PREQUALIFIED,
+        # Every new funding file begins in document collection. The profile
+        # readiness engine advances it when the required evidence is loaded.
+        stage=LoanStage.COLLECTING_DOCS,
         amount=loan_amount,
         # Best-effort fill from scenario; numeric columns are decimals,
         # so leave them None when scenario doesn't have the field.

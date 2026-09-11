@@ -1,11 +1,10 @@
 """Who is on a file.
 
-One agent seat, any number of underwriter seats, one company. The agent seat
-is derived from the ownership pointers the system already keeps and moves
-with the reassign actions that already exist; there is deliberately no
-hand-picker for it, because a second source of truth would let the roster
-and the old fan-outs disagree about who the agent is. Underwriters and the
-company are set by the desk.
+Any number of agent and underwriter seats, plus one company. The first agent
+is still derived from the ownership pointers the system already keeps and
+moves with the existing reassign actions. The desk can add collaborators
+without replacing that primary ownership source. Underwriters and the
+company are also set by the desk.
 
 Seats decide who is told about the file's timeline and who may read it
 (`seat_or_visible`). They never widen what a person may open.
@@ -63,13 +62,20 @@ class CompanyRef:
 @dataclass
 class Team:
     agent: Member | None = None
+    agents: list[Member] = field(default_factory=list)
     underwriters: list[Member] = field(default_factory=list)
     company: CompanyRef | None = None
 
+    def agent_members(self) -> list[Member]:
+        agents = list(self.agents)
+        if self.agent and all(member.user_id != self.agent.user_id for member in agents):
+            agents.insert(0, self.agent)
+        return agents
+
     def user_ids(self, *, agent: bool = True, underwriters: bool = True) -> set[UUID]:
         ids: set[UUID] = set()
-        if agent and self.agent:
-            ids.add(self.agent.user_id)
+        if agent:
+            ids.update(member.user_id for member in self.agent_members())
         if underwriters:
             ids.update(m.user_id for m in self.underwriters)
         return ids
@@ -155,28 +161,53 @@ async def _seat_rows(db: AsyncSession, profile_id: UUID) -> list[FileTeamMember]
 
 
 async def team_for(db: AsyncSession, profile: ApplicationProfile, *, persist: bool = False) -> Team:
-    """The team on a file. With `persist`, a derived agent seat and a derived
-    company are written so the next read is a plain lookup; without it they
-    are derived in memory (the notification path never writes rows)."""
+    """Read a file team and keep its ownership-derived primary agent current."""
     team = Team()
     rows = await _seat_rows(db, profile.id)
-    agent_row = next((r for r in rows if r.seat == SEAT_AGENT), None)
-    if agent_row is not None:
-        user = await _live_user(db, agent_row.user_id)
+    agent_rows = [row for row in rows if row.seat == SEAT_AGENT]
+    derived_rows = [row for row in agent_rows if row.derived_from is not None]
+    if derived_rows and not persist:
+        derived_user_id = derived_rows[0].user_id
+        derived_source = derived_rows[0].derived_from
+    else:
+        derived_user_id, derived_source = await derive_agent(db, profile)
+
+    if persist:
+        target = next((row for row in agent_rows if row.user_id == derived_user_id), None)
+        stale = [row for row in derived_rows if row is not target]
+        for row in stale:
+            await db.delete(row)
+        if stale:
+            await db.flush()
+        if derived_user_id is not None:
+            if target is None:
+                target = FileTeamMember(
+                    profile_id=profile.id,
+                    user_id=derived_user_id,
+                    seat=SEAT_AGENT,
+                    derived_from=derived_source,
+                )
+                db.add(target)
+                agent_rows.append(target)
+            else:
+                target.derived_from = derived_source
+            await db.flush()
+
+    primary: Member | None = None
+    if derived_user_id is not None:
+        user = await _live_user(db, derived_user_id)
         if user is not None:
-            team.agent = _member(user, SEAT_AGENT, agent_row.derived_from)
-    if team.agent is None:
-        user_id, source = await derive_agent(db, profile)
-        if user_id is not None:
-            user = await _live_user(db, user_id)
-            if user is not None:
-                team.agent = _member(user, SEAT_AGENT, source)
-                if persist:
-                    if agent_row is not None:
-                        await db.delete(agent_row)
-                        await db.flush()
-                    db.add(FileTeamMember(profile_id=profile.id, user_id=user_id, seat=SEAT_AGENT, derived_from=source))
-                    await db.flush()
+            primary = _member(user, SEAT_AGENT, derived_source)
+            team.agents.append(primary)
+
+    for row in agent_rows:
+        if row.user_id == derived_user_id or row in derived_rows:
+            continue
+        user = await _live_user(db, row.user_id)
+        if user is not None:
+            team.agents.append(_member(user, SEAT_AGENT, row.derived_from))
+    team.agent = primary or (team.agents[0] if team.agents else None)
+
     for row in rows:
         if row.seat != SEAT_UNDERWRITER:
             continue
@@ -220,22 +251,37 @@ async def seat_or_visible(db: AsyncSession, profile: ApplicationProfile, user: U
 
 
 def team_read(team: Team, *, for_client: bool) -> dict[str, Any]:
-    """The roster as an API shape. A client sees the agent's name and nothing
-    else — no emails, no underwriters, no company."""
+    """The roster as an API shape. Clients receive agent names only."""
+    agents = team.agent_members()
     if for_client:
-        return {"agent": {"name": team.agent.name} if team.agent else None, "underwriters": [], "company": None}
+        return {
+            "agent": {"name": agents[0].name} if agents else None,
+            "agents": [{"name": member.name} for member in agents],
+            "underwriters": [],
+            "company": None,
+        }
     return {
         "agent": (
             {
-                "user_id": str(team.agent.user_id),
-                "name": team.agent.name,
-                "email": team.agent.email,
-                "role": team.agent.role,
-                "derived_from": team.agent.derived_from,
+                "user_id": str(agents[0].user_id),
+                "name": agents[0].name,
+                "email": agents[0].email,
+                "role": agents[0].role,
+                "derived_from": agents[0].derived_from,
             }
-            if team.agent
+            if agents
             else None
         ),
+        "agents": [
+            {
+                "user_id": str(member.user_id),
+                "name": member.name,
+                "email": member.email,
+                "role": member.role,
+                "derived_from": member.derived_from,
+            }
+            for member in agents
+        ],
         "underwriters": [
             {"user_id": str(m.user_id), "name": m.name, "email": m.email, "role": m.role} for m in team.underwriters
         ],
@@ -267,23 +313,30 @@ async def _emit_team_changed(db: AsyncSession, profile: ApplicationProfile, *, t
 
 
 async def refresh_agent_seat(db: AsyncSession, profile: ApplicationProfile, *, actor: User | None = None) -> tuple[UUID | None, UUID | None]:
-    """Re-derive the agent seat after one of the existing reassign actions.
-    Returns (previous, current). Idempotent when nothing moved."""
+    """Refresh only the ownership-derived primary; manual agents remain."""
     rows = await _seat_rows(db, profile.id)
-    previous = next((r for r in rows if r.seat == SEAT_AGENT), None)
+    agent_rows = [row for row in rows if row.seat == SEAT_AGENT]
+    derived_rows = [row for row in agent_rows if row.derived_from is not None]
+    previous = derived_rows[0] if derived_rows else None
     previous_id = previous.user_id if previous is not None else None
     user_id, source = await derive_agent(db, profile)
-    if previous_id == user_id:
-        return previous_id, user_id
-    if previous is not None:
-        await db.delete(previous)
+    target = next((row for row in agent_rows if row.user_id == user_id), None)
+    stale = [row for row in derived_rows if row is not target]
+    for row in stale:
+        await db.delete(row)
+    if stale:
         await db.flush()
     if user_id is not None:
-        db.add(FileTeamMember(profile_id=profile.id, user_id=user_id, seat=SEAT_AGENT, derived_from=source, assigned_by_user_id=actor.id if actor else None))
+        if target is None:
+            db.add(FileTeamMember(profile_id=profile.id, user_id=user_id, seat=SEAT_AGENT, derived_from=source, assigned_by_user_id=actor.id if actor else None))
+        else:
+            target.derived_from = source
         await db.flush()
     if profile.company_set_by_user_id is None:
         company = await derive_company(db, user_id)
         profile.company_id = company.id if company is not None else None
+    if previous_id == user_id:
+        return previous_id, user_id
     user = await _live_user(db, user_id)
     await _emit_team_changed(
         db,
@@ -293,6 +346,80 @@ async def refresh_agent_seat(db: AsyncSession, profile: ApplicationProfile, *, a
         meta={"seat": SEAT_AGENT, "previous_user_id": str(previous_id) if previous_id else None, "user_id": str(user_id) if user_id else None, "derived_from": source},
     )
     return previous_id, user_id
+
+
+async def add_agent(db: AsyncSession, profile: ApplicationProfile, user_id: UUID, actor: User) -> Team:
+    user = await _live_user(db, user_id)
+    if user is None or user.role not in AGENT_ROLES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick an active broker, field rep, or dealer partner")
+    existing = (
+        await db.execute(
+            select(FileTeamMember).where(
+                FileTeamMember.profile_id == profile.id,
+                FileTeamMember.user_id == user_id,
+                FileTeamMember.seat == SEAT_AGENT,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        db.add(FileTeamMember(profile_id=profile.id, user_id=user_id, seat=SEAT_AGENT, assigned_by_user_id=actor.id))
+        await db.flush()
+        await profiles.log_profile_action(
+            db,
+            profile,
+            actor,
+            "file_team.agent_added",
+            f"Added {user.name or user.email} as an agent",
+            target_type="file_team",
+            target_id=user_id,
+        )
+        await _emit_team_changed(
+            db,
+            profile,
+            title=f"{user.name or user.email} was added as an agent",
+            actor=actor,
+            meta={"seat": SEAT_AGENT, "user_id": str(user_id)},
+        )
+    return await team_for(db, profile, persist=True)
+
+
+async def remove_agent(db: AsyncSession, profile: ApplicationProfile, user_id: UUID, actor: User) -> Team:
+    row = (
+        await db.execute(
+            select(FileTeamMember).where(
+                FileTeamMember.profile_id == profile.id,
+                FileTeamMember.user_id == user_id,
+                FileTeamMember.seat == SEAT_AGENT,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is not None and row.derived_from is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This is the ownership-derived primary agent. Change the file's ownership assignment instead.",
+        )
+    if row is not None:
+        user = await db.get(User, user_id)
+        label = (user.name or user.email) if user else "An agent"
+        await db.delete(row)
+        await db.flush()
+        await profiles.log_profile_action(
+            db,
+            profile,
+            actor,
+            "file_team.agent_removed",
+            f"Removed {label} as an agent",
+            target_type="file_team",
+            target_id=user_id,
+        )
+        await _emit_team_changed(
+            db,
+            profile,
+            title=f"{label} was removed as an agent",
+            actor=actor,
+            meta={"seat": SEAT_AGENT, "user_id": str(user_id), "removed": True},
+        )
+    return await team_for(db, profile, persist=True)
 
 
 async def add_underwriter(db: AsyncSession, profile: ApplicationProfile, user_id: UUID, actor: User) -> Team:

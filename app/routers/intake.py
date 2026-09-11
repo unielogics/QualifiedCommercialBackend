@@ -89,7 +89,7 @@ async def submit_intake(
         invite_behavior=payload.invite_behavior,
         # Buyer / seller (alembic 0023). Drives checklist filtering.
         side=payload.side,
-        stage=LoanStage.PREQUALIFIED,
+        stage=LoanStage.COLLECTING_DOCS,
         amount=payload.numbers.amount,
         ltv=payload.numbers.ltv,
         ltc=payload.numbers.ltc,

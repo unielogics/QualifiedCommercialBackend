@@ -12,6 +12,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.enums import LoanStage
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
 from app.models.application_profile import (
     ApplicationProfile,
@@ -28,6 +29,7 @@ from app.models.bucket import (
 )
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
+from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
@@ -43,6 +45,8 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
+from app.services import file_events
+from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
@@ -1073,6 +1077,98 @@ async def email_is_suppressed(db: AsyncSession, client_id: uuid.UUID) -> bool:
     return False
 
 
+def _requirement_is_fully_loaded(
+    state: ApplicationRequirementState,
+    override: ApplicationProgramRequirementOverride | None,
+) -> bool:
+    if state.status in SATISFIED_STATES:
+        return True
+    if override and override.disposition in {"waived", "not_applicable"}:
+        return True
+    if state.status != "received_unverified":
+        return False
+    coverage = dict((state.provenance or {}).get("coverage") or {})
+    if coverage:
+        return bool(coverage.get("complete"))
+    return state.evidence_file_id is not None
+
+
+async def _auto_start_underwriting_if_loaded(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    loaded_program_keys: list[str],
+) -> bool:
+    """Advance document-complete files once, without moving later stages back."""
+    if not loaded_program_keys or profile.underwriting_status not in {"submitted", "collecting_docs"}:
+        return False
+
+    previous_status = profile.underwriting_status
+    profile.underwriting_status = "in_underwriting"
+    profile.underwriting_updated_at = now()
+    profile.underwriting_updated_by_user_id = None
+
+    loan: Loan | None = await db.get(Loan, profile.loan_id) if profile.loan_id else None
+    previous_loan_stage: str | None = None
+    if loan is not None:
+        previous_loan_stage = getattr(loan.stage, "value", str(loan.stage))
+        if previous_loan_stage in {LoanStage.PREQUALIFIED.value, LoanStage.COLLECTING_DOCS.value}:
+            loan.stage = LoanStage.PROCESSING
+            await log_activity(
+                db,
+                loan_id=loan.id,
+                actor_label="system",
+                kind="loan.stage_changed",
+                summary="Required evidence is complete; the file moved to underwriting",
+                payload={
+                    "from": previous_loan_stage,
+                    "to": LoanStage.PROCESSING.value,
+                    "source": "program_readiness",
+                    "program_keys": loaded_program_keys,
+                },
+            )
+
+    await profiles.log_profile_action(
+        db,
+        profile,
+        None,
+        "underwriting.auto_started",
+        "Required evidence is complete; the file moved to underwriting",
+        target_type="loan" if loan else "application_profile",
+        target_id=loan.id if loan else profile.id,
+        metadata={
+            "from": previous_status,
+            "to": "in_underwriting",
+            "loan_stage_from": previous_loan_stage,
+            "loan_stage_to": (
+                LoanStage.PROCESSING.value
+                if loan is not None and previous_loan_stage in {LoanStage.PREQUALIFIED.value, LoanStage.COLLECTING_DOCS.value}
+                else previous_loan_stage
+            ),
+            "source": "program_readiness",
+            "program_keys": loaded_program_keys,
+        },
+    )
+    await file_events.emit(
+        db,
+        profile=profile,
+        kind="status.changed",
+        visibility=file_events.VISIBILITY_CLIENT,
+        title="Your file moved to underwriting",
+        actor_label="Qualified Commercial",
+        target_type="application_profile",
+        target_id=profile.id,
+        meta={
+            "from": previous_status,
+            "to": "in_underwriting",
+            "source": "program_readiness",
+            "automatic": True,
+            "program_keys": loaded_program_keys,
+        },
+    )
+    await db.flush()
+    return True
+
+
 async def get_program_readiness(
     db: AsyncSession, profile: ApplicationProfile
 ) -> ApplicationProgramReadiness:
@@ -1107,12 +1203,14 @@ async def get_program_readiness(
             can_waive[row.requirement_key] = can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
 
     programs: list[ProgramReadinessItem] = []
+    fully_loaded_program_keys: list[str] = []
     for selection in selections:
         keys = list(dict.fromkeys(per_selection.get(selection.id, [])))
         required_keys = [
             key for key in keys if requirement_map.get(key) and requirement_map[key].required_level == "required"
         ]
         blocking = []
+        loading_blockers = []
         satisfied = 0
         for key in required_keys:
             state = requirement_map[key]
@@ -1124,6 +1222,10 @@ async def get_program_readiness(
                 satisfied += 1
             else:
                 blocking.append(key)
+            if not _requirement_is_fully_loaded(state, override):
+                loading_blockers.append(key)
+        if required_keys and not loading_blockers:
+            fully_loaded_program_keys.append(selection.program_key)
         percent = 100 if not required_keys else round((satisfied / len(required_keys)) * 100)
         programs.append(
             ProgramReadinessItem(
@@ -1138,6 +1240,8 @@ async def get_program_readiness(
                 requirement_keys=keys,
             )
         )
+    if lending_applicable:
+        await _auto_start_underwriting_if_loaded(db, profile, fully_loaded_program_keys)
     effectively_satisfied: set[str] = set()
     for item in states:
         if item.status in SATISFIED_STATES:

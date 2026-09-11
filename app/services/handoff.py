@@ -348,7 +348,7 @@ async def promote_deal_to_loan(
         type=loan_type,
         purpose=loan_purpose,
         side=side,
-        stage=LoanStage.PREQUALIFIED.value,
+        stage=LoanStage.COLLECTING_DOCS.value,
         amount=loan_amount,
         source_deal_id=deal.id,
         baseline_profile_snapshot=snapshot,

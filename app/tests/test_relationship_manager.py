@@ -294,4 +294,4 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0209_requirement_multi_evidence"]
+    assert heads == ["0210_multi_agent_collecting_docs"]

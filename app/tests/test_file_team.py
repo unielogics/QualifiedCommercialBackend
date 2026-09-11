@@ -187,6 +187,64 @@ def test_adding_an_underwriter_writes_the_seat_logs_and_emits_once():
     assert emit.await_args.kwargs["kind"] == "team.changed" and emit.await_args.kwargs["visibility"] == "team"
 
 
+def test_adding_an_agent_keeps_a_separate_collaborator_seat():
+    agent = _user(Role.FIELD_REP, name="Second Agent")
+    actor = _user(Role.SUPER_ADMIN, name="Desk")
+    db = _db_with(_obj("User", id=agent.id, **{k: v for k, v in vars(agent).items() if k != "id"}))
+    profile = _profile()
+    with patch.object(file_team.profiles, "log_profile_action", AsyncMock()) as audit, patch(
+        "app.services.file_events.emit", AsyncMock()
+    ) as emit, patch.object(file_team, "team_for", AsyncMock(return_value=file_team.Team())):
+        _run(file_team.add_agent(db, profile, agent.id, actor))
+
+    assert len(db.added) == 1
+    assert db.added[0].seat == SEAT_AGENT
+    assert db.added[0].derived_from is None
+    assert db.added[0].assigned_by_user_id == actor.id
+    assert audit.await_args.args[3] == "file_team.agent_added"
+    assert emit.await_args.kwargs["meta"]["seat"] == SEAT_AGENT
+
+
+def test_refreshing_primary_agent_preserves_manually_assigned_agents():
+    manual_id = uuid.uuid4()
+    primary_id = uuid.uuid4()
+    manual = SimpleNamespace(
+        id=uuid.uuid4(),
+        profile_id=uuid.uuid4(),
+        user_id=manual_id,
+        seat=SEAT_AGENT,
+        derived_from=None,
+    )
+    db = _Db(rows=[manual])
+    profile = _profile()
+    with patch.object(file_team, "derive_agent", AsyncMock(return_value=(primary_id, "client.current_agent_id"))), patch.object(
+        file_team, "derive_company", AsyncMock(return_value=None)
+    ), patch.object(file_team, "_live_user", AsyncMock(return_value=None)), patch.object(
+        file_team, "_emit_team_changed", AsyncMock()
+    ):
+        before, after = _run(file_team.refresh_agent_seat(db, profile))
+
+    assert before is None and after == primary_id
+    assert manual not in db.deleted
+    assert len(db.added) == 1 and db.added[0].user_id == primary_id
+
+
+def test_ownership_derived_primary_agent_cannot_be_removed_directly():
+    actor = _user(Role.SUPER_ADMIN, name="Desk")
+    derived = SimpleNamespace(
+        id=uuid.uuid4(),
+        profile_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        seat=SEAT_AGENT,
+        derived_from="intake.broker_id",
+    )
+    db = _Db(rows=[derived])
+    with pytest.raises(HTTPException) as err:
+        _run(file_team.remove_agent(db, _profile(), derived.user_id, actor))
+    assert err.value.status_code == 409
+    assert db.deleted == []
+
+
 def test_seat_or_visible_admits_a_seat_and_never_a_vendor():
     profile = _profile()
     seated = _user(Role.BROKER, name="Seated")
@@ -199,15 +257,25 @@ def test_seat_or_visible_admits_a_seat_and_never_a_vendor():
 
 
 def test_the_client_shape_of_the_roster_carries_no_email_and_no_underwriters():
+    primary = file_team.Member(user_id=uuid.uuid4(), name="Agent", email="a@example.com", role="broker", seat=SEAT_AGENT, derived_from="client.current_agent_id")
+    collaborator = file_team.Member(user_id=uuid.uuid4(), name="Agent Two", email="b@example.com", role="field_rep", seat=SEAT_AGENT)
     team = file_team.Team(
-        agent=file_team.Member(user_id=uuid.uuid4(), name="Agent", email="a@example.com", role="broker", seat=SEAT_AGENT),
+        agent=primary,
+        agents=[primary, collaborator],
         underwriters=[file_team.Member(user_id=uuid.uuid4(), name="Uw", email="u@example.com", role="loan_exec", seat=SEAT_UNDERWRITER)],
         company=file_team.CompanyRef(id=uuid.uuid4(), name="Acme", kind=KIND_REFERRAL_PARTNER, notice_email="x@acme.example", derived=True),
     )
     client_view = file_team.team_read(team, for_client=True)
-    assert client_view == {"agent": {"name": "Agent"}, "underwriters": [], "company": None}
+    assert client_view == {
+        "agent": {"name": "Agent"},
+        "agents": [{"name": "Agent"}, {"name": "Agent Two"}],
+        "underwriters": [],
+        "company": None,
+    }
     desk_view = file_team.team_read(team, for_client=False)
-    assert desk_view["agent"]["email"] == "a@example.com" and len(desk_view["underwriters"]) == 1 and desk_view["company"]["name"] == "Acme"
+    assert desk_view["agent"]["email"] == "a@example.com" and len(desk_view["agents"]) == 2
+    assert len(desk_view["underwriters"]) == 1 and desk_view["company"]["name"] == "Acme"
+    assert team.user_ids() == {primary.user_id, collaborator.user_id, team.underwriters[0].user_id}
     assert "notice_email" not in repr(desk_view)
 
 

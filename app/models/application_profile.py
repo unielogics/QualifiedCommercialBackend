@@ -136,7 +136,7 @@ class ApplicationProfile(TimestampMixin, Base):
     )
     bank_verification_override_reason: Mapped[str | None] = mapped_column(Text)
     underwriting_status: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="submitted", server_default="submitted"
+        String(32), nullable=False, default="collecting_docs", server_default="collecting_docs"
     )
     underwriting_approved_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))
     underwriting_term_sheet_amount: Mapped[float | None] = mapped_column(Numeric(14, 2))

@@ -101,7 +101,9 @@ class Loan(TimestampMixin, Base):
     side: Mapped[LoanSide] = mapped_column(
         String(8), nullable=False, default=LoanSide.BUYER, server_default="buyer"
     )
-    stage: Mapped[LoanStage] = mapped_column(String(32), default=LoanStage.PREQUALIFIED)
+    stage: Mapped[LoanStage] = mapped_column(
+        String(32), default=LoanStage.COLLECTING_DOCS, server_default="collecting_docs"
+    )
     amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     ltv: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
     ltc: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)

@@ -5,7 +5,7 @@ Mounted before the application-profiles router on purpose: `/find` and
 otherwise try to parse as ids.
 
 Reads are gated by `seat_or_visible` — the file's own visibility rules or a
-seat on it. Writes (underwriters, company) are the desk's. The client's view
+seat on it. Writes (agents, underwriters, company) are the desk's. The client's view
 of the timeline comes through the PIN room, never through a login-less id.
 """
 
@@ -106,10 +106,11 @@ async def find_file(
 async def team_candidates(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     if not _is_operator(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
+    candidate_roles = file_team.AGENT_ROLES | file_team.UNDERWRITER_ROLES
     users = (
         await db.execute(
             select(User)
-            .where(User.role.in_([r.value for r in file_team.UNDERWRITER_ROLES]), User.deleted_at.is_(None))
+            .where(User.role.in_([r.value for r in candidate_roles]), User.deleted_at.is_(None))
             .order_by(User.name.asc())
         )
     ).scalars().all()
@@ -119,7 +120,16 @@ async def team_candidates(user: CurrentUser, db: AsyncSession = Depends(get_db))
         )
     ).scalars().all()
     return {
-        "underwriters": [{"user_id": str(u.id), "name": u.name, "email": u.email, "role": file_team._role_value(u.role)} for u in users],
+        "agents": [
+            {"user_id": str(u.id), "name": u.name, "email": u.email, "role": file_team._role_value(u.role)}
+            for u in users
+            if u.role in file_team.AGENT_ROLES
+        ],
+        "underwriters": [
+            {"user_id": str(u.id), "name": u.name, "email": u.email, "role": file_team._role_value(u.role)}
+            for u in users
+            if u.role in file_team.UNDERWRITER_ROLES
+        ],
         "companies": [{"id": str(c.id), "name": c.name, "kind": c.kind} for c in companies],
     }
 
@@ -135,6 +145,22 @@ async def read_team(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depe
     if _is_operator(user):
         await db.commit()
     return {**file_team.team_read(team, for_client=not _is_operator(user) and file_events.tier_for_role(user.role) == file_events.VISIBILITY_CLIENT), "can_edit": _is_operator(user)}
+
+
+@router.post("/{profile_id}/team/agents")
+async def add_agent(profile_id: UUID, payload: UnderwriterAdd, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    profile = await _desk_profile(db, profile_id, user)
+    team = await file_team.add_agent(db, profile, payload.user_id, user)
+    await db.commit()
+    return {**file_team.team_read(team, for_client=False), "can_edit": True}
+
+
+@router.delete("/{profile_id}/team/agents/{user_id}")
+async def remove_agent(profile_id: UUID, user_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    profile = await _desk_profile(db, profile_id, user)
+    team = await file_team.remove_agent(db, profile, user_id, user)
+    await db.commit()
+    return {**file_team.team_read(team, for_client=False), "can_edit": True}
 
 
 @router.post("/{profile_id}/team/underwriters")

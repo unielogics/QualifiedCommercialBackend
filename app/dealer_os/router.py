@@ -7962,7 +7962,7 @@ async def _appointment_application_summary(
             profile_id=None,
             loan_id=None,
             vertical=_intake_vertical(intake.variant),
-            underwriting_status="submitted",
+            underwriting_status="collecting_docs",
             is_draft=True,
             blockers=["Application profile has not been initialized"],
         )
@@ -9151,7 +9151,7 @@ async def _create_calendar_funding_file(
         property_type=PropertyType.COMMERCIAL,
         type=LoanType.BRIDGE,
         purpose=LoanPurpose.CASH_OUT_REFI,
-        stage=LoanStage.PREQUALIFIED,
+        stage=LoanStage.COLLECTING_DOCS,
         amount=amount,
         entity_name=appointment.company,
         funding_file_kind="business",

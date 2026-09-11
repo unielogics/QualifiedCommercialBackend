@@ -69,7 +69,7 @@ class ApplicationProfileRead(BaseModel):
     extraction_reviewed_at: datetime | None = None
     bank_verification_override_at: datetime | None = None
     bank_verification_override_reason: str | None = None
-    underwriting_status: UnderwritingLifecycleStatus = "submitted"
+    underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     underwriting_approved_amount: float | None = None
     underwriting_term_sheet_amount: float | None = None
     underwriting_current_dscr: float | None = None
@@ -257,7 +257,7 @@ class ApplicationUnderwritingRead(BaseModel):
     source_kind: ApplicationSourceKind | None = None
     source_id: UUID | None = None
     loan_id: UUID | None = None
-    underwriting_status: UnderwritingLifecycleStatus = "submitted"
+    underwriting_status: UnderwritingLifecycleStatus = "collecting_docs"
     approved_amount: float | None = None
     term_sheet_amount: float | None = None
     current_dscr: float | None = None

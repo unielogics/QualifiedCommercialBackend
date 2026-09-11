@@ -156,8 +156,8 @@ UNDERWRITING_TO_LOAN_STAGE = {
     "closed_won": LoanStage.FUNDED,
 }
 INTAKE_STATUS_TO_UNDERWRITING = {
-    "collecting": "submitted",
-    "submitted": "submitted",
+    "collecting": "collecting_docs",
+    "submitted": "collecting_docs",
     "reviewing": "collecting_docs",
     "reviewed": "in_underwriting",
     "completed": "approved",
@@ -165,11 +165,11 @@ INTAKE_STATUS_TO_UNDERWRITING = {
     "denied": "denied",
 }
 WORKING_STAGE_TO_UNDERWRITING = {
-    "lead": "submitted",
+    "lead": "collecting_docs",
     "contacted": "collecting_docs",
     "verified": "collecting_docs",
     "ready_for_lending": "in_underwriting",
-    "applicant_intake": "submitted",
+    "applicant_intake": "collecting_docs",
     "verification": "collecting_docs",
     "financial_profile": "collecting_docs",
     "credit_application": "in_underwriting",
@@ -977,20 +977,32 @@ async def _team_names_for_profiles(db: AsyncSession, profile_ids: set[UUID]) -> 
     seats = list(
         (
             await db.execute(
-                select(FileTeamMember.profile_id, FileTeamMember.seat, User.name, User.email)
+                select(
+                    FileTeamMember.profile_id,
+                    FileTeamMember.seat,
+                    FileTeamMember.derived_from,
+                    User.name,
+                    User.email,
+                )
                 .join(User, User.id == FileTeamMember.user_id)
                 .where(FileTeamMember.profile_id.in_(profile_ids), User.deleted_at.is_(None))
+                .order_by(FileTeamMember.profile_id, FileTeamMember.created_at.asc())
             )
         ).all()
     )
     out: dict[UUID, dict[str, Any]] = {}
-    for profile_id, seat, name, email in seats:
-        entry = out.setdefault(profile_id, {"agent": None, "underwriters": [], "company": None})
+    for profile_id, seat, derived_from, name, email in seats:
+        entry = out.setdefault(profile_id, {"agent": None, "agents": [], "underwriters": [], "company": None})
         label = name or email
         if seat == SEAT_AGENT:
-            entry["agent"] = label
+            if derived_from:
+                entry["agents"].insert(0, label)
+            else:
+                entry["agents"].append(label)
         else:
             entry["underwriters"].append(label)
+    for entry in out.values():
+        entry["agent"] = entry["agents"][0] if entry["agents"] else None
     company_ids = {
         p.company_id
         for p in (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id.in_(profile_ids)))).scalars().all()
@@ -1005,7 +1017,7 @@ async def _team_names_for_profiles(db: AsyncSession, profile_ids: set[UUID]) -> 
     if company_names:
         for p in (await db.execute(select(ApplicationProfile).where(ApplicationProfile.id.in_(profile_ids)))).scalars().all():
             if p.company_id in company_names:
-                out.setdefault(p.id, {"agent": None, "underwriters": [], "company": None})["company"] = company_names[p.company_id]
+                out.setdefault(p.id, {"agent": None, "agents": [], "underwriters": [], "company": None})["company"] = company_names[p.company_id]
     return out
 
 
@@ -1027,13 +1039,13 @@ def _pipeline_status_for_row(
     if profile and profile.underwriting_status in PIPELINE_LIFECYCLE:
         return profile.underwriting_status
     if row.funding_stage:
-        return LOAN_STAGE_TO_UNDERWRITING.get(row.funding_stage.key, "submitted")
+        return LOAN_STAGE_TO_UNDERWRITING.get(row.funding_stage.key, "collecting_docs")
     if row.intake_id:
         key = row.working_stage.key if row.working_stage else row.normalized_stage.lower()
-        return WORKING_STAGE_TO_UNDERWRITING.get(key, "submitted")
+        return WORKING_STAGE_TO_UNDERWRITING.get(key, "collecting_docs")
     if row.working_stage:
-        return WORKING_STAGE_TO_UNDERWRITING.get(row.working_stage.key, "submitted")
-    return "submitted"
+        return WORKING_STAGE_TO_UNDERWRITING.get(row.working_stage.key, "collecting_docs")
+    return "collecting_docs"
 
 
 async def _decorate_pipeline_state(
@@ -1051,6 +1063,7 @@ async def _decorate_pipeline_state(
         # time the desk opens the file; until then the row's own owner/rep
         # name is the best answer for the agent column.
         row.agent_name = (team or {}).get("agent") or row.owner_name or row.rep_name
+        row.agent_names = list((team or {}).get("agents") or ([row.agent_name] if row.agent_name else []))
         row.underwriter_names = list((team or {}).get("underwriters") or [])
         row.company_name = (team or {}).get("company")
         row.pipeline_status = status_value  # type: ignore[assignment]
@@ -2018,7 +2031,7 @@ async def promote_intake_to_funding(
         property_type=PropertyType.COMMERCIAL,
         type=LoanType.DSCR if vertical == "real_estate" else LoanType.BRIDGE,
         purpose=LoanPurpose.PURCHASE if vertical == "real_estate" else LoanPurpose.CASH_OUT_REFI,
-        stage=LoanStage.PREQUALIFIED,
+        stage=LoanStage.COLLECTING_DOCS,
         amount=float(intake.requested_loan_amount or 0),
         source_intake_id=intake.id,
         funding_file_kind=funding_kind,

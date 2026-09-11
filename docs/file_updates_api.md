@@ -11,16 +11,19 @@ another platform reads the same thing.
 ```json
 {
   "agent":        {"user_id": "…", "name": "Ana Lopez", "email": "…", "role": "dealer_partner", "derived_from": "intake.broker_id"},
+  "agents":       [{"user_id": "…", "name": "Ana Lopez", "email": "…", "role": "dealer_partner", "derived_from": "intake.broker_id"}],
   "underwriters": [{"user_id": "…", "name": "Jane Doe", "email": "…", "role": "loan_exec"}],
   "company":      {"id": "…", "name": "Acme Referrals", "kind": "referral_partner", "derived": true},
   "can_edit": true
 }
 ```
 
-A client login receives only `{"agent": {"name": …}, "underwriters": [], "company": null}`.
-The agent seat is derived from the file's ownership and follows the existing
-reassign actions; the desk sets underwriters (`POST`/`DELETE …/team/underwriters`)
-and the company (`PUT …/team/company`). Candidates: `GET /application-profiles/team/candidates`.
+A client login receives agent names but no email addresses, underwriters, or
+company details. The primary agent is derived from file ownership and follows
+existing reassign actions. The desk adds or removes collaborator agents through
+`POST`/`DELETE …/team/agents`, manages underwriters through
+`POST`/`DELETE …/team/underwriters`, and sets the company through
+`PUT …/team/company`. Candidates: `GET /application-profiles/team/candidates`.
 
 ## What happened on a file
 
