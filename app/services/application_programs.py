@@ -954,7 +954,11 @@ async def _materialize_requirements(
                     state.verified_by_user_id = newest_verification.verified_by_user_id
                     state.state_reason = (
                         "Verified automatically by published criteria"
-                        if all(row.source == "automatic" for row in links if row.verified_at)
+                        if all(
+                            row.source == "automatic" and row.verified_by_user_id is None
+                            for row in links
+                            if row.verified_at
+                        )
                         else "Required evidence set verified by underwriting staff"
                     )
                 else:
@@ -1011,6 +1015,7 @@ async def _automation_state(
             if item.required_level == "required"
             and visibility.get(item.requirement_key, False)
             and item.requirement_key not in effectively_satisfied
+            and _requirement_needs_client_evidence(item)
         ),
         None,
     )
@@ -1058,6 +1063,17 @@ async def _automation_state(
         attempts=profile.missing_item_email_attempts,
         stop_reason=stop_reason,
     )
+
+
+def _requirement_needs_client_evidence(state: ApplicationRequirementState) -> bool:
+    if state.status in SATISFIED_STATES:
+        return False
+    if state.status in {"missing", "requested", "stale", "failed"}:
+        return True
+    coverage = dict((state.provenance or {}).get("coverage") or {})
+    if coverage:
+        return not bool(coverage.get("complete"))
+    return state.evidence_file_id is None
 
 
 async def email_is_suppressed(db: AsyncSession, client_id: uuid.UUID) -> bool:
@@ -1564,6 +1580,121 @@ async def patch_requirement(
         state.status = "received_unverified" if active_links else "requested"
         state.state_reason = payload.reason or "Requirement restored"
     await db.flush()
+
+
+def analysis_is_high_confidence_match(
+    requirement: ApplicationRequirementRead,
+    file: BucketFile,
+    analysis: BucketFileAnalysis | None,
+) -> bool:
+    """Only accept current, high-confidence, content-level classifications."""
+
+    expected = EXPECTED_CLASSIFICATIONS.get(requirement.requirement_key, set()).union(
+        classifications_for_requested_doc(requirement.label, requirement.category)
+    )
+    if not expected or analysis is None or analysis.status != "completed":
+        return False
+    if file.content_hash and analysis.content_hash != file.content_hash:
+        return False
+    return (
+        str(analysis.confidence or "").casefold() == "high"
+        and analysis.classification in expected
+    )
+
+
+async def accept_high_confidence_ai_evidence(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    requirement_keys: list[str],
+    user: User,
+) -> dict[str, Any]:
+    """Apply a staff-reviewed bulk acceptance of trustworthy AI matches."""
+
+    readiness = await get_program_readiness(db, profile)
+    requirements = {item.requirement_key: item for item in readiness.requirements}
+    selected_keys = set(requirement_keys) if requirement_keys else {
+        item.requirement_key
+        for item in readiness.requirements
+        if item.status == "received_unverified"
+    }
+    if selected_keys.difference(requirements):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Requirement not found")
+
+    states = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementState).where(
+                    ApplicationRequirementState.profile_id == profile.id,
+                    ApplicationRequirementState.requirement_key.in_(selected_keys)
+                    if selected_keys
+                    else False,
+                )
+            )
+        ).scalars().all()
+    )
+    state_by_id = {state.id: state for state in states}
+    links = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementEvidence).where(
+                    ApplicationRequirementEvidence.requirement_state_id.in_(state_by_id)
+                    if state_by_id
+                    else False,
+                    ApplicationRequirementEvidence.removed_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    )
+    files, analyses, _classifications = await _evidence_inventory(db, profile)
+    file_by_id = {file.id: file for file in files}
+    timestamp = now()
+    reviewed = verified = already_verified = retained = analysis_required = 0
+    for link in links:
+        state = state_by_id[link.requirement_state_id]
+        requirement = requirements[state.requirement_key]
+        if requirement.status in SATISFIED_STATES:
+            continue
+        file = file_by_id.get(link.file_id)
+        if file is None:
+            continue
+        reviewed += 1
+        if link.verified_at is not None:
+            already_verified += 1
+            continue
+        analysis = analyses.get(file.id)
+        if analysis is None or analysis.status != "completed" or (
+            file.content_hash and analysis.content_hash != file.content_hash
+        ):
+            analysis_required += 1
+            continue
+        if not analysis_is_high_confidence_match(requirement, file, analysis):
+            retained += 1
+            continue
+        link.verified_at = timestamp
+        link.verified_by_user_id = user.id
+        link.reason = "Accepted by underwriting staff from a high-confidence AI content match"
+        link.provenance = {
+            **(link.provenance or {}),
+            "ai_verification": {
+                "analysis_id": str(analysis.id),
+                "classification": analysis.classification,
+                "confidence": analysis.confidence,
+                "accepted_by_user_id": str(user.id),
+                "accepted_at": timestamp.isoformat(),
+            },
+        }
+        verified += 1
+
+    await db.flush()
+    updated = await get_program_readiness(db, profile)
+    return {
+        "readiness": updated,
+        "reviewed_file_count": reviewed,
+        "verified_file_count": verified,
+        "already_verified_count": already_verified,
+        "retained_for_staff_count": retained,
+        "analysis_required_count": analysis_required,
+    }
 
 
 def validate_playbook_rules(rules: dict[str, Any] | None) -> None:

@@ -14,6 +14,8 @@ from app.services.application_programs import (
     _automatic_candidate,
     _is_lending_applicable,
     _requirement_is_fully_loaded,
+    _requirement_needs_client_evidence,
+    analysis_is_high_confidence_match,
 )
 from app.services.intake_chat_actions import _idempotency_key as chat_action_idempotency_key
 from app.services.missing_item_automation import _idempotency_key as missing_email_idempotency_key
@@ -118,6 +120,40 @@ def test_received_requirement_only_counts_as_loaded_when_coverage_is_complete() 
 
     assert _requirement_is_fully_loaded(partial, None) is False
     assert _requirement_is_fully_loaded(complete, None) is True
+    assert _requirement_needs_client_evidence(partial) is True
+    assert _requirement_needs_client_evidence(complete) is False
+
+
+def test_ai_evidence_acceptance_requires_current_high_confidence_content_match() -> None:
+    requirement = SimpleNamespace(
+        requirement_key="business_tax_returns_2_years",
+        label="Last 2 years business tax returns",
+        category="financials",
+    )
+    file = SimpleNamespace(content_hash="current")
+    matching = SimpleNamespace(
+        status="completed",
+        content_hash="current",
+        confidence="high",
+        classification="tax_return",
+    )
+
+    assert analysis_is_high_confidence_match(requirement, file, matching) is True
+    assert analysis_is_high_confidence_match(
+        requirement,
+        file,
+        SimpleNamespace(**{**matching.__dict__, "confidence": "medium"}),
+    ) is False
+    assert analysis_is_high_confidence_match(
+        requirement,
+        file,
+        SimpleNamespace(**{**matching.__dict__, "content_hash": "stale"}),
+    ) is False
+    assert analysis_is_high_confidence_match(
+        requirement,
+        file,
+        SimpleNamespace(**{**matching.__dict__, "classification": "bank_statement"}),
+    ) is False
 
 
 def test_loaded_program_automatically_starts_underwriting_and_syncs_early_loan() -> None:

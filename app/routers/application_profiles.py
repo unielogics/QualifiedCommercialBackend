@@ -68,6 +68,9 @@ from app.schemas.application_profile import (
     ApplicationProfileResolve,
     ApplicationProgramReadiness,
     ApplicationProgramsPatch,
+    ApplicationRequirementAIReview,
+    ApplicationRequirementAIReviewResult,
+    ApplicationRequirementBatchReminder,
     ApplicationRequirementPatch,
     ApplicationRequirementReminder,
     ApplicationRoomAccess,
@@ -921,6 +924,45 @@ async def update_application_requirement(
 
 
 @router.post(
+    "/{profile_id}/requirements/ai-review",
+    response_model=ApplicationRequirementAIReviewResult,
+)
+async def review_application_requirement_evidence(
+    profile_id: UUID,
+    payload: ApplicationRequirementAIReview,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationRequirementAIReviewResult:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    result = await application_programs.accept_high_confidence_ai_evidence(
+        db,
+        profile,
+        payload.requirement_keys,
+        user,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.ai_review_accepted",
+        f"Accepted {result['verified_file_count']} high-confidence AI evidence match(es)",
+        target_type="application_requirement",
+        target_id=profile.id,
+        metadata={
+            "requirement_keys": payload.requirement_keys,
+            "reviewed_file_count": result["reviewed_file_count"],
+            "verified_file_count": result["verified_file_count"],
+            "already_verified_count": result["already_verified_count"],
+            "retained_for_staff_count": result["retained_for_staff_count"],
+            "analysis_required_count": result["analysis_required_count"],
+        },
+    )
+    await db.commit()
+    return ApplicationRequirementAIReviewResult.model_validate(result)
+
+
+@router.post(
     "/{profile_id}/requirements/{requirement_key}/reminders",
     response_model=RoomDeliveryReceipt,
 )
@@ -939,6 +981,30 @@ async def send_application_requirement_reminder(
         requirement_key=requirement_key,
         user=user,
         initiation_source="staff_requirement_request",
+        retry_failed=payload.retry_failed,
+    )
+    await db.commit()
+    return _room_delivery_read(delivery)
+
+
+@router.post(
+    "/{profile_id}/requirements/batch-reminders",
+    response_model=RoomDeliveryReceipt,
+)
+async def send_application_requirement_batch_reminder(
+    profile_id: UUID,
+    payload: ApplicationRequirementBatchReminder,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomDeliveryReceipt:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    delivery = await missing_item_automation.send_requirements_email(
+        db,
+        profile=profile,
+        requirement_keys=payload.requirement_keys,
+        user=user,
+        initiation_source="staff_requirement_batch_request",
         retry_failed=payload.retry_failed,
     )
     await db.commit()
@@ -1001,6 +1067,7 @@ def _room_delivery_read(row: ApplicationRoomDelivery) -> RoomDeliveryReceipt:
         attempt_number=row.attempt_number,
         scheduled_for=row.scheduled_for,
         created_at=row.created_at,
+        requirement_keys=[str(key) for key in provider.get("requirement_keys") or []],
     )
 
 

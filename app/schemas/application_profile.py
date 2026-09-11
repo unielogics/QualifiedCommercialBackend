@@ -197,6 +197,15 @@ class ApplicationProgramReadiness(BaseModel):
     automation: MissingItemAutomationRead
 
 
+class ApplicationRequirementAIReviewResult(BaseModel):
+    readiness: ApplicationProgramReadiness
+    reviewed_file_count: int = 0
+    verified_file_count: int = 0
+    already_verified_count: int = 0
+    retained_for_staff_count: int = 0
+    analysis_required_count: int = 0
+
+
 class ApplicationProgramsPatch(BaseModel):
     program_keys: list[str] = Field(default_factory=list, max_length=20)
     return_to_ai: bool = False
@@ -246,6 +255,30 @@ class ApplicationRequirementPatch(BaseModel):
 class ApplicationRequirementReminder(BaseModel):
     channel: Literal["email"] = "email"
     retry_failed: bool = False
+
+
+class ApplicationRequirementBatchReminder(BaseModel):
+    requirement_keys: list[str] = Field(min_length=1, max_length=25)
+    channel: Literal["email"] = "email"
+    retry_failed: bool = False
+
+    @field_validator("requirement_keys")
+    @classmethod
+    def _deduplicate_requirement_keys(cls, value: list[str]) -> list[str]:
+        keys = list(dict.fromkeys(key.strip() for key in value if key.strip()))
+        if not keys:
+            raise ValueError("Select at least one requirement")
+        return keys
+
+
+class ApplicationRequirementAIReview(BaseModel):
+    requirement_keys: list[str] = Field(default_factory=list, max_length=25)
+    confirmed: Literal[True]
+
+    @field_validator("requirement_keys")
+    @classmethod
+    def _deduplicate_review_keys(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(key.strip() for key in value if key.strip()))
 
 
 class MissingItemAutomationPatch(BaseModel):
@@ -665,6 +698,7 @@ class RoomDeliveryReceipt(BaseModel):
     attempt_number: int = 1
     scheduled_for: datetime | None = None
     created_at: datetime
+    requirement_keys: list[str] = Field(default_factory=list)
 
 
 class RoomRequestCreate(BaseModel):

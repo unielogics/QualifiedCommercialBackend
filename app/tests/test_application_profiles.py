@@ -13,7 +13,12 @@ from app.models.application_profile import (
 )
 from app.routers.application_profiles import _require_profile_bank_client
 from app.routers.communications import _intake_allowed_channels
-from app.schemas.application_profile import ApplicationRequirementPatch, FileOwnerPatch
+from app.schemas.application_profile import (
+    ApplicationRequirementAIReview,
+    ApplicationRequirementBatchReminder,
+    ApplicationRequirementPatch,
+    FileOwnerPatch,
+)
 from app.services.application_profiles import _statement_months_from_analysis
 from app.services.underwriting_intelligence import calculate_dscr
 
@@ -52,6 +57,27 @@ def test_requirement_patch_accepts_multiple_evidence_files() -> None:
     assert set(payload.evidence_file_ids) == set(file_ids)
     with pytest.raises(ValidationError):
         ApplicationRequirementPatch(action="unlink_evidence", confirmed=True)
+
+
+def test_batch_reminder_deduplicates_requirements_and_requires_a_selection() -> None:
+    payload = ApplicationRequirementBatchReminder(
+        requirement_keys=["tax_returns", "bank_statements", "tax_returns"]
+    )
+
+    assert payload.requirement_keys == ["tax_returns", "bank_statements"]
+    with pytest.raises(ValidationError):
+        ApplicationRequirementBatchReminder(requirement_keys=[])
+
+
+def test_ai_requirement_review_allows_all_or_selected_requirements() -> None:
+    all_received = ApplicationRequirementAIReview(confirmed=True)
+    selected = ApplicationRequirementAIReview(
+        requirement_keys=["tax_returns", "tax_returns"],
+        confirmed=True,
+    )
+
+    assert all_received.requirement_keys == []
+    assert selected.requirement_keys == ["tax_returns"]
 
 
 def test_model_metadata_contains_partial_uniqueness_contracts() -> None:
