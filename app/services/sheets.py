@@ -73,12 +73,24 @@ KINDS: tuple[str, ...] = sheet_layout.KINDS
 #: minutes of divergence, which is a dropped connection, not a race.
 STALE_LIMIT = 200
 
-#: Blank lines offered past the end of each list, so there is always somewhere
-#: to type. They are addressed by ordinal — `r{n}` where n is the position
-#: *after* the stored rows — which is exactly how `sheet_layout._set` appends,
-#: so typing into one creates the row and stored rows keep their own ids.
+#: How many lines a list-shaped sheet shows when nobody has filled it in, so
+#: there is always somewhere to type. Addressed by ordinal — `r{n}` — which is
+#: exactly how `sheet_layout._set` and `_find_list_row` address a row the body
+#: does not hold yet, so typing into one creates it and stored rows keep their
+#: own ids.
+#:
+#: **A floor, not an addition.** It is the minimum a sheet nobody has touched
+#: is padded up to; a list that already holds this many lines is shown as it
+#: is, and a deliberate delete may take it below (see `apply_row_op`). Padding
+#: *past* every stored row would mean the count never answered to the add and
+#: remove buttons — which is the bug this floor is written against.
 BLANK_DEBT_ROWS = 3
 BLANK_SCHEDULE_ROWS = 2
+
+#: The most blank lines one row operation will mint to catch up with a client.
+#: Only reached through an explicit `visible`, which is a number off the wire:
+#: a client claiming to see a million rows gets a sheet, not a heap.
+MAX_BLANK_FILL = 200
 
 #: Where `sheet_rev` lives, per sheet. Addressed as plain tables rather than
 #: through the ORM: the column is bookkeeping for this module, and no other
@@ -141,29 +153,51 @@ def _kind_or_400(kind: str) -> str:
     return kind
 
 
-def _row_keys(rows: Sequence[Any], blanks: int) -> list[str]:
-    """The stored rows by identity, then `blanks` empty lines addressed by the
-    position each would occupy."""
+def _row_keys(rows: Sequence[Any], minimum: int) -> list[str]:
+    """The stored rows by identity, padded **up to** `minimum` lines.
+
+    A floor: a list shorter than the minimum is filled out with empty lines
+    addressed by the position each would occupy, and a list at or past it is
+    returned as it stands. `minimum=0` pads nothing — which is what a row
+    operation asks for, because it has already brought the body up to every
+    line the caller can see and a second helping of padding would put the
+    count back out of the caller's reach.
+    """
     keys = [
         sheet_layout._list_row_key(row, index)
         for index, row in enumerate(rows or [], start=1)
     ]
-    return keys + [f"r{n}" for n in range(len(keys) + 1, len(keys) + 1 + blanks)]
+    return keys + [f"r{n}" for n in range(len(keys) + 1, max(len(keys), minimum) + 1)]
 
 
-def _layout_for(kind: str, body: Mapping[str, Any] | None) -> sheet_layout.Sheet:
-    """The sheet's shape for the grid: the body's own rows, plus blank lines."""
+def _blank_minimum(kind: str) -> int:
+    return BLANK_DEBT_ROWS if kind == "debt_schedule" else BLANK_SCHEDULE_ROWS
+
+
+def _layout_for(
+    kind: str, body: Mapping[str, Any] | None, *, exact: str | None = None
+) -> sheet_layout.Sheet:
+    """The sheet's shape for the grid: the body's own rows, padded up to the
+    blank minimum.
+
+    `exact` names the one list whose rows the body already carries in full —
+    the block a row operation just changed. That list is shown exactly as the
+    body holds it, blanks and all, so an insert reads as one more line and a
+    delete as one fewer instead of being rounded back up to the floor.
+    """
     body = body or {}
     if kind == "debt_schedule":
-        return sheet_layout.layout(
-            kind, debt_rows=_row_keys(body.get("debts") or [], BLANK_DEBT_ROWS)
-        )
+        minimum = 0 if exact == "debts" else BLANK_DEBT_ROWS
+        return sheet_layout.layout(kind, debt_rows=_row_keys(body.get("debts") or [], minimum))
     if kind == "pfs":
         schedules = pfs_schema.normalize_schedule_rows(dict(body))
         return sheet_layout.layout(
             kind,
             schedule_rows={
-                spec.key: _row_keys(schedules.get(spec.key) or [], BLANK_SCHEDULE_ROWS)
+                spec.key: _row_keys(
+                    schedules.get(spec.key) or [],
+                    0 if exact == spec.key else BLANK_SCHEDULE_ROWS,
+                )
                 for spec in pfs_schema.SCHEDULES
             },
         )
@@ -751,15 +785,31 @@ async def apply_row_op(
     worksheet: FinancialWorksheet | None = None,
     participant_id: str | None = None,
     client_id: str | None = None,
+    visible: int | None = None,
 ) -> dict[str, Any]:
     """Add or remove a line on one of the two list-shaped sheets.
+
+    **The count always moves.** An explicit add returns one line more than the
+    caller was looking at and an explicit remove one line fewer — including
+    below the blank minimum, because the minimum is the floor a sheet nobody
+    has touched is drawn at, not a floor that swallows a deliberate act. That
+    is what `_as_seen` is for: the padding the read invents is minted into the
+    list *before* the operation, so the operation lands on the sheet the person
+    can see rather than on the shorter one the file happens to hold.
 
     **An added debt row is not written to the file.** It comes back as an
     addressable blank line and becomes a real `dos_debts` row the moment
     somebody types into it. Persisting it empty would mean inventing an
     obligation — and `count_in_dscr` defaults to true, so a phantom row lands
     in the debt-service denominator and understates coverage. A blank line on
-    the personal financial statement carries no such weight and is stored.
+    the personal financial statement carries no such weight and is stored,
+    which is also how the 413's schedules remember a line that was added and
+    not yet typed into.
+
+    `visible` is how many lines the client has on screen, when the client says
+    so. With nothing said the count is derived — the floor, which is what a
+    read of this same list returns — and that is exact for a client whose last
+    picture of the sheet came from a read.
     """
     _kind_or_400(kind)
     if kind not in ("debt_schedule", "pfs"):
@@ -794,17 +844,17 @@ async def apply_row_op(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown schedule")
         body = dict(loaded.body)
         schedules = dict(pfs_schema.normalize_schedule_rows(body))
-        rows = list(schedules.get(spec.key) or [])
-        was = [str((row or {}).get("id") or "") for row in rows]
-        rows = _apply_rows(rows, op=op, row_id=row_id, after=after)
-        # Which line this was about, for the broadcast: on a delete it is the
-        # one asked for, on an insert it is the id `_apply_rows` minted, and
-        # the only honest way to learn that is to diff.
-        touched = row_id or next(
-            (str((row or {}).get("id") or "") for row in rows
-             if str((row or {}).get("id") or "") not in was),
-            None,
+        rows = _as_seen(
+            list(schedules.get(spec.key) or []),
+            minimum=_blank_minimum(kind),
+            origin=origin,
+            visible=visible,
         )
+        # Which line this was about, for the broadcast: on a delete the one
+        # asked for, on an insert the one minted here.
+        fresh = _blank_line(origin) if op == "insert" else None
+        rows = _apply_rows(rows, op=op, row_id=row_id, after=after, blank=fresh)
+        touched = fresh["id"] if fresh is not None else row_id
         schedules[spec.key] = rows
         body["schedules"] = schedules
         saved = await financial_statements.save_statement(
@@ -821,14 +871,19 @@ async def apply_row_op(
         await _announce(db, worksheet, [_row_announcement(touched, worksheet.revision)])
         stored = dict(getattr(saved, "body", None) or body)
         return {
-            "rows": _row_payloads(kind, stored),
+            "rows": _row_payloads(kind, stored, exact=spec.key),
             "row_meta": _row_meta(kind, stored),
             "rev": {kind: worksheet.revision, "debt_schedule": worksheet.revision},
         }
 
-    rows = list(loaded.body.get("debts") or [])
+    rows = _as_seen(
+        list(loaded.body.get("debts") or []),
+        minimum=_blank_minimum(kind),
+        origin=origin,
+        visible=visible,
+    )
     if op == "insert":
-        fresh = {"id": str(uuid.uuid4()), "editable": True, "owner": origin}
+        fresh = _blank_line(origin)
         rows = _apply_rows(rows, op=op, row_id=fresh["id"], after=after, blank=fresh)
         # Not saved: an empty line is not an obligation. It persists on the
         # first keystroke, through the same `save_debt_rows` every other edit
@@ -839,12 +894,14 @@ async def apply_row_op(
         # in a row everybody already has rather than appearing out of nowhere.
         await _announce(db, worksheet, [_row_announcement(fresh["id"], worksheet.revision)])
         return {
-            "rows": _row_payloads(kind, body),
+            "rows": _row_payloads(kind, body, exact="debts"),
             "row_meta": _row_meta(kind, body),
             "rev": {kind: worksheet.revision},
         }
 
     rows = _apply_rows(rows, op=op, row_id=row_id, after=after)
+    # Only what somebody typed is written — `debt_rows_from_body` drops the
+    # blank lines, so the minted padding goes no further than this answer.
     await financial_statements.save_debt_rows(
         db,
         profile,
@@ -855,11 +912,64 @@ async def apply_row_op(
     await db.flush()
     await _announce(db, worksheet, [_row_announcement(row_id, worksheet.revision)])
     stored = await financial_statements.debt_body_for_profile(db, profile, origin=origin)
+    body = {**stored, "debts": _reconciled(rows, stored.get("debts") or [])}
     return {
-        "rows": _row_payloads(kind, stored),
-        "row_meta": _row_meta(kind, stored),
+        "rows": _row_payloads(kind, body, exact="debts"),
+        "row_meta": _row_meta(kind, body),
         "rev": {kind: worksheet.revision},
     }
+
+
+#: Keys a line carries for the grid's sake rather than the borrower's. A row
+#: holding nothing else is a line somebody was given to type into and did not.
+_BOOKKEEPING = frozenset({"id", "row_id", "editable", "owner", "source", "count_in_dscr"})
+
+
+def _is_blank(row: Any) -> bool:
+    """Whether this line holds nothing anybody typed."""
+    if not isinstance(row, dict):
+        return True
+    for key, value in row.items():
+        if key in _BOOKKEEPING or value is None or isinstance(value, bool):
+            continue
+        if str(value).strip():
+            return False
+    return True
+
+
+def _blank_line(origin: str) -> dict[str, Any]:
+    """An empty line in the shape every visible line has: an id to address it
+    by, editable, and owned by whoever is looking — so the first keystroke
+    saves it through the ordinary path instead of landing nowhere."""
+    return {"id": str(uuid.uuid4()), "editable": True, "owner": origin}
+
+
+def _as_seen(
+    rows: list[Any], *, minimum: int, origin: str, visible: int | None = None
+) -> list[Any]:
+    """The list brought up to every line the caller can currently see.
+
+    A row operation is a deliberate act on a sheet somebody is looking at, and
+    what they are looking at includes the blank lines the read padded the list
+    out to. Those lines are not in the body — the debt schedule refuses to
+    store a blank, and rightly, since `DealerDebt.count_in_dscr` defaults true
+    and an invented obligation understates coverage. So they are minted here,
+    in memory, *before* the operation: insert on a list of three lines then
+    returns four, and delete returns two, instead of both disappearing into
+    padding that is regenerated either way.
+
+    `visible` is the count the client says it has on screen, when it says; with
+    nothing said the floor is the honest guess, and it is the exact one for a
+    sheet the client last saw through a read.
+    """
+    try:
+        target = minimum if visible is None else int(visible)
+    except (TypeError, ValueError):
+        # A count that is not a number is a client that did not say, not an
+        # error worth refusing a row operation over.
+        target = minimum
+    target = max(len(rows), min(target, len(rows) + MAX_BLANK_FILL))
+    return [*rows, *(_blank_line(origin) for _ in range(target - len(rows)))]
 
 
 def _apply_rows(
@@ -870,27 +980,72 @@ def _apply_rows(
     after: str | None,
     blank: dict[str, Any] | None = None,
 ) -> list[Any]:
+    """One line added or removed, on a list that already holds every line the
+    caller can see.
+
+    Rows are addressed the way the grid addresses them — by id, or by the
+    ordinal `r{n}` a line the body did not hold is drawn under — through
+    `sheet_layout`'s own resolver, so a row operation and a keystroke cannot
+    disagree about which line is which.
+    """
     if op == "delete":
         if not row_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Which row?")
-        found = [row for row in rows if str((row or {}).get("id") or "") != str(row_id)]
-        if len(found) == len(rows):
+        at = sheet_layout._find_list_row(rows, str(row_id))
+        if at is None:
+            # An id the sheet does not hold: a blank line minted for an earlier
+            # insert, which was never stored because it was never typed into.
+            # Removing one of those is the likeliest delete there is, and the
+            # answer a person is owed is the shorter list, not a 404. The last
+            # unfilled line is dropped rather than any line at all, so a stray
+            # id can never take out an obligation somebody entered.
+            at = next(
+                (index for index in range(len(rows) - 1, -1, -1) if _is_blank(rows[index])),
+                None,
+            )
+        if at is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Row not found")
-        return found
+        return [*rows[:at], *rows[at + 1 :]]
     new = dict(blank or {"id": str(uuid.uuid4())})
-    if not after:
+    at = sheet_layout._find_list_row(rows, str(after)) if after else None
+    if at is None:
         return [*rows, new]
-    at = next(
-        (index for index, row in enumerate(rows) if str((row or {}).get("id") or "") == str(after)),
-        len(rows) - 1,
-    )
     return [*rows[: at + 1], new, *rows[at + 1 :]]
 
 
-def _row_payloads(kind: str, body: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _reconciled(kept: Sequence[Any], stored: Sequence[Any]) -> list[Any]:
+    """The saved schedule with the caller's blank lines put back where they were.
+
+    A debt save writes only real obligations — `debt_rows_from_body` drops a
+    line nobody filled in — so re-reading the file after a delete would hand
+    back a list with every blank line missing and the count jumping about. The
+    stored rows are authoritative for anything anybody typed; the unfilled
+    lines around them are carried through so the sheet the caller is looking at
+    loses exactly the one line they removed. A row that appeared from another
+    source in the meantime is kept, at the end, rather than hidden.
+    """
+    by_id = {
+        str(row.get("id") or ""): row
+        for row in stored or []
+        if isinstance(row, dict) and row.get("id")
+    }
+    out: list[Any] = []
+    for row in kept:
+        found = by_id.pop(str((row or {}).get("id") or ""), None)
+        if found is not None:
+            out.append(found)
+        elif _is_blank(row):
+            out.append(row)
+    out.extend(by_id.values())
+    return out
+
+
+def _row_payloads(
+    kind: str, body: Mapping[str, Any], *, exact: str | None = None
+) -> list[dict[str, Any]]:
     """The sheet's row list after a row operation, in the same shape the read
     returns, so the grid replaces rows rather than reconciling two shapes."""
-    shape = _layout_for(kind, body)
+    shape = _layout_for(kind, body, exact=exact)
     values = sheet_layout.flatten(kind, body)
     return [
         {**_row_payload(row), "values": {
@@ -903,6 +1058,7 @@ def _row_payloads(kind: str, body: Mapping[str, Any]) -> list[dict[str, Any]]:
 __all__ = [
     "BLANK_DEBT_ROWS",
     "BLANK_SCHEDULE_ROWS",
+    "MAX_BLANK_FILL",
     "KINDS",
     "STALE_LIMIT",
     "apply_cell_edits",

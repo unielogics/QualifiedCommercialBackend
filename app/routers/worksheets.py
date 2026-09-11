@@ -149,6 +149,8 @@ class RowsBody(LiveBody):
     after: str | None = Field(default=None, max_length=64)
     block: str | None = Field(default=None, max_length=64)
     name: str | None = Field(default=None, max_length=120)
+    #: Lines on screen for that list. See `WorksheetRowOp.visible`.
+    visible: int | None = Field(default=None, ge=0, le=10_000)
 
 
 class CursorBody(BaseModel):
@@ -370,6 +372,7 @@ async def write_worksheet_rows(
         worksheet=access.worksheet,
         participant_id=payload.participant_id,
         client_id=payload.client_id,
+        visible=payload.visible,
     )
     after_rows = _row_ids(result.get("rows"), payload.block)
     revs = dict(result.get("rev") or {})

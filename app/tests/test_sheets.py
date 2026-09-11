@@ -297,10 +297,14 @@ def test_a_stored_debt_row_keeps_its_identity_and_blank_lines_follow_it():
     data_rows = [row for row in debt["rows"] if row["kind"] == "data"]
     assert data_rows[0]["row_key"] == str(row_id)
     # Blank lines are addressed by the position each would occupy, so typing
-    # into one appends rather than overwriting the stored row.
+    # into one appends rather than overwriting the stored row. The minimum is a
+    # floor the sheet is drawn up to, not a tail added past every stored row:
+    # one real line and two blanks, not one and three. A floor is what lets an
+    # add or a remove move the count — see `apply_row_op`.
     assert [row["row_key"] for row in data_rows[1:]] == [
-        f"r{n}" for n in range(2, 2 + sheets.BLANK_DEBT_ROWS)
+        f"r{n}" for n in range(2, sheets.BLANK_DEBT_ROWS + 1)
     ]
+    assert len(data_rows) == sheets.BLANK_DEBT_ROWS
 
 
 def test_the_read_says_which_debt_rows_this_caller_may_actually_write():
@@ -521,7 +525,24 @@ def test_a_pfs_cell_is_saved_through_the_413s_own_save_and_keeps_its_status():
 # ── rows ────────────────────────────────────────────────────────────────────
 
 
-def _row_op(*, kind, op, row_id=None, after=None, block=None, debts=None, pfs=None, revision=3, store=None):
+def _lines(rows, block):
+    """The typeable lines of one list, the way the grid counts them."""
+    return [row for row in rows if row["kind"] == "data" and row.get("block") == block]
+
+
+def _row_op(
+    *,
+    kind,
+    op,
+    row_id=None,
+    after=None,
+    block=None,
+    debts=None,
+    pfs=None,
+    revision=3,
+    store=None,
+    visible=None,
+):
     profile = _profile()
     worksheet = _worksheet(revision=revision, profile_id=profile.id)
     patches = _reading(debts=debts, pfs=pfs)
@@ -548,6 +569,7 @@ def _row_op(*, kind, op, row_id=None, after=None, block=None, debts=None, pfs=No
                 origin="admin",
                 actor_user_id=uuid.uuid4(),
                 worksheet=worksheet,
+                visible=visible,
             )
         )
     return result, worksheet, saver
@@ -591,9 +613,20 @@ def test_removing_a_debt_line_goes_through_save_debt_rows_with_origin():
 
 
 def test_removing_a_row_that_is_not_there_is_a_404_not_a_silent_no_op():
+    # Every line on this sheet is an obligation somebody entered, so an id
+    # nobody recognises is a mistake and is told so — a stray id must never be
+    # allowed to take out a real row just to make the count move.
+    store = _DebtStore(
+        [
+            {"id": uuid.uuid4(), "lender": "Fifth Third", "balance": "10"},
+            {"id": uuid.uuid4(), "lender": "Newtek", "balance": "20"},
+            {"id": uuid.uuid4(), "lender": "Amex", "balance": "30"},
+        ]
+    )
     with pytest.raises(HTTPException) as caught:
-        _row_op(kind="debt_schedule", op="delete", row_id=str(uuid.uuid4()), debts=_debt_body())
+        _row_op(kind="debt_schedule", op="delete", row_id=str(uuid.uuid4()), store=store)
     assert caught.value.status_code == 404
+    assert len(store.rows) == 3
 
 
 def test_a_sheet_with_a_fixed_row_list_refuses_a_row_operation():
@@ -608,9 +641,167 @@ def test_a_schedule_line_added_to_the_413_is_stored_and_advances_the_clock():
         kind="pfs", op="insert", block=pfs_schema.SCHEDULES[0].key, pfs=statement
     )
     stored = statement.body["schedules"][pfs_schema.SCHEDULES[0].key]
-    assert len(stored) == 1 and stored[0]["id"]
+    # The lines the schedule was drawn up to are stored alongside the new one,
+    # so the 413 remembers what the person is looking at and the next add moves
+    # the count again. A blank line here carries no weight — unlike a debt row,
+    # which would land in the DSCR denominator and is never persisted empty.
+    assert len(stored) == sheets.BLANK_SCHEDULE_ROWS + 1
+    assert all(row["id"] for row in stored)
     assert worksheet.revision == 4
     assert any(row["kind"] == "data" for row in result["rows"])
+
+
+# ── the count answers to the button ─────────────────────────────────────────
+#
+# The bug these pin: an empty schedule holds no rows, the sheet is drawn up to
+# a minimum of blank lines so there is somewhere to type, and "Add a line" used
+# to be swallowed by that padding — the row list came back the same length and
+# the button looked broken. The minimum is a floor for a sheet nobody has
+# touched; a deliberate add or remove always moves the count, and a remove may
+# take it below the floor, because lines somebody removed are meant to be gone.
+
+
+def _read_lines(**reading):
+    payload = _read(**reading)
+    debt = next(sheet for sheet in payload["sheets"] if sheet["kind"] == "debt_schedule")
+    pfs = next(sheet for sheet in payload["sheets"] if sheet["kind"] == "pfs")
+    return debt, pfs
+
+
+def test_a_fresh_read_of_an_untouched_sheet_still_offers_the_blank_minimum():
+    debt, pfs = _read_lines()
+    assert len(_lines(debt["rows"], "debts")) == sheets.BLANK_DEBT_ROWS
+    for spec in pfs_schema.SCHEDULES:
+        assert len(_lines(pfs["rows"], spec.key)) == sheets.BLANK_SCHEDULE_ROWS
+
+
+def test_adding_a_line_to_an_empty_debt_schedule_returns_one_more_than_the_read():
+    debt, _ = _read_lines()
+    seen = len(_lines(debt["rows"], "debts"))
+    result, _, saver = _row_op(kind="debt_schedule", op="insert", block="debts")
+    lines = _lines(result["rows"], "debts")
+    assert len(lines) == seen + 1
+    # Every visible line is addressable and owned by the caller, so the first
+    # keystroke saves through `save_debt_rows` like any other edit.
+    assert all(result["row_meta"][row["row_key"]] == {"editable": True, "owner": "admin"}
+               for row in lines)
+    # Nothing written: an empty line is not an obligation.
+    saver.assert_not_awaited()
+
+
+def test_each_further_add_moves_the_count_again_when_the_client_says_what_it_sees():
+    # A debt row is deliberately not stored until it is typed into, so the file
+    # looks identical after every add; the count the client is looking at is
+    # what the next add has to land on.
+    debt, _ = _read_lines()
+    seen = len(_lines(debt["rows"], "debts"))
+    for _ in range(3):
+        result, _, saver = _row_op(kind="debt_schedule", op="insert", block="debts", visible=seen)
+        lines = _lines(result["rows"], "debts")
+        assert len(lines) == seen + 1
+        saver.assert_not_awaited()
+        seen = len(lines)
+    assert seen == sheets.BLANK_DEBT_ROWS + 3
+
+
+def test_a_client_cannot_ask_for_an_unbounded_sheet_by_claiming_to_see_one():
+    result, _, _ = _row_op(kind="debt_schedule", op="insert", block="debts", visible=10_000_000)
+    assert len(_lines(result["rows"], "debts")) == sheets.MAX_BLANK_FILL + 1
+
+
+def test_removing_a_line_returns_one_fewer_and_may_go_below_the_blank_minimum():
+    debt, _ = _read_lines()
+    seen = len(_lines(debt["rows"], "debts"))
+    result, _, saver = _row_op(kind="debt_schedule", op="delete", row_id="r2", block="debts")
+    assert len(_lines(result["rows"], "debts")) == seen - 1
+    # Below the floor on purpose: the minimum is what a sheet nobody has
+    # touched is drawn at, not a quota a person is held to.
+    assert seen - 1 < sheets.BLANK_DEBT_ROWS
+    # And still nothing blank on the file.
+    assert saver.await_args.args[2] == []
+
+    result, _, _ = _row_op(
+        kind="debt_schedule", op="delete", row_id="r1", block="debts", visible=seen - 1
+    )
+    assert len(_lines(result["rows"], "debts")) == seen - 2
+
+
+def test_deleting_a_line_that_only_exists_on_screen_is_not_a_404():
+    # The likeliest delete there is: somebody adds a line, changes their mind,
+    # and removes it before typing. The server never stored it, so the id means
+    # nothing to the file — and the answer they are owed is the shorter list.
+    debt, _ = _read_lines()
+    seen = len(_lines(debt["rows"], "debts"))
+    added, _, _ = _row_op(kind="debt_schedule", op="insert", block="debts")
+    minted = _lines(added["rows"], "debts")[-1]["row_key"]
+    result, _, _ = _row_op(
+        kind="debt_schedule", op="delete", row_id=minted, block="debts", visible=seen + 1
+    )
+    assert len(_lines(result["rows"], "debts")) == seen
+
+
+def test_a_removed_line_does_not_take_a_real_obligation_with_it():
+    keep = uuid.uuid4()
+    store = _DebtStore([{"id": keep, "owner": "admin", "lender": "Fifth Third", "balance": "10"}])
+    result, _, saver = _row_op(kind="debt_schedule", op="delete", row_id="r2", store=store)
+    lines = _lines(result["rows"], "debts")
+    # One fewer than the floor the read drew, and the obligation is still first.
+    assert len(lines) == sheets.BLANK_DEBT_ROWS - 1
+    assert lines[0]["row_key"] == str(keep)
+    assert [str(row["id"]) for row in store.rows] == [str(keep)]
+    # The blank lines the caller was looking at are not obligations and are
+    # never handed to the save.
+    assert [row["id"] for row in saver.await_args.args[2]] == [str(keep)]
+
+
+def test_the_413s_schedules_answer_to_the_buttons_the_same_way():
+    block = pfs_schema.SCHEDULES[0].key
+    statement = _statement("pfs", body=pfs_schema.empty_body())
+    _, pfs_sheet = _read_lines(pfs=statement)
+    seen = len(_lines(pfs_sheet["rows"], block))
+    assert seen == sheets.BLANK_SCHEDULE_ROWS
+
+    for _ in range(2):
+        result, _, _ = _row_op(kind="pfs", op="insert", block=block, pfs=statement)
+        lines = _lines(result["rows"], block)
+        assert len(lines) == seen + 1
+        seen = len(lines)
+    # The other schedules are untouched and still show their own floor.
+    other = pfs_schema.SCHEDULES[1].key
+    assert len(_lines(result["rows"], other)) == sheets.BLANK_SCHEDULE_ROWS
+
+    while seen:
+        result, _, _ = _row_op(
+            kind="pfs",
+            op="delete",
+            row_id=_lines(result["rows"], block)[-1]["row_key"],
+            block=block,
+            pfs=statement,
+            # Past the floor the server can no longer derive what is on screen
+            # — a client that has deleted its way below the minimum says so.
+            visible=seen,
+        )
+        assert len(_lines(result["rows"], block)) == seen - 1
+        seen -= 1
+    # All the way to nothing, well below the minimum a fresh read would draw.
+    assert len(_lines(result["rows"], block)) == 0
+    # And the floor comes back for the next person to open it: the minimum is
+    # about a sheet nobody has touched, not about this one.
+    _, reopened = _read_lines(pfs=statement)
+    assert len(_lines(reopened["rows"], block)) == sheets.BLANK_SCHEDULE_ROWS
+
+
+def test_no_blank_debt_line_is_ever_written_to_the_file():
+    store = _DebtStore()
+    _, _, saver = _row_op(kind="debt_schedule", op="insert", block="debts", store=store)
+    saver.assert_not_awaited()
+
+    _, _, saver = _row_op(
+        kind="debt_schedule", op="delete", row_id="r1", block="debts", store=store
+    )
+    for written in saver.await_args.args[2] or []:
+        assert written["lender"] or written["balance"] or written["monthly_payment"]
+    assert store.rows == []
 
 
 # ── sharing ─────────────────────────────────────────────────────────────────
@@ -728,3 +919,72 @@ def test_revoking_a_link_that_is_not_on_this_file_is_a_404():
 
 def test_the_model_and_the_layout_name_the_same_four_sheets():
     assert set(SHEET_KINDS) == set(sheet_layout.KINDS) == set(sheets.KINDS)
+
+
+# ── the wire between the two row routes and the service ─────────────────────
+#
+# The service got `visible` right and shipped, and a second "Add a line" still
+# did nothing, because neither route had a field to put it in. Both halves
+# were correct and the seam between them was empty. A test per field would
+# have been written after the fact and only for that field, so this one is
+# about the seam itself: whatever a row body and `apply_row_op` turn out to
+# have in common has to actually travel between them.
+
+
+def _row_op_parameters() -> set[str]:
+    import inspect
+
+    return set(inspect.signature(sheets.apply_row_op).parameters)
+
+
+def _forwarded_kwargs(func) -> set[str]:
+    """The keyword names the route hands to `sheets.apply_row_op`."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        name = target.attr if isinstance(target, ast.Attribute) else getattr(target, "id", "")
+        if name == "apply_row_op":
+            return {kw.arg for kw in node.keywords if kw.arg}
+    raise AssertionError(f"{func.__name__} never calls apply_row_op")
+
+
+def test_both_row_routes_forward_every_field_they_share_with_the_service():
+    """A field on the body whose name the service also takes must be passed.
+
+    `sheet` is the one rename — the wire calls it `sheet` and the service
+    calls it `kind` — and `name` is deliberately not a service argument: it is
+    the self-declared name on the audit row and stops at the router.
+    """
+    from app.routers import worksheets as public_router
+
+    accepted = _row_op_parameters()
+    assert "visible" in accepted
+
+    for route, body in (
+        (router.write_worksheet_row, router.WorksheetRowOp),
+        (public_router.write_worksheet_rows, public_router.RowsBody),
+    ):
+        fields = set(body.model_fields)
+        shared = (fields & accepted) - {"sheet"}
+        missing = shared - _forwarded_kwargs(route)
+        assert not missing, f"{route.__name__} drops {sorted(missing)} on the way to apply_row_op"
+        assert "visible" in shared, f"{body.__name__} has no visible field"
+
+
+def test_a_row_body_refuses_a_line_count_that_is_not_one():
+    """The count is a count. A negative one is a client bug, not a row to add."""
+    from pydantic import ValidationError
+
+    from app.routers import worksheets as public_router
+
+    for body in (router.WorksheetRowOp, public_router.RowsBody):
+        assert body(sheet="debt_schedule", op="insert").visible is None
+        assert body(sheet="debt_schedule", op="insert", visible=7).visible == 7
+        with pytest.raises(ValidationError):
+            body(sheet="debt_schedule", op="insert", visible=-1)

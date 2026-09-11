@@ -916,6 +916,11 @@ class WorksheetRowOp(BaseModel):
     #: Which supporting schedule, on the personal financial statement. The debt
     #: schedule is one list and ignores it.
     block: str | None = None
+    #: How many lines the grid is showing for that list, blanks included. The
+    #: server pads a short list up to this before adding or removing, so the
+    #: count always moves by one from the picture the person is looking at.
+    #: Left out by an older client, which falls back to the read's own floor.
+    visible: int | None = Field(default=None, ge=0, le=10_000)
 
 
 class WorksheetLinkCreate(BaseModel):

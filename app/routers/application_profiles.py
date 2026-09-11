@@ -5136,6 +5136,7 @@ async def write_worksheet_row(
         block=payload.block,
         origin="admin",
         actor_user_id=user.id,
+        visible=payload.visible,
     )
     await db.commit()
     # Queued, not rendered: see `write_worksheet_cells` above.
