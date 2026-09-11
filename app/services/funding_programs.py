@@ -398,6 +398,12 @@ async def publish_version(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Publish requires a validated fit rule"
         )
+    unresolved = (playbook.rules or {}).get("unresolved_review_items") or []
+    if unresolved:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Resolve every imported criteria review item in a new draft before publishing",
+        )
     current = list(
         (
             await db.execute(

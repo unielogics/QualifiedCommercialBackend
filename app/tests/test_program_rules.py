@@ -15,6 +15,7 @@ from app.schemas.application_profile import ProgramFitCandidate
 from app.schemas.funding_program import FundingProgramVersionCreate
 from app.services import application_programs
 from app.services.application_programs import (
+    _analysis_nsf_count,
     _automatic_candidate,
     _automatic_evidence_decision,
     _coverage_for_files,
@@ -170,6 +171,52 @@ def test_catalog_contains_exact_products_and_vertical_placements() -> None:
         for vertical in ("real_estate", "dealer", "main_street", "mca")
     }
     assert counts == {"real_estate": 8, "dealer": 8, "main_street": 12, "mca": 1}
+
+
+def test_legacy_fit_imports_are_bounded_inactive_drafts() -> None:
+    migration_path = Path("alembic/versions/0212_legacy_fit_rule_drafts.py")
+    spec = importlib.util.spec_from_file_location("migration_0212", migration_path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    assert "business_baseline" not in migration.LEGACY_FIT_RULE_DRAFTS
+    assert set(migration.LEGACY_FIT_RULE_DRAFTS) == {
+        "sba_7a",
+        "dealer_real_estate_capital",
+        "ez_term",
+        "microcap",
+        "line_of_credit",
+        "equipment_financing",
+        "jumbo_term",
+        "hybrid_term_loc",
+        "transportation_finance",
+        "sba_grocery",
+        "sba_made_in_america",
+    }
+    for rules in migration.LEGACY_FIT_RULE_DRAFTS.values():
+        validate_rules(rules)
+        assert rules["import"]["review_required"] is True
+        assert rules["import"]["status"] == "provisional"
+
+    assert migration.LEGACY_FIT_RULE_DRAFTS["microcap"]["unresolved_review_items"]
+    assert migration.LEGACY_FIT_RULE_DRAFTS["sba_7a"]["unresolved_review_items"]
+
+
+def test_nsf_count_prefers_explicit_month_rows() -> None:
+    analysis = SimpleNamespace(
+        analysis={
+            "key_facts": {
+                "nsf_or_overdraft_count": 99,
+                "months": [
+                    {"month": "2026-01", "nsf_or_overdraft_count": 1},
+                    {"month": "2026-02", "nsf_count": 2},
+                ],
+            }
+        }
+    )
+
+    assert _analysis_nsf_count(analysis) == 3
 
 
 def test_hard_scope_requires_industry_or_declared_facts() -> None:

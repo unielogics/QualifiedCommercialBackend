@@ -132,6 +132,25 @@ def _fact_presence(value: Any, keys: set[str]) -> bool | None:
     return any(item not in (None, "", False, 0, [], {}) for item in values)
 
 
+def _analysis_nsf_count(analysis: BucketFileAnalysis | None) -> float | None:
+    if analysis is None or not isinstance(analysis.analysis, dict):
+        return None
+    facts = analysis.analysis.get("key_facts")
+    if not isinstance(facts, dict):
+        return None
+    months = facts.get("months")
+    if isinstance(months, list):
+        values = [
+            _float(row.get("nsf_or_overdraft_count", row.get("nsf_count")))
+            for row in months
+            if isinstance(row, dict)
+        ]
+        known = [value for value in values if value is not None]
+        if known:
+            return sum(known)
+    return _float(facts.get("nsf_or_overdraft_count", facts.get("nsf_count")))
+
+
 def _is_lending_applicable(context: dict[str, Any]) -> bool:
     return context.get("intent_kind") not in {"non_lending", "route_out"}
 
@@ -222,6 +241,26 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         and analysis.status == "completed"
         and analysis.classification
     }
+    accepted_bank_months: set[str] = set()
+    accepted_tax_years: set[str] = set()
+    accepted_nsf_counts: list[float] = []
+    for file in files:
+        if file.id not in accepted_file_ids:
+            continue
+        analysis = latest_analyses.get(file.id)
+        classification = effective_file_classification(file.file_name, analysis)
+        if classification == "bank_statement":
+            if file.statement_period:
+                accepted_bank_months.add(file.statement_period)
+            accepted_bank_months.update(statement_months_from_filename(file.file_name))
+            accepted_bank_months.update(
+                statement_months_from_analysis(analysis.analysis if analysis else None)
+            )
+            nsf_count = _analysis_nsf_count(analysis)
+            if nsf_count is not None:
+                accepted_nsf_counts.append(nsf_count)
+        elif classification == "tax_return":
+            accepted_tax_years.update(_tax_years(file, analysis))
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
     metrics = snapshot.get("key_metrics") if isinstance(snapshot.get("key_metrics"), dict) else {}
     revenue = _float(
@@ -289,6 +328,17 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
             "vehicle_inventory",
         },
     )
+    equipment_financing_intent = _fact_presence(
+        combined_intake_data,
+        {
+            "financing_equipment_or_vehicle",
+            "equipment_financing",
+            "equipment_purchase",
+            "vehicle_financing",
+        },
+    )
+    if "equipment" in str(intake.loan_purpose if intake else "").casefold():
+        equipment_financing_intent = True
     if intake and "mca" in str(intake.variant).casefold():
         mca_obligations = True
     return {
@@ -309,6 +359,11 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "annual_revenue": revenue,
         "annualized_deposits": annualized_deposits,
         "deposits": annualized_deposits,
+        "bank_statement_months": len(accepted_bank_months),
+        "tax_return_years": len(accepted_tax_years),
+        "nsf_or_overdraft_count": (
+            sum(accepted_nsf_counts) if accepted_nsf_counts else None
+        ),
         "credit_score": credit_score,
         "estimated_credit_score": credit_score,
         "dscr": _float(metrics.get("estimated_dscr") or metrics.get("dscr")),
@@ -326,6 +381,7 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         "declared_collateral": declared_collateral,
         "mca_obligations_present": mca_obligations,
         "floorplan_inventory_present": floorplan_inventory,
+        "equipment_financing_intent": equipment_financing_intent,
     }
 
 
