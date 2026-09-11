@@ -3198,6 +3198,15 @@ async def create_chat_reply(
         db.add(assistant)
         await db.flush()
         proposals = await _create_proposals(db, bucket=bucket, source_message=assistant, parsed=parsed, audience=audience, upload_link=upload_link, share=share, vendor_access=vendor_access, user=user)
+        if audience == "uploader":
+            from app.services.intake_chat_actions import author_actions_for_message
+
+            await author_actions_for_message(
+                db,
+                message=assistant,
+                upload_link=upload_link,
+                intake_id=intake_id,
+            )
         await log_bucket_ai_activity(db, bucket.id, "ai_chat_message_created", user=user, actor_name=actor_name, actor_role=audience, target_type="ai_message", target_id=str(user_row.id), detail=message[:180])
         return [user_row, assistant], proposals, suggested_widget
     except Exception as exc:  # noqa: BLE001
@@ -3219,6 +3228,123 @@ async def create_chat_reply(
         return [user_row, assistant], [], None
 
 
+async def _program_context_for_chat(
+    db: AsyncSession,
+    *,
+    bucket_id: UUID,
+    intake_id: UUID | None,
+    upload_link_id: UUID | None,
+    audience: str,
+) -> dict[str, Any] | None:
+    """Expose selected playbook knowledge without leaking staff-only fit data."""
+    from app.models.ai_playbook import AICollectionRequirement
+    from app.models.application_profile import (
+        ApplicationProgramRequirementOverride,
+        ApplicationRequirementState,
+    )
+    from app.services.application_programs import active_selections, profile_for_chat_scope
+
+    profile = await profile_for_chat_scope(
+        db,
+        bucket_id=bucket_id,
+        intake_id=intake_id,
+        upload_link_id=upload_link_id,
+    )
+    if profile is None:
+        return None
+    selections = await active_selections(db, profile.id)
+    if not selections:
+        return None
+    states = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementState)
+                .where(ApplicationRequirementState.profile_id == profile.id)
+                .order_by(ApplicationRequirementState.created_at)
+            )
+        ).scalars().all()
+    )
+    definitions = list(
+        (
+            await db.execute(
+                select(AICollectionRequirement).where(
+                    AICollectionRequirement.playbook_id.in_([item.playbook_id for item in selections])
+                )
+            )
+        ).scalars().all()
+    )
+    client_visible = {
+        row.requirement_key
+        for row in definitions
+        if {"borrower", "client"}.intersection(set(row.visibility or []))
+    }
+    overrides = list(
+        (
+            await db.execute(
+                select(ApplicationProgramRequirementOverride).where(
+                    ApplicationProgramRequirementOverride.selection_id.in_([item.id for item in selections]),
+                    ApplicationProgramRequirementOverride.restored_at.is_(None),
+                )
+            )
+        ).scalars().all()
+    )
+    selection_by_id = {item.id: item for item in selections}
+    override_map = {
+        (selection_by_id[row.selection_id].program_key, row.requirement_key): row.disposition
+        for row in overrides
+        if row.selection_id in selection_by_id
+    }
+    if audience == "admin":
+        return {
+            "selection_mode": profile.program_selection_mode,
+            "selected_programs": [
+                {
+                    "program_key": item.program_key,
+                    "program_name": item.program_name,
+                    "playbook_version": item.playbook_version,
+                }
+                for item in selections
+            ],
+            "shared_requirements": [
+                {
+                    "requirement_key": item.requirement_key,
+                    "label": item.label,
+                    "status": item.status,
+                    "required_level": item.required_level,
+                    "source_program_keys": list(item.source_program_keys or []),
+                    "program_overrides": {
+                        program_key: disposition
+                        for (program_key, key), disposition in override_map.items()
+                        if key == item.requirement_key
+                    },
+                }
+                for item in states
+            ],
+        }
+    return {
+        "requirements": [
+            {
+                "requirement_key": item.requirement_key,
+                "label": item.label,
+                "status": item.status,
+                "required_level": item.required_level,
+                "online_or_template_actions_available": item.requirement_key
+                in {
+                    "owner_personal_financial_statement",
+                    "business_debt_schedule",
+                    "ytd_p_and_l_balance_sheet",
+                },
+            }
+            for item in states
+            if item.requirement_key in client_visible
+        ],
+        "instructions": (
+            "Use these deterministic requirement states to choose one next missing item. "
+            "Do not disclose program names, fit scores, rankings, or unpublished criteria."
+        ),
+    }
+
+
 async def _chat_context(
     db: AsyncSession,
     *,
@@ -3229,6 +3355,13 @@ async def _chat_context(
     vendor_access: BucketVendorAccess | None,
     intake_id: UUID | None = None,
 ) -> dict[str, Any]:
+    program_context = await _program_context_for_chat(
+        db,
+        bucket_id=bucket.id,
+        intake_id=intake_id,
+        upload_link_id=upload_link.id if upload_link else None,
+        audience=audience,
+    )
     base = {
         "bucket": {
             "name": bucket.name,
@@ -3268,6 +3401,7 @@ async def _chat_context(
             "linked_evidence_files": [_file_context(file) for file in linked_files],
             "notes": [_note_context(note) for note in bucket.notes],
             "latest_review": review.result if review else None,
+            "program_readiness": program_context,
             "action_items": [_task_context(task) for task in tasks],
             "instructions": "When the admin asks for tasks or document requests, use the template library where it fits. If no template matches, create a custom action item with route uploader/admin/share.",
         }
@@ -3296,6 +3430,7 @@ async def _chat_context(
             "document_evidence_map": evidence_map,
             "next_best_action": latest_result.get("next_best_action") if latest_result else None,
             "baseline_coverage": (evidence_map or {}).get("baseline_coverage") if evidence_map else None,
+            "deterministic_requirements": program_context,
             "instructions": (
                 "Help the uploader understand what is already uploaded, what is still needed, and how to submit files. "
                 "Do not discuss admin notes or shares. External users cannot change saved AI instructions."

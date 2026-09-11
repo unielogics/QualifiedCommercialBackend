@@ -11,10 +11,13 @@ explicitly publish. Active client plans pin to a specific version so
 edits don't disrupt in-flight deals.
 """
 
+# FastAPI dependency injection is expressed through callable defaults.
+# ruff: noqa: B008
+
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
@@ -29,6 +32,7 @@ from app.enums import Role
 from app.models.ai_cadence_rule import AICadenceRule
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
 from app.services.ai.audit import record_event
+from app.services.program_rules import ProgramRuleError, validate_rules
 
 router = APIRouter(prefix="/lending-admin", tags=["lending-admin"])
 log = logging.getLogger(__name__)
@@ -40,6 +44,21 @@ def _require_admin(user) -> None:
             status.HTTP_403_FORBIDDEN,
             "Lending AI Settings is super-admin / loan-exec only.",
         )
+
+
+def _require_governance(user) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only a super admin may change or publish Lending AI criteria.",
+        )
+
+
+def _validate_program_rules_or_422(rules: dict | None) -> None:
+    try:
+        validate_rules(rules)
+    except ProgramRuleError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 # ── Loan Product Playbooks ─────────────────────────────────────────
@@ -101,7 +120,8 @@ async def create_funding_playbook(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PlaybookOut:
-    _require_admin(user)
+    _require_governance(user)
+    _validate_program_rules_or_422(payload.rules)
     pb = AIPlaybookTemplate(
         owner_type="funding",
         owner_id=user.id,
@@ -134,7 +154,9 @@ async def update_funding_playbook(
 
     `fork=False` allows in-place edits ONLY if the row is still in
     `draft` status."""
-    _require_admin(user)
+    _require_governance(user)
+    if payload.rules is not None:
+        _validate_program_rules_or_422(payload.rules)
     pb = await db.get(AIPlaybookTemplate, playbook_id)
     if pb is None or not pb.is_active:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Playbook not found")
@@ -216,14 +238,15 @@ async def publish_playbook(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PlaybookOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await db.get(AIPlaybookTemplate, playbook_id)
     if pb is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Playbook not found")
+    _validate_program_rules_or_422(pb.rules)
     if pb.status == "published":
         return _serialize_playbook(pb)
     pb.status = "published"
-    pb.published_at = datetime.now(timezone.utc)
+    pb.published_at = datetime.now(UTC)
     await record_event(
         db, event_type="playbook_published", actor_type="user", actor_id=user.id,
         playbook_id=pb.id, new_value={"version": pb.version, "status": pb.status},
@@ -241,7 +264,7 @@ async def duplicate_from_platform(
 ) -> PlaybookOut:
     """Fork the platform default into a funding-owned draft. Funding
     team can then edit + publish without touching the platform row."""
-    _require_admin(user)
+    _require_governance(user)
     src = await db.get(AIPlaybookTemplate, platform_playbook_id)
     if src is None or src.owner_type != "platform":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Platform playbook not found")
@@ -405,7 +428,7 @@ async def upsert_requirement(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> RequirementOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await db.get(AIPlaybookTemplate, playbook_id)
     if pb is None or pb.owner_type == "platform":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Platform playbooks are read-only")
@@ -473,7 +496,7 @@ async def delete_requirement(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    _require_admin(user)
+    _require_governance(user)
     pb = await db.get(AIPlaybookTemplate, playbook_id)
     if pb is None or pb.owner_type == "platform":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Platform playbooks are read-only")
@@ -546,7 +569,7 @@ async def upsert_funding_cadence(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> CadenceRuleOut:
-    _require_admin(user)
+    _require_governance(user)
     if payload.playbook_id:
         pb = await db.get(AIPlaybookTemplate, payload.playbook_id)
         if pb is None or pb.owner_type == "platform":
@@ -586,7 +609,7 @@ async def delete_funding_cadence(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    _require_admin(user)
+    _require_governance(user)
     row = await db.get(AICadenceRule, rule_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Rule not found")
@@ -653,7 +676,7 @@ async def patch_verification_rules(
     payload: FundingRulesPatch,
     user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> FundingRulesOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await _ensure_funding_meta_playbook_async(db, user, "verification")
     old = pb.rules or {}
     pb.rules = payload.rules or {}
@@ -679,7 +702,7 @@ async def patch_escalation_rules(
     payload: FundingRulesPatch,
     user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> FundingRulesOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await _ensure_funding_meta_playbook_async(db, user, "escalation")
     old = pb.rules or {}
     pb.rules = payload.rules or {}
@@ -717,7 +740,7 @@ async def patch_follow_up_rules(
     payload: FundingRulesPatch,
     user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> FundingRulesOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await _ensure_funding_meta_playbook_async(db, user, "follow_up")
     old = pb.rules or {}
     pb.rules = payload.rules or {}
@@ -743,7 +766,7 @@ async def patch_communication_rules(
     payload: FundingRulesPatch,
     user: CurrentUser, db: AsyncSession = Depends(get_db),
 ) -> FundingRulesOut:
-    _require_admin(user)
+    _require_governance(user)
     pb = await _ensure_funding_meta_playbook_async(db, user, "communication")
     old = pb.rules or {}
     pb.rules = payload.rules or {}
@@ -948,7 +971,7 @@ async def _save_ai_task_config(
     training = dict(rules.get("task_training") or {})
     entry = dict(entry)
     entry["updated_by"] = str(user.id)
-    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    entry["updated_at"] = datetime.now(UTC).isoformat()
     training[task_key] = entry
     rules["task_training"] = training
     old = pb.rules
@@ -1084,14 +1107,14 @@ async def get_ai_training_feedback(
 
 def _usage_window(from_date: str | None, to_date: str | None) -> tuple[datetime, datetime]:
     """Parse optional ISO dates → [start, end). Defaults to last 30 days."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     end = now
     start = now - timedelta(days=30)
     try:
         if to_date:
-            end = datetime.fromisoformat(to_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+            end = datetime.fromisoformat(to_date).replace(tzinfo=UTC) + timedelta(days=1)
         if from_date:
-            start = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
+            start = datetime.fromisoformat(from_date).replace(tzinfo=UTC)
     except ValueError:
         pass
     return start, end
@@ -1105,8 +1128,8 @@ async def token_usage_summary(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(user)
-    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.ai_usage_event import AIUsageEvent as E
 
     start, end = _usage_window(from_date, to_date)
     legacy_row = (
@@ -1169,8 +1192,8 @@ async def token_usage_breakdown(
 ):
     _require_admin(user)
     from app.models.ai_agent import AIAgent
-    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.broker import Broker
     from app.models.deal import Deal
     from app.models.loan import Loan
@@ -1345,8 +1368,8 @@ async def token_usage_breakdown(
         deal_ids = [r[0] for r in deal_raw]
         loan_lbl, deal_lbl = {}, {}
         if loan_ids:
-            for l in (await db.execute(select(Loan.id, Loan.deal_id, Loan.address).where(Loan.id.in_(loan_ids)))).all():
-                loan_lbl[l[0]] = (l[1] or "loan") + (f" · {l[2]}" if l[2] else "")
+            for loan_row in (await db.execute(select(Loan.id, Loan.deal_id, Loan.address).where(Loan.id.in_(loan_ids)))).all():
+                loan_lbl[loan_row[0]] = (loan_row[1] or "loan") + (f" · {loan_row[2]}" if loan_row[2] else "")
         if deal_ids:
             for d in (await db.execute(select(Deal.id, Deal.title).where(Deal.id.in_(deal_ids)))).all():
                 deal_lbl[d[0]] = d[1] or "deal"
@@ -1400,8 +1423,8 @@ async def token_usage_timeseries(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(user)
-    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.ai_usage_event import AIUsageEvent as E
 
     start, end = _usage_window(from_date, to_date)
     legacy_bucket = func.date_trunc("day", U.created_at).label("day")
@@ -1495,8 +1518,8 @@ async def token_usage_attribution(
     explicitly named as a projection/run-rate.
     """
     _require_admin(user)
-    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.ai_token_usage import AITokenUsage as U
+    from app.models.ai_usage_event import AIUsageEvent as E
     from app.models.bucket import Bucket
     from app.models.client import Client
     from app.models.deal import Deal

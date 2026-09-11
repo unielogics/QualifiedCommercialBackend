@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -51,6 +52,8 @@ class BucketRequestedDocumentRead(ORMModel):
     signature_kind: str | None
     template_file_id: UUID | None
     signature_document_text: str | None
+    requirement_key: str | None = None
+    requirement_source: dict | None = None
     template_download_url: str | None = None
 
 
@@ -653,9 +656,37 @@ class BucketAIMessageRead(ORMModel):
     created_at: datetime
 
 
+class IntakeChatActionRead(ORMModel):
+    id: UUID
+    source_message_id: UUID
+    requested_document_id: UUID | None = None
+    requirement_key: str
+    action_type: str
+    template_kind: str | None = None
+    label: str
+    status: str
+    expires_at: datetime
+    executed_at: datetime | None = None
+    result: dict | None = None
+
+
+class IntakeChatActionExecute(BaseModel):
+    passcode: str | None = Field(default=None, max_length=80)
+
+
+class IntakeChatActionResult(BaseModel):
+    action_id: UUID
+    status: Literal["executed", "failed"]
+    detail: str
+    download_url: str | None = None
+    room_url: str | None = None
+    delivery: dict | None = None
+
+
 class BucketAIChatResponse(BaseModel):
     messages: list[BucketAIMessageRead]
     proposed_action_items: list[BucketAIActionItemRead] = []
+    chat_actions: list[IntakeChatActionRead] = []
 
 
 class BucketAIActionItemRead(ORMModel):

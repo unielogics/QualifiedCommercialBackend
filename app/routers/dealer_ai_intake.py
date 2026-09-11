@@ -37,10 +37,11 @@ from app.enums import (
     Role,
 )
 from app.models.activity import Activity
-from app.models.application_profile import ApplicationRoomDelivery
+from app.models.application_profile import ApplicationProfile, ApplicationRoomDelivery
 from app.models.booking_settings import BookingSettings
 from app.models.bucket import (
     Bucket,
+    BucketAIChatAction,
     BucketAIMessage,
     BucketAIReview,
     BucketDocumentSignature,
@@ -84,6 +85,8 @@ from app.schemas.bucket import (
     BucketNoteRead,
     BucketRequestedDocumentRead,
     BucketRequestUploadedFileRead,
+    IntakeChatActionRead,
+    IntakeChatActionResult,
 )
 from app.schemas.common import ORMModel
 from app.schemas.phone import OptionalPhone, RequiredPhone
@@ -111,6 +114,11 @@ from app.services.bucket_ai import (
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
+from app.services.intake_chat_actions import (
+    actions_for_messages,
+    execute_room_action,
+    template_for_action,
+)
 from app.services.main_street_programs import (
     TERM_3_5_MIN_DSCR,
     TERM_3_5_MIN_REVENUE,
@@ -779,6 +787,8 @@ class LeadProgramFitResponse(BaseModel):
     the same program keys as PROGRAM_LABELS/_compute_loan_program_fit."""
     computed: bool
     programs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    readiness: dict[str, Any] | None = None
 
 
 class DealerIntakePatch(BaseModel):
@@ -1148,6 +1158,7 @@ class DealerIntakeResponse(BaseModel):
     ai_summary: dict[str, Any] | None = None
     latest_review: BucketAIReviewRead | None = None
     messages: list[BucketAIMessageRead] = []
+    chat_actions: list[IntakeChatActionRead] = []
     artifacts: list[PublicUnderwritingArtifactRead] = []
     email_sends: list[PublicUnderwritingEmailSendRead] = []
     # Internal admin <-> dealer-partner notes thread. Populated only for the
@@ -4973,11 +4984,16 @@ async def _response(
         upload_url=_public_url(f"/buckets/request/{intake.bucket_upload_link.token}") if intake.bucket_upload_link else None,
         assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
-        requested_documents=[_requested_document_read(doc) for doc in intake.bucket.requested_documents],
+        requested_documents=[
+            _requested_document_read(doc)
+            for doc in intake.bucket.requested_documents
+            if doc.status != "not_applicable"
+        ],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=summary,
         latest_review=review_read,
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
+        chat_actions=await actions_for_messages(db, list(messages or [])),
         artifacts=[_artifact_read(artifact) for artifact in artifacts],
         email_sends=[_email_send_read(row) for row in email_sends],
         notes=[
@@ -5581,7 +5597,15 @@ async def _submit_pfs_form(
 ) -> BucketFile:
     if not payload.acknowledgment:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
-    req = next((doc for doc in intake.bucket.requested_documents if doc.category == "Personal Financials"), None)
+    req = next(
+        (
+            doc
+            for doc in intake.bucket.requested_documents
+            if getattr(doc, "requirement_key", None) == "owner_personal_financial_statement"
+            or doc.category == "Personal Financials"
+        ),
+        None,
+    )
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Personal financial statement is not requested on this intake")
 
@@ -5680,7 +5704,15 @@ async def _submit_debt_schedule_form(
 ) -> BucketFile:
     if not payload.acknowledgment:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "You must acknowledge the disclaimer to submit this form")
-    req = next((doc for doc in intake.bucket.requested_documents if doc.category == "Debts"), None)
+    req = next(
+        (
+            doc
+            for doc in intake.bucket.requested_documents
+            if getattr(doc, "requirement_key", None) == "business_debt_schedule"
+            or doc.category == "Debts"
+        ),
+        None,
+    )
     if req is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Debt schedule is not requested on this intake")
     if req.status == "uploaded":
@@ -7806,6 +7838,7 @@ async def broker_dealer_lead_chat(
             message=payload.message.strip(),
             actor_name=user.name or "Dealer partner",
             user=user,
+            intake_id=intake.id,
         )
         if chat_messages:
             assistant_message = chat_messages[-1].content
@@ -8468,7 +8501,25 @@ async def get_lead_program_fit(
     if intake.variant == FUNDING_VARIANT:
         return LeadProgramFitResponse(computed=False)
     fit = _compute_loan_program_fit(intake)
-    return LeadProgramFitResponse(computed=True, programs=fit)
+    profile = (
+        await db.execute(
+            select(ApplicationProfile).where(ApplicationProfile.intake_id == intake.id)
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        return LeadProgramFitResponse(computed=True, programs=fit)
+    from app.services.application_programs import get_program_readiness
+
+    normalized = await get_program_readiness(db, profile)
+    # Readiness can pin the first automatic selection and materialize stable
+    # requirement rows. Persist those deterministic first-read writes here too.
+    await db.commit()
+    return LeadProgramFitResponse(
+        computed=True,
+        programs=fit,
+        candidates=[candidate.model_dump(mode="json") for candidate in normalized.candidates],
+        readiness=normalized.model_dump(mode="json"),
+    )
 
 
 class LeadDscrPotentialResponse(BaseModel):
@@ -8805,6 +8856,7 @@ async def _client_chat_turn(
         user=user,
         upload_link=link,
         preferred_language=intake.preferred_language,
+        intake_id=getattr(intake, "id", None),
         sender_kind="client",
     )
     return chat_messages, (chat_messages[-1].content if chat_messages else None), False
@@ -9620,6 +9672,111 @@ async def dealer_intake_chat(
     )
 
 
+async def _intake_chat_action(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    action_id: UUID,
+) -> BucketAIChatAction:
+    action = (
+        await db.execute(
+            select(BucketAIChatAction).where(
+                BucketAIChatAction.id == action_id,
+                BucketAIChatAction.bucket_id == intake.bucket_id,
+                BucketAIChatAction.upload_link_id == intake.bucket_upload_link_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if action is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Chat action not found")
+    if action.expires_at <= _now() and action.status == "available":
+        action.status = "expired"
+        await db.flush()
+    if action.status in {"expired", "disabled"}:
+        raise HTTPException(status.HTTP_410_GONE, "This action is no longer available")
+    return action
+
+
+@router.post("/{token}/chat-actions/{action_id}", response_model=IntakeChatActionResult)
+@funding_router.post("/{token}/chat-actions/{action_id}", response_model=IntakeChatActionResult)
+@mca_router.post("/{token}/chat-actions/{action_id}", response_model=IntakeChatActionResult)
+async def execute_public_intake_chat_action(
+    token: str,
+    action_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> IntakeChatActionResult:
+    intake = await _load_public_intake(db, token)
+    action = await _intake_chat_action(db, intake, action_id)
+    if intake.bucket_upload_link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This intake has no active secure room")
+    public_action_segment = (
+        "funding-review"
+        if intake.variant == FUNDING_VARIANT
+        else "mca-refinance"
+        if intake.variant == MCA_VARIANT
+        else "dealer-ai-intake"
+    )
+    result = await execute_room_action(
+        db,
+        action=action,
+        link=intake.bucket_upload_link,
+        download_url_override=(
+            f"/api/v1/public/{public_action_segment}/{token}/chat-actions/{action.id}/template"
+        ),
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        f"chat_action_{result.status}",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=f"{action.action_type}: {result.detail}"[:500],
+    )
+    await db.commit()
+    return result
+
+
+@router.get("/{token}/chat-actions/{action_id}/template")
+@funding_router.get("/{token}/chat-actions/{action_id}/template")
+@mca_router.get("/{token}/chat-actions/{action_id}/template")
+async def download_public_intake_chat_template(
+    token: str,
+    action_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    intake = await _load_public_intake(db, token)
+    action = await _intake_chat_action(db, intake, action_id)
+    if action.action_type != "download_template":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Template not found")
+    template = template_for_action(action)
+    action.status = "executed"
+    action.executed_at = action.executed_at or _now()
+    action.result = action.result or {"detail": "Template downloaded"}
+    await _log(
+        db,
+        intake.bucket_id,
+        "chat_template_downloaded",
+        request=request,
+        actor_name=intake.full_name,
+        actor_email=intake.email,
+        actor_role="public_lead",
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=template.filename,
+    )
+    await db.commit()
+    return Response(
+        content=template.content,
+        media_type=template.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{template.filename}"'},
+    )
+
+
 @router.post("/{token}/files/upload-init", response_model=BucketFileUploadInitResponse)
 async def dealer_upload_init(
     token: str,
@@ -9922,6 +10079,74 @@ async def my_dealer_intake_chat(
         token=None,
         assistant_message=assistant_message,
         messages=messages,
+    )
+
+
+@client_router.post("/{intake_id}/chat-actions/{action_id}", response_model=IntakeChatActionResult)
+async def execute_my_intake_chat_action(
+    intake_id: UUID,
+    action_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> IntakeChatActionResult:
+    intake = await _load_client_intake(db, user, intake_id)
+    action = await _intake_chat_action(db, intake, action_id)
+    if intake.bucket_upload_link is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This intake has no active secure room")
+    result = await execute_room_action(
+        db,
+        action=action,
+        link=intake.bucket_upload_link,
+        download_url_override=(
+            f"/api/v1/buckets/client/intakes/{intake.id}/chat-actions/{action.id}/template"
+        ),
+    )
+    await _log(
+        db,
+        intake.bucket_id,
+        f"chat_action_{result.status}",
+        request=request,
+        user=user,
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=f"{action.action_type}: {result.detail}"[:500],
+    )
+    await db.commit()
+    return result
+
+
+@client_router.get("/{intake_id}/chat-actions/{action_id}/template")
+async def download_my_intake_chat_template(
+    intake_id: UUID,
+    action_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    intake = await _load_client_intake(db, user, intake_id)
+    action = await _intake_chat_action(db, intake, action_id)
+    if action.action_type != "download_template":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Template not found")
+    template = template_for_action(action)
+    action.status = "executed"
+    action.executed_at = action.executed_at or _now()
+    action.result = action.result or {"detail": "Template downloaded"}
+    await _log(
+        db,
+        intake.bucket_id,
+        "chat_template_downloaded",
+        request=request,
+        user=user,
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=template.filename,
+    )
+    await db.commit()
+    return Response(
+        content=template.content,
+        media_type=template.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{template.filename}"'},
     )
 
 

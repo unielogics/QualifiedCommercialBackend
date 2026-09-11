@@ -34,6 +34,10 @@ def test_all_client_and_admin_intake_conversation_routes_remain_registered() -> 
     assert ("/buckets/client/intakes/{intake_id}/chat", "POST") in _route_contract(client_router)
     assert ("/admin/ai-underwriter-leads/{intake_id}/chat", "POST") in _route_contract(admin_router)
     assert ("/admin/ai-underwriter-leads/{intake_id}/client-thread", "GET") in _route_contract(admin_router)
+    assert ("/public/dealer-ai-intake/{token}/chat-actions/{action_id}", "POST") in _route_contract(router)
+    assert ("/public/funding-review/{token}/chat-actions/{action_id}", "POST") in _route_contract(funding_router)
+    assert ("/public/mca-refinance/{token}/chat-actions/{action_id}", "POST") in _route_contract(mca_router)
+    assert ("/buckets/client/intakes/{intake_id}/chat-actions/{action_id}", "POST") in _route_contract(client_router)
 
 
 def test_client_transcript_access_stays_super_admin_only() -> None:
@@ -84,6 +88,7 @@ async def test_private_underwriter_context_includes_selected_linked_evidence(mon
     )
     monkeypatch.setattr(bucket_ai, "latest_review", AsyncMock(return_value=None))
     monkeypatch.setattr(bucket_ai, "visible_action_items", AsyncMock(return_value=[]))
+    monkeypatch.setattr(bucket_ai, "_program_context_for_chat", AsyncMock(return_value=None))
     selected = AsyncMock(return_value=[linked])
     monkeypatch.setattr(operator_file_links, "selected_files_for_intake", selected)
     intake_id = uuid4()

@@ -15,7 +15,17 @@ from uuid import UUID, uuid4
 
 import boto3
 from botocore.config import Config
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
@@ -110,6 +120,9 @@ from app.schemas.bucket import (
     BucketVendorAccessReadResponse,
     BucketVendorBucketRead,
     BucketVendorRead,
+    IntakeChatActionExecute,
+    IntakeChatActionRead,
+    IntakeChatActionResult,
 )
 from app.services import clerk as clerk_service
 from app.services import file_events
@@ -123,6 +136,13 @@ from app.services.bucket_ai import (
     upload_link_visible_summary,
     vendor_visible_summary,
     visible_action_items,
+)
+from app.services.intake_chat_actions import (
+    actions_for_messages,
+    author_actions_for_message,
+    execute_room_action,
+    load_action_for_room,
+    template_for_action,
 )
 from app.services.merchant_processing import is_offer_document
 
@@ -2520,7 +2540,11 @@ async def request_link_access(
         allow_notes=link.allow_notes,
         can_use_ai_chat=link.can_use_ai_chat,
         can_view_ai_tasks=link.can_view_ai_tasks,
-        requested_documents=[BucketRequestedDocumentRead.model_validate(d) for d in link.bucket.requested_documents],
+        requested_documents=[
+            BucketRequestedDocumentRead.model_validate(d)
+            for d in link.bucket.requested_documents
+            if d.status != "not_applicable"
+        ],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=upload_link_visible_summary(review, link.bucket),
     )
@@ -2761,10 +2785,124 @@ async def request_ai_chat(
         upload_link=link,
         sender_kind="client",
     )
+    assistant = next((message for message in reversed(messages) if message.role == "assistant"), None)
+    if assistant:
+        await author_actions_for_message(db, message=assistant, upload_link=link)
+    chat_actions = await actions_for_messages(db, messages)
     await db.commit()
     return BucketAIChatResponse(
         messages=[BucketAIMessageRead.model_validate(message) for message in messages],
         proposed_action_items=[BucketAIActionItemRead.model_validate(item) for item in proposals],
+        chat_actions=chat_actions,
+    )
+
+
+@router.post(
+    "/request/{token}/chat-actions",
+    response_model=list[IntakeChatActionRead],
+)
+async def list_request_chat_actions(
+    token: str,
+    payload: BucketRequestAccessRequest,
+    db: AsyncSession = Depends(get_db),
+) -> list[IntakeChatActionRead]:
+    link = await _load_upload_link_or_404(db, token)
+    if not _verify_passcode(payload.passcode, link.passcode_hash):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    messages = list(
+        (
+            await db.execute(
+                select(BucketAIMessage).where(
+                    BucketAIMessage.bucket_id == link.bucket_id,
+                    BucketAIMessage.upload_link_id == link.id,
+                    BucketAIMessage.audience == "uploader",
+                )
+            )
+        ).scalars().all()
+    )
+    return await actions_for_messages(db, messages)
+
+
+@router.post(
+    "/request/{token}/chat-actions/{action_id}",
+    response_model=IntakeChatActionResult,
+)
+async def execute_request_chat_action(
+    token: str,
+    action_id: UUID,
+    payload: IntakeChatActionExecute,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> IntakeChatActionResult:
+    link = await _load_upload_link_or_404(db, token)
+    if not _verify_passcode(payload.passcode or "", link.passcode_hash):
+        await _log(
+            db,
+            link.bucket_id,
+            "upload_passcode_failed",
+            request=request,
+            actor_name=link.recipient_name,
+            actor_email=link.recipient_email,
+            actor_role="uploader",
+            target_type="chat_action",
+            target_id=str(action_id),
+            detail="execute chat action",
+        )
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    action = await load_action_for_room(db, action_id=action_id, link=link)
+    result = await execute_room_action(db, action=action, link=link)
+    await _log(
+        db,
+        link.bucket_id,
+        f"chat_action_{result.status}",
+        request=request,
+        actor_name=link.recipient_name,
+        actor_email=link.recipient_email,
+        actor_role="uploader",
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=f"{action.action_type}: {result.detail}"[:500],
+    )
+    await db.commit()
+    return result
+
+
+@router.get("/request/{token}/chat-actions/{action_id}/template")
+async def download_request_chat_template(
+    token: str,
+    action_id: UUID,
+    request: Request,
+    room_passcode: str = Header(default="", alias="X-Room-Passcode"),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    link = await _load_upload_link_or_404(db, token)
+    if not _verify_passcode(room_passcode, link.passcode_hash):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+    action = await load_action_for_room(db, action_id=action_id, link=link)
+    if action.action_type != "download_template":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Template not found")
+    template = template_for_action(action)
+    action.status = "executed"
+    action.executed_at = action.executed_at or _now()
+    action.result = action.result or {"detail": "Template downloaded"}
+    await _log(
+        db,
+        link.bucket_id,
+        "chat_template_downloaded",
+        request=request,
+        actor_name=link.recipient_name,
+        actor_email=link.recipient_email,
+        actor_role="uploader",
+        target_type="chat_action",
+        target_id=str(action.id),
+        detail=template.filename,
+    )
+    await db.commit()
+    return Response(
+        content=template.content,
+        media_type=template.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{template.filename}"'},
     )
 
 

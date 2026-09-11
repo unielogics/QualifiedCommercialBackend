@@ -18,6 +18,16 @@ UnderwritingLifecycleStatus = Literal[
     "closed_lost",
     "denied",
 ]
+RequirementStateStatus = Literal[
+    "missing",
+    "requested",
+    "received_unverified",
+    "verified",
+    "waived",
+    "not_applicable",
+    "stale",
+    "failed",
+]
 
 
 class ApplicationProfileResolve(BaseModel):
@@ -69,7 +79,145 @@ class ApplicationProfileRead(BaseModel):
     underwriting_notes: str | None = None
     underwriting_updated_by_user_id: UUID | None = None
     underwriting_updated_at: datetime | None = None
+    program_selection_mode: Literal["auto", "manual"] = "auto"
+    program_selection_locked_at: datetime | None = None
+    program_selection_locked_by_user_id: UUID | None = None
+    missing_item_email_enabled: bool = True
+    missing_item_email_last_sent_at: datetime | None = None
+    missing_item_email_next_send_at: datetime | None = None
+    missing_item_email_attempts: int = 0
+    missing_item_email_requirement_key: str | None = None
     owner_storage: Literal["application", "dealer"]
+
+
+class ProgramFitCandidate(BaseModel):
+    program_key: str
+    program_name: str
+    playbook_id: UUID
+    playbook_version: int
+    eligible: bool
+    fit_score: float = 0
+    confidence: float = 0
+    priority: int = 0
+    reasons: list[str] = Field(default_factory=list)
+
+
+class ApplicationProgramSelectionRead(BaseModel):
+    id: UUID
+    program_key: str
+    program_name: str
+    playbook_id: UUID
+    playbook_version: int
+    source: Literal["ai_auto", "operator"]
+    fit_score: float | None = None
+    fit_confidence: float | None = None
+    fit_reasons: list[str] = Field(default_factory=list)
+    selected_at: datetime
+
+
+class ApplicationRequirementRead(BaseModel):
+    requirement_key: str
+    label: str
+    category: str
+    required_level: Literal["required", "recommended", "optional"]
+    status: RequirementStateStatus
+    requested_document_id: UUID | None = None
+    evidence_file_id: UUID | None = None
+    evidence_file_name: str | None = None
+    verification_required: bool = False
+    source_program_keys: list[str] = Field(default_factory=list)
+    program_overrides: dict[str, str] = Field(default_factory=dict)
+    client_visible: bool = False
+    can_waive: bool = False
+    state_reason: str | None = None
+    last_requested_at: datetime | None = None
+    received_at: datetime | None = None
+    verified_at: datetime | None = None
+    provenance: dict = Field(default_factory=dict)
+
+
+class ProgramReadinessItem(BaseModel):
+    selection_id: UUID
+    program_key: str
+    program_name: str
+    complete: bool = False
+    completion_percent: int = 0
+    required_count: int = 0
+    satisfied_count: int = 0
+    blocking_requirement_keys: list[str] = Field(default_factory=list)
+    requirement_keys: list[str] = Field(default_factory=list)
+
+
+class MissingItemAutomationRead(BaseModel):
+    enabled: bool = False
+    eligible: bool = False
+    next_requirement_key: str | None = None
+    next_send_at: datetime | None = None
+    last_sent_at: datetime | None = None
+    attempts: int = 0
+    max_attempts: int = 3
+    stop_reason: str | None = None
+
+
+class ApplicationProgramReadiness(BaseModel):
+    profile_id: UUID
+    lending_applicable: bool = True
+    selection_mode: Literal["auto", "manual"] = "auto"
+    selections: list[ApplicationProgramSelectionRead] = Field(default_factory=list)
+    candidates: list[ProgramFitCandidate] = Field(default_factory=list)
+    programs: list[ProgramReadinessItem] = Field(default_factory=list)
+    requirements: list[ApplicationRequirementRead] = Field(default_factory=list)
+    can_advance: bool = False
+    automation: MissingItemAutomationRead
+
+
+class ApplicationProgramsPatch(BaseModel):
+    program_keys: list[str] = Field(default_factory=list, max_length=20)
+    return_to_ai: bool = False
+    confirmed: Literal[True]
+    reason: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _validate_program_action(self) -> ApplicationProgramsPatch:
+        if self.return_to_ai and self.program_keys:
+            raise ValueError("Return to AI selection cannot include manual program keys")
+        return self
+
+
+class ApplicationRequirementPatch(BaseModel):
+    action: Literal[
+        "link_evidence",
+        "verify",
+        "unverify",
+        "waive",
+        "not_applicable",
+        "restore",
+        "failed",
+    ]
+    evidence_file_id: UUID | None = None
+    program_keys: list[str] = Field(default_factory=list)
+    all_programs: bool = False
+    reason: str | None = Field(default=None, max_length=2000)
+    confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def _validate_requirement_action(self) -> ApplicationRequirementPatch:
+        if self.action == "link_evidence" and self.evidence_file_id is None:
+            raise ValueError("Select an evidence file")
+        if self.action in {"waive", "not_applicable"} and len((self.reason or "").strip()) < 8:
+            raise ValueError("A reason of at least eight characters is required")
+        if self.all_programs and self.program_keys:
+            raise ValueError("Choose specific programs or all programs, not both")
+        return self
+
+
+class ApplicationRequirementReminder(BaseModel):
+    channel: Literal["email"] = "email"
+    retry_failed: bool = False
+
+
+class MissingItemAutomationPatch(BaseModel):
+    enabled: bool
 
 
 class ApplicationUnderwritingRead(BaseModel):
@@ -474,12 +622,16 @@ class RoomPinRotateRequest(BaseModel):
 
 class RoomDeliveryReceipt(BaseModel):
     id: UUID
+    requested_document_id: UUID | None = None
     action_kind: str
     channel: str
     recipient_masked: str | None = None
     status: str
     detail: str | None = None
     provider_accepted: bool = False
+    initiation_source: str | None = None
+    attempt_number: int = 1
+    scheduled_for: datetime | None = None
     created_at: datetime
 
 

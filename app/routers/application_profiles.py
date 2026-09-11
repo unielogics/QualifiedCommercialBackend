@@ -66,6 +66,10 @@ from app.schemas.application_profile import (
     ApplicationPlaidUpdateLinkRequest,
     ApplicationProfileRead,
     ApplicationProfileResolve,
+    ApplicationProgramReadiness,
+    ApplicationProgramsPatch,
+    ApplicationRequirementPatch,
+    ApplicationRequirementReminder,
     ApplicationRoomAccess,
     ApplicationRoomConsentGrant,
     ApplicationRoomCreditInvite,
@@ -105,6 +109,7 @@ from app.schemas.application_profile import (
     FundingCategoryCreate,
     FundingCategoryRead,
     ManualBankOverrideRequest,
+    MissingItemAutomationPatch,
     PlaidAssetReportCreate,
     PlaidAssetReportRead,
     PublicBankVerificationRead,
@@ -134,6 +139,7 @@ from app.schemas.application_profile import (
 from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import (
+    application_programs,
     business_statement_schema,
     business_statements,
     dealer_forms_pdf,
@@ -141,6 +147,7 @@ from app.services import (
     file_events,
     financial_statements,
     merchant_processing,
+    missing_item_automation,
     pfs_schema,
     plaid_lifecycle,
     plaid_policy,
@@ -829,6 +836,143 @@ async def apply_underwriting_changes(
     return loan
 
 
+@router.get("/{profile_id}/program-readiness", response_model=ApplicationProgramReadiness)
+async def get_application_program_readiness(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    readiness = await application_programs.get_program_readiness(db, profile)
+    # The first read may pin an AI-selected playbook and materialize stable
+    # requirement rows. Those writes are deterministic and idempotent.
+    await db.commit()
+    return readiness
+
+
+@router.patch("/{profile_id}/programs", response_model=ApplicationProgramReadiness)
+async def update_application_programs(
+    profile_id: UUID,
+    payload: ApplicationProgramsPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    before = [item.program_key for item in await application_programs.active_selections(db, profile.id)]
+    await application_programs.set_programs(db, profile, payload, user)
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "programs.returned_to_ai" if payload.return_to_ai else "programs.selected",
+        "Returned program selection to published AI criteria"
+        if payload.return_to_ai
+        else "Updated selected funding programs",
+        target_type="application_profile",
+        target_id=profile.id,
+        metadata={
+            "before": before,
+            "after": [item.program_key for item in readiness.selections],
+            "selection_mode": readiness.selection_mode,
+            "reason": payload.reason,
+        },
+    )
+    await db.commit()
+    return readiness
+
+
+@router.patch(
+    "/{profile_id}/requirements/{requirement_key}",
+    response_model=ApplicationProgramReadiness,
+)
+async def update_application_requirement(
+    profile_id: UUID,
+    requirement_key: str,
+    payload: ApplicationRequirementPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    await application_programs.patch_requirement(db, profile, requirement_key, payload, user)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        f"requirement.{payload.action}",
+        f"Updated requirement {requirement_key.replace('_', ' ')}",
+        target_type="application_requirement",
+        metadata={
+            "requirement_key": requirement_key,
+            "action": payload.action,
+            "evidence_file_id": str(payload.evidence_file_id) if payload.evidence_file_id else None,
+            "program_keys": payload.program_keys,
+            "all_programs": payload.all_programs,
+            "reason": payload.reason,
+        },
+    )
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await db.commit()
+    return readiness
+
+
+@router.post(
+    "/{profile_id}/requirements/{requirement_key}/reminders",
+    response_model=RoomDeliveryReceipt,
+)
+async def send_application_requirement_reminder(
+    profile_id: UUID,
+    requirement_key: str,
+    payload: ApplicationRequirementReminder,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RoomDeliveryReceipt:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    delivery = await missing_item_automation.send_requirement_email(
+        db,
+        profile=profile,
+        requirement_key=requirement_key,
+        user=user,
+        initiation_source="staff_requirement_request",
+        retry_failed=payload.retry_failed,
+    )
+    await db.commit()
+    return _room_delivery_read(delivery)
+
+
+@router.patch(
+    "/{profile_id}/missing-item-automation",
+    response_model=ApplicationProgramReadiness,
+)
+async def update_missing_item_automation(
+    profile_id: UUID,
+    payload: MissingItemAutomationPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    profile.missing_item_email_enabled = payload.enabled
+    if payload.enabled:
+        profile.missing_item_email_next_send_at = datetime.now(UTC)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "missing_item_automation.enabled" if payload.enabled else "missing_item_automation.disabled",
+        f"{'Enabled' if payload.enabled else 'Disabled'} missing-item email automation",
+        target_type="application_profile",
+        target_id=profile.id,
+    )
+    readiness = await application_programs.get_program_readiness(db, profile)
+    await db.commit()
+    return readiness
+
+
 def _masked_recipient(channel: str, email: str | None, phone: str | None) -> str | None:
     if channel == "email" and email and "@" in email:
         local, domain = email.split("@", 1)
@@ -843,6 +987,7 @@ def _room_delivery_read(row: ApplicationRoomDelivery) -> RoomDeliveryReceipt:
     provider = row.provider_result if isinstance(row.provider_result, dict) else {}
     return RoomDeliveryReceipt(
         id=row.id,
+        requested_document_id=row.requested_document_id,
         action_kind=row.action_kind,
         channel=row.channel,
         recipient_masked=_masked_recipient(
@@ -851,6 +996,9 @@ def _room_delivery_read(row: ApplicationRoomDelivery) -> RoomDeliveryReceipt:
         status=row.status,
         detail=row.detail,
         provider_accepted=bool(provider.get("accepted")),
+        initiation_source=row.initiation_source,
+        attempt_number=row.attempt_number,
+        scheduled_for=row.scheduled_for,
         created_at=row.created_at,
     )
 

@@ -32,7 +32,7 @@ from app.services.email import ses_client
 from app.services.notifications import notify_users
 from app.services.sms import optout
 
-from . import consent_delivery, precall
+from . import client_room, consent_delivery, precall
 
 log = logging.getLogger(__name__)
 
@@ -58,14 +58,7 @@ async def _room_link(db: AsyncSession, intake: PublicUnderwritingIntake) -> Buck
         link = await db.get(BucketUploadLink, intake.bucket_upload_link_id)
         if link is not None and link.status == "active":
             return link
-    return (
-        await db.execute(
-            select(BucketUploadLink)
-            .where(BucketUploadLink.bucket_id == intake.bucket_id, BucketUploadLink.status == "active")
-            .order_by(BucketUploadLink.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    return await client_room.active_link(db, intake.bucket_id)
 
 
 async def room_for_intake(

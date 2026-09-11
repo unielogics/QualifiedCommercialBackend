@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
@@ -87,6 +89,7 @@ class Bucket(TimestampMixin, Base):
     ai_reviews: Mapped[list[BucketAIReview]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     ai_messages: Mapped[list[BucketAIMessage]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
     ai_action_items: Mapped[list[BucketAIActionItem]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    ai_chat_actions: Mapped[list[BucketAIChatAction]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
 
 
 class BucketDocumentTemplate(TimestampMixin, Base):
@@ -137,6 +140,8 @@ class BucketRequestedDocument(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL"), nullable=True
     )
     signature_document_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requirement_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    requirement_source: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     bucket: Mapped[Bucket] = relationship(back_populates="requested_documents")
     template: Mapped[BucketDocumentTemplate | None] = relationship()
@@ -602,6 +607,53 @@ class BucketAIMessage(Base):
     share: Mapped[BucketShare | None] = relationship()
     vendor_access: Mapped[BucketVendorAccess | None] = relationship()
     user: Mapped[User | None] = relationship(foreign_keys=[user_id])
+
+
+class BucketAIChatAction(TimestampMixin, Base):
+    """Server-authored client action attached to an assistant message."""
+
+    __tablename__ = "bucket_ai_chat_actions"
+    __table_args__ = (
+        Index("ix_bucket_ai_chat_actions_message", "source_message_id", "created_at"),
+        Index("ix_bucket_ai_chat_actions_profile_status", "profile_id", "status"),
+        CheckConstraint(
+            "action_type IN ('upload_own','complete_now','download_template','email_template')",
+            name="ck_bucket_ai_chat_action_type",
+        ),
+        CheckConstraint(
+            "status IN ('available','executed','failed','expired','disabled')",
+            name="ck_bucket_ai_chat_action_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bucket_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("buckets.id", ondelete="CASCADE"), nullable=False
+    )
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    source_message_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_ai_messages.id", ondelete="CASCADE"), nullable=False
+    )
+    upload_link_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_upload_links.id", ondelete="CASCADE")
+    )
+    requested_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_requested_documents.id", ondelete="SET NULL")
+    )
+    requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_kind: Mapped[str | None] = mapped_column(String(40))
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="available", server_default="available")
+    recipient_email: Mapped[str | None] = mapped_column(String(320))
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict | None] = mapped_column(JSONB)
+
+    bucket: Mapped[Bucket] = relationship(back_populates="ai_chat_actions")
 
 
 class BucketAIActionItem(Base):

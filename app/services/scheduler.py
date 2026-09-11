@@ -609,12 +609,14 @@ async def job_cadence_pass() -> None:
     explicitly opts into auto-send."""
     from app.db import SessionLocal
     from app.services.ai.cadence_engine import run_cadence_pass
+    from app.services.missing_item_automation import run_missing_item_email_pass
 
     async with SessionLocal() as db:
         try:
             stats = await run_cadence_pass(db)
+            missing_item_stats = await run_missing_item_email_pass(db)
             await db.commit()
-            log.info("cadence_pass: %s", stats)
+            log.info("cadence_pass: %s; missing_item_email: %s", stats, missing_item_stats)
         except Exception:
             await db.rollback()
             log.exception("cadence_pass: failed; rolled back")

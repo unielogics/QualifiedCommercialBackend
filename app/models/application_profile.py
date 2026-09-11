@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     Boolean,
@@ -40,6 +40,10 @@ class ApplicationProfile(TimestampMixin, Base):
         CheckConstraint(
             "plaid_assets_enabled OR plaid_statements_enabled",
             name="ck_application_profiles_plaid_product_enabled",
+        ),
+        CheckConstraint(
+            "program_selection_mode IN ('auto', 'manual')",
+            name="ck_application_profiles_program_selection_mode",
         ),
     )
 
@@ -145,6 +149,141 @@ class ApplicationProfile(TimestampMixin, Base):
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     underwriting_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    program_selection_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="auto", server_default="auto"
+    )
+    program_selection_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    program_selection_locked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    missing_item_email_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    missing_item_email_last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missing_item_email_next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missing_item_email_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    missing_item_email_requirement_key: Mapped[str | None] = mapped_column(String(120))
+
+
+class ApplicationProgramSelection(TimestampMixin, Base):
+    __tablename__ = "application_program_selections"
+    __table_args__ = (
+        Index(
+            "uq_application_program_selection_active",
+            "profile_id",
+            "program_key",
+            unique=True,
+            postgresql_where=text("removed_at IS NULL"),
+        ),
+        Index("ix_application_program_selections_profile", "profile_id", "selected_at"),
+        CheckConstraint(
+            "source IN ('ai_auto', 'operator')",
+            name="ck_application_program_selection_source",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("ai_playbook_templates.id", ondelete="RESTRICT"), nullable=False
+    )
+    playbook_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    program_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    program_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    source: Mapped[str] = mapped_column(String(24), nullable=False, default="operator", server_default="operator")
+    fit_score: Mapped[float | None] = mapped_column(Numeric(8, 4))
+    fit_confidence: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    fit_reasons: Mapped[list | None] = mapped_column(JSONB)
+    selected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    selected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    removed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ApplicationRequirementState(TimestampMixin, Base):
+    __tablename__ = "application_requirement_states"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "requirement_key", name="uq_application_requirement_profile_key"),
+        Index("ix_application_requirement_states_profile_status", "profile_id", "status"),
+        CheckConstraint(
+            "status IN ('missing','requested','received_unverified','verified','waived','not_applicable','stale','failed')",
+            name="ck_application_requirement_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    label: Mapped[str] = mapped_column(String(200), nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    required_level: Mapped[str] = mapped_column(String(16), nullable=False, default="required", server_default="required")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="missing", server_default="missing")
+    requested_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_requested_documents.id", ondelete="SET NULL")
+    )
+    evidence_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
+    )
+    verification_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    source_program_keys: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+    provenance: Mapped[dict | None] = mapped_column(JSONB)
+    state_reason: Mapped[str | None] = mapped_column(Text)
+    first_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+
+class ApplicationProgramRequirementOverride(TimestampMixin, Base):
+    __tablename__ = "application_program_requirement_overrides"
+    __table_args__ = (
+        Index(
+            "uq_application_program_requirement_override_active",
+            "selection_id",
+            "requirement_key",
+            unique=True,
+            postgresql_where=text("restored_at IS NULL"),
+        ),
+        CheckConstraint(
+            "disposition IN ('waived','not_applicable','required','recommended')",
+            name="ck_application_program_requirement_override_disposition",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    selection_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("application_program_selections.id", ondelete="CASCADE"), nullable=False
+    )
+    requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    disposition: Mapped[str] = mapped_column(String(24), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restored_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
 
 
 class FundingCategory(TimestampMixin, Base):
@@ -273,6 +412,12 @@ class ApplicationRoomDelivery(TimestampMixin, Base):
         Index("ix_application_room_deliveries_profile", "profile_id", "created_at"),
         Index("ix_application_room_deliveries_bucket", "bucket_id", "created_at"),
         Index("ix_application_room_deliveries_request", "requested_document_id"),
+        Index(
+            "uq_application_room_delivery_idempotency",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -298,6 +443,10 @@ class ApplicationRoomDelivery(TimestampMixin, Base):
     )
     detail: Mapped[str | None] = mapped_column(Text)
     provider_result: Mapped[dict | None] = mapped_column(JSONB)
+    initiation_source: Mapped[str | None] = mapped_column(String(32))
+    idempotency_key: Mapped[str | None] = mapped_column(String(160))
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )

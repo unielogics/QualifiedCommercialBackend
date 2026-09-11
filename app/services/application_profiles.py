@@ -163,6 +163,9 @@ async def capture_extracted_profile_facts(
     if analysis.classification == "bank_statement" and month_match and not file.statement_period:
         file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
     await db.flush()
+    from app.services.application_programs import get_program_readiness
+
+    await get_program_readiness(db, profile)
 
 
 def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
@@ -210,6 +213,14 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
         underwriting_notes=profile.underwriting_notes,
         underwriting_updated_by_user_id=profile.underwriting_updated_by_user_id,
         underwriting_updated_at=profile.underwriting_updated_at,
+        program_selection_mode=profile.program_selection_mode,
+        program_selection_locked_at=profile.program_selection_locked_at,
+        program_selection_locked_by_user_id=profile.program_selection_locked_by_user_id,
+        missing_item_email_enabled=profile.missing_item_email_enabled,
+        missing_item_email_last_sent_at=profile.missing_item_email_last_sent_at,
+        missing_item_email_next_send_at=profile.missing_item_email_next_send_at,
+        missing_item_email_attempts=profile.missing_item_email_attempts,
+        missing_item_email_requirement_key=profile.missing_item_email_requirement_key,
         owner_storage="dealer" if profile.dealer_id else "application",
     )
 
