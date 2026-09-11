@@ -29,6 +29,8 @@ from app.models.application_profile import (
     ApplicationOwner,
     ApplicationPlaidItem,
     ApplicationProfile,
+    ApplicationRequirementEvidence,
+    ApplicationRequirementState,
     ApplicationTaxonomyEntry,
 )
 from app.models.bucket import (
@@ -40,6 +42,7 @@ from app.models.bucket import (
 )
 from app.models.client import Client
 from app.models.deal import Deal
+from app.models.funding_program import ApplicationRequirementEvidenceDecision
 from app.models.loan import Loan
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
@@ -48,6 +51,7 @@ from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
     ApplicationDraftAnalysisStatus,
     ApplicationEvidenceRead,
+    ApplicationEvidenceSummary,
     ApplicationIntelligenceRead,
     ApplicationProfileRead,
     EvidenceFileRead,
@@ -76,7 +80,26 @@ CREDIT_THRESHOLD = Decimal("20.00")
 class ManualStatementEvidence:
     months: list[str]
     file_count: int
+    accepted_file_count: int
     pending_analysis_count: int
+    needs_more_file_count: int
+    rejected_file_count: int
+    failed_analysis_count: int
+
+
+def application_evidence_summary(
+    evidence: ManualStatementEvidence,
+) -> ApplicationEvidenceSummary:
+    return ApplicationEvidenceSummary(
+        bank_statement_months=evidence.months,
+        bank_statement_file_count=evidence.file_count,
+        bank_statement_accepted_count=evidence.accepted_file_count,
+        bank_statement_processing_count=evidence.pending_analysis_count,
+        bank_statement_needs_more_count=evidence.needs_more_file_count,
+        bank_statement_rejected_count=evidence.rejected_file_count,
+        bank_statement_failed_count=evidence.failed_analysis_count,
+        bank_statement_coverage_complete=len(evidence.months) >= 6,
+    )
 
 
 def now() -> datetime:
@@ -582,17 +605,13 @@ async def resolve_profile(
     elif profile is None and isinstance(source, PublicUnderwritingIntake):
         dealer = (
             await db.execute(
-                select(DealerBusiness).where(
-                    DealerBusiness.handoff_intake_id == source.id
-                )
+                select(DealerBusiness).where(DealerBusiness.handoff_intake_id == source.id)
             )
         ).scalar_one_or_none()
         if dealer:
             profile = (
                 await db.execute(
-                    select(ApplicationProfile).where(
-                        ApplicationProfile.dealer_id == dealer.id
-                    )
+                    select(ApplicationProfile).where(ApplicationProfile.dealer_id == dealer.id)
                 )
             ).scalar_one_or_none()
             if profile and profile.intake_id is None:
@@ -654,6 +673,7 @@ async def resolve_profile(
             name=f"{label} evidence",
             bucket_type="application_profile",
             client_name=label,
+            name_sync_mode="linked",
             purpose="Application evidence and verification",
             status="collecting_documents",
             created_by_id=user.id,
@@ -666,8 +686,10 @@ async def resolve_profile(
 
     await _seed_primary_owner(db, profile)
     if profile.dealer_id is not None:
-        dealer = source if isinstance(source, DealerBusiness) else await db.get(
-            DealerBusiness, profile.dealer_id
+        dealer = (
+            source
+            if isinstance(source, DealerBusiness)
+            else await db.get(DealerBusiness, profile.dealer_id)
         )
         if dealer is not None:
             await plaid_policy.copy_latest_policy_on_handoff(dealer, profile)
@@ -746,15 +768,22 @@ async def verification_state(
     if pending:
         credit_blockers.append(f"{len(pending)} required owner credit authorization(s) pending")
     banking_blockers: list[str] = []
-    banking_complete = bool(banks) or bool(
-        profile.bank_verification_override_at and manual_evidence.file_count
+    banking_complete = (
+        bool(banks)
+        or len(manual_months) >= 6
+        or bool(profile.bank_verification_override_at and manual_evidence.file_count)
     )
     if not banking_complete:
-        banking_blockers.append(
-            "Review and approve uploaded statement evidence"
-            if manual_evidence.file_count
-            else "Connect an LLC business bank or upload statement evidence"
-        )
+        if manual_months:
+            banking_blockers.append(
+                f"{len(manual_months)} of 6 statement months accepted; add the missing periods"
+            )
+        elif manual_evidence.pending_analysis_count:
+            banking_blockers.append("Uploaded bank statements are still being analyzed")
+        elif manual_evidence.file_count:
+            banking_blockers.append("Uploaded statement evidence needs attention")
+        else:
+            banking_blockers.append("Connect an LLC business bank or upload statement evidence")
     evidence = await evidence_state(db, profile)
     blockers = ownership_blockers + credit_blockers + banking_blockers + evidence.blockers
     return FileOwnerRequirementState(
@@ -774,7 +803,10 @@ async def verification_state(
         business_banking_complete=banking_complete,
         evidence_complete=evidence.review_file_count > 0 and not evidence.blockers,
         ready_for_step_2=ready_step_2,
-        unlocked=ready_step_2 and banking_complete and not pending and evidence.review_file_count > 0,
+        unlocked=ready_step_2
+        and banking_complete
+        and not pending
+        and evidence.review_file_count > 0,
         ownership_blockers=ownership_blockers,
         credit_blockers=credit_blockers,
         banking_blockers=banking_blockers,
@@ -821,9 +853,22 @@ async def _profile_evidence_file_ids(
 async def manual_statement_evidence(
     db: AsyncSession, profile: ApplicationProfile
 ) -> ManualStatementEvidence:
+    # Materialize the shared checklist and its immutable AI decisions first so
+    # Step 4 consumes the same evidence truth as Step 2.
+    from app.services import application_programs
+
+    await application_programs.get_program_readiness(db, profile)
     file_ids = await _profile_evidence_file_ids(db, profile)
     if not file_ids:
-        return ManualStatementEvidence(months=[], file_count=0, pending_analysis_count=0)
+        return ManualStatementEvidence(
+            months=[],
+            file_count=0,
+            accepted_file_count=0,
+            pending_analysis_count=0,
+            needs_more_file_count=0,
+            rejected_file_count=0,
+            failed_analysis_count=0,
+        )
     rows = list(
         (
             await db.execute(
@@ -834,8 +879,7 @@ async def manual_statement_evidence(
                 )
                 .outerjoin(
                     BucketFileAnalysis,
-                    (BucketFileAnalysis.bucket_file_id == BucketFile.id)
-                    & (BucketFileAnalysis.status == "completed"),
+                    BucketFileAnalysis.bucket_file_id == BucketFile.id,
                 )
                 .where(
                     BucketFile.id.in_(file_ids),
@@ -849,12 +893,76 @@ async def manual_statement_evidence(
             )
         ).all()
     )
-    latest: dict[UUID, tuple[BucketFile, BucketRequestedDocument | None, BucketFileAnalysis | None]] = {}
+    latest: dict[
+        UUID, tuple[BucketFile, BucketRequestedDocument | None, BucketFileAnalysis | None]
+    ] = {}
     for file, requested, analysis in rows:
         latest.setdefault(file.id, (file, requested, analysis))
     months: set[str] = set()
     statement_file_ids: set[UUID] = set()
     pending_analysis_ids: set[UUID] = set()
+    accepted_file_ids: set[UUID] = set()
+    needs_more_file_ids: set[UUID] = set()
+    rejected_file_ids: set[UUID] = set()
+    failed_analysis_ids: set[UUID] = set()
+    requirement_state = (
+        await db.execute(
+            select(ApplicationRequirementState).where(
+                ApplicationRequirementState.profile_id == profile.id,
+                ApplicationRequirementState.requirement_key == "business_bank_statements_6_months",
+            )
+        )
+    ).scalar_one_or_none()
+    if requirement_state is not None:
+        links = list(
+            (
+                await db.execute(
+                    select(ApplicationRequirementEvidence).where(
+                        ApplicationRequirementEvidence.requirement_state_id == requirement_state.id,
+                        ApplicationRequirementEvidence.removed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        decisions = list(
+            (
+                await db.execute(
+                    select(ApplicationRequirementEvidenceDecision)
+                    .where(
+                        ApplicationRequirementEvidenceDecision.requirement_evidence_id.in_(
+                            [link.id for link in links]
+                        )
+                        if links
+                        else False
+                    )
+                    .order_by(
+                        ApplicationRequirementEvidenceDecision.created_at.desc(),
+                        ApplicationRequirementEvidenceDecision.id.desc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        latest_decisions: dict[UUID, ApplicationRequirementEvidenceDecision] = {}
+        for decision in decisions:
+            latest_decisions.setdefault(decision.requirement_evidence_id, decision)
+        for link in links:
+            decision = latest_decisions.get(link.id)
+            if link.verified_at and (
+                link.verified_by_user_id is not None
+                or decision is not None
+                and decision.decision == "accepted"
+            ):
+                accepted_file_ids.add(link.file_id)
+            elif decision is not None and decision.decision == "needs_more":
+                needs_more_file_ids.add(link.file_id)
+            elif decision is not None and decision.decision == "rejected":
+                rejected_file_ids.add(link.file_id)
+            elif decision is not None and decision.decision == "failed":
+                failed_analysis_ids.add(link.file_id)
     for file, requested, analysis in latest.values():
         requested_is_bank = bool(
             requested
@@ -865,8 +973,18 @@ async def manual_statement_evidence(
         if classification != "bank_statement" and not requested_is_bank:
             continue
         statement_file_ids.add(file.id)
-        if analysis is None:
+        if analysis is not None and analysis.status == "failed":
+            failed_analysis_ids.add(file.id)
+        elif (
+            file.id not in accepted_file_ids
+            and file.id not in needs_more_file_ids
+            and file.id not in rejected_file_ids
+            and file.id not in failed_analysis_ids
+            and (analysis is None or analysis.status in {"pending", "running"})
+        ):
             pending_analysis_ids.add(file.id)
+        if file.id not in accepted_file_ids:
+            continue
         if file.statement_period:
             months.add(str(file.statement_period))
         months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
@@ -874,7 +992,11 @@ async def manual_statement_evidence(
     return ManualStatementEvidence(
         months=sorted(months),
         file_count=len(statement_file_ids),
-        pending_analysis_count=len(pending_analysis_ids),
+        accepted_file_count=len(accepted_file_ids & statement_file_ids),
+        pending_analysis_count=len(pending_analysis_ids & statement_file_ids),
+        needs_more_file_count=len(needs_more_file_ids & statement_file_ids),
+        rejected_file_count=len(rejected_file_ids & statement_file_ids),
+        failed_analysis_count=len(failed_analysis_ids & statement_file_ids),
     )
 
 

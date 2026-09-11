@@ -184,17 +184,25 @@ class ApplicationProgramSelection(TimestampMixin, Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     profile_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_profiles.id", ondelete="CASCADE"),
+        nullable=False,
     )
     playbook_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("ai_playbook_templates.id", ondelete="RESTRICT"), nullable=False
+        PG_UUID(as_uuid=True),
+        ForeignKey("ai_playbook_templates.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     playbook_version: Mapped[int] = mapped_column(Integer, nullable=False)
     program_key: Mapped[str] = mapped_column(String(64), nullable=False)
     program_name: Mapped[str] = mapped_column(String(160), nullable=False)
-    source: Mapped[str] = mapped_column(String(24), nullable=False, default="operator", server_default="operator")
+    source: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="operator", server_default="operator"
+    )
     fit_score: Mapped[float | None] = mapped_column(Numeric(8, 4))
     fit_confidence: Mapped[float | None] = mapped_column(Numeric(5, 4))
     fit_reasons: Mapped[list | None] = mapped_column(JSONB)
@@ -209,11 +217,17 @@ class ApplicationProgramSelection(TimestampMixin, Base):
     )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    needs_scope_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
 
 class ApplicationRequirementState(TimestampMixin, Base):
     __tablename__ = "application_requirement_states"
     __table_args__ = (
-        UniqueConstraint("profile_id", "requirement_key", name="uq_application_requirement_profile_key"),
+        UniqueConstraint(
+            "profile_id", "requirement_key", name="uq_application_requirement_profile_key"
+        ),
         Index("ix_application_requirement_states_profile_status", "profile_id", "status"),
         CheckConstraint(
             "status IN ('missing','requested','received_unverified','verified','waived','not_applicable','stale','failed')",
@@ -221,23 +235,39 @@ class ApplicationRequirementState(TimestampMixin, Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     profile_id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("application_profiles.id", ondelete="CASCADE"), nullable=False
+        PG_UUID(as_uuid=True),
+        ForeignKey("application_profiles.id", ondelete="CASCADE"),
+        nullable=False,
     )
     requirement_key: Mapped[str] = mapped_column(String(120), nullable=False)
     label: Mapped[str] = mapped_column(String(200), nullable=False)
     category: Mapped[str] = mapped_column(String(40), nullable=False)
-    required_level: Mapped[str] = mapped_column(String(16), nullable=False, default="required", server_default="required")
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="missing", server_default="missing")
+    required_level: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="required", server_default="required"
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="missing", server_default="missing"
+    )
     requested_document_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_requested_documents.id", ondelete="SET NULL")
     )
     evidence_file_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("bucket_files.id", ondelete="SET NULL")
     )
-    verification_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    verification_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     source_program_keys: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+    source_policy_keys: Mapped[list] = mapped_column(
         JSONB,
         nullable=False,
         default=list,

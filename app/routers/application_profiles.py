@@ -93,6 +93,8 @@ from app.schemas.application_profile import (
     ClassificationConfirm,
     ClassificationPatch,
     ClassificationPreview,
+    EvidenceDecisionOverride,
+    EvidenceReanalyzeResult,
     ExtractedFactRead,
     ExtractedFactReview,
     FileCreditInviteBatch,
@@ -143,6 +145,7 @@ from app.schemas.bucket import BucketFileRead, BucketFileUploadInitResponse
 from app.services import application_profiles as profiles
 from app.services import (
     application_programs,
+    bucket_ai,
     business_statement_schema,
     business_statements,
     dealer_forms_pdf,
@@ -924,6 +927,79 @@ async def update_application_requirement(
 
 
 @router.post(
+    "/{profile_id}/evidence/{file_id}/reanalyze",
+    response_model=EvidenceReanalyzeResult,
+)
+async def reanalyze_application_evidence(
+    profile_id: UUID,
+    file_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> EvidenceReanalyzeResult:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    evidence = await profiles.evidence_state(db, profile)
+    if file_id not in {item.id for item in evidence.files}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    file = await db.get(BucketFile, file_id)
+    if file is None or file.deleted_at is not None or file.status != "uploaded":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    await bucket_ai.enqueue_file_analysis(db, file, force=True)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "requirement.evidence.reanalysis_requested",
+        f"Queued AI reanalysis for {file.file_name}",
+        target_type="bucket_file",
+        target_id=file.id,
+    )
+    await db.commit()
+    return EvidenceReanalyzeResult(file_id=file.id)
+
+
+@router.patch(
+    "/{profile_id}/requirements/{requirement_key}/evidence/{file_id}",
+    response_model=ApplicationProgramReadiness,
+)
+async def override_application_requirement_evidence(
+    profile_id: UUID,
+    requirement_key: str,
+    file_id: UUID,
+    payload: EvidenceDecisionOverride,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationProgramReadiness:
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    readiness = await application_programs.override_evidence_decision(
+        db,
+        profile=profile,
+        requirement_key=requirement_key,
+        file_id=file_id,
+        payload=payload,
+        user=user,
+    )
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        f"requirement.evidence.{payload.decision}",
+        f"Overrode AI evidence decision for {requirement_key.replace('_', ' ')}",
+        target_type="bucket_file",
+        target_id=file_id,
+        metadata={
+            "requirement_key": requirement_key,
+            "decision": payload.decision,
+            "reason_code": payload.reason_code,
+            "reason": payload.reason,
+        },
+    )
+    await db.commit()
+    return readiness
+
+
+@router.post(
     "/{profile_id}/requirements/ai-review",
     response_model=ApplicationRequirementAIReviewResult,
 )
@@ -989,6 +1065,10 @@ async def send_application_requirement_reminder(
 
 @router.post(
     "/{profile_id}/requirements/batch-reminders",
+    response_model=RoomDeliveryReceipt,
+)
+@router.post(
+    "/{profile_id}/requirements/batch-request",
     response_model=RoomDeliveryReceipt,
 )
 async def send_application_requirement_batch_reminder(
@@ -2049,7 +2129,13 @@ async def _application_bank_state(
         manual_override_reason=profile.bank_verification_override_reason,
         manual_statement_months=manual_evidence.months,
         manual_statement_file_count=manual_evidence.file_count,
+        manual_statement_accepted_count=manual_evidence.accepted_file_count,
         manual_statement_pending_count=manual_evidence.pending_analysis_count,
+        manual_statement_rejected_count=(
+            manual_evidence.needs_more_file_count + manual_evidence.rejected_file_count
+        ),
+        manual_statement_failed_count=manual_evidence.failed_analysis_count,
+        evidence_summary=profiles.application_evidence_summary(manual_evidence),
         assets_enabled=policy.assets_enabled,
         statements_enabled=policy.statements_enabled,
         selected_products=policy.selected_products,
@@ -2058,9 +2144,7 @@ async def _application_bank_state(
         connections_requiring_client_authorization=(
             len(items)
             if items and not consent_granted
-            else sum(
-                row.authorization_state == "client_authorization_required" for row in items
-            )
+            else sum(row.authorization_state == "client_authorization_required" for row in items)
         ),
         plaid_policy_updated_at=policy_owner.plaid_policy_updated_at,
         plaid_policy_updated_by_user_id=policy_owner.plaid_policy_updated_by_user_id,
@@ -2756,7 +2840,9 @@ async def public_bank_verification(
     if invitation.opened_at is None:
         invitation.opened_at = datetime.now(UTC)
         await db.commit()
-    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
     client = await db.get(Client, profile.client_id) if profile.client_id else None
     policy = plaid_policy.from_owner(profile)
     consent_row = await _application_consent_row(db, profile.id)
@@ -2764,14 +2850,21 @@ async def public_bank_verification(
     manual_evidence = await profiles.manual_statement_evidence(db, profile)
     return PublicBankVerificationRead(
         business_name=_business_label(profile, intake, client),
-        disclosure_version=str(disclosure["version"]), disclosure_text=str(disclosure["text"]),
+        disclosure_version=str(disclosure["version"]),
+        disclosure_text=str(disclosure["text"]),
         consent_granted=await _application_consent_granted(
             db, profile.id, policy.selected_products
         ),
         items=await profiles.bank_rows(db, profile),
         manual_statement_months=manual_evidence.months,
         manual_statement_file_count=manual_evidence.file_count,
+        manual_statement_accepted_count=manual_evidence.accepted_file_count,
         manual_statement_pending_count=manual_evidence.pending_analysis_count,
+        manual_statement_rejected_count=(
+            manual_evidence.needs_more_file_count + manual_evidence.rejected_file_count
+        ),
+        manual_statement_failed_count=manual_evidence.failed_analysis_count,
+        evidence_summary=profiles.application_evidence_summary(manual_evidence),
         assets_enabled=policy.assets_enabled,
         statements_enabled=policy.statements_enabled,
         selected_products=policy.selected_products,

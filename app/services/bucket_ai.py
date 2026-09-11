@@ -10,7 +10,7 @@ import zipfile
 from datetime import UTC, datetime
 from io import BytesIO, StringIO
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import boto3
 from openpyxl import load_workbook
@@ -2318,12 +2318,18 @@ async def analyze_bucket_file(
             "baseline_categories_supported": parsed.get("baseline_categories_supported") or [],
             "red_flags": parsed.get("red_flags") or [],
             "limitations": parsed.get("limitations") or [],
-            "key_facts": parsed.get("key_facts") if isinstance(parsed.get("key_facts"), dict) else {},
-            "profile_facts": parsed.get("profile_facts") if isinstance(parsed.get("profile_facts"), dict) else {},
+            "key_facts": parsed.get("key_facts")
+            if isinstance(parsed.get("key_facts"), dict)
+            else {},
+            "profile_facts": parsed.get("profile_facts")
+            if isinstance(parsed.get("profile_facts"), dict)
+            else {},
         }
         if offer_document:
             row.classification = merchant_processing.OFFER_CLASSIFICATION
-            row.analysis["desk_only"] = parsed.get("desk_only") if isinstance(parsed.get("desk_only"), dict) else {}
+            row.analysis["desk_only"] = (
+                parsed.get("desk_only") if isinstance(parsed.get("desk_only"), dict) else {}
+            )
             # The partner's name is not the borrower's legal entity.
             row.analysis["profile_facts"] = {}
         row.input_tokens = input_tokens
@@ -2343,6 +2349,10 @@ async def analyze_bucket_file(
         row.error = str(exc)[:2000]
         if offer_document:
             await merchant_processing.absorb_analysis(db, file, row)
+    if not offer_document:
+        from app.services.application_programs import reconcile_profiles_for_file
+
+        await reconcile_profiles_for_file(db, file)
     await db.flush()
     return row
 
@@ -2636,7 +2646,7 @@ async def drain_bucket_ai_reviews(db: AsyncSession, *, limit: int = 3) -> int:
     return len(rows)
 
 
-async def enqueue_file_analysis(db: AsyncSession, file: BucketFile) -> None:
+async def enqueue_file_analysis(db: AsyncSession, file: BucketFile, *, force: bool = False) -> None:
     """Cheaply mark a file for background analysis (no AI call, no S3 read).
     Called best-effort on upload-complete so the file is analyzed before anyone
     opens the lead — the review then composes from a warm cache. Safe to call
@@ -2652,7 +2662,9 @@ async def enqueue_file_analysis(db: AsyncSession, file: BucketFile) -> None:
             .where(
                 BucketFileAnalysis.bucket_file_id == file.id,
                 BucketFileAnalysis.analysis_version == CURRENT_FILE_ANALYSIS_VERSION,
-                BucketFileAnalysis.status.in_(["pending", "running", "completed", "skipped"]),
+                BucketFileAnalysis.status.in_(["pending", "running"])
+                if force
+                else BucketFileAnalysis.status.in_(["pending", "running", "completed", "skipped"]),
             )
             .limit(1)
         )
@@ -2663,9 +2675,10 @@ async def enqueue_file_analysis(db: AsyncSession, file: BucketFile) -> None:
         BucketFileAnalysis(
             bucket_file_id=file.id,
             bucket_id=file.bucket_id,
-            content_hash="pending",
+            content_hash=f"pending:{uuid4().hex}" if force else "pending",
             analysis_version=CURRENT_FILE_ANALYSIS_VERSION,
             status="pending",
+            skip_reason="force_reanalysis" if force else None,
         )
     )
 
@@ -2676,14 +2689,21 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     once; the placeholder row is replaced by analyze_bucket_file's real
     (hash, version) row."""
     rows = (
-        await db.execute(
-            select(BucketFileAnalysis)
-            .where(BucketFileAnalysis.status == "pending", BucketFileAnalysis.content_hash == "pending")
-            .order_by(BucketFileAnalysis.created_at.asc())
-            .limit(limit)
-            .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
+        (
+            await db.execute(
+                select(BucketFileAnalysis)
+                .where(
+                    BucketFileAnalysis.status == "pending",
+                    BucketFileAnalysis.content_hash.like("pending%"),
+                )
+                .order_by(BucketFileAnalysis.created_at.asc())
+                .limit(limit)
+                .options(selectinload(BucketFileAnalysis.file).selectinload(BucketFile.bucket))
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     processed = 0
     attempted = 0
     for placeholder in rows:
@@ -2697,7 +2717,12 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
             continue
         review_type = (file.bucket.ai_context or {}).get("review_type") if file.bucket else None
         try:
-            await analyze_bucket_file(db, file, review_type=review_type)
+            await analyze_bucket_file(
+                db,
+                file,
+                review_type=review_type,
+                force=placeholder.skip_reason == "force_reanalysis",
+            )
             await db.commit()
             processed += 1
         except Exception:
@@ -2727,14 +2752,18 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                     .limit(remaining)
                     .options(selectinload(BucketFile.bucket))
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
         for file in missing_files:
             try:
                 await analyze_bucket_file(
                     db,
                     file,
-                    review_type=(file.bucket.ai_context or {}).get("review_type") if file.bucket else None,
+                    review_type=(file.bucket.ai_context or {}).get("review_type")
+                    if file.bucket
+                    else None,
                 )
                 await db.commit()
                 processed += 1

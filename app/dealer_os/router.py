@@ -22,7 +22,19 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy import String, and_, delete as sa_delete, exists, func, not_, select, or_
@@ -39,7 +51,11 @@ from app.models.user import User
 from app.models.client import Client
 from app.models.loan import Loan
 from app.models.credit_pull import CreditPull
-from app.models.application_profile import ApplicationProfile, ApplicationTaxonomyEntry, PlaidAssetReport
+from app.models.application_profile import (
+    ApplicationProfile,
+    ApplicationTaxonomyEntry,
+    PlaidAssetReport,
+)
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.booking_settings import BookingSettings
 from app.services.booking_availability import (
@@ -59,7 +75,11 @@ from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.notifications import notify_inbound_communication, notify_users
 from app.services import file_events, merchant_processing
-from app.services.team_calendar import effective_booking_settings, lock_calendar_owner, team_booking_settings
+from app.services.team_calendar import (
+    effective_booking_settings,
+    lock_calendar_owner,
+    team_booking_settings,
+)
 from app.services import plaid_lifecycle, plaid_policy
 from app.services.email import ses_client
 from app.services.google import calendar_sync
@@ -428,7 +448,24 @@ from .schemas import (
     UnderwritingReviewPreferenceBook,
     UnderwritingReviewPreferenceRead,
 )
-from .services import analyst, application_prescreen, application_taxonomy, archive, bucket_ingest, buckets_link, business_credit as business_credit_svc, credit_quality, financial_snapshot as financial_snapshot_svc, vendors, handoff as handoff_service, recurrence, report_pdf, rollups, storage, workflow_readiness
+from .services import (
+    analyst,
+    application_prescreen,
+    application_taxonomy,
+    archive,
+    bucket_ingest,
+    buckets_link,
+    business_credit as business_credit_svc,
+    credit_quality,
+    financial_snapshot as financial_snapshot_svc,
+    vendors,
+    handoff as handoff_service,
+    recurrence,
+    report_pdf,
+    rollups,
+    storage,
+    workflow_readiness,
+)
 from .services.audit import log_action
 from .services.progress import compute_progress
 from .services.engines import compute_metrics, load_metric_inputs, recompute_snapshot
@@ -456,7 +493,32 @@ from .services.paths import (
     validate_requirements,
     validate_sizing,
 )
-from .services import application_precall, bank_consent, balance_health, client_room, consent_delivery, precall, contract_fill, contract_packages, contract_registry, contract_sign, decision, delivery_log, file_chat, qc_master_application, rep_workflows, routing_resolution, sms_consent as sms_consent_svc, mca_readiness as mca_svc, payment_timing, plaid_client, plaid_sync, refinance as refinance_svc, simulate, timing_optimizer
+from .services import (
+    application_precall,
+    bank_consent,
+    balance_health,
+    client_room,
+    consent_delivery,
+    precall,
+    contract_fill,
+    contract_packages,
+    contract_registry,
+    contract_sign,
+    decision,
+    delivery_log,
+    file_chat,
+    qc_master_application,
+    rep_workflows,
+    routing_resolution,
+    sms_consent as sms_consent_svc,
+    mca_readiness as mca_svc,
+    payment_timing,
+    plaid_client,
+    plaid_sync,
+    refinance as refinance_svc,
+    simulate,
+    timing_optimizer,
+)
 from .services.targets import propose_targets
 
 logger = logging.getLogger(__name__)
@@ -3069,9 +3131,9 @@ async def create_dealer_bucket(
         ):
             file_count = (
                 await db.execute(
-                    select(func.count()).select_from(BucketFile).where(
-                        BucketFile.bucket_id == current.id
-                    )
+                    select(func.count())
+                    .select_from(BucketFile)
+                    .where(BucketFile.bucket_id == current.id)
                 )
             ).scalar_one()
             if file_count == 0:
@@ -3083,6 +3145,7 @@ async def create_dealer_bucket(
         bucket = Bucket(
             name=dedicated_name,
             client_name=(dealer.name or "")[:180] or None,
+            name_sync_mode="linked",
         )
         db.add(bucket)
         await db.flush()
@@ -3091,7 +3154,11 @@ async def create_dealer_bucket(
         # The active connection owns the file set — move the mirrors with it.
         await _remirror_documents(db, dealer)
     await log_action(
-        db, dealer.id, user, "dealer.bucket_create", "dealer",
+        db,
+        dealer.id,
+        user,
+        "dealer.bucket_create",
+        "dealer",
         entity_id=dealer.id,
         before={"bucket_id": before_bucket_id},
         after={"bucket_id": bucket.id},
@@ -9201,6 +9268,11 @@ async def _apply_calendar_booking_data(
         intake.business_name = appointment.company
         intake.loan_purpose = appointment.program_name
         intake.requested_loan_amount = _appointment_amount(appointment.requested_amount)
+        bucket = await db.get(Bucket, intake.bucket_id)
+        if bucket is not None and bucket.name_sync_mode == "linked":
+            linked_name = (intake.business_name or intake.full_name or "Application").strip()[:180]
+            bucket.name = linked_name
+            bucket.client_name = linked_name
         return RepAppointmentActionResult(
             action="apply_booking_data",
             status="completed",

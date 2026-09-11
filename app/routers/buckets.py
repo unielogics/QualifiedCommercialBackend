@@ -637,11 +637,31 @@ def _vendor_access_read(access: BucketVendorAccess) -> BucketVendorAccessRead:
     return data
 
 
+def _newest_unique_active_files(files: list[BucketFile]) -> list[BucketFile]:
+    newest_active = sorted(
+        (file for file in files if file.deleted_at is None),
+        key=lambda file: (file.created_at, str(file.id)),
+        reverse=True,
+    )
+    seen_hashes: set[str] = set()
+    deduplicated: list[BucketFile] = []
+    for file in newest_active:
+        content_hash = (file.content_hash or "").strip().casefold()
+        if content_hash and content_hash in seen_hashes:
+            continue
+        if content_hash:
+            seen_hashes.add(content_hash)
+        deduplicated.append(file)
+    return deduplicated
+
+
 def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     data = BucketDetail.model_validate(bucket)
-    data.files = [file for file in data.files if file.deleted_at is None]
+    deduplicated = _newest_unique_active_files(bucket.files)
+    data.files = [BucketFileRead.model_validate(file) for file in deduplicated]
     data.upload_links = [
-        _upload_link_read(link) for link in bucket.upload_links
+        _upload_link_read(link)
+        for link in bucket.upload_links
         if link.status == "active" and (link.expires_at is None or link.expires_at > _now())
     ]
     data.shares = [_share_read(share) for share in bucket.shares]
@@ -650,15 +670,16 @@ def _bucket_detail_read(bucket: Bucket) -> BucketDetail:
     return data
 
 
-async def _attach_bucket_file_links(
-    db: AsyncSession, buckets: list[Bucket]
-) -> bool:
+async def _attach_bucket_file_links(db: AsyncSession, buckets: list[Bucket]) -> bool:
     """Project every business-file identity linked to these storage buckets."""
     bucket_ids = [bucket.id for bucket in buckets]
     if not bucket_ids:
         return False
     links: dict[UUID, list[BucketLinkedFileRead]] = {bucket_id: [] for bucket_id in bucket_ids}
     seen: dict[UUID, set[tuple[str, UUID]]] = {bucket_id: set() for bucket_id in bucket_ids}
+    linked_names: dict[UUID, list[tuple[int, datetime, str]]] = {
+        bucket_id: [] for bucket_id in bucket_ids
+    }
 
     def add(bucket_id: UUID, item: BucketLinkedFileRead) -> None:
         key = (item.surface, item.id)
@@ -667,18 +688,37 @@ async def _attach_bucket_file_links(
         seen[bucket_id].add(key)
         links[bucket_id].append(item)
 
+    def suggest_name(
+        bucket_id: UUID,
+        value: str | None,
+        *,
+        priority: int,
+        updated_at: datetime,
+    ) -> None:
+        label = (value or "").strip()[:180]
+        if label and bucket_id in linked_names:
+            linked_names[bucket_id].append((priority, updated_at, label))
+
     dealers = (
-        await db.execute(
-            select(DealerBusiness)
-            .where(DealerBusiness.bucket_id.in_(bucket_ids))
-            .order_by(DealerBusiness.updated_at.desc())
+        (
+            await db.execute(
+                select(DealerBusiness)
+                .where(DealerBusiness.bucket_id.in_(bucket_ids))
+                .order_by(DealerBusiness.updated_at.desc())
+            )
         )
-    ).scalars().all()
-    dealers_by_bucket: dict[UUID, list[DealerBusiness]] = {}
+        .scalars()
+        .all()
+    )
     for dealer in dealers:
         if dealer.bucket_id is None:
             continue
-        dealers_by_bucket.setdefault(dealer.bucket_id, []).append(dealer)
+        suggest_name(
+            dealer.bucket_id,
+            dealer.name or dealer.legal_name,
+            priority=10,
+            updated_at=dealer.updated_at,
+        )
         add(
             dealer.bucket_id,
             BucketLinkedFileRead(
@@ -694,25 +734,37 @@ async def _attach_bucket_file_links(
         )
 
     profiles = (
-        await db.execute(
-            select(ApplicationProfile).where(ApplicationProfile.primary_bucket_id.in_(bucket_ids))
+        (
+            await db.execute(
+                select(ApplicationProfile).where(
+                    ApplicationProfile.primary_bucket_id.in_(bucket_ids)
+                )
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     loan_ids = {profile.loan_id for profile in profiles if profile.loan_id}
-    loans = {
-        row.id: row
-        for row in (
-            await db.execute(select(Loan).where(Loan.id.in_(loan_ids)))
-        ).scalars().all()
-    } if loan_ids else {}
+    loans = (
+        {
+            row.id: row
+            for row in (await db.execute(select(Loan).where(Loan.id.in_(loan_ids)))).scalars().all()
+        }
+        if loan_ids
+        else {}
+    )
     client_ids = {profile.client_id for profile in profiles if profile.client_id}
     client_ids.update(loan.client_id for loan in loans.values() if loan.client_id)
-    clients = {
-        row.id: row
-        for row in (
-            await db.execute(select(Client).where(Client.id.in_(client_ids)))
-        ).scalars().all()
-    } if client_ids else {}
+    clients = (
+        {
+            row.id: row
+            for row in (await db.execute(select(Client).where(Client.id.in_(client_ids))))
+            .scalars()
+            .all()
+        }
+        if client_ids
+        else {}
+    )
     for profile in profiles:
         bucket_id = profile.primary_bucket_id
         if bucket_id is None or profile.dealer_id is not None:
@@ -720,13 +772,21 @@ async def _attach_bucket_file_links(
         loan = loans.get(profile.loan_id) if profile.loan_id else None
         client_id = profile.client_id or (loan.client_id if loan else None)
         client = clients.get(client_id) if client_id else None
+        suggest_name(
+            bucket_id,
+            client.name if client else None,
+            priority=20,
+            updated_at=profile.updated_at,
+        )
         if profile.loan_id is not None:
             add(
                 bucket_id,
                 BucketLinkedFileRead(
                     id=profile.loan_id,
                     kind="Funding loan",
-                    label=(client.name if client else None) or (loan.address if loan else None) or "Funding loan",
+                    label=(client.name if client else None)
+                    or (loan.address if loan else None)
+                    or "Funding loan",
                     reference=loan.deal_id if loan else None,
                     email=client.email if client else None,
                     phone=client.phone if client else None,
@@ -750,13 +810,23 @@ async def _attach_bucket_file_links(
             )
 
     intakes = (
-        await db.execute(
-            select(PublicUnderwritingIntake)
-            .where(PublicUnderwritingIntake.bucket_id.in_(bucket_ids))
-            .order_by(PublicUnderwritingIntake.created_at.desc())
+        (
+            await db.execute(
+                select(PublicUnderwritingIntake)
+                .where(PublicUnderwritingIntake.bucket_id.in_(bucket_ids))
+                .order_by(PublicUnderwritingIntake.created_at.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for intake in intakes:
+        suggest_name(
+            intake.bucket_id,
+            intake.business_name or intake.full_name,
+            priority=30,
+            updated_at=intake.updated_at,
+        )
         add(
             intake.bucket_id,
             BucketLinkedFileRead(
@@ -772,18 +842,19 @@ async def _attach_bucket_file_links(
         )
 
     changed_buckets: list[Bucket] = []
-    bucket_by_id = {bucket.id: bucket for bucket in buckets}
-    for bucket_id, linked_dealers in dealers_by_bucket.items():
-        if len(linked_dealers) != 1:
-            continue
-        dealer = linked_dealers[0]
-        expected = (dealer.name or dealer.legal_name or "Client").strip()[:180]
-        bucket = bucket_by_id[bucket_id]
-        if bucket.name != expected or bucket.client_name != expected:
-            bucket.name = expected
-            bucket.client_name = expected
-            changed_buckets.append(bucket)
     for bucket in buckets:
+        candidates = linked_names.get(bucket.id, [])
+        expected = max(candidates, default=None, key=lambda row: (row[0], row[1]))
+        linked_name = expected[2] if expected else None
+        bucket.linked_name = linked_name
+        if (
+            bucket.name_sync_mode == "linked"
+            and linked_name
+            and (bucket.name != linked_name or bucket.client_name != linked_name)
+        ):
+            bucket.name = linked_name
+            bucket.client_name = linked_name
+            changed_buckets.append(bucket)
         bucket.linked_files = links[bucket.id]
     if changed_buckets:
         await db.flush()
@@ -1039,6 +1110,10 @@ async def update_bucket(
 ) -> BucketDetail:
     bucket = await _load_bucket_or_404(db, bucket_id)
     changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes and "name_sync_mode" not in changes:
+        changes["name_sync_mode"] = "custom"
+    if changes.get("name_sync_mode") == "linked":
+        changes.pop("name", None)
     if not changes:
         detail = await _load_bucket_detail_or_404(db, bucket_id)
         if await _attach_bucket_file_links(db, [detail]):

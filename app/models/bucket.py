@@ -60,8 +60,16 @@ bucket_public_share_files = Table(
 
 class Bucket(TimestampMixin, Base):
     __tablename__ = "buckets"
+    __table_args__ = (
+        CheckConstraint(
+            "name_sync_mode IN ('linked','custom')",
+            name="ck_buckets_name_sync_mode",
+        ),
+    )
 
-    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     name: Mapped[str] = mapped_column(String(180), nullable=False)
     bucket_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     client_name: Mapped[str | None] = mapped_column(String(180), nullable=True)
@@ -69,6 +77,9 @@ class Bucket(TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     ai_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="collecting_documents")
+    name_sync_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="custom", server_default="custom"
+    )
     created_by_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -78,18 +89,42 @@ class Bucket(TimestampMixin, Base):
     requested_documents: Mapped[list[BucketRequestedDocument]] = relationship(
         back_populates="bucket", cascade="all, delete-orphan"
     )
-    files: Mapped[list[BucketFile]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    file_annotations: Mapped[list[BucketFileAnnotation]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    upload_links: Mapped[list[BucketUploadLink]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    shares: Mapped[list[BucketShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    vendor_access: Mapped[list[BucketVendorAccess]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    public_shares: Mapped[list[BucketPublicShare]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    notes: Mapped[list[BucketNote]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    activity: Mapped[list[BucketActivityLog]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    ai_reviews: Mapped[list[BucketAIReview]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    ai_messages: Mapped[list[BucketAIMessage]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    ai_action_items: Mapped[list[BucketAIActionItem]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
-    ai_chat_actions: Mapped[list[BucketAIChatAction]] = relationship(back_populates="bucket", cascade="all, delete-orphan")
+    files: Mapped[list[BucketFile]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    file_annotations: Mapped[list[BucketFileAnnotation]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    upload_links: Mapped[list[BucketUploadLink]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    shares: Mapped[list[BucketShare]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    vendor_access: Mapped[list[BucketVendorAccess]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    public_shares: Mapped[list[BucketPublicShare]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    notes: Mapped[list[BucketNote]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    activity: Mapped[list[BucketActivityLog]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    ai_reviews: Mapped[list[BucketAIReview]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    ai_messages: Mapped[list[BucketAIMessage]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    ai_action_items: Mapped[list[BucketAIActionItem]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
+    ai_chat_actions: Mapped[list[BucketAIChatAction]] = relationship(
+        back_populates="bucket", cascade="all, delete-orphan"
+    )
 
 
 class BucketDocumentTemplate(TimestampMixin, Base):

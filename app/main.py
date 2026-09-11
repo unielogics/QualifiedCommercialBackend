@@ -50,6 +50,7 @@ from app.routers import (
     file_team,
     fix_flip,
     fred,
+    funding_programs,
     inbox,
     inline_images,
     intake,
@@ -142,8 +143,10 @@ async def startup() -> None:
     # for the SINGLE-INSTANCE assumption — must move to AWS EventBridge
     # before scaling out to multiple backend instances.
     from app.services.scheduler import start_scheduler
+
     start_scheduler()
     from app.services.communication_events import broker as communication_event_broker
+
     await communication_event_broker.start()
     # A plain asyncio task, deliberately not an APScheduler job: APScheduler is
     # the reason this process runs `--workers 1`, and presence housekeeping —
@@ -151,16 +154,20 @@ async def startup() -> None:
     # added to that pile. It drops anyone whose worksheet stream went half-open
     # (a closed laptop lid holds the socket for minutes) and announces them out.
     from app.services.worksheet_presence import sweeper as worksheet_presence_sweeper
+
     await worksheet_presence_sweeper.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     from app.services.worksheet_presence import sweeper as worksheet_presence_sweeper
+
     await worksheet_presence_sweeper.stop()
     from app.services.communication_events import broker as communication_event_broker
+
     await communication_event_broker.stop()
     from app.services.scheduler import shutdown_scheduler
+
     shutdown_scheduler()
 
 
@@ -189,9 +196,11 @@ for r in [
     dealer_os_router.router,
     dealer_os_crm_router.router,
     meta.router,
+    funding_programs.public_router,
     auth.router,
     client_access.router,
     admin_router.router,
+    funding_programs.admin_router,
     loans.router,
     loan_participants.router,
     loan_summary.router,

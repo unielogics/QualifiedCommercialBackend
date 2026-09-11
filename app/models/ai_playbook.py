@@ -18,7 +18,8 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -29,7 +30,9 @@ class AIPlaybookTemplate(TimestampMixin, Base):
     __tablename__ = "ai_playbook_templates"
 
     id: Mapped[uuid.UUID] = mapped_column(
-        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
     )
     owner_type: Mapped[str] = mapped_column(String(16), nullable=False)
     """One of: platform | funding | agent."""
@@ -43,6 +46,12 @@ class AIPlaybookTemplate(TimestampMixin, Base):
     product_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     """For playbook_type=loan_product: dscr_purchase | dscr_refi | bridge | fix_flip | construction."""
 
+    funding_program_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("funding_program_catalog.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -54,15 +63,19 @@ class AIPlaybookTemplate(TimestampMixin, Base):
     Active client plans pin to a specific version so a config edit
     doesn't disrupt an in-flight deal."""
 
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft", server_default="draft")
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="draft", server_default="draft"
+    )
     """draft | published | archived."""
 
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
     """Legacy soft-delete flag. New code reads `status` instead."""
 
-    requirements: Mapped[list["AICollectionRequirement"]] = relationship(
+    requirements: Mapped[list[AICollectionRequirement]] = relationship(
         back_populates="playbook",
         cascade="all, delete-orphan",
         order_by="AICollectionRequirement.display_order",

@@ -19,7 +19,11 @@ from app.schemas.application_profile import (
     ApplicationRequirementPatch,
     FileOwnerPatch,
 )
-from app.services.application_profiles import _statement_months_from_analysis
+from app.services.application_profiles import (
+    ManualStatementEvidence,
+    _statement_months_from_analysis,
+    application_evidence_summary,
+)
 from app.services.underwriting_intelligence import calculate_dscr
 
 
@@ -139,6 +143,25 @@ def test_manual_statement_coverage_uses_every_explicit_month() -> None:
             }
         }
     ) == {"2026-01", "2026-02", "2026-03"}
+
+
+def test_shared_evidence_summary_preserves_ai_decision_states() -> None:
+    summary = application_evidence_summary(
+        ManualStatementEvidence(
+            months=["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"],
+            file_count=9,
+            accepted_file_count=6,
+            pending_analysis_count=1,
+            needs_more_file_count=1,
+            rejected_file_count=0,
+            failed_analysis_count=1,
+        )
+    )
+
+    assert summary.bank_statement_coverage_complete is True
+    assert summary.bank_statement_processing_count == 1
+    assert summary.bank_statement_needs_more_count == 1
+    assert summary.bank_statement_failed_count == 1
 
 
 def test_shared_dscr_engine_requires_deterministic_inputs() -> None:

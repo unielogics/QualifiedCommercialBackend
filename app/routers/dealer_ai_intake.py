@@ -3317,6 +3317,7 @@ async def _create_bucket_for_intake(
         name=f"{payload.business_name or payload.full_name} Dealer AI Intake",
         bucket_type="dealer_ai_intake",
         client_name=payload.business_name or payload.full_name,
+        name_sync_mode="linked",
         purpose="Dealer financing AI intake",
         description="Public AI gatekeeper intake for dealer financing with real estate collateral.",
         ai_context={
@@ -3428,6 +3429,7 @@ async def _create_bucket_for_main_street(
         name=f"{display} Main Street Intake",
         bucket_type="main_street_intake",
         client_name=display,
+        name_sync_mode="linked",
         purpose="Operating business funding review",
         description=(
             f"Public AI intake for an operating business. Industry: {industry_label}. "
@@ -3524,6 +3526,7 @@ async def _create_bucket_for_funding_review(
         name=f"{investor_name} Funding Review",
         bucket_type="real_estate_ai_intake",
         client_name=investor_name,
+        name_sync_mode="linked",
         purpose="Real estate investor funding AI intake",
         description="Public DSCR and investor lending preliminary review.",
         ai_context={
@@ -3686,6 +3689,10 @@ def _apply_updates(intake: PublicUnderwritingIntake, updates: DealerIntakePatch 
     for key in ("business_name", "phone", "loan_purpose", "requested_loan_amount", "estimated_credit_score", "referral_source"):
         if key in data:
             setattr(intake, key, data[key])
+    if "business_name" in data and intake.bucket.name_sync_mode == "linked":
+        linked_name = (intake.business_name or intake.full_name or "Application").strip()[:180]
+        intake.bucket.name = linked_name
+        intake.bucket.client_name = linked_name
     if "asset_rows" in data:
         intake.asset_rows = [row.model_dump() if isinstance(row, DealerAssetRow) else row for row in updates.asset_rows or []]
     state = dict(intake.intake_state or {})
@@ -7154,6 +7161,12 @@ async def update_lead_contact(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Email is required")
     for field, value in values.items():
         setattr(intake, field, str(value) if field == "email" and value is not None else value)
+    if {"business_name", "full_name"}.intersection(values):
+        bucket = await db.get(Bucket, intake.bucket_id)
+        if bucket is not None and bucket.name_sync_mode == "linked":
+            linked_name = (intake.business_name or intake.full_name or "Application").strip()[:180]
+            bucket.name = linked_name
+            bucket.client_name = linked_name
     changed = ", ".join(sorted(values)) or "No fields changed"
     await _log(
         db,
@@ -7167,7 +7180,9 @@ async def update_lead_contact(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake.id)
-    return await _response(db, intake, token=None, include_management=True, admin_thread=True, thread_user=user)
+    return await _response(
+        db, intake, token=None, include_management=True, admin_thread=True, thread_user=user
+    )
 
 
 async def _create_admin_ai_lead_core(
@@ -11066,6 +11081,7 @@ async def _create_bucket_for_mca_refi(
         name=f"{business} MCA Refinance",
         bucket_type="mca_refinance_intake",
         client_name=business,
+        name_sync_mode="linked",
         purpose="MCA refinance AI intake",
         description="Public MCA refinance preliminary review — statements, credit authorization, advance terms.",
         ai_context={

@@ -28,6 +28,19 @@ RequirementStateStatus = Literal[
     "stale",
     "failed",
 ]
+ProgramRecommendationStatus = Literal[
+    "recommended",
+    "needs_information",
+    "not_eligible",
+    "criteria_unavailable",
+]
+EvidenceDecisionStatus = Literal[
+    "processing",
+    "accepted",
+    "needs_more",
+    "rejected",
+    "failed",
+]
 
 
 class ApplicationProfileResolve(BaseModel):
@@ -93,9 +106,12 @@ class ApplicationProfileRead(BaseModel):
 class ProgramFitCandidate(BaseModel):
     program_key: str
     program_name: str
-    playbook_id: UUID
-    playbook_version: int
+    catalog_id: UUID
+    public_slug: str
+    playbook_id: UUID | None = None
+    playbook_version: int | None = None
     eligible: bool
+    recommendation_status: ProgramRecommendationStatus
     fit_score: float = 0
     confidence: float = 0
     priority: int = 0
@@ -113,6 +129,16 @@ class ApplicationProgramSelectionRead(BaseModel):
     fit_confidence: float | None = None
     fit_reasons: list[str] = Field(default_factory=list)
     selected_at: datetime
+    needs_scope_review: bool = False
+
+
+class EvidencePolicySelectionRead(BaseModel):
+    id: UUID
+    policy_key: str
+    policy_name: str
+    playbook_id: UUID
+    playbook_version: int
+    selected_at: datetime
 
 
 class ApplicationRequirementEvidenceRead(BaseModel):
@@ -123,6 +149,13 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     source: Literal["automatic", "filename_suggestion", "operator"]
     verified: bool = False
     verified_at: datetime | None = None
+    ai_decision: EvidenceDecisionStatus = "processing"
+    ai_reason_code: str | None = None
+    ai_explanation: str | None = None
+    ai_confidence: str | None = None
+    decision_actor: Literal["ai", "staff", "system"] | None = None
+    analysis_id: UUID | None = None
+    coverage_contribution: dict = Field(default_factory=dict)
 
 
 class ApplicationEvidenceOptionRead(BaseModel):
@@ -151,6 +184,7 @@ class ApplicationRequirementRead(BaseModel):
     allow_multiple_files: bool = True
     verification_required: bool = False
     source_program_keys: list[str] = Field(default_factory=list)
+    source_policy_keys: list[str] = Field(default_factory=list)
     program_overrides: dict[str, str] = Field(default_factory=dict)
     client_visible: bool = False
     can_waive: bool = False
@@ -184,16 +218,35 @@ class MissingItemAutomationRead(BaseModel):
     stop_reason: str | None = None
 
 
+class ApplicationEvidenceSummary(BaseModel):
+    """Shared evidence truth consumed by both intake and banking workspaces."""
+
+    bank_statement_months: list[str] = Field(default_factory=list)
+    bank_statement_required_months: int = 6
+    bank_statement_file_count: int = 0
+    bank_statement_accepted_count: int = 0
+    bank_statement_processing_count: int = 0
+    bank_statement_needs_more_count: int = 0
+    bank_statement_rejected_count: int = 0
+    bank_statement_failed_count: int = 0
+    bank_statement_coverage_complete: bool = False
+
+
 class ApplicationProgramReadiness(BaseModel):
     profile_id: UUID
     lending_applicable: bool = True
     selection_mode: Literal["auto", "manual"] = "auto"
     selections: list[ApplicationProgramSelectionRead] = Field(default_factory=list)
+    evidence_policies: list[EvidencePolicySelectionRead] = Field(default_factory=list)
     candidates: list[ProgramFitCandidate] = Field(default_factory=list)
     programs: list[ProgramReadinessItem] = Field(default_factory=list)
     requirements: list[ApplicationRequirementRead] = Field(default_factory=list)
     available_evidence_files: list[ApplicationEvidenceOptionRead] = Field(default_factory=list)
+    evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     can_advance: bool = False
+    automatic_stage_status: Literal[
+        "not_ready", "ready", "advanced", "already_in_underwriting", "not_applicable"
+    ] = "not_ready"
     automation: MissingItemAutomationRead
 
 
@@ -279,6 +332,28 @@ class ApplicationRequirementAIReview(BaseModel):
     @classmethod
     def _deduplicate_review_keys(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(key.strip() for key in value if key.strip()))
+
+
+class EvidenceDecisionOverride(BaseModel):
+    decision: Literal["accepted", "rejected", "needs_more"]
+    reason_code: Literal[
+        "wrong_document",
+        "wrong_entity",
+        "wrong_period",
+        "incomplete",
+        "unreadable",
+        "duplicate",
+        "other",
+        "ai_override",
+    ]
+    reason: str = Field(min_length=8, max_length=2000)
+    confirmed: Literal[True]
+
+
+class EvidenceReanalyzeResult(BaseModel):
+    file_id: UUID
+    queued: bool = True
+    status: Literal["queued"] = "queued"
 
 
 class MissingItemAutomationPatch(BaseModel):
@@ -479,7 +554,11 @@ class ApplicationBankState(BaseModel):
     manual_override_reason: str | None = None
     manual_statement_months: list[str] = Field(default_factory=list)
     manual_statement_file_count: int = 0
+    manual_statement_accepted_count: int = 0
     manual_statement_pending_count: int = 0
+    manual_statement_rejected_count: int = 0
+    manual_statement_failed_count: int = 0
+    evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     assets_enabled: bool = False
     statements_enabled: bool = False
     selected_products: list[str] = Field(default_factory=list)
@@ -803,6 +882,7 @@ class ApplicationRoomSignResult(BaseModel):
 class ApplicationRoomMerchantOfferSummary(BaseModel):
     """Enough for the room to show its "Your offer" tab; the offer itself is
     fetched from its own endpoint."""
+
     id: UUID
     status: str
     estimated_annual_savings: float | None = None
@@ -838,7 +918,11 @@ class PublicBankVerificationRead(BaseModel):
     items: list[ApplicationBankConnectionRead] = Field(default_factory=list)
     manual_statement_months: list[str] = Field(default_factory=list)
     manual_statement_file_count: int = 0
+    manual_statement_accepted_count: int = 0
     manual_statement_pending_count: int = 0
+    manual_statement_rejected_count: int = 0
+    manual_statement_failed_count: int = 0
+    evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     assets_enabled: bool = False
     statements_enabled: bool = False
     selected_products: list[str] = Field(default_factory=list)

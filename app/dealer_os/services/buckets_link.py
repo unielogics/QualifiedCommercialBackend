@@ -100,14 +100,20 @@ async def ensure_bucket(
                 await db.flush()
                 logger.info(
                     "dealer-os: dealer %s adopted intake bucket %s (intake %s)",
-                    dealer.id, bucket.id, intake.id,
+                    dealer.id,
+                    bucket.id,
+                    intake.id,
                 )
                 return bucket
 
     # No intake to adopt — create a fresh audit bucket. Only `name` is
     # required on Bucket; bucket_type/purpose stay at their model defaults.
     bucket_name = audit_bucket_name(dealer)
-    bucket = Bucket(name=bucket_name, client_name=bucket_name)
+    bucket = Bucket(
+        name=bucket_name,
+        client_name=bucket_name,
+        name_sync_mode="linked",
+    )
     db.add(bucket)
     await db.flush()
     dealer.bucket_id = bucket.id

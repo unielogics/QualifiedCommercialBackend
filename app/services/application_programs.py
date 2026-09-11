@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import LoanStage
@@ -29,23 +30,33 @@ from app.models.bucket import (
 )
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
+from app.models.funding_program import (
+    ApplicationEvidencePolicySelection,
+    ApplicationRequirementEvidenceDecision,
+    FundingProgramScope,
+)
 from app.models.loan import Loan
+from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
     ApplicationEvidenceOptionRead,
+    ApplicationEvidenceSummary,
     ApplicationProgramReadiness,
     ApplicationProgramSelectionRead,
     ApplicationProgramsPatch,
     ApplicationRequirementEvidenceRead,
     ApplicationRequirementPatch,
     ApplicationRequirementRead,
+    EvidenceDecisionOverride,
+    EvidencePolicySelectionRead,
     MissingItemAutomationRead,
     ProgramFitCandidate,
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
 from app.services import file_events
+from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
     classifications_for_requested_doc,
@@ -77,6 +88,15 @@ EXPECTED_CLASSIFICATIONS: dict[str, set[str]] = {
     "signed_credit_authorization": {"identity", "credit_authorization"},
     "current_advance_terms": {"floorplan_mca_inventory", "loan_agreement"},
 }
+BUSINESS_ENTITY_REQUIREMENTS = {
+    "business_bank_statements_6_months",
+    "business_tax_returns_2_years",
+    "ytd_p_and_l_balance_sheet",
+    "business_debt_schedule",
+    "current_advance_terms",
+}
+
+POLICY_KEYS = {"business_baseline", "real_estate_baseline", "mca_baseline"}
 
 
 def now() -> datetime:
@@ -90,6 +110,26 @@ def _float(value: Any) -> float | None:
         return float(str(value).replace("$", "").replace(",", "").replace("x", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def _deep_values(value: Any, wanted_keys: set[str]) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).casefold() in wanted_keys:
+                found.append(item)
+            found.extend(_deep_values(item, wanted_keys))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_deep_values(item, wanted_keys))
+    return found
+
+
+def _fact_presence(value: Any, keys: set[str]) -> bool | None:
+    values = _deep_values(value, {key.casefold() for key in keys})
+    if not values:
+        return None
+    return any(item not in (None, "", False, 0, [], {}) for item in values)
 
 
 def _is_lending_applicable(context: dict[str, Any]) -> bool:
@@ -112,7 +152,9 @@ async def _evidence_inventory(
                     BucketFile.status == "uploaded",
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     analyses = list(
         (
@@ -125,7 +167,9 @@ async def _evidence_inventory(
                     BucketFileAnalysis.created_at.desc(),
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     latest: dict[uuid.UUID, BucketFileAnalysis] = {}
     for analysis in analyses:
@@ -139,8 +183,45 @@ async def _evidence_inventory(
 
 
 async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> dict[str, Any]:
-    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
-    files, _latest, classifications = await _evidence_inventory(db, profile)
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
+    files, latest_analyses, _classifications = await _evidence_inventory(db, profile)
+    evidence_links = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementEvidence)
+                .join(
+                    ApplicationRequirementState,
+                    ApplicationRequirementState.id
+                    == ApplicationRequirementEvidence.requirement_state_id,
+                )
+                .where(
+                    ApplicationRequirementState.profile_id == profile.id,
+                    ApplicationRequirementEvidence.removed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_decisions = await _latest_evidence_decisions(db, evidence_links)
+    accepted_file_ids = {
+        link.file_id
+        for link in evidence_links
+        if (
+            latest_decisions.get(link.id) is not None
+            and latest_decisions[link.id].decision == "accepted"
+        )
+        or (latest_decisions.get(link.id) is None and link.verified_at is not None)
+    }
+    accepted_classifications = {
+        analysis.classification
+        for file_id, analysis in latest_analyses.items()
+        if file_id in accepted_file_ids
+        and analysis.status == "completed"
+        and analysis.classification
+    }
     snapshot = dict(intake.result_snapshot or {}) if intake else {}
     metrics = snapshot.get("key_metrics") if isinstance(snapshot.get("key_metrics"), dict) else {}
     revenue = _float(
@@ -150,8 +231,13 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
         or metrics.get("gross_revenue")
     )
     annualized_deposits = _float(
-        metrics.get("annualized_adjusted_deposits")
-        or metrics.get("annualized_deposits")
+        metrics.get("annualized_adjusted_deposits") or metrics.get("annualized_deposits")
+    )
+    credit_score = _float(
+        (intake.estimated_credit_score if intake else None)
+        or metrics.get("estimated_credit_score")
+        or metrics.get("credit_score")
+        or metrics.get("fico")
     )
     intake_state = dict(intake.intake_state or {}) if intake else {}
     main_street_details = intake_state.get("main_street_details")
@@ -160,86 +246,290 @@ async def profile_fit_context(db: AsyncSession, profile: ApplicationProfile) -> 
     stated_intent_kind = (
         intent_kind(stated_intent) if profile.vertical == "main_street" else "lending"
     )
+    combined_intake_data = {
+        "intake_state": intake_state,
+        "result_snapshot": snapshot,
+        "asset_rows": list(intake.asset_rows or []) if intake else [],
+    }
+    business_age_values = _deep_values(
+        combined_intake_data,
+        {"years_in_business", "time_in_business_years", "business_age_years"},
+    )
+    business_age = next(
+        (_float(value) for value in business_age_values if _float(value) is not None),
+        None,
+    )
+    declared_collateral = _fact_presence(
+        combined_intake_data,
+        {
+            "real_estate_schedule",
+            "collateral",
+            "collateral_value",
+            "property_address",
+            "property_value",
+        },
+    )
+    mca_obligations = _fact_presence(
+        combined_intake_data,
+        {
+            "mca_obligations",
+            "mca_balance",
+            "current_advances",
+            "merchant_cash_advances",
+            "advance_balance",
+        },
+    )
+    floorplan_inventory = _fact_presence(
+        combined_intake_data,
+        {
+            "floorplan",
+            "floorplan_balance",
+            "inventory",
+            "inventory_value",
+            "vehicle_inventory",
+        },
+    )
+    if intake and "mca" in str(intake.variant).casefold():
+        mca_obligations = True
     return {
         "vertical": profile.vertical,
+        "intake_variant": intake.variant if intake else None,
         "intent": stated_intent if profile.vertical == "main_street" else None,
         "intent_kind": stated_intent_kind,
         "funding_category": profile.funding_category,
         "entity_type": profile.entity_type,
         "industry": profile.industry,
         "subindustry": profile.subindustry,
+        "industry_key": profile.industry,
         "naics_code": profile.naics_code,
+        "loan_purpose": intake.loan_purpose if intake else None,
         "requested_amount": _float(intake.requested_loan_amount) if intake else None,
+        "business_age_years": business_age,
         "revenue": revenue,
         "annual_revenue": revenue,
         "annualized_deposits": annualized_deposits,
         "deposits": annualized_deposits,
+        "credit_score": credit_score,
+        "estimated_credit_score": credit_score,
         "dscr": _float(metrics.get("estimated_dscr") or metrics.get("dscr")),
-        "cash_flow": _float(metrics.get("estimated_ebitda_or_cash_flow") or metrics.get("cash_flow")),
+        "cash_flow": _float(
+            metrics.get("estimated_ebitda_or_cash_flow") or metrics.get("cash_flow")
+        ),
         "debt_burden": _float(metrics.get("estimated_debt_burden") or metrics.get("debt_burden")),
-        "liquid_assets": _float(metrics.get("pfs_total_liquid_assets") or metrics.get("liquid_assets")),
-        "tax_returns_available": "tax_return" in classifications,
-        "bank_statements_available": "bank_statement" in classifications,
+        "liquid_assets": _float(
+            metrics.get("pfs_total_liquid_assets") or metrics.get("liquid_assets")
+        ),
+        "tax_returns_available": "tax_return" in accepted_classifications,
+        "bank_statements_available": "bank_statement" in accepted_classifications,
         "evidence_count": len(files),
-        "evidence_available": classifications,
+        "evidence_available": accepted_classifications,
+        "declared_collateral": declared_collateral,
+        "mca_obligations_present": mca_obligations,
+        "floorplan_inventory_present": floorplan_inventory,
     }
+
+
+def _scope_match(
+    scope: FundingProgramScope,
+    context: dict[str, Any],
+) -> tuple[bool | None, list[str]]:
+    """Return True, False, or unknown for one hard catalog scope."""
+
+    unknown: list[str] = []
+    variant = str(context.get("intake_variant") or "").casefold()
+    variants = {str(value).casefold() for value in scope.intake_variants or []}
+    if variants:
+        if not variant:
+            unknown.append("intake variant")
+        elif variant not in variants:
+            return False, ["Intake variant is outside this product scope"]
+
+    intent = str(context.get("intent") or "").casefold()
+    intents = {str(value).casefold() for value in scope.intent_keys or []}
+    if intents:
+        if not intent:
+            unknown.append("funding purpose")
+        elif intent not in intents:
+            return False, ["Funding purpose is outside this product scope"]
+
+    industry = str(context.get("industry_key") or "").casefold()
+    naics = str(context.get("naics_code") or "").strip()
+    industry_keys = {str(value).casefold() for value in scope.industry_keys or []}
+    naics_prefixes = [str(value) for value in scope.naics_prefixes or []]
+    if industry_keys or naics_prefixes:
+        if not industry and not naics:
+            unknown.append("industry or NAICS")
+        elif industry not in industry_keys and not any(
+            naics.startswith(prefix) for prefix in naics_prefixes
+        ):
+            return False, ["Industry is outside this product scope"]
+
+    for key in scope.required_fact_keys or []:
+        actual = context.get(str(key))
+        if actual is False:
+            return False, [f"Required {str(key).replace('_', ' ')} is not present"]
+        if actual in (None, "", [], {}):
+            unknown.append(str(key).replace("_", " "))
+
+    if unknown:
+        return None, [f"Needs {', '.join(dict.fromkeys(unknown))}"]
+    return True, []
+
+
+def _catalog_scope_match(
+    scopes: list[FundingProgramScope],
+    context: dict[str, Any],
+) -> tuple[bool | None, list[str]]:
+    relevant = [scope for scope in scopes if scope.vertical == context.get("vertical")]
+    if not relevant:
+        return False, ["Product is not offered for this vertical"]
+    outcomes = [_scope_match(scope, context) for scope in relevant]
+    matched = next((item for item in outcomes if item[0] is True), None)
+    if matched:
+        return matched
+    unknown = [reason for outcome, reasons in outcomes if outcome is None for reason in reasons]
+    if unknown:
+        return None, list(dict.fromkeys(unknown))
+    return False, [reason for _outcome, reasons in outcomes for reason in reasons]
+
+
+def _rule_fields(node: Any) -> set[str]:
+    if not isinstance(node, dict):
+        return set()
+    fields = {str(node["field"])} if isinstance(node.get("field"), str) else set()
+    for key in ("all", "any"):
+        for child in node.get(key) or []:
+            fields.update(_rule_fields(child))
+    if "not" in node:
+        fields.update(_rule_fields(node["not"]))
+    return fields
+
+
+def _context_field(context: dict[str, Any], field: str) -> Any:
+    current: Any = context
+    for part in field.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
 
 
 async def published_candidates(
     db: AsyncSession, profile: ApplicationProfile
 ) -> list[ProgramFitCandidate]:
-    rows = list(
+    context = await profile_fit_context(db, profile)
+    if context.get("intent_kind") in {"non_lending", "route_out"}:
+        return []
+
+    catalog = await program_catalog.catalog_rows(db)
+    scopes = await program_catalog.scopes_by_program(db, [row.id for row in catalog])
+    playbooks = list(
         (
             await db.execute(
                 select(AIPlaybookTemplate).where(
                     AIPlaybookTemplate.playbook_type == "loan_product",
                     AIPlaybookTemplate.status == "published",
                     AIPlaybookTemplate.is_active.is_(True),
-                    AIPlaybookTemplate.product_key.is_not(None),
+                    AIPlaybookTemplate.funding_program_id.in_([row.id for row in catalog])
+                    if catalog
+                    else False,
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
-    # A funding-published program overrides a platform program with the same key.
-    rows.sort(
+    playbooks.sort(
         key=lambda row: (
-            str(row.product_key),
             1 if row.owner_type == "funding" else 0,
             row.version,
+            row.published_at or row.created_at,
             str(row.id),
         ),
         reverse=True,
     )
-    latest: dict[str, AIPlaybookTemplate] = {}
-    for row in rows:
-        latest.setdefault(str(row.product_key), row)
-    context = await profile_fit_context(db, profile)
-    if context.get("intent_kind") in {"non_lending", "route_out"}:
-        return []
+    latest: dict[uuid.UUID, AIPlaybookTemplate] = {}
+    for row in playbooks:
+        if row.funding_program_id is not None:
+            latest.setdefault(row.funding_program_id, row)
+
     candidates: list[ProgramFitCandidate] = []
-    for key, row in latest.items():
+    for item in catalog:
+        scope_state, scope_reasons = _catalog_scope_match(scopes.get(item.id, []), context)
+        if scope_state is False:
+            continue
+        playbook = latest.get(item.id)
+        if playbook is None:
+            candidates.append(
+                ProgramFitCandidate(
+                    program_key=item.program_key,
+                    program_name=item.name,
+                    catalog_id=item.id,
+                    public_slug=item.public_slug,
+                    eligible=False,
+                    recommendation_status="criteria_unavailable",
+                    reasons=["Published underwriting criteria are not available"],
+                )
+            )
+            continue
         try:
-            result = evaluate_rules(row.rules or {}, context)
+            validate_rules(playbook.rules or {})
+            has_fit_rule = bool((playbook.rules or {}).get("fit"))
+            result = evaluate_rules(playbook.rules or {}, context) if has_fit_rule else None
         except ProgramRuleError:
             result = None
-        priority = int((row.rules or {}).get("priority") or 0)
+            has_fit_rule = False
+        priority = int((playbook.rules or {}).get("priority") or 0)
+        missing_fields = [
+            field
+            for field in sorted(_rule_fields((playbook.rules or {}).get("fit")))
+            if _context_field(context, field) in (None, "", [], {})
+        ]
+        if not has_fit_rule or result is None:
+            recommendation_status = "criteria_unavailable"
+            reasons = ["Published fit criteria are unavailable or invalid"]
+            eligible = False
+        elif scope_state is None or (not result.matched and missing_fields):
+            recommendation_status = "needs_information"
+            reasons = [
+                *scope_reasons,
+                *[f"Needs {field.replace('_', ' ')}" for field in missing_fields],
+            ]
+            eligible = False
+        elif result.matched:
+            recommendation_status = "recommended"
+            reasons = result.reasons
+            eligible = True
+        else:
+            recommendation_status = "not_eligible"
+            reasons = result.reasons
+            eligible = False
         candidates.append(
             ProgramFitCandidate(
-                program_key=key,
-                program_name=row.name,
-                playbook_id=row.id,
-                playbook_version=row.version,
-                eligible=bool(result and result.matched),
+                program_key=item.program_key,
+                program_name=item.name,
+                catalog_id=item.id,
+                public_slug=item.public_slug,
+                playbook_id=playbook.id,
+                playbook_version=playbook.version,
+                eligible=eligible,
+                recommendation_status=recommendation_status,
                 fit_score=round((result.confidence if result else 0) * 100, 2),
                 confidence=result.confidence if result else 0,
                 priority=priority,
-                reasons=(result.reasons if result else ["Published fit rule is invalid"]),
+                reasons=list(dict.fromkeys(reasons)),
             )
         )
+    rank = {
+        "recommended": 0,
+        "needs_information": 1,
+        "criteria_unavailable": 2,
+        "not_eligible": 3,
+    }
     return sorted(
         candidates,
         key=lambda item: (
-            not item.eligible,
+            rank[item.recommendation_status],
             -item.confidence,
             -item.priority,
             item.program_key,
@@ -252,13 +542,7 @@ def _automatic_candidate(
     candidates: list[ProgramFitCandidate],
 ) -> ProgramFitCandidate | None:
     eligible = next((item for item in candidates if item.eligible), None)
-    if eligible is not None:
-        return eligible
-    baseline_key = {
-        "real_estate": "real_estate_baseline",
-        "mca": "mca_baseline",
-    }.get(profile.vertical, "business_baseline")
-    return next((item for item in candidates if item.program_key == baseline_key), None)
+    return eligible
 
 
 async def active_selections(
@@ -272,9 +556,13 @@ async def active_selections(
                     ApplicationProgramSelection.profile_id == profile_id,
                     ApplicationProgramSelection.removed_at.is_(None),
                 )
-                .order_by(ApplicationProgramSelection.selected_at, ApplicationProgramSelection.program_key)
+                .order_by(
+                    ApplicationProgramSelection.selected_at, ApplicationProgramSelection.program_key
+                )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
 
@@ -309,7 +597,9 @@ async def profile_for_chat_scope(
                         PublicUnderwritingIntake.bucket_upload_link_id == upload_link_id,
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
         if len(rows) == 1:
             return rows[0]
@@ -320,7 +610,9 @@ async def profile_for_chat_scope(
             await db.execute(
                 select(ApplicationProfile).where(ApplicationProfile.primary_bucket_id == bucket_id)
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     return rows[0] if len(rows) == 1 else None
 
@@ -334,7 +626,7 @@ async def _auto_select(
     if active or profile.program_selection_mode != "auto":
         return active
     candidate = _automatic_candidate(profile, candidates)
-    if candidate is None:
+    if candidate is None or candidate.playbook_id is None or candidate.playbook_version is None:
         return []
     row = ApplicationProgramSelection(
         profile_id=profile.id,
@@ -387,19 +679,32 @@ async def set_programs(
         return
 
     wanted = list(dict.fromkeys(key.strip() for key in payload.program_keys if key.strip()))
-    candidates = {candidate.program_key: candidate for candidate in await published_candidates(db, profile)}
-    if not wanted:
-        baseline_key = {
-            "real_estate": "real_estate_baseline",
-            "mca": "mca_baseline",
-        }.get(profile.vertical, "business_baseline")
-        if baseline_key in candidates:
-            wanted = [baseline_key]
+    candidates = {
+        candidate.program_key: candidate for candidate in await published_candidates(db, profile)
+    }
     missing = [key for key in wanted if key not in candidates]
     if missing:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             f"Published program not found: {', '.join(missing)}",
+        )
+    unavailable = [
+        key
+        for key in wanted
+        if candidates[key].playbook_id is None
+        or candidates[key].playbook_version is None
+        or candidates[key].recommendation_status == "criteria_unavailable"
+    ]
+    if unavailable:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Published criteria are unavailable for: {', '.join(unavailable)}",
+        )
+    ineligible = [key for key in wanted if not candidates[key].eligible]
+    if ineligible and len((payload.reason or "").strip()) < 8:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "A reviewed reason is required to select an AI-ineligible program",
         )
     current = {selection.program_key: selection for selection in active}
     for key, selection in current.items():
@@ -410,6 +715,8 @@ async def set_programs(
         if key in current:
             continue
         candidate = candidates[key]
+        if candidate.playbook_id is None or candidate.playbook_version is None:
+            continue
         db.add(
             ApplicationProgramSelection(
                 profile_id=profile.id,
@@ -442,10 +749,48 @@ async def _selection_requirements(
         (
             await db.execute(
                 select(AICollectionRequirement)
-                .where(AICollectionRequirement.playbook_id.in_([item.playbook_id for item in selections]))
-                .order_by(AICollectionRequirement.display_order, AICollectionRequirement.requirement_key)
+                .where(
+                    AICollectionRequirement.playbook_id.in_(
+                        [item.playbook_id for item in selections]
+                    )
+                )
+                .order_by(
+                    AICollectionRequirement.display_order, AICollectionRequirement.requirement_key
+                )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
+    )
+    grouped: dict[uuid.UUID, list[AICollectionRequirement]] = defaultdict(list)
+    for row in rows:
+        if _legacy_condition_matches(row.applies_when, context):
+            grouped[row.playbook_id].append(row)
+    return grouped
+
+
+async def _policy_requirements(
+    db: AsyncSession,
+    policies: list[ApplicationEvidencePolicySelection],
+    context: dict[str, Any],
+) -> dict[uuid.UUID, list[AICollectionRequirement]]:
+    if not policies:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(AICollectionRequirement)
+                .where(
+                    AICollectionRequirement.playbook_id.in_([item.playbook_id for item in policies])
+                )
+                .order_by(
+                    AICollectionRequirement.display_order,
+                    AICollectionRequirement.requirement_key,
+                )
+            )
+        )
+        .scalars()
+        .all()
     )
     grouped: dict[uuid.UUID, list[AICollectionRequirement]] = defaultdict(list)
     for row in rows:
@@ -481,6 +826,7 @@ async def _requested_document(
     profile: ApplicationProfile,
     requirement: AICollectionRequirement,
     program_keys: list[str],
+    policy_keys: list[str],
 ) -> BucketRequestedDocument | None:
     if profile.primary_bucket_id is None or not _client_visible(requirement):
         return None
@@ -509,6 +855,7 @@ async def _requested_document(
     source = {
         "kind": "program_readiness",
         "program_keys": program_keys,
+        "policy_keys": policy_keys,
         "playbook_id": str(requirement.playbook_id),
     }
     if requested is None:
@@ -558,6 +905,15 @@ def _tax_years(file: BucketFile, analysis: BucketFileAnalysis | None) -> set[str
     return years
 
 
+def _analysis_supports(analysis: BucketFileAnalysis | None) -> set[str]:
+    if analysis is None or not isinstance(analysis.analysis, dict):
+        return set()
+    raw = analysis.analysis.get("baseline_categories_supported") or []
+    if not isinstance(raw, list):
+        return set()
+    return {re.sub(r"[^a-z0-9]+", "_", str(value).casefold()).strip("_") for value in raw if value}
+
+
 def _coverage_for_files(
     requirement: AICollectionRequirement,
     files: list[BucketFile],
@@ -581,12 +937,14 @@ def _coverage_for_files(
                 file_months.add(file.statement_period)
             file_months.update(statement_months_from_filename(file.file_name))
             analysis = analyses.get(file.id)
-            file_months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
+            file_months.update(
+                statement_months_from_analysis(analysis.analysis if analysis else None)
+            )
             if file_months:
                 months.update(file_months)
             else:
                 unknown_period_files += 1
-        current = len(months) + unknown_period_files
+        current = len(months)
         coverage.update(
             {
                 "months": sorted(months),
@@ -607,7 +965,7 @@ def _coverage_for_files(
                 years.update(file_years)
             else:
                 unknown_year_files += 1
-        current = len(years) + unknown_year_files
+        current = len(years)
         coverage.update(
             {
                 "years": sorted(years),
@@ -620,14 +978,22 @@ def _coverage_for_files(
         )
         complete = current >= 2
     elif requirement.requirement_key == "ytd_p_and_l_balance_sheet":
-        classifications = {
-            effective_file_classification(file.file_name, analyses.get(file.id))
-            for file in files
-        }
+        classifications = set()
+        support_categories: set[str] = set()
+        for file in files:
+            analysis = analyses.get(file.id)
+            classifications.add(effective_file_classification(file.file_name, analysis))
+            support_categories.update(_analysis_supports(analysis))
         has_profit_and_loss = bool(
             {"current_p_and_l", "profit_and_loss"}.intersection(classifications)
+        ) or bool(
+            {"current_p_and_l", "profit_and_loss", "p_and_l", "income_statement"}.intersection(
+                support_categories
+            )
         )
-        has_balance_sheet = "balance_sheet" in classifications
+        has_balance_sheet = (
+            "balance_sheet" in classifications or "balance_sheet" in support_categories
+        )
         combined_template = any(
             "profit-loss-balance-sheet" in file.file_name.casefold()
             or "p&l and balance sheet" in file.file_name.casefold()
@@ -749,7 +1115,9 @@ async def _sync_requirement_evidence(
                     ApplicationRequirementEvidence.requirement_state_id == state.id
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     active = {row.file_id: row for row in rows if row.removed_at is None}
     excluded = {
@@ -790,42 +1158,397 @@ async def _sync_requirement_evidence(
     )
 
 
+def _normalized_entity(value: object) -> str:
+    words = re.findall(r"[a-z0-9]+", str(value or "").casefold())
+    suffixes = {
+        "corp",
+        "corporation",
+        "inc",
+        "incorporated",
+        "llc",
+        "llp",
+        "lp",
+        "ltd",
+        "limited",
+        "pllc",
+    }
+    while words and words[-1] in suffixes:
+        words.pop()
+    return "".join(words)
+
+
+def _analysis_fact(analysis: BucketFileAnalysis | None, key: str) -> object | None:
+    if analysis is None or not isinstance(analysis.analysis, dict):
+        return None
+    profile_facts = analysis.analysis.get("profile_facts")
+    if not isinstance(profile_facts, dict):
+        return None
+    value = profile_facts.get(key)
+    return value.get("value") if isinstance(value, dict) else value
+
+
+def _analysis_business_entity(analysis: BucketFileAnalysis | None) -> object | None:
+    entity = _analysis_fact(analysis, "legal_entity_name")
+    if entity:
+        return entity
+    if analysis is None or not isinstance(analysis.analysis, dict):
+        return None
+    key_facts = analysis.analysis.get("key_facts")
+    if not isinstance(key_facts, dict):
+        return None
+    return key_facts.get("business_name") or key_facts.get("account_holder")
+
+
+def _blocking_analysis_text(analysis: BucketFileAnalysis) -> str:
+    detail = analysis.analysis if isinstance(analysis.analysis, dict) else {}
+    values = [*(detail.get("limitations") or []), *(detail.get("red_flags") or [])]
+    return " ".join(str(value).casefold() for value in values)
+
+
+def _automatic_evidence_decision(
+    *,
+    requirement: AICollectionRequirement,
+    file: BucketFile,
+    analysis: BucketFileAnalysis | None,
+    expected_entity: str | None,
+    duplicate_content: bool,
+) -> tuple[str, str, str, str | None]:
+    if duplicate_content:
+        return (
+            "rejected",
+            "duplicate",
+            "An identical active copy is already linked and contributes coverage only once.",
+            analysis.confidence if analysis else None,
+        )
+    if analysis is None or analysis.status in {"pending", "running"}:
+        return (
+            "processing",
+            "analysis_pending",
+            "AI extraction and document validation are still running.",
+            analysis.confidence if analysis else None,
+        )
+    if analysis.status == "failed":
+        return (
+            "failed",
+            "analysis_failed",
+            analysis.error or "AI document analysis failed and can be retried.",
+            analysis.confidence,
+        )
+    if analysis.status == "skipped":
+        if analysis.skip_reason == "zip_parent_archive":
+            return (
+                "needs_more",
+                "archive_container",
+                "The ZIP container does not count as evidence; its extracted files are reviewed individually.",
+                analysis.confidence,
+            )
+        return (
+            "rejected",
+            "unreadable",
+            analysis.skip_detail or "The file could not be read for evidence analysis.",
+            analysis.confidence,
+        )
+    if file.content_hash and analysis.content_hash != file.content_hash:
+        return (
+            "processing",
+            "analysis_stale",
+            "The file changed and its current content is being analyzed.",
+            analysis.confidence,
+        )
+
+    expected = _expected_classes(requirement)
+    classification = str(analysis.classification or "")
+    if classification == "unreadable":
+        return (
+            "rejected",
+            "unreadable",
+            "The document is not readable enough to support this requirement.",
+            analysis.confidence,
+        )
+    if not expected:
+        return (
+            "needs_more",
+            "criteria_unavailable",
+            "Published criteria do not define an automatic document classification for this requirement.",
+            analysis.confidence,
+        )
+    if classification not in expected:
+        return (
+            "rejected",
+            "wrong_document",
+            f"AI classified this as {classification or 'an unknown document type'}, not evidence for this requirement.",
+            analysis.confidence,
+        )
+    if str(analysis.confidence or "").casefold() != "high":
+        return (
+            "needs_more",
+            "low_confidence",
+            "The document type could not be validated with high confidence.",
+            analysis.confidence,
+        )
+
+    extracted_entity = _analysis_business_entity(analysis)
+    wanted_entity = _normalized_entity(expected_entity)
+    found_entity = _normalized_entity(extracted_entity)
+    if wanted_entity and not found_entity:
+        return (
+            "needs_more",
+            "entity_unconfirmed",
+            "AI could not confirm that this document belongs to the application entity.",
+            analysis.confidence,
+        )
+    if wanted_entity and found_entity and wanted_entity != found_entity:
+        return (
+            "rejected",
+            "wrong_entity",
+            f"The document names {extracted_entity}, which does not match the application entity.",
+            analysis.confidence,
+        )
+
+    blocking_text = _blocking_analysis_text(analysis)
+    if any(
+        token in blocking_text
+        for token in ("tamper", "altered", "fraud", "illegible", "unreadable")
+    ):
+        return (
+            "rejected",
+            "integrity_or_readability",
+            "AI found a document-integrity or readability issue that prevents acceptance.",
+            analysis.confidence,
+        )
+    if any(
+        token in blocking_text
+        for token in ("missing page", "pages missing", "incomplete", "cut off", "partial document")
+    ):
+        return (
+            "needs_more",
+            "incomplete",
+            "The document appears incomplete and does not yet support full evidence coverage.",
+            analysis.confidence,
+        )
+
+    if requirement.requirement_key == "business_bank_statements_6_months":
+        months = statement_months_from_analysis(analysis.analysis)
+        months.update(statement_months_from_filename(file.file_name))
+        if file.statement_period:
+            months.add(file.statement_period)
+        if not months:
+            return (
+                "needs_more",
+                "wrong_period",
+                "AI could not establish the statement month, so this file cannot increase coverage.",
+                analysis.confidence,
+            )
+    if requirement.requirement_key == "business_tax_returns_2_years" and not _tax_years(
+        file, analysis
+    ):
+        return (
+            "needs_more",
+            "wrong_period",
+            "AI could not establish the tax year, so this file cannot increase coverage.",
+            analysis.confidence,
+        )
+    return (
+        "accepted",
+        "validated",
+        "AI validated the document type, entity, readable content, and applicable period.",
+        analysis.confidence,
+    )
+
+
+async def _latest_evidence_decisions(
+    db: AsyncSession,
+    links: list[ApplicationRequirementEvidence],
+) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
+    if not links:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationRequirementEvidenceDecision)
+                .where(
+                    ApplicationRequirementEvidenceDecision.requirement_evidence_id.in_(
+                        [link.id for link in links]
+                    )
+                )
+                .order_by(
+                    ApplicationRequirementEvidenceDecision.created_at.desc(),
+                    ApplicationRequirementEvidenceDecision.id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest: dict[uuid.UUID, ApplicationRequirementEvidenceDecision] = {}
+    for row in rows:
+        latest.setdefault(row.requirement_evidence_id, row)
+    return latest
+
+
+async def _reconcile_evidence_decisions(
+    db: AsyncSession,
+    *,
+    requirement: AICollectionRequirement,
+    links: list[ApplicationRequirementEvidence],
+    inventory: dict[uuid.UUID, BucketFile],
+    analyses: dict[uuid.UUID, BucketFileAnalysis],
+    expected_entity: str | None,
+    criteria_version: int,
+) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
+    latest = await _latest_evidence_decisions(db, links)
+    seen_hashes: set[str] = set()
+    timestamp = now()
+    effective: dict[uuid.UUID, ApplicationRequirementEvidenceDecision] = {}
+    for link in links:
+        file = inventory[link.file_id]
+        analysis = analyses.get(file.id)
+        content_hash = (
+            file.content_hash
+            or (analysis.content_hash if analysis else None)
+            or hashlib.sha256(f"pending:{file.id}".encode()).hexdigest()
+        )
+        duplicate = content_hash in seen_hashes
+        seen_hashes.add(content_hash)
+        current = latest.get(link.id)
+        analysis_version = analysis.analysis_version if analysis else 0
+        if (
+            current is not None
+            and current.actor_kind == "staff"
+            and current.content_hash == content_hash
+            and current.analysis_version == analysis_version
+        ):
+            effective[link.id] = current
+        else:
+            decision, reason_code, explanation, confidence = _automatic_evidence_decision(
+                requirement=requirement,
+                file=file,
+                analysis=analysis,
+                expected_entity=expected_entity,
+                duplicate_content=duplicate,
+            )
+            raw_key = ":".join(
+                (
+                    "ai-evidence-v1",
+                    str(link.id),
+                    content_hash,
+                    str(analysis_version),
+                    str(criteria_version),
+                    analysis.analyzed_at.isoformat()
+                    if analysis and analysis.analyzed_at
+                    else "pending",
+                )
+            )
+            idempotency_key = hashlib.sha256(raw_key.encode()).hexdigest()
+            row = (
+                await db.execute(
+                    select(ApplicationRequirementEvidenceDecision).where(
+                        ApplicationRequirementEvidenceDecision.idempotency_key == idempotency_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = ApplicationRequirementEvidenceDecision(
+                    requirement_evidence_id=link.id,
+                    analysis_id=analysis.id if analysis else None,
+                    content_hash=content_hash,
+                    analysis_version=analysis_version,
+                    policy_version=criteria_version,
+                    decision=decision,
+                    reason_code=reason_code,
+                    explanation=explanation,
+                    confidence=confidence,
+                    actor_kind="ai",
+                    supersedes_decision_id=current.id if current else None,
+                    idempotency_key=idempotency_key,
+                )
+                db.add(row)
+            effective[link.id] = row
+
+        accepted = effective[link.id].decision == "accepted"
+        can_auto_verify = accepted and not requirement.verification_required
+        if can_auto_verify and link.verified_at is None:
+            link.verified_at = timestamp
+            link.verified_by_user_id = None
+            link.reason = "Accepted by AI evidence review"
+        elif (
+            not can_auto_verify
+            and link.verified_at is not None
+            and link.verified_by_user_id is None
+            and link.reason == "Accepted by AI evidence review"
+        ):
+            link.verified_at = None
+            link.reason = effective[link.id].explanation
+    await db.flush()
+    return effective
+
+
 async def _materialize_requirements(
     db: AsyncSession,
     profile: ApplicationProfile,
     selections: list[ApplicationProgramSelection],
     grouped: dict[uuid.UUID, list[AICollectionRequirement]],
+    policies: list[ApplicationEvidencePolicySelection],
+    grouped_policies: dict[uuid.UUID, list[AICollectionRequirement]],
 ) -> tuple[list[ApplicationRequirementState], dict[uuid.UUID, list[str]]]:
     files, analyses, _classifications = await _evidence_inventory(db, profile)
     inventory = {file.id: file for file in files}
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
+    expected_entity = intake.business_name if intake else None
+    criteria_versions = {
+        item.playbook_id: item.playbook_version for item in [*selections, *policies]
+    }
     existing = {
         item.requirement_key: item
         for item in (
             await db.execute(
-                select(ApplicationRequirementState).where(ApplicationRequirementState.profile_id == profile.id)
+                select(ApplicationRequirementState).where(
+                    ApplicationRequirementState.profile_id == profile.id
+                )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     }
-    merged: dict[str, tuple[AICollectionRequirement, set[str]]] = {}
+    merged: dict[str, dict[str, Any]] = {}
     per_selection: dict[uuid.UUID, list[str]] = defaultdict(list)
+
+    def merge_requirement(
+        requirement: AICollectionRequirement,
+        *,
+        program_key: str | None = None,
+        policy_key: str | None = None,
+    ) -> None:
+        current = merged.get(requirement.requirement_key)
+        if current is None:
+            current = {
+                "requirement": requirement,
+                "program_keys": set(),
+                "policy_keys": set(),
+            }
+            merged[requirement.requirement_key] = current
+        elif (
+            LEVEL_RANK.get(requirement.required_level, 0),
+            bool(requirement.verification_required),
+        ) > (
+            LEVEL_RANK.get(current["requirement"].required_level, 0),
+            bool(current["requirement"].verification_required),
+        ):
+            current["requirement"] = requirement
+        if program_key:
+            current["program_keys"].add(program_key)
+        if policy_key:
+            current["policy_keys"].add(policy_key)
+
     for selection in selections:
         for requirement in grouped.get(selection.playbook_id, []):
             per_selection[selection.id].append(requirement.requirement_key)
-            current = merged.get(requirement.requirement_key)
-            if current is None or (
-                LEVEL_RANK.get(requirement.required_level, 0),
-                bool(requirement.verification_required),
-            ) > (
-                LEVEL_RANK.get(current[0].required_level, 0),
-                bool(current[0].verification_required),
-            ):
-                prior_sources = current[1] if current else set()
-                merged[requirement.requirement_key] = (
-                    requirement,
-                    {*prior_sources, selection.program_key},
-                )
-            else:
-                current[1].add(selection.program_key)
+            merge_requirement(requirement, program_key=selection.program_key)
+    for policy in policies:
+        for requirement in grouped_policies.get(policy.playbook_id, []):
+            merge_requirement(requirement, policy_key=policy.policy_key)
 
     active_keys = set(merged)
     for key, state in existing.items():
@@ -842,8 +1565,17 @@ async def _materialize_requirements(
                 requested.status = "not_applicable"
 
     result: list[ApplicationRequirementState] = []
-    for key, (requirement, source_programs) in merged.items():
-        requested = await _requested_document(db, profile, requirement, sorted(source_programs))
+    for key, merged_item in merged.items():
+        requirement = merged_item["requirement"]
+        source_programs = merged_item["program_keys"]
+        source_policies = merged_item["policy_keys"]
+        requested = await _requested_document(
+            db,
+            profile,
+            requirement,
+            sorted(source_programs),
+            sorted(source_policies),
+        )
         state = existing.get(key)
         if state is None:
             state = ApplicationRequirementState(
@@ -856,6 +1588,7 @@ async def _materialize_requirements(
                 requested_document_id=requested.id if requested else None,
                 verification_required=requirement.verification_required,
                 source_program_keys=sorted(source_programs),
+                source_policy_keys=sorted(source_policies),
             )
             if requested:
                 state.first_requested_at = requested.created_at or now()
@@ -866,6 +1599,7 @@ async def _materialize_requirements(
         state.required_level = requirement.required_level
         state.verification_required = requirement.verification_required
         state.source_program_keys = sorted(source_programs)
+        state.source_policy_keys = sorted(source_policies)
         if requested:
             state.requested_document_id = requested.id
 
@@ -877,7 +1611,9 @@ async def _materialize_requirements(
                         ApplicationRequirementEvidence.removed_at.is_(None),
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
         prior_link_ids = {row.file_id for row in prior_links}
         manual_ids = {row.file_id for row in prior_links if row.source == "operator"}
@@ -890,46 +1626,50 @@ async def _materialize_requirements(
             trust_preferred=True,
         )
         desired_sources = {file.id: "automatic" for file in matched_files}
-        for file in _filename_suggestions(requirement, files, analyses):
-            desired_sources.setdefault(file.id, "filename_suggestion")
         links = await _sync_requirement_evidence(db, state, inventory, desired_sources)
         linked_files = [inventory[row.file_id] for row in links]
-        coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
-        if requested and not requested.requires_signature:
-            requested.status = "uploaded" if coverage_complete else "requested"
-
-        automatic_files = [
-            inventory[row.file_id]
+        _coverage_complete, coverage = _coverage_for_files(requirement, linked_files, analyses)
+        decisions = await _reconcile_evidence_decisions(
+            db,
+            requirement=requirement,
+            links=links,
+            inventory=inventory,
+            analyses=analyses,
+            expected_entity=(
+                expected_entity
+                if requirement.requirement_key in BUSINESS_ENTITY_REQUIREMENTS
+                else None
+            ),
+            criteria_version=criteria_versions.get(requirement.playbook_id, 1),
+        )
+        accepted_links = [
+            row
             for row in links
-            if row.source == "automatic"
+            if row.verified_at is not None
+            and (
+                row.verified_by_user_id is not None
+                or decisions.get(row.id) is not None
+                and decisions[row.id].decision == "accepted"
+            )
         ]
-        automatic_complete, _automatic_coverage = _coverage_for_files(
-            requirement, automatic_files, analyses
+        accepted_files = [inventory[row.file_id] for row in accepted_links]
+        accepted_complete, accepted_coverage = _coverage_for_files(
+            requirement, accepted_files, analyses
         )
-        if automatic_complete and not requirement.verification_required:
-            for row in links:
-                if row.source == "automatic" and row.verified_at is None:
-                    row.verified_at = now()
-                    row.verified_by_user_id = None
-                    row.reason = "Verified automatically by published criteria"
-
-        verified_files = [inventory[row.file_id] for row in links if row.verified_at]
-        verified_complete, verified_coverage = _coverage_for_files(
-            requirement, verified_files, analyses
-        )
+        if requested and not requested.requires_signature:
+            requested.status = "uploaded" if accepted_complete else "requested"
         state.evidence_file_id = linked_files[0].id if linked_files else None
         state.provenance = {
             **matched_provenance,
             "source": "multi_evidence",
             "linked_file_ids": [str(file.id) for file in linked_files],
-            "automatic_file_ids": [
-                str(row.file_id) for row in links if row.source == "automatic"
-            ],
+            "automatic_file_ids": [str(row.file_id) for row in links if row.source == "automatic"],
             "suggested_file_ids": [
                 str(row.file_id) for row in links if row.source == "filename_suggestion"
             ],
             "coverage": coverage,
-            "verified_coverage": verified_coverage,
+            "verified_coverage": accepted_coverage,
+            "accepted_file_ids": [str(row.file_id) for row in accepted_links],
         }
         if state.status not in {"waived", "not_applicable"}:
             if linked_files:
@@ -944,35 +1684,35 @@ async def _materialize_requirements(
                     state.state_reason = "Evidence is older than the published program allows"
                 elif state.status == "failed" and prior_link_ids == {row.file_id for row in links}:
                     pass
-                elif verified_complete:
+                elif accepted_complete:
                     state.status = "verified"
                     newest_verification = max(
-                        (row for row in links if row.verified_at),
+                        accepted_links,
                         key=lambda row: row.verified_at or datetime.min.replace(tzinfo=UTC),
                     )
                     state.verified_at = newest_verification.verified_at
                     state.verified_by_user_id = newest_verification.verified_by_user_id
                     state.state_reason = (
-                        "Verified automatically by published criteria"
-                        if all(
-                            row.source == "automatic" and row.verified_by_user_id is None
-                            for row in links
-                            if row.verified_at
-                        )
-                        else "Required evidence set verified by underwriting staff"
+                        "Accepted by automatic AI evidence review"
+                        if newest_verification.verified_by_user_id is None
+                        else "Accepted by underwriting override"
                     )
                 else:
                     state.status = "received_unverified"
                     state.verified_at = None
                     state.verified_by_user_id = None
-                    current = int(coverage.get("current") or 0)
-                    required = int(coverage.get("required") or 1)
-                    unit = str(coverage.get("unit") or "documents")
-                    state.state_reason = (
-                        "Evidence received; staff verification required"
-                        if coverage_complete
-                        else f"Evidence received; {current} of {required} required {unit} linked"
-                    )
+                    current = int(accepted_coverage.get("current") or 0)
+                    required = int(accepted_coverage.get("required") or 1)
+                    unit = str(accepted_coverage.get("unit") or "documents")
+                    decision_values = {row.decision for row in decisions.values()}
+                    if "processing" in decision_values:
+                        state.state_reason = "AI evidence analysis is in progress"
+                    elif "failed" in decision_values:
+                        state.state_reason = "AI evidence analysis failed; retry is available"
+                    elif decision_values.intersection({"rejected", "needs_more"}):
+                        state.state_reason = f"AI accepted {current} of {required} required {unit}; some evidence needs attention"
+                    else:
+                        state.state_reason = f"AI accepted {current} of {required} required {unit}"
             else:
                 state.evidence_file_id = None
                 if state.status != "failed":
@@ -991,13 +1731,19 @@ async def _active_overrides(
     if not selections:
         return {}
     rows = (
-        await db.execute(
-            select(ApplicationProgramRequirementOverride).where(
-                ApplicationProgramRequirementOverride.selection_id.in_([item.id for item in selections]),
-                ApplicationProgramRequirementOverride.restored_at.is_(None),
+        (
+            await db.execute(
+                select(ApplicationProgramRequirementOverride).where(
+                    ApplicationProgramRequirementOverride.selection_id.in_(
+                        [item.id for item in selections]
+                    ),
+                    ApplicationProgramRequirementOverride.restored_at.is_(None),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return {(row.selection_id, row.requirement_key): row for row in rows}
 
 
@@ -1019,17 +1765,23 @@ async def _automation_state(
         ),
         None,
     )
-    intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    intake = (
+        await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
+    )
     client = await db.get(Client, profile.client_id) if profile.client_id else None
-    email = profiles.normalized_email((intake.email if intake else None) or (client.email if client else None))
+    email = profiles.normalized_email(
+        (intake.email if intake else None) or (client.email if client else None)
+    )
     link = None
     if profile.primary_bucket_id:
         link = (
             await db.execute(
-                select(BucketUploadLink.id).where(
+                select(BucketUploadLink.id)
+                .where(
                     BucketUploadLink.bucket_id == profile.primary_bucket_id,
                     BucketUploadLink.status == "active",
-                ).limit(1)
+                )
+                .limit(1)
             )
         ).scalar_one_or_none()
     stop_reason = None
@@ -1043,7 +1795,10 @@ async def _automation_state(
         stop_reason = "Client opted out of automated email"
     elif link is None:
         stop_reason = "No active secure room"
-    elif profile.missing_item_email_attempts >= 3 and profile.missing_item_email_requirement_key == missing.requirement_key:
+    elif (
+        profile.missing_item_email_attempts >= 3
+        and profile.missing_item_email_requirement_key == missing.requirement_key
+    ):
         stop_reason = "Maximum automatic attempts reached"
     eligible = stop_reason is None
     if missing and profile.missing_item_email_requirement_key != missing.requirement_key:
@@ -1052,7 +1807,11 @@ async def _automation_state(
         profile.missing_item_email_next_send_at = now()
     next_send = profile.missing_item_email_next_send_at
     if eligible and next_send is None:
-        next_send = max(now(), (profile.missing_item_email_last_sent_at or now() - timedelta(days=1)) + timedelta(hours=24))
+        next_send = max(
+            now(),
+            (profile.missing_item_email_last_sent_at or now() - timedelta(days=1))
+            + timedelta(hours=24),
+        )
         profile.missing_item_email_next_send_at = next_send
     return MissingItemAutomationRead(
         enabled=profile.missing_item_email_enabled,
@@ -1078,12 +1837,16 @@ def _requirement_needs_client_evidence(state: ApplicationRequirementState) -> bo
 
 async def email_is_suppressed(db: AsyncSession, client_id: uuid.UUID) -> bool:
     rows = (
-        await db.execute(
-            select(ClientAIPlan.ai_secretary_settings)
-            .where(ClientAIPlan.client_id == client_id)
-            .order_by(ClientAIPlan.updated_at.desc())
+        (
+            await db.execute(
+                select(ClientAIPlan.ai_secretary_settings)
+                .where(ClientAIPlan.client_id == client_id)
+                .order_by(ClientAIPlan.updated_at.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for settings in rows:
         if not isinstance(settings, dict):
             continue
@@ -1093,7 +1856,7 @@ async def email_is_suppressed(db: AsyncSession, client_id: uuid.UUID) -> bool:
     return False
 
 
-def _requirement_is_fully_loaded(
+def _requirement_is_effectively_accepted(
     state: ApplicationRequirementState,
     override: ApplicationProgramRequirementOverride | None,
 ) -> bool:
@@ -1101,12 +1864,7 @@ def _requirement_is_fully_loaded(
         return True
     if override and override.disposition in {"waived", "not_applicable"}:
         return True
-    if state.status != "received_unverified":
-        return False
-    coverage = dict((state.provenance or {}).get("coverage") or {})
-    if coverage:
-        return bool(coverage.get("complete"))
-    return state.evidence_file_id is not None
+    return False
 
 
 async def _auto_start_underwriting_if_loaded(
@@ -1114,8 +1872,11 @@ async def _auto_start_underwriting_if_loaded(
     profile: ApplicationProfile,
     loaded_program_keys: list[str],
 ) -> bool:
-    """Advance document-complete files once, without moving later stages back."""
-    if not loaded_program_keys or profile.underwriting_status not in {"submitted", "collecting_docs"}:
+    """Advance criteria-complete files once, without moving later stages back."""
+    if not loaded_program_keys or profile.underwriting_status not in {
+        "submitted",
+        "collecting_docs",
+    }:
         return False
 
     previous_status = profile.underwriting_status
@@ -1157,7 +1918,9 @@ async def _auto_start_underwriting_if_loaded(
             "loan_stage_from": previous_loan_stage,
             "loan_stage_to": (
                 LoanStage.PROCESSING.value
-                if loan is not None and previous_loan_stage in {LoanStage.PREQUALIFIED.value, LoanStage.COLLECTING_DOCS.value}
+                if loan is not None
+                and previous_loan_stage
+                in {LoanStage.PREQUALIFIED.value, LoanStage.COLLECTING_DOCS.value}
                 else previous_loan_stage
             ),
             "source": "program_readiness",
@@ -1191,9 +1954,7 @@ async def get_program_readiness(
     # Readiness GETs may perform deterministic first-use materialization. Lock
     # this profile so simultaneous tabs cannot race the active unique indexes.
     await db.execute(
-        select(ApplicationProfile.id)
-        .where(ApplicationProfile.id == profile.id)
-        .with_for_update()
+        select(ApplicationProfile.id).where(ApplicationProfile.id == profile.id).with_for_update()
     )
     context = await profile_fit_context(db, profile)
     lending_applicable = _is_lending_applicable(context)
@@ -1208,22 +1969,38 @@ async def get_program_readiness(
     # to a non-lending workflow.
     selections = stored_selections if lending_applicable else []
     grouped = await _selection_requirements(db, selections, context)
-    states, per_selection = await _materialize_requirements(db, profile, selections, grouped)
+    policies = await ensure_evidence_policy(db, profile) if lending_applicable else []
+    grouped_policies = await _policy_requirements(db, policies, context)
+    states, per_selection = await _materialize_requirements(
+        db,
+        profile,
+        selections,
+        grouped,
+        policies,
+        grouped_policies,
+    )
     overrides = await _active_overrides(db, selections)
     requirement_map = {item.requirement_key: item for item in states}
     visibility: dict[str, bool] = {}
     can_waive: dict[str, bool] = {}
-    for rows in grouped.values():
+    for rows in [*grouped.values(), *grouped_policies.values()]:
         for row in rows:
-            visibility[row.requirement_key] = visibility.get(row.requirement_key, False) or _client_visible(row)
-            can_waive[row.requirement_key] = can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
+            visibility[row.requirement_key] = visibility.get(
+                row.requirement_key, False
+            ) or _client_visible(row)
+            can_waive[row.requirement_key] = (
+                can_waive.get(row.requirement_key, False) or row.can_underwriter_waive
+            )
 
     programs: list[ProgramReadinessItem] = []
     fully_loaded_program_keys: list[str] = []
+    policy_requirement_keys = [item.requirement_key for item in states if item.source_policy_keys]
     for selection in selections:
-        keys = list(dict.fromkeys(per_selection.get(selection.id, [])))
+        keys = list(dict.fromkeys([*policy_requirement_keys, *per_selection.get(selection.id, [])]))
         required_keys = [
-            key for key in keys if requirement_map.get(key) and requirement_map[key].required_level == "required"
+            key
+            for key in keys
+            if requirement_map.get(key) and requirement_map[key].required_level == "required"
         ]
         blocking = []
         loading_blockers = []
@@ -1238,17 +2015,17 @@ async def get_program_readiness(
                 satisfied += 1
             else:
                 blocking.append(key)
-            if not _requirement_is_fully_loaded(state, override):
+            if not _requirement_is_effectively_accepted(state, override):
                 loading_blockers.append(key)
         if required_keys and not loading_blockers:
             fully_loaded_program_keys.append(selection.program_key)
-        percent = 100 if not required_keys else round((satisfied / len(required_keys)) * 100)
+        percent = 0 if not required_keys else round((satisfied / len(required_keys)) * 100)
         programs.append(
             ProgramReadinessItem(
                 selection_id=selection.id,
                 program_key=selection.program_key,
                 program_name=selection.program_name,
-                complete=not blocking,
+                complete=bool(required_keys) and not blocking,
                 completion_percent=percent,
                 required_count=len(required_keys),
                 satisfied_count=satisfied,
@@ -1256,8 +2033,9 @@ async def get_program_readiness(
                 requirement_keys=keys,
             )
         )
+    advanced = False
     if lending_applicable:
-        await _auto_start_underwriting_if_loaded(db, profile, fully_loaded_program_keys)
+        advanced = await _auto_start_underwriting_if_loaded(db, profile, fully_loaded_program_keys)
     effectively_satisfied: set[str] = set()
     for item in states:
         if item.status in SATISFIED_STATES:
@@ -1282,7 +2060,9 @@ async def get_program_readiness(
         visibility,
         effectively_satisfied,
     )
-    links_by_state: dict[uuid.UUID, list[tuple[ApplicationRequirementEvidence, BucketFile]]] = defaultdict(list)
+    links_by_state: dict[uuid.UUID, list[tuple[ApplicationRequirementEvidence, BucketFile]]] = (
+        defaultdict(list)
+    )
     state_ids = [item.id for item in states]
     if state_ids:
         evidence_rows = (
@@ -1300,7 +2080,77 @@ async def get_program_readiness(
         ).all()
         for link, file in evidence_rows:
             links_by_state[link.requirement_state_id].append((link, file))
-    available_files, _available_analyses, _available_classes = await _evidence_inventory(db, profile)
+    all_links = [link for rows in links_by_state.values() for link, _file in rows]
+    latest_decisions = await _latest_evidence_decisions(db, all_links)
+    available_files, available_analyses, _available_classes = await _evidence_inventory(db, profile)
+    requirement_definitions: dict[str, AICollectionRequirement] = {}
+    for rows in [*grouped.values(), *grouped_policies.values()]:
+        for definition in rows:
+            requirement_definitions.setdefault(definition.requirement_key, definition)
+
+    def evidence_read(
+        state: ApplicationRequirementState,
+        link: ApplicationRequirementEvidence,
+        file: BucketFile,
+    ) -> ApplicationRequirementEvidenceRead:
+        decision = latest_decisions.get(link.id)
+        definition = requirement_definitions.get(state.requirement_key)
+        contribution: dict[str, Any] = {}
+        if definition is not None:
+            _complete, contribution = _coverage_for_files(definition, [file], available_analyses)
+        inferred_decision = "accepted" if link.verified_at else "processing"
+        return ApplicationRequirementEvidenceRead(
+            file_id=file.id,
+            file_name=file.file_name,
+            bucket_id=file.bucket_id,
+            created_at=file.created_at,
+            source=link.source,
+            verified=link.verified_at is not None,
+            verified_at=link.verified_at,
+            ai_decision=decision.decision if decision else inferred_decision,
+            ai_reason_code=decision.reason_code if decision else None,
+            ai_explanation=decision.explanation if decision else None,
+            ai_confidence=decision.confidence if decision else None,
+            decision_actor=(
+                decision.actor_kind if decision else "staff" if link.verified_by_user_id else None
+            ),
+            analysis_id=decision.analysis_id if decision else None,
+            coverage_contribution=contribution,
+        )
+
+    bank_state = next(
+        (item for item in states if item.requirement_key == "business_bank_statements_6_months"),
+        None,
+    )
+    bank_links = links_by_state.get(bank_state.id, []) if bank_state else []
+    bank_decision_counts: Counter[str] = Counter()
+    for link, _file in bank_links:
+        decision = latest_decisions.get(link.id)
+        effective_decision = (
+            decision.decision
+            if decision is not None
+            else "accepted"
+            if link.verified_at is not None
+            else "processing"
+        )
+        bank_decision_counts[effective_decision] += 1
+    bank_coverage = (
+        dict((bank_state.provenance or {}).get("verified_coverage") or {}) if bank_state else {}
+    )
+    evidence_summary = ApplicationEvidenceSummary(
+        bank_statement_months=list(bank_coverage.get("months") or []),
+        bank_statement_required_months=int(
+            bank_coverage.get("required_months") or bank_coverage.get("required") or 6
+        ),
+        bank_statement_file_count=len(bank_links),
+        bank_statement_accepted_count=bank_decision_counts["accepted"],
+        bank_statement_processing_count=bank_decision_counts["processing"],
+        bank_statement_needs_more_count=bank_decision_counts["needs_more"],
+        bank_statement_rejected_count=bank_decision_counts["rejected"],
+        bank_statement_failed_count=bank_decision_counts["failed"],
+        bank_statement_coverage_complete=bool(bank_coverage.get("complete")),
+    )
+
     return ApplicationProgramReadiness(
         profile_id=profile.id,
         lending_applicable=lending_applicable,
@@ -1317,8 +2167,20 @@ async def get_program_readiness(
                 fit_confidence=_float(item.fit_confidence),
                 fit_reasons=list(item.fit_reasons or []),
                 selected_at=item.selected_at,
+                needs_scope_review=item.needs_scope_review,
             )
             for item in selections
+        ],
+        evidence_policies=[
+            EvidencePolicySelectionRead(
+                id=item.id,
+                policy_key=item.policy_key,
+                policy_name=item.policy_name,
+                playbook_id=item.playbook_id,
+                playbook_version=item.playbook_version,
+                selected_at=item.selected_at,
+            )
+            for item in policies
         ],
         candidates=candidates,
         programs=programs,
@@ -1332,31 +2194,18 @@ async def get_program_readiness(
                 requested_document_id=item.requested_document_id,
                 evidence_file_id=item.evidence_file_id,
                 evidence_file_name=(
-                    links_by_state[item.id][0][1].file_name
-                    if links_by_state.get(item.id)
-                    else None
+                    links_by_state[item.id][0][1].file_name if links_by_state.get(item.id) else None
                 ),
                 evidence_files=[
-                    ApplicationRequirementEvidenceRead(
-                        file_id=file.id,
-                        file_name=file.file_name,
-                        bucket_id=file.bucket_id,
-                        created_at=file.created_at,
-                        source=link.source,
-                        verified=link.verified_at is not None,
-                        verified_at=link.verified_at,
-                    )
+                    evidence_read(item, link, file)
                     for link, file in links_by_state.get(item.id, [])
                 ],
                 evidence_count=len(links_by_state.get(item.id, [])),
                 verified_evidence_count=sum(
-                    link.verified_at is not None
-                    for link, _file in links_by_state.get(item.id, [])
+                    link.verified_at is not None for link, _file in links_by_state.get(item.id, [])
                 ),
                 coverage=dict((item.provenance or {}).get("coverage") or {}),
-                verified_coverage=dict(
-                    (item.provenance or {}).get("verified_coverage") or {}
-                ),
+                verified_coverage=dict((item.provenance or {}).get("verified_coverage") or {}),
                 coverage_complete=bool(
                     ((item.provenance or {}).get("coverage") or {}).get("complete")
                 ),
@@ -1366,8 +2215,11 @@ async def get_program_readiness(
                 allow_multiple_files=True,
                 verification_required=item.verification_required,
                 source_program_keys=list(item.source_program_keys or []),
+                source_policy_keys=list(item.source_policy_keys or []),
                 program_overrides={
-                    selection.program_key: overrides[(selection.id, item.requirement_key)].disposition
+                    selection.program_key: overrides[
+                        (selection.id, item.requirement_key)
+                    ].disposition
                     for selection in selections
                     if (selection.id, item.requirement_key) in overrides
                 },
@@ -1390,7 +2242,19 @@ async def get_program_readiness(
             )
             for file in sorted(available_files, key=lambda row: row.created_at, reverse=True)
         ],
+        evidence_summary=evidence_summary,
         can_advance=lending_applicable and any(item.complete for item in programs),
+        automatic_stage_status=(
+            "not_applicable"
+            if not lending_applicable
+            else "advanced"
+            if advanced
+            else "already_in_underwriting"
+            if profile.underwriting_status not in {"submitted", "collecting_docs"}
+            else "ready"
+            if any(item.complete for item in programs)
+            else "not_ready"
+        ),
         automation=automation,
     )
 
@@ -1431,7 +2295,9 @@ async def patch_requirement(
                     ApplicationRequirementEvidence.removed_at.is_(None),
                 )
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     active_links = {row.file_id: row for row in link_rows}
     if payload.action == "link_evidence":
@@ -1477,9 +2343,16 @@ async def patch_requirement(
         state.verified_by_user_id = None
         state.state_reason = payload.reason or "Evidence link removed by underwriting staff"
     elif payload.action == "verify":
+        if not state.verification_required:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Routine financial evidence is decided automatically; use an evidence override when needed",
+            )
         target_ids = selected_file_ids or set(active_links)
         if not target_ids:
-            raise HTTPException(status.HTTP_409_CONFLICT, "Link evidence before verifying this requirement")
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Link evidence before verifying this requirement"
+            )
         if target_ids.difference(active_links):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Linked evidence file not found")
         for file_id in target_ids:
@@ -1510,27 +2383,48 @@ async def patch_requirement(
     elif payload.action in {"waive", "not_applicable"}:
         selected = {item.program_key: item for item in await active_selections(db, profile.id)}
         source_keys = set(requirement_read.source_program_keys)
+        if not source_keys and requirement_read.source_policy_keys:
+            if payload.action == "waive" and not requirement_read.can_waive:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "Published evidence policy does not allow this requirement to be waived",
+                )
+            state.status = "waived" if payload.action == "waive" else "not_applicable"
+            state.state_reason = (payload.reason or "").strip()
+            state.verified_at = timestamp
+            state.verified_by_user_id = user.id
+            await db.flush()
+            return
         target_keys = list(source_keys) if payload.all_programs else payload.program_keys
         if not target_keys:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Select at least one program")
         unknown = [key for key in target_keys if key not in selected or key not in source_keys]
         if unknown:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Override target does not use this requirement")
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Override target does not use this requirement",
+            )
         if payload.action == "waive":
             requirements = list(
                 (
                     await db.execute(
                         select(AICollectionRequirement).where(
-                            AICollectionRequirement.playbook_id.in_([selected[key].playbook_id for key in target_keys]),
+                            AICollectionRequirement.playbook_id.in_(
+                                [selected[key].playbook_id for key in target_keys]
+                            ),
                             AICollectionRequirement.requirement_key == requirement_key,
                         )
                     )
-                ).scalars().all()
+                )
+                .scalars()
+                .all()
             )
             waivable_playbooks = {
                 row.playbook_id for row in requirements if row.can_underwriter_waive
             }
-            blocked = [key for key in target_keys if selected[key].playbook_id not in waivable_playbooks]
+            blocked = [
+                key for key in target_keys if selected[key].playbook_id not in waivable_playbooks
+            ]
             if blocked:
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1567,12 +2461,16 @@ async def patch_requirement(
             (
                 await db.execute(
                     select(ApplicationProgramRequirementOverride).where(
-                        ApplicationProgramRequirementOverride.selection_id.in_(active_ids) if active_ids else False,
+                        ApplicationProgramRequirementOverride.selection_id.in_(active_ids)
+                        if active_ids
+                        else False,
                         ApplicationProgramRequirementOverride.requirement_key == requirement_key,
                         ApplicationProgramRequirementOverride.restored_at.is_(None),
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
         for override in overrides:
             override.restored_at = timestamp
@@ -1597,8 +2495,7 @@ def analysis_is_high_confidence_match(
     if file.content_hash and analysis.content_hash != file.content_hash:
         return False
     return (
-        str(analysis.confidence or "").casefold() == "high"
-        and analysis.classification in expected
+        str(analysis.confidence or "").casefold() == "high" and analysis.classification in expected
     )
 
 
@@ -1606,95 +2503,246 @@ async def accept_high_confidence_ai_evidence(
     db: AsyncSession,
     profile: ApplicationProfile,
     requirement_keys: list[str],
-    user: User,
+    _user: User,
 ) -> dict[str, Any]:
-    """Apply a staff-reviewed bulk acceptance of trustworthy AI matches."""
+    """Compatibility refresh for clients that still call the old review route.
 
+    Evidence acceptance is now produced automatically by immutable decisions.
+    This route intentionally performs no staff verification mutation.
+    """
     readiness = await get_program_readiness(db, profile)
-    requirements = {item.requirement_key: item for item in readiness.requirements}
-    selected_keys = set(requirement_keys) if requirement_keys else {
-        item.requirement_key
+    selected_keys = (
+        set(requirement_keys)
+        if requirement_keys
+        else {item.requirement_key for item in readiness.requirements}
+    )
+    requirements = {
+        item.requirement_key: item
         for item in readiness.requirements
-        if item.status == "received_unverified"
+        if item.requirement_key in selected_keys
     }
     if selected_keys.difference(requirements):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Requirement not found")
-
-    states = list(
-        (
-            await db.execute(
-                select(ApplicationRequirementState).where(
-                    ApplicationRequirementState.profile_id == profile.id,
-                    ApplicationRequirementState.requirement_key.in_(selected_keys)
-                    if selected_keys
-                    else False,
-                )
-            )
-        ).scalars().all()
-    )
-    state_by_id = {state.id: state for state in states}
-    links = list(
-        (
-            await db.execute(
-                select(ApplicationRequirementEvidence).where(
-                    ApplicationRequirementEvidence.requirement_state_id.in_(state_by_id)
-                    if state_by_id
-                    else False,
-                    ApplicationRequirementEvidence.removed_at.is_(None),
-                )
-            )
-        ).scalars().all()
-    )
-    files, analyses, _classifications = await _evidence_inventory(db, profile)
-    file_by_id = {file.id: file for file in files}
-    timestamp = now()
-    reviewed = verified = already_verified = retained = analysis_required = 0
-    for link in links:
-        state = state_by_id[link.requirement_state_id]
-        requirement = requirements[state.requirement_key]
-        if requirement.status in SATISFIED_STATES:
-            continue
-        file = file_by_id.get(link.file_id)
-        if file is None:
-            continue
-        reviewed += 1
-        if link.verified_at is not None:
-            already_verified += 1
-            continue
-        analysis = analyses.get(file.id)
-        if analysis is None or analysis.status != "completed" or (
-            file.content_hash and analysis.content_hash != file.content_hash
-        ):
-            analysis_required += 1
-            continue
-        if not analysis_is_high_confidence_match(requirement, file, analysis):
-            retained += 1
-            continue
-        link.verified_at = timestamp
-        link.verified_by_user_id = user.id
-        link.reason = "Accepted by underwriting staff from a high-confidence AI content match"
-        link.provenance = {
-            **(link.provenance or {}),
-            "ai_verification": {
-                "analysis_id": str(analysis.id),
-                "classification": analysis.classification,
-                "confidence": analysis.confidence,
-                "accepted_by_user_id": str(user.id),
-                "accepted_at": timestamp.isoformat(),
-            },
-        }
-        verified += 1
-
-    await db.flush()
-    updated = await get_program_readiness(db, profile)
+    evidence = [row for item in requirements.values() for row in item.evidence_files]
+    accepted = sum(row.ai_decision == "accepted" and row.verified for row in evidence)
+    retained = sum(row.ai_decision in {"needs_more", "rejected"} for row in evidence)
+    analysis_required = sum(row.ai_decision in {"processing", "failed"} for row in evidence)
     return {
-        "readiness": updated,
-        "reviewed_file_count": reviewed,
-        "verified_file_count": verified,
-        "already_verified_count": already_verified,
+        "readiness": readiness,
+        "reviewed_file_count": len(evidence),
+        "verified_file_count": 0,
+        "already_verified_count": accepted,
         "retained_for_staff_count": retained,
         "analysis_required_count": analysis_required,
     }
+
+
+def _policy_key_for_profile(profile: ApplicationProfile) -> str:
+    return {
+        "real_estate": "real_estate_baseline",
+        "mca": "mca_baseline",
+    }.get(profile.vertical, "business_baseline")
+
+
+async def active_evidence_policies(
+    db: AsyncSession, profile_id: uuid.UUID
+) -> list[ApplicationEvidencePolicySelection]:
+    return list(
+        (
+            await db.execute(
+                select(ApplicationEvidencePolicySelection)
+                .where(
+                    ApplicationEvidencePolicySelection.profile_id == profile_id,
+                    ApplicationEvidencePolicySelection.replaced_at.is_(None),
+                )
+                .order_by(ApplicationEvidencePolicySelection.selected_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def ensure_evidence_policy(
+    db: AsyncSession, profile: ApplicationProfile
+) -> list[ApplicationEvidencePolicySelection]:
+    wanted_key = _policy_key_for_profile(profile)
+    active = await active_evidence_policies(db, profile.id)
+    matching = [item for item in active if item.policy_key == wanted_key]
+    if matching:
+        return matching
+    timestamp = now()
+    for item in active:
+        item.replaced_at = timestamp
+    playbooks = list(
+        (
+            await db.execute(
+                select(AIPlaybookTemplate).where(
+                    AIPlaybookTemplate.playbook_type == "evidence_policy",
+                    AIPlaybookTemplate.product_key == wanted_key,
+                    AIPlaybookTemplate.status == "published",
+                    AIPlaybookTemplate.is_active.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    playbooks.sort(
+        key=lambda row: (
+            1 if row.owner_type == "funding" else 0,
+            row.version,
+            row.published_at or row.created_at,
+            str(row.id),
+        ),
+        reverse=True,
+    )
+    if not playbooks:
+        return []
+    playbook = playbooks[0]
+    policy = ApplicationEvidencePolicySelection(
+        profile_id=profile.id,
+        playbook_id=playbook.id,
+        playbook_version=playbook.version,
+        policy_key=wanted_key,
+        policy_name=playbook.name,
+        selected_at=timestamp,
+    )
+    db.add(policy)
+    await db.flush()
+    return [policy]
+
+
+async def override_evidence_decision(
+    db: AsyncSession,
+    *,
+    profile: ApplicationProfile,
+    requirement_key: str,
+    file_id: uuid.UUID,
+    payload: EvidenceDecisionOverride,
+    user: User,
+) -> ApplicationProgramReadiness:
+    await get_program_readiness(db, profile)
+    state = (
+        await db.execute(
+            select(ApplicationRequirementState).where(
+                ApplicationRequirementState.profile_id == profile.id,
+                ApplicationRequirementState.requirement_key == requirement_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if state is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Requirement not found")
+    link = (
+        await db.execute(
+            select(ApplicationRequirementEvidence).where(
+                ApplicationRequirementEvidence.requirement_state_id == state.id,
+                ApplicationRequirementEvidence.file_id == file_id,
+                ApplicationRequirementEvidence.removed_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence is not linked to this requirement")
+    file = await db.get(BucketFile, file_id)
+    if file is None or file.deleted_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    analysis = (
+        await db.execute(
+            select(BucketFileAnalysis)
+            .where(BucketFileAnalysis.bucket_file_id == file.id)
+            .order_by(
+                BucketFileAnalysis.analysis_version.desc(),
+                BucketFileAnalysis.created_at.desc(),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    current = (await _latest_evidence_decisions(db, [link])).get(link.id)
+    content_hash = (
+        file.content_hash
+        or (analysis.content_hash if analysis else None)
+        or hashlib.sha256(f"pending:{file.id}".encode()).hexdigest()
+    )
+    analysis_version = analysis.analysis_version if analysis else 0
+    raw_key = ":".join(
+        (
+            "staff-evidence-v1",
+            str(link.id),
+            content_hash,
+            str(analysis_version),
+            payload.decision,
+            payload.reason_code,
+            payload.reason.strip(),
+        )
+    )
+    idempotency_key = hashlib.sha256(raw_key.encode()).hexdigest()
+    decision = (
+        await db.execute(
+            select(ApplicationRequirementEvidenceDecision).where(
+                ApplicationRequirementEvidenceDecision.idempotency_key == idempotency_key
+            )
+        )
+    ).scalar_one_or_none()
+    if decision is None:
+        decision = ApplicationRequirementEvidenceDecision(
+            requirement_evidence_id=link.id,
+            analysis_id=analysis.id if analysis else None,
+            content_hash=content_hash,
+            analysis_version=analysis_version,
+            policy_version=current.policy_version if current else 1,
+            decision=payload.decision,
+            reason_code=payload.reason_code,
+            explanation=payload.reason.strip(),
+            confidence=analysis.confidence if analysis else None,
+            actor_kind="staff",
+            actor_user_id=user.id,
+            supersedes_decision_id=current.id if current else None,
+            idempotency_key=idempotency_key,
+        )
+        db.add(decision)
+    if payload.decision == "accepted":
+        link.verified_at = now()
+        link.verified_by_user_id = user.id
+        link.reason = payload.reason.strip()
+    else:
+        link.verified_at = None
+        link.verified_by_user_id = None
+        link.reason = payload.reason.strip()
+    await db.flush()
+    return await get_program_readiness(db, profile)
+
+
+async def reconcile_profiles_for_file(db: AsyncSession, file: BucketFile) -> list[uuid.UUID]:
+    linked_intake_ids = list(
+        (
+            await db.execute(
+                select(BucketIntakeLink.intake_id)
+                .join(
+                    BucketIntakeLinkFile,
+                    BucketIntakeLinkFile.link_id == BucketIntakeLink.id,
+                )
+                .where(
+                    BucketIntakeLinkFile.bucket_file_id == file.id,
+                    BucketIntakeLinkFile.removed_at.is_(None),
+                    BucketIntakeLink.unlinked_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    profile_filter = [ApplicationProfile.primary_bucket_id == file.bucket_id]
+    if linked_intake_ids:
+        profile_filter.append(ApplicationProfile.intake_id.in_(linked_intake_ids))
+    rows = list(
+        (await db.execute(select(ApplicationProfile).where(or_(*profile_filter)))).scalars().all()
+    )
+    profile_ids: list[uuid.UUID] = []
+    for profile in {row.id: row for row in rows}.values():
+        await get_program_readiness(db, profile)
+        profile_ids.append(profile.id)
+    return profile_ids
 
 
 def validate_playbook_rules(rules: dict[str, Any] | None) -> None:

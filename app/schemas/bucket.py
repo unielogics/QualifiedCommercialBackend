@@ -72,6 +72,7 @@ class BucketUpdate(BaseModel):
     purpose: str | None = Field(default=None, max_length=255)
     description: str | None = None
     status: str | None = Field(default=None, max_length=40)
+    name_sync_mode: Literal["linked", "custom"] | None = None
 
 
 class BucketLinkedFileRead(BaseModel):
@@ -93,6 +94,8 @@ class BucketRead(ORMModel):
     purpose: str | None
     description: str | None
     status: str
+    name_sync_mode: Literal["linked", "custom"] = "custom"
+    linked_name: str | None = None
     created_by_id: UUID | None
     created_at: datetime
     updated_at: datetime
@@ -327,6 +330,7 @@ class BucketShareEmailRequest(BaseModel):
     admin's connected Gmail. The passcode is supplied by the caller (known only at
     create/regenerate time — the server stores only its hash), so the composer echoes
     it back here to embed in the body."""
+
     to_emails: list[EmailStr] = Field(min_length=1, max_length=25)
     cc_emails: list[EmailStr] = Field(default_factory=list, max_length=25)
     subject: str = Field(min_length=1, max_length=512)
@@ -502,6 +506,7 @@ class BucketShareAccessRead(BaseModel):
 class BucketPublicShareCreate(BaseModel):
     """No-login, no-passcode share link. Preview/download only — no notes,
     AI chat, or task capabilities, unlike BucketShare."""
+
     recipient_name: str | None = Field(default=None, max_length=180)
     file_ids: list[UUID] = Field(min_length=1)
     can_preview: bool = True
