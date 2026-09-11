@@ -22,6 +22,8 @@ Job catalog (registered in `start_scheduler`):
   calendar_lookahead   cron 7am UTC pre-emit reminder Activity rows
   account_summary      cron 3am UTC per-client summarizer
   pipeline_scan        cron 8am UTC stalled-loan / anomaly digest
+  form_pdf_refresh     every 30 s   redraw a financial form's PDF once
+                                    the typing has stopped (0206)
 
 The drain job is the hot path — it gets touched any time a Loan
 flips `summary_dirty=True` (Phase 6). Cron jobs share the same
@@ -189,6 +191,27 @@ def start_scheduler() -> None:
         "interval",
         minutes=1,
         id="booking_reminders",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    # The financial forms' PDFs, redrawn once the typing stops (0206). Saves
+    # queue a deadline 120 seconds out and push it further out on every further
+    # edit, so this tick is a no-op for a form somebody is still working in and
+    # fires once, on the finished figures, after they stop. Thirty seconds
+    # rather than a minute so the wait is close to the 120 the owner asked for
+    # rather than up to a minute past it.
+    #
+    # Same single-instance caveat as every job in this file: a second backend
+    # instance would draw the same due row twice. The unique (profile, kind)
+    # row makes that a duplicate render rather than a duplicate document — the
+    # refresh overwrites one file in place — but it is still the double-fire
+    # bug named at the top, and the same EventBridge migration fixes it.
+    scheduler.add_job(
+        _wrap(job_form_pdf_refresh),
+        "interval",
+        seconds=30,
+        id="form_pdf_refresh",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
@@ -512,6 +535,17 @@ async def job_file_updates_drain() -> None:
         sent = await drain_notices(db)
         if sent:
             log.info("file_updates_drain emails=%d", sent)
+
+
+async def job_form_pdf_refresh() -> None:
+    """Redraw a financial form's PDF once nobody has typed into it for 120s."""
+    from app.db import SessionLocal
+    from app.services.drafted_forms import drain_form_refresh_queue
+
+    async with SessionLocal() as db:
+        drawn = await drain_form_refresh_queue(db)
+        if drawn:
+            log.info("form_pdf_refresh forms=%d", drawn)
 
 
 async def job_booking_reminders() -> None:

@@ -316,20 +316,24 @@ DRAFT_SITES = (
 
 
 def test_every_draft_save_refreshes_the_pdf_after_its_commit():
+    # Queued rather than rendered since 0206: the redraw settles 120 seconds
+    # after the last edit, so a form somebody is still typing into is not
+    # refiled on every save. `test_form_pdf_refresh.py` holds the debounce
+    # itself; what is pinned here is that a draft save still asks for it.
     for handler in DRAFT_SITES:
         src = inspect.getsource(handler)
-        assert "drafted_forms.refresh_saved_form(" in src, handler.__name__
+        assert "drafted_forms.enqueue_form_refresh(" in src, handler.__name__
         # After the save is durable: rendering is WeasyPrint and a put is a
         # network hop, and neither may sit inside the transaction the borrower
-        # is waiting on.
+        # is waiting on. The queue write commits too, so the rule survives.
         assert src.index("await db.commit()") < src.index(
-            "drafted_forms.refresh_saved_form("
+            "drafted_forms.enqueue_form_refresh("
         ), handler.__name__
 
 
 def test_the_public_draft_refreshes_all_three_kinds_it_serves():
     src = inspect.getsource(router.save_public_financial_form_draft)
-    assert src.count("drafted_forms.refresh_saved_form(") == 3
+    assert src.count("drafted_forms.enqueue_form_refresh(") == 3
     assert '"debt_schedule"' in src and "link.kind" in src and '"pfs"' in src
 
 

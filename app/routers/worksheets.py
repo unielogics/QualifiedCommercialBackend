@@ -328,6 +328,9 @@ async def write_worksheet_cells(
             claimed_name=payload.name,
         )
     await db.commit()
+    # Queued, not rendered. An outsider working through a shared link types the
+    # same way the desk does, so the same 120-second settle applies: the PDF is
+    # filed once the typing stops, on the finished figure.
     await sheets.refresh_touched_pdfs(db, access.profile, kinds, actor_name=payload.name)
     return result
 
@@ -388,6 +391,7 @@ async def write_worksheet_rows(
         claimed_name=payload.name,
     )
     await db.commit()
+    # Queued, not rendered: see `write_worksheet_cells` above.
     await sheets.refresh_touched_pdfs(db, access.profile, [kind], actor_name=payload.name)
     return result
 

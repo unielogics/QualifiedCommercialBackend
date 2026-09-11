@@ -3852,9 +3852,11 @@ async def update_financial_statement(
     await db.commit()
     await db.refresh(statement)
     # After the commit and never able to fail it: the PDF behind the statement
-    # is redrawn from what was just saved. Does not satisfy the checklist row.
-    await drafted_forms.refresh_saved_form(
-        db, profile, "pfs", body=payload.body, statement=statement,
+    # is queued rather than redrawn, so it lands 120 seconds after the last
+    # edit instead of on every save of a form somebody is still typing into.
+    # Does not satisfy the checklist row.
+    await drafted_forms.enqueue_form_refresh(
+        db, profile, "pfs",
         actor_name=user.name or user.email, actor_email=user.email,
     )
     return await _statement_read(db, profile, statement)
@@ -4035,8 +4037,8 @@ async def save_public_financial_form_draft(
             origin="client_form",
         )
         await db.commit()
-        await drafted_forms.refresh_saved_form(
-            db, profile, "debt_schedule", body=payload.body,
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, "debt_schedule",
             actor_name=link.invitee_email or "Borrower",
             actor_email=link.invitee_email or "",
         )
@@ -4047,8 +4049,8 @@ async def save_public_financial_form_draft(
             db, profile, kind=link.kind, body=payload.body or {}, status="draft"
         )
         await db.commit()
-        await drafted_forms.refresh_saved_form(
-            db, profile, link.kind, body=payload.body or {},
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, link.kind,
             actor_name=link.invitee_email or "Borrower",
             actor_email=link.invitee_email or "",
         )
@@ -4067,8 +4069,8 @@ async def save_public_financial_form_draft(
     )
     link.statement_id = saved.id
     await db.commit()
-    await drafted_forms.refresh_saved_form(
-        db, profile, "pfs", body=payload.body, statement=saved,
+    await drafted_forms.enqueue_form_refresh(
+        db, profile, "pfs",
         actor_name=link.invitee_email or "Borrower",
         actor_email=link.invitee_email or "",
     )
@@ -4811,10 +4813,12 @@ async def save_debt_schedule(
     )
     await db.commit()
     if not payload.submit:
-        # A submit has just filed the sheet through `refresh_form_pdf`; only a
-        # draft save needs the standing PDF brought up to date.
-        await drafted_forms.refresh_saved_form(
-            db, profile, "debt_schedule", body=payload.body,
+        # A submit has just filed the sheet through `refresh_form_pdf` — which
+        # also clears anything this queued earlier, so the two cannot both land.
+        # Only a draft save needs the standing PDF brought up to date, and it
+        # waits 120 seconds for the typing to stop before it is.
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, "debt_schedule",
             actor_name=user.name or user.email, actor_email=user.email,
         )
     return {"row_count": len(rows), "submitted": bool(payload.submit)}
@@ -4888,8 +4892,8 @@ async def save_business_statement(
     )
     await db.commit()
     if not payload.submit:
-        await drafted_forms.refresh_saved_form(
-            db, profile, kind, body=payload.body, statement=statement,
+        await drafted_forms.enqueue_form_refresh(
+            db, profile, kind,
             actor_name=user.name or user.email, actor_email=user.email,
         )
     return {
@@ -5097,7 +5101,10 @@ async def write_worksheet_cells(
     )
     await db.commit()
     # After the commit: the document the AI reads should carry what was just
-    # typed, and re-rendering it must never be able to fail the save.
+    # typed, and re-rendering it must never be able to fail the save. Queued
+    # rather than rendered here — on a grid a save is a cell, and the redraw
+    # waits 120 seconds for the typing to stop so the PDF is filed once, on the
+    # finished figure, instead of once per keystroke.
     await sheets.refresh_touched_pdfs(
         db, profile, [edit.sheet for edit in payload.edits],
         actor_name=getattr(user, "name", None), actor_email=getattr(user, "email", None),
@@ -5131,6 +5138,7 @@ async def write_worksheet_row(
         actor_user_id=user.id,
     )
     await db.commit()
+    # Queued, not rendered: see `write_worksheet_cells` above.
     await sheets.refresh_touched_pdfs(
         db, profile, [payload.sheet],
         actor_name=getattr(user, "name", None), actor_email=getattr(user, "email", None),

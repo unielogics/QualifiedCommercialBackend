@@ -20,20 +20,29 @@ transaction the write belongs to, so both stay with the caller.
 is the save path: it keeps that one document's PDF and its analysis current so
 the AI reads today's figures rather than the ones typed on the day it was first
 filed. A save never satisfies the checklist row — only a submit does.
+
+**A save no longer renders on the spot.** `enqueue_form_refresh` puts the form
+on `form_pdf_refresh_queue` with a deadline 120 seconds out, every further save
+pushes that deadline forward, and the scheduler's `job_form_pdf_refresh` calls
+`refresh_saved_form` once the typing has stopped. A submit is untouched: it
+still files synchronously, and clears the pending row on its way through.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.application_profile import ApplicationProfile
 from app.models.bucket import BucketFile, BucketFileAnalysis, BucketRequestedDocument
+from app.models.form_pdf_refresh import FormPdfRefresh
 from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
 log = logging.getLogger(__name__)
@@ -276,6 +285,13 @@ async def refresh_form_pdf(
 
     if mark_uploaded:
         requested_document.status = "uploaded"
+        # A submit has just filed this document synchronously. Any redraw still
+        # waiting out its 120 seconds would land a minute later and put an
+        # identical render over the top of it — work with no reader, and a
+        # `updated_at` on the file that lies about when it was filed. Dropped
+        # inside the submit's own transaction, so a submit that rolls back
+        # keeps its place in the queue.
+        await _clear_pending_refresh(db, bucket_id=bucket_id, classification=classification)
     await db.flush()
     return result_file
 
@@ -450,3 +466,258 @@ async def refresh_saved_form(
         except Exception:  # noqa: BLE001
             log.exception("drafted_forms.refresh_saved_form could not roll back")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the typing to stop.
+#
+# Everything above renders when it is called. That was right when a save was a
+# person filling in a page of boxes and pressing Save; it is wrong on the live
+# worksheet, where a save is a cell and the render is a document rewritten on
+# every keystroke.
+#
+# The owner's instruction: *"a simple adjustment to make is that we will wait
+# 120 seconds before we generate PDF with updates. This way we prevent
+# excessive mistakes from happening and documents being updated for no
+# reason."* Two reasons, and both are about the reader rather than the CPU: a
+# document rewritten on every keystroke is noise in a room somebody has to
+# read, and a half-typed figure briefly filed as fact is worse than a document
+# two minutes behind — because everything downstream reads `key_facts` and
+# never asks how finished the number was.
+#
+# What makes this a debounce and not a rate limit is that a save pushes the
+# deadline *forward* rather than claiming a slot. A rate limit fires on the
+# first edit of a burst and drops the rest, so the last thing typed never
+# reaches the PDF — exactly the figure that mattered. Here the render happens
+# 120 seconds after the last edit, and it renders the finished number.
+# ---------------------------------------------------------------------------
+
+#: How long a form is left alone before its PDF is redrawn. The owner's number.
+#: A document rewritten on every keystroke is noise, and a half-typed figure
+#: briefly filed as fact is worse than a document two minutes behind.
+REFRESH_DELAY_SECONDS = 120
+
+#: How many due forms one tick draws. A render is WeasyPrint plus an S3 put, so
+#: this bounds a tick rather than letting one backlog hold the scheduler's
+#: event loop. Anything left over is still due and goes on the next tick.
+REFRESH_DRAIN_LIMIT = 25
+
+#: The analyser classification each form is filed under, read backwards. Only
+#: used to find the queue row a submit should clear: the submit paths speak in
+#: classifications (they are filing a document), the queue speaks in kinds.
+_KIND_FOR_CLASSIFICATION = {
+    "current_p_and_l": "p_and_l",
+    "balance_sheet": "balance_sheet",
+    "debt_schedule": "debt_schedule",
+    "personal_financial_statement": "pfs",
+}
+
+
+async def enqueue_form_refresh(
+    db: AsyncSession,
+    profile: Any,
+    kind: str,
+    *,
+    actor_name: str | None = None,
+    actor_email: str | None = None,
+    delay_seconds: int = REFRESH_DELAY_SECONDS,
+) -> datetime | None:
+    """Ask for this form's PDF to be redrawn once the typing stops.
+
+    **Every save pushes `due_at` further out.** That is the whole mechanism: an
+    upsert on (profile, kind) whose conflict branch moves the deadline rather
+    than leaving the first one standing, so a burst of saves settles 120
+    seconds after the *last* one instead of firing on the first and dropping
+    everything after it.
+
+    Nothing about what was typed is stored. The drain reads the body back off
+    the file when it renders, so a row that waited through six more edits
+    still draws today's figures — which is also why there is no `body`
+    parameter here and no way for a stale payload to reach a PDF.
+
+    `actor_name`/`actor_email` are carried so the refreshed document is
+    attributed to whoever last typed rather than to the cron actor that drew
+    it, and are coalesced on conflict: a later save with no name does not
+    erase the name the earlier one had.
+
+    **Call it after the save is committed**, like the render it replaces, and
+    for the same reason — and it commits its own write, since the caller's
+    commit has already happened. Swallows everything: a save that is already
+    durable must never be reported as failed because a queue row would not go
+    in. The cost of that is a PDF that stays behind until the next save, which
+    is the same cost the old immediate render paid when WeasyPrint threw.
+    """
+    if profile is None or kind not in _KINDS:
+        return None
+    try:
+        profile_id = profile.id
+        has_room = profile.primary_bucket_id is not None
+    except Exception:  # noqa: BLE001 - an expired ORM row, mid-loop
+        # Reading an attribute off a row a rollback has expired is a lazy load
+        # with no greenlet under it. That can happen here: the caller committed
+        # before calling, and something between may have rolled back — the
+        # per-kind loop in `sheets.refresh_touched_pdfs`, for one. The redraw is
+        # lost, which costs a stale PDF until the next save; raising would cost
+        # a 500 on a save that is already durable.
+        log.exception("drafted_forms.enqueue_form_refresh could not read the file kind=%s", kind)
+        return None
+    if profile_id is None or not has_room:
+        # No document room means there is nothing to file into, so there is
+        # nothing to hold back either.
+        return None
+
+    now = datetime.now(UTC)
+    due_at = now + timedelta(seconds=max(0, int(delay_seconds)))
+    table = FormPdfRefresh.__table__
+    insert = pg_insert(table).values(
+        id=uuid4(),
+        profile_id=profile_id,
+        kind=kind,
+        due_at=due_at,
+        actor_name=actor_name,
+        actor_email=actor_email,
+        created_at=now,
+        updated_at=now,
+    )
+    statement = insert.on_conflict_do_update(
+        constraint="uq_form_pdf_refresh_queue_profile_kind",
+        set_={
+            # The push. Not `greatest(...)`: a later save always wins, because
+            # the point is to wait for the person who is still typing.
+            "due_at": insert.excluded.due_at,
+            "actor_name": func.coalesce(insert.excluded.actor_name, table.c.actor_name),
+            "actor_email": func.coalesce(insert.excluded.actor_email, table.c.actor_email),
+            "updated_at": insert.excluded.updated_at,
+        },
+    )
+    try:
+        await db.execute(statement)
+        await db.commit()
+    except Exception:  # noqa: BLE001 - a queued redraw must never fail a save
+        log.exception(
+            "drafted_forms.enqueue_form_refresh failed kind=%s profile=%s", kind, profile_id
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            log.exception("drafted_forms.enqueue_form_refresh could not roll back")
+        return None
+    return due_at
+
+
+async def _clear_pending_refresh(
+    db: AsyncSession, *, bucket_id: UUID, classification: str
+) -> None:
+    """Drop the queued redraw a submit has just made unnecessary.
+
+    Keyed off the classification and the document room rather than taking a
+    profile and a kind, so every submit path gets this by filing through
+    `refresh_form_pdf` — the staff routes, the borrower's own link, the packet
+    children and `business_statements.file_pdf` alike — without each of them
+    having to remember. One statement; no read first, because a delete of
+    nothing is already a no-op.
+
+    Part of the caller's transaction, deliberately. A submit that rolls back
+    has not filed anything, and its form should still be redrawn on schedule.
+    """
+    kind = _KIND_FOR_CLASSIFICATION.get(classification)
+    if kind is None:
+        return
+    await db.execute(
+        delete(FormPdfRefresh).where(
+            FormPdfRefresh.kind == kind,
+            FormPdfRefresh.profile_id.in_(
+                select(ApplicationProfile.id).where(
+                    ApplicationProfile.primary_bucket_id == bucket_id
+                )
+            ),
+        )
+    )
+
+
+async def drain_form_refresh_queue(
+    db: AsyncSession, *, limit: int = REFRESH_DRAIN_LIMIT
+) -> int:
+    """Redraw every form whose deadline has passed. The scheduler's half.
+
+    Returns how many queue rows were cleared, which is not how many PDFs were
+    written: a row whose form has no checklist slot, nothing typed into it yet
+    or no document room is dropped rather than kept, because none of those
+    resolve by waiting and a row that can never succeed would be redrawn every
+    thirty seconds forever.
+
+    **A failure must not wedge the queue.** One row is one transaction: the
+    render, then the delete, then a commit. If anything raises, the session is
+    rolled back and that row's `due_at` is pushed out by the delay, so it is
+    retried on a later tick instead of being retried immediately, forever, in
+    front of everything behind it. The other rows in the batch are unaffected.
+
+    The columns are read as plain values rather than as ORM rows because
+    `refresh_saved_form` commits, which would expire an ORM row mid-loop and
+    turn the next attribute read into a lazy load with no greenlet under it.
+    """
+    now = datetime.now(UTC)
+    rows = (
+        await db.execute(
+            select(
+                FormPdfRefresh.id,
+                FormPdfRefresh.profile_id,
+                FormPdfRefresh.kind,
+                FormPdfRefresh.actor_name,
+                FormPdfRefresh.actor_email,
+            )
+            .where(FormPdfRefresh.due_at <= now)
+            .order_by(FormPdfRefresh.due_at)
+            .limit(limit)
+        )
+    ).all()
+    if not rows:
+        return 0
+
+    cleared = 0
+    for row_id, profile_id, kind, actor_name, actor_email in rows:
+        try:
+            profile = await db.get(ApplicationProfile, profile_id)
+            if profile is not None:
+                # Reads the body off the file itself — so what lands in the PDF
+                # is the state at this moment, not the state at the save that
+                # first queued it. Swallows its own failures and commits its
+                # own write.
+                await refresh_saved_form(
+                    db,
+                    profile,
+                    kind,
+                    actor_name=actor_name,
+                    actor_email=actor_email,
+                )
+            await db.execute(delete(FormPdfRefresh).where(FormPdfRefresh.id == row_id))
+            await db.commit()
+            cleared += 1
+        except Exception:  # noqa: BLE001 - one bad row must not stop the drain
+            log.exception(
+                "drafted_forms.drain_form_refresh_queue failed kind=%s profile=%s",
+                kind,
+                profile_id,
+            )
+            try:
+                await db.rollback()
+                await db.execute(
+                    update(FormPdfRefresh)
+                    .where(FormPdfRefresh.id == row_id)
+                    .values(
+                        due_at=datetime.now(UTC) + timedelta(seconds=REFRESH_DELAY_SECONDS),
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "drafted_forms.drain_form_refresh_queue could not defer kind=%s profile=%s",
+                    kind,
+                    profile_id,
+                )
+                try:
+                    await db.rollback()
+                except Exception:  # noqa: BLE001
+                    log.exception("drafted_forms.drain_form_refresh_queue could not roll back")
+    return cleared

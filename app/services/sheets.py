@@ -613,19 +613,28 @@ async def refresh_touched_pdfs(
     actor_name: str | None = None,
     actor_email: str | None = None,
 ) -> None:
-    """Put today's figures behind each form's PDF, after the save is committed.
+    """Ask for each touched form's PDF, once the typing stops.
 
     The AI reads a form through the document filed for it — `classification`
     and `key_facts` on the analysis row, never the statement table — so a
     worksheet that only wrote the database would leave the extractors, the
     intelligence cards and the lender packet reading whatever the borrower had
-    when they last pressed Send. Refreshing here keeps them current.
+    when they last pressed Send. Refreshing keeps them current.
 
-    **After the commit, never inside it.** Rendering a PDF is WeasyPrint and an
-    S3 put; neither belongs in the transaction that holds the cell the person
-    just typed. It is also allowed to fail: a document that could not be
-    re-rendered is a stale document, which is a far smaller problem than a save
-    that came back as an error because a renderer did.
+    **It no longer renders here.** On a grid a save is a cell, so rendering on
+    the spot was one WeasyPrint pass and one S3 put per keystroke — and a
+    half-typed figure briefly filed as fact is worse than a document two
+    minutes behind. So the work is queued instead: `enqueue_form_refresh` sets
+    a deadline 120 seconds out and every further cell pushes it further out, so
+    the render lands once, after the last edit, on the finished number. The
+    name and signature stay as they were because four write routes call this
+    and the change is what it does, not what it is.
+
+    **After the commit, never inside it** — unchanged, and for the same reason
+    the render had to be: the queue write commits, and it must not be holding
+    the transaction that carries the cell the person just typed. It is still
+    allowed to fail silently: a PDF that is behind is a far smaller problem
+    than a save that came back as an error.
     """
     from app.services import drafted_forms
 
@@ -633,11 +642,11 @@ async def refresh_touched_pdfs(
         if kind not in KINDS:
             continue
         try:
-            await drafted_forms.refresh_saved_form(
+            await drafted_forms.enqueue_form_refresh(
                 db, profile, kind, actor_name=actor_name, actor_email=actor_email
             )
         except Exception:  # noqa: BLE001 - a stale PDF must never fail a save
-            log.exception("sheets: could not refresh the %s document", kind)
+            log.exception("sheets: could not queue the %s document", kind)
             await db.rollback()
 
 

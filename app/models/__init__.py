@@ -101,6 +101,7 @@ from app.models.email_draft import EmailDraft  # noqa: F401
 from app.models.email_message import EmailMessage  # noqa: F401
 from app.models.event import CalendarEvent  # noqa: F401
 from app.models.fix_flip_scenario import FixFlipScenario  # noqa: F401
+from app.models.form_pdf_refresh import FormPdfRefresh  # noqa: F401
 from app.models.fred_observation import FredObservation  # noqa: F401
 from app.models.google_account import GoogleAccount  # noqa: F401
 from app.models.hud import HudLineItem  # noqa: F401
