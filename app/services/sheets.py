@@ -220,6 +220,13 @@ def _cell_payload(cell: sheet_layout.Cell) -> dict[str, Any]:
         out["compute"] = cell.compute
     if cell.source is not None:
         out["source"] = cell.source
+    if cell.formula is not None:
+        # The formula text, not just the name of its answer. The grid reads it
+        # to work out which subtotals are made of nothing but blank cells, and
+        # shows those as an em dash rather than $0.00 — a zero it was told and
+        # a zero it made up are not the same claim. Without this the grid sees
+        # no formulas at all and every empty total reads as a real zero.
+        out["formula"] = cell.formula
     if cell.hint is not None:
         out["hint"] = cell.hint
     if cell.flags:

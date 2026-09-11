@@ -988,3 +988,29 @@ def test_a_row_body_refuses_a_line_count_that_is_not_one():
         assert body(sheet="debt_schedule", op="insert", visible=7).visible == 7
         with pytest.raises(ValidationError):
             body(sheet="debt_schedule", op="insert", visible=-1)
+
+
+def test_a_formula_cell_carries_its_formula_onto_the_wire():
+    """The grid needs the formula text, not only the name of its answer.
+
+    It reads the references to decide which subtotals are made of nothing but
+    blank cells and shows those as an em dash — a zero somebody typed and a
+    zero nobody typed are different claims, and on a debt schedule the second
+    one reads as "this business has no debt". The client's own tests passed on
+    a fixture that carried `formula` while the wire did not, so the feature
+    was dead in the browser and green in CI. Hence a test on the payload.
+    """
+    for kind in ("p_and_l", "balance_sheet", "debt_schedule", "pfs"):
+        sheet = sheets._layout_for(kind, {})
+        formulas = [
+            cell
+            for row in sheet.rows
+            for cell in row.cells
+            if cell.type == "formula" and cell.formula
+        ]
+        assert formulas, f"{kind} has no formula cells to check"
+        for cell in formulas:
+            wire = sheets._cell_payload(cell)
+            assert wire.get("formula") == cell.formula, f"{kind}/{cell.xlsx_name}"
+            # Both halves of what `indexFormulas` keys on.
+            assert wire.get("xlsx_name"), f"{kind}/{cell.c} has a formula and no name"
