@@ -1,3 +1,4 @@
+# ruff: noqa: B008
 """SmartIntake submission — creates a Loan + draft HUD + activity log + vector entry."""
 
 from __future__ import annotations
@@ -154,7 +155,8 @@ async def submit_intake(
         else 0
     )
     if _start_delay and _start_delay > 0:
-        from datetime import date as _d, timedelta as _td
+        from datetime import date as _d
+        from datetime import timedelta as _td
         loan.collection_starts_on = _d.today() + _td(days=int(_start_delay))
         await db.flush()
 
@@ -162,7 +164,9 @@ async def submit_intake(
     # loan type and auto-create the Document rows + calendar reminders.
     # Idempotent — re-submits don't duplicate. Safe even if the
     # checklist is empty (function logs and returns 0).
-    from app.models.app_settings import AppSettings as _AppSettings  # local import — keeps this module's import surface tight
+    from app.models.app_settings import (
+        AppSettings as _AppSettings,  # local import — keeps this module's import surface tight
+    )
     from app.services.loan_intake_automation import kickoff_loan as _kickoff
     settings_row = (await db.execute(select(_AppSettings).limit(1))).scalar_one_or_none()
     await _kickoff(db, loan, settings_row)
@@ -186,9 +190,11 @@ async def submit_intake(
     # custom one-off Documents the agent typed in.
     overrides = payload.document_overrides
     if overrides is not None:
-        from app.models.document import Document as _Doc
+        from datetime import date as _date_type
+        from datetime import timedelta as _timedelta
+
         from app.enums import DocStatus as _DocStatus
-        from datetime import date as _date_type, timedelta as _timedelta
+        from app.models.document import Document as _Doc
         # Skip + due-offset overrides both target the Documents that
         # kickoff_loan just materialized — fetch once.
         if overrides.skip_names or overrides.due_offset_overrides:

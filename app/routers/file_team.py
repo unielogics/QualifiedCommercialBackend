@@ -1,3 +1,4 @@
+# ruff: noqa: B008
 """The team on a file, and its timeline.
 
 Mounted before the application-profiles router on purpose: `/find` and

@@ -1,3 +1,4 @@
+# ruff: noqa: B008
 """Pre-qualification letter approval workflow.
 
 Borrower submits → status=pending → operator reviews/edits → status=approved
@@ -25,11 +26,12 @@ import asyncio
 import logging
 import re
 import secrets
+from datetime import UTC, datetime
 from typing import Any
-from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -38,8 +40,6 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import LoanPurpose, LoanStage, LoanType, PropertyType, Role
-from pydantic import BaseModel, Field
-
 from app.models.activity import Activity
 from app.models.app_settings import AppSettings
 from app.models.broker import Broker
@@ -55,7 +55,6 @@ from app.schemas.prequal import (
     PrequalRequestStartCreate,
     PrequalSellerOutcome,
 )
-from app.schemas.settings import AppSettingsData
 from app.services import calendar_emitter, prequal_pdf
 from app.services.activity_log import mark_loan_dirty
 
@@ -153,7 +152,7 @@ async def _spawn_loan_from_approved_request(
     to it, and returns the new Loan. Pre-fills as much from the scenario
     as we have so the underwriter doesn't re-type values they already set."""
     # Resolve numbers — prefer approved_*, fall back to requested.
-    purchase = float(request.approved_purchase_price or request.purchase_price)
+    _purchase = float(request.approved_purchase_price or request.purchase_price)
     loan_amount = float(request.approved_loan_amount or request.requested_loan_amount)
     scenario = request.approved_scenario or {}
 
@@ -645,7 +644,7 @@ async def _apply_approval(
     if req.status == "pending":
         req.status = "approved"
     req.reviewed_by = actor_user_id
-    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_at = datetime.now(UTC)
     # Generate the qualification # (Q-XXXX) on first approval. Re-approval
     # keeps the same number so the borrower's downloaded letter stays
     # consistent across edits.
@@ -967,7 +966,7 @@ async def reject_prequal_request(
     req.status = "rejected"
     req.admin_notes = payload.admin_notes
     req.reviewed_by = user.id
-    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_at = datetime.now(UTC)
     await db.flush()
 
     # Activity log only when a loan is attached. Pre-loan rejections

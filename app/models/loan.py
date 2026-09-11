@@ -5,7 +5,8 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -270,8 +271,8 @@ class Loan(TimestampMixin, Base):
     # creation, optionally re-pointed for transfers). One-way relationship —
     # the Broker.clients collection is the canonical reverse, and we don't
     # want a Broker.loans collection-load slowing every broker fetch.
-    broker: Mapped["Broker | None"] = relationship(foreign_keys="Loan.broker_id")
-    lender: Mapped["Lender | None"] = relationship(back_populates="loans")
+    broker: Mapped[Broker | None] = relationship(foreign_keys="Loan.broker_id")
+    lender: Mapped[Lender | None] = relationship(back_populates="loans")
     documents: Mapped[list[Document]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     hud_items: Mapped[list[HudLineItem]] = relationship(back_populates="loan", cascade="all, delete-orphan")
     activities: Mapped[list[Activity]] = relationship(back_populates="loan", cascade="all, delete-orphan")

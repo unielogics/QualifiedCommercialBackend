@@ -37,13 +37,10 @@ import logging
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-log = logging.getLogger(__name__)
 
 from app.enums import (
     DealHandoffStatus,
@@ -58,13 +55,14 @@ from app.models.agent_task import AgentTask
 from app.models.ai_chat_thread import AIChatThread
 from app.models.client import Client
 from app.models.client_ai_plan import ClientAIPlan
-from app.models.client_requirement_status import ClientRequirementStatus
 from app.models.deal import Deal
 from app.models.lending_handoff_packet import LendingHandoffPacket
 from app.models.loan import Loan
-from app.services.lending_handoff_shared import spawn_lending_thread
 from app.models.prequal_request import PrequalRequest
 from app.services.ai.handoff_builder import build_handoff_packet
+from app.services.lending_handoff_shared import spawn_lending_thread
+
+log = logging.getLogger(__name__)
 
 
 # Map a Deal.deal_type + Loan.purpose hint into a funding_file_kind label.
