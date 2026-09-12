@@ -62,6 +62,47 @@ async def test_inbound_communication_notification_is_individual_and_deep_linked(
 
 
 @pytest.mark.asyncio
+async def test_disconnected_tablet_sms_failure_is_actionable_and_deep_linked(
+    monkeypatch,
+) -> None:
+    captured = {}
+    recipient_id = uuid4()
+    sms_message_id = uuid4()
+    intake_id = uuid4()
+
+    async def fake_users_with_roles(_db, *_roles):
+        return [SimpleNamespace(id=recipient_id)]
+
+    async def fake_notify_users(_db, **kwargs):
+        captured.update(kwargs)
+        return [SimpleNamespace(id=uuid4())]
+
+    monkeypatch.setattr(notifications, "users_with_roles", fake_users_with_roles)
+    monkeypatch.setattr(notifications, "notify_users", fake_notify_users)
+
+    rows = await notifications.notify_sms_delivery_failure(
+        object(),
+        sms_message_id=sms_message_id,
+        phone_e164="+18623841951",
+        provider="android",
+        detail="Tablet gateway unreachable; check the tailnet.",
+        intake_id=intake_id,
+    )
+
+    assert rows
+    assert captured["recipient_ids"] == {recipient_id}
+    assert captured["event_type"] == "sms_delivery_failed"
+    assert captured["priority"] == "high"
+    assert captured["title"] == "SMS failed — tablet relay disconnected"
+    assert "•••-•••-1951" in captured["body"]
+    assert captured["deep_link"] == (
+        f"/admin/ai-underwriter-leads?lead={intake_id}"
+        "&view=communications&channel=client"
+    )
+    assert captured["push"] is False
+
+
+@pytest.mark.asyncio
 async def test_rep_inbox_append_creates_notification_for_inbound_only(monkeypatch) -> None:
     captured = []
 

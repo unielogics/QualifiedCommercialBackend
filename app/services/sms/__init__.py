@@ -148,7 +148,7 @@ async def send_sms_checked(
             )
 
     result = await asyncio.to_thread(send_sms, phone, body)
-    await ledger.record(
+    row = await ledger.record(
         db, direction="outbound", phone_e164=phone,
         status="sent" if result.ok else "failed",
         body=recorded_body, provider=result.provider,
@@ -157,4 +157,22 @@ async def send_sms_checked(
         profile_id=profile_id, intake_id=intake_id,
         portal_message_id=portal_message_id,
     )
+    if not result.ok:
+        try:
+            from app.services.notifications import notify_sms_delivery_failure
+
+            await notify_sms_delivery_failure(
+                db,
+                sms_message_id=row.id if row else None,
+                phone_e164=phone,
+                provider=result.provider,
+                detail=result.detail,
+                client_id=client_id,
+                profile_id=profile_id,
+                intake_id=intake_id,
+            )
+        except Exception:  # noqa: BLE001
+            # Never replace the true SMS result or lose its ledger row because
+            # a secondary operator notification could not be created.
+            log.exception("failed to create operator notification for SMS failure")
     return result

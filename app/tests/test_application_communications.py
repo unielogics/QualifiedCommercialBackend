@@ -157,3 +157,47 @@ async def test_sms_ledger_keeps_profile_and_portal_linkage(monkeypatch: pytest.M
     assert recorded.await_args.kwargs["profile_id"] == profile_id
     assert recorded.await_args.kwargs["intake_id"] == intake_id
     assert recorded.await_args.kwargs["portal_message_id"] == portal_message_id
+
+
+@pytest.mark.asyncio
+async def test_failed_sms_creates_operator_notification(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import notifications
+    from app.services.sms import ledger
+
+    sms_message_id = uuid4()
+    recorded = AsyncMock(return_value=SimpleNamespace(id=sms_message_id))
+    notified = AsyncMock()
+    monkeypatch.setattr(ledger, "record", recorded)
+    monkeypatch.setattr(notifications, "notify_sms_delivery_failure", notified)
+    monkeypatch.setattr(sms_service, "_provider", lambda: SimpleNamespace(selected_provider=lambda: "android"))
+    monkeypatch.setattr(sms_service, "is_opted_out", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        sms_service,
+        "send_sms",
+        lambda _phone, _body: sms_service.SmsResult(
+            False,
+            "android",
+            detail="Tablet gateway unreachable.",
+        ),
+    )
+    intake_id = uuid4()
+
+    result = await sms_service.send_sms_checked(
+        SimpleNamespace(),
+        to_phone="862-384-1951",
+        body="Test",
+        intake_id=intake_id,
+        context="intake_client_reply",
+    )
+
+    assert result.ok is False
+    notified.assert_awaited_once_with(
+        SimpleNamespace(),
+        sms_message_id=sms_message_id,
+        phone_e164="+18623841951",
+        provider="android",
+        detail="Tablet gateway unreachable.",
+        client_id=None,
+        profile_id=None,
+        intake_id=intake_id,
+    )

@@ -239,6 +239,83 @@ async def notify_inbound_communication(
     )
 
 
+async def notify_sms_delivery_failure(
+    db: AsyncSession,
+    *,
+    sms_message_id: UUID | None,
+    phone_e164: str,
+    provider: str,
+    detail: str,
+    client_id: UUID | None = None,
+    profile_id: UUID | None = None,
+    intake_id: UUID | None = None,
+) -> list[Notification]:
+    """Create the durable, actionable UI signal for an SMS transport failure."""
+    recipients = {
+        user.id
+        for user in await users_with_roles(db, Role.SUPER_ADMIN, Role.LOAN_EXEC)
+    }
+    if client_id:
+        client = await db.get(Client, client_id)
+        if client:
+            recipients.update(await client_agent_user_ids(db, client))
+
+    normalized_provider = (provider or "SMS").strip().lower()
+    normalized_detail = " ".join((detail or "Provider rejected the message.").split())[:300]
+    relay_disconnected = normalized_provider == "android" and any(
+        marker in normalized_detail.lower()
+        for marker in ("unreachable", "offline", "disconnected", "tailnet", "tablet")
+    )
+    title = (
+        "SMS failed — tablet relay disconnected"
+        if relay_disconnected
+        else f"SMS delivery failed — {normalized_provider.title()}"
+    )
+    digits = "".join(character for character in phone_e164 if character.isdigit())
+    masked_phone = f"•••-•••-{digits[-4:]}" if len(digits) >= 4 else "the client number"
+    action = (
+        "Reconnect the tablet to Wi-Fi and Tailscale, then open this file to retry."
+        if relay_disconnected
+        else "Open the affected communication to review the provider response and retry."
+    )
+    if intake_id:
+        deep_link = (
+            f"/admin/ai-underwriter-leads?lead={intake_id}"
+            "&view=communications&channel=client"
+        )
+        target_key = f"intake:{intake_id}"
+    elif client_id:
+        deep_link = f"/clients/{client_id}?tab=messages"
+        target_key = f"client:{client_id}"
+    else:
+        deep_link = "/admin/communications"
+        target_key = f"phone:{digits[-4:] or 'unknown'}"
+
+    return await notify_users(
+        db,
+        recipient_ids=recipients,
+        event_type="sms_delivery_failed",
+        category="communications",
+        priority="high",
+        title=title,
+        body=f"SMS to {masked_phone} failed: {normalized_detail} {action}",
+        target_type="sms_message",
+        target_id=str(sms_message_id) if sms_message_id else None,
+        deep_link=deep_link,
+        meta={
+            "sms_message_id": str(sms_message_id) if sms_message_id else None,
+            "provider": normalized_provider,
+            "detail": normalized_detail,
+            "profile_id": str(profile_id) if profile_id else None,
+            "intake_id": str(intake_id) if intake_id else None,
+            "client_id": str(client_id) if client_id else None,
+        },
+        batch_key=f"sms_failure:{normalized_provider}:{target_key}",
+        email=False,
+        push=False,
+    )
+
+
 async def _send_notification_email(
     db: AsyncSession, to_email: str, *, subject: str, body: str,
     event_type: str = "", owner_user_id=None,
