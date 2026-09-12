@@ -61,6 +61,7 @@ from app.models.public_underwriting_intake import (
     PublicUnderwritingIntakeArtifact,
     PublicUnderwritingIntakeEmailSend,
 )
+from app.models.sms_message import SmsMessage
 from app.models.user import User
 from app.routers.buckets import (
     _bucket_storage_config,
@@ -128,6 +129,7 @@ from app.services.main_street_programs import (
 )
 from app.services.payment_authorization import primary_super_admin
 from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
+from app.services.sms import send_sms_checked
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 
 router = APIRouter(prefix="/public/dealer-ai-intake", tags=["dealer-ai-intake"])
@@ -810,6 +812,9 @@ class DealerIntakePatch(BaseModel):
 class DealerChatRequest(BaseModel):
     message: str | None = Field(default=None, max_length=4000)
     updates: DealerIntakePatch | None = None
+    # Client-thread replies always land in the secure portal. This optional
+    # delivery flag mirrors the same text to the consented client number.
+    also_sms: bool = False
 
 
 class ReviewRunStartResponse(BaseModel):
@@ -8877,10 +8882,105 @@ async def _client_chat_turn(
     return chat_messages, (chat_messages[-1].content if chat_messages else None), False
 
 
+class ClientSmsMessageRead(BaseModel):
+    id: UUID
+    direction: str
+    phone_e164: str
+    body: str | None = None
+    provider: str
+    provider_message_id: str
+    status: str
+    detail: str
+    context: str
+    portal_message_id: UUID | None = None
+    created_at: datetime
+
+
+class ClientSmsStateRead(BaseModel):
+    phone: str | None = None
+    can_send: bool = False
+    transactional_consented: bool = False
+    opted_out: bool = False
+    provider_available: bool = False
+    blocked_reason: str | None = None
+
+
 class ClientThreadResponse(BaseModel):
-    messages: list[BucketAIMessageRead] = []
+    messages: list[BucketAIMessageRead] = Field(default_factory=list)
     # Set while the desk has taken the conversation over and the AI is standing down.
     ai_paused_until: datetime | None = None
+    # SMS follows the normalized client number. A row linked to a portal message
+    # is rendered as a second transport on that message rather than a duplicate.
+    sms_messages: list[ClientSmsMessageRead] = Field(default_factory=list)
+    sms_state: ClientSmsStateRead = Field(default_factory=ClientSmsStateRead)
+
+
+async def _client_thread_response(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    paused_until: datetime | None = None,
+) -> ClientThreadResponse:
+    from app.dealer_os.services import sms_consent as sms_consent_svc
+    from app.services.sms import is_opted_out, sms_available, unavailable_reason
+
+    messages = await _client_thread_messages(db, intake)
+    link = intake.bucket_upload_link
+    if paused_until is None and link and engagement.is_paused(link):
+        paused_until = link.ai_paused_until
+    phone = consent_delivery.normalize_phone(intake.phone)
+    rows: list[SmsMessage] = []
+    if phone:
+        rows = list(
+            (
+                await db.execute(
+                    select(SmsMessage)
+                    .where(SmsMessage.phone_e164 == phone)
+                    .order_by(SmsMessage.created_at.asc())
+                    .limit(200)
+                )
+            ).scalars().all()
+        )
+    opted_out = bool(phone and await is_opted_out(db, phone))
+    consent = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="transactional") if phone else None
+    ready = sms_available()
+    reason = None
+    if not phone:
+        reason = "No mobile number is on this file."
+    elif opted_out:
+        reason = "This number opted out of text messages."
+    elif consent is None:
+        reason = "Transactional SMS consent is required."
+    elif not ready:
+        reason = unavailable_reason() or "SMS delivery is not configured."
+    return ClientThreadResponse(
+        messages=[BucketAIMessageRead.model_validate(message) for message in messages],
+        ai_paused_until=paused_until,
+        sms_messages=[
+            ClientSmsMessageRead(
+                id=row.id,
+                direction=row.direction,
+                phone_e164=row.phone_e164,
+                body=row.body,
+                provider=row.provider,
+                provider_message_id=row.provider_message_id,
+                status=row.status,
+                detail=row.detail,
+                context=row.context,
+                portal_message_id=row.portal_message_id,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ],
+        sms_state=ClientSmsStateRead(
+            phone=phone,
+            can_send=bool(phone and consent and not opted_out and ready),
+            transactional_consented=consent is not None,
+            opted_out=opted_out,
+            provider_available=ready,
+            blocked_reason=reason,
+        ),
+    )
 
 
 # Shown to the borrower in place of an AI answer while a human is replying. It is
@@ -8902,12 +9002,7 @@ async def get_dealer_ai_client_thread(
     different thread from the private admin cockpit chat (audience='admin')."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    messages = await _client_thread_messages(db, intake)
-    link = intake.bucket_upload_link
-    return ClientThreadResponse(
-        messages=[BucketAIMessageRead.model_validate(m) for m in messages],
-        ai_paused_until=link.ai_paused_until if link and engagement.is_paused(link) else None,
-    )
+    return await _client_thread_response(db, intake)
 
 
 @admin_router.post("/{intake_id}/client-thread/reply", response_model=ClientThreadResponse)
@@ -8934,7 +9029,7 @@ async def reply_dealer_ai_client_thread(
     if intake.bucket_upload_link is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This lead has no client upload link to reply into")
     attribution = f"Underwriter — {user.name}" if user.name else "Underwriter"
-    await create_human_message(
+    portal_message = await create_human_message(
         db,
         bucket=intake.bucket,
         audience="uploader",
@@ -8943,6 +9038,23 @@ async def reply_dealer_ai_client_thread(
         user=user,
         upload_link=intake.bucket_upload_link,
     )
+    if payload.also_sms:
+        profile_id = (
+            await db.execute(
+                select(ApplicationProfile.id).where(ApplicationProfile.intake_id == intake.id)
+            )
+        ).scalar_one_or_none()
+        await send_sms_checked(
+            db,
+            to_phone=intake.phone,
+            body=payload.message.strip(),
+            require_consent_kind="transactional",
+            client_id=intake.client_id,
+            profile_id=profile_id,
+            intake_id=intake.id,
+            portal_message_id=portal_message.id,
+            context="intake_client_reply",
+        )
     paused_until = engagement.pause(intake.bucket_upload_link)
     await _log(
         db,
@@ -8957,11 +9069,73 @@ async def reply_dealer_ai_client_thread(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake_id)
-    messages = await _client_thread_messages(db, intake)
-    return ClientThreadResponse(
-        messages=[BucketAIMessageRead.model_validate(m) for m in messages],
-        ai_paused_until=paused_until,
+    return await _client_thread_response(db, intake, paused_until=paused_until)
+
+
+@admin_router.post(
+    "/{intake_id}/client-thread/{message_id}/sms-retry",
+    response_model=ClientThreadResponse,
+)
+async def retry_dealer_ai_client_thread_sms(
+    intake_id: UUID,
+    message_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ClientThreadResponse:
+    """Retry only the SMS transport for an operator-authored portal message."""
+    _require_super_admin(user)
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    message = (
+        await db.execute(
+            select(BucketAIMessage).where(
+                BucketAIMessage.id == message_id,
+                BucketAIMessage.bucket_id == intake.bucket_id,
+                BucketAIMessage.audience == "uploader",
+                BucketAIMessage.sender_kind == "operator",
+            )
+        )
+    ).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client message not found")
+    prior = (
+        await db.execute(
+            select(SmsMessage)
+            .where(SmsMessage.portal_message_id == message.id)
+            .order_by(SmsMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if prior is not None and prior.status in {"sent", "delivered"}:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This message was already sent by SMS")
+    profile_id = (
+        await db.execute(select(ApplicationProfile.id).where(ApplicationProfile.intake_id == intake.id))
+    ).scalar_one_or_none()
+    await send_sms_checked(
+        db,
+        to_phone=intake.phone,
+        body=message.content,
+        require_consent_kind="transactional",
+        client_id=intake.client_id,
+        profile_id=profile_id,
+        intake_id=intake.id,
+        portal_message_id=message.id,
+        context="intake_client_retry",
     )
+    await _log(
+        db,
+        intake.bucket_id,
+        "dealer_ai_admin_retried_client_sms",
+        request=request,
+        user=user,
+        actor_role="underwriter",
+        target_type="bucket_ai_message",
+        target_id=str(message.id),
+        detail=f"SMS delivery retried by {user.name or user.email}",
+    )
+    await db.commit()
+    intake = await _load_admin_dealer_lead(db, intake_id)
+    return await _client_thread_response(db, intake)
 
 
 @admin_router.post("/{intake_id}/client-thread/resume", response_model=ClientThreadResponse)
@@ -8993,8 +9167,7 @@ async def resume_dealer_ai_client_thread(
     )
     await db.commit()
     intake = await _load_admin_dealer_lead(db, intake_id)
-    messages = await _client_thread_messages(db, intake)
-    return ClientThreadResponse(messages=[BucketAIMessageRead.model_validate(m) for m in messages])
+    return await _client_thread_response(db, intake)
 
 
 @admin_router.post("/{intake_id}/files/upload-init", response_model=BucketFileUploadInitResponse)

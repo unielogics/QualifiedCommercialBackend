@@ -36,6 +36,7 @@ class SendOutcome:
     ok: bool
     detail: str
     message_id: str | None = None
+    provider_thread_id: str | None = None
     #: The ledger row. None only if the ledger write itself failed, which never
     #: blocks the send.
     row: Any = None
@@ -189,7 +190,7 @@ async def deliver_email(
             db, channel="email", status="blocked", draft=draft, context=context,
             template_key=template_key, detail=f"bad recipient: {draft.to!r}", subject=subject,
         )
-        return SendOutcome(False, "bad recipient", None, row)
+        return SendOutcome(False, "bad recipient", row=row)
 
     # The row goes in first, so a transport that dies mid-call still leaves
     # evidence that we tried.
@@ -198,7 +199,7 @@ async def deliver_email(
         template_key=template_key, subject=subject,
     )
 
-    provider, message_id, ok, detail = "ses", None, False, ""
+    provider, message_id, provider_thread_id, ok, detail = "ses", None, None, False, ""
     try:
         if sender_user_id is not None:
             from app.services.email.user_mailer import send_as_user
@@ -215,6 +216,7 @@ async def deliver_email(
                 attachments=list(draft.attachments),
             )
             ok, message_id, detail = result.ok, result.message_id, result.detail
+            provider_thread_id = getattr(result, "provider_thread_id", None)
             provider = "gmail" if detail == "sent_gmail" else "ses"
         else:
             from app.services.email import ses_client
@@ -246,7 +248,7 @@ async def deliver_email(
         if not ok:
             row.failed_at = datetime.now(UTC)
         await db.flush()
-    return SendOutcome(ok, detail, message_id, row)
+    return SendOutcome(ok, detail, message_id, provider_thread_id, row)
 
 
 #: SES event types mapped onto the ledger's vocabulary. `Send` and `Reject` are

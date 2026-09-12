@@ -32,6 +32,7 @@ class SesSendResult:
     ok: bool
     message_id: str | None
     detail: str
+    provider_thread_id: str | None = None
 
     @property
     def error(self) -> str | None:

@@ -570,6 +570,44 @@ class ApplicationBankState(BaseModel):
     asset_reports: list[PlaidAssetReportRead] = Field(default_factory=list)
 
 
+class BusinessBankEvidence(BaseModel):
+    source: Literal["none", "plaid", "uploaded_statements", "mixed"] = "none"
+    connected_institutions: int = 0
+    banking_access_complete: bool = False
+    accepted_statement_months: list[str] = Field(default_factory=list)
+    required_statement_months: int = 6
+    statement_coverage_complete: bool = False
+    processing_files: int = 0
+    needs_attention_files: int = 0
+    reconnect_required: bool = False
+
+
+class ClientEvidenceRequirementRead(BaseModel):
+    requirement_key: str
+    label: str
+    required_level: Literal["required", "recommended", "optional"]
+    status: RequirementStateStatus
+    complete: bool = False
+    evidence_count: int = 0
+    accepted_evidence_count: int = 0
+    processing_evidence_count: int = 0
+    coverage: dict = Field(default_factory=dict)
+
+
+class ClientEvidenceBankingSummary(BaseModel):
+    """Client-safe evidence state without program candidates or staff criteria."""
+
+    requirements: list[ClientEvidenceRequirementRead] = Field(default_factory=list)
+    required_count: int = 0
+    completed_required_count: int = 0
+    missing_required_count: int = 0
+    processing_file_count: int = 0
+    supporting_group_id: UUID | None = None
+    supporting_group_name: str | None = None
+    supporting_file_count: int = 0
+    bank_evidence: BusinessBankEvidence = Field(default_factory=BusinessBankEvidence)
+
+
 class ApplicationPlaidSettingsPatch(BaseModel):
     assets_enabled: bool
     statements_enabled: bool
@@ -898,6 +936,9 @@ class ApplicationRoomState(BaseModel):
     verification: FileOwnerRequirementState
     precall: ApplicationRoomPrecallState | None = None
     banking: ApplicationBankState
+    evidence_banking_summary: ClientEvidenceBankingSummary = Field(
+        default_factory=ClientEvidenceBankingSummary
+    )
     signable: list[ApplicationRoomSignable] = Field(default_factory=list)
     merchant_offer: ApplicationRoomMerchantOfferSummary | None = None
 
@@ -1196,6 +1237,43 @@ class FinancialFormSave(BaseModel):
 class FinancialFormsRead(BaseModel):
     forms: list[FinancialFormStatus] = Field(default_factory=list)
     packets: list[FinancialFormPacket] = Field(default_factory=list)
+
+
+class SupportingDocumentGroupRead(BaseModel):
+    id: UUID
+    bucket_id: UUID
+    name: str
+    description: str | None = None
+    required: bool = False
+    allow_multiple_files: bool = True
+    status: str = "requested"
+    file_count: int = 0
+
+
+class EvidenceProcessingSummary(BaseModel):
+    total_files: int = 0
+    analyzing_files: int = 0
+    accepted_files: int = 0
+    needs_attention_files: int = 0
+    failed_files: int = 0
+    has_processing: bool = False
+
+
+class ApplicationEvidenceWorkspace(BaseModel):
+    profile_id: UUID
+    primary_bucket_id: UUID | None = None
+    primary_bucket_name: str | None = None
+    program_readiness: ApplicationProgramReadiness
+    verification: FileOwnerRequirementState
+    banking: ApplicationBankState
+    bank_evidence: BusinessBankEvidence
+    forms: FinancialFormsRead
+    evidence: ApplicationEvidenceRead
+    supporting_group: SupportingDocumentGroupRead | None = None
+    processing: EvidenceProcessingSummary
+    can_manage_evidence: bool = False
+    can_manage_plaid_settings: bool = False
+    can_upload: bool = False
 
 
 # ---------------------------------------------------------------------------

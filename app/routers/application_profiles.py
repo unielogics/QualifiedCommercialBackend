@@ -37,6 +37,7 @@ from app.models.application_profile import (
     PlaidAssetReport,
 )
 from app.models.bucket import (
+    Bucket,
     BucketFile,
     BucketFileAnalysis,
     BucketRequestedDocument,
@@ -57,6 +58,7 @@ from app.schemas.application_profile import (
     ApplicationBankState,
     ApplicationDraftAnalysisStatus,
     ApplicationEvidenceRead,
+    ApplicationEvidenceWorkspace,
     ApplicationIntelligenceRead,
     ApplicationPlaidExchange,
     ApplicationPlaidItemPatch,
@@ -94,6 +96,7 @@ from app.schemas.application_profile import (
     ClassificationPatch,
     ClassificationPreview,
     EvidenceDecisionOverride,
+    EvidenceProcessingSummary,
     EvidenceReanalyzeResult,
     ExtractedFactRead,
     ExtractedFactReview,
@@ -128,6 +131,7 @@ from app.schemas.application_profile import (
     RoomRequestResult,
     SecureBankFileUploadComplete,
     SecureBankFileUploadInit,
+    SupportingDocumentGroupRead,
     TaxonomyContributionCreate,
     TaxonomyEntryRead,
     TaxonomyPathEntry,
@@ -855,6 +859,112 @@ async def get_application_program_readiness(
     # requirement rows. Those writes are deterministic and idempotent.
     await db.commit()
     return readiness
+
+
+@router.get("/{profile_id}/evidence-workspace", response_model=ApplicationEvidenceWorkspace)
+async def get_application_evidence_workspace(
+    profile_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationEvidenceWorkspace:
+    """One canonical snapshot for requirements, files, forms, and banking."""
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    supporting = await profiles.ensure_supporting_document_group(db, profile)
+    readiness = await application_programs.get_program_readiness(db, profile)
+    verification = await profiles.verification_state(db, profile)
+    banking = await _application_bank_state(db, profile)
+    forms = await financial_forms_status(profile_id, user, db)
+    evidence = await profiles.evidence_state(db, profile)
+
+    decisions_by_file: dict[UUID, set[str]] = {}
+    for requirement in readiness.requirements:
+        for item in requirement.evidence_files:
+            decisions_by_file.setdefault(item.file_id, set()).add(item.ai_decision)
+
+    latest_analysis: dict[UUID, str] = {}
+    evidence_ids = [item.id for item in evidence.files]
+    if evidence_ids:
+        analyses = list(
+            (
+                await db.execute(
+                    select(BucketFileAnalysis)
+                    .where(BucketFileAnalysis.bucket_file_id.in_(evidence_ids))
+                    .order_by(
+                        BucketFileAnalysis.bucket_file_id,
+                        BucketFileAnalysis.created_at.desc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for analysis in analyses:
+            latest_analysis.setdefault(analysis.bucket_file_id, analysis.status)
+
+    analyzing = accepted = needs_attention = failed = 0
+    for item in evidence.files:
+        decisions = decisions_by_file.get(item.id, set())
+        analysis_status = latest_analysis.get(item.id)
+        if "processing" in decisions or analysis_status in {
+            "pending",
+            "queued",
+            "processing",
+            "running",
+        }:
+            analyzing += 1
+        elif "failed" in decisions or analysis_status == "failed":
+            failed += 1
+        elif decisions.intersection({"needs_more", "rejected"}):
+            needs_attention += 1
+        elif "accepted" in decisions:
+            accepted += 1
+
+    client_summary = await profiles.client_evidence_banking_summary(
+        db,
+        profile,
+        readiness=readiness,
+        verification=verification,
+        banking=banking,
+    )
+    bucket = await db.get(Bucket, profile.primary_bucket_id) if profile.primary_bucket_id else None
+    await db.commit()
+    return ApplicationEvidenceWorkspace(
+        profile_id=profile.id,
+        primary_bucket_id=profile.primary_bucket_id,
+        primary_bucket_name=bucket.name if bucket else None,
+        program_readiness=readiness,
+        verification=verification,
+        banking=banking,
+        bank_evidence=client_summary.bank_evidence,
+        forms=forms,
+        evidence=evidence,
+        supporting_group=(
+            SupportingDocumentGroupRead(
+                id=supporting.id,
+                bucket_id=supporting.bucket_id,
+                name=supporting.name,
+                description=supporting.description,
+                required=False,
+                allow_multiple_files=True,
+                status=supporting.status,
+                file_count=client_summary.supporting_file_count,
+            )
+            if supporting is not None
+            else None
+        ),
+        processing=EvidenceProcessingSummary(
+            total_files=evidence.total_files,
+            analyzing_files=analyzing,
+            accepted_files=accepted,
+            needs_attention_files=needs_attention,
+            failed_files=failed,
+            has_processing=analyzing > 0,
+        ),
+        can_manage_evidence=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
+        can_manage_plaid_settings=user.role == Role.SUPER_ADMIN,
+        can_upload=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
+    )
 
 
 @router.patch("/{profile_id}/programs", response_model=ApplicationProgramReadiness)
@@ -2230,6 +2340,13 @@ async def _application_room_state(
             done_count=ready.done_count,
             missing=ready.missing,
         )
+    banking = await _application_bank_state(db, profile)
+    evidence_banking_summary = await profiles.client_evidence_banking_summary(
+        db,
+        profile,
+        verification=verification,
+        banking=banking,
+    )
     return ApplicationRoomState(
         profile_id=profile.id,
         business_name=_business_label(profile, intake, client),
@@ -2238,7 +2355,8 @@ async def _application_room_state(
         owners=[profiles.owner_read(owner) for owner in owner_rows],
         verification=verification,
         precall=room_precall,
-        banking=await _application_bank_state(db, profile),
+        banking=banking,
+        evidence_banking_summary=evidence_banking_summary,
         signable=await _application_room_signables(db, link.bucket_id),
         merchant_offer=await _room_merchant_offer_summary(db, profile),
     )
@@ -2252,7 +2370,9 @@ async def public_application_room_state(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationRoomState:
     link, profile = await _public_application_room(db, token, payload.passcode, request)
-    return await _application_room_state(db, link=link, profile=profile)
+    state = await _application_room_state(db, link=link, profile=profile)
+    await db.commit()
+    return state
 
 
 @router.post(

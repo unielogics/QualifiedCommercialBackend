@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -141,6 +142,14 @@ class BucketDocumentTemplate(TimestampMixin, Base):
 
 class BucketRequestedDocument(TimestampMixin, Base):
     __tablename__ = "bucket_requested_documents"
+    __table_args__ = (
+        Index(
+            "uq_bucket_requested_documents_supporting_group",
+            "bucket_id",
+            unique=True,
+            postgresql_where=text("requirement_key = 'supporting_documents'"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     bucket_id: Mapped[uuid.UUID] = mapped_column(

@@ -11,16 +11,22 @@ from app.models.application_profile import (
     ApplicationPlaidItem,
     ApplicationRequirementEvidence,
 )
+from app.models.bucket import BucketRequestedDocument
 from app.routers.application_profiles import _require_profile_bank_client
 from app.routers.communications import _intake_allowed_channels
 from app.schemas.application_profile import (
     ApplicationRequirementAIReview,
     ApplicationRequirementBatchReminder,
     ApplicationRequirementPatch,
+    BusinessBankEvidence,
+    ClientEvidenceBankingSummary,
+    ClientEvidenceRequirementRead,
     FileOwnerPatch,
+    SupportingDocumentGroupRead,
 )
 from app.services.application_profiles import (
     ManualStatementEvidence,
+    _client_requirement_coverage,
     _statement_months_from_analysis,
     application_evidence_summary,
 )
@@ -90,11 +96,105 @@ def test_model_metadata_contains_partial_uniqueness_contracts() -> None:
     requirement_evidence_indexes = {
         index.name for index in ApplicationRequirementEvidence.__table__.indexes
     }
+    requested_document_indexes = {
+        index.name for index in BucketRequestedDocument.__table__.indexes
+    }
 
     assert "uq_application_owners_primary" in owner_indexes
     assert "uq_application_owners_email" in owner_indexes
     assert "uq_application_plaid_items_primary" in bank_indexes
     assert "uq_application_requirement_evidence_active" in requirement_evidence_indexes
+    assert (
+        "uq_bucket_requested_documents_supporting_group"
+        in requested_document_indexes
+    )
+
+
+def test_supporting_document_group_is_optional_and_multi_file() -> None:
+    group = SupportingDocumentGroupRead(
+        id=uuid4(),
+        bucket_id=uuid4(),
+        name="Supporting / Other",
+    )
+
+    assert group.required is False
+    assert group.allow_multiple_files is True
+    assert group.file_count == 0
+
+
+def test_business_bank_evidence_uses_provider_neutral_sources() -> None:
+    state = BusinessBankEvidence(
+        source="uploaded_statements",
+        accepted_statement_months=["2026-01", "2026-02"],
+        required_statement_months=6,
+    )
+
+    assert state.connected_institutions == 0
+    assert state.statement_coverage_complete is False
+    with pytest.raises(ValidationError):
+        BusinessBankEvidence(source="manual_upload")
+
+
+def test_client_evidence_summary_excludes_staff_program_details() -> None:
+    summary = ClientEvidenceBankingSummary(
+        requirements=[
+            ClientEvidenceRequirementRead(
+                requirement_key="business_bank_statements_6_months",
+                label="Last 6 months business bank statements",
+                required_level="required",
+                status="verified",
+                complete=True,
+                evidence_count=6,
+                accepted_evidence_count=6,
+                coverage={"months": 6, "required_months": 6, "complete": True},
+            )
+        ],
+        required_count=1,
+        completed_required_count=1,
+        bank_evidence=BusinessBankEvidence(
+            source="uploaded_statements",
+            accepted_statement_months=[
+                "2026-01",
+                "2026-02",
+                "2026-03",
+                "2026-04",
+                "2026-05",
+                "2026-06",
+            ],
+            statement_coverage_complete=True,
+            banking_access_complete=True,
+        ),
+    )
+
+    payload = summary.model_dump()
+    assert payload["missing_required_count"] == 0
+    assert payload["bank_evidence"]["statement_coverage_complete"] is True
+    assert "programs" not in payload
+    assert "candidates" not in payload
+    assert "source_program_keys" not in payload["requirements"][0]
+
+
+def test_client_requirement_coverage_strips_classifier_metadata() -> None:
+    coverage = _client_requirement_coverage(
+        {
+            "matched_files": 2,
+            "expected_classifications": ["business_tax_return"],
+            "classifications": ["business_tax_return"],
+            "years": ["2024", "2025"],
+            "current": 2,
+            "required": 2,
+            "unit": "years",
+            "complete": True,
+        }
+    )
+
+    assert coverage == {
+        "years": ["2024", "2025"],
+        "current": 2,
+        "required": 2,
+        "unit": "years",
+        "complete": True,
+    }
 
 
 @pytest.mark.parametrize(

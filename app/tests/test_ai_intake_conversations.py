@@ -34,6 +34,7 @@ def test_all_client_and_admin_intake_conversation_routes_remain_registered() -> 
     assert ("/buckets/client/intakes/{intake_id}/chat", "POST") in _route_contract(client_router)
     assert ("/admin/ai-underwriter-leads/{intake_id}/chat", "POST") in _route_contract(admin_router)
     assert ("/admin/ai-underwriter-leads/{intake_id}/client-thread", "GET") in _route_contract(admin_router)
+    assert ("/admin/ai-underwriter-leads/{intake_id}/client-thread/{message_id}/sms-retry", "POST") in _route_contract(admin_router)
     assert ("/public/dealer-ai-intake/{token}/chat-actions/{action_id}", "POST") in _route_contract(router)
     assert ("/public/funding-review/{token}/chat-actions/{action_id}", "POST") in _route_contract(funding_router)
     assert ("/public/mca-refinance/{token}/chat-actions/{action_id}", "POST") in _route_contract(mca_router)

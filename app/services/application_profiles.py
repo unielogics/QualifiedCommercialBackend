@@ -49,11 +49,16 @@ from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
+    ApplicationBankState,
     ApplicationDraftAnalysisStatus,
     ApplicationEvidenceRead,
     ApplicationEvidenceSummary,
     ApplicationIntelligenceRead,
     ApplicationProfileRead,
+    ApplicationProgramReadiness,
+    BusinessBankEvidence,
+    ClientEvidenceBankingSummary,
+    ClientEvidenceRequirementRead,
     EvidenceFileRead,
     EvidenceSourceRead,
     FileOwnerRead,
@@ -73,7 +78,35 @@ from app.services.underwriting_intelligence import calculate_dscr
 from app.services.user_access import is_audit_client
 
 MAX_OWNERS = 5
+
+_CLIENT_REQUIREMENT_COVERAGE_KEYS = frozenset(
+    {
+        "balance_sheet",
+        "complete",
+        "current",
+        "months",
+        "profit_and_loss",
+        "required",
+        "required_months",
+        "required_years",
+        "unit",
+        "years",
+    }
+)
 CREDIT_THRESHOLD = Decimal("20.00")
+SUPPORTING_DOCUMENT_REQUIREMENT_KEY = "supporting_documents"
+SUPPORTING_DOCUMENT_NAME = "Supporting / Other"
+
+
+def _client_requirement_coverage(coverage: dict | None) -> dict:
+    """Remove classifier and playbook metadata from client room coverage."""
+    if not isinstance(coverage, dict):
+        return {}
+    return {
+        key: coverage[key]
+        for key in _CLIENT_REQUIREMENT_COVERAGE_KEYS
+        if key in coverage
+    }
 
 
 @dataclass(frozen=True)
@@ -104,6 +137,203 @@ def application_evidence_summary(
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+async def ensure_supporting_document_group(
+    db: AsyncSession, profile: ApplicationProfile
+) -> BucketRequestedDocument | None:
+    """Keep one optional, multi-file destination on every application bucket.
+
+    It is intentionally outside program readiness: files uploaded here are
+    analyzed and may later be assigned to a real requirement, but the group
+    itself never blocks the file or triggers a reminder.
+    """
+    if profile.primary_bucket_id is None:
+        return None
+    # Serialize repair/creation within a bucket. The partial unique index is
+    # the final guard, while this lock keeps concurrent first reads idempotent.
+    await db.execute(
+        select(Bucket.id)
+        .where(Bucket.id == profile.primary_bucket_id)
+        .with_for_update()
+    )
+    existing = (
+        await db.execute(
+            select(BucketRequestedDocument).where(
+                BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                BucketRequestedDocument.requirement_key
+                == SUPPORTING_DOCUMENT_REQUIREMENT_KEY,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = (
+            await db.execute(
+                select(BucketRequestedDocument)
+                .where(
+                    BucketRequestedDocument.bucket_id == profile.primary_bucket_id,
+                    BucketRequestedDocument.requirement_key.is_(None),
+                    BucketRequestedDocument.required.is_(False),
+                    BucketRequestedDocument.requires_signature.is_(False),
+                    func.lower(func.trim(BucketRequestedDocument.name)).in_(
+                        ("supporting / other", "supporting/other")
+                    ),
+                )
+                .order_by(
+                    BucketRequestedDocument.created_at.asc(),
+                    BucketRequestedDocument.id.asc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if existing is not None:
+        existing.name = SUPPORTING_DOCUMENT_NAME
+        existing.category = "Supporting documents"
+        existing.description = (
+            "Optional supporting material that does not match a requested item. "
+            "Files are still analyzed and may be reassigned later."
+        )
+        existing.required = False
+        existing.allow_multiple_files = True
+        existing.requires_signature = False
+        existing.requirement_key = SUPPORTING_DOCUMENT_REQUIREMENT_KEY
+        existing.requirement_source = {"kind": "system_supporting", "client_visible": True}
+        return existing
+
+    row = BucketRequestedDocument(
+        bucket_id=profile.primary_bucket_id,
+        name=SUPPORTING_DOCUMENT_NAME,
+        category="Supporting documents",
+        description=(
+            "Optional supporting material that does not match a requested item. "
+            "Files are still analyzed and may be reassigned later."
+        ),
+        required=False,
+        allow_multiple_files=True,
+        status="requested",
+        is_custom=False,
+        requires_signature=False,
+        requirement_key=SUPPORTING_DOCUMENT_REQUIREMENT_KEY,
+        requirement_source={"kind": "system_supporting", "client_visible": True},
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def client_evidence_banking_summary(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    readiness: ApplicationProgramReadiness | None = None,
+    verification: FileOwnerRequirementState | None = None,
+    banking: ApplicationBankState | None = None,
+) -> ClientEvidenceBankingSummary:
+    """Return only evidence and bank state that is safe for a client room."""
+    from app.services import application_programs
+
+    readiness = readiness or await application_programs.get_program_readiness(db, profile)
+    verification = verification or await verification_state(db, profile)
+    supporting = await ensure_supporting_document_group(db, profile)
+
+    visible = [item for item in readiness.requirements if item.client_visible]
+    satisfied_states = {"verified", "waived", "not_applicable"}
+    requirement_rows: list[ClientEvidenceRequirementRead] = []
+    processing_ids: set[UUID] = set()
+    for item in visible:
+        accepted_count = sum(
+            evidence.ai_decision == "accepted" or evidence.verified
+            for evidence in item.evidence_files
+        )
+        processing_count = sum(
+            evidence.ai_decision == "processing" for evidence in item.evidence_files
+        )
+        processing_ids.update(
+            evidence.file_id
+            for evidence in item.evidence_files
+            if evidence.ai_decision == "processing"
+        )
+        requirement_rows.append(
+            ClientEvidenceRequirementRead(
+                requirement_key=item.requirement_key,
+                label=item.label,
+                required_level=item.required_level,
+                status=item.status,
+                complete=(
+                    item.status in satisfied_states
+                    or item.verified_coverage_complete
+                ),
+                evidence_count=item.evidence_count,
+                accepted_evidence_count=accepted_count,
+                processing_evidence_count=processing_count,
+                coverage=_client_requirement_coverage(
+                    item.verified_coverage or item.coverage
+                ),
+            )
+        )
+
+    required = [item for item in requirement_rows if item.required_level == "required"]
+    completed = [item for item in required if item.complete]
+    if banking is None:
+        bank_items = await bank_rows(db, profile)
+        evidence_summary = readiness.evidence_summary
+    else:
+        bank_items = banking.items
+        evidence_summary = banking.evidence_summary
+    connected = [item for item in bank_items if item.status != "removed"]
+    uploaded_count = evidence_summary.bank_statement_file_count
+    bank_source = (
+        "mixed"
+        if connected and uploaded_count
+        else "plaid"
+        if connected
+        else "uploaded_statements"
+        if uploaded_count
+        else "none"
+    )
+    supporting_file_count = 0
+    if supporting is not None:
+        supporting_file_count = int(
+            (
+                await db.execute(
+                    select(func.count()).select_from(BucketFile).where(
+                        BucketFile.requested_document_id == supporting.id,
+                        BucketFile.deleted_at.is_(None),
+                        BucketFile.status == "uploaded",
+                    )
+                )
+            ).scalar_one()
+        )
+
+    return ClientEvidenceBankingSummary(
+        requirements=requirement_rows,
+        required_count=len(required),
+        completed_required_count=len(completed),
+        missing_required_count=len(required) - len(completed),
+        processing_file_count=len(processing_ids),
+        supporting_group_id=supporting.id if supporting else None,
+        supporting_group_name=supporting.name if supporting else None,
+        supporting_file_count=supporting_file_count,
+        bank_evidence=BusinessBankEvidence(
+            source=bank_source,
+            connected_institutions=len(connected),
+            banking_access_complete=verification.business_banking_complete,
+            accepted_statement_months=evidence_summary.bank_statement_months,
+            required_statement_months=evidence_summary.bank_statement_required_months,
+            statement_coverage_complete=evidence_summary.bank_statement_coverage_complete,
+            processing_files=evidence_summary.bank_statement_processing_count,
+            needs_attention_files=(
+                evidence_summary.bank_statement_needs_more_count
+                + evidence_summary.bank_statement_rejected_count
+                + evidence_summary.bank_statement_failed_count
+            ),
+            reconnect_required=(
+                not connected
+                and uploaded_count == 0
+                and not verification.business_banking_complete
+            ),
+        ),
+    )
 
 
 def normalized_email(value: str | None) -> str | None:
@@ -441,6 +671,7 @@ async def provision_profile_for_intake(
         return existing
 
     await _seed_primary_owner(db, profile, intake=intake)
+    await ensure_supporting_document_group(db, profile)
     await db.flush()
     return profile
 
@@ -685,6 +916,7 @@ async def resolve_profile(
             source.bucket_id = bucket.id
 
     await _seed_primary_owner(db, profile)
+    await ensure_supporting_document_group(db, profile)
     if profile.dealer_id is not None:
         dealer = (
             source

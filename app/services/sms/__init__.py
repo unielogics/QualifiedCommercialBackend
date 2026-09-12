@@ -87,6 +87,9 @@ async def send_sms_checked(
     body: str,
     require_consent_kind: str | None = None,
     client_id=None,
+    profile_id=None,
+    intake_id=None,
+    portal_message_id=None,
     context: str = "",
     ledger_body: str | None = None,
 ) -> SmsResult:
@@ -120,6 +123,8 @@ async def send_sms_checked(
             db, direction="outbound", phone_e164=phone_for_row, status="blocked",
             body=recorded_body, provider=provider_name, detail=detail,
             context=context, client_id=client_id,
+            profile_id=profile_id, intake_id=intake_id,
+            portal_message_id=portal_message_id,
         )
         return SmsResult(False, provider_name, detail=detail)
 
@@ -149,5 +154,7 @@ async def send_sms_checked(
         body=recorded_body, provider=result.provider,
         provider_message_id=result.message_id, detail=result.detail,
         context=context, client_id=client_id,
+        profile_id=profile_id, intake_id=intake_id,
+        portal_message_id=portal_message_id,
     )
     return result

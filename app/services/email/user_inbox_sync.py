@@ -147,6 +147,8 @@ async def _mirror_file_email_reply(
     subject: str,
     body: str | None,
     gmail_id: str,
+    gmail_thread_id: str | None = None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> None:
     """Attach an inbound Gmail reply to its provider-backed file thread.
 
@@ -159,6 +161,65 @@ async def _mirror_file_email_reply(
     from app.dealer_os.router import _append_rep_inbox_message
 
     subject_key = _thread_subject_key(subject)
+    # AI Intake threads do not manufacture a rep CRM contact. Prefer Gmail's
+    # stable thread id and fall back to exact participant + normalized subject.
+    app_thread = None
+    if owner_user_id is not None and gmail_thread_id:
+        app_thread = (
+            await db.execute(
+                select(DealerRepInboxThread).where(
+                    DealerRepInboxThread.owner_user_id == owner_user_id,
+                    DealerRepInboxThread.profile_id.is_not(None),
+                    DealerRepInboxThread.channel == "email",
+                    DealerRepInboxThread.status == "open",
+                    DealerRepInboxThread.provider_thread_id == gmail_thread_id,
+                )
+            )
+        ).scalars().first()
+    if app_thread is None and owner_user_id is not None:
+        candidates = list(
+            (
+                await db.execute(
+                    select(DealerRepInboxThread)
+                    .where(
+                        DealerRepInboxThread.owner_user_id == owner_user_id,
+                        DealerRepInboxThread.profile_id.is_not(None),
+                        DealerRepInboxThread.channel == "email",
+                        DealerRepInboxThread.status == "open",
+                        DealerRepInboxThread.subject_key == subject_key,
+                    )
+                    .order_by(DealerRepInboxThread.last_message_at.desc().nullslast())
+                )
+            ).scalars().all()
+        )
+        app_thread = next(
+            (
+                thread
+                for thread in candidates
+                if from_email.lower()
+                in {str(value).strip().lower() for value in (thread.participant_emails or [])}
+            ),
+            None,
+        )
+    if app_thread is not None:
+        if gmail_thread_id and not app_thread.provider_thread_id:
+            app_thread.provider_thread_id = gmail_thread_id
+        await _append_rep_inbox_message(
+            db,
+            thread=app_thread,
+            contact=None,
+            direction="inbound",
+            channel="email",
+            subject=subject,
+            body=body or subject,
+            provider="gmail",
+            provider_message_id=gmail_id,
+            delivery_status="received",
+            sender=from_email,
+            recipient=mailbox,
+        )
+        return
+
     row = (
         await db.execute(
             select(DealerRepInboxThread, DealerRepContact)
@@ -320,6 +381,8 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
         subject=subject,
         body=body_text,
         gmail_id=gmail_id,
+        gmail_thread_id=thread_id,
+        owner_user_id=owner_user_id,
     )
 
     # Body-less breadcrumbs on the SHARED loan/client feeds (isolation rule 2):

@@ -74,6 +74,18 @@ class SmsMessage(TimestampMixin, Base):
         nullable=True, index=True,
     )
 
+    #: File linkage for AI Intake's combined portal + SMS conversation. These
+    #: remain plain UUID breadcrumbs so the ledger outlives either subsystem.
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    intake_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    portal_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+
     #: Set when a carrier delivery receipt confirms arrival — the timestamp a
     #: dispute actually needs, distinct from when we sent it.
     delivered_at: Mapped[datetime | None] = mapped_column(

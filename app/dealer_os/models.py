@@ -1663,6 +1663,8 @@ class DealerRepInboxThread(TimestampMixin, Base):
         Index("ix_dos_rep_inbox_threads_owner", "owner_user_id", "last_message_at"),
         Index("ix_dos_rep_inbox_threads_contact", "contact_id"),
         Index("ix_dos_rep_inbox_threads_dealer", "dealer_id"),
+        Index("ix_dos_rep_inbox_threads_profile", "profile_id", "last_message_at"),
+        Index("ix_dos_rep_inbox_threads_provider_thread", "provider_thread_id"),
     )
 
     id: Mapped[uuid.UUID] = _pk()
@@ -1675,6 +1677,14 @@ class DealerRepInboxThread(TimestampMixin, Base):
     dealer_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
     )
+    # Platform application-file breadcrumb. Nullable keeps every existing Rep
+    # inbox row valid while letting AI Intake use the same provider history.
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    # Every address that may legitimately reply to this thread. File-email
+    # threads can have an owner in To and other verified owners in Cc.
+    participant_emails: Mapped[list | None] = mapped_column(JSONB)
+    # Gmail's stable thread id when the connected-mailbox transport returns it.
+    provider_thread_id: Mapped[str | None] = mapped_column(String(160))
     subject: Mapped[str] = mapped_column(String(200), nullable=False)
     subject_key: Mapped[str | None] = mapped_column(String(200))
     channel: Mapped[str] = mapped_column(String(16), nullable=False, default="email", server_default="email")
@@ -1691,6 +1701,7 @@ class DealerRepInboxMessage(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_dos_rep_inbox_messages_thread", "thread_id", "created_at"),
         Index("ix_dos_rep_inbox_messages_owner", "owner_user_id", "created_at"),
+        Index("ix_dos_rep_inbox_messages_profile", "profile_id", "created_at"),
         Index(
             "uq_dos_rep_inbox_provider_message",
             "provider",
@@ -1713,6 +1724,10 @@ class DealerRepInboxMessage(TimestampMixin, Base):
     dealer_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_dealers.id", ondelete="SET NULL")
     )
+    profile_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    message_send_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("message_sends.id", ondelete="SET NULL")
+    )
     direction: Mapped[str] = mapped_column(String(12), nullable=False)
     channel: Mapped[str] = mapped_column(String(16), nullable=False)
     subject: Mapped[str | None] = mapped_column(String(200))
@@ -1723,6 +1738,7 @@ class DealerRepInboxMessage(TimestampMixin, Base):
     delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="stored", server_default="stored")
     sender: Mapped[str | None] = mapped_column(String(320))
     recipient: Mapped[str | None] = mapped_column(String(320))
+    cc_emails: Mapped[list | None] = mapped_column(JSONB)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 

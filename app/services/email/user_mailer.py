@@ -58,7 +58,7 @@ async def _try_gmail_send_as_user(
         {"filename": fn, "mime_type": ct, "data": data} for (fn, data, ct) in (attachments or [])
     ]
 
-    def _send() -> str | None:
+    def _send() -> tuple[str | None, str | None]:
         from googleapiclient.discovery import build
 
         svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -72,14 +72,14 @@ async def _try_gmail_send_as_user(
             attachments=gmail_attachments,
         )
         resp = svc.users().messages().send(userId="me", body={"raw": built.raw_base64}).execute()
-        return resp.get("id")
+        return resp.get("id"), resp.get("threadId")
 
     try:
         import asyncio
 
-        msg_id = await asyncio.to_thread(_send)
+        msg_id, thread_id = await asyncio.to_thread(_send)
         log.info("send_as_user: sent via Gmail user=%s to=%s id=%s", sender_user_id, to_emails, msg_id)
-        return SesSendResult(True, msg_id, "sent_gmail")
+        return SesSendResult(True, msg_id, "sent_gmail", thread_id)
     except Exception as exc:  # noqa: BLE001
         # Gmail send genuinely failed (not "not connected") — surface it rather
         # than silently falling back, so the failure is visible.

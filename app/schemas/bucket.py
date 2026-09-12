@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.schemas.application_profile import ClientEvidenceBankingSummary
 from app.schemas.common import ORMModel
 
 
@@ -208,6 +209,7 @@ class BucketRequestAccessRead(BaseModel):
     requested_documents: list[BucketRequestedDocumentRead]
     files: list[BucketRequestUploadedFileRead] = []
     ai_summary: dict | None = None
+    evidence_banking_summary: ClientEvidenceBankingSummary | None = None
 
 
 class BucketFileUploadInit(BaseModel):

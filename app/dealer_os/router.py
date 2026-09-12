@@ -7632,6 +7632,8 @@ async def _append_rep_inbox_message(
     delivery_status: str = "stored",
     sender: str | None = None,
     recipient: str | None = None,
+    cc_emails: list[str] | None = None,
+    message_send_id: UUID | None = None,
 ) -> DealerRepInboxMessage:
     now = datetime.now(timezone.utc)
     msg = DealerRepInboxMessage(
@@ -7639,6 +7641,8 @@ async def _append_rep_inbox_message(
         owner_user_id=thread.owner_user_id,
         contact_id=thread.contact_id,
         dealer_id=thread.dealer_id,
+        profile_id=getattr(thread, "profile_id", None),
+        message_send_id=message_send_id,
         direction=direction,
         channel=channel,
         subject=subject,
@@ -7649,6 +7653,7 @@ async def _append_rep_inbox_message(
         delivery_status=delivery_status,
         sender=sender,
         recipient=recipient,
+        cc_emails=cc_emails or None,
         read_at=now if direction == "outbound" else None,
     )
     db.add(msg)

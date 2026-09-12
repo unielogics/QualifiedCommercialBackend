@@ -124,6 +124,7 @@ from app.schemas.bucket import (
     IntakeChatActionRead,
     IntakeChatActionResult,
 )
+from app.services import application_profiles as profiles
 from app.services import clerk as clerk_service
 from app.services import file_events
 from app.services.ai import engagement
@@ -2607,6 +2608,37 @@ async def request_link_access(
         reverse=True,
     )
     review = await latest_review(db, link.bucket_id)
+    profile = (
+        (
+            await db.execute(
+                select(ApplicationProfile)
+                .where(ApplicationProfile.primary_bucket_id == link.bucket_id)
+                .order_by(ApplicationProfile.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    evidence_banking_summary = (
+        await profiles.client_evidence_banking_summary(db, profile)
+        if profile is not None
+        else None
+    )
+    requested_documents = list(
+        (
+            await db.execute(
+                select(BucketRequestedDocument)
+                .where(BucketRequestedDocument.bucket_id == link.bucket_id)
+                .order_by(
+                    BucketRequestedDocument.created_at.asc(),
+                    BucketRequestedDocument.id.asc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     await db.commit()
     return BucketRequestAccessRead(
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
@@ -2617,11 +2649,12 @@ async def request_link_access(
         can_view_ai_tasks=link.can_view_ai_tasks,
         requested_documents=[
             BucketRequestedDocumentRead.model_validate(d)
-            for d in link.bucket.requested_documents
+            for d in requested_documents
             if d.status != "not_applicable"
         ],
         files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
         ai_summary=upload_link_visible_summary(review, link.bucket),
+        evidence_banking_summary=evidence_banking_summary,
     )
 
 

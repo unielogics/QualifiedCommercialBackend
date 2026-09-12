@@ -8,7 +8,7 @@ hiccuped. Failures log loudly instead — a quiet ledger is a lying ledger.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +32,9 @@ async def record(
     detail: str = "",
     context: str = "",
     client_id=None,
+    profile_id=None,
+    intake_id=None,
+    portal_message_id=None,
     occurred_at: datetime | None = None,
 ) -> SmsMessage | None:
     """`occurred_at` is when the message actually happened on the wire.
@@ -51,6 +54,9 @@ async def record(
             detail=detail[:300],
             context=context[:32],
             client_id=client_id,
+            profile_id=profile_id,
+            intake_id=intake_id,
+            portal_message_id=portal_message_id,
         )
         if occurred_at is not None:
             row.created_at = occurred_at
@@ -89,7 +95,7 @@ async def mark_delivery(
         return False
     if status == "delivered":
         row.status = "delivered"
-        row.delivered_at = datetime.now(timezone.utc)
+        row.delivered_at = datetime.now(UTC)
     elif status == "failed":
         # A carrier rejection is the one state that must overwrite "delivered":
         # it can only arrive after the fact, and it is the truer answer.
