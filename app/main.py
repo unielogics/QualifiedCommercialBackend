@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.dealer_os import crm_router as dealer_os_crm_router
 from app.dealer_os import router as dealer_os_router
+from app.private_api_cache import PrivateApiCacheMiddleware
 from app.request_context import RequestContextMiddleware
 from app.routers import (
     admin as admin_router,
@@ -125,6 +126,10 @@ app.add_middleware(
 # before anything else runs. Until now there was no middleware here but CORS,
 # and so no way to say which action produced which message.
 app.add_middleware(RequestContextMiddleware)
+# Authenticated API reads are mutable application state. This is especially
+# important for message timelines: a successful poll must reach Postgres rather
+# than receive a cached snapshot until the page is refreshed.
+app.add_middleware(PrivateApiCacheMiddleware)
 
 
 @app.on_event("startup")
