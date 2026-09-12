@@ -29,7 +29,6 @@ from __future__ import annotations
 import base64
 import csv
 import io
-import json
 import logging
 import re
 from datetime import date, datetime
@@ -41,6 +40,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # READ-ONLY reuse of the intake pipeline's Bedrock client + usage tracking.
 from app.services.ai.bedrock_client import get_client, model_heavy
+from app.services.ai.pdf_chunks import PDFChunk, split_pdf_pages
+from app.services.ai.structured_output import (
+    ModelOutputTruncated,
+    parse_json_object,
+    parse_json_response,
+)
 from app.services.ai.usage import tracked_messages_create
 
 from ..models import (
@@ -61,6 +66,8 @@ from .vendors import normalize_vendor
 logger = logging.getLogger(__name__)
 
 MAX_TRANSACTIONS = 5000
+MODEL_PDF_PAGES_PER_CHUNK = 8
+MODEL_EXTRACT_MAX_TOKENS = 3000
 
 
 # --- pure parsing helpers (mirrors the frontend ledger importer) -------------
@@ -848,8 +855,8 @@ async def _route_debt_schedule(
 # --- PDF/image path: same Bedrock vision model as the intake pipeline --------
 
 _EXTRACT_SYSTEM = """You are a financial-document extraction engine for commercial underwriting.
-The user message contains ONE document (bank statement, tax return, P&L / income statement, balance sheet, debt schedule, credit report, ...) as a PDF or image.
-Read EVERY page/month — never summarize only the first month.
+The user message contains ONE document or ONE consecutive page chunk from a document (bank statement, tax return, P&L / income statement, balance sheet, debt schedule, credit report, ...) as a PDF or image.
+Read every attached page. Extract only facts printed in this page chunk; the application merges all chunks afterward.
 
 Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 {
@@ -860,9 +867,7 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
      "low_daily_balance": number|null, "nsf_count": number|null,
      "negative_balance_dates": ["YYYY-MM-DD"]}
   ],
-  "transactions": [
-    {"date": "YYYY-MM-DD", "description": "string", "amount": number}
-  ],
+  "transactions": [],
   "account": {"institution": "string|null", "name_hint": "string|null",
               "mask": "string|null", "kind_hint": "string|null"},
   "tax_years": [{"year": number, "revenue": number|null}],
@@ -876,7 +881,8 @@ Return ONLY strict JSON (no markdown, no commentary) with exactly this shape:
 
 Rules:
 - "doc_type" is REQUIRED: classify what the document actually IS, regardless of what the uploader called it. Use "other" only when none of the listed types fits.
-- months[] and transactions[] are for BANK STATEMENTS: one months[] entry per statement month present in the document. For any non-statement document return "months": [] and "transactions": [].
+- months[] is for BANK STATEMENTS: one entry per statement month whose summary figures are visible in this chunk. For any non-statement document return "months": [].
+- Always return "transactions": []. Individual transaction lines are intentionally excluded from this bounded extraction response; do not enumerate them.
 - beginning_balance is the opening/starting balance printed for that statement month. Use null when it is not explicitly readable; never infer it from deposits and withdrawals.
 - negative_balance_dates must list each calendar date whose end-of-day balance is visibly negative. Return [] only when the full statement establishes there were none; use null when daily balances are not readable enough to determine this.
 - "account" is optional and best-effort: identify the bank account the statement belongs to. institution = bank name as printed; name_hint = account title/product name (e.g. "Business Complete Checking", "Payroll Account"); mask = LAST 4 digits of the account number only; kind_hint = one of checking|savings|payroll|other if stated. Omit "account" (or use nulls) when the document is not a bank statement or the fields are not visible. Never invent account details.
@@ -886,7 +892,6 @@ Rules:
 - "debts" is for DEBT SCHEDULES and LOAN/MCA AGREEMENTS: one entry per obligation — lender/funder as printed, monthly_payment = the recurring MONTHLY payment (convert only when the document states the payment frequency; null when unknown), balance = current outstanding balance.
 - "loan_agreement" covers loan notes, merchant cash advance (MCA) agreements, and financing contracts for a SINGLE obligation. For these also fill: payment_amount = the payment in the contract's own cadence (e.g. the daily remittance), payment_frequency = that cadence, factor_rate = the MCA factor (payback / advance, e.g. 1.38) when stated, rate = the annual interest rate as a percent when stated, term_months = the stated term, payoff_amount = the stated payoff/balance when printed. Never derive factor_rate and rate from each other.
 - Every number is a bare number: no currency symbols, no commas. Withdrawals in total_withdrawals are a positive magnitude.
-- transactions[] is best-effort: include individual lines when they are legible, with deposits positive and withdrawals/debits NEGATIVE. If lines are not reliably legible, return "transactions": [].
 - Use null for any field the document does not state. Never invent numbers.
 - If the document contains no extractable financial data at all, still return the classified doc_type with every array empty."""
 
@@ -907,33 +912,93 @@ def _media_type(content_type: str, filename: str) -> str | None:
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:
-    """Defensive JSON parse: strip code fences, then fall back to the outermost
-    {...} slice. Raises ValueError with a clear message when unusable."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", cleaned)
-    for candidate in (cleaned, cleaned[cleaned.find("{") : cleaned.rfind("}") + 1]):
-        if not candidate:
-            continue
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except (ValueError, TypeError):
-            continue
-    raise ValueError("Model did not return parseable extraction JSON")
+    """Compatibility wrapper around the shared structured-output parser."""
+    return parse_json_object(text, purpose="extraction")
 
 
-async def _extract_via_model(
-    db: AsyncSession, doc: DealerDocument, raw: bytes, media: str
+def _merge_keyed_rows(
+    target: list[dict[str, Any]], incoming: Any, *, keys: tuple[str, ...]
+) -> None:
+    if not isinstance(incoming, list):
+        return
+    index = {
+        tuple(str(row.get(key) or "").strip().lower() for key in keys): row
+        for row in target
+        if isinstance(row, dict)
+    }
+    for raw_row in incoming:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        identity = tuple(str(row.get(key) or "").strip().lower() for key in keys)
+        existing = index.get(identity)
+        if existing is None:
+            target.append(row)
+            index[identity] = row
+            continue
+        for key, value in row.items():
+            if isinstance(existing.get(key), list) and isinstance(value, list):
+                existing[key] = list(dict.fromkeys([*existing[key], *value]))
+                continue
+            if existing.get(key) in (None, "", []) and value not in (None, "", []):
+                existing[key] = value
+
+
+def _merge_extractions(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "doc_type": "other",
+        "months": [],
+        "transactions": [],
+        "account": {},
+        "tax_years": [],
+        "business_identity": {},
+        "pl_months": [],
+        "debts": [],
+    }
+    for part in parts:
+        doc_type = str(part.get("doc_type") or "").strip().lower()
+        if doc_type and (merged["doc_type"] == "other" or doc_type == "bank_statement"):
+            merged["doc_type"] = doc_type
+        _merge_keyed_rows(merged["months"], part.get("months"), keys=("month",))
+        _merge_keyed_rows(merged["tax_years"], part.get("tax_years"), keys=("year",))
+        _merge_keyed_rows(merged["pl_months"], part.get("pl_months"), keys=("month",))
+        _merge_keyed_rows(
+            merged["debts"],
+            part.get("debts"),
+            keys=("lender",),
+        )
+        for object_key in ("account", "business_identity"):
+            incoming = part.get(object_key)
+            if not isinstance(incoming, dict):
+                continue
+            for key, value in incoming.items():
+                if merged[object_key].get(key) in (None, "", []) and value not in (None, "", []):
+                    merged[object_key][key] = value
+    merged["months"].sort(key=lambda row: str(row.get("month") or ""))
+    merged["tax_years"].sort(key=lambda row: str(row.get("year") or ""))
+    merged["pl_months"].sort(key=lambda row: str(row.get("month") or ""))
+    return merged
+
+
+async def _extract_model_payload(
+    db: AsyncSession,
+    doc: DealerDocument,
+    raw: bytes,
+    media: str,
+    *,
+    page_label: str | None = None,
 ) -> dict[str, Any]:
     encoded = base64.b64encode(raw).decode("ascii")
     block_type = "document" if media == "application/pdf" else "image"
+    scope = f" Pages: {page_label}." if page_label else ""
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": f"Document: {doc.filename} (declared kind: {doc.kind}). "
-            "Classify the document type and extract its financial data. Return only the required JSON.",
+            "text": (
+                f"Document: {doc.filename} (declared kind: {doc.kind}).{scope} "
+                "Classify this content and extract its bounded financial summary. "
+                "Do not return individual transactions. Return only the required JSON."
+            ),
         },
         {"type": block_type, "source": {"type": "base64", "media_type": media, "data": encoded}},
     ]
@@ -943,15 +1008,51 @@ async def _extract_via_model(
         feature="dealer_os_document_extract",
         client=get_client(),
         model=model,
-        metadata={"dealer_id": str(doc.dealer_id), "dos_document_id": str(doc.id)},
-        max_tokens=8000,
+        metadata={
+            "dealer_id": str(doc.dealer_id),
+            "dos_document_id": str(doc.id),
+            "page_scope": page_label,
+        },
+        max_tokens=MODEL_EXTRACT_MAX_TOKENS,
         system=_EXTRACT_SYSTEM,
         messages=[{"role": "user", "content": content}],
     )
-    text = "".join(
-        getattr(b, "text", "") for b in getattr(resp, "content", []) if getattr(b, "type", "") == "text"
-    )
-    return _parse_model_json(text)
+    return parse_json_response(resp, purpose="extraction")
+
+
+async def _extract_pdf_chunk(
+    db: AsyncSession, doc: DealerDocument, chunk: PDFChunk
+) -> list[dict[str, Any]]:
+    label = f"{chunk.first_page}-{chunk.last_page} of {chunk.total_pages}"
+    try:
+        return [await _extract_model_payload(db, doc, chunk.raw, "application/pdf", page_label=label)]
+    except (ModelOutputTruncated, ValueError):
+        page_count = chunk.last_page - chunk.first_page + 1
+        if page_count <= 1:
+            raise
+        local_parts = split_pdf_pages(chunk.raw, pages_per_chunk=max(1, page_count // 2))
+        extracted: list[dict[str, Any]] = []
+        for local in local_parts:
+            nested = PDFChunk(
+                raw=local.raw,
+                first_page=chunk.first_page + local.first_page - 1,
+                last_page=chunk.first_page + local.last_page - 1,
+                total_pages=chunk.total_pages,
+            )
+            extracted.extend(await _extract_pdf_chunk(db, doc, nested))
+        return extracted
+
+
+async def _extract_via_model(
+    db: AsyncSession, doc: DealerDocument, raw: bytes, media: str
+) -> dict[str, Any]:
+    if media != "application/pdf":
+        return await _extract_model_payload(db, doc, raw, media)
+    chunks = split_pdf_pages(raw, pages_per_chunk=MODEL_PDF_PAGES_PER_CHUNK)
+    parts: list[dict[str, Any]] = []
+    for chunk in chunks:
+        parts.extend(await _extract_pdf_chunk(db, doc, chunk))
+    return _merge_extractions(parts)
 
 
 # --- orchestrator ------------------------------------------------------------

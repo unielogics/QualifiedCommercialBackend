@@ -39,7 +39,7 @@ import base64
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -57,6 +57,11 @@ from app.models.document import Document
 from app.models.loan import Loan
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.bedrock_client import get_client, model_heavy
+from app.services.ai.structured_output import (
+    is_truncated_response,
+    require_complete_response,
+    response_text,
+)
 from app.services.ai.usage import tracked_messages_create
 from app.services.loan_intake_automation import _checklist_for, _coerce_settings
 
@@ -404,9 +409,36 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
                 }
             ],
         )
-        text = "".join(
-            b.text for b in result.content if getattr(b, "type", None) == "text"
-        )
+        if is_truncated_response(result):
+            result = await tracked_messages_create(
+                db,
+                feature="document_scan",
+                client=client,
+                model=model_heavy(),
+                client_id=loan.client_id,
+                loan_id=loan.id,
+                metadata={
+                    "document_id": str(doc.id),
+                    "content_type": ct,
+                    "retry_reason": "truncated_output",
+                },
+                max_tokens=1800,
+                system=(
+                    _VISION_SYSTEM
+                    + "\nA prior response hit its token limit. Keep every list concise and complete the JSON object."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            _build_content_block(media_type, raw),
+                            {"type": "text", "text": user_text},
+                        ],
+                    }
+                ],
+            )
+        require_complete_response(result, purpose="document scan")
+        text = response_text(result)
     except Exception as exc:  # noqa: BLE001
         log.exception("scanner: vision call failed doc=%s", doc.id)
         doc.ai_scan_status = "failed"
@@ -443,7 +475,7 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
         # Categorized: agreement + confidence drives verify/flag.
         if scan.matches_expected and scan.confidence >= AUTO_VERIFY_MIN_CONFIDENCE:
             doc.status = DocStatus.VERIFIED
-            doc.verified_at = datetime.now(timezone.utc)
+            doc.verified_at = datetime.now(UTC)
             doc.verified_by = "ai"
         else:
             doc.status = DocStatus.FLAGGED
@@ -517,6 +549,7 @@ async def scan_document(db: AsyncSession, document_id: UUID) -> ScanResult:
     # the agent the scan succeeded.
     try:
         from decimal import Decimal as _D
+
         from app.models.document_analysis_result import DocumentAnalysisResult
         from app.services.ai.contradiction_detector import detect_and_record
 

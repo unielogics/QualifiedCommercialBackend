@@ -39,6 +39,7 @@ from app.models.bucket import (
 from app.models.user import User
 from app.services import merchant_processing
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
+from app.services.ai.structured_output import is_truncated_response, require_complete_response
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
 from app.services.bucket_evidence import classifications_for_requested_doc, reconcile_uploaded_file
 
@@ -2289,6 +2290,11 @@ async def analyze_bucket_file(
 
     try:
         model = model_heavy()
+        analysis_system = (
+            merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
+            if offer_document
+            else build_file_analysis_system(review_type)
+        )
         resp = await tracked_messages_create(
             db,
             feature="file_analysis",
@@ -2298,13 +2304,28 @@ async def analyze_bucket_file(
             max_tokens=3000,
             # The partner's terms sheet is read with its own prompt, chosen by
             # the file's marker before any product persona is consulted.
-            system=(
-                merchant_processing.MERCHANT_OFFER_ANALYSIS_SYSTEM
-                if offer_document
-                else build_file_analysis_system(review_type)
-            ),
+            system=analysis_system,
             messages=[{"role": "user", "content": content}],
         )
+        if is_truncated_response(resp):
+            resp = await tracked_messages_create(
+                db,
+                feature="file_analysis",
+                client=get_client(),
+                model=model,
+                metadata={
+                    "bucket_id": str(file.bucket_id),
+                    "bucket_file_id": str(file.id),
+                    "retry_reason": "truncated_output",
+                },
+                max_tokens=6000,
+                system=(
+                    analysis_system
+                    + "\nA prior response hit its token limit. Respect the list limits, stay concise, and complete the JSON object."
+                ),
+                messages=[{"role": "user", "content": content}],
+            )
+        require_complete_response(resp, purpose="file analysis")
         parsed = _json_or_fallback(_text_from_response(resp), "summary")
         input_tokens, output_tokens = _usage_tokens(resp)
         row.provider = "bedrock"
