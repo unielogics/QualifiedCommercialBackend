@@ -8994,6 +8994,7 @@ TAKEOVER_CLIENT_NOTICE = (
 @admin_router.get("/{intake_id}/client-thread", response_model=ClientThreadResponse)
 async def get_dealer_ai_client_thread(
     intake_id: UUID,
+    response: Response,
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ClientThreadResponse:
@@ -9001,6 +9002,7 @@ async def get_dealer_ai_client_thread(
     super-admin can see what the borrower and their AI have exchanged. This is a
     different thread from the private admin cockpit chat (audience='admin')."""
     _require_super_admin(user)
+    response.headers["Cache-Control"] = "private, no-store"
     intake = await _load_admin_dealer_lead(db, intake_id)
     return await _client_thread_response(db, intake)
 
