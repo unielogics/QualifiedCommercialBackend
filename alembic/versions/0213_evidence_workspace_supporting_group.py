@@ -92,7 +92,7 @@ def upgrade() -> None:
                         'Optional supporting material that does not match a requested item. Files are still analyzed and may be reassigned later.',
                         false, true, 'requested', false, false,
                         :requirement_key,
-                        CAST('{"kind":"system_supporting","client_visible":true}' AS jsonb)
+                        CAST(:requirement_source AS jsonb)
                     )
                     """
                 ),
@@ -100,6 +100,7 @@ def upgrade() -> None:
                     "id": keeper_id,
                     "bucket_id": bucket_id,
                     "requirement_key": SUPPORTING_KEY,
+                    "requirement_source": '{"kind":"system_supporting","client_visible":true}',
                 },
             )
         else:
@@ -116,11 +117,15 @@ def upgrade() -> None:
                         is_custom = false,
                         requires_signature = false,
                         requirement_key = :requirement_key,
-                        requirement_source = CAST('{"kind":"system_supporting","client_visible":true}' AS jsonb)
+                        requirement_source = CAST(:requirement_source AS jsonb)
                     WHERE id = :keeper_id
                     """
                 ),
-                {"keeper_id": keeper_id, "requirement_key": SUPPORTING_KEY},
+                {
+                    "keeper_id": keeper_id,
+                    "requirement_key": SUPPORTING_KEY,
+                    "requirement_source": '{"kind":"system_supporting","client_visible":true}',
+                },
             )
 
     bind.execute(
