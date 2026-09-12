@@ -83,12 +83,17 @@ class ApplicationCommunicationContact(BaseModel):
 class ApplicationSmsState(BaseModel):
     phone: str | None = None
     can_send: bool = False
+    delivery_enabled: bool = False
     transactional_consented: bool = False
     marketing_consented: bool = False
     opted_out: bool = False
     provider_available: bool = False
     blocked_reason: str | None = None
     grants: list[SmsConsentOut] = Field(default_factory=list)
+
+
+class ApplicationSmsPreferencePatch(BaseModel):
+    enabled: bool
 
 
 class ApplicationEmailThreadRead(BaseModel):
@@ -235,7 +240,13 @@ async def _sms_state(db: AsyncSession, profile: ApplicationProfile) -> Applicati
     )
     provider_ready = sms_available()
     if not phone:
-        return ApplicationSmsState(phone=None, provider_available=provider_ready, blocked_reason="No mobile number is on this file.", grants=grants)
+        return ApplicationSmsState(
+            phone=None,
+            delivery_enabled=profile.client_sms_delivery_enabled,
+            provider_available=provider_ready,
+            blocked_reason="No mobile number is on this file.",
+            grants=grants,
+        )
     opted_out = await is_opted_out(db, phone)
     transactional = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="transactional")
     marketing = await sms_consent_svc.consent_for(db, phone_e164=phone, kind="marketing")
@@ -249,6 +260,7 @@ async def _sms_state(db: AsyncSession, profile: ApplicationProfile) -> Applicati
     return ApplicationSmsState(
         phone=phone,
         can_send=bool(transactional and not opted_out and provider_ready),
+        delivery_enabled=profile.client_sms_delivery_enabled,
         transactional_consented=transactional is not None,
         marketing_consented=marketing is not None,
         opted_out=opted_out,
@@ -280,6 +292,30 @@ async def get_application_sms_consent(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationSmsState:
     profile = await _load_profile(db, profile_id, user)
+    return await _sms_state(db, profile)
+
+
+@router.patch(
+    "/{profile_id}/communications/sms-preference",
+    response_model=ApplicationSmsState,
+)
+async def update_application_sms_preference(
+    profile_id: UUID,
+    payload: ApplicationSmsPreferencePatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ApplicationSmsState:
+    profile = await _load_profile(db, profile_id, user)
+    profile.client_sms_delivery_enabled = payload.enabled
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        "sms.delivery_enabled" if payload.enabled else "sms.delivery_disabled",
+        f"{'Enabled' if payload.enabled else 'Disabled'} persistent SMS delivery for client replies",
+        metadata={"enabled": payload.enabled},
+    )
+    await db.commit()
     return await _sms_state(db, profile)
 
 

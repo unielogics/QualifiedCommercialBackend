@@ -294,4 +294,4 @@ def test_the_migration_chain_has_one_head():
     from alembic.script import ScriptDirectory
 
     heads = ScriptDirectory.from_config(Config("alembic.ini")).get_heads()
-    assert heads == ["0214_ai_intake_communications"]
+    assert heads == ["0215_persistent_intake_sms_preference"]

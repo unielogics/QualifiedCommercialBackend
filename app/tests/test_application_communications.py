@@ -26,10 +26,35 @@ def test_application_communication_routes_are_registered() -> None:
     assert ("/application-profiles/{profile_id}/communications/contacts", "GET") in routes
     assert ("/application-profiles/{profile_id}/communications/sms-consent", "GET") in routes
     assert ("/application-profiles/{profile_id}/communications/sms-consent", "POST") in routes
+    assert ("/application-profiles/{profile_id}/communications/sms-preference", "PATCH") in routes
     assert ("/application-profiles/{profile_id}/communications/email/threads", "GET") in routes
     assert ("/application-profiles/{profile_id}/communications/email/threads", "POST") in routes
     assert ("/application-profiles/{profile_id}/communications/email/threads/{thread_id}/messages", "POST") in routes
     assert ("/application-profiles/{profile_id}/communications/links", "POST") in routes
+
+
+@pytest.mark.asyncio
+async def test_sms_delivery_preference_persists_on_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = SimpleNamespace(id=uuid4(), client_sms_delivery_enabled=False)
+    expected = communications.ApplicationSmsState(delivery_enabled=True)
+    db = SimpleNamespace(commit=AsyncMock())
+    user = SimpleNamespace(id=uuid4(), name="Underwriter")
+    monkeypatch.setattr(communications, "_load_profile", AsyncMock(return_value=profile))
+    monkeypatch.setattr(communications, "_sms_state", AsyncMock(return_value=expected))
+    audit = AsyncMock()
+    monkeypatch.setattr(communications.profiles, "log_profile_action", audit)
+
+    result = await communications.update_application_sms_preference(
+        profile.id,
+        communications.ApplicationSmsPreferencePatch(enabled=True),
+        user,
+        db,
+    )
+
+    assert profile.client_sms_delivery_enabled is True
+    assert result.delivery_enabled is True
+    db.commit.assert_awaited_once()
+    assert audit.await_args.args[3] == "sms.delivery_enabled"
 
 
 @pytest.mark.parametrize(

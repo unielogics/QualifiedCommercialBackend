@@ -159,6 +159,9 @@ class ApplicationProfile(TimestampMixin, Base):
     missing_item_email_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
+    client_sms_delivery_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     missing_item_email_last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     missing_item_email_next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     missing_item_email_attempts: Mapped[int] = mapped_column(
