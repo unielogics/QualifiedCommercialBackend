@@ -336,7 +336,7 @@ async def contract_status(
     db: AsyncSession = Depends(get_db),
 ) -> ContractStatus:
     _require_routable(contract_type)
-    required = user.role == Role.DEALER_PARTNER
+    required = user.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}
 
     if contract_type in _INDIVIDUAL_SCOPED:
         agreement = await _latest_agreement(
@@ -395,8 +395,8 @@ async def sign_platform_access(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ContractAgreement:
-    if user.role != Role.DEALER_PARTNER:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
+    if user.role not in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Referral partner role required")
     return await _sign(
         db,
         request,

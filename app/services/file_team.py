@@ -35,7 +35,12 @@ from app.services import application_profiles as profiles
 
 log = logging.getLogger(__name__)
 
-AGENT_ROLES = frozenset({Role.BROKER, Role.FIELD_REP, Role.DEALER_PARTNER})
+AGENT_ROLES = frozenset({
+    Role.BROKER,
+    Role.FIELD_REP,
+    Role.DEALER_PARTNER,
+    Role.PROFESSIONAL_REFERRAL_PARTNER,
+})
 UNDERWRITER_ROLES = frozenset({Role.LOAN_EXEC, Role.SUPER_ADMIN})
 DESK_ROLES = UNDERWRITER_ROLES
 

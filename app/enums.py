@@ -20,6 +20,9 @@ class Role(StrEnum):
     # External loan-referral partner, scoped to the dealer AI-intake tool only —
     # no book-of-business (/loans, /clients, /reports) like Role.BROKER has.
     DEALER_PARTNER = "dealer_partner"
+    # External attorney, commercial mortgage broker, receiver, or restructuring
+    # advisor. Access is confined to the member's referral-company rescue files.
+    PROFESSIONAL_REFERRAL_PARTNER = "professional_referral_partner"
     DEALER = "dealer"  # Dealer OS self-serve (audit.qualifiedcommercial.com)
     # Field sales rep (rep.qualifiedcommercial.com) — visits businesses in
     # person, creates and works the files they own. Internal, but NOT a team

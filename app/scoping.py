@@ -36,7 +36,12 @@ if TYPE_CHECKING:
 # explicitly: the helpers below end in a bare `return stmt`, which is the
 # SUPER_ADMIN/LOAN_EXEC "see everything" case, so any role that is not named
 # here inherits full visibility by omission rather than by decision.
-_NO_FUNDING_BOOK = frozenset({Role.DEALER_PARTNER, Role.DEALER, Role.FIELD_REP})
+_NO_FUNDING_BOOK = frozenset({
+    Role.DEALER_PARTNER,
+    Role.PROFESSIONAL_REFERRAL_PARTNER,
+    Role.DEALER,
+    Role.FIELD_REP,
+})
 
 
 def scope_client_query(user, stmt: "Select") -> "Select":

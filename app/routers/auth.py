@@ -49,6 +49,7 @@ class MeResponse(ORMModel):
     # since AppShell's gate needs BOTH the individual Platform Access
     # Agreement AND the company's Referral Protection Agreement status.
     referral_partner_company_id: UUID | None = None
+    referral_partner_company_admin: bool = False
     account_types: list[str]
     account_status: str
     # An operator's own contact details. The Production Package names the
@@ -86,6 +87,7 @@ async def me(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> MeRespons
         name=user.name,
         role=user.role,
         referral_partner_company_id=user.referral_partner_company_id,
+        referral_partner_company_admin=bool(getattr(user, "referral_partner_company_admin", False)),
         account_types=effective_account_types,
         account_status=user.account_status,
         phone=user.phone,

@@ -393,7 +393,14 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
         )
 
     acceptances = await ack.latest_acceptances(db, {r.id for r in rows})
-    platform_access = await _platform_access_by_user(db, {r.id for r in rows if r.role == Role.DEALER_PARTNER})
+    platform_access = await _platform_access_by_user(
+        db,
+        {
+            r.id
+            for r in rows
+            if r.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}
+        },
+    )
 
     results = []
     for r in rows:
@@ -459,18 +466,18 @@ async def invite_user(
     company_name = (body.company_name or "").strip()
     requested_access = set(body.account_types or [])
     _check_console_grants(body.role, requested_access)
-    if body.role == Role.DEALER_PARTNER and not company_name and body.referral_partner_company_id is None:
+    if body.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER} and not company_name and body.referral_partner_company_id is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "Company name is required for Dealer Partner invites — their company must sign the "
+            "Company name is required for partner invites — their company must sign the "
             "Referral Protection Agreement before they can use the platform.",
         )
 
     referral_partner_company_id = body.referral_partner_company_id
     if referral_partner_company_id is not None:
         company = await _company_for_link(db, referral_partner_company_id)
-        if body.role == Role.DEALER_PARTNER and _is_house(company):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "A dealer partner belongs to their own company, not the house.")
+        if body.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER} and _is_house(company):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "A partner belongs to their own company, not the house.")
     elif company_name:
         referral_partner_company_id = (await _company_by_name(db, company_name)).id
     elif body.role in HOUSE_ROLES:
@@ -560,7 +567,7 @@ async def update_user(
         # house-linked staffer counts as having no partner company: promoting
         # them without one would lock them out for good.
         linked = await db.get(ReferralPartnerCompany, user.referral_partner_company_id) if user.referral_partner_company_id else None
-        if body.role == Role.DEALER_PARTNER and (linked is None or _is_house(linked)):
+        if body.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER} and (linked is None or _is_house(linked)):
             if body.referral_partner_company_id is not None:
                 company = await _company_for_link(db, body.referral_partner_company_id)
                 if _is_house(company):
@@ -571,11 +578,11 @@ async def update_user(
                 if not company_name:
                     raise HTTPException(
                         status.HTTP_400_BAD_REQUEST,
-                        "Company name is required to set the Dealer Partner role — their company must sign the "
+                        "Company name is required to set a partner role — their company must sign the "
                         "Referral Protection Agreement before they can use the platform.",
                     )
                 user.referral_partner_company_id = (await _company_by_name(db, company_name)).id
-        elif body.role in HOUSE_ROLES and user.role == Role.DEALER_PARTNER and "referral_partner_company_id" not in body.model_fields_set:
+        elif body.role in HOUSE_ROLES and user.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER} and "referral_partner_company_id" not in body.model_fields_set:
             # Coming in from a partner company with no new link named: the
             # house, or their old company would keep defaulting the sponsor.
             house = await house_company(db)
@@ -588,15 +595,15 @@ async def update_user(
         user.phone = store_phone(body.phone)
     if "referral_partner_company_id" in body.model_fields_set:
         role_after = body.role or user.role
-        if body.referral_partner_company_id is None and role_after in HOUSE_ROLES | {Role.DEALER_PARTNER}:
+        if body.referral_partner_company_id is None and role_after in HOUSE_ROLES | {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "Every operator is linked to a business relationship profile — pick the house or a partner company.",
             )
         if body.referral_partner_company_id is not None:
             company = await _company_for_link(db, body.referral_partner_company_id)
-            if role_after == Role.DEALER_PARTNER and _is_house(company):
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, "A dealer partner belongs to their own company, not the house.")
+            if role_after in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER} and _is_house(company):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "A partner belongs to their own company, not the house.")
         user.referral_partner_company_id = body.referral_partner_company_id
     if body.account_types is not None:
         requested_access = set(body.account_types)

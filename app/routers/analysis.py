@@ -262,7 +262,7 @@ def _scope_analysis_query(user, stmt):
                 AnalysisRun.loan_id.in_(loan_ids),
             )
         )
-    if user.role == Role.DEALER_PARTNER:
+    if user.role in {Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER}:
         # No book-of-business -- deny by default rather than falling
         # through to SUPER_ADMIN/LOAN_EXEC's firm-wide visibility below.
         return stmt.where(False)

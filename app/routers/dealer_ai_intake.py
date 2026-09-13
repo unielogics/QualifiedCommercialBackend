@@ -13,7 +13,7 @@ import re
 import secrets
 import time
 import zipfile
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -115,6 +115,7 @@ from app.services.bucket_ai import (
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
+from app.services.foreclosure_rescue import FORECLOSURE_RESCUE_VARIANT
 from app.services.intake_chat_actions import (
     actions_for_messages,
     execute_room_action,
@@ -1072,6 +1073,11 @@ class DealerIntakeRead(ORMModel):
     intake_state: dict[str, Any] | None
     result_snapshot: dict[str, Any] | None
     preferred_language: str = "en"
+    foreclosure_rescue_status: str | None = None
+    foreclosure_sale_date: date | None = None
+    client_contact_suppressed: bool = False
+    referral_partner_company_id: UUID | None = None
+    assigned_underwriter_user_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -10418,7 +10424,7 @@ def _funding_empty_message(lang: str = Language.EN) -> str:
 
 
 def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
-    if intake.variant != FUNDING_VARIANT:
+    if intake.variant not in {FUNDING_VARIANT, FORECLOSURE_RESCUE_VARIANT}:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding review not found")
 
 
@@ -10436,6 +10442,7 @@ _ADMIN_VARIANT_CONSTANTS: dict[str, str] = {
     "real_estate": FUNDING_VARIANT,
     "main_street": MAIN_STREET_VARIANT,
     "mca_refinance": MCA_VARIANT,
+    "foreclosure_rescue": FORECLOSURE_RESCUE_VARIANT,
 }
 
 _VARIANT_LABELS: dict[str, str] = {
@@ -10443,6 +10450,7 @@ _VARIANT_LABELS: dict[str, str] = {
     FUNDING_VARIANT: "real estate DSCR/investor",
     MAIN_STREET_VARIANT: "operating business",
     MCA_VARIANT: "MCA refinance",
+    FORECLOSURE_RESCUE_VARIANT: "commercial foreclosure rescue",
 }
 
 
@@ -10804,7 +10812,25 @@ async def funding_review_upload_complete(
 ) -> BucketFile:
     intake = await _load_public_intake(db, token)
     _require_funding_intake(intake)
-    return await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+    uploaded = await _complete_upload(db, intake, payload, request, actor_name=intake.full_name, actor_email=intake.email)
+    if intake.variant == FORECLOSURE_RESCUE_VARIANT and intake.foreclosure_rescue_status in {
+        "new_rescue", "initial_docs_pending"
+    }:
+        initial_docs = (
+            await db.execute(
+                select(BucketRequestedDocument).where(
+                    BucketRequestedDocument.bucket_id == intake.bucket_id,
+                    BucketRequestedDocument.category == "Initial Review",
+                    BucketRequestedDocument.required.is_(True),
+                )
+            )
+        ).scalars().all()
+        satisfied = {"uploaded", "received_unverified", "verified", "waived", "not_applicable"}
+        if initial_docs and all(document.status in satisfied for document in initial_docs):
+            intake.foreclosure_rescue_status = "ready_for_initial_review"
+            intake.status = "reviewing"
+            await db.commit()
+    return uploaded
 
 
 @funding_router.post("/{token}/requested-documents/sign", response_model=BucketFileRead)

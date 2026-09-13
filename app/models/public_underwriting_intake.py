@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -56,6 +56,12 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     broker_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    referral_partner_company_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("referral_partner_companies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    assigned_underwriter_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(96), nullable=False, unique=True, index=True)
     variant: Mapped[str] = mapped_column(String(64), nullable=False, default="dealer_gatekeeper_v1", server_default="dealer_gatekeeper_v1")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="collecting", server_default="collecting")
@@ -68,6 +74,11 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     # Admin/broker-facing UI and the "admin" chat audience always stay
     # English regardless of this value.
     preferred_language: Mapped[str] = mapped_column(String(8), nullable=False, default="en", server_default="en")
+    foreclosure_rescue_status: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    foreclosure_sale_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    client_contact_suppressed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
 
     full_name: Mapped[str] = mapped_column(String(180), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
@@ -99,6 +110,7 @@ class PublicUnderwritingIntake(TimestampMixin, Base):
     bucket_upload_link: Mapped[BucketUploadLink | None] = relationship()
     latest_review: Mapped[BucketAIReview | None] = relationship()
     delete_requested_by: Mapped[User | None] = relationship(foreign_keys=[delete_requested_by_user_id])
+    assigned_underwriter: Mapped[User | None] = relationship(foreign_keys=[assigned_underwriter_user_id])
 
 
 class PublicUnderwritingIntakeArtifact(TimestampMixin, Base):

@@ -80,7 +80,7 @@ async def list_messages(
     `before` is a keyset cursor on created_at — stable under new arrivals,
     which an offset would not be on a table that only ever grows.
     """
-    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP}:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER, Role.FIELD_REP}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only view")
     if status_filter is not None and status_filter not in SMS_STATUSES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"status must be one of {SMS_STATUSES}")
@@ -139,7 +139,7 @@ async def summary(
     db: AsyncSession = Depends(get_db),
 ) -> SmsSummary:
     """Counts for the log header — one query, grouped."""
-    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.FIELD_REP}:
+    if user.role in {Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER, Role.FIELD_REP}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator-only view")
 
     stmt = select(SmsMessage.direction, SmsMessage.status, func.count()).group_by(

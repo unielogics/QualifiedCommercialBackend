@@ -576,7 +576,7 @@ async def _sms_threads(db: AsyncSession, user: User) -> list[UnifiedCommunicatio
     rep has, since rep leads are not clients. Unattributed numbers stay
     admin-only either way.
     """
-    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER):
+    if user.role in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER):
         return []
     stmt = (
         select(SmsMessage, Client)
@@ -795,7 +795,7 @@ async def _thread_summary(db: AsyncSession, user: User, thread_id: str) -> Unifi
         from app.dealer_os.services.consent_delivery import normalize_phone
 
         phone = normalize_phone(parts[2])
-        if phone and user.role not in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER):
+        if phone and user.role not in (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER):
             name = email = None
             client = await _client_for_phone_scoped(db, user, phone)
             if client is not None:
@@ -934,7 +934,7 @@ async def list_communication_contacts(
 
 #: Roles with no one to start a conversation with from this inbox. FIELD_REP is
 #: deliberately absent: a rep composes to the contacts they own, resolved below.
-_OPERATOR_DENY = (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER)
+_OPERATOR_DENY = (Role.CLIENT, Role.REGIONAL_MANAGER, Role.DEALER, Role.DEALER_PARTNER, Role.PROFESSIONAL_REFERRAL_PARTNER)
 
 
 async def _own_rep_contacts(db: AsyncSession, user: User) -> list[DealerRepContact]:

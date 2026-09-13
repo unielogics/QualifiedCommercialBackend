@@ -153,6 +153,7 @@ from app.models.message_attachment import MessageAttachment  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile  # noqa: F401
 from app.models.prequal_request import PrequalRequest  # noqa: F401
+from app.models.professional_partner_application import ProfessionalPartnerApplication  # noqa: F401
 from app.models.production_package import (  # noqa: F401
     ProductionPackage,
     ProductionPackageRevision,
