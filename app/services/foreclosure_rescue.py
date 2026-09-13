@@ -10,6 +10,7 @@ FORECLOSURE_RESCUE_VARIANT = "commercial_foreclosure_bailout_v1"
 NOTE_RATE_PCT = Decimal("12.99")
 TERM_MONTHS = 24
 AMORTIZATION_MONTHS = 480
+MAX_LTV_PCT = Decimal("75")
 PROCEEDS_POLICY = "payoff_only"
 
 
@@ -20,8 +21,23 @@ def program_terms() -> dict[str, str | int | float]:
         "note_rate_pct": float(NOTE_RATE_PCT),
         "term_months": TERM_MONTHS,
         "amortization_months": AMORTIZATION_MONTHS,
+        "max_ltv_pct": float(MAX_LTV_PCT),
         "proceeds_policy": PROCEEDS_POLICY,
     }
+
+
+def maximum_rescue_amount(estimated_market_value: Decimal | float | str) -> Decimal:
+    """Preliminary collateral ceiling before file-specific underwriting adjustments."""
+
+    value = Decimal(str(estimated_market_value))
+    return (value * MAX_LTV_PCT / Decimal("100")).quantize(Decimal("0.01"))
+
+
+def minimum_value_for_payoff(payoff_amount: Decimal | float | str) -> Decimal:
+    """Minimum indicated value needed for a payoff at the published LTV ceiling."""
+
+    payoff = Decimal(str(payoff_amount))
+    return (payoff / (MAX_LTV_PCT / Decimal("100"))).quantize(Decimal("0.01"))
 
 
 def validate_term_sheet_note_rate(note_rate_pct: Decimal | float | str) -> None:

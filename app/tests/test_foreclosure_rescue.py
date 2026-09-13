@@ -7,9 +7,12 @@ from pydantic import ValidationError
 from app.routers.foreclosure_rescue import ForeclosureRescueIntakeCreate, RescueDocumentStatusUpdate
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
+    MAX_LTV_PCT,
     NOTE_RATE_PCT,
     TERM_MONTHS,
     balloon_balance,
+    maximum_rescue_amount,
+    minimum_value_for_payoff,
     monthly_principal_and_interest,
     urgency_for,
     validate_term_sheet_note_rate,
@@ -51,6 +54,9 @@ def test_program_terms_and_amortization_fixture():
     assert NOTE_RATE_PCT == Decimal("12.99")
     assert TERM_MONTHS == 24
     assert AMORTIZATION_MONTHS == 480
+    assert MAX_LTV_PCT == Decimal("75")
+    assert maximum_rescue_amount(2_000_000) == Decimal("1500000.00")
+    assert minimum_value_for_payoff(1_500_000) == Decimal("2000000.00")
     assert monthly_principal_and_interest(1_000_000) == Decimal("10887.01")
     assert balloon_balance(1_000_000) == Decimal("998310.99")
     validate_term_sheet_note_rate("12.99")
