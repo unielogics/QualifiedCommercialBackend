@@ -25,12 +25,13 @@ render_contract_document() and stores it as signature_document_text; the
 client signs it through the mechanism that already exists, unchanged).
 """
 
+# ruff: noqa: B008
 from __future__ import annotations
 
 import base64
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -277,7 +278,7 @@ def _token_hash(token: str) -> str:
 
 def _ip_hash(request: Request) -> str:
     ip = tpl.client_ip(request) or "unknown"
-    return hashlib.sha256(f"public-contract:{ip}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"public-contract:{ip}".encode()).hexdigest()
 
 
 @router.post(
@@ -293,7 +294,7 @@ async def create_mutual_nda_public_session(
     if payload.honeypot:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unable to create signing session")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ip_hash = _ip_hash(request)
     recent_count = (
         await db.execute(
@@ -324,7 +325,7 @@ async def _next_contract_number(db: AsyncSession, contract_type: ContractType) -
     from sqlalchemy import text
 
     seq = (await db.execute(text("SELECT nextval('contract_number_seq')"))).scalar_one()
-    year = datetime.now(timezone.utc).year
+    year = datetime.now(UTC).year
     code = tpl.CONTRACT_TYPE_CODE[contract_type]
     return f"QC-{code}-{year}-{seq:05d}"
 
@@ -441,7 +442,7 @@ async def _fail_public_session(
 ) -> None:
     session.attempt_count += 1
     if session.attempt_count >= _PUBLIC_SESSION_MAX_ATTEMPTS:
-        session.revoked_at = datetime.now(timezone.utc)
+        session.revoked_at = datetime.now(UTC)
     await db.commit()
     raise HTTPException(status_code, detail)
 
@@ -517,7 +518,7 @@ async def sign_mutual_nda_non_circumvention(
     if payload.honeypot:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unable to sign agreement")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     session = (
         await db.execute(
             select(PublicContractSignSession)
@@ -653,7 +654,7 @@ async def _sign(
     if not sig_bytes:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A drawn signature is required")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     contract_number = await _next_contract_number(db, contract_type)
 
     agreement = ContractAgreement(

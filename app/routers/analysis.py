@@ -1,9 +1,10 @@
+# ruff: noqa: B008
 from __future__ import annotations
 
 import time
 import uuid
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -790,7 +791,7 @@ async def share_analysis_to_client(
     if row.sanitized_client_report is None:
         snapshot = await _require_snapshot_access(db, user, row.property_snapshot_id)
         await _refresh_report(db, user, row, snapshot)
-    row.shared_at = datetime.now(timezone.utc)
+    row.shared_at = datetime.now(UTC)
     row.shared_by_id = user.id
     row.status = "shared"
     db.add(

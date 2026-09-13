@@ -7,8 +7,9 @@ Revises: 0215_persistent_intake_sms_preference
 from __future__ import annotations
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0216_foreclosure_rescue"
 down_revision = "0215_persistent_intake_sms_preference"

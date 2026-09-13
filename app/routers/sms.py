@@ -11,6 +11,7 @@ and client/dealer-side roles see nothing at all. The deny is explicit because
 an SMS body is borrower conversation, not metadata.
 """
 
+# ruff: noqa: B008
 from __future__ import annotations
 
 from datetime import datetime
@@ -25,7 +26,7 @@ from app.db import get_db
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.client import Client
-from app.models.sms_message import SMS_DIRECTIONS, SMS_STATUSES, SmsMessage
+from app.models.sms_message import SMS_STATUSES, SmsMessage
 from app.scoping import scope_client_query
 
 router = APIRouter(prefix="/sms", tags=["sms"])

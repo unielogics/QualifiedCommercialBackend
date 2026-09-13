@@ -1,9 +1,10 @@
+# ruff: noqa: B008
 from __future__ import annotations
 
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -12,8 +13,8 @@ from app.enums import AITaskStatus, Role
 from app.models.activity import Activity
 from app.models.ai_task import AITask
 from app.models.loan import Loan
-from app.scoping import regional_manager_broker_ids_subquery
 from app.schemas.ai_task import AITaskDecision, AITaskRead
+from app.scoping import regional_manager_broker_ids_subquery
 
 router = APIRouter(prefix="/ai-tasks", tags=["ai-tasks"])
 

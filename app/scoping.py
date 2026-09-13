@@ -20,7 +20,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import false as sql_false, or_, select
+from sqlalchemy import false as sql_false
+from sqlalchemy import or_, select
 
 from app.enums import Role
 from app.models.broker import Broker
@@ -44,7 +45,7 @@ _NO_FUNDING_BOOK = frozenset({
 })
 
 
-def scope_client_query(user, stmt: "Select") -> "Select":
+def scope_client_query(user, stmt: Select) -> Select:
     """Scope a `select(Client)` to rows the calling user may see."""
     if user.role == Role.CLIENT:
         if user.client is None:
@@ -68,7 +69,7 @@ def scope_client_query(user, stmt: "Select") -> "Select":
     return stmt
 
 
-def scope_loan_query(user, stmt: "Select") -> "Select":
+def scope_loan_query(user, stmt: Select) -> Select:
     """Scope a `select(Loan)` to rows the calling user may see.
 
     SUPER_ADMIN and LOAN_EXEC see everything; BROKER is restricted to
