@@ -10,12 +10,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import LoanStage
 from app.models.ai_playbook import AICollectionRequirement, AIPlaybookTemplate
 from app.models.application_profile import (
+    ApplicationExtractedFact,
     ApplicationProfile,
     ApplicationProgramRequirementOverride,
     ApplicationProgramSelection,
@@ -36,7 +37,6 @@ from app.models.funding_program import (
     FundingProgramScope,
 )
 from app.models.loan import Loan
-from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
@@ -55,7 +55,7 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
-from app.services import file_events
+from app.services import file_events, locked_file_requests
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
@@ -64,10 +64,12 @@ from app.services.bucket_evidence import (
     statement_months_from_analysis,
     statement_months_from_filename,
 )
+from app.services.extracted_facts import canonical_field_aliases
 from app.services.main_street_programs import intent_kind, normalize_intent
 from app.services.program_rules import ProgramRuleError, evaluate_rules, validate_rules
 
 SATISFIED_STATES = {"verified", "waived", "not_applicable"}
+AI_EVIDENCE_DECISION_ALGORITHM = "ai-evidence-v2"
 OPEN_UNDERWRITING_STATES = {
     "submitted",
     "collecting_docs",
@@ -191,7 +193,15 @@ async def _evidence_inventory(
         .all()
     )
     latest: dict[uuid.UUID, BucketFileAnalysis] = {}
+    files_by_id = {file.id: file for file in files}
     for analysis in analyses:
+        current_file = files_by_id.get(analysis.bucket_file_id)
+        if (
+            current_file
+            and current_file.content_hash
+            and analysis.content_hash != current_file.content_hash
+        ):
+            continue
         latest.setdefault(analysis.bucket_file_id, analysis)
     classifications = {
         analysis.classification
@@ -1214,23 +1224,169 @@ async def _sync_requirement_evidence(
     )
 
 
-def _normalized_entity(value: object) -> str:
-    words = re.findall(r"[a-z0-9]+", str(value or "").casefold())
-    suffixes = {
-        "corp",
-        "corporation",
-        "inc",
-        "incorporated",
-        "llc",
-        "llp",
-        "lp",
-        "ltd",
-        "limited",
-        "pllc",
-    }
-    while words and words[-1] in suffixes:
+_ENTITY_SUFFIXES = {
+    "corp",
+    "corporation",
+    "inc",
+    "incorporated",
+    "llc",
+    "llp",
+    "lp",
+    "ltd",
+    "limited",
+    "pllc",
+}
+def _entity_words(value: object) -> tuple[str, ...]:
+    text = str(value or "").casefold().replace("&", " and ")
+    words = re.findall(r"[a-z0-9]+", text)
+    while words and words[-1] in _ENTITY_SUFFIXES:
         words.pop()
+    return tuple(words)
+
+
+def _normalized_entity(value: object) -> str:
+    # A conjunction does not distinguish ``A & B`` from ``A and B`` for the
+    # historical normalized representation.
+    words = (word for word in _entity_words(value) if word != "and")
     return "".join(words)
+
+
+def _entities_match(expected: object, observed: object) -> bool:
+    """Match exact names after punctuation and legal-suffix normalization."""
+
+    expected_words = _entity_words(expected)
+    observed_words = _entity_words(observed)
+    return bool(expected_words and expected_words == observed_words)
+
+
+def _plausible_entity_expansion(expected: object, observed: object) -> bool:
+    """Return whether ``observed`` could be a longer legal/DBA rendering.
+
+    This is only a candidate gate. It never accepts evidence on its own; the
+    same longer name must also be independently present in two document types.
+    Keeping the full intake name as an exact prefix avoids fuzzy matches such
+    as ``Amazing Grace Auto Sales`` or ``Grace Auto Repair``.
+    """
+
+    expected_words = _entity_words(expected)
+    observed_words = _entity_words(observed)
+    added_words = observed_words[len(expected_words) :]
+    return (
+        len(expected_words) >= 3
+        and observed_words[: len(expected_words)] == expected_words
+        and added_words in {("and", "service"), ("and", "services")}
+    )
+
+
+def _corroborated_entity_aliases(
+    expected_entity: object, analyses: list[BucketFileAnalysis]
+) -> set[str]:
+    """Find longer entity names corroborated across independent document types."""
+
+    candidates: dict[str, dict[str, set[str]]] = {}
+    for analysis in analyses:
+        if (
+            analysis.status != "completed"
+            or str(analysis.confidence or "").casefold() != "high"
+        ):
+            continue
+        observed = _analysis_business_entity(analysis)
+        if not _plausible_entity_expansion(expected_entity, observed):
+            continue
+        normalized = _normalized_entity(observed)
+        candidate = candidates.setdefault(
+            normalized, {"documents": set(), "classifications": set()}
+        )
+        candidate["documents"].add(
+            str(analysis.content_hash or getattr(analysis, "id", ""))
+        )
+        candidate["classifications"].add(str(analysis.classification or ""))
+
+    return {
+        normalized
+        for normalized, evidence in candidates.items()
+        if len(evidence["documents"]) >= 2
+        and len(evidence["classifications"] - {""}) >= 2
+    }
+
+
+async def _accepted_entity_aliases(
+    db: AsyncSession, profile_id: uuid.UUID
+) -> set[str]:
+    """Return legal names an underwriter explicitly accepted for this file.
+
+    This is the safe system-wide escape hatch for DBA/legal-name variations
+    that do not fit a narrowly proven automatic pattern. It avoids fuzzy name
+    matching while letting one reviewed identity decision reconcile every
+    document that carries that same legal name.
+    """
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationExtractedFact).where(
+                    ApplicationExtractedFact.profile_id == profile_id,
+                    ApplicationExtractedFact.field_key.in_(
+                        canonical_field_aliases("legal_entity_name")
+                    ),
+                    ApplicationExtractedFact.status == "accepted",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    aliases = set()
+    for row in rows:
+        value = row.value.get("value") if isinstance(row.value, dict) else row.value
+        normalized = _normalized_entity(value or row.normalized_value)
+        if normalized:
+            aliases.add(normalized)
+    return aliases
+
+
+def _evidence_decision_context_key(
+    *,
+    link_id: object,
+    content_hash: str,
+    analysis_version: int,
+    criteria_version: int,
+    analyzed_at: str,
+    expected_entity: object,
+    duplicate_content: bool,
+    corroborated_entities: set[str],
+) -> str:
+    """Fingerprint every input that can change an automatic decision."""
+
+    corroboration = ",".join(sorted(corroborated_entities)) or "none"
+    raw_key = ":".join(
+        (
+            AI_EVIDENCE_DECISION_ALGORITHM,
+            str(link_id),
+            content_hash,
+            str(analysis_version),
+            str(criteria_version),
+            analyzed_at,
+            " ".join(_entity_words(expected_entity)) or "none",
+            "duplicate" if duplicate_content else "original",
+            corroboration,
+        )
+    )
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+def _evidence_decision_transition_key(
+    context_key: str, supersedes_decision_id: object | None
+) -> str:
+    """Identify one append-only transition into a decision context.
+
+    Including the superseded head makes A→B→A append a new A row instead of
+    reusing the older historical A row. Repeating the current A is handled by
+    its context-key prefix and creates nothing.
+    """
+
+    predecessor = str(supersedes_decision_id or "root")
+    transition = hashlib.sha256(predecessor.encode()).hexdigest()[:32]
+    return f"{context_key}:{transition}"
 
 
 def _analysis_fact(analysis: BucketFileAnalysis | None, key: str) -> object | None:
@@ -1268,6 +1424,7 @@ def _automatic_evidence_decision(
     analysis: BucketFileAnalysis | None,
     expected_entity: str | None,
     duplicate_content: bool,
+    corroborated_entities: set[str] | None = None,
 ) -> tuple[str, str, str, str | None]:
     if duplicate_content:
         return (
@@ -1296,6 +1453,14 @@ def _automatic_evidence_decision(
                 "needs_more",
                 "archive_container",
                 "The ZIP container does not count as evidence; its extracted files are reviewed individually.",
+                analysis.confidence,
+            )
+        if analysis.skip_reason == "password_protected":
+            return (
+                "rejected",
+                "password_protected",
+                analysis.skip_detail
+                or "This PDF requires a password. Ask for an unlocked copy.",
                 analysis.confidence,
             )
         return (
@@ -1353,7 +1518,12 @@ def _automatic_evidence_decision(
             "AI could not confirm that this document belongs to the application entity.",
             analysis.confidence,
         )
-    if wanted_entity and found_entity and wanted_entity != found_entity:
+    if (
+        wanted_entity
+        and found_entity
+        and not _entities_match(expected_entity, extracted_entity)
+        and found_entity not in (corroborated_entities or set())
+    ):
         return (
             "rejected",
             "wrong_entity",
@@ -1427,18 +1597,35 @@ async def _latest_evidence_decisions(
                         [link.id for link in links]
                     )
                 )
-                .order_by(
-                    ApplicationRequirementEvidenceDecision.created_at.desc(),
-                    ApplicationRequirementEvidenceDecision.id.desc(),
-                )
             )
         )
         .scalars()
         .all()
     )
     latest: dict[uuid.UUID, ApplicationRequirementEvidenceDecision] = {}
+    by_link: dict[uuid.UUID, list[ApplicationRequirementEvidenceDecision]] = {}
     for row in rows:
-        latest.setdefault(row.requirement_evidence_id, row)
+        by_link.setdefault(row.requirement_evidence_id, []).append(row)
+    for link_id, decisions in by_link.items():
+        superseded = {
+            row.supersedes_decision_id
+            for row in decisions
+            if row.supersedes_decision_id is not None
+        }
+        heads = [row for row in decisions if row.id not in superseded]
+        candidates = heads or decisions
+        # A normal append-only chain has exactly one head. The fallback handles
+        # legacy/concurrent branches: newest transaction wins, with an explicit
+        # staff override winning an equal-timestamp tie instead of random UUID
+        # ordering deciding whether the override is honored.
+        latest[link_id] = max(
+            candidates,
+            key=lambda row: (
+                str(row.created_at or ""),
+                1 if row.actor_kind == "staff" else 0,
+                str(row.id),
+            ),
+        )
     return latest
 
 
@@ -1450,6 +1637,7 @@ async def _reconcile_evidence_decisions(
     inventory: dict[uuid.UUID, BucketFile],
     analyses: dict[uuid.UUID, BucketFileAnalysis],
     expected_entity: str | None,
+    corroborated_entities: set[str],
     criteria_version: int,
 ) -> dict[uuid.UUID, ApplicationRequirementEvidenceDecision]:
     latest = await _latest_evidence_decisions(db, links)
@@ -1482,43 +1670,56 @@ async def _reconcile_evidence_decisions(
                 analysis=analysis,
                 expected_entity=expected_entity,
                 duplicate_content=duplicate,
+                corroborated_entities=corroborated_entities,
             )
-            raw_key = ":".join(
-                (
-                    "ai-evidence-v1",
-                    str(link.id),
-                    content_hash,
-                    str(analysis_version),
-                    str(criteria_version),
+            context_key = _evidence_decision_context_key(
+                link_id=link.id,
+                content_hash=content_hash,
+                analysis_version=analysis_version,
+                criteria_version=criteria_version,
+                analyzed_at=(
                     analysis.analyzed_at.isoformat()
                     if analysis and analysis.analyzed_at
-                    else "pending",
-                )
+                    else "pending"
+                ),
+                expected_entity=expected_entity,
+                duplicate_content=duplicate,
+                corroborated_entities=corroborated_entities,
             )
-            idempotency_key = hashlib.sha256(raw_key.encode()).hexdigest()
-            row = (
-                await db.execute(
-                    select(ApplicationRequirementEvidenceDecision).where(
-                        ApplicationRequirementEvidenceDecision.idempotency_key == idempotency_key
+            if (
+                current is not None
+                and current.actor_kind == "ai"
+                and current.idempotency_key.startswith(f"{context_key}:")
+            ):
+                row = current
+            else:
+                idempotency_key = _evidence_decision_transition_key(
+                    context_key, current.id if current else None
+                )
+                row = (
+                    await db.execute(
+                        select(ApplicationRequirementEvidenceDecision).where(
+                            ApplicationRequirementEvidenceDecision.idempotency_key
+                            == idempotency_key
+                        )
                     )
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                row = ApplicationRequirementEvidenceDecision(
-                    requirement_evidence_id=link.id,
-                    analysis_id=analysis.id if analysis else None,
-                    content_hash=content_hash,
-                    analysis_version=analysis_version,
-                    policy_version=criteria_version,
-                    decision=decision,
-                    reason_code=reason_code,
-                    explanation=explanation,
-                    confidence=confidence,
-                    actor_kind="ai",
-                    supersedes_decision_id=current.id if current else None,
-                    idempotency_key=idempotency_key,
-                )
-                db.add(row)
+                ).scalar_one_or_none()
+                if row is None:
+                    row = ApplicationRequirementEvidenceDecision(
+                        requirement_evidence_id=link.id,
+                        analysis_id=analysis.id if analysis else None,
+                        content_hash=content_hash,
+                        analysis_version=analysis_version,
+                        policy_version=criteria_version,
+                        decision=decision,
+                        reason_code=reason_code,
+                        explanation=explanation,
+                        confidence=confidence,
+                        actor_kind="ai",
+                        supersedes_decision_id=current.id if current else None,
+                        idempotency_key=idempotency_key,
+                    )
+                    db.add(row)
             effective[link.id] = row
 
         accepted = effective[link.id].decision == "accepted"
@@ -1553,6 +1754,10 @@ async def _materialize_requirements(
         await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     )
     expected_entity = intake.business_name if intake else None
+    corroborated_entities = _corroborated_entity_aliases(
+        expected_entity, list(analyses.values())
+    )
+    corroborated_entities.update(await _accepted_entity_aliases(db, profile.id))
     criteria_versions = {
         item.playbook_id: item.playbook_version for item in [*selections, *policies]
     }
@@ -1695,6 +1900,11 @@ async def _materialize_requirements(
                 expected_entity
                 if requirement.requirement_key in BUSINESS_ENTITY_REQUIREMENTS
                 else None
+            ),
+            corroborated_entities=(
+                corroborated_entities
+                if requirement.requirement_key in BUSINESS_ENTITY_REQUIREMENTS
+                else set()
             ),
             criteria_version=criteria_versions.get(requirement.playbook_id, 1),
         )
@@ -2139,6 +2349,20 @@ async def get_program_readiness(
     all_links = [link for rows in links_by_state.values() for link, _file in rows]
     latest_decisions = await _latest_evidence_decisions(db, all_links)
     available_files, available_analyses, _available_classes = await _evidence_inventory(db, profile)
+    unlocked_copy_requests = await locked_file_requests.request_states_for_files(
+        db,
+        profile=profile,
+        file_ids={file.id for file in available_files},
+        file_fingerprints={
+            file.id: getattr(file, "content_hash", None)
+            or (
+                getattr(available_analyses[file.id], "content_hash", None)
+                if file.id in available_analyses
+                else None
+            )
+            for file in available_files
+        },
+    )
     requirement_definitions: dict[str, AICollectionRequirement] = {}
     for rows in [*grouped.values(), *grouped_policies.values()]:
         for definition in rows:
@@ -2160,6 +2384,7 @@ async def get_program_readiness(
             file_name=file.file_name,
             bucket_id=file.bucket_id,
             created_at=file.created_at,
+            preview_url=profiles.evidence_preview_endpoint(profile.id, file.id),
             source=link.source,
             verified=link.verified_at is not None,
             verified_at=link.verified_at,
@@ -2172,6 +2397,16 @@ async def get_program_readiness(
             ),
             analysis_id=decision.analysis_id if decision else None,
             coverage_contribution=contribution,
+            is_password_protected=locked_file_requests.is_password_protected_file(
+                file, available_analyses.get(file.id)
+            ),
+            unlocked_copy_request=profiles._unlocked_copy_request_read(
+                locked_file_requests.current_request_state(
+                    file,
+                    available_analyses.get(file.id),
+                    unlocked_copy_requests.get(file.id),
+                )
+            ),
         )
 
     bank_state = next(
@@ -2295,6 +2530,7 @@ async def get_program_readiness(
                 file_name=file.file_name,
                 bucket_id=file.bucket_id,
                 created_at=file.created_at,
+                preview_url=profiles.evidence_preview_endpoint(profile.id, file.id),
             )
             for file in sorted(available_files, key=lambda row: row.created_at, reverse=True)
         ],
@@ -2732,31 +2968,42 @@ async def override_evidence_decision(
             payload.reason.strip(),
         )
     )
-    idempotency_key = hashlib.sha256(raw_key.encode()).hexdigest()
-    decision = (
-        await db.execute(
-            select(ApplicationRequirementEvidenceDecision).where(
-                ApplicationRequirementEvidenceDecision.idempotency_key == idempotency_key
+    context_key = hashlib.sha256(raw_key.encode()).hexdigest()
+    if (
+        current is not None
+        and current.actor_kind == "staff"
+        and current.idempotency_key.startswith(f"{context_key}:")
+    ):
+        decision = current
+    else:
+        idempotency_key = _evidence_decision_transition_key(
+            context_key, current.id if current else None
+        )
+        decision = (
+            await db.execute(
+                select(ApplicationRequirementEvidenceDecision).where(
+                    ApplicationRequirementEvidenceDecision.idempotency_key
+                    == idempotency_key
+                )
             )
-        )
-    ).scalar_one_or_none()
-    if decision is None:
-        decision = ApplicationRequirementEvidenceDecision(
-            requirement_evidence_id=link.id,
-            analysis_id=analysis.id if analysis else None,
-            content_hash=content_hash,
-            analysis_version=analysis_version,
-            policy_version=current.policy_version if current else 1,
-            decision=payload.decision,
-            reason_code=payload.reason_code,
-            explanation=payload.reason.strip(),
-            confidence=analysis.confidence if analysis else None,
-            actor_kind="staff",
-            actor_user_id=user.id,
-            supersedes_decision_id=current.id if current else None,
-            idempotency_key=idempotency_key,
-        )
-        db.add(decision)
+        ).scalar_one_or_none()
+        if decision is None:
+            decision = ApplicationRequirementEvidenceDecision(
+                requirement_evidence_id=link.id,
+                analysis_id=analysis.id if analysis else None,
+                content_hash=content_hash,
+                analysis_version=analysis_version,
+                policy_version=current.policy_version if current else 1,
+                decision=payload.decision,
+                reason_code=payload.reason_code,
+                explanation=payload.reason.strip(),
+                confidence=analysis.confidence if analysis else None,
+                actor_kind="staff",
+                actor_user_id=user.id,
+                supersedes_decision_id=current.id if current else None,
+                idempotency_key=idempotency_key,
+            )
+            db.add(decision)
     if payload.decision == "accepted":
         link.verified_at = now()
         link.verified_by_user_id = user.id
@@ -2770,32 +3017,9 @@ async def override_evidence_decision(
 
 
 async def reconcile_profiles_for_file(db: AsyncSession, file: BucketFile) -> list[uuid.UUID]:
-    linked_intake_ids = list(
-        (
-            await db.execute(
-                select(BucketIntakeLink.intake_id)
-                .join(
-                    BucketIntakeLinkFile,
-                    BucketIntakeLinkFile.link_id == BucketIntakeLink.id,
-                )
-                .where(
-                    BucketIntakeLinkFile.bucket_file_id == file.id,
-                    BucketIntakeLinkFile.removed_at.is_(None),
-                    BucketIntakeLink.unlinked_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    profile_filter = [ApplicationProfile.primary_bucket_id == file.bucket_id]
-    if linked_intake_ids:
-        profile_filter.append(ApplicationProfile.intake_id.in_(linked_intake_ids))
-    rows = list(
-        (await db.execute(select(ApplicationProfile).where(or_(*profile_filter)))).scalars().all()
-    )
+    rows = await profiles.affected_profiles_for_file(db, file)
     profile_ids: list[uuid.UUID] = []
-    for profile in {row.id: row for row in rows}.values():
+    for profile in rows:
         await get_program_readiness(db, profile)
         profile_ids.append(profile.id)
     return profile_ids

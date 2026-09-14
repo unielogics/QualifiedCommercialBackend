@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -15,10 +16,16 @@ from app.schemas.application_profile import ProgramFitCandidate
 from app.schemas.funding_program import FundingProgramVersionCreate
 from app.services import application_programs
 from app.services.application_programs import (
+    AI_EVIDENCE_DECISION_ALGORITHM,
+    _accepted_entity_aliases,
     _analysis_nsf_count,
     _automatic_candidate,
     _automatic_evidence_decision,
+    _corroborated_entity_aliases,
     _coverage_for_files,
+    _entities_match,
+    _evidence_decision_context_key,
+    _evidence_decision_transition_key,
     _is_lending_applicable,
     _requirement_is_effectively_accepted,
     _requirement_needs_client_evidence,
@@ -303,6 +310,305 @@ def test_ai_decisions_validate_type_entity_period_and_duplicates() -> None:
     assert wrong_entity[:2] == ("rejected", "wrong_entity")
     assert duplicate[:2] == ("rejected", "duplicate")
     assert entity_unconfirmed[:2] == ("needs_more", "entity_unconfirmed")
+
+
+def test_password_protected_skip_retains_actionable_reason_code() -> None:
+    decision = _automatic_evidence_decision(
+        requirement=SimpleNamespace(
+            requirement_key="business_bank_statements_6_months",
+            label="Last 6 months business bank statements",
+            category="financials",
+        ),
+        file=SimpleNamespace(
+            file_name="locked.pdf",
+            content_hash="locked-hash",
+            statement_period=None,
+        ),
+        analysis=SimpleNamespace(
+            status="skipped",
+            content_hash="locked-hash",
+            confidence=None,
+            classification="unreadable",
+            error=None,
+            skip_reason="password_protected",
+            skip_detail="This PDF requires a password.",
+        ),
+        expected_entity="Grace Auto Sales",
+        duplicate_content=False,
+    )
+
+    assert decision[:2] == ("rejected", "password_protected")
+
+
+@pytest.mark.parametrize(
+    ("expected", "observed"),
+    [
+        ("Good Warranty Solutions", "Good Warranty Solutions LLC"),
+    ],
+)
+def test_entity_matching_accepts_legal_suffix_normalization(expected: str, observed: str) -> None:
+    assert _entities_match(expected, observed) is True
+
+
+@pytest.mark.parametrize(
+    ("expected", "observed"),
+    [
+        ("Grace Auto Sales", "Grace Auto Repair"),
+        ("Grace Auto Sales", "Amazing Grace Auto Sales"),
+        ("Grace Auto", "Grace Auto and Service"),
+        ("Grace Auto Sales", "Grace Auto Sales East"),
+        ("Grace Auto Sales", "Grace Auto Sales and Leasing"),
+        ("Grace Auto Sales", "Grace Auto Sales and Service Center"),
+        ("Grace Auto Sales", "Grace Auto Sales and Service, Inc."),
+        ("Grace Auto Sales and Service, Inc.", "Grace Auto Sales"),
+    ],
+)
+def test_entity_matching_rejects_generic_or_merely_similar_names(expected: str, observed: str) -> None:
+    assert _entities_match(expected, observed) is False
+
+
+def test_ai_decision_accepts_grace_legal_name_expansion() -> None:
+    requirement = SimpleNamespace(
+        requirement_key="business_bank_statements_6_months",
+        label="Last 6 months business bank statements",
+        category="financials",
+    )
+    file = SimpleNamespace(
+        file_name="Grace Auto statement.pdf",
+        content_hash="grace-hash",
+        statement_period="2026-08",
+    )
+    analysis = SimpleNamespace(
+        id=uuid4(),
+        status="completed",
+        content_hash="grace-hash",
+        confidence="high",
+        classification="bank_statement",
+        error=None,
+        skip_reason=None,
+        skip_detail=None,
+        analysis={"profile_facts": {"legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}}},
+    )
+    corroborating = SimpleNamespace(
+        id=uuid4(),
+        status="completed",
+        content_hash="tax-hash",
+        confidence="high",
+        classification="tax_return",
+        analysis={"profile_facts": {"legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}}},
+    )
+    aliases = _corroborated_entity_aliases(
+        "Grace Auto Sales", [analysis, corroborating]
+    )
+
+    decision = _automatic_evidence_decision(
+        requirement=requirement,
+        file=file,
+        analysis=analysis,
+        expected_entity="Grace Auto Sales",
+        duplicate_content=False,
+        corroborated_entities=aliases,
+    )
+
+    assert decision[:2] == ("accepted", "validated")
+    assert aliases == {"graceautosalesservice"}
+    assert AI_EVIDENCE_DECISION_ALGORITHM == "ai-evidence-v2"
+
+
+@pytest.mark.asyncio
+async def test_operator_accepted_legal_name_becomes_an_authoritative_alias() -> None:
+    accepted = SimpleNamespace(
+        value={"value": "Grace Auto Sales East, Inc."},
+        normalized_value="grace auto sales east inc",
+    )
+    result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [accepted])
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    aliases = await _accepted_entity_aliases(db, uuid4())
+
+    assert aliases == {"graceautosaleseast"}
+
+
+def test_one_document_type_cannot_self_corroborate_an_entity_alias() -> None:
+    analyses = [
+        SimpleNamespace(
+            id=uuid4(),
+            status="completed",
+            content_hash=f"hash-{index}",
+            confidence="high",
+            classification="bank_statement",
+            analysis={
+                "profile_facts": {
+                    "legal_entity_name": {"value": "Grace Auto Sales East, Inc."}
+                }
+            },
+        )
+        for index in range(3)
+    ]
+
+    assert _corroborated_entity_aliases("Grace Auto Sales", analyses) == set()
+
+
+def test_evidence_decision_key_appends_alias_corroboration_add_and_remove() -> None:
+    common = {
+        "link_id": uuid4(),
+        "content_hash": "statement-hash",
+        "analysis_version": 1,
+        "criteria_version": 3,
+        "analyzed_at": "2026-09-14T19:05:00+00:00",
+        "expected_entity": "Grace Auto Sales",
+        "duplicate_content": False,
+    }
+
+    before_context = _evidence_decision_context_key(
+        **common, corroborated_entities=set()
+    )
+    corroborated_context = _evidence_decision_context_key(
+        **common, corroborated_entities={"graceautosalesservice"}
+    )
+    after_removal_context = _evidence_decision_context_key(
+        **common, corroborated_entities=set()
+    )
+    before = _evidence_decision_transition_key(before_context, None)
+    corroborated = _evidence_decision_transition_key(
+        corroborated_context, "decision-before"
+    )
+    after_removal = _evidence_decision_transition_key(
+        after_removal_context, "decision-corroborated"
+    )
+
+    assert corroborated != before
+    assert after_removal_context == before_context
+    assert after_removal != before
+
+    renamed = _evidence_decision_context_key(
+        **{**common, "expected_entity": "Grace Auto Sales and Service"},
+        corroborated_entities=set(),
+    )
+    duplicate = _evidence_decision_context_key(
+        **{**common, "duplicate_content": True}, corroborated_entities=set()
+    )
+    assert renamed != before_context
+    assert duplicate != before_context
+
+    conjunction_changed = _evidence_decision_context_key(
+        **{**common, "expected_entity": "Grace and Auto Sales"},
+        corroborated_entities=set(),
+    )
+    ampersand_equivalent = _evidence_decision_context_key(
+        **{**common, "expected_entity": "Grace & Auto Sales"},
+        corroborated_entities=set(),
+    )
+    assert conjunction_changed != before_context
+    assert ampersand_equivalent == conjunction_changed
+
+
+@pytest.mark.asyncio
+async def test_decision_head_follows_supersedes_chain_not_random_uuid_order() -> None:
+    link = SimpleNamespace(id=uuid4())
+    timestamp = datetime(2026, 9, 14, 20, 0, tzinfo=UTC)
+    ai = SimpleNamespace(
+        id=uuid4(),
+        requirement_evidence_id=link.id,
+        supersedes_decision_id=None,
+        actor_kind="ai",
+        created_at=timestamp,
+    )
+    staff = SimpleNamespace(
+        id=uuid4(),
+        requirement_evidence_id=link.id,
+        supersedes_decision_id=ai.id,
+        actor_kind="staff",
+        created_at=timestamp,
+    )
+    rows = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [ai, staff]))
+    db = SimpleNamespace(execute=AsyncMock(return_value=rows))
+
+    latest = await application_programs._latest_evidence_decisions(db, [link])
+
+    assert latest[link.id] is staff
+
+
+@pytest.mark.asyncio
+async def test_unchanged_staff_override_remains_effective_during_reconciliation() -> None:
+    file_id = uuid4()
+    staff_user_id = uuid4()
+    reviewed_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    link = SimpleNamespace(
+        id=uuid4(),
+        file_id=file_id,
+        verified_at=reviewed_at,
+        verified_by_user_id=staff_user_id,
+        reason="Staff confirmed the statement belongs to the applicant.",
+    )
+    file = SimpleNamespace(id=file_id, content_hash="current-content")
+    analysis = SimpleNamespace(content_hash="current-content", analysis_version=3)
+    staff = SimpleNamespace(
+        id=uuid4(),
+        requirement_evidence_id=link.id,
+        supersedes_decision_id=None,
+        actor_kind="staff",
+        created_at=reviewed_at,
+        content_hash="current-content",
+        analysis_version=3,
+        decision="accepted",
+        explanation="Staff confirmed the statement belongs to the applicant.",
+    )
+    rows = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [staff]))
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=rows),
+        add=Mock(),
+        flush=AsyncMock(),
+    )
+    requirement = SimpleNamespace(verification_required=False)
+
+    effective = await application_programs._reconcile_evidence_decisions(
+        db,
+        requirement=requirement,
+        links=[link],
+        inventory={file_id: file},
+        analyses={file_id: analysis},
+        expected_entity="Grace Auto Sales",
+        corroborated_entities={"graceautosalesandservice"},
+        criteria_version=1,
+    )
+
+    assert effective[link.id] is staff
+    assert link.verified_at == reviewed_at
+    assert link.verified_by_user_id == staff_user_id
+    assert link.reason == "Staff confirmed the statement belongs to the applicant."
+    db.add.assert_not_called()
+
+
+def test_staff_decisions_use_append_only_transition_keys() -> None:
+    source = __import__("inspect").getsource(
+        application_programs.override_evidence_decision
+    )
+
+    assert "_evidence_decision_transition_key(" in source
+    assert "context_key, current.id if current else None" in source
+
+
+def test_two_document_types_do_not_corroborate_an_unapproved_branch_suffix() -> None:
+    analyses = [
+        SimpleNamespace(
+            id=uuid4(),
+            status="completed",
+            content_hash=f"hash-{classification}",
+            confidence="high",
+            classification=classification,
+            analysis={
+                "profile_facts": {
+                    "legal_entity_name": {"value": "Grace Auto Sales East, Inc."}
+                }
+            },
+        )
+        for classification in ("bank_statement", "tax_return")
+    ]
+
+    assert _corroborated_entity_aliases("Grace Auto Sales", analyses) == set()
 
 
 def test_coverage_counts_distinct_periods_not_file_count() -> None:

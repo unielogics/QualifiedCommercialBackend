@@ -30,6 +30,7 @@ from app.models.referral_partner_company import ReferralPartnerCompany
 from app.models.user import User
 from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
+from app.services.extracted_facts import canonical_field_key
 
 SOURCE_LABELS: dict[str, str] = {
     "dealer": "Dealer file",
@@ -201,21 +202,24 @@ async def extracted_facts(db: AsyncSession, profile: ApplicationProfile) -> dict
             select(ApplicationExtractedFact)
             .where(
                 ApplicationExtractedFact.profile_id == profile.id,
-                ApplicationExtractedFact.status != "rejected",
+                ApplicationExtractedFact.status.in_(["accepted", "suggested"]),
             )
             .order_by(ApplicationExtractedFact.created_at.desc())
         )
     ).scalars().all()
     best: dict[str, tuple[int, float, str]] = {}
     for row in rows:
-        if row.status == "rejected":  # the query excludes these; so does this
+        # Keep the in-memory guard as defense in depth and for callers backed
+        # by repository fakes that do not apply SQL predicates.
+        if row.status not in {"accepted", "suggested"}:
             continue
         value = _text(row.normalized_value) or _text(row.value if isinstance(row.value, str) else (row.value or {}).get("value"))
         if not value:
             continue
         rank = (1 if row.status == "accepted" else 0, float(row.confidence or 0))
-        if row.field_key not in best or rank > best[row.field_key][:2]:
-            best[row.field_key] = (*rank, value)
+        field_key = canonical_field_key(row.field_key)
+        if field_key not in best or rank > best[field_key][:2]:
+            best[field_key] = (*rank, value)
     return {k: v[2] for k, v in best.items()}
 
 

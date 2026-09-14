@@ -138,6 +138,8 @@ from app.schemas.application_profile import (
     TaxonomyReviewRequest,
     TaxonomySearchRead,
     UnifiedAuditEvent,
+    UnlockedCopyRequestCreate,
+    UnlockedCopyRequestResult,
     UploadedStatementFigures,
     VerificationInvitationCreate,
     VerificationInvitationRead,
@@ -156,6 +158,7 @@ from app.services import (
     drafted_forms,
     file_events,
     financial_statements,
+    locked_file_requests,
     merchant_processing,
     missing_item_automation,
     pfs_schema,
@@ -165,6 +168,13 @@ from app.services import (
 )
 from app.services.activity_log import log_activity, mark_loan_dirty
 from app.services.application_plaid_sync import sync_item_background
+from app.services.extracted_facts import (
+    accepted_review_group_keys,
+    canonical_field_key,
+    fact_review_group_key,
+    facts_resolved_by_review,
+    pending_review_group_keys,
+)
 from app.services.user_access import is_audit_client, is_funding_client
 
 logger = logging.getLogger(__name__)
@@ -614,6 +624,18 @@ def _require_underwriting_actor(user: User) -> None:
         )
 
 
+def _can_review_manual_bank_evidence(user: User) -> bool:
+    return user.role in {
+        Role.SUPER_ADMIN,
+        Role.REGIONAL_MANAGER,
+        Role.BROKER,
+        Role.LOAN_EXEC,
+        Role.DEALER_PARTNER,
+        Role.PROFESSIONAL_REFERRAL_PARTNER,
+        Role.FIELD_REP,
+    }
+
+
 def _underwriting_read(
     profile: ApplicationProfile,
     *,
@@ -873,39 +895,21 @@ async def get_application_evidence_workspace(
     supporting = await profiles.ensure_supporting_document_group(db, profile)
     readiness = await application_programs.get_program_readiness(db, profile)
     verification = await profiles.verification_state(db, profile)
-    banking = await _application_bank_state(db, profile)
+    banking = await _application_bank_state(db, profile, include_statement_files=True)
     forms = await financial_forms_status(profile_id, user, db)
     evidence = await profiles.evidence_state(db, profile)
+    for item in evidence.files:
+        item.preview_url = profiles.evidence_preview_endpoint(profile.id, item.id)
 
     decisions_by_file: dict[UUID, set[str]] = {}
     for requirement in readiness.requirements:
         for item in requirement.evidence_files:
             decisions_by_file.setdefault(item.file_id, set()).add(item.ai_decision)
 
-    latest_analysis: dict[UUID, str] = {}
-    evidence_ids = [item.id for item in evidence.files]
-    if evidence_ids:
-        analyses = list(
-            (
-                await db.execute(
-                    select(BucketFileAnalysis)
-                    .where(BucketFileAnalysis.bucket_file_id.in_(evidence_ids))
-                    .order_by(
-                        BucketFileAnalysis.bucket_file_id,
-                        BucketFileAnalysis.created_at.desc(),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for analysis in analyses:
-            latest_analysis.setdefault(analysis.bucket_file_id, analysis.status)
-
-    analyzing = accepted = needs_attention = failed = 0
+    analyzing = accepted = needs_attention = failed = skipped = 0
     for item in evidence.files:
         decisions = decisions_by_file.get(item.id, set())
-        analysis_status = latest_analysis.get(item.id)
+        analysis_status = item.analysis_status
         if "processing" in decisions or analysis_status in {
             "pending",
             "queued",
@@ -919,6 +923,8 @@ async def get_application_evidence_workspace(
             needs_attention += 1
         elif "accepted" in decisions:
             accepted += 1
+        elif analysis_status == "skipped":
+            skipped += 1
 
     client_summary = await profiles.client_evidence_banking_summary(
         db,
@@ -959,6 +965,7 @@ async def get_application_evidence_workspace(
             accepted_files=accepted,
             needs_attention_files=needs_attention,
             failed_files=failed,
+            skipped_files=skipped,
             has_processing=analyzing > 0,
         ),
         can_manage_evidence=user.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC},
@@ -1066,6 +1073,174 @@ async def reanalyze_application_evidence(
     )
     await db.commit()
     return EvidenceReanalyzeResult(file_id=file.id)
+
+
+@router.post(
+    "/{profile_id}/evidence/{file_id}/request-unlocked-copy",
+    response_model=UnlockedCopyRequestResult,
+)
+async def request_unlocked_application_evidence(
+    profile_id: UUID,
+    file_id: UUID,
+    payload: UnlockedCopyRequestCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> UnlockedCopyRequestResult:
+    """Ask for a password-free replacement of a confirmed locked PDF."""
+
+    _require_underwriting_actor(user)
+    profile = await profiles.load_profile(db, profile_id, user)
+    evidence = await profiles.evidence_state(db, profile)
+    if file_id not in {item.id for item in evidence.files}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+
+    # This source-file lock serializes the absent replacement-request lookup in
+    # locked_file_requests. Locking only a row that may not exist would not
+    # prevent two first clicks from creating duplicate checklist items.
+    file = (
+        await db.execute(
+            select(BucketFile)
+            .where(
+                BucketFile.id == file_id,
+                BucketFile.status == "uploaded",
+                BucketFile.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if file is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
+    # Re-open the current bytes through the canonical extractor before acting.
+    # This discovers direct uploads without an analysis and repairs legacy rows
+    # that called any encrypted PDF password-protected even when empty-password
+    # decryption succeeds. True locks stop before the AI model; readable cached
+    # files remain cheap.
+    analysis = await bucket_ai.analyze_bucket_file(db, file, force=False)
+    if not locked_file_requests.is_password_protected_file(file, analysis):
+        # Persist any corrected fingerprint/analysis produced by revalidation
+        # even though the requested side effect is rejected.
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "evidence_not_password_protected",
+                "message": "This file is not currently confirmed as password-protected.",
+            },
+        )
+
+    link = await _profile_room_link(db, profile)
+    _require_usable_unlocked_copy_room(link)
+    recipient = await missing_item_automation.optional_recipient_for_profile(db, profile, link)
+    email_suppressed = bool(
+        profile.client_id and await application_programs.email_is_suppressed(db, profile.client_id)
+    )
+    send_email = bool(
+        payload.delivery_mode == "email_if_available" and recipient and not email_suppressed
+    )
+
+    async def require_email_delivery_permission() -> None:
+        await _require_training_live_action(
+            db,
+            profile=profile,
+            user=user,
+            request=request,
+            action="Request an unlocked evidence copy",
+            provider="email",
+            recipient=recipient,
+            effect=f"Ask the client to replace password-protected {file.file_name}",
+        )
+
+    delivery_note = (
+        "Created for secure-room link sharing without sending an email"
+        if payload.delivery_mode == "room_link_only"
+        else "Created without sending because the client has opted out of email"
+        if email_suppressed
+        else "Created without sending; no client email is available"
+    )
+    try:
+        outcome = await locked_file_requests.request_unlocked_copy(
+            db,
+            profile=profile,
+            file=file,
+            analysis=analysis,
+            link=link,
+            recipient=recipient,
+            user=user,
+            send_email=send_email,
+            delivery_note=delivery_note,
+            retry_failed=payload.retry_failed,
+            before_email_delivery=(require_email_delivery_permission if send_email else None),
+        )
+    except locked_file_requests.StaleUnlockedCopyRequest as exc:
+        # Preserve canonical reanalysis of the clicked file, but never email a
+        # deep link to an obsolete/hidden replacement task.
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "stale_unlocked_copy_request",
+                "message": str(exc),
+            },
+        ) from exc
+    delivery = outcome.delivery
+    if not outcome.deduplicated:
+        await profiles.log_profile_action(
+            db,
+            profile,
+            user,
+            (
+                "evidence.unlocked_copy_requested"
+                if delivery.status in {"sent", "created"}
+                else "evidence.unlocked_copy_request_failed"
+            ),
+            f"Unlocked-copy request for {file.file_name}: {delivery.detail}",
+            target_type="bucket_file",
+            target_id=file.id,
+            metadata={
+                "requested_document_id": str(outcome.requested_document.id),
+                "delivery_id": str(delivery.id),
+                "delivery_status": delivery.status,
+                "channel": delivery.channel,
+                "attempt_number": delivery.attempt_number,
+                "analysis_id": str(analysis.id) if analysis else None,
+            },
+        )
+        if delivery.attempt_number == 1:
+            await file_events.emit(
+                db,
+                profile=profile,
+                kind="document.requested",
+                visibility=file_events.VISIBILITY_CLIENT,
+                title=f"We asked for an unlocked copy of {file.file_name}",
+                actor=user,
+                target_type="requested_document",
+                target_id=outcome.requested_document.id,
+            )
+
+    provider = delivery.provider_result if isinstance(delivery.provider_result, dict) else {}
+    source_file_id = outcome.source_file_id or file.id
+    result = UnlockedCopyRequestResult(
+        source_file_id=source_file_id,
+        requested_document_id=outcome.requested_document.id,
+        request_status=outcome.requested_document.status,
+        delivery_id=delivery.id,
+        delivery_status=delivery.status,
+        requested_at=outcome.requested_document.created_at,
+        last_delivery_at=delivery.created_at,
+        replacement_review_state=outcome.replacement_review_state,
+        room_url=outcome.room_url,
+        # On a deduplicated response the newly resolved profile recipient can
+        # differ from the address on the durable delivery. Report only what
+        # was actually used for that delivery.
+        recipient_masked=_masked_recipient(
+            delivery.channel, getattr(delivery, "recipient_email", None), None
+        ),
+        provider_accepted=bool(provider.get("accepted")),
+        deduplicated=outcome.deduplicated,
+    )
+    await db.commit()
+    return result
 
 
 @router.patch(
@@ -1271,6 +1446,50 @@ async def _profile_room_link(
     if link is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "This file has no active application room")
     return link
+
+
+def _require_usable_unlocked_copy_room(link: BucketUploadLink) -> None:
+    """Prevent sending a replacement request to a room the client cannot open."""
+
+    now = datetime.now(UTC)
+    expires_at = getattr(link, "expires_at", None)
+    expired = bool(expires_at and expires_at <= now)
+    consumed = bool(
+        getattr(link, "completed_at", None) and not getattr(link, "allow_multiple_sessions", True)
+    )
+    if getattr(link, "status", "active") != "active" or expired or consumed:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "application_room_unavailable",
+                "message": (
+                    "The application room is inactive, expired, or already completed. "
+                    "Create or reactivate a room before requesting an unlocked copy."
+                ),
+            },
+        )
+    recovered_pin = (
+        client_room.read_passcode(link)
+        if getattr(link, "passcode_hash", None)
+        and getattr(link, "encrypted_passcode", None)
+        else None
+    )
+    if (
+        recovered_pin is None
+        or len(recovered_pin) != 6
+        or not recovered_pin.isascii()
+        or not recovered_pin.isdigit()
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "code": "application_room_pin_required",
+                "message": (
+                    "Set or rotate the application-room PIN to a recoverable six-digit code "
+                    "before requesting an unlocked copy."
+                ),
+            },
+        )
 
 
 def _room_url(link: BucketUploadLink, *, query: str | None = None) -> str:
@@ -1627,7 +1846,14 @@ async def list_extracted_facts(
     rows = list((await db.execute(select(ApplicationExtractedFact).where(
         ApplicationExtractedFact.profile_id == profile.id,
     ).order_by(ApplicationExtractedFact.created_at.desc()))).scalars().all())
-    return [ExtractedFactRead.model_validate(row, from_attributes=True) for row in rows]
+    return [_extracted_fact_read(row) for row in rows]
+
+
+def _extracted_fact_read(fact: ApplicationExtractedFact) -> ExtractedFactRead:
+    result = ExtractedFactRead.model_validate(fact, from_attributes=True)
+    return result.model_copy(
+        update={"canonical_field_key": canonical_field_key(fact.field_key)}
+    )
 
 
 @router.post("/{profile_id}/extracted-facts/{fact_id}/review", response_model=ExtractedFactRead)
@@ -1638,39 +1864,76 @@ async def review_extracted_fact(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> ExtractedFactRead:
+    _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
-    fact = (await db.execute(select(ApplicationExtractedFact).where(
-        ApplicationExtractedFact.id == fact_id,
+    # Serialize extraction capture, operator review, and draft finalization on
+    # the same application row so a concurrent upload cannot reopen a field
+    # after the operator has accepted it.
+    await db.refresh(profile, with_for_update=True)
+    fact_rows = list((await db.execute(select(ApplicationExtractedFact).where(
         ApplicationExtractedFact.profile_id == profile.id,
-    ))).scalar_one_or_none()
+    ).with_for_update())).scalars().all())
+    fact = next((row for row in fact_rows if row.id == fact_id), None)
     if fact is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Extracted fact not found")
-    fact.status = "accepted" if payload.action == "accept" else "rejected"
-    fact.reviewed_by_user_id = user.id
-    fact.reviewed_at = datetime.now(UTC)
+    requested_status = "accepted" if payload.action == "accept" else "rejected"
+    if fact.status != "suggested":
+        if fact.status == requested_status:
+            return _extracted_fact_read(fact)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This field suggestion was already resolved",
+        )
+    canonical_key = canonical_field_key(fact.field_key)
+    if payload.action == "accept" and fact_review_group_key(fact) in accepted_review_group_keys(
+        row for row in fact_rows if row.id != fact.id
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This field already has an accepted value",
+        )
+    reviewed_at = datetime.now(UTC)
+    resolved = facts_resolved_by_review(fact_rows, fact, payload.action)
+    for row in resolved:
+        row.status = (
+            requested_status
+            if row.id == fact.id or payload.action == "reject"
+            else "superseded"
+        )
+        row.reviewed_by_user_id = user.id
+        row.reviewed_at = reviewed_at
     allowed_profile_fields = {"funding_category", "entity_type", "industry", "subindustry", "naics_code", "naics_label"}
-    if payload.action == "accept" and fact.field_key in allowed_profile_fields:
+    if payload.action == "accept" and canonical_key in allowed_profile_fields:
         raw = fact.value.get("value") if isinstance(fact.value, dict) else None
         if raw not in (None, ""):
-            setattr(profile, fact.field_key, str(raw))
-    remaining = (await db.execute(select(func.count()).where(
-        ApplicationExtractedFact.profile_id == profile.id,
-        ApplicationExtractedFact.status == "suggested",
-        ApplicationExtractedFact.id != fact.id,
-    ))).scalar_one()
-    if remaining == 0:
+            setattr(profile, canonical_key, str(raw))
+    if not pending_review_group_keys(fact_rows):
         profile.extraction_reviewed_at = datetime.now(UTC)
-    await profiles.log_profile_action(db, profile, user, f"extraction.{fact.status}", f"{fact.status.title()} extracted {fact.field_key}", target_type="extracted_fact", target_id=fact.id)
+    await profiles.log_profile_action(
+        db,
+        profile,
+        user,
+        f"extraction.{requested_status}",
+        f"{requested_status.title()} extracted {canonical_key}",
+        target_type="extracted_fact",
+        target_id=fact.id,
+        metadata={
+            "canonical_field_key": canonical_key,
+            "resolved_suggestion_count": len(resolved),
+        },
+    )
     await db.commit()
     await db.refresh(fact)
-    return ExtractedFactRead.model_validate(fact, from_attributes=True)
+    return _extracted_fact_read(fact)
 
 
 @router.post("/{profile_id}/finalize", response_model=ApplicationProfileRead)
 async def finalize_application_draft(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationProfileRead:
+    _require_underwriting_actor(user)
     profile = await profiles.load_profile(db, profile_id, user)
+    await db.refresh(profile, with_for_update=True)
     draft_status = await profiles.draft_analysis_status(db, profile)
     if draft_status.processing_file_count:
         raise HTTPException(
@@ -2210,7 +2473,10 @@ async def _public_application_room(
 
 
 async def _application_bank_state(
-    db: AsyncSession, profile: ApplicationProfile
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    *,
+    include_statement_files: bool = False,
 ) -> ApplicationBankState:
     policy, policy_owner = await plaid_policy.for_profile(db, profile)
     disclosure = dealer_bank_consent.disclosure(policy.selected_products)
@@ -2245,6 +2511,10 @@ async def _application_bank_state(
             manual_evidence.needs_more_file_count + manual_evidence.rejected_file_count
         ),
         manual_statement_failed_count=manual_evidence.failed_analysis_count,
+        evidence_processing_count=(
+            manual_evidence.evidence_processing_count if include_statement_files else 0
+        ),
+        manual_statement_files=(list(manual_evidence.files) if include_statement_files else []),
         evidence_summary=profiles.application_evidence_summary(manual_evidence),
         assets_enabled=policy.assets_enabled,
         statements_enabled=policy.statements_enabled,
@@ -3313,7 +3583,11 @@ async def get_application_banks(
     profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
-    return await _application_bank_state(db, profile)
+    return await _application_bank_state(
+        db,
+        profile,
+        include_statement_files=_can_review_manual_bank_evidence(user),
+    )
 
 
 @router.patch("/{profile_id}/banks/settings", response_model=ApplicationBankState)
@@ -3434,7 +3708,7 @@ async def update_application_plaid_settings(
             from app.services.application_plaid_sync import sync_item_background
 
             background.add_task(sync_item_background, item_id)
-    return await _application_bank_state(db, profile)
+    return await _application_bank_state(db, profile, include_statement_files=True)
 
 
 @router.post("/{profile_id}/banks/manual-override", response_model=ApplicationBankState)
@@ -3445,7 +3719,7 @@ async def approve_manual_bank_evidence(
     db: AsyncSession = Depends(get_db),
 ) -> ApplicationBankState:
     profile = await profiles.load_profile(db, profile_id, user)
-    if user.role in {Role.CLIENT, Role.DEALER, Role.VENDOR, Role.LENDER}:
+    if not _can_review_manual_bank_evidence(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only scoped staff may approve manual bank evidence")
     manual_evidence = await profiles.manual_statement_evidence(db, profile)
     if not manual_evidence.file_count:
@@ -4038,7 +4312,11 @@ async def get_application_evidence(
     profile = await profiles.load_profile(db, profile_id, user)
     state = await profiles.evidence_state(db, profile)
     for file in state.files:
-        file.preview_url = f"/api/v1/application-profiles/{profile.id}/evidence/files/{file.id}/url"
+        file.preview_url = (
+            profiles.evidence_preview_endpoint(profile.id, file.id)
+            if _can_review_manual_bank_evidence(user)
+            else None
+        )
     return state
 
 
@@ -4049,11 +4327,15 @@ async def get_application_evidence_file_url(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    if not _can_review_manual_bank_evidence(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Evidence review role required")
     profile = await profiles.load_profile(db, profile_id, user)
     evidence = await profiles.evidence_state(db, profile)
     if file_id not in {row.id for row in evidence.files}:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
     file = await db.get(BucketFile, file_id)
+    if file is None or file.status != "uploaded" or file.deleted_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence file not found")
     from app.routers.buckets import _download_url
 
     await profiles.log_profile_action(db, profile, user, "evidence.preview", f"Opened {file.file_name}", target_type="file", target_id=file.id)

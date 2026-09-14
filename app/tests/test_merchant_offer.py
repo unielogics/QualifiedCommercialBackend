@@ -137,7 +137,10 @@ def test_the_lender_zip_the_room_file_list_and_the_review_all_skip_it():
     from app.routers import buckets, dealer_ai_intake
 
     assert "merchant_processing.is_offer_document" in inspect.getsource(dealer_ai_intake.build_package_zip_bytes)
-    assert "is_offer_document(file)" in inspect.getsource(buckets.request_link_access)
+    # Initial access and silent status refresh now share this one projection,
+    # so the offer exclusion belongs in the response builder rather than only
+    # in the initial-access route.
+    assert "is_offer_document(file)" in inspect.getsource(buckets._request_access_read)
     source = inspect.getsource(ai.run_bucket_ai_review)
     assert "merchant_processing.is_offer_document(file)" in source
     # Skipped silently — not listed as "not analyzed", which would read as a gap.

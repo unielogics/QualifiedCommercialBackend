@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import re
 import zipfile
 from datetime import UTC, datetime
 from io import BytesIO, StringIO
@@ -15,7 +16,7 @@ from uuid import UUID, uuid4
 import boto3
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from sqlalchemy import case, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -41,7 +42,11 @@ from app.services import merchant_processing
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
-from app.services.bucket_evidence import classifications_for_requested_doc, reconcile_uploaded_file
+from app.services.bucket_evidence import (
+    classifications_for_requested_doc,
+    reconcile_uploaded_file,
+    statement_months_from_filename,
+)
 
 # The user and assistant rows of one chat turn are flushed together and share
 # a single created_at, so timestamp-only ordering can render an answer above
@@ -980,29 +985,74 @@ def _merge_per_file_analyses(
     satisfied categories (bank statements, tax returns, P&L, …) are shown as
     covered instead of missing — even when the light synthesis pass leaves them
     blank."""
-    if not per_file_analyses:
-        return
     evidence_map = result.get("document_evidence_map")
     if not isinstance(evidence_map, dict):
         evidence_map = {"files": [], "baseline_coverage": []}
-    if not isinstance(evidence_map.get("files"), list) or not evidence_map.get("files"):
-        evidence_map["files"] = [
+    durable_files = {
+        str(item["file_id"]): {
+            "file_id": item["file_id"],
+            "file_name": item["file_name"],
+            "ai_classification": item.get("ai_classification"),
+            "supports": item.get("supports") or [],
+            "baseline_categories_supported": item.get("baseline_categories_supported") or [],
+            "confidence": item.get("confidence"),
+            "limitations": item.get("limitations") or [],
+        }
+        for item in per_file_analyses
+    }
+    synthesized_files = evidence_map.get("files")
+    synthesized_files_by_id = {
+        str(raw.get("file_id")): raw
+        for raw in synthesized_files
+        if isinstance(raw, dict) and str(raw.get("file_id") or "") in durable_files
+    } if isinstance(synthesized_files, list) else {}
+    # File IDs from the durable analysis rows define the complete output set.
+    # Synthesis may annotate one of those rows, but it may not invent a row or
+    # match by file name (two uploads can legitimately share the same name).
+    evidence_map["files"] = [
+        {**synthesized_files_by_id.get(file_id, {}), **durable}
+        for file_id, durable in durable_files.items()
+    ]
+    if not isinstance(evidence_map.get("baseline_coverage"), list):
+        evidence_map["baseline_coverage"] = []
+    # Build baseline_coverage deterministically against the current checklist.
+    # A partial synthesis response must not hide requested categories or retain
+    # stale coverage from an earlier file set.
+    if requested_documents:
+        from app.services.public_underwriting_packet_pdf import (
+            extract_bank_months,
+            extract_tax_years,
+        )
+
+        normalized = [
             {
-                "file_id": item["file_id"],
-                "file_name": item["file_name"],
-                "ai_classification": item.get("ai_classification"),
-                "supports": item.get("supports") or [],
-                "baseline_categories_supported": item.get("baseline_categories_supported") or [],
-                "confidence": item.get("confidence"),
-                "limitations": item.get("limitations") or [],
+                "file_id": item.get("file_id"),
+                "classification": item.get("ai_classification"),
+                "key_facts": item.get("key_facts") or {},
             }
             for item in per_file_analyses
         ]
-    if not isinstance(evidence_map.get("baseline_coverage"), list):
-        evidence_map["baseline_coverage"] = []
-    # Build baseline_coverage against the requested-document checklist when the
-    # synthesis pass did not provide one, using what the files were classified as.
-    if requested_documents and not evidence_map.get("baseline_coverage"):
+        bank_months = {
+            str(row.get("sort"))
+            for row in extract_bank_months(normalized, limit=120)
+            if row.get("sort")
+        }
+        for item in per_file_analyses:
+            if item.get("ai_classification") == "bank_statement":
+                bank_months.update(
+                    statement_months_from_filename(str(item.get("file_name") or ""))
+                )
+        tax_years = {
+            str(row.get("year"))
+            for row in extract_tax_years(normalized, limit=120)
+            if re.fullmatch(r"20\d{2}", str(row.get("year") or ""))
+        }
+        for item in per_file_analyses:
+            if item.get("ai_classification") == "tax_return":
+                tax_years.update(
+                    re.findall(r"\b20\d{2}\b", str(item.get("file_name") or ""))
+                )
+
         present_classes: dict[str, list[str]] = {}
         for item in per_file_analyses:
             cls = item.get("ai_classification")
@@ -1015,6 +1065,42 @@ def _merge_per_file_analyses(
             wanted = classifications_for_requested_doc(name, category)
             evidence_files = [fn for cls in wanted for fn in present_classes.get(cls, [])]
             gap = "" if evidence_files else "No matching document analyzed yet."
+
+            if "bank_statement" in wanted:
+                match = re.search(r"\b(\d{1,2})\s*(?:months?|mos?)\b", name.casefold())
+                required = int(match.group(1)) if match else 1
+                current = len(bank_months)
+                satisfied = current >= required
+                coverage.append(
+                    {
+                        "category": name,
+                        "status": "satisfied" if satisfied else "partial" if evidence_files else "missing",
+                        "evidence": evidence_files,
+                        "gap": "" if satisfied else f"{current} of {required} distinct statement months analyzed.",
+                        "current": current,
+                        "required": required,
+                        "unit": "months",
+                    }
+                )
+                continue
+
+            if "tax_return" in wanted:
+                match = re.search(r"\b(\d{1,2})\s*(?:years?|yrs?)\b", name.casefold())
+                required = int(match.group(1)) if match else 1
+                current = len(tax_years)
+                satisfied = current >= required
+                coverage.append(
+                    {
+                        "category": name,
+                        "status": "satisfied" if satisfied else "partial" if evidence_files else "missing",
+                        "evidence": evidence_files,
+                        "gap": "" if satisfied else f"{current} of {required} distinct tax years analyzed.",
+                        "current": current,
+                        "required": required,
+                        "unit": "years",
+                    }
+                )
+                continue
 
             # A slot the borrower has actually satisfied counts, whatever the
             # analyzer decided the document was. All four routes end here — an
@@ -1052,16 +1138,25 @@ def _merge_per_file_analyses(
         if coverage:
             evidence_map["baseline_coverage"] = coverage
     result["document_evidence_map"] = evidence_map
-    if not isinstance(result.get("per_file_summaries"), list) or not result.get("per_file_summaries"):
-        result["per_file_summaries"] = [
-            {
-                "file_id": item["file_id"],
-                "file_name": item["file_name"],
-                "summary": item.get("summary") or "",
-                "red_flags": item.get("red_flags") or [],
-            }
-            for item in per_file_analyses
-        ]
+    durable_summaries = {
+        str(item["file_id"]): {
+            "file_id": item["file_id"],
+            "file_name": item["file_name"],
+            "summary": item.get("summary") or "",
+            "red_flags": item.get("red_flags") or [],
+        }
+        for item in per_file_analyses
+    }
+    synthesized_summaries = result.get("per_file_summaries")
+    synthesized_summaries_by_id = {
+        str(raw.get("file_id")): raw
+        for raw in synthesized_summaries
+        if isinstance(raw, dict) and str(raw.get("file_id") or "") in durable_summaries
+    } if isinstance(synthesized_summaries, list) else {}
+    result["per_file_summaries"] = [
+        {**synthesized_summaries_by_id.get(file_id, {}), **durable}
+        for file_id, durable in durable_summaries.items()
+    ]
 
 
 def _compute_key_metrics_from_cache(
@@ -1514,10 +1609,51 @@ def _content_block(media_type: str, raw: bytes) -> dict[str, Any]:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
 
 
+def _pdf_requires_password(reader: PdfReader) -> bool:
+    """Distinguish an open-password lock from encryption used for permissions.
+
+    Some banks mark PDFs encrypted only to restrict editing/copying while still
+    allowing them to open with an empty user password.  PyPDF reports both
+    cases as ``is_encrypted``; only a failed empty-password decrypt is a client
+    remediation issue.
+    """
+
+    if not reader.is_encrypted:
+        return False
+    try:
+        return not bool(reader.decrypt(""))
+    except Exception:  # noqa: BLE001 - malformed encryption must fail closed
+        return True
+
+
+def _pdf_bytes_for_model(raw: bytes) -> bytes:
+    """Return model-safe PDF bytes, removing empty-password encryption.
+
+    A PDF can use encryption only to restrict editing/copying while still
+    opening without a user password.  ``PdfReader.decrypt("")`` makes that
+    document readable inside this process, but it does not change ``raw``.
+    Bedrock/Claude rejects encrypted PDF attachments, so rewrite the decrypted
+    pages into a transient, unencrypted document before building the model
+    content block.  The original evidence object is never modified.
+    """
+
+    reader = PdfReader(BytesIO(raw), strict=False)
+    if not reader.is_encrypted:
+        return raw
+    if _pdf_requires_password(reader):
+        raise ValueError("PDF requires a user password")
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def _pdf_review_metadata(raw: bytes) -> tuple[int | None, tuple[str, str] | None]:
     try:
         reader = PdfReader(BytesIO(raw), strict=False)
-        if reader.is_encrypted:
+        if _pdf_requires_password(reader):
             return (
                 None,
                 (
@@ -1554,11 +1690,28 @@ def _pdf_review_metadata(raw: bytes) -> tuple[int | None, tuple[str, str] | None
         )
 
 
+def _password_skip_still_applies(
+    analysis: BucketFileAnalysis,
+    *,
+    raw: bytes,
+    content_type: str,
+    file_name: str,
+) -> bool:
+    """Revalidate legacy password skips without invalidating every AI cache."""
+
+    if analysis.status != "skipped" or analysis.skip_reason != "password_protected":
+        return True
+    if _media_type(content_type, file_name) != "application/pdf":
+        return True
+    _pages, skip = _pdf_review_metadata(raw)
+    return bool(skip and skip[0] == "password_protected")
+
+
 def _extract_pdf_text(file: BucketFile, raw: bytes, *, display_name: str | None = None) -> tuple[str | None, tuple[str, str] | None]:
     file_name = display_name or file.file_name
     try:
         reader = PdfReader(BytesIO(raw), strict=False)
-        if reader.is_encrypted:
+        if _pdf_requires_password(reader):
             return None, (
                 "password_protected",
                 "This PDF requires a password before AI can read it. Upload an unlocked copy or provide a readable replacement.",
@@ -1988,6 +2141,7 @@ def _append_review_file_content(
             skipped.append(_skip_named_file(file, file_name, "spreadsheet_too_large", "Only the first part of this CSV could be included before the spreadsheet text budget was reached."))
         return True, attached_pdf_pages, spreadsheet_text_chars
     if media:
+        model_raw = raw
         if media == "application/pdf":
             page_count, pdf_skip = _pdf_review_metadata(raw)
             if pdf_skip:
@@ -2039,11 +2193,54 @@ def _append_review_file_content(
                 else:
                     skipped.append(_skip_named_file(file, file_name, "pdf_page_budget_exceeded", f"Bedrock accepts up to {MAX_PDF_PAGES} total PDF pages per review. This file would bring the review to {attached_pdf_pages + page_count} pages, so it was reviewed by metadata only."))
                 return False, attached_pdf_pages, spreadsheet_text_chars
+            try:
+                model_raw = _pdf_bytes_for_model(raw)
+            except Exception:  # noqa: BLE001 - never send encrypted/malformed bytes
+                extracted, extract_skip = _extract_pdf_text(
+                    file, raw, display_name=file_name
+                )
+                if extracted:
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"PDF file {file.id}: {file_name}\n"
+                                "Extracted searchable text for underwriting review because a "
+                                "model-safe PDF attachment could not be created:\n\n"
+                                f"{extracted}"
+                            ),
+                        }
+                    )
+                    skipped.append(
+                        _skip_named_file(
+                            file,
+                            file_name,
+                            "pdf_text_extract_used",
+                            "The PDF could not be normalized for direct attachment, so searchable text was extracted and reviewed.",
+                        )
+                    )
+                    return True, attached_pdf_pages, spreadsheet_text_chars
+                if _append_pdf_vision_pages(content, file, raw, file_name):
+                    skipped.append(
+                        _skip_named_file(
+                            file,
+                            file_name,
+                            "pdf_vision_read",
+                            "The PDF could not be normalized for direct attachment, so its pages were read as images by the AI.",
+                        )
+                    )
+                    return True, attached_pdf_pages, spreadsheet_text_chars
+                reason, explanation = extract_skip or (
+                    "pdf_parse_failed",
+                    "The PDF could not be normalized safely for AI review.",
+                )
+                skipped.append(_skip_named_file(file, file_name, reason, explanation))
+                return False, attached_pdf_pages, spreadsheet_text_chars
             attached_pdf_pages += page_count or 0
             content.append({"type": "text", "text": f"PDF file {file.id}: {file_name}"})
         else:
             content.append({"type": "text", "text": f"Image file {file.id}: {file_name} ({media}) attached for visual underwriting review."})
-        content.append(_content_block(media, raw))
+        content.append(_content_block(media, model_raw))
         return True, attached_pdf_pages, spreadsheet_text_chars
     lower = f"{content_type} {file_name}".lower()
     if "text/" in lower or file_name.lower().endswith((".txt", ".md", ".log")):
@@ -2193,6 +2390,46 @@ async def _get_or_create_analysis_row(
     return row
 
 
+async def _lock_analysis_scope(db: AsyncSession, file: BucketFile) -> None:
+    """Serialize review/drain work for one file before analysis-row upsert.
+
+    The file lock is enough to protect the select-then-insert analysis row and
+    cache-consumer replay. Application readiness keeps its own short profile
+    lock only after the model work finishes, so a long AI call cannot block the
+    polling UI or monopolize profile rows.
+    """
+
+    await db.execute(
+        select(BucketFile.id)
+        .where(BucketFile.id == file.id)
+        # PostgreSQL FOR NO KEY UPDATE: competing analyzers serialize, while
+        # FK checks from readiness may still take a compatible KEY SHARE lock.
+        .with_for_update(key_share=True)
+    )
+
+
+async def _reconcile_analysis_consumers(
+    db: AsyncSession, *, file: BucketFile, analysis: BucketFileAnalysis
+) -> None:
+    """Replay every idempotent consumer of a durable file analysis.
+
+    This must run for cache hits as well as fresh model responses. Otherwise a
+    file analyzed before an application profile existed remains permanently
+    absent from that profile even when the operator runs the review again.
+    """
+    await reconcile_uploaded_file(db, file, analysis)
+    if merchant_processing.is_offer_document(file):
+        await merchant_processing.absorb_analysis(db, file, analysis)
+        return
+    if analysis.status == "completed":
+        from app.services.application_profiles import capture_extracted_profile_facts
+
+        await capture_extracted_profile_facts(db, file=file, analysis=analysis)
+    from app.services.application_programs import reconcile_profiles_for_file
+
+    await reconcile_profiles_for_file(db, file)
+
+
 async def analyze_bucket_file(
     db: AsyncSession,
     file: BucketFile,
@@ -2207,9 +2444,25 @@ async def analyze_bucket_file(
     review_type picks the per-file persona (dealer vs real-estate). Returns None
     only if the file bytes cannot be fetched from storage.
     """
+    await _lock_analysis_scope(db, file)
     # High-signal filenames can satisfy the matching checklist slot and expose
     # statement coverage immediately, while the durable content analysis runs.
     await reconcile_uploaded_file(db, file)
+    if _is_zip_file(getattr(file, "content_type", "") or "", file.file_name):
+        # A ZIP is only a transport container. Its extracted children are the
+        # evidence records. Persist a stable terminal analysis without fetching
+        # the parent object so a missing/expired archive cannot be selected by
+        # the legacy backfill on every scheduler tick.
+        content_hash = file.content_hash or f"zip-parent:{file.id}"
+        row = await _get_or_create_analysis_row(db, file, content_hash)
+        row.status = "skipped"
+        row.skip_reason = "zip_parent_archive"
+        row.skip_detail = "ZIP archives are analyzed via their extracted files, not directly."
+        row.error = None
+        row.analyzed_at = _now()
+        await _reconcile_analysis_consumers(db, file=file, analysis=row)
+        await db.flush()
+        return row
     fetched = _fetch_file(file)
     if fetched is None:
         return None
@@ -2222,16 +2475,30 @@ async def analyze_bucket_file(
 
     if not force:
         cached = await _cached_file_analysis(db, file, content_hash)
-        if cached is not None:
-            await reconcile_uploaded_file(db, file, cached)
+        if cached is not None and _password_skip_still_applies(
+            cached,
+            raw=raw,
+            content_type=content_type,
+            file_name=file.file_name,
+        ):
             if merchant_processing.is_offer_document(file):
+                await reconcile_uploaded_file(db, file, cached)
                 # A re-dropped terms PDF hits the cache; its new offer row
                 # still needs the numbers.
                 await merchant_processing.absorb_analysis(db, file, cached)
+            else:
+                await _reconcile_analysis_consumers(db, file=file, analysis=cached)
             return cached
 
     row = await _get_or_create_analysis_row(db, file, content_hash)
     row.status = "running"
+    # A readable revalidation can intentionally reuse a legacy cached row that
+    # was marked password_protected under the old encryption heuristic. Clear
+    # terminal metadata before the fresh run so a successful result (or a real
+    # provider failure) cannot retain a stale lock reason/detail.
+    row.skip_reason = None
+    row.skip_detail = None
+    row.error = None
     await db.flush()
     offer_document = merchant_processing.is_offer_document(file)
 
@@ -2256,15 +2523,6 @@ async def analyze_bucket_file(
     ]
     skipped: list[dict[str, str]] = []
     blocked_files: list[dict[str, str]] = []
-    if _is_zip_file(content_type, file.file_name):
-        # A zip parent is not analyzed directly; its extracted children each get
-        # their own analysis. Cache a skip so it is not retried every run.
-        row.status = "skipped"
-        row.skip_reason = "zip_parent_archive"
-        row.skip_detail = "ZIP archives are analyzed via their extracted files, not directly."
-        row.analyzed_at = _now()
-        await db.flush()
-        return row
     added, _pages, _chars = _append_review_file_content(
         content=content,
         skipped=skipped,
@@ -2283,9 +2541,8 @@ async def analyze_bucket_file(
         row.skip_detail = skip.get("explanation", "This file could not be read for AI analysis.")
         row.classification = "unreadable"
         row.analyzed_at = _now()
+        await _reconcile_analysis_consumers(db, file=file, analysis=row)
         await db.flush()
-        if offer_document:
-            await merchant_processing.absorb_analysis(db, file, row)
         return row
 
     try:
@@ -2357,47 +2614,94 @@ async def analyze_bucket_file(
         row.output_tokens = output_tokens
         row.error = None
         row.analyzed_at = _now()
-        await reconcile_uploaded_file(db, file, row)
-        if offer_document:
-            await merchant_processing.absorb_analysis(db, file, row)
-        else:
-            from app.services.application_profiles import capture_extracted_profile_facts
-
-            await capture_extracted_profile_facts(db, file=file, analysis=row)
     except Exception as exc:  # noqa: BLE001
         log.exception("analyze_bucket_file failed file=%s", file.id)
         row.status = "failed"
         row.error = str(exc)[:2000]
-        if offer_document:
-            await merchant_processing.absorb_analysis(db, file, row)
-    if not offer_document:
-        from app.services.application_programs import reconcile_profiles_for_file
-
-        await reconcile_profiles_for_file(db, file)
+    await _reconcile_analysis_consumers(db, file=file, analysis=row)
     await db.flush()
     return row
 
 
-async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIReview | None:
+async def _persist_review_failure(
+    db: AsyncSession,
+    *,
+    review_id: UUID,
+    bucket_id: UUID,
+    error: Exception,
+    files_total: int,
+    files_done: int,
+    claimed_at: datetime,
+) -> BucketAIReview | None:
+    """Fail only the still-running review owned by this worker claim."""
+
+    await db.rollback()
     review = (
         await db.execute(
             select(BucketAIReview)
-            .where(BucketAIReview.id == review_id)
+            .where(
+                BucketAIReview.id == review_id,
+                BucketAIReview.status == "running",
+                BucketAIReview.started_at == claimed_at,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if review is None:
+        await db.rollback()
+        return await db.get(BucketAIReview, review_id)
+    review.status = "failed"
+    review.error = str(error)[:2000]
+    review.completed_at = _now()
+    review.progress = {
+        "stage": "error",
+        "label": "The review could not be completed.",
+        "percent": 100,
+        "files_total": files_total,
+        "files_done": files_done,
+    }
+    await log_bucket_ai_activity(
+        db,
+        bucket_id,
+        "ai_review_failed",
+        target_type="ai_review",
+        target_id=str(review_id),
+        detail=review.error,
+    )
+    await db.commit()
+    return review
+
+
+async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIReview | None:
+    claimed_at = _now()
+    review = (
+        await db.execute(
+            select(BucketAIReview)
+            .where(
+                BucketAIReview.id == review_id,
+                BucketAIReview.status.in_(["queued", "failed"]),
+            )
+            .with_for_update(skip_locked=True)
             .options(
                 selectinload(BucketAIReview.bucket).selectinload(Bucket.requested_documents),
                 selectinload(BucketAIReview.bucket).selectinload(Bucket.files),
             )
         )
     ).scalar_one_or_none()
-    if review is None or review.status not in {"queued", "failed"}:
-        return review
+    if review is None:
+        await db.rollback()
+        return await db.get(BucketAIReview, review_id)
 
     bucket = review.bucket
     review.status = "running"
-    review.started_at = _now()
+    review.started_at = claimed_at
+    review.completed_at = None
     review.error = None
     await log_bucket_ai_activity(db, bucket.id, "ai_review_started", target_type="ai_review", target_id=str(review.id), detail=bucket.name)
-    await db.flush()
+    # Commit the claim before any storage/model work. A background task and the
+    # scheduler may discover the same queued row, but only the lock holder can
+    # transition it to running and the loser returns without doing AI work.
+    await db.commit()
 
     files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
     # An intake may explicitly grant Elara access to selected files from
@@ -2518,7 +2822,20 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
             # otherwise read as card volume, revenue or a saving to claim.
             continue
         await _set_progress("analyzing", f"Analyzing {file.file_name}…", files_done)
-        analysis = await analyze_bucket_file(db, file, review_type=review_type)
+        try:
+            analysis = await analyze_bucket_file(db, file, review_type=review_type)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("bucket_ai: file analysis failed review=%s file=%s", review.id, file.id)
+            review.status = "failed"
+            return await _persist_review_failure(
+                db,
+                review_id=review.id,
+                bucket_id=bucket.id,
+                error=exc,
+                files_total=files_total,
+                files_done=files_done,
+                claimed_at=claimed_at,
+            )
         files_done += 1
         if analysis is None:
             skipped.append(_skip_file(file, "fetch_failed", "The system could not retrieve this file from storage for AI review."))
@@ -2623,31 +2940,52 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     except Exception as exc:  # noqa: BLE001
         log.exception("bucket_ai: review failed review=%s", review.id)
         review.status = "failed"
-        review.error = str(exc)[:2000]
-        review.completed_at = _now()
-        review.progress = {
-            "stage": "error",
-            "label": "The review could not be completed.",
-            "percent": 100,
-            "files_total": files_total,
-            "files_done": files_done,
-        }
-        await log_bucket_ai_activity(db, bucket.id, "ai_review_failed", target_type="ai_review", target_id=str(review.id), detail=review.error)
+        return await _persist_review_failure(
+            db,
+            review_id=review.id,
+            bucket_id=bucket.id,
+            error=exc,
+            files_total=files_total,
+            files_done=files_done,
+            claimed_at=claimed_at,
+        )
     if review.status == "completed":
         # The timeline learns that a review finished and where it landed —
         # never what it said.
         from app.services import file_events
 
         probability = str((review.result or {}).get("probability_status") or "").strip()
-        await file_events.emit(
-            db,
-            bucket_id=bucket.id,
-            kind="review.completed",
-            visibility=file_events.VISIBILITY_TEAM,
-            title=f"Review completed: {probability}" if probability else "Review completed",
-            target_type="ai_review",
-            target_id=review.id,
-        )
+        try:
+            await file_events.emit(
+                db,
+                bucket_id=bucket.id,
+                kind="review.completed",
+                visibility=file_events.VISIBILITY_TEAM,
+                title=f"Review completed: {probability}" if probability else "Review completed",
+                target_type="ai_review",
+                target_id=review.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("bucket_ai: completion event failed review=%s", review.id)
+            review.status = "failed"
+            return await _persist_review_failure(
+                db,
+                review_id=review.id,
+                bucket_id=bucket.id,
+                error=exc,
+                files_total=files_total,
+                files_done=files_done,
+                claimed_at=claimed_at,
+            )
+        if intake is not None and isinstance(review.result, dict):
+            # Completion belongs to the core worker, not only to the HTTP
+            # background wrapper. The scheduler can win the atomic claim while
+            # that wrapper loses; synchronizing here guarantees the intake/UI
+            # still receives the finished evidence map in either execution path.
+            intake.latest_review_id = review.id
+            intake.result_snapshot = review.result
+            intake.status = "reviewed"
+            intake.completed_at = review.completed_at
     await db.flush()
     return review
 
@@ -2709,6 +3047,46 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     request path, so reviews compose from a warm cache. Each file is analyzed
     once; the placeholder row is replaced by analyze_bucket_file's real
     (hash, version) row."""
+    # Retry ZIP extraction from the durable file state, not from the analysis
+    # placeholder. Older workers could consume that placeholder into a cached
+    # ZIP-parent skip before extraction succeeded; tying retries to it would
+    # strand those archives forever after a rolling deployment.
+    retryable_zip_ids = (
+        (
+            await db.execute(
+                select(BucketFile.id)
+                .where(
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.extraction_status == "retryable",
+                )
+                .order_by(BucketFile.created_at.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if retryable_zip_ids:
+        from app.routers.buckets import _reconcile_completed_bucket_file
+
+        for file_id in retryable_zip_ids:
+            file = await db.get(BucketFile, file_id)
+            if file is None:
+                continue
+            try:
+                await _reconcile_completed_bucket_file(
+                    db,
+                    file,
+                    None,
+                    actor_name=file.uploaded_by_name or "System",
+                    actor_email=file.uploaded_by_email or "",
+                )
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                await db.rollback()
+                log.exception("drain_file_analyses: ZIP retry failed file=%s", file.id)
+
     rows = (
         (
             await db.execute(
@@ -2730,6 +3108,15 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
     for placeholder in rows:
         attempted += 1
         file = placeholder.file
+        if (
+            file is not None
+            and file.deleted_at is None
+            and file.status == "uploaded"
+            and file.extraction_status == "retryable"
+        ):
+            # The independent retry pass above owns archive recovery. Preserve
+            # this placeholder until extraction succeeds or becomes terminal.
+            continue
         # Drop the placeholder; analyze_bucket_file upserts the real hashed row.
         await db.delete(placeholder)
         await db.flush()

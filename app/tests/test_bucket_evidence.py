@@ -177,3 +177,154 @@ def test_a_classification_match_still_wins_and_names_the_file():
         slot_files={"slot-4": ["schedule.pdf", "stray.pdf"]},
     )
     assert rows["Debt schedule"]["evidence"] == ["schedule.pdf"]
+
+
+def test_partial_synthesis_is_completed_from_every_durable_file_analysis():
+    from app.services.bucket_ai import _merge_per_file_analyses
+
+    result = {
+        "document_evidence_map": {
+            "files": [{"file_id": "f1", "file_name": "first.pdf", "ai_classification": "unknown"}],
+            "baseline_coverage": [],
+        },
+        "per_file_summaries": [{"file_id": "f1", "file_name": "first.pdf", "summary": "model summary"}],
+    }
+    analyses = [
+        {
+            "file_id": "f1",
+            "file_name": "first.pdf",
+            "ai_classification": "bank_statement",
+            "summary": "durable first",
+            "red_flags": [],
+        },
+        {
+            "file_id": "f2",
+            "file_name": "second.pdf",
+            "ai_classification": "tax_return",
+            "summary": "durable second",
+            "red_flags": ["review"],
+        },
+    ]
+
+    _merge_per_file_analyses(result, analyses)
+
+    mapped = {row["file_id"]: row for row in result["document_evidence_map"]["files"]}
+    summaries = {row["file_id"]: row for row in result["per_file_summaries"]}
+    assert set(mapped) == {"f1", "f2"}
+    assert mapped["f1"]["ai_classification"] == "bank_statement"
+    assert mapped["f2"]["ai_classification"] == "tax_return"
+    assert set(summaries) == {"f1", "f2"}
+    assert summaries["f2"]["summary"] == "durable second"
+
+
+def test_synthesis_cannot_invent_or_name_match_a_file_mapping():
+    from app.services.bucket_ai import _merge_per_file_analyses
+
+    result = {
+        "document_evidence_map": {
+            "files": [
+                {"file_id": "invented", "file_name": "same.pdf", "supports": ["fiction"]}
+            ],
+            "baseline_coverage": [],
+        },
+        "per_file_summaries": [
+            {"file_id": "invented", "file_name": "same.pdf", "summary": "fiction"}
+        ],
+    }
+    analyses = [
+        {
+            "file_id": "durable",
+            "file_name": "same.pdf",
+            "ai_classification": "bank_statement",
+            "summary": "source of truth",
+        }
+    ]
+
+    _merge_per_file_analyses(result, analyses)
+
+    assert result["document_evidence_map"]["files"] == [
+        {
+            "file_id": "durable",
+            "file_name": "same.pdf",
+            "ai_classification": "bank_statement",
+            "supports": [],
+            "baseline_categories_supported": [],
+            "confidence": None,
+            "limitations": [],
+        }
+    ]
+    assert result["per_file_summaries"] == [
+        {
+            "file_id": "durable",
+            "file_name": "same.pdf",
+            "summary": "source of truth",
+            "red_flags": [],
+        }
+    ]
+
+
+def test_multi_period_coverage_stays_partial_until_every_period_is_present():
+    rows = _coverage(
+        requested=[
+            {
+                "id": "bank-slot",
+                "name": "Last 6 months business bank statements",
+                "category": "Bank Statements",
+                "status": "uploaded",
+            },
+            {
+                "id": "tax-slot",
+                "name": "Last 2 years business tax returns",
+                "category": "Tax Returns",
+                "status": "uploaded",
+            },
+        ],
+        analyses=[
+            {
+                "file_id": "bank-1",
+                "file_name": "Statement 2026-08.pdf",
+                "ai_classification": "bank_statement",
+                "key_facts": {"statement_period": "2026-08-01 to 2026-08-31"},
+            },
+            {
+                "file_id": "tax-1",
+                "file_name": "Business return 2025.pdf",
+                "ai_classification": "tax_return",
+                "key_facts": {"tax_year": "2025"},
+            },
+        ],
+    )
+
+    assert rows["Last 6 months business bank statements"]["status"] == "partial"
+    assert rows["Last 6 months business bank statements"]["current"] == 1
+    assert rows["Last 2 years business tax returns"]["status"] == "partial"
+    assert rows["Last 2 years business tax returns"]["current"] == 1
+
+
+def test_all_skipped_batch_clears_phantoms_and_shows_missing_checklist_rows():
+    from app.services.bucket_ai import _merge_per_file_analyses
+
+    result = {
+        "document_evidence_map": {
+            "files": [{"file_id": "phantom", "file_name": "ghost.pdf"}],
+            "baseline_coverage": [{"category": "stale", "status": "satisfied"}],
+        },
+        "per_file_summaries": [{"file_id": "phantom", "summary": "ghost"}],
+    }
+
+    _merge_per_file_analyses(
+        result,
+        [],
+        requested_documents=[
+            {
+                "id": "bank-slot",
+                "name": "Last 6 months business bank statements",
+                "category": "Bank Statements",
+                "status": "requested",
+            }
+        ],
+    )
+
+    assert result["document_evidence_map"]["files"] == []
+    assert result["per_file_summaries"] == []
+    assert result["document_evidence_map"]["baseline_coverage"][0]["status"] == "missing"

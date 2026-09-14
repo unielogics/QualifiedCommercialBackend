@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.application_profile import ApplicationProfile
 from app.models.financial_statement import FinancialStatement, FinancialStatementOwner
 from app.services import pfs_schema
+from app.services.extracted_facts import canonical_field_aliases
 
 log = logging.getLogger(__name__)
 
@@ -727,10 +728,15 @@ async def form_prefill(db: AsyncSession, profile: ApplicationProfile) -> dict[st
                 select(ApplicationExtractedFact)
                 .where(
                     ApplicationExtractedFact.profile_id == profile.id,
-                    ApplicationExtractedFact.field_key == "legal_entity_name",
-                    ApplicationExtractedFact.status != "rejected",
+                    ApplicationExtractedFact.field_key.in_(
+                        canonical_field_aliases("legal_entity_name")
+                    ),
+                    ApplicationExtractedFact.status.in_(["accepted", "suggested"]),
                 )
-                .order_by(ApplicationExtractedFact.created_at.desc())
+                .order_by(
+                    (ApplicationExtractedFact.status == "accepted").desc(),
+                    ApplicationExtractedFact.created_at.desc(),
+                )
             )
         ).scalars().first()
         if fact is not None:

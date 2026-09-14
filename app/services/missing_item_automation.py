@@ -57,17 +57,31 @@ async def _active_room_link(db: AsyncSession, profile: ApplicationProfile) -> Bu
     return link
 
 
-async def _recipient(db: AsyncSession, profile: ApplicationProfile, link: BucketUploadLink) -> str:
+async def optional_recipient_for_profile(
+    db: AsyncSession, profile: ApplicationProfile, link: BucketUploadLink
+) -> str | None:
     intake = await db.get(PublicUnderwritingIntake, profile.intake_id) if profile.intake_id else None
     client = await db.get(Client, profile.client_id) if profile.client_id else None
-    email = profiles.normalized_email(
+    return profiles.normalized_email(
         (intake.email if intake else None)
         or (client.email if client else None)
         or link.recipient_email
     )
+
+
+async def _recipient(db: AsyncSession, profile: ApplicationProfile, link: BucketUploadLink) -> str:
+    email = await optional_recipient_for_profile(db, profile, link)
     if not email:
         raise HTTPException(status.HTTP_409_CONFLICT, "No verified client email is available")
     return email
+
+
+async def recipient_for_profile(
+    db: AsyncSession, profile: ApplicationProfile, link: BucketUploadLink
+) -> str:
+    """Resolve the same verified destination used by all application-room requests."""
+
+    return await _recipient(db, profile, link)
 
 
 async def send_requirement_email(

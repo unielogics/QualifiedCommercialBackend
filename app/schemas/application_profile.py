@@ -141,11 +141,24 @@ class EvidencePolicySelectionRead(BaseModel):
     selected_at: datetime
 
 
+class UnlockedCopyRequestStateRead(BaseModel):
+    requested_document_id: UUID
+    request_status: str
+    delivery_id: UUID | None = None
+    delivery_status: str | None = None
+    requested_at: datetime
+    last_delivery_at: datetime | None = None
+    replacement_review_state: Literal[
+        "requested", "checking", "received", "needs_another_copy"
+    ] | None = None
+
+
 class ApplicationRequirementEvidenceRead(BaseModel):
     file_id: UUID
     file_name: str
     bucket_id: UUID
     created_at: datetime
+    preview_url: str | None = None
     source: Literal["automatic", "filename_suggestion", "operator"]
     verified: bool = False
     verified_at: datetime | None = None
@@ -156,6 +169,8 @@ class ApplicationRequirementEvidenceRead(BaseModel):
     decision_actor: Literal["ai", "staff", "system"] | None = None
     analysis_id: UUID | None = None
     coverage_contribution: dict = Field(default_factory=dict)
+    is_password_protected: bool = False
+    unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
 
 
 class ApplicationEvidenceOptionRead(BaseModel):
@@ -163,6 +178,7 @@ class ApplicationEvidenceOptionRead(BaseModel):
     file_name: str
     bucket_id: UUID
     created_at: datetime
+    preview_url: str | None = None
 
 
 class ApplicationRequirementRead(BaseModel):
@@ -543,6 +559,37 @@ class PlaidAssetReportRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ApplicationBankEvidenceFileRead(BaseModel):
+    """Staff-only detail for one uploaded business-bank evidence file."""
+
+    file_id: UUID
+    file_name: str
+    bucket_id: UUID
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+    preview_url: str | None = None
+    linked_to_requirement: bool = False
+    source: Literal["automatic", "filename_suggestion", "operator"] | None = None
+    verified: bool = False
+    verified_at: datetime | None = None
+    ai_decision: EvidenceDecisionStatus | None = None
+    ai_reason_code: str | None = None
+    ai_explanation: str | None = None
+    ai_confidence: str | None = None
+    decision_actor: Literal["ai", "staff", "system"] | None = None
+    analysis_id: UUID | None = None
+    coverage_contribution: dict = Field(default_factory=dict)
+    analysis_status: str | None = None
+    analysis_classification: str | None = None
+    analysis_confidence: str | None = None
+    analysis_summary: str | None = None
+    analysis_reason_code: str | None = None
+    analysis_detail: str | None = None
+    is_password_protected: bool = False
+    unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
+
+
 class ApplicationBankState(BaseModel):
     enabled: bool = False
     environment: str = "disabled"
@@ -558,6 +605,8 @@ class ApplicationBankState(BaseModel):
     manual_statement_pending_count: int = 0
     manual_statement_rejected_count: int = 0
     manual_statement_failed_count: int = 0
+    evidence_processing_count: int = 0
+    manual_statement_files: list[ApplicationBankEvidenceFileRead] = Field(default_factory=list)
     evidence_summary: ApplicationEvidenceSummary = Field(default_factory=ApplicationEvidenceSummary)
     assets_enabled: bool = False
     statements_enabled: bool = False
@@ -760,6 +809,7 @@ class FundingCategoryCreate(BaseModel):
 class ExtractedFactRead(BaseModel):
     id: UUID
     field_key: str
+    canonical_field_key: str | None = None
     value: dict
     normalized_value: str | None = None
     confidence: float | None = None
@@ -800,6 +850,21 @@ class VerificationInvitationRead(BaseModel):
 
 class RoomPinRotateRequest(BaseModel):
     secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class UnlockedCopyRequestCreate(BaseModel):
+    retry_failed: bool = False
+    delivery_mode: Literal["email_if_available", "room_link_only"] = (
+        "email_if_available"
+    )
+
+
+class UnlockedCopyRequestResult(UnlockedCopyRequestStateRead):
+    source_file_id: UUID
+    room_url: str
+    recipient_masked: str | None = None
+    provider_accepted: bool = False
+    deduplicated: bool = False
 
 
 class RoomDeliveryReceipt(BaseModel):
@@ -1039,6 +1104,14 @@ class EvidenceFileRead(BaseModel):
     selected: bool = True
     included_in_review: bool = True
     preview_url: str | None = None
+    analysis_status: str | None = None
+    analysis_classification: str | None = None
+    analysis_confidence: str | None = None
+    analysis_summary: str | None = None
+    analysis_reason_code: str | None = None
+    analysis_detail: str | None = None
+    is_password_protected: bool = False
+    unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
     created_at: datetime
 
 
@@ -1256,6 +1329,7 @@ class EvidenceProcessingSummary(BaseModel):
     accepted_files: int = 0
     needs_attention_files: int = 0
     failed_files: int = 0
+    skipped_files: int = 0
     has_processing: bool = False
 
 

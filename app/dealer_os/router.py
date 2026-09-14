@@ -5928,6 +5928,14 @@ async def _ingest_bucket_file_core(
     """Shared ingest core (endpoint + background auto-ingest). Idempotent: a
     bucket file already referenced by a DealerDocument is returned as-is,
     never double-counted. Flushes; the caller commits."""
+    # Endpoint clicks and upload-complete background sweeps can overlap. Lock
+    # the dealer before the existence check so both paths cannot create a
+    # second document/ledger plan for the same bucket file.
+    await db.execute(
+        select(DealerBusiness.id)
+        .where(DealerBusiness.id == dealer.id)
+        .with_for_update()
+    )
     existing = (
         await db.execute(
             select(DealerDocument).where(

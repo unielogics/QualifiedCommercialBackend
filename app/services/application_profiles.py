@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -42,13 +43,13 @@ from app.models.bucket import (
 )
 from app.models.client import Client
 from app.models.deal import Deal
-from app.models.funding_program import ApplicationRequirementEvidenceDecision
 from app.models.loan import Loan
 from app.models.operator_file import BucketIntakeLink, BucketIntakeLinkFile
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
 from app.schemas.application_profile import (
     ApplicationBankConnectionRead,
+    ApplicationBankEvidenceFileRead,
     ApplicationBankState,
     ApplicationDraftAnalysisStatus,
     ApplicationEvidenceRead,
@@ -65,14 +66,20 @@ from app.schemas.application_profile import (
     FileOwnerRequirementState,
     IntelligenceMetric,
     UnifiedAuditEvent,
+    UnlockedCopyRequestStateRead,
 )
 from app.scoping import scope_client_query, scope_loan_query
-from app.services import plaid_policy
+from app.services import locked_file_requests, plaid_policy
 from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
     statement_months_from_analysis,
     statement_months_from_filename,
+)
+from app.services.extracted_facts import (
+    accepted_review_group_keys,
+    fact_review_group_key,
+    pending_review_group_keys,
 )
 from app.services.underwriting_intelligence import calculate_dscr
 from app.services.user_access import is_audit_client
@@ -98,6 +105,22 @@ SUPPORTING_DOCUMENT_REQUIREMENT_KEY = "supporting_documents"
 SUPPORTING_DOCUMENT_NAME = "Supporting / Other"
 
 
+def _unlocked_copy_request_read(
+    state: locked_file_requests.UnlockedCopyRequestState | None,
+) -> UnlockedCopyRequestStateRead | None:
+    if state is None:
+        return None
+    return UnlockedCopyRequestStateRead(
+        requested_document_id=state.requested_document_id,
+        request_status=state.request_status,
+        delivery_id=state.delivery_id,
+        delivery_status=state.delivery_status,
+        requested_at=state.requested_at,
+        last_delivery_at=state.last_delivery_at,
+        replacement_review_state=state.replacement_review_state,
+    )
+
+
 def _client_requirement_coverage(coverage: dict | None) -> dict:
     """Remove classifier and playbook metadata from client room coverage."""
     if not isinstance(coverage, dict):
@@ -118,6 +141,8 @@ class ManualStatementEvidence:
     needs_more_file_count: int
     rejected_file_count: int
     failed_analysis_count: int
+    evidence_processing_count: int = 0
+    files: tuple[ApplicationBankEvidenceFileRead, ...] = ()
 
 
 def application_evidence_summary(
@@ -137,6 +162,16 @@ def application_evidence_summary(
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+def evidence_preview_endpoint(profile_id: UUID, file_id: UUID) -> str:
+    """Authenticated resolver for a short-lived inline evidence URL.
+
+    Returning the resolver instead of a presigned storage URL keeps cached
+    application snapshots free of storage credentials and rechecks profile
+    access every time somebody opens a file.
+    """
+    return f"/api/v1/application-profiles/{profile_id}/evidence/files/{file_id}/url"
 
 
 async def ensure_supporting_document_group(
@@ -347,78 +382,147 @@ def normalized_phone(value: str | None) -> str | None:
     return normalize_phone(value)
 
 
+async def affected_profiles_for_file(
+    db: AsyncSession, file: BucketFile
+) -> list[ApplicationProfile]:
+    """Return every application that owns or actively selected this file."""
+    linked_intake_ids = list(
+        (
+            await db.execute(
+                select(BucketIntakeLink.intake_id)
+                .join(
+                    BucketIntakeLinkFile,
+                    BucketIntakeLinkFile.link_id == BucketIntakeLink.id,
+                )
+                .where(
+                    BucketIntakeLinkFile.bucket_file_id == file.id,
+                    BucketIntakeLinkFile.removed_at.is_(None),
+                    BucketIntakeLink.unlinked_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    profile_filter = [ApplicationProfile.primary_bucket_id == file.bucket_id]
+    if linked_intake_ids:
+        profile_filter.append(ApplicationProfile.intake_id.in_(linked_intake_ids))
+    rows = list(
+        (
+            await db.execute(
+                select(ApplicationProfile)
+                .where(or_(*profile_filter))
+                .order_by(ApplicationProfile.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list({profile.id: profile for profile in rows}.values())
+
+
 async def capture_extracted_profile_facts(
     db: AsyncSession, *, file: BucketFile, analysis: BucketFileAnalysis
-) -> None:
-    profile = (
-        await db.execute(select(ApplicationProfile).where(
-            ApplicationProfile.primary_bucket_id == file.bucket_id
-        ).limit(1))
-    ).scalar_one_or_none()
-    if profile is None:
-        return
+) -> list[UUID]:
+    """Persist facts into applications that own the file's source bucket.
+
+    Linked applications still have their readiness reconciled by
+    ``reconcile_profiles_for_file``. Facts are deliberately not copied across a
+    bucket link: unlinking or replacing that link must not leave another
+    application's extracted-fact ledger holding stale source data.
+    """
+    profiles = [
+        profile
+        for profile in await affected_profiles_for_file(db, file)
+        if profile.primary_bucket_id == file.bucket_id
+    ]
+    if not profiles:
+        return []
     payload = analysis.analysis or {}
     facts = payload.get("profile_facts") if isinstance(payload.get("profile_facts"), dict) else {}
-    for field_key, raw in facts.items():
-        if not isinstance(raw, dict):
-            raw = {"value": raw}
-        value = raw.get("value")
-        if value in (None, ""):
-            continue
-        normalized = " ".join(str(value).casefold().split())
-        existing = (
-            await db.execute(select(ApplicationExtractedFact.id).where(
-                ApplicationExtractedFact.profile_id == profile.id,
-                ApplicationExtractedFact.source_analysis_id == analysis.id,
-                ApplicationExtractedFact.field_key == field_key,
-                ApplicationExtractedFact.normalized_value == normalized,
-            ).limit(1))
-        ).scalar_one_or_none()
-        if existing:
-            continue
-        confidence = raw.get("confidence")
-        try:
-            confidence_value = max(0.0, min(float(confidence), 1.0)) if confidence is not None else None
-        except (TypeError, ValueError):
-            confidence_value = None
-        db.add(ApplicationExtractedFact(
-            profile_id=profile.id, field_key=str(field_key)[:64], value={"value": value},
-            normalized_value=normalized, confidence=confidence_value,
-            source_file_id=file.id, source_analysis_id=analysis.id,
-        ))
-        if field_key in {"entity_type", "naics_code", "naics_label"} and not getattr(profile, field_key, None):
-            setattr(profile, field_key, str(value))
-    code = str((facts.get("naics_code") or {}).get("value") or "").strip()
-    if re.fullmatch(r"\d{6}", code):
-        entry = (
-            await db.execute(select(ApplicationTaxonomyEntry).where(
-                ApplicationTaxonomyEntry.level == 6,
-                ApplicationTaxonomyEntry.code == code,
-                ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
-            ).limit(1))
-        ).scalar_one_or_none()
-        if entry:
-            subindustry = await db.get(ApplicationTaxonomyEntry, entry.parent_id)
-            industry = await db.get(ApplicationTaxonomyEntry, subindustry.parent_id) if subindustry else None
-            profile.activity_entry_id = profile.activity_entry_id or entry.id
-            profile.subindustry_entry_id = profile.subindustry_entry_id or (subindustry.id if subindustry else None)
-            profile.industry_entry_id = profile.industry_entry_id or (industry.id if industry else None)
-            profile.naics_label = profile.naics_label or entry.label
-            profile.subindustry = profile.subindustry or (subindustry.label if subindustry else None)
-            profile.industry = profile.industry or (industry.label if industry else None)
-            profile.classification_provenance = {
-                "source": "document_extraction", "source_file_id": str(file.id),
-                "source_analysis_id": str(analysis.id), "status": "suggested",
-            }
+    for profile in profiles:
+        accepted_rows = list(
+            (
+                await db.execute(
+                    select(ApplicationExtractedFact).where(
+                        ApplicationExtractedFact.profile_id == profile.id,
+                        ApplicationExtractedFact.status == "accepted",
+                    )
+                )
+            ).scalars().all()
+        )
+        accepted_groups = accepted_review_group_keys(accepted_rows)
+        for field_key, raw in facts.items():
+            if not isinstance(raw, dict):
+                raw = {"value": raw}
+            value = raw.get("value")
+            if value in (None, ""):
+                continue
+            normalized = " ".join(str(value).casefold().split())
+            # Once an operator accepts a scalar logical field, later uploads
+            # must not reopen it. Multi-valued facts suppress only the same
+            # accepted value (for example, tax year 2025 does not hide 2024).
+            candidate = SimpleNamespace(
+                field_key=str(field_key),
+                normalized_value=normalized,
+                value={"value": value},
+            )
+            if fact_review_group_key(candidate) in accepted_groups:
+                continue
+            existing = (
+                await db.execute(select(ApplicationExtractedFact.id).where(
+                    ApplicationExtractedFact.profile_id == profile.id,
+                    ApplicationExtractedFact.source_analysis_id == analysis.id,
+                    ApplicationExtractedFact.field_key == field_key,
+                    ApplicationExtractedFact.normalized_value == normalized,
+                ).limit(1))
+            ).scalar_one_or_none()
+            if existing:
+                continue
+            confidence = raw.get("confidence")
+            try:
+                confidence_value = max(0.0, min(float(confidence), 1.0)) if confidence is not None else None
+            except (TypeError, ValueError):
+                confidence_value = None
+            db.add(ApplicationExtractedFact(
+                profile_id=profile.id, field_key=str(field_key)[:64], value={"value": value},
+                normalized_value=normalized, confidence=confidence_value,
+                source_file_id=file.id, source_analysis_id=analysis.id,
+            ))
+            profile.extraction_reviewed_at = None
+            if field_key in {"entity_type", "naics_code", "naics_label"} and not getattr(profile, field_key, None):
+                setattr(profile, field_key, str(value))
+        code_raw = facts.get("naics_code") or {}
+        code = str(code_raw.get("value") if isinstance(code_raw, dict) else code_raw or "").strip()
+        if re.fullmatch(r"\d{6}", code):
+            entry = (
+                await db.execute(select(ApplicationTaxonomyEntry).where(
+                    ApplicationTaxonomyEntry.level == 6,
+                    ApplicationTaxonomyEntry.code == code,
+                    ApplicationTaxonomyEntry.status.in_(["official", "approved"]),
+                ).limit(1))
+            ).scalar_one_or_none()
+            if entry:
+                subindustry = await db.get(ApplicationTaxonomyEntry, entry.parent_id)
+                industry = await db.get(ApplicationTaxonomyEntry, subindustry.parent_id) if subindustry else None
+                profile.activity_entry_id = profile.activity_entry_id or entry.id
+                profile.subindustry_entry_id = profile.subindustry_entry_id or (subindustry.id if subindustry else None)
+                profile.industry_entry_id = profile.industry_entry_id or (industry.id if industry else None)
+                profile.naics_label = profile.naics_label or entry.label
+                profile.subindustry = profile.subindustry or (subindustry.label if subindustry else None)
+                profile.industry = profile.industry or (industry.label if industry else None)
+                profile.classification_provenance = {
+                    "source": "document_extraction", "source_file_id": str(file.id),
+                    "source_analysis_id": str(analysis.id), "status": "suggested",
+                }
     key_facts = payload.get("key_facts") if isinstance(payload.get("key_facts"), dict) else {}
     period = str(key_facts.get("statement_period") or "")
     month_match = re.search(r"(20\d{2})[-/](0[1-9]|1[0-2])", period)
     if analysis.classification == "bank_statement" and month_match and not file.statement_period:
         file.statement_period = f"{month_match.group(1)}-{month_match.group(2)}"
     await db.flush()
-    from app.services.application_programs import get_program_readiness
-
-    await get_program_readiness(db, profile)
+    return [profile.id for profile in profiles]
 
 
 def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
@@ -1089,7 +1193,18 @@ async def manual_statement_evidence(
     # Step 4 consumes the same evidence truth as Step 2.
     from app.services import application_programs
 
-    await application_programs.get_program_readiness(db, profile)
+    readiness = await application_programs.get_program_readiness(db, profile)
+    bank_requirement = next(
+        (
+            requirement
+            for requirement in readiness.requirements
+            if requirement.requirement_key == "business_bank_statements_6_months"
+        ),
+        None,
+    )
+    linked_reads = {
+        item.file_id: item for item in (bank_requirement.evidence_files if bank_requirement else [])
+    }
     file_ids = await _profile_evidence_file_ids(db, profile)
     if not file_ids:
         return ManualStatementEvidence(
@@ -1120,7 +1235,8 @@ async def manual_statement_evidence(
                 .order_by(
                     BucketFile.id,
                     BucketFileAnalysis.analysis_version.desc().nullslast(),
-                    BucketFileAnalysis.analyzed_at.desc().nullslast(),
+                    BucketFileAnalysis.created_at.desc(),
+                    BucketFileAnalysis.id.desc(),
                 )
             )
         ).all()
@@ -1129,14 +1245,28 @@ async def manual_statement_evidence(
         UUID, tuple[BucketFile, BucketRequestedDocument | None, BucketFileAnalysis | None]
     ] = {}
     for file, requested, analysis in rows:
-        latest.setdefault(file.id, (file, requested, analysis))
+        if file.id in latest and latest[file.id][2] is not None:
+            continue
+        if (
+            analysis is not None
+            and getattr(file, "content_hash", None)
+            and getattr(analysis, "content_hash", None) != file.content_hash
+        ):
+            # Direct object replacement can retain historical analyses on the
+            # same BucketFile row.  Keep the file visible, but never project a
+            # stale lock/reason/detail while its current bytes are unanalysed.
+            latest.setdefault(file.id, (file, requested, None))
+            continue
+        latest[file.id] = (file, requested, analysis)
     months: set[str] = set()
     statement_file_ids: set[UUID] = set()
+    display_file_ids: set[UUID] = set()
     pending_analysis_ids: set[UUID] = set()
     accepted_file_ids: set[UUID] = set()
     needs_more_file_ids: set[UUID] = set()
     rejected_file_ids: set[UUID] = set()
     failed_analysis_ids: set[UUID] = set()
+    bank_links: list[ApplicationRequirementEvidence] = []
     requirement_state = (
         await db.execute(
             select(ApplicationRequirementState).where(
@@ -1146,7 +1276,7 @@ async def manual_statement_evidence(
         )
     ).scalar_one_or_none()
     if requirement_state is not None:
-        links = list(
+        bank_links = list(
             (
                 await db.execute(
                     select(ApplicationRequirementEvidence).where(
@@ -1158,43 +1288,22 @@ async def manual_statement_evidence(
             .scalars()
             .all()
         )
-        decisions = list(
-            (
-                await db.execute(
-                    select(ApplicationRequirementEvidenceDecision)
-                    .where(
-                        ApplicationRequirementEvidenceDecision.requirement_evidence_id.in_(
-                            [link.id for link in links]
-                        )
-                        if links
-                        else False
-                    )
-                    .order_by(
-                        ApplicationRequirementEvidenceDecision.created_at.desc(),
-                        ApplicationRequirementEvidenceDecision.id.desc(),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        latest_decisions: dict[UUID, ApplicationRequirementEvidenceDecision] = {}
-        for decision in decisions:
-            latest_decisions.setdefault(decision.requirement_evidence_id, decision)
-        for link in links:
-            decision = latest_decisions.get(link.id)
-            if link.verified_at and (
-                link.verified_by_user_id is not None
-                or decision is not None
-                and decision.decision == "accepted"
-            ):
+        for link in bank_links:
+            decision = linked_reads.get(link.file_id)
+            if link.file_id in latest:
+                display_file_ids.add(link.file_id)
+            if decision is not None and decision.ai_decision == "accepted":
                 accepted_file_ids.add(link.file_id)
-            elif decision is not None and decision.decision == "needs_more":
+                if link.file_id in latest:
+                    statement_file_ids.add(link.file_id)
+            elif decision is not None and decision.ai_decision == "needs_more":
                 needs_more_file_ids.add(link.file_id)
-            elif decision is not None and decision.decision == "rejected":
+            elif decision is not None and decision.ai_decision == "rejected":
                 rejected_file_ids.add(link.file_id)
-            elif decision is not None and decision.decision == "failed":
+            elif decision is not None and decision.ai_decision == "failed":
                 failed_analysis_ids.add(link.file_id)
+            elif decision is None or decision.ai_decision == "processing":
+                pending_analysis_ids.add(link.file_id)
     for file, requested, analysis in latest.values():
         requested_is_bank = bool(
             requested
@@ -1205,6 +1314,7 @@ async def manual_statement_evidence(
         if classification != "bank_statement" and not requested_is_bank:
             continue
         statement_file_ids.add(file.id)
+        display_file_ids.add(file.id)
         if analysis is not None and analysis.status == "failed":
             failed_analysis_ids.add(file.id)
         elif (
@@ -1221,6 +1331,97 @@ async def manual_statement_evidence(
             months.add(str(file.statement_period))
         months.update(statement_months_from_analysis(analysis.analysis if analysis else None))
         months.update(statement_months_from_filename(file.file_name))
+    evidence_processing_count = sum(
+        analysis is not None and analysis.status in {"pending", "queued", "processing", "running"}
+        for _file, _requested, analysis in latest.values()
+    )
+    links_by_file = {link.file_id: link for link in bank_links}
+    request_states = await locked_file_requests.request_states_for_files(
+        db,
+        profile=profile,
+        file_ids=display_file_ids,
+        file_fingerprints={
+            file_id: (
+                getattr(latest[file_id][0], "content_hash", None)
+                or (
+                    getattr(latest[file_id][2], "content_hash", None)
+                    if latest[file_id][2] is not None
+                    else None
+                )
+            )
+            for file_id in display_file_ids
+            if file_id in latest
+        },
+    )
+    statement_files: list[ApplicationBankEvidenceFileRead] = []
+    for file_id in sorted(
+        display_file_ids,
+        key=lambda value: (
+            latest[value][0].created_at if value in latest else datetime.min.replace(tzinfo=UTC)
+        ),
+        reverse=True,
+    ):
+        record = latest.get(file_id)
+        if record is None:
+            continue
+        file, _requested, analysis = record
+        linked = linked_reads.get(file_id)
+        link = links_by_file.get(file_id)
+        direct_months = set()
+        if file.statement_period:
+            direct_months.add(str(file.statement_period))
+        direct_months.update(
+            statement_months_from_analysis(analysis.analysis if analysis else None)
+        )
+        direct_months.update(statement_months_from_filename(file.file_name))
+        is_linked = linked is not None or link is not None
+        analysis_status = analysis.status if analysis else None
+        statement_files.append(
+            ApplicationBankEvidenceFileRead(
+                file_id=file.id,
+                file_name=file.file_name,
+                bucket_id=file.bucket_id,
+                content_type=file.content_type,
+                size_bytes=file.size_bytes,
+                created_at=file.created_at,
+                preview_url=evidence_preview_endpoint(profile.id, file.id),
+                linked_to_requirement=is_linked,
+                source=linked.source if linked else link.source if link else None,
+                verified=linked.verified if linked else bool(link and link.verified_at),
+                verified_at=linked.verified_at if linked else link.verified_at if link else None,
+                ai_decision=linked.ai_decision if linked else None,
+                ai_reason_code=linked.ai_reason_code if linked else None,
+                ai_explanation=linked.ai_explanation if linked else None,
+                ai_confidence=linked.ai_confidence
+                if linked
+                else analysis.confidence
+                if analysis
+                else None,
+                decision_actor=linked.decision_actor if linked else None,
+                analysis_id=linked.analysis_id if linked else analysis.id if analysis else None,
+                coverage_contribution=(
+                    linked.coverage_contribution
+                    if linked
+                    else {"months": sorted(direct_months)}
+                    if direct_months
+                    else {}
+                ),
+                analysis_status=analysis_status,
+                analysis_classification=(effective_file_classification(file.file_name, analysis)),
+                analysis_confidence=analysis.confidence if analysis else None,
+                analysis_summary=analysis.summary if analysis else None,
+                analysis_reason_code=analysis.skip_reason if analysis else None,
+                analysis_detail=(analysis.skip_detail or analysis.error) if analysis else None,
+                is_password_protected=locked_file_requests.is_password_protected_file(
+                    file, analysis
+                ),
+                unlocked_copy_request=_unlocked_copy_request_read(
+                    locked_file_requests.current_request_state(
+                        file, analysis, request_states.get(file.id)
+                    )
+                ),
+            )
+        )
     return ManualStatementEvidence(
         months=sorted(months),
         file_count=len(statement_file_ids),
@@ -1229,6 +1430,8 @@ async def manual_statement_evidence(
         needs_more_file_count=len(needs_more_file_ids & statement_file_ids),
         rejected_file_count=len(rejected_file_ids & statement_file_ids),
         failed_analysis_count=len(failed_analysis_ids & statement_file_ids),
+        evidence_processing_count=evidence_processing_count,
+        files=tuple(statement_files),
     )
 
 
@@ -1274,15 +1477,30 @@ async def draft_analysis_status(
     fact_rows = list(
         (
             await db.execute(
-                select(ApplicationExtractedFact.status, func.count())
+                select(
+                    ApplicationExtractedFact.field_key,
+                    ApplicationExtractedFact.status,
+                    ApplicationExtractedFact.normalized_value,
+                    ApplicationExtractedFact.value,
+                )
                 .where(ApplicationExtractedFact.profile_id == profile.id)
-                .group_by(ApplicationExtractedFact.status)
             )
         ).all()
     )
-    fact_counts = {str(status_value): int(count) for status_value, count in fact_rows}
-    suggested = fact_counts.get("suggested", 0)
-    reviewed = fact_counts.get("accepted", 0) + fact_counts.get("rejected", 0)
+    fact_objects = [
+        SimpleNamespace(
+            field_key=str(field_key),
+            status=str(status_value),
+            normalized_value=normalized_value,
+            value=value,
+        )
+        for field_key, status_value, normalized_value, value in fact_rows
+    ]
+    suggested = len(pending_review_group_keys(fact_objects))
+    reviewed = sum(
+        status_value in {"accepted", "rejected", "superseded"}
+        for _, status_value, _, _ in fact_rows
+    )
     return ApplicationDraftAnalysisStatus(
         profile_id=profile.id,
         uploaded_file_count=len(file_ids),
@@ -1500,6 +1718,7 @@ async def evidence_state(
 ) -> ApplicationEvidenceRead:
     sources: list[EvidenceSourceRead] = []
     files: list[EvidenceFileRead] = []
+    raw_files: dict[UUID, BucketFile] = {}
     primary_id = profile.primary_bucket_id
     if primary_id:
         bucket = await db.get(Bucket, primary_id)
@@ -1515,6 +1734,7 @@ async def evidence_state(
             ).scalars().all()
         )
         source_id = f"bucket:{primary_id}"
+        raw_files.update((file.id, file) for file in primary_files)
         sources.append(
             EvidenceSourceRead(
                 id=source_id,
@@ -1579,6 +1799,7 @@ async def evidence_state(
                 ).scalar_one()
             )
             source_id = f"link:{link.id}"
+            raw_files.update((file.id, file) for file in rows)
             sources.append(
                 EvidenceSourceRead(
                     id=source_id,
@@ -1606,6 +1827,64 @@ async def evidence_state(
                 for file in rows
             )
     by_id = {file.id: file for file in files}
+    latest_analyses: dict[UUID, BucketFileAnalysis] = {}
+    if by_id:
+        analyses = list(
+            (
+                await db.execute(
+                    select(BucketFileAnalysis)
+                    .where(BucketFileAnalysis.bucket_file_id.in_(by_id))
+                    .order_by(
+                        BucketFileAnalysis.bucket_file_id,
+                        BucketFileAnalysis.analysis_version.desc(),
+                        BucketFileAnalysis.created_at.desc(),
+                        BucketFileAnalysis.id.desc(),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for analysis in analyses:
+            current_file = raw_files.get(analysis.bucket_file_id)
+            if (
+                current_file
+                and current_file.content_hash
+                and analysis.content_hash != current_file.content_hash
+            ):
+                continue
+            latest_analyses.setdefault(analysis.bucket_file_id, analysis)
+    request_states = await locked_file_requests.request_states_for_files(
+        db,
+        profile=profile,
+        file_ids=set(by_id),
+        file_fingerprints={
+            file_id: getattr(raw_files[file_id], "content_hash", None)
+            or (
+                getattr(latest_analyses[file_id], "content_hash", None)
+                if file_id in latest_analyses
+                else None
+            )
+            for file_id in by_id
+        },
+    )
+    for file_id, item in by_id.items():
+        analysis = latest_analyses.get(file_id)
+        if analysis:
+            item.analysis_status = analysis.status
+            item.analysis_classification = analysis.classification
+            item.analysis_confidence = analysis.confidence
+            item.analysis_summary = analysis.summary
+            item.analysis_reason_code = analysis.skip_reason
+            item.analysis_detail = analysis.skip_detail or analysis.error
+        item.is_password_protected = locked_file_requests.is_password_protected_file(
+            raw_files[file_id], analysis
+        )
+        item.unlocked_copy_request = _unlocked_copy_request_read(
+            locked_file_requests.current_request_state(
+                raw_files[file_id], analysis, request_states.get(file_id)
+            )
+        )
     blockers = [] if by_id else ["Add or link evidence before running AI review"]
     return ApplicationEvidenceRead(
         profile_id=profile.id,

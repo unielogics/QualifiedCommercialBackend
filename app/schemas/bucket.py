@@ -6,8 +6,47 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from app.schemas.application_profile import ClientEvidenceBankingSummary
+from app.schemas.application_profile import (
+    ClientEvidenceBankingSummary,
+    UnlockedCopyRequestStateRead,
+)
 from app.schemas.common import ORMModel
+
+PublicAnalysisClassification = Literal[
+    "accounts_receivable_aging",
+    "balance_sheet",
+    "bank_statement",
+    "business_license_or_permit",
+    "collateral_debt_evidence",
+    "commercial_lease",
+    "current_p_and_l",
+    "debt_schedule",
+    "entity_or_vesting",
+    "equipment_quote_or_invoice",
+    "fleet_or_vehicle_schedule",
+    "floorplan_mca_inventory",
+    "franchise_agreement",
+    "hoa",
+    "identity",
+    "insurance",
+    "inventory_or_purchase_ledger",
+    "lease_or_rent",
+    "merchant_processing_offer",
+    "merchant_processing_statement",
+    "other",
+    "payoff_or_mortgage_statement",
+    "payroll_report",
+    "personal_financial_statement",
+    "purchase_contract",
+    "real_estate_schedule",
+    "tax_return",
+    "transportation_authority",
+    "unreadable",
+]
+PublicFileReviewState = Literal["checking", "received", "needs_another_copy"]
+ReplacementReviewState = Literal[
+    "requested", "checking", "received", "needs_another_copy"
+]
 
 
 class BucketTemplateRead(ORMModel):
@@ -55,6 +94,11 @@ class BucketRequestedDocumentRead(ORMModel):
     signature_document_text: str | None
     requirement_key: str | None = None
     requirement_source: dict | None = None
+    # Public-room projections redact requirement_source and populate these
+    # explicit, client-safe fields for password-free replacement requests.
+    request_kind: Literal["unlocked_copy"] | None = None
+    source_file_id: UUID | None = None
+    replacement_review_state: ReplacementReviewState | None = None
     template_download_url: str | None = None
 
 
@@ -195,6 +239,26 @@ class BucketRequestUploadedFileRead(ORMModel):
     #: One readable line for the operator, e.g. "Uploaded by a field rep · Dana Ruiz".
     source_label: str | None = None
     status: str
+    is_password_protected: bool = False
+    unlocked_copy_request: UnlockedCopyRequestStateRead | None = None
+    analysis_status: Literal[
+        "pending",
+        "queued",
+        "processing",
+        "running",
+        "completed",
+        "failed",
+        "skipped",
+    ] | None = None
+    analysis_reason_code: Literal[
+        "analysis_pending",
+        "analysis_failed",
+        "password_protected",
+        "archive_container",
+        "unreadable",
+    ] | None = None
+    analysis_classification: PublicAnalysisClassification | None = None
+    analysis_review_state: PublicFileReviewState = "checking"
     created_at: datetime
     updated_at: datetime
 

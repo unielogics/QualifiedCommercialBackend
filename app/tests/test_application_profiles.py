@@ -1,4 +1,6 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -12,9 +14,17 @@ from app.models.application_profile import (
     ApplicationRequirementEvidence,
 )
 from app.models.bucket import BucketRequestedDocument
-from app.routers.application_profiles import _require_profile_bank_client
+from app.routers.application_profiles import (
+    _application_bank_state,
+    _can_review_manual_bank_evidence,
+    _require_profile_bank_client,
+    get_application_banks,
+    get_application_evidence,
+    get_application_evidence_file_url,
+)
 from app.routers.communications import _intake_allowed_channels
 from app.schemas.application_profile import (
+    ApplicationBankEvidenceFileRead,
     ApplicationRequirementAIReview,
     ApplicationRequirementBatchReminder,
     ApplicationRequirementPatch,
@@ -29,6 +39,9 @@ from app.services.application_profiles import (
     _client_requirement_coverage,
     _statement_months_from_analysis,
     application_evidence_summary,
+    capture_extracted_profile_facts,
+    evidence_preview_endpoint,
+    manual_statement_evidence,
 )
 from app.services.underwriting_intelligence import calculate_dscr
 
@@ -230,6 +243,49 @@ def test_application_bank_actions_are_client_owned() -> None:
         assert dealer_error.value.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_extracted_facts_stay_with_source_bucket_while_links_are_discovered() -> None:
+    bucket_id = uuid4()
+    primary = SimpleNamespace(id=uuid4(), primary_bucket_id=bucket_id)
+    linked = SimpleNamespace(id=uuid4(), primary_bucket_id=uuid4())
+
+    def rows(values):
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: values))
+
+    missing = SimpleNamespace(scalar_one_or_none=lambda: None)
+    added = []
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                rows([uuid4()]),
+                rows([primary, linked, primary]),
+                rows([]),
+                missing,
+            ]
+        ),
+        add=added.append,
+        flush=AsyncMock(),
+    )
+    file = SimpleNamespace(id=uuid4(), bucket_id=bucket_id, statement_period=None)
+    analysis = SimpleNamespace(
+        id=uuid4(),
+        classification="tax_return",
+        analysis={
+            "profile_facts": {
+                "legal_entity_name": {"value": "Grace Auto Sales and Service, Inc."}
+            },
+            "key_facts": {},
+        },
+    )
+
+    profile_ids = await capture_extracted_profile_facts(db, file=file, analysis=analysis)
+
+    assert profile_ids == [primary.id]
+    assert [fact.profile_id for fact in added] == [primary.id]
+    assert db.execute.await_count == 4
+    db.flush.assert_awaited_once()
+
+
 def test_manual_statement_coverage_uses_every_explicit_month() -> None:
     assert _statement_months_from_analysis(
         {
@@ -262,6 +318,325 @@ def test_shared_evidence_summary_preserves_ai_decision_states() -> None:
     assert summary.bank_statement_processing_count == 1
     assert summary.bank_statement_needs_more_count == 1
     assert summary.bank_statement_failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_statement_rows_include_unassigned_failed_and_operator_linked_files() -> None:
+    profile = SimpleNamespace(id=uuid4(), primary_bucket_id=uuid4(), intake_id=None)
+    now = datetime.now(UTC)
+    completed_id, failed_id, linked_id, processing_id = uuid4(), uuid4(), uuid4(), uuid4()
+
+    def evidence_file(file_id, name, created_at):
+        return SimpleNamespace(
+            id=file_id,
+            bucket_id=profile.primary_bucket_id,
+            file_name=name,
+            content_type="application/pdf",
+            size_bytes=1024,
+            created_at=created_at,
+            statement_period=None,
+        )
+
+    completed_file = evidence_file(completed_id, "Operating Statement 2026-05.pdf", now)
+    completed_file.content_hash = "completed-current"
+    failed_file = evidence_file(failed_id, "Bank Statement 2026-06.pdf", now - timedelta(minutes=1))
+    linked_file = evidence_file(linked_id, "miscellaneous.pdf", now - timedelta(minutes=2))
+    processing_file = evidence_file(processing_id, "opaque.pdf", now - timedelta(minutes=3))
+    older_completed = SimpleNamespace(
+        id=uuid4(),
+        status="completed",
+        skip_reason=None,
+        skip_detail=None,
+        classification="bank_statement",
+        confidence="high",
+        summary="Older completed analysis",
+        analysis={"key_facts": {"statement_period": "2026-05"}},
+        error=None,
+    )
+    newest_pending = SimpleNamespace(
+        id=uuid4(),
+        status="pending",
+        skip_reason=None,
+        skip_detail=None,
+        classification=None,
+        confidence=None,
+        summary=None,
+        analysis=None,
+        error=None,
+        content_hash="completed-current",
+    )
+    stale_locked = SimpleNamespace(
+        id=uuid4(),
+        status="skipped",
+        skip_reason="password_protected",
+        skip_detail="Historical password lock",
+        classification="unreadable",
+        confidence=None,
+        summary=None,
+        analysis=None,
+        error=None,
+        content_hash="completed-old",
+    )
+    failed_analysis = SimpleNamespace(
+        id=uuid4(),
+        status="failed",
+        skip_reason=None,
+        skip_detail=None,
+        classification=None,
+        confidence=None,
+        summary=None,
+        analysis=None,
+        error="PDF extraction failed",
+    )
+    wrong_document_analysis = SimpleNamespace(
+        id=uuid4(),
+        status="completed",
+        skip_reason=None,
+        skip_detail=None,
+        classification="purchase_contract",
+        confidence="high",
+        summary="Purchase agreement",
+        analysis={"key_facts": {}},
+        error=None,
+    )
+    processing_analysis = SimpleNamespace(
+        id=uuid4(),
+        status="completed",
+        skip_reason=None,
+        skip_detail=None,
+        classification="purchase_contract",
+        confidence="high",
+        summary="Completed extraction awaiting a fresh assignment decision",
+        analysis={"key_facts": {}},
+        error=None,
+    )
+    link = SimpleNamespace(
+        id=uuid4(),
+        file_id=linked_id,
+        source="operator",
+        verified_at=None,
+        verified_by_user_id=None,
+    )
+    processing_link = SimpleNamespace(
+        id=uuid4(),
+        file_id=processing_id,
+        source="operator",
+        verified_at=None,
+        verified_by_user_id=None,
+    )
+    linked_read = SimpleNamespace(
+        file_id=linked_id,
+        source="operator",
+        verified=False,
+        verified_at=None,
+        ai_decision="rejected",
+        ai_reason_code="wrong_document",
+        ai_explanation="This is a purchase agreement, not a bank statement.",
+        ai_confidence="high",
+        decision_actor="ai",
+        analysis_id=wrong_document_analysis.id,
+        coverage_contribution={},
+    )
+    processing_read = SimpleNamespace(
+        file_id=processing_id,
+        source="operator",
+        verified=False,
+        verified_at=None,
+        ai_decision="processing",
+        ai_reason_code="analysis_pending",
+        ai_explanation="A fresh decision is pending.",
+        ai_confidence=None,
+        decision_actor="system",
+        analysis_id=processing_analysis.id,
+        coverage_contribution={},
+    )
+    readiness = SimpleNamespace(
+        requirements=[
+            SimpleNamespace(
+                requirement_key="business_bank_statements_6_months",
+                evidence_files=[linked_read, processing_read],
+            )
+        ]
+    )
+    requirement_state = SimpleNamespace(id=uuid4())
+
+    def rows(values):
+        return SimpleNamespace(all=lambda: values)
+
+    def scalar_rows(values):
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: values))
+
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                rows(
+                    [
+                        (completed_file, None, stale_locked),
+                        (completed_file, None, newest_pending),
+                        (completed_file, None, older_completed),
+                        (failed_file, None, failed_analysis),
+                        (linked_file, None, wrong_document_analysis),
+                        (processing_file, None, processing_analysis),
+                    ]
+                ),
+                SimpleNamespace(scalar_one_or_none=lambda: requirement_state),
+                scalar_rows([link, processing_link]),
+            ]
+        )
+    )
+
+    with (
+        patch(
+            "app.services.application_programs.get_program_readiness",
+            AsyncMock(return_value=readiness),
+        ),
+        patch(
+            "app.services.application_profiles._profile_evidence_file_ids",
+            AsyncMock(return_value={completed_id, failed_id, linked_id, processing_id}),
+        ),
+        patch(
+            "app.services.application_profiles.locked_file_requests.request_states_for_files",
+            AsyncMock(return_value={}),
+        ),
+    ):
+        result = await manual_statement_evidence(db, profile)
+
+    files = {item.file_id: item for item in result.files}
+    assert set(files) == {completed_id, failed_id, linked_id, processing_id}
+    assert files[completed_id].analysis_status == "pending"
+    assert files[completed_id].is_password_protected is False
+    assert files[completed_id].analysis_detail is None
+    assert files[completed_id].ai_decision is None
+    assert files[failed_id].analysis_status == "failed"
+    assert files[failed_id].analysis_detail == "PDF extraction failed"
+    assert files[linked_id].linked_to_requirement is True
+    assert files[linked_id].source == "operator"
+    assert files[linked_id].ai_decision == "rejected"
+    assert files[linked_id].ai_reason_code == "wrong_document"
+    assert files[processing_id].ai_decision == "processing"
+    assert result.file_count == 2
+    assert result.pending_analysis_count == 1
+    assert result.rejected_file_count == 0
+    assert result.evidence_processing_count == 1
+
+    analysis_query = str(db.execute.await_args_list[0].args[0])
+    assert "bucket_file_analyses.created_at DESC" in analysis_query
+
+
+def test_manual_bank_evidence_review_roles_fail_closed() -> None:
+    allowed = {
+        Role.SUPER_ADMIN,
+        Role.REGIONAL_MANAGER,
+        Role.BROKER,
+        Role.LOAN_EXEC,
+        Role.DEALER_PARTNER,
+        Role.PROFESSIONAL_REFERRAL_PARTNER,
+        Role.FIELD_REP,
+    }
+    for role in Role:
+        assert _can_review_manual_bank_evidence(SimpleNamespace(role=role)) is (role in allowed)
+
+
+@pytest.mark.asyncio
+async def test_bank_state_statement_file_details_are_opt_in() -> None:
+    profile = SimpleNamespace(
+        id=uuid4(),
+        dealer_id=None,
+        bank_verification_override_at=None,
+        bank_verification_override_reason=None,
+    )
+    policy = SimpleNamespace(
+        selected_products=["assets"],
+        available_products=["assets", "statements"],
+        assets_enabled=True,
+        statements_enabled=False,
+    )
+    owner = SimpleNamespace(
+        plaid_policy_updated_at=None,
+        plaid_policy_updated_by_user_id=None,
+    )
+    detail = ApplicationBankEvidenceFileRead(
+        file_id=uuid4(),
+        file_name="statement.pdf",
+        bucket_id=uuid4(),
+        content_type="application/pdf",
+        size_bytes=123,
+        created_at=datetime.now(UTC),
+    )
+    evidence = ManualStatementEvidence(
+        months=[],
+        file_count=1,
+        accepted_file_count=0,
+        pending_analysis_count=1,
+        needs_more_file_count=0,
+        rejected_file_count=0,
+        failed_analysis_count=0,
+        evidence_processing_count=1,
+        files=(detail,),
+    )
+    db = SimpleNamespace()
+
+    with (
+        patch(
+            "app.routers.application_profiles.plaid_policy.for_profile",
+            AsyncMock(return_value=(policy, owner)),
+        ),
+        patch(
+            "app.routers.application_profiles.dealer_bank_consent.disclosure",
+            return_value={"version": "v1", "text": "Disclosure"},
+        ),
+        patch(
+            "app.routers.application_profiles._application_consent_row",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.routers.application_profiles._application_consent_granted",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.manual_statement_evidence",
+            AsyncMock(return_value=evidence),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.bank_rows",
+            AsyncMock(return_value=[]),
+        ),
+        patch("app.routers.application_profiles.plaid_client.enabled", return_value=True),
+        patch("app.routers.application_profiles.plaid_client.environment", return_value="sandbox"),
+        patch(
+            "app.routers.application_profiles.plaid_lifecycle.owner_asset_reports",
+            AsyncMock(return_value=[]),
+        ),
+    ):
+        public_safe = await _application_bank_state(db, profile)
+        staff = await _application_bank_state(db, profile, include_statement_files=True)
+
+    assert public_safe.manual_statement_files == []
+    assert public_safe.evidence_processing_count == 0
+    assert [item.file_id for item in staff.manual_statement_files] == [detail.file_id]
+    assert staff.evidence_processing_count == 1
+
+
+@pytest.mark.asyncio
+async def test_authenticated_bank_route_requests_details_only_for_review_roles() -> None:
+    profile_id = uuid4()
+    profile = SimpleNamespace(id=profile_id)
+    db = SimpleNamespace()
+    for role, expected in [(Role.LOAN_EXEC, True), (Role.CLIENT, False)]:
+        bank_state = AsyncMock(return_value=SimpleNamespace())
+        with (
+            patch(
+                "app.routers.application_profiles.profiles.load_profile",
+                AsyncMock(return_value=profile),
+            ),
+            patch("app.routers.application_profiles._application_bank_state", bank_state),
+        ):
+            await get_application_banks(profile_id, SimpleNamespace(role=role), db)
+        bank_state.assert_awaited_once_with(
+            db,
+            profile,
+            include_statement_files=expected,
+        )
 
 
 def test_shared_dscr_engine_requires_deterministic_inputs() -> None:
@@ -313,3 +688,140 @@ def test_classification_snapshot_keeps_unset_entry_ids_null() -> None:
     assert snapshot["industry_entry_id"] is None
     assert snapshot["subindustry_entry_id"] is None
     assert snapshot["activity_entry_id"] is None
+
+
+def test_evidence_preview_endpoint_is_profile_scoped_and_not_a_storage_url() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+
+    endpoint = evidence_preview_endpoint(profile_id, file_id)
+
+    assert endpoint == (f"/api/v1/application-profiles/{profile_id}/evidence/files/{file_id}/url")
+    assert "s3" not in endpoint.casefold()
+
+
+@pytest.mark.asyncio
+async def test_evidence_file_url_rechecks_inventory_and_signs_inline() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    profile = SimpleNamespace(id=profile_id)
+    file = SimpleNamespace(
+        id=file_id,
+        file_name="statement.pdf",
+        s3_key="private/evidence/statement.pdf",
+        content_type="application/pdf",
+        status="uploaded",
+        deleted_at=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=file), commit=AsyncMock())
+    user = SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC)
+
+    with (
+        patch(
+            "app.routers.application_profiles.profiles.load_profile",
+            AsyncMock(return_value=profile),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(return_value=SimpleNamespace(files=[SimpleNamespace(id=file_id)])),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.log_profile_action",
+            AsyncMock(),
+        ) as log_action,
+        patch(
+            "app.routers.buckets._download_url",
+            return_value="https://storage.example/signed",
+        ) as sign,
+    ):
+        result = await get_application_evidence_file_url(profile_id, file_id, user, db)
+
+    assert result == {"url": "https://storage.example/signed", "expires_in": 900}
+    sign.assert_called_once_with(
+        file.s3_key,
+        disposition="inline",
+        content_type="application/pdf",
+    )
+    log_action.assert_awaited_once()
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_evidence_file_url_hides_files_outside_current_inventory() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    db = SimpleNamespace(get=AsyncMock(), commit=AsyncMock())
+
+    with (
+        patch(
+            "app.routers.application_profiles.profiles.load_profile",
+            AsyncMock(return_value=SimpleNamespace(id=profile_id)),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(return_value=SimpleNamespace(files=[])),
+        ),
+        pytest.raises(HTTPException) as error,
+    ):
+        await get_application_evidence_file_url(
+            profile_id,
+            file_id,
+            SimpleNamespace(id=uuid4(), role=Role.LOAN_EXEC),
+            db,
+        )
+
+    assert error.value.status_code == 404
+    db.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evidence_file_url_denies_non_staff_before_inventory_lookup() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    db = SimpleNamespace(get=AsyncMock(), commit=AsyncMock())
+
+    with (
+        patch(
+            "app.routers.application_profiles.profiles.load_profile",
+            AsyncMock(),
+        ) as load_profile,
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(),
+        ) as evidence_state,
+        pytest.raises(HTTPException) as error,
+    ):
+        await get_application_evidence_file_url(
+            profile_id,
+            file_id,
+            SimpleNamespace(id=uuid4(), role=Role.CLIENT),
+            db,
+        )
+
+    assert error.value.status_code == 403
+    load_profile.assert_not_awaited()
+    evidence_state.assert_not_awaited()
+    db.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evidence_inventory_omits_preview_resolvers_for_non_staff() -> None:
+    profile_id = uuid4()
+    file_id = uuid4()
+    file = SimpleNamespace(id=file_id, preview_url="/should/not/leak")
+    state = SimpleNamespace(files=[file])
+    user = SimpleNamespace(id=uuid4(), role=Role.CLIENT)
+
+    with (
+        patch(
+            "app.routers.application_profiles.profiles.load_profile",
+            AsyncMock(return_value=SimpleNamespace(id=profile_id)),
+        ),
+        patch(
+            "app.routers.application_profiles.profiles.evidence_state",
+            AsyncMock(return_value=state),
+        ),
+    ):
+        result = await get_application_evidence(profile_id, user, SimpleNamespace())
+
+    assert result.files[0].preview_url is None

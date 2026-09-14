@@ -59,6 +59,7 @@ from app.models.client import Client
 from app.models.loan import Loan
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.user import User
+from app.schemas.application_profile import UnlockedCopyRequestStateRead
 from app.schemas.bucket import (
     BucketActivityPage,
     BucketActivityRead,
@@ -126,7 +127,7 @@ from app.schemas.bucket import (
 )
 from app.services import application_profiles as profiles
 from app.services import clerk as clerk_service
-from app.services import file_events
+from app.services import file_events, locked_file_requests, provenance
 from app.services.ai import engagement
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
@@ -260,6 +261,13 @@ def _generate_passcode() -> str:
 def _require_upload_passcode(link: BucketUploadLink) -> None:
     if not link.passcode_hash:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This upload invite must be regenerated with an access code")
+
+
+def _stale_requested_document_error(message: str) -> HTTPException:
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={"code": "stale_requested_document", "message": message},
+    )
 
 
 def _is_active(status_value: str, expires_at: datetime | None) -> bool:
@@ -2021,10 +2029,20 @@ async def admin_upload_init(
     req = None
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
-        if req is None or req.bucket_id != bucket_id:
-            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document mismatch")
+        if req is None or req.bucket_id != bucket_id or req.status == "not_applicable":
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document is no longer active")
             await db.commit()
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
+            raise _stale_requested_document_error(
+                "This document request is no longer active. Refresh the bucket and choose the current request."
+            )
+        try:
+            await locked_file_requests.require_current_unlocked_copy_upload_target(
+                db, req, for_update=True
+            )
+        except locked_file_requests.StaleUnlockedCopyRequest as exc:
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(req.id), detail="stale unlocked-copy request")
+            await db.commit()
+            raise _stale_requested_document_error(str(exc)) from exc
     _, prefix, _ = _bucket_storage_config()
     safe = _safe_filename(payload.file_name)
     requested_doc_condition = (
@@ -2078,6 +2096,9 @@ async def admin_upload_init(
         size_bytes=payload.size_bytes,
         uploaded_by_name=payload.uploader_name,
         uploaded_by_email=str(payload.uploader_email) if payload.uploader_email else None,
+        uploaded_by_user_id=user.id,
+        source_kind=provenance.document_source_for(user),
+        source_detail="Admin bucket upload",
         status="uploading",
     )
     db.add(file)
@@ -2108,6 +2129,54 @@ async def _bucket_upload_notice_reached(db: AsyncSession, bucket: Bucket) -> set
         return set()
 
 
+async def _reconcile_completed_bucket_file(
+    db: AsyncSession,
+    file: BucketFile,
+    request: Request | None,
+    *,
+    actor_name: str,
+    actor_email: str,
+) -> None:
+    """Expand archives and queue every resulting file through one upload path."""
+    from app.services.bucket_ai import enqueue_file_analysis
+    from app.services.bucket_evidence import reconcile_uploaded_file
+
+    targets = [file]
+    content_type = (getattr(file, "content_type", None) or "").casefold()
+    is_zip = (
+        file.file_name.casefold().endswith(".zip")
+        or "application/zip" in content_type
+        or "application/x-zip-compressed" in content_type
+    )
+    if is_zip:
+        # Imported lazily because dealer_ai_intake imports this router's shared
+        # storage helpers at module load time.
+        from app.routers.dealer_ai_intake import _extract_zip_bucket_files
+
+        await _extract_zip_bucket_files(
+            db, file, request, actor_name=actor_name, actor_email=actor_email
+        )
+        await db.flush()
+        children = list(
+            (
+                await db.execute(
+                    select(BucketFile).where(
+                        BucketFile.parent_zip_file_id == file.id,
+                        BucketFile.deleted_at.is_(None),
+                        BucketFile.status == "uploaded",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        targets.extend(children)
+
+    for target in targets:
+        await reconcile_uploaded_file(db, target)
+        await enqueue_file_analysis(db, target)
+
+
 @router.post("/admin/{bucket_id}/files/complete", response_model=BucketFileRead)
 async def admin_upload_complete(
     bucket_id: UUID,
@@ -2124,17 +2193,49 @@ async def admin_upload_complete(
         await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.status == "uploaded":
+        try:
+            await _reconcile_completed_bucket_file(
+                db,
+                file,
+                request,
+                actor_name=user.name or user.email or "Super Admin",
+                actor_email=user.email or "",
+            )
+            await db.commit()
+            await db.refresh(file)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reconcile completed admin file failed bucket=%s file=%s",
+                bucket_id,
+                file.id,
+            )
+        background.add_task(auto_ingest_bucket_files_for_bucket, bucket_id)
         return file
-    file.status = "uploaded"
+    req = None
     if file.requested_document_id:
         req = await db.get(BucketRequestedDocument, file.requested_document_id)
-        # A requires_signature item is satisfied by SIGNING, which produces its
-        # certificate through the sign flow — never by an arbitrary upload.
-        # Without this check a client could attach any file and the desk would
-        # see the signature request as fulfilled with no signature, no hashes
-        # and no certificate on record.
-        if req and not req.requires_signature:
-            req.status = "uploaded"
+        if req is None or req.bucket_id != bucket_id or req.status == "not_applicable":
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(file.requested_document_id), detail="complete failed: requested document is no longer active")
+            await db.commit()
+            raise _stale_requested_document_error(
+                "This document request is no longer active. Refresh the bucket and choose the current request."
+            )
+        try:
+            await locked_file_requests.require_current_unlocked_copy_upload_target(
+                db, req, for_update=True
+            )
+        except locked_file_requests.StaleUnlockedCopyRequest as exc:
+            await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(req.id), detail="complete failed: stale unlocked-copy request")
+            await db.commit()
+            raise _stale_requested_document_error(str(exc)) from exc
+    file.status = "uploaded"
+    # A requires_signature item is satisfied by SIGNING, which produces its
+    # certificate through the sign flow — never by an arbitrary upload.
+    # Without this check a client could attach any file and the desk would
+    # see the signature request as fulfilled with no signature, no hashes
+    # and no certificate on record.
+    if req and not req.requires_signature:
+        req.status = "uploaded"
     if payload.note:
         db.add(
             BucketNote(
@@ -2178,11 +2279,13 @@ async def admin_upload_complete(
             already_notified=await _bucket_upload_notice_reached(db, bucket),
         )
     try:
-        from app.services.bucket_ai import enqueue_file_analysis
-        from app.services.bucket_evidence import reconcile_uploaded_file
-
-        await reconcile_uploaded_file(db, file)
-        await enqueue_file_analysis(db, file)
+        await _reconcile_completed_bucket_file(
+            db,
+            file,
+            request,
+            actor_name=user.name or user.email or "Super Admin",
+            actor_email=user.email or "",
+        )
     except Exception:  # noqa: BLE001
         import logging
 
@@ -2585,20 +2688,88 @@ async def request_link_info(token: str, db: AsyncSession = Depends(get_db)) -> B
     )
 
 
-@router.post("/request/{token}/access", response_model=BucketRequestAccessRead)
-async def request_link_access(
-    token: str,
+async def _request_uploaded_file_reads(
+    db: AsyncSession,
+    bucket_id: UUID,
+    files: list[BucketFile],
+) -> list[BucketRequestUploadedFileRead]:
+    protected, requests, analysis_states = await locked_file_requests.password_protection_for_files(
+        db,
+        bucket_id=bucket_id,
+        files=files,
+    )
+    reads: list[BucketRequestUploadedFileRead] = []
+    for file in files:
+        request_state = requests.get(file.id)
+        analysis_state = analysis_states[file.id]
+        reads.append(
+            BucketRequestUploadedFileRead.model_validate(file).model_copy(
+                update={
+                    "is_password_protected": file.id in protected,
+                    "unlocked_copy_request": (
+                        UnlockedCopyRequestStateRead(
+                            requested_document_id=request_state.requested_document_id,
+                            request_status=request_state.request_status,
+                            delivery_id=request_state.delivery_id,
+                            delivery_status=request_state.delivery_status,
+                            requested_at=request_state.requested_at,
+                            last_delivery_at=request_state.last_delivery_at,
+                            replacement_review_state=request_state.replacement_review_state,
+                        )
+                        if request_state
+                        else None
+                    ),
+                    "analysis_status": analysis_state.analysis_status,
+                    "analysis_reason_code": analysis_state.analysis_reason_code,
+                    "analysis_classification": analysis_state.analysis_classification,
+                    "analysis_review_state": analysis_state.analysis_review_state,
+                }
+            )
+        )
+    return reads
+
+
+def _public_requested_document_read(
+    document: BucketRequestedDocument,
+    uploaded_files: list[BucketRequestUploadedFileRead],
+) -> BucketRequestedDocumentRead:
+    metadata = locked_file_requests.public_request_metadata(document, uploaded_files)
+    return BucketRequestedDocumentRead.model_validate(document).model_copy(
+        update={
+            # requirement_source may carry provenance and fingerprints intended
+            # only for staff/audit consumers. The explicit fields below are
+            # the complete public replacement-request contract.
+            "requirement_source": None,
+            "requirement_key": None if metadata["request_kind"] else document.requirement_key,
+            **metadata,
+        }
+    )
+
+
+async def _require_request_access_passcode(
+    db: AsyncSession,
+    link: BucketUploadLink,
     payload: BucketRequestAccessRequest,
     request: Request,
-    db: AsyncSession = Depends(get_db),
-) -> BucketRequestAccessRead:
-    link = await _load_upload_link_or_404(db, token)
+) -> None:
     _require_upload_passcode(link)
-    if not _verify_passcode(payload.passcode, link.passcode_hash, attempt_scope=_client_ip(request) or "unknown"):
-        await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
-        await db.commit()
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
-    await _log(db, link.bucket_id, "upload_link_accessed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    if _verify_passcode(
+        payload.passcode,
+        link.passcode_hash,
+        attempt_scope=_client_ip(request) or "unknown",
+    ):
+        return
+    # Failed attempts remain security-audited on both initial access and the
+    # no-write polling endpoint. Only successful refreshes are silent.
+    await _log(db, link.bucket_id, "upload_passcode_failed", request=request, actor_name=link.recipient_name, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    await db.commit()
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
+
+
+async def _request_access_read(
+    db: AsyncSession,
+    link: BucketUploadLink,
+) -> BucketRequestAccessRead:
     files = sorted(
         (
             file
@@ -2640,7 +2811,10 @@ async def request_link_access(
         .scalars()
         .all()
     )
-    await db.commit()
+    file_reads = await _request_uploaded_file_reads(db, link.bucket_id, files)
+    current_requested_documents = await locked_file_requests.current_public_request_documents(
+        db, requested_documents
+    )
     return BucketRequestAccessRead(
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
         recipient_name=link.recipient_name,
@@ -2649,14 +2823,43 @@ async def request_link_access(
         can_use_ai_chat=link.can_use_ai_chat,
         can_view_ai_tasks=link.can_view_ai_tasks,
         requested_documents=[
-            BucketRequestedDocumentRead.model_validate(d)
-            for d in requested_documents
+            _public_requested_document_read(d, file_reads)
+            for d in current_requested_documents
             if d.status != "not_applicable"
         ],
-        files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
+        files=file_reads,
         ai_summary=upload_link_visible_summary(review, link.bucket),
         evidence_banking_summary=evidence_banking_summary,
     )
+
+
+@router.post("/request/{token}/access", response_model=BucketRequestAccessRead)
+async def request_link_access(
+    token: str,
+    payload: BucketRequestAccessRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestAccessRead:
+    link = await _load_upload_link_or_404(db, token)
+    await _require_request_access_passcode(db, link, payload, request)
+    await _log(db, link.bucket_id, "upload_link_accessed", request=request, actor_name=link.recipient_name, actor_email=link.recipient_email, actor_role="uploader", target_type="upload_link", target_id=str(link.id))
+    result = await _request_access_read(db, link)
+    await db.commit()
+    return result
+
+
+@router.post("/request/{token}/status", response_model=BucketRequestAccessRead)
+async def request_link_status(
+    token: str,
+    payload: BucketRequestAccessRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> BucketRequestAccessRead:
+    """Refresh a verified room without writing a successful-access audit row."""
+
+    link = await _load_upload_link_or_404(db, token)
+    await _require_request_access_passcode(db, link, payload, request)
+    return await _request_access_read(db, link)
 
 
 @router.post("/request/{token}/upload-init", response_model=BucketFileUploadInitResponse)
@@ -2674,10 +2877,24 @@ async def request_upload_init(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid access code")
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
-        if req is None or req.bucket_id != link.bucket_id:
-            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document mismatch")
+        if (
+            req is None
+            or req.bucket_id != link.bucket_id
+            or req.status == "not_applicable"
+        ):
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="requested_document", target_id=str(payload.requested_document_id), detail="requested document is no longer active")
             await db.commit()
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this bucket")
+            raise _stale_requested_document_error(
+                "This document request is no longer active. Refresh the application room and choose the current request."
+            )
+        try:
+            await locked_file_requests.require_current_unlocked_copy_upload_target(
+                db, req, for_update=True
+            )
+        except locked_file_requests.StaleUnlockedCopyRequest as exc:
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=payload.uploader_name, actor_email=str(payload.uploader_email) if payload.uploader_email else None, actor_role="uploader", target_type="requested_document", target_id=str(req.id), detail="stale unlocked-copy request")
+            await db.commit()
+            raise _stale_requested_document_error(str(exc)) from exc
     else:
         req = None
     _, prefix, _ = _bucket_storage_config()
@@ -2687,7 +2904,7 @@ async def request_upload_init(
         BucketFile.upload_link_id == link.id,
         BucketFile.file_name == payload.file_name,
         BucketFile.size_bytes == payload.size_bytes,
-        BucketFile.status.in_(("uploading", "uploaded")),
+        BucketFile.status == "uploading",
         BucketFile.deleted_at.is_(None),
     ]
     if payload.requested_document_id:
@@ -2732,6 +2949,8 @@ async def request_upload_init(
         size_bytes=payload.size_bytes,
         uploaded_by_name=payload.uploader_name,
         uploaded_by_email=str(payload.uploader_email) if payload.uploader_email else None,
+        source_kind="client_room",
+        source_detail="Secure bucket upload link",
         status="uploading",
     )
     db.add(file)
@@ -2756,13 +2975,45 @@ async def request_upload_complete(
         await db.commit()
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.status == "uploaded":
+        try:
+            await _reconcile_completed_bucket_file(
+                db,
+                file,
+                request,
+                actor_name=file.uploaded_by_name or link.recipient_name,
+                actor_email=file.uploaded_by_email or link.recipient_email or "",
+            )
+            await db.commit()
+            await db.refresh(file)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "reconcile completed public file failed bucket=%s file=%s",
+                link.bucket_id,
+                file.id,
+            )
+        background.add_task(auto_ingest_bucket_files_for_bucket, link.bucket_id)
         return file
-    file.status = "uploaded"
-    link.completed_at = _now()
+    req = None
     if file.requested_document_id:
         req = await db.get(BucketRequestedDocument, file.requested_document_id)
-        if req:
-            req.status = "uploaded"
+        if req is None or req.bucket_id != link.bucket_id or req.status == "not_applicable":
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=file.uploaded_by_name or link.recipient_name, actor_email=file.uploaded_by_email or link.recipient_email, actor_role="uploader", target_type="requested_document", target_id=str(file.requested_document_id), detail="complete failed: requested document is no longer active")
+            await db.commit()
+            raise _stale_requested_document_error(
+                "This document request is no longer active. Refresh the application room and choose the current request."
+            )
+        try:
+            await locked_file_requests.require_current_unlocked_copy_upload_target(
+                db, req, for_update=True
+            )
+        except locked_file_requests.StaleUnlockedCopyRequest as exc:
+            await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=file.uploaded_by_name or link.recipient_name, actor_email=file.uploaded_by_email or link.recipient_email, actor_role="uploader", target_type="requested_document", target_id=str(req.id), detail="complete failed: stale unlocked-copy request")
+            await db.commit()
+            raise _stale_requested_document_error(str(exc)) from exc
+    file.status = "uploaded"
+    link.completed_at = _now()
+    if req:
+        req.status = "uploaded"
     if payload.note and link.allow_notes:
         db.add(
             BucketNote(
@@ -2799,11 +3050,13 @@ async def request_upload_complete(
             already_notified=await _bucket_upload_notice_reached(db, link.bucket),
         )
     try:
-        from app.services.bucket_ai import enqueue_file_analysis
-        from app.services.bucket_evidence import reconcile_uploaded_file
-
-        await reconcile_uploaded_file(db, file)
-        await enqueue_file_analysis(db, file)
+        await _reconcile_completed_bucket_file(
+            db,
+            file,
+            request,
+            actor_name=file.uploaded_by_name or link.recipient_name,
+            actor_email=file.uploaded_by_email or link.recipient_email or "",
+        )
     except Exception:  # noqa: BLE001
         import logging
 

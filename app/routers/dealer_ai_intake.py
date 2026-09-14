@@ -11,6 +11,7 @@ import logging
 import mimetypes
 import re
 import secrets
+import struct
 import time
 import zipfile
 from datetime import UTC, date, datetime, timedelta
@@ -70,10 +71,14 @@ from app.routers.buckets import (
     _generate_passcode,
     _hash_passcode,
     _log,
+    _public_requested_document_read,
     _public_url,
+    _reconcile_completed_bucket_file,
+    _request_uploaded_file_reads,
     _s3_client,
     _safe_filename,
     _sanitize_upload_content_type,
+    _stale_requested_document_error,
     _upload_url,
     _vendor_user_from_payload,
 )
@@ -97,6 +102,7 @@ from app.services import (
     booking_reminders,
     file_events,
     inline_images,
+    locked_file_requests,
     merchant_processing,
     provenance,
 )
@@ -256,8 +262,12 @@ DEALER_LOGIN_MAX_ATTEMPTS = 5
 DEALER_LOGIN_RATE_LIMIT_WINDOW_MINUTES = 15
 DEALER_LOGIN_RATE_LIMIT_MAX = 5
 ZIP_MAX_ENTRIES = 60
+ZIP_MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 ZIP_MAX_ENTRY_BYTES = 40 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 80 * 1024 * 1024
+ZIP_FETCH_READ_ATTEMPTS = 3
+ZIP_FETCH_MAX_RUNS = 5
+ZIP_MAX_CENTRAL_DIRECTORY_BYTES = 2 * 1024 * 1024
 
 # Abuse guards for the fully-public POST endpoints (single-instance in-memory,
 # same assumption as the public.py throttle). /start creates a Client + Bucket +
@@ -3898,11 +3908,14 @@ async def _decorate_widget(db: AsyncSession, intake: PublicUnderwritingIntake, w
     return decorated
 
 
-def _requested_document_read(doc: BucketRequestedDocument) -> BucketRequestedDocumentRead:
+def _requested_document_read(
+    doc: BucketRequestedDocument,
+    uploaded_files: list[BucketRequestUploadedFileRead],
+) -> BucketRequestedDocumentRead:
     """Adds a signed download URL for an admin-uploaded blank-form template
     (e.g. a fillable PFS), independent of requires_signature — this is a plain
     "download the blank form" affordance, not part of the e-sign flow."""
-    data = BucketRequestedDocumentRead.model_validate(doc)
+    data = _public_requested_document_read(doc, uploaded_files)
     if doc.template_file_id and doc.template_file is not None:
         bucket, _prefix, _kms = _bucket_storage_config()
         filename = _safe_filename(doc.template_file.file_name)
@@ -4992,6 +5005,10 @@ async def _response(
     # The lead is already authorised for this caller at this point, so the
     # images ride on the same permission as the note text.
     note_images = await inline_images.hydrate(db, "bucket_note", [str(n.id) for n in notes])
+    file_reads = await _request_uploaded_file_reads(db, intake.bucket_id, files)
+    current_requested_documents = await locked_file_requests.current_public_request_documents(
+        db, list(intake.bucket.requested_documents)
+    )
     return DealerIntakeResponse(
         intake=intake_read,
         ai_paused_until=_link.ai_paused_until if _link is not None and engagement.is_paused(_link) else None,
@@ -5003,11 +5020,11 @@ async def _response(
         assistant_message=assistant_message or (_format_review_update(latest_result) if latest_result else empty_message or _message_for_widget(widget, intake)),
         widget=widget,
         requested_documents=[
-            _requested_document_read(doc)
-            for doc in intake.bucket.requested_documents
+            _requested_document_read(doc, file_reads)
+            for doc in current_requested_documents
             if doc.status != "not_applicable"
         ],
-        files=[BucketRequestUploadedFileRead.model_validate(file) for file in files],
+        files=file_reads,
         ai_summary=summary,
         latest_review=review_read,
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
@@ -5051,14 +5068,26 @@ async def _start_upload(
     req = None
     if payload.requested_document_id:
         req = await db.get(BucketRequestedDocument, payload.requested_document_id)
-        if req is None or req.bucket_id != intake.bucket_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Requested document does not belong to this intake")
+        if (
+            req is None
+            or req.bucket_id != intake.bucket_id
+            or req.status == "not_applicable"
+        ):
+            raise _stale_requested_document_error(
+                "This document request is no longer active. Refresh the intake and choose the current request."
+            )
+        try:
+            await locked_file_requests.require_current_unlocked_copy_upload_target(
+                db, req, for_update=True
+            )
+        except locked_file_requests.StaleUnlockedCopyRequest as exc:
+            raise _stale_requested_document_error(str(exc)) from exc
     existing_conditions = [
         BucketFile.bucket_id == intake.bucket_id,
         BucketFile.upload_link_id == intake.bucket_upload_link_id,
         BucketFile.file_name == payload.file_name,
         BucketFile.size_bytes == payload.size_bytes,
-        BucketFile.status.in_(("uploading", "uploaded")),
+        BucketFile.status == "uploading",
         BucketFile.deleted_at.is_(None),
     ]
     if payload.requested_document_id:
@@ -5153,13 +5182,30 @@ def _guess_entry_content_type(name: str) -> str:
     return "application/octet-stream"
 
 
-def _read_bucket_object(s3_key: str) -> bytes | None:
+class _ZipArchiveTooLarge(ValueError):
+    pass
+
+
+def _read_bucket_object(s3_key: str, *, max_bytes: int | None = None) -> bytes | None:
     bucket, _, _ = _bucket_storage_config()
+    body = None
     try:
         obj = _s3_client().get_object(Bucket=bucket, Key=s3_key)
-        return obj["Body"].read()
+        content_length = int(obj.get("ContentLength") or 0)
+        if max_bytes is not None and content_length > max_bytes:
+            raise _ZipArchiveTooLarge
+        body = obj["Body"]
+        data = body.read(max_bytes + 1) if max_bytes is not None else body.read()
+        if max_bytes is not None and len(data) > max_bytes:
+            raise _ZipArchiveTooLarge
+        return data
+    except _ZipArchiveTooLarge:
+        raise
     except Exception:  # noqa: BLE001
         return None
+    finally:
+        if body is not None:
+            body.close()
 
 
 def _put_bucket_object(s3_key: str, content_type: str, data: bytes) -> None:
@@ -5174,34 +5220,147 @@ def _put_bucket_object(s3_key: str, content_type: str, data: bytes) -> None:
     )
 
 
+def _zip_directory_metadata(raw: bytes) -> tuple[int, int] | None:
+    """Read entry count and central-directory size without opening the ZIP.
+
+    ``zipfile.ZipFile`` materializes the entire central directory. Checking the
+    end record first prevents a small public archive containing hundreds of
+    thousands of zero-byte entries from exhausting a worker before the normal
+    per-entry cap can run. ZIP64 entry-count overflow is rejected here because
+    this upload path intentionally supports only a small evidence bundle.
+    """
+
+    signature = b"PK\x05\x06"
+    start = max(0, len(raw) - 65_557)
+    offset = raw.rfind(signature, start)
+    if offset < start or offset + 22 > len(raw):
+        return None
+    # This evidence-bundle path never needs ZIP64 (60 entries / 100 MiB max).
+    # Python's ZipFile follows a ZIP64 locator and replaces the classic EOCD
+    # values, so trusting only forged-small classic fields would bypass the
+    # pre-materialization limits below.
+    if offset >= 20 and raw[offset - 20 : offset - 16] == b"PK\x06\x07":
+        return None
+    unpacked = struct.unpack_from("<4s4H2LH", raw, offset)
+    comment_length = unpacked[7]
+    if offset + 22 + comment_length != len(raw):
+        return None
+    if (
+        unpacked[1] != 0
+        or unpacked[2] != 0
+        or unpacked[3] != unpacked[4]
+        or unpacked[4] == 0xFFFF
+        or unpacked[5] == 0xFFFFFFFF
+        or unpacked[6] == 0xFFFFFFFF
+    ):
+        return None
+    return int(unpacked[4]), int(unpacked[5])
+
+
+def _mark_zip_retry(
+    file: BucketFile,
+    *,
+    reason: str,
+    extracted: int = 0,
+) -> None:
+    """Persist a bounded retry state after a transient archive failure."""
+
+    prior_runs = 0
+    try:
+        prior = json.loads(getattr(file, "extraction_reason", None) or "[]")
+        if isinstance(prior, list) and prior and isinstance(prior[0], dict):
+            prior_runs = int(prior[0].get("runs") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        prior_runs = 0
+    runs = prior_runs + 1
+    if runs >= ZIP_FETCH_MAX_RUNS:
+        file.extraction_status = "partial" if extracted else "skipped"
+    else:
+        file.extraction_status = "retryable"
+    file.extraction_reason = json.dumps(
+        [{"entry": file.file_name, "reason": reason, "runs": runs}]
+    )
+
+
 async def _extract_zip_bucket_files(
     db: AsyncSession,
-    intake: PublicUnderwritingIntake,
     file: BucketFile,
-    request: Request,
+    request: Request | None,
     *,
     actor_name: str,
     actor_email: str,
 ) -> None:
     if not _is_zip_upload(file):
         return
+    locked_file = (
+        await db.execute(
+            select(BucketFile)
+            .where(BucketFile.id == file.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked_file is None:
+        return
+    file = locked_file
     if file.extraction_status in {"extracted", "partial", "skipped"}:
         return
-    raw = _read_bucket_object(file.s3_key)
-    if raw is None:
+    try:
+        raw = None
+        for attempt in range(ZIP_FETCH_READ_ATTEMPTS):
+            raw = await asyncio.to_thread(
+                _read_bucket_object,
+                file.s3_key,
+                max_bytes=ZIP_MAX_ARCHIVE_BYTES,
+            )
+            if raw is not None:
+                break
+            if attempt + 1 < ZIP_FETCH_READ_ATTEMPTS:
+                await asyncio.sleep(0.2 * (2**attempt))
+    except _ZipArchiveTooLarge:
         file.extraction_status = "skipped"
-        file.extraction_reason = json.dumps([{"entry": file.file_name, "reason": "zip_fetch_failed"}])
+        file.extraction_reason = json.dumps(
+            [{"entry": file.file_name, "reason": "zip_archive_too_large"}]
+        )
+        return
+    if raw is None:
+        # Storage can be momentarily unavailable immediately after a direct or
+        # multipart upload completes. The persisted analysis drain retries this
+        # state on later ticks, with a cap so one missing object cannot starve
+        # the queue forever.
+        _mark_zip_retry(file, reason="zip_fetch_failed")
         return
     skipped: list[dict[str, str]] = []
     extracted = 0
     total_bytes = 0
+    directory = _zip_directory_metadata(raw)
+    if directory is None:
+        # ``ZipFile`` deliberately accepts bytes after the end record. Reject
+        # those archives here instead of bypassing the bounded central-directory
+        # pre-scan and allowing an attacker-controlled entry list to be
+        # materialized in worker memory.
+        file.extraction_status = "skipped"
+        file.extraction_reason = json.dumps(
+            [{"entry": file.file_name, "reason": "zip_parse_failed"}]
+        )
+        return
+    if (
+        directory[0] > ZIP_MAX_ENTRIES
+        or directory[0] == 0xFFFF
+        or directory[1] > ZIP_MAX_CENTRAL_DIRECTORY_BYTES
+    ):
+        file.extraction_status = "skipped"
+        file.extraction_reason = json.dumps(
+            [{"entry": file.file_name, "reason": "zip_entry_limit"}]
+        )
+        return
     _, prefix, _ = _bucket_storage_config()
     try:
         with zipfile.ZipFile(BytesIO(raw)) as archive:
             for index, member in enumerate(archive.infolist()):
                 if index >= ZIP_MAX_ENTRIES:
                     skipped.append({"entry": member.filename, "reason": "zip_entry_limit"})
-                    continue
+                    break
                 entry_path = _safe_zip_entry_path(member.filename)
                 if not entry_path:
                     skipped.append({"entry": member.filename, "reason": "zip_unsafe_path"})
@@ -5231,6 +5390,10 @@ async def _extract_zip_bucket_files(
                     )
                 ).scalar_one_or_none()
                 if duplicate is not None:
+                    # A previous attempt may have committed this child before a
+                    # later entry failed. Count it as recovered evidence so the
+                    # eventual terminal parent state is accurate.
+                    extracted += 1
                     continue
                 try:
                     data = archive.read(member)
@@ -5238,20 +5401,36 @@ async def _extract_zip_bucket_files(
                     skipped.append({"entry": entry_path, "reason": "zip_entry_encrypted"})
                     continue
                 total_bytes += len(data)
+                content_hash = hashlib.sha256(data).hexdigest()
+                existing_content = (
+                    await db.execute(
+                        select(BucketFile.id)
+                        .where(
+                            BucketFile.bucket_id == file.bucket_id,
+                            BucketFile.content_hash == content_hash,
+                            BucketFile.deleted_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if existing_content is not None:
+                    skipped.append({"entry": entry_path, "reason": "duplicate_existing_file"})
+                    continue
                 content_type = _sanitize_upload_content_type(_guess_entry_content_type(entry_path))
                 child_id = uuid4()
                 safe = _safe_filename(entry_path.split("/")[-1])
-                child_key = f"{prefix}/uploads/{intake.bucket_id}/{child_id}-zip-{safe}"
+                child_key = f"{prefix}/uploads/{file.bucket_id}/{child_id}-zip-{safe}"
                 _put_bucket_object(child_key, content_type, data)
                 child = BucketFile(
                     id=child_id,
-                    bucket_id=intake.bucket_id,
+                    bucket_id=file.bucket_id,
                     requested_document_id=None,
-                    upload_link_id=intake.bucket_upload_link_id,
-                    file_name=entry_path,
+                    upload_link_id=file.upload_link_id,
+                    file_name=entry_path[:255],
                     s3_key=child_key,
                     content_type=content_type,
                     size_bytes=len(data),
+                    content_hash=content_hash,
                     uploaded_by_name=actor_name,
                     uploaded_by_email=actor_email,
                     uploaded_by_user_id=file.uploaded_by_user_id,
@@ -5266,21 +5445,33 @@ async def _extract_zip_bucket_files(
                 extracted += 1
     except zipfile.BadZipFile:
         skipped.append({"entry": file.file_name, "reason": "zip_parse_failed"})
+    except Exception:  # noqa: BLE001
+        log.exception("ZIP extraction failed file=%s", file.id)
+        _mark_zip_retry(file, reason="zip_extract_failed", extracted=extracted)
+        return
     file.extraction_status = "extracted" if extracted and not skipped else "partial" if extracted else "skipped"
     file.extraction_reason = json.dumps(skipped[-80:])
     if extracted:
-        await _log(
-            db,
-            intake.bucket_id,
-            "dealer_ai_zip_extracted",
-            request=request,
-            actor_name=actor_name,
-            actor_email=actor_email,
-            actor_role=provenance.actor_role_for(file.source_kind or "client_room"),
-            target_type="file",
-            target_id=str(file.id),
-            detail=f"Extracted {extracted} supported file(s) from {file.file_name}",
-        )
+        try:
+            await _log(
+                db,
+                file.bucket_id,
+                "dealer_ai_zip_extracted",
+                request=request,
+                actor_name=actor_name,
+                actor_email=actor_email,
+                actor_role=provenance.actor_role_for(
+                    getattr(file, "source_kind", None) or "client_room"
+                ),
+                target_type="file",
+                target_id=str(file.id),
+                detail=f"Extracted {extracted} supported file(s) from {file.file_name}",
+            )
+        except Exception:  # noqa: BLE001
+            # The children are already valid evidence. An audit-log outage must
+            # not prevent the shared completion path from flushing and queuing
+            # them for analysis.
+            log.exception("ZIP extraction activity log failed file=%s", file.id)
 
 
 async def _complete_upload(
@@ -5296,11 +5487,26 @@ async def _complete_upload(
     if file is None or file.bucket_id != intake.bucket_id or file.upload_link_id != intake.bucket_upload_link_id or file.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "File not found")
     if file.status != "uploaded":
-        file.status = "uploaded"
+        req = None
         if file.requested_document_id:
             req = await db.get(BucketRequestedDocument, file.requested_document_id)
-            if req is not None:
-                req.status = "uploaded"
+            if (
+                req is None
+                or req.bucket_id != intake.bucket_id
+                or req.status == "not_applicable"
+            ):
+                raise _stale_requested_document_error(
+                    "This document request is no longer active. Refresh the intake and choose the current request."
+                )
+            try:
+                await locked_file_requests.require_current_unlocked_copy_upload_target(
+                    db, req, for_update=True
+                )
+            except locked_file_requests.StaleUnlockedCopyRequest as exc:
+                raise _stale_requested_document_error(str(exc)) from exc
+        file.status = "uploaded"
+        if req is not None:
+            req.status = "uploaded"
         if intake.bucket_upload_link is not None:
             intake.bucket_upload_link.completed_at = _now()
     if payload.note:
@@ -5313,7 +5519,6 @@ async def _complete_upload(
                 content=payload.note,
             )
         )
-    await _extract_zip_bucket_files(db, intake, file, request, actor_name=actor_name, actor_email=actor_email)
     await _log(
         db,
         intake.bucket_id,
@@ -5331,22 +5536,13 @@ async def _complete_upload(
     # Queue this file (and any files extracted from it as a zip) for background
     # analysis so the review composes from a warm per-file cache.
     try:
-        from app.services.bucket_ai import enqueue_file_analysis
-        from app.services.bucket_evidence import reconcile_uploaded_file
-
-        await db.flush()
-        children = (
-            await db.execute(
-                select(BucketFile).where(
-                    BucketFile.parent_zip_file_id == file.id,
-                    BucketFile.deleted_at.is_(None),
-                    BucketFile.status == "uploaded",
-                )
-            )
-        ).scalars().all()
-        for target in [file, *children]:
-            await reconcile_uploaded_file(db, target)
-            await enqueue_file_analysis(db, target)
+        await _reconcile_completed_bucket_file(
+            db,
+            file,
+            request,
+            actor_name=actor_name,
+            actor_email=actor_email,
+        )
     except Exception:  # noqa: BLE001
         log.exception("enqueue file analysis failed intake=%s file=%s", intake.id, file.id)
     # One timeline line for the upload itself; files extracted from a zip
