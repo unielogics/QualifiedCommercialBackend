@@ -394,18 +394,24 @@ async def _audit(db: AsyncSession, intake: PublicUnderwritingIntake, user: User 
     ))
 
 
-@public_router.post("", response_model=ForeclosureRescueCreated, status_code=status.HTTP_201_CREATED)
-async def create_foreclosure_rescue(
+async def _create_foreclosure_rescue(
     payload: ForeclosureRescueIntakeCreate,
     request: Request,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession,
+    *,
+    actor: User | None = None,
+    send_resume_email: bool = True,
 ) -> ForeclosureRescueCreated:
     email = str(payload.contact_email).strip().lower()
     matching_user = (
         await db.execute(select(User).where(User.email == email, User.deleted_at.is_(None)))
     ).scalar_one_or_none()
-    partner_user = matching_user if matching_user and matching_user.role == Role.PROFESSIONAL_REFERRAL_PARTNER else None
-    owner = await primary_super_admin(db)
+    partner_user = (
+        actor
+        if actor and actor.role == Role.PROFESSIONAL_REFERRAL_PARTNER
+        else matching_user if matching_user and matching_user.role == Role.PROFESSIONAL_REFERRAL_PARTNER else None
+    )
+    owner = actor or await primary_super_admin(db)
     bucket = Bucket(
         name=f"{payload.holding_entity} Foreclosure Rescue",
         bucket_type="commercial_foreclosure_rescue",
@@ -464,11 +470,16 @@ async def create_foreclosure_rescue(
     token = _new_public_token()
     rescue_details = payload.model_dump(mode="json")
     rescue_details["client_email"] = str(payload.client_email) if payload.client_email else None
+    if actor is not None:
+        for acknowledgment in ("authority_attested", "owner_contact_consent", "terms_accepted", "privacy_accepted"):
+            rescue_details.pop(acknowledgment, None)
+        rescue_details["created_internally"] = True
+        rescue_details["created_by_user_id"] = str(actor.id)
     intake = PublicUnderwritingIntake(
-        source_kind="partner" if partner_user else "public_form",
-        source_detail="Commercial foreclosure rescue form",
+        source_kind="operator" if actor and actor.role in {Role.SUPER_ADMIN, Role.LOAN_EXEC} else "partner" if partner_user else "public_form",
+        source_detail="Internal commercial foreclosure rescue intake" if actor else "Commercial foreclosure rescue form",
         source_actor_name=payload.contact_name.strip(),
-        source_user_id=partner_user.id if partner_user else None,
+        source_user_id=actor.id if actor else partner_user.id if partner_user else None,
         referral_partner_company_id=partner_user.referral_partner_company_id if partner_user else None,
         bucket_id=bucket.id,
         bucket_upload_link_id=link.id,
@@ -492,9 +503,10 @@ async def create_foreclosure_rescue(
             "foreclosure_rescue": rescue_details,
             "program_terms": program_terms(),
             "legal_acceptance": {
-                "authority_attested": payload.authority_attested,
-                "terms_accepted": payload.terms_accepted,
-                "privacy_accepted": payload.privacy_accepted,
+                "authority_attested": payload.authority_attested if actor is None else None,
+                "terms_accepted": payload.terms_accepted if actor is None else None,
+                "privacy_accepted": payload.privacy_accepted if actor is None else None,
+                "entry_method": "internal_operator" if actor else "public_submission",
                 "ip_address": request.client.host if request.client else None,
                 "user_agent": request.headers.get("user-agent"),
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -503,18 +515,25 @@ async def create_foreclosure_rescue(
     )
     db.add(intake)
     await db.flush()
-    await _audit(db, intake, partner_user, "foreclosure_rescue_created", "Five-minute foreclosure rescue intake submitted")
-    await db.commit()
-    await _record_resume_email(
+    await _audit(
+        db,
         intake,
-        token=token,
-        request=request,
-        reason="foreclosure_rescue_created",
-        public_path="/funding-review",
-        review_label="commercial foreclosure rescue",
-        room_label="commercial foreclosure rescue file",
+        actor or partner_user,
+        "foreclosure_rescue_created",
+        "Internal foreclosure rescue file created" if actor else "Five-minute foreclosure rescue intake submitted",
     )
     await db.commit()
+    if send_resume_email:
+        await _record_resume_email(
+            intake,
+            token=token,
+            request=request,
+            reason="foreclosure_rescue_created",
+            public_path="/funding-review",
+            review_label="commercial foreclosure rescue",
+            room_label="commercial foreclosure rescue file",
+        )
+        await db.commit()
     return ForeclosureRescueCreated(
         id=intake.id,
         status="new_rescue",
@@ -523,6 +542,15 @@ async def create_foreclosure_rescue(
         resume_url=f"/funding-review?token={token}",
         program=program_terms(),
     )
+
+
+@public_router.post("", response_model=ForeclosureRescueCreated, status_code=status.HTTP_201_CREATED)
+async def create_foreclosure_rescue(
+    payload: ForeclosureRescueIntakeCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ForeclosureRescueCreated:
+    return await _create_foreclosure_rescue(payload, request, db)
 
 
 @public_router.get("/program")
@@ -561,6 +589,19 @@ async def list_operator_rescues(
         stmt = stmt.where(PublicUnderwritingIntake.foreclosure_rescue_status == rescue_status)
     stmt = stmt.order_by(PublicUnderwritingIntake.foreclosure_sale_date.asc().nullslast(), PublicUnderwritingIntake.created_at.asc())
     return [_read(row) for row in (await db.execute(stmt)).scalars().unique().all()]
+
+
+@operator_router.post("", response_model=ForeclosureRescueCreated, status_code=status.HTTP_201_CREATED)
+async def create_operator_rescue(
+    payload: ForeclosureRescueIntakeCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ForeclosureRescueCreated:
+    """Create a rescue from the authenticated deadline desk without a public-site handoff or email."""
+
+    _require_operator(user)
+    return await _create_foreclosure_rescue(payload, request, db, actor=user, send_resume_email=False)
 
 
 @operator_router.get("/partner-applications", response_model=list[ProfessionalPartnerApplicationRead])
@@ -788,6 +829,21 @@ async def list_partner_rescues(user: CurrentUser, db: AsyncSession = Depends(get
     company_id = await _require_partner(user, db)
     stmt = _base_query().where(PublicUnderwritingIntake.referral_partner_company_id == company_id).order_by(PublicUnderwritingIntake.updated_at.desc())
     return [_read(row) for row in (await db.execute(stmt)).scalars().unique().all()]
+
+
+@partner_router.post("", response_model=ForeclosureRescueCreated, status_code=status.HTTP_201_CREATED)
+async def create_partner_rescue(
+    payload: ForeclosureRescueIntakeCreate,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ForeclosureRescueCreated:
+    """Let an approved professional partner open a firm-owned rescue inside the portal."""
+
+    await _require_partner(user, db)
+    if payload.submitter_type == "owner_direct":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Professional firms must create attorney- or broker-referred matters")
+    return await _create_foreclosure_rescue(payload, request, db, actor=user, send_resume_email=False)
 
 
 @partner_router.get("/members", response_model=list[ProfessionalMemberRead])

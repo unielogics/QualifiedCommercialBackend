@@ -4,7 +4,12 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from app.routers.foreclosure_rescue import ForeclosureRescueIntakeCreate, RescueDocumentStatusUpdate
+from app.routers.foreclosure_rescue import (
+    ForeclosureRescueIntakeCreate,
+    RescueDocumentStatusUpdate,
+    operator_router,
+    partner_router,
+)
 from app.services.foreclosure_rescue import (
     AMORTIZATION_MONTHS,
     MAX_LTV_PCT,
@@ -87,3 +92,8 @@ def test_scheduled_sale_requires_date_and_waiver_requires_reason():
     with pytest.raises(ValidationError):
         RescueDocumentStatusUpdate(status="waived")
     assert RescueDocumentStatusUpdate(status="not_applicable", reason="No guarantor").reason == "No guarantor"
+
+
+def test_authenticated_rescue_creation_routes_are_available_inside_the_portal():
+    assert any(route.path == "/foreclosure-rescues" and "POST" in route.methods for route in operator_router.routes)
+    assert any(route.path == "/professional/foreclosure-rescues" and "POST" in route.methods for route in partner_router.routes)
