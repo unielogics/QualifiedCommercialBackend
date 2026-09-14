@@ -79,7 +79,10 @@ def _hash_passcode(passcode: str) -> str:
 
 
 def _generate_passcode() -> str:
-    return f"{secrets.randbelow(900000) + 100000}"
+    while True:
+        candidate = f"{secrets.randbelow(900000) + 100000}"
+        if passcode_problem(candidate) is None:
+            return candidate
 
 
 def _store_passcode(link: BucketUploadLink, passcode: str) -> None:
@@ -88,13 +91,16 @@ def _store_passcode(link: BucketUploadLink, passcode: str) -> None:
     The PBKDF2 hash remains the authentication source. The encrypted copy is
     used only by authenticated, file-scoped staff views.
     """
+    code = (passcode or "").strip()
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
+        raise ValueError("The secure client-room PIN must contain six digits.")
     settings = get_settings()
-    link.passcode_hash = _hash_passcode(passcode)
+    link.passcode_hash = _hash_passcode(code)
     if settings.provider_secrets_kms_key_id:
-        link.encrypted_passcode = _encrypt_kms(passcode)
+        link.encrypted_passcode = _encrypt_kms(code)
         link.passcode_encryption_provider = "aws_kms"
     else:
-        link.encrypted_passcode = _encrypt_fernet(passcode)
+        link.encrypted_passcode = _encrypt_fernet(code)
         link.passcode_encryption_provider = "fernet"
 
 
@@ -336,7 +342,7 @@ _TRIVIAL_PASSCODES = frozenset(
 def passcode_problem(new_passcode: str, current_passcode: str | None = None) -> str | None:
     """Why a client-chosen PIN is not acceptable, or None when it is."""
     code = (new_passcode or "").strip()
-    if len(code) != 6 or not code.isdigit():
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
         return "Choose a 6-digit PIN."
     if code in _TRIVIAL_PASSCODES:
         return "That PIN is too easy to guess. Choose six digits that are not all the same or in a row."

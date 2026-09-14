@@ -127,7 +127,7 @@ class BucketUploadLinkCreate(BaseModel):
     allow_multiple_sessions: bool = True
     can_use_ai_chat: bool = True
     can_view_ai_tasks: bool = True
-    passcode: str | None = Field(default=None, max_length=80)
+    passcode: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
 
     @field_validator("recipient_email", mode="before")
     @classmethod

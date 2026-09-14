@@ -79,6 +79,19 @@ def test_a_generated_code_is_always_six_digits_in_range():
         code = client_room._generate_passcode()
         assert len(code) == 6 and code.isdigit()
         assert 100000 <= int(code) <= 999999
+        assert client_room.passcode_problem(code) is None
+
+
+def test_the_shared_storage_boundary_rejects_password_style_codes():
+    link = SimpleNamespace(
+        id="l1",
+        passcode_hash=None,
+        encrypted_passcode=None,
+        passcode_encryption_provider=None,
+    )
+    for invalid in ("Welcome123!", "12345", "1234567", "١٢٣٤٥٦"):
+        with pytest.raises(ValueError):
+            client_room._store_passcode(link, invalid)
 
 
 def test_a_decrypted_value_that_is_not_a_pin_is_refused_rather_than_shown():

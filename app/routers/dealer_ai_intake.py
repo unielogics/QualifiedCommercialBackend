@@ -525,7 +525,7 @@ class AdminLeadCreate(BaseModel):
     # Optionally assign the file to a dealer partner at creation, so the team's
     # first message on it reaches that partner's channel. Must be a dealer_partner.
     broker_user_id: UUID | None = None
-    secure_room_pin: str = Field(pattern=r"^\d{6}$")
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
 
     @field_validator("variant", mode="before")
     @classmethod

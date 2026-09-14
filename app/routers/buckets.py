@@ -253,7 +253,8 @@ def _verify_passcode(
 
 
 def _generate_passcode() -> str:
-    return f"{secrets.randbelow(900000) + 100000}"
+    """Canonical six-digit room/share PIN generator."""
+    return client_room._generate_passcode()
 
 
 def _require_upload_passcode(link: BucketUploadLink) -> None:

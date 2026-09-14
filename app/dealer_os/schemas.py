@@ -1032,7 +1032,7 @@ class RepAppointmentOutcomePatch(BaseModel):
     conversion_target: Literal["field_desk", "ai_intake"] | None = None
     ai_variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
     notify_client: bool = False
-    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
+    secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
 
     @model_validator(mode="after")
     def _conversion_requires_destination(self) -> "RepAppointmentOutcomePatch":
@@ -1168,7 +1168,7 @@ class RepAppointmentNoteCreate(BaseModel):
 
 class RepAppointmentStartApplication(BaseModel):
     variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"]
-    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
+    secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     notify_client: bool = False
     existing_intake_id: UUID | None = None
 
@@ -1250,7 +1250,7 @@ class RepAppointmentApplyOutcome(BaseModel):
     existing_file_kind: AppointmentFileKind | None = None
     existing_file_id: UUID | None = None
     variant: Literal["dealer", "real_estate", "main_street", "mca_refinance"] | None = None
-    secure_room_pin: str | None = Field(default=None, pattern=r"^\d{6}$")
+    secure_room_pin: str | None = Field(default=None, pattern=r"^[0-9]{6}$")
     notify_client: bool = False
     apply_booking_data: bool = False
     requested_document_keys: list[str] = Field(default_factory=list, max_length=20)

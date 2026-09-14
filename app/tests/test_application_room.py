@@ -23,6 +23,7 @@ from app.routers.buckets import (
 )
 from app.routers.dealer_ai_intake import AdminLeadCreate
 from app.schemas.application_profile import RoomPinRotateRequest
+from app.schemas.bucket import BucketUploadLinkCreate
 
 
 def test_new_room_passcodes_are_six_numeric_digits() -> None:
@@ -116,18 +117,29 @@ def test_admin_intake_requires_a_matching_shape_room_pin() -> None:
         secure_room_pin="104293",
     )
     assert row.secure_room_pin == "104293"
-    with pytest.raises(ValidationError):
-        AdminLeadCreate(
-            full_name="Jane Owner",
-            email="jane@example.com",
-            business_name="Example LLC",
-            secure_room_pin="QC-104293",
-        )
+    for invalid in ("QC-104293", "Welcome123!", "١٢٣٤٥٦"):
+        with pytest.raises(ValidationError):
+            AdminLeadCreate(
+                full_name="Jane Owner",
+                email="jane@example.com",
+                business_name="Example LLC",
+                secure_room_pin=invalid,
+            )
+
+
+def test_admin_upload_links_accept_only_six_digit_room_pins() -> None:
+    assert (
+        BucketUploadLinkCreate(recipient_name="Robert Wake", passcode="989619").passcode
+        == "989619"
+    )
+    for invalid in ("Welcome123!", "12345", "1234567", "١٢٣٤٥٦"):
+        with pytest.raises(ValidationError):
+            BucketUploadLinkCreate(recipient_name="Robert Wake", passcode=invalid)
 
 
 def test_pin_rotation_accepts_only_six_numeric_digits() -> None:
     assert RoomPinRotateRequest(secure_room_pin="000014").secure_room_pin == "000014"
-    for invalid in ("12345", "1234567", "12A456"):
+    for invalid in ("12345", "1234567", "12A456", "١٢٣٤٥٦"):
         with pytest.raises(ValidationError):
             RoomPinRotateRequest(secure_room_pin=invalid)
 

@@ -799,7 +799,7 @@ class VerificationInvitationRead(BaseModel):
 
 
 class RoomPinRotateRequest(BaseModel):
-    secure_room_pin: str = Field(pattern=r"^\d{6}$")
+    secure_room_pin: str = Field(pattern=r"^[0-9]{6}$")
 
 
 class RoomDeliveryReceipt(BaseModel):
