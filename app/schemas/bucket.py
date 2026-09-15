@@ -264,6 +264,10 @@ class BucketRequestUploadedFileRead(ORMModel):
 
 
 class BucketRequestAccessRead(BaseModel):
+    # The generic upload room serves three distinct backends.  Returning the
+    # resolved kind after the PIN gate keeps the browser from probing the
+    # other two backends and treating their expected 404s as feature errors.
+    room_kind: Literal["dealer", "application", "basic"] = "basic"
     bucket: BucketRequestBucketRead
     recipient_name: str
     recipient_email: str | None

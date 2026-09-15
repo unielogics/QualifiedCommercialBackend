@@ -2918,6 +2918,7 @@ async def _request_access_read(
         .scalars()
         .first()
     )
+    room_kind = await _request_room_kind(db, link.bucket_id, profile)
     evidence_banking_summary = (
         await profiles.client_evidence_banking_summary(db, profile)
         if profile is not None
@@ -2942,6 +2943,7 @@ async def _request_access_read(
         db, requested_documents
     )
     return BucketRequestAccessRead(
+        room_kind=room_kind,
         bucket=BucketRequestBucketRead(name=link.bucket.name, client_name=link.bucket.client_name, purpose=link.bucket.purpose),
         recipient_name=link.recipient_name,
         recipient_email=link.recipient_email,
@@ -2957,6 +2959,30 @@ async def _request_access_read(
         ai_summary=upload_link_visible_summary(review, link.bucket),
         evidence_banking_summary=evidence_banking_summary,
     )
+
+
+async def _request_room_kind(
+    db: AsyncSession,
+    bucket_id: UUID,
+    profile: ApplicationProfile | None,
+) -> str:
+    """Resolve the public room backend once, after the PIN has been verified.
+
+    Application profiles are authoritative when present.  Older Dealer OS
+    rooms can predate their unified profile, so they need the small legacy
+    lookup before falling back to an upload-only room.
+    """
+
+    if profile is not None:
+        return "dealer" if profile.dealer_id is not None else "application"
+    dealer_id = (
+        await db.execute(
+            select(DealerBusiness.id)
+            .where(DealerBusiness.bucket_id == bucket_id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return "dealer" if dealer_id is not None else "basic"
 
 
 @router.post("/request/{token}/access", response_model=BucketRequestAccessRead)
