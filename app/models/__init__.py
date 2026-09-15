@@ -54,6 +54,10 @@ from app.models.application_profile import (  # noqa: F401
     FundingCategory,
     PlaidAssetReport,
 )
+from app.models.application_terms import (  # noqa: F401
+    ApplicationTermSheet,
+    ApplicationTermSheetDelivery,
+)
 from app.models.billing import (  # noqa: F401
     BillableExpense,
     ChargeAttempt,

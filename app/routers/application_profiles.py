@@ -805,6 +805,19 @@ async def apply_underwriting_changes(
             profile.underwriting_close_outcome = status_value
     if "approved_amount" in changes:
         profile.underwriting_approved_amount = changes["approved_amount"]
+    elif (
+        status_value in {"approved", "closed_won"}
+        and profile.underwriting_term_sheet_amount is not None
+    ):
+        # Client terms are the source of truth for the offer amount. Promoting
+        # the lifecycle must also populate the amount consumed by operator
+        # queues and funding-file summaries, even when no legacy manual amount
+        # field was edited.
+        profile.underwriting_approved_amount = profile.underwriting_term_sheet_amount
+        changes = {
+            **changes,
+            "approved_amount": float(profile.underwriting_term_sheet_amount),
+        }
     if "term_sheet_amount" in changes:
         profile.underwriting_term_sheet_amount = changes["term_sheet_amount"]
     if "current_dscr" in changes:

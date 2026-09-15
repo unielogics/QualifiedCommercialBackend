@@ -30,6 +30,7 @@ from app.routers import (
     analysis,
     application_communications,
     application_profiles,
+    application_terms,
     auth,
     billing,
     brokers,
@@ -242,6 +243,7 @@ for r in [
     analysis.router,
     file_team.router,  # before application_profiles: /find and /team/candidates are not profile ids
     application_communications.router,
+    application_terms.router,
     application_profiles.router,
     merchant_offers.router,
     production_packages.link_router,  # before the package router: /link/{token} is not a package id
