@@ -342,6 +342,10 @@ async def test_any_role_may_be_linked_and_the_house_is_the_default_for_staff():
         # An underwriter invited with nothing is linked to the house.
         out = await users_router.invite_user(users_router.UserInvite(email="uw@example.com", name="Cleo Desk", role=Role.LOAN_EXEC), _request(), db, current=_actor())
         assert out.referral_partner_company_id == house.id and out.company_kind == KIND_HOUSE
+        # A regional manager is internal staff too; leaving this role unlinked
+        # makes sponsorship and the Team profile disagree about its workspace.
+        out = await users_router.invite_user(users_router.UserInvite(email="rm@example.com", name="Robin Manager", role=Role.REGIONAL_MANAGER), _request(), db, current=_actor())
+        assert out.referral_partner_company_id == house.id and out.company_kind == KIND_HOUSE
         # A dealer partner still needs a company, and it can never be the house.
         with pytest.raises(HTTPException) as err:
             await users_router.invite_user(users_router.UserInvite(email="dp@example.com", name="Andy Gale", role=Role.DEALER_PARTNER), _request(), db, current=_actor())

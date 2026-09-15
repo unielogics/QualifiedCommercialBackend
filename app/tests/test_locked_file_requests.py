@@ -844,9 +844,14 @@ def test_password_protection_ignores_stale_analysis_and_includes_encrypted_zip()
         content_hash="zip-hash",
         extraction_reason='[{"entry":"locked.pdf","reason":"zip_entry_encrypted"}]',
     )
+    rejected_at_upload = SimpleNamespace(
+        content_hash=None,
+        extraction_reason='[{"reason":"password_protected_pdf"}]',
+    )
 
     assert locked_file_requests.is_password_protected_file(replaced, stale) is False
     assert locked_file_requests.is_password_protected_file(encrypted_zip, None) is True
+    assert locked_file_requests.is_password_protected_file(rejected_at_upload, None) is True
 
 
 @pytest.mark.asyncio

@@ -6,9 +6,9 @@ Two outbound flows merge into this table:
   * source='outbound_upload'   the operator drag-and-dropped or
                                browsed-to a fresh file in the
                                composer; we presigned-PUT it to S3
-                               and the resulting attachment row
-                               lives in `status='staged'` until the
-                               operator hits send. On send the
+                               and the resulting attachment row moves
+                               from `status='staged'` to `validated`
+                               after upload completion. On send the
                                reply handler flips status to
                                'committed' and links message_id.
   * source='system_doc_ref'    the operator picked an existing
@@ -83,7 +83,8 @@ class MessageAttachment(Base):
     """'outbound' | 'inbound' — denormalized so the timeline can render
     without joining through the matching Message row."""
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="staged")
-    """'staged' (upload pending or fresh, message_id NULL) |
+    """'staged' (upload pending, message_id NULL) |
+    'validated' (outbound bytes inspected and ready to send) |
     'committed' (linked to a Message and shouldn't be GC'd)."""
 
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(

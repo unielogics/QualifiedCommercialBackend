@@ -35,7 +35,7 @@ from app.schemas.document import (
     VaultTotals,
 )
 from app.scoping import scope_loan_query
-from app.services import calendar_emitter, file_events
+from app.services import calendar_emitter, file_events, upload_validation
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 
@@ -621,6 +621,76 @@ async def upload_complete(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     already_received = doc.status in (DocStatus.RECEIVED, DocStatus.VERIFIED)
+    if not already_received and (
+        not doc.s3_key
+        and doc.ai_scan_status == "failed"
+        and doc.ai_notes
+        in {
+            upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+            upload_validation.UPLOAD_TOO_LARGE_CODE,
+            upload_validation.UPLOAD_SIZE_MISMATCH_CODE,
+        }
+    ):
+        code = doc.ai_notes
+        if code == upload_validation.PASSWORD_PROTECTED_PDF_CODE:
+            response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+            message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+        elif code == upload_validation.UPLOAD_TOO_LARGE_CODE:
+            response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+            message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+        else:
+            response_status = status.HTTP_409_CONFLICT
+            message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+        raise HTTPException(
+            response_status,
+            detail={"code": code, "message": message},
+        )
+    if not already_received and doc.s3_key:
+        try:
+            await upload_validation.validate_s3_pdf_upload(
+                s3_key=doc.s3_key,
+                file_name=doc.name,
+                content_type=None,
+            )
+        except upload_validation.UploadInspectionUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_CODE,
+                    "message": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE,
+                },
+            ) from exc
+        except (
+            upload_validation.PasswordProtectedPDF,
+            upload_validation.UploadTooLarge,
+            upload_validation.UploadSizeMismatch,
+        ) as exc:
+            if isinstance(exc, upload_validation.PasswordProtectedPDF):
+                response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+                message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+            elif isinstance(exc, upload_validation.UploadTooLarge):
+                response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                code = upload_validation.UPLOAD_TOO_LARGE_CODE
+                message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+            else:
+                response_status = status.HTTP_409_CONFLICT
+                code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+                message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+            await upload_validation.discard_s3_upload(doc.s3_key)
+            doc.s3_key = None
+            doc.scan_dirty = False
+            doc.ai_scan_status = "failed"
+            # Store only the stable reason code. The detailed client-safe text
+            # is supplied by the structured response and never includes a
+            # password or any content from the PDF.
+            doc.ai_notes = code
+            await db.commit()
+            raise HTTPException(
+                response_status,
+                detail={"code": code, "message": message},
+            ) from exc
+
     doc.status = DocStatus.RECEIVED
     if doc.received_on is None:
         doc.received_on = date.today()

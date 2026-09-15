@@ -47,6 +47,7 @@ from app.services.bucket_evidence import (
     reconcile_uploaded_file,
     statement_months_from_filename,
 )
+from app.services.upload_validation import pdf_requires_password as _pdf_requires_password
 
 # The user and assistant rows of one chat turn are flushed together and share
 # a single created_at, so timestamp-only ordering can render an answer above
@@ -1607,23 +1608,6 @@ def _content_block(media_type: str, raw: bytes) -> dict[str, Any]:
     if media_type == "application/pdf":
         return {"type": "document", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": encoded}}
-
-
-def _pdf_requires_password(reader: PdfReader) -> bool:
-    """Distinguish an open-password lock from encryption used for permissions.
-
-    Some banks mark PDFs encrypted only to restrict editing/copying while still
-    allowing them to open with an empty user password.  PyPDF reports both
-    cases as ``is_encrypted``; only a failed empty-password decrypt is a client
-    remediation issue.
-    """
-
-    if not reader.is_encrypted:
-        return False
-    try:
-        return not bool(reader.decrypt(""))
-    except Exception:  # noqa: BLE001 - malformed encryption must fail closed
-        return True
 
 
 def _pdf_bytes_for_model(raw: bytes) -> bytes:

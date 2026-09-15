@@ -80,6 +80,7 @@ from app.routers.buckets import (
     _sanitize_upload_content_type,
     _stale_requested_document_error,
     _upload_url,
+    _validate_completed_bucket_file,
     _vendor_user_from_payload,
 )
 from app.routers.public import _available_booking_slots, _to_utc_minute
@@ -105,6 +106,7 @@ from app.services import (
     locked_file_requests,
     merchant_processing,
     provenance,
+    upload_validation,
 )
 from app.services.ai import engagement
 from app.services.ai.bedrock_client import get_client, model_light
@@ -119,6 +121,10 @@ from app.services.bucket_ai import (
     upload_link_visible_summary,
 )
 from app.services.dealer_ai_intelligence_pdf import render_dealer_intelligence_pdf
+from app.services.dealer_partner_access import (
+    DEALER_INTAKE_VARIANT,
+    require_dealer_partner_standing,
+)
 from app.services.email.ses_client import send_email, send_raw_email
 from app.services.email.user_mailer import send_as_user
 from app.services.foreclosure_rescue import FORECLOSURE_RESCUE_VARIANT
@@ -5504,6 +5510,15 @@ async def _complete_upload(
                 )
             except locked_file_requests.StaleUnlockedCopyRequest as exc:
                 raise _stale_requested_document_error(str(exc)) from exc
+        await _validate_completed_bucket_file(
+            db,
+            file,
+            request,
+            action="dealer_ai_file_upload_rejected",
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role=provenance.actor_role_for(file.source_kind or "client_room"),
+        )
         file.status = "uploaded"
         if req is not None:
             req.status = "uploaded"
@@ -6410,46 +6425,9 @@ async def _load_admin_dealer_lead(db: AsyncSession, intake_id: UUID) -> PublicUn
 
 
 async def _require_dealer_partner(user: CurrentUser, db: AsyncSession) -> None:
-    if user.role != Role.DEALER_PARTNER:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Dealer partner role required")
-    # Hard-block every broker endpoint until BOTH the individual (Platform
-    # Access Agreement) and their company (Referral Protection Agreement)
-    # have a signed ContractAgreement on file — see app/routers/contracts.py
-    # and app/services/contract_templates.py. This is the real enforcement
-    # point; the frontend gate in AppShell.tsx is UX on top of it.
-    from app.enums import ContractSubjectType, ContractType
-    from app.models.contract_agreement import ContractAgreement
-
-    individual_signed = (
-        await db.execute(
-            select(ContractAgreement.id).where(
-                ContractAgreement.contract_type == ContractType.PLATFORM_ACCESS,
-                ContractAgreement.subject_type == ContractSubjectType.USER,
-                ContractAgreement.subject_id == user.id,
-            )
-        )
-    ).first()
-    if individual_signed is None:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "You must sign the Platform Access Agreement before using the platform",
-        )
-    company_signed = None
-    if user.referral_partner_company_id is not None:
-        company_signed = (
-            await db.execute(
-                select(ContractAgreement.id).where(
-                    ContractAgreement.contract_type == ContractType.REFERRAL_PROTECTION,
-                    ContractAgreement.subject_type == ContractSubjectType.COMPANY,
-                    ContractAgreement.subject_id == user.referral_partner_company_id,
-                )
-            )
-        ).first()
-    if company_signed is None:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Your company must have a signed Referral Protection Agreement on file before using the platform",
-        )
+    # This is shared with operator-files/application-profiles so secondary
+    # interfaces cannot bypass the signed-agreement gate.
+    await require_dealer_partner_standing(db, user)
 
 
 async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID) -> PublicUnderwritingIntake:
@@ -6464,6 +6442,7 @@ async def _load_broker_dealer_lead(db: AsyncSession, user: User, intake_id: UUID
             .where(
                 PublicUnderwritingIntake.id == intake_id,
                 PublicUnderwritingIntake.broker_id == user.id,
+                PublicUnderwritingIntake.variant == DEALER_VARIANT,
             )
             .options(
                 selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.requested_documents).selectinload(BucketRequestedDocument.template_file),
@@ -6643,6 +6622,7 @@ async def list_dealer_ai_leads(
     status_filter: str | None = None,
     probability_status: str | None = None,
     variant_filter: str | None = None,
+    partner_user_id: UUID | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> DealerAILeadListResponse:
@@ -6667,6 +6647,8 @@ async def list_dealer_ai_leads(
     )
     if status_filter and status_filter != "all":
         stmt = stmt.where(PublicUnderwritingIntake.status == status_filter)
+    if partner_user_id is not None:
+        stmt = stmt.where(PublicUnderwritingIntake.broker_id == partner_user_id)
     if variant_filter and variant_filter != "all":
         if variant_filter == "dealer":
             stmt = stmt.where(PublicUnderwritingIntake.variant == DEALER_VARIANT)
@@ -7010,7 +6992,12 @@ class AssignPartnerRequest(BaseModel):
 
 async def _load_dealer_partner_user(db: AsyncSession, user_id: UUID) -> User:
     partner = await db.get(User, user_id)
-    if partner is None or partner.role != Role.DEALER_PARTNER or partner.deleted_at is not None:
+    if (
+        partner is None
+        or partner.role != Role.DEALER_PARTNER
+        or partner.deleted_at is not None
+        or getattr(partner, "account_status", "active") != "active"
+    ):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Selected user is not an active dealer partner.")
     return partner
 
@@ -7026,7 +7013,11 @@ async def list_dealer_partners(
     rows = (
         await db.execute(
             select(User)
-            .where(User.role == Role.DEALER_PARTNER, User.deleted_at.is_(None))
+            .where(
+                User.role == Role.DEALER_PARTNER,
+                User.deleted_at.is_(None),
+                User.account_status == "active",
+            )
             .order_by(User.name)
         )
     ).scalars().all()
@@ -7045,6 +7036,11 @@ async def assign_lead_partner(
     it reach that partner's channel. Setting None detaches the partner."""
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
+    if payload.broker_user_id is not None and intake.variant != DEALER_VARIANT:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Only auto-industry dealer intake files can be assigned to an Auto Dealer Agent.",
+        )
     if payload.broker_user_id is None:
         intake.broker_id = None
     else:
@@ -7707,6 +7703,7 @@ async def list_broker_dealer_leads(
         .where(
             Bucket.archived_at.is_(None),
             PublicUnderwritingIntake.broker_id == user.id,
+            PublicUnderwritingIntake.variant == DEALER_VARIANT,
             # A broker's own deletion request hides the lead from their own
             # board immediately — the lead stays fully intact and visible to
             # admin (with a pending badge) until admin separately confirms.
@@ -7755,6 +7752,7 @@ async def broker_dealer_channel_inbox(
         .where(
             Bucket.archived_at.is_(None),
             PublicUnderwritingIntake.broker_id == user.id,
+            PublicUnderwritingIntake.variant == DEALER_VARIANT,
             PublicUnderwritingIntake.delete_requested_at.is_(None),
         )
         .options(selectinload(PublicUnderwritingIntake.bucket).selectinload(Bucket.notes))
@@ -9512,6 +9510,23 @@ async def dealer_ai_lead_ingest_from_drive(
             fname, data, ctype = got
             content_type = _sanitize_upload_content_type(ctype)
             safe = _safe_filename(fname)
+            try:
+                upload_validation.validate_upload_bytes(
+                    data,
+                    file_name=fname,
+                    content_type=content_type,
+                )
+            except upload_validation.PasswordProtectedPDF:
+                items.append(
+                    DriveIngestItemResult(
+                        drive_file_id=file_id,
+                        file_name=fname,
+                        status="skipped",
+                        reason=upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+                    )
+                )
+                skipped += 1
+                continue
             # Content-level idempotency: hash the downloaded bytes and skip if a
             # byte-identical active file is already in the bucket. Using the hash
             # (not name+size) avoids both a false "already there" on a coincidental
@@ -10624,7 +10639,7 @@ def _require_funding_intake(intake: PublicUnderwritingIntake) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Funding review not found")
 
 
-DEALER_VARIANT = "dealer_gatekeeper_v1"
+DEALER_VARIANT = DEALER_INTAKE_VARIANT
 MAIN_STREET_VARIANT = "main_street_v1"
 MCA_VARIANT = "mca_refi_v1"
 MCA_PUBLIC_PATH = "/mca-refinance-intake"

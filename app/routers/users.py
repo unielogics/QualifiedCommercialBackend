@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -45,7 +47,33 @@ router = APIRouter(prefix="/users", tags=["users"])
 # Every employee is linked to a business relationship profile. These are the
 # roles that are the house's own people: with no company on the invite they
 # are linked to the house row, and their link can be changed but never cleared.
-HOUSE_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.FIELD_REP})
+HOUSE_ROLES: frozenset[Role] = frozenset(
+    {Role.SUPER_ADMIN, Role.LOAN_EXEC, Role.REGIONAL_MANAGER, Role.FIELD_REP}
+)
+TEAM_INVITABLE_ROLES: frozenset[Role] = frozenset(
+    {
+        Role.SUPER_ADMIN,
+        Role.LOAN_EXEC,
+        Role.REGIONAL_MANAGER,
+        Role.BROKER,
+        Role.FIELD_REP,
+        Role.DEALER_PARTNER,
+        Role.PROFESSIONAL_REFERRAL_PARTNER,
+    }
+)
+
+
+def _login_state(user: User) -> str:
+    if getattr(user, "account_status", "active") == "suspended":
+        return "suspended"
+    clerk_id = getattr(user, "clerk_id", None)
+    if clerk_id and not clerk_id.startswith("pending:"):
+        return "active"
+    if getattr(user, "last_invite_status", None) == "failed":
+        return "invite_failed"
+    if getattr(user, "last_invited_at", None) is not None:
+        return "invited"
+    return "not_invited"
 
 
 def _account_types(user: User) -> list[str]:
@@ -132,6 +160,12 @@ class UserRead(BaseModel):
     platform_access_signed_at: datetime | None = None
     platform_access_contract_number: str | None = None
     created_at: datetime | None = None
+    account_status: Literal["active", "suspended"] = "active"
+    login_state: Literal["active", "suspended", "invited", "invite_failed", "not_invited"] = "not_invited"
+    last_seen_at: datetime | None = None
+    last_invited_at: datetime | None = None
+    last_invite_status: str | None = None
+    last_invite_error: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -247,6 +281,7 @@ async def _with_company(db: AsyncSession, user: User, result: UserRead) -> UserR
     """The linked profile on a user read: name, kind, and whether it really signed."""
     result.account_types = _account_types(user)
     result.inherited_account_types = sorted(inherited_console_keys(user.role))
+    result.login_state = _login_state(user)  # type: ignore[assignment]
     if user.referral_partner_company_id is not None:
         company = await db.get(ReferralPartnerCompany, user.referral_partner_company_id)
         result.referral_partner_company_name = company.name if company else None
@@ -407,6 +442,7 @@ async def list_users(db: AsyncSession = Depends(get_db)) -> list[UserRead]:
         user_read = UserRead.model_validate(r)
         user_read.account_types = _account_types(r)
         user_read.inherited_account_types = sorted(inherited_console_keys(r.role))
+        user_read.login_state = _login_state(r)  # type: ignore[assignment]
         if r.referral_partner_company_id is not None:
             company = companies.get(r.referral_partner_company_id)
             user_read.referral_partner_company_name = company.name if company else None
@@ -463,6 +499,11 @@ async def invite_user(
             status.HTTP_400_BAD_REQUEST,
             "VENDOR role belongs to bucket vendor access — use /buckets/admin/vendors.",
         )
+    if body.role not in TEAM_INVITABLE_ROLES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This role requires its dedicated onboarding workflow and cannot be invited from Team.",
+        )
     company_name = (body.company_name or "").strip()
     requested_access = set(body.account_types or [])
     _check_console_grants(body.role, requested_access)
@@ -500,6 +541,9 @@ async def invite_user(
         existing.referral_partner_company_id = referral_partner_company_id
         existing.account_access_types = sorted(requested_access)
         existing.phone = store_phone(body.phone) or existing.phone
+        existing.account_status = "active"
+        existing.suspended_at = None
+        existing.suspended_by_user_id = None
         user = existing
     else:
         user = User(
@@ -510,6 +554,7 @@ async def invite_user(
             referral_partner_company_id=referral_partner_company_id,
             account_access_types=sorted(requested_access),
             phone=store_phone(body.phone),
+            account_status="active",
         )
         db.add(user)
 
@@ -520,7 +565,7 @@ async def invite_user(
     # Land them on the app they actually work in. Without this the invite goes
     # to the desktop sign-up page, and a field rep or client signs in somewhere
     # their role has no access and gets bounced with no explanation.
-    await clerk_service.invite_user(
+    invitation = await clerk_service.invite_user(
         email=body.email,
         name=body.name,
         role=body.role,
@@ -528,9 +573,206 @@ async def invite_user(
         account_types=console_keys(user),
         account_status=getattr(user, "account_status", None) or "active",
     )
+    user.last_invited_at = datetime.now(UTC)
+    user.last_invite_status = "sent" if invitation is not None else "failed"
+    user.last_invite_error = None if invitation is not None else "Clerk invitation was not accepted"
     await _tell_clerk_and_record(db, user=user, actor=current, request=request, action="team_access.invited", before=None)
 
     return await _with_company(db, user, UserRead.model_validate(user))
+
+
+class TeamAccessActionResult(BaseModel):
+    user_id: UUID
+    account_status: Literal["active", "suspended"]
+    invitation_sent: bool = False
+    sessions_revoked: bool = False
+    reset_instructions_sent: bool = False
+    message: str
+
+
+class TeamAccountStatusPatch(BaseModel):
+    account_status: Literal["active", "suspended"]
+    reason: str = Field(min_length=8, max_length=500)
+
+
+async def _active_team_user(db: AsyncSession, user_id: UUID) -> User:
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None or user.deleted_at is not None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if user.role not in TEAM_INVITABLE_ROLES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This account is managed in its dedicated access area.")
+    return user
+
+
+@router.post("/{user_id}/resend-invite", response_model=TeamAccessActionResult)
+async def resend_team_invite(
+    user_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+) -> TeamAccessActionResult:
+    user = await _active_team_user(db, user_id)
+    if user.clerk_id and not user.clerk_id.startswith("pending:"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This login is already active. Send password-reset instructions or revoke its sessions instead.",
+        )
+    invitation = await clerk_service.invite_user(
+        email=user.email,
+        name=user.name,
+        role=user.role,
+        redirect_url=_invite_landing(user.role),
+        account_types=console_keys(user),
+        account_status=user.account_status,
+    )
+    user.last_invited_at = datetime.now(UTC)
+    user.last_invite_status = "sent" if invitation is not None else "failed"
+    user.last_invite_error = None if invitation is not None else "Clerk invitation was not accepted"
+    record_access_event(
+        db,
+        user_id=user.id,
+        actor_user_id=current.id,
+        action="team_access.invite_resent",
+        reason=None,
+        before_state=console_state(user),
+        after_state=console_state(user),
+        metadata=request_metadata(
+            ip_address=_request_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        ),
+    )
+    sent = invitation is not None
+    return TeamAccessActionResult(
+        user_id=user.id,
+        account_status=user.account_status,
+        invitation_sent=sent,
+        message="Invitation sent." if sent else "Invitation could not be sent. Check the Clerk configuration and try again.",
+    )
+
+
+@router.post("/{user_id}/send-password-reset", response_model=TeamAccessActionResult)
+async def send_team_password_reset(
+    user_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+) -> TeamAccessActionResult:
+    """Email a safe self-service reset entry point; administrators never set passwords."""
+
+    user = await _active_team_user(db, user_id)
+    if not user.clerk_id or user.clerk_id.startswith("pending:"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This account has not accepted its invitation yet. Resend the invitation instead.")
+    from app.services.email.user_mailer import send_as_user
+
+    reset_url = f"{get_settings().frontend_app_url.rstrip('/')}/forgot-password?email={quote(user.email)}"
+    delivery = await send_as_user(
+        db,
+        current.id,
+        to_emails=[user.email],
+        subject="Reset your Qualified Commercial password",
+        body_text=(
+            f"Hello {user.name or 'there'},\n\n"
+            "An administrator sent you the Qualified Commercial password-reset page. "
+            "Open the link below and request your private six-digit reset code. "
+            "Administrators cannot see or set your password.\n\n"
+            f"{reset_url}\n"
+        ),
+    )
+    record_access_event(
+        db,
+        user_id=user.id,
+        actor_user_id=current.id,
+        action="team_access.password_reset_sent" if delivery.ok else "team_access.password_reset_failed",
+        reason=None,
+        before_state=console_state(user),
+        after_state=console_state(user),
+        metadata={
+            **request_metadata(ip_address=_request_ip(request), user_agent=request.headers.get("user-agent")),
+            "delivery": delivery.detail,
+        },
+    )
+    return TeamAccessActionResult(
+        user_id=user.id,
+        account_status=user.account_status,
+        reset_instructions_sent=delivery.ok,
+        message="Password-reset instructions sent." if delivery.ok else "Password-reset instructions could not be delivered.",
+    )
+
+
+@router.post("/{user_id}/revoke-sessions", response_model=TeamAccessActionResult)
+async def revoke_team_sessions(
+    user_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+) -> TeamAccessActionResult:
+    user = await _active_team_user(db, user_id)
+    if current.id == user.id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You cannot revoke your own sessions from Team.")
+    revoked = await clerk_service.revoke_user_sessions(user.clerk_id or "")
+    record_access_event(
+        db,
+        user_id=user.id,
+        actor_user_id=current.id,
+        action="team_access.sessions_revoked",
+        reason=None,
+        before_state=console_state(user),
+        after_state=console_state(user),
+        metadata=request_metadata(ip_address=_request_ip(request), user_agent=request.headers.get("user-agent")),
+    )
+    return TeamAccessActionResult(
+        user_id=user.id,
+        account_status=user.account_status,
+        sessions_revoked=revoked,
+        message="Active sessions revoked." if revoked else "No active Clerk sessions were revoked.",
+    )
+
+
+@router.patch("/{user_id}/account-status", response_model=TeamAccessActionResult)
+async def update_team_account_status(
+    user_id: UUID,
+    body: TeamAccountStatusPatch,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current: User = Depends(require_role(Role.SUPER_ADMIN)),
+) -> TeamAccessActionResult:
+    user = await _active_team_user(db, user_id)
+    if current.id == user.id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You cannot suspend your own super-admin account.")
+    before = console_state(user)
+    suspended = body.account_status == "suspended"
+    user.account_status = body.account_status
+    user.suspended_at = datetime.now(UTC) if suspended else None
+    user.suspended_by_user_id = current.id if suspended else None
+    await db.flush()
+    clerk_updated = await clerk_service.set_user_suspended(user.clerk_id or "", suspended)
+    sessions_revoked = await clerk_service.revoke_user_sessions(user.clerk_id or "") if suspended else False
+    if user.clerk_id:
+        await clerk_service.update_user_access_metadata(
+            user.clerk_id,
+            role=user.role,
+            account_types=console_keys(user),
+            account_status=user.account_status,
+        )
+    record_access_event(
+        db,
+        user_id=user.id,
+        actor_user_id=current.id,
+        action="team_access.suspended" if suspended else "team_access.activated",
+        reason=body.reason.strip(),
+        before_state=before,
+        after_state=console_state(user),
+        metadata={
+            **request_metadata(ip_address=_request_ip(request), user_agent=request.headers.get("user-agent")),
+            "clerk_updated": clerk_updated,
+        },
+    )
+    return TeamAccessActionResult(
+        user_id=user.id,
+        account_status=user.account_status,
+        sessions_revoked=sessions_revoked,
+        message="Login suspended and access blocked." if suspended else "Login reactivated.",
+    )
 
 
 @router.patch(

@@ -7,8 +7,8 @@ Three insertion paths into `message_attachments`:
        returns a presigned S3 PUT URL the browser uses to ship the
        file directly to S3.
   2. POST /loans/{id}/lender-thread/attachment/upload-complete
-     → flips the row's status confirmation flag (kept as 'staged'
-       until actually attached to a send).
+     → validates the object and flips status to 'validated' until
+       it is actually attached to a send.
   3. POST /loans/{id}/lender-thread/attachment/from-doc
      → creates a `system_doc_ref` row pointing at an existing
        Document.s3_key. No S3 copy — the row re-references.
@@ -82,6 +82,16 @@ def _safe_filename(raw: str) -> str:
     can't break out of the prefix."""
     out = re.sub(r"[\\/\x00-\x1f]", "_", raw).strip()
     return out[:200] or "untitled"
+
+
+def attachment_is_ready_for_send(attachment: MessageAttachment) -> bool:
+    """Return whether an outbound reference passed its required completion gate."""
+
+    if attachment.source == "outbound_upload":
+        return attachment.status == "validated"
+    if attachment.source == "system_doc_ref":
+        return attachment.status == "staged"
+    return False
 
 
 async def init_outbound_upload(
@@ -215,6 +225,14 @@ async def commit_attachments_to_message(
             log.warning(
                 "attachment %s already committed to message %s; skipping",
                 r.id, r.message_id,
+            )
+            continue
+        if not attachment_is_ready_for_send(r):
+            log.warning(
+                "attachment %s is not ready for send (source=%s status=%s); skipping",
+                r.id,
+                r.source,
+                r.status,
             )
             continue
         r.message_id = message_id

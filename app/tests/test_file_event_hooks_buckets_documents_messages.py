@@ -272,6 +272,7 @@ async def _receive(doc_status, *, source_deal_id):
     db = SimpleNamespace(get=AsyncMock(side_effect=[doc, loan]), add=lambda row: None, flush=AsyncMock(), refresh=AsyncMock())
     emit = AsyncMock()
     with patch.object(documents_router, "_can_access_loan", AsyncMock(return_value=True)), \
+         patch.object(documents_router.upload_validation, "validate_s3_pdf_upload", AsyncMock()), \
          patch.object(documents_router, "mark_loan_dirty", AsyncMock()), \
          patch.object(documents_router, "DocumentRead", SimpleNamespace(model_validate=lambda row: row)), \
          patch("app.services.notifications.notify_document_uploaded", AsyncMock()), \

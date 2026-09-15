@@ -36,6 +36,7 @@ from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
 from app.services import production_packages as pkgs
 from app.services import production_presentation as pres
+from app.services import upload_validation
 from app.services.payment_authorization import (
     client_ip,
     decode_signature_data_url,
@@ -1025,6 +1026,21 @@ async def complete_scan(db: AsyncSession, access: pkgs.PackageAccess, *, signatu
     raw = storage.get_bytes(sig.scan_s3_key)
     if raw is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "The scan has not been uploaded yet.")
+    try:
+        upload_validation.validate_pdf_bytes(
+            raw,
+            file_name=sig.scan_s3_key,
+            content_type=None,
+        )
+    except upload_validation.PasswordProtectedPDF as exc:
+        await upload_validation.discard_s3_upload(sig.scan_s3_key)
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+                "message": upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE,
+            },
+        ) from exc
     actual = hashlib.sha256(raw).hexdigest()
     if actual != sha256.lower():
         raise HTTPException(status.HTTP_409_CONFLICT, "The uploaded scan does not match the fingerprint you sent.")

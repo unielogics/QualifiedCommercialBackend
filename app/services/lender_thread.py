@@ -792,6 +792,7 @@ async def post_reply(
     if attachment_ids:
         from app.models.message_attachment import MessageAttachment as _MA
         from app.services.lender_attachments import (
+            attachment_is_ready_for_send,
             materialize_attachments_for_send,
         )
 
@@ -803,6 +804,10 @@ async def post_reply(
                 )
             )
         ).scalars().all()
+        if any(not attachment_is_ready_for_send(att) for att in staged_atts):
+            raise LenderThreadError(
+                "Complete each new attachment upload before sending the reply."
+            )
         materialized_attachments = await materialize_attachments_for_send(staged_atts)
 
     sent_message_id, note = _gmail_send_or_skip(

@@ -75,12 +75,12 @@ def test_console_grants_are_ignored_for_client_roles() -> None:
 
 def test_audit_alone_is_not_a_grant_for_a_broker_and_the_manager_is_not_rep_tier() -> None:
     # An "audit" value stored on its own (old data) opens nothing and does
-    # not make the broker rep-tier; a regional manager's Field Desk is a
-    # sign-in only — the rep tier stays exactly as it was.
+    # not make the broker rep-tier. Regional managers cannot be granted Field
+    # Desk until Dealer OS has a region-scoped view, and remain funding-only.
     assert is_rep(SimpleNamespace(role=Role.BROKER, account_access_types=["audit"], deleted_at=None, account_status="active")) is False
     assert _account_types(SimpleNamespace(role=Role.BROKER, account_access_types=["audit"])) == ["funding"]
     assert is_rep(SimpleNamespace(role=Role.REGIONAL_MANAGER, account_access_types=["field_desk"], deleted_at=None, account_status="active")) is False
-    assert _account_types(SimpleNamespace(role=Role.REGIONAL_MANAGER, account_access_types=["field_desk"])) == ["field_desk", "funding"]
+    assert _account_types(SimpleNamespace(role=Role.REGIONAL_MANAGER, account_access_types=["field_desk"])) == ["funding"]
 
 
 def test_super_admin_inherits_all_operator_accounts() -> None:

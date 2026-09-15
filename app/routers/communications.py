@@ -53,6 +53,10 @@ from app.scoping import scope_client_query, scope_loan_query
 from app.services import file_events, inline_images
 from app.services.communication_events import HEARTBEAT_SECONDS, user_audience
 from app.services.communication_events import broker as communication_event_broker
+from app.services.dealer_partner_access import (
+    DEALER_INTAKE_VARIANT,
+    require_dealer_partner_standing,
+)
 from app.services.user_access import is_audit_client
 
 log = logging.getLogger(__name__)
@@ -260,7 +264,11 @@ async def _visible_intakes(db: AsyncSession, user: User) -> list[PublicUnderwrit
     if user.role in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         pass
     elif user.role == Role.DEALER_PARTNER:
-        stmt = stmt.where(PublicUnderwritingIntake.broker_id == user.id)
+        await require_dealer_partner_standing(db, user)
+        stmt = stmt.where(
+            PublicUnderwritingIntake.broker_id == user.id,
+            PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
+        )
     elif user.role in (Role.CLIENT, Role.BROKER, Role.REGIONAL_MANAGER):
         client_ids = scope_client_query(user, select(Client.id))
         stmt = stmt.where(PublicUnderwritingIntake.client_id.in_(client_ids))

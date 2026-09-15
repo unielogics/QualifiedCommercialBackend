@@ -45,6 +45,7 @@ from app.services.team_calendar import INHERITABLE_BOOKING_FIELDS, effective_boo
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
 from app.schemas.stored_signature import StoredSignatureAdoptBody, StoredSignatureState
 from app.services import stored_signatures as stored_sigs
+from app.services import upload_validation
 
 router = APIRouter(prefix="/me", tags=["me"])
 log = logging.getLogger(__name__)
@@ -1437,6 +1438,68 @@ async def ai_knowledge_upload_complete(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
 
     if doc.status != "ready":
+        if (
+            doc.status == "rejected"
+            and doc.error
+            in {
+                upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE,
+                upload_validation.UPLOAD_TOO_LARGE_MESSAGE,
+                upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE,
+            }
+        ):
+            if doc.error == upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE:
+                response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+            elif doc.error == upload_validation.UPLOAD_TOO_LARGE_MESSAGE:
+                response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                code = upload_validation.UPLOAD_TOO_LARGE_CODE
+            else:
+                response_status = status.HTTP_409_CONFLICT
+                code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+            raise HTTPException(
+                response_status,
+                detail={"code": code, "message": doc.error},
+            )
+        try:
+            await upload_validation.validate_s3_pdf_upload(
+                s3_key=doc.s3_key,
+                file_name=doc.filename,
+                content_type=doc.content_type,
+                expected_size_bytes=doc.size_bytes,
+            )
+        except upload_validation.UploadInspectionUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_CODE,
+                    "message": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE,
+                },
+            ) from exc
+        except (
+            upload_validation.PasswordProtectedPDF,
+            upload_validation.UploadTooLarge,
+            upload_validation.UploadSizeMismatch,
+        ) as exc:
+            if isinstance(exc, upload_validation.PasswordProtectedPDF):
+                response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+                message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+            elif isinstance(exc, upload_validation.UploadTooLarge):
+                response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                code = upload_validation.UPLOAD_TOO_LARGE_CODE
+                message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+            else:
+                response_status = status.HTTP_409_CONFLICT
+                code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+                message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+            await upload_validation.discard_s3_upload(doc.s3_key)
+            doc.status = "rejected"
+            doc.error = message
+            await db.commit()
+            raise HTTPException(
+                response_status,
+                detail={"code": code, "message": message},
+            ) from exc
         await parse_document_inline(db, doc)
 
     return _KnowledgeDocumentOut(

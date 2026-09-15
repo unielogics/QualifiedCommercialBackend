@@ -626,7 +626,16 @@ async def resolve_user_from_headers(
 
 
 def _enforce_account_active(user: User, request: Request) -> None:
-    """Deny suspended accounts everywhere except the identity status read."""
+    """Deny removed/suspended accounts at the common authentication boundary."""
+
+    if getattr(user, "deleted_at", None) is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "account_removed",
+                "message": "This login has been removed. Contact your administrator.",
+            },
+        )
 
     if getattr(user, "account_status", "active") != "suspended":
         return

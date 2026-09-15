@@ -61,13 +61,12 @@ _INHERITED_CONSOLES: dict[Role, frozenset[str]] = {
     Role.FIELD_REP: frozenset({"field_desk", "audit"}),
 }
 # What a super admin may toggle per role, beyond what the role inherits.
-# Audit is never a standalone grant for a broker or a regional manager: it
-# arrives with Field Desk or not at all. A regional manager's Field Desk is
-# offered but is not rep-tier (see _REP_TIER_GRANT_ROLES) — one constant if
-# the owner wants it.
+# Audit is never a standalone grant for a broker: it arrives with Field Desk
+# or not at all. Regional managers stay in the scoped Funding workspace until
+# Dealer OS has an equally scoped regional view; granting its global Field
+# Desk would otherwise expose the wrong industry workspace.
 _STANDALONE_GRANTS: dict[Role, frozenset[str]] = {
     Role.BROKER: frozenset({"field_desk"}),
-    Role.REGIONAL_MANAGER: frozenset({"field_desk"}),
     Role.FIELD_REP: frozenset({"funding"}),
 }
 CONSOLE_GRANT_ROLES: frozenset[Role] = frozenset(_STANDALONE_GRANTS)

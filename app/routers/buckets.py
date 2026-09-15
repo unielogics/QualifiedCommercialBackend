@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import json
 import logging
 import re
 import secrets
@@ -127,7 +128,7 @@ from app.schemas.bucket import (
 )
 from app.services import application_profiles as profiles
 from app.services import clerk as clerk_service
-from app.services import file_events, locked_file_requests, provenance
+from app.services import file_events, locked_file_requests, provenance, upload_validation
 from app.services.ai import engagement
 from app.services.bucket_ai import (
     CHAT_TURN_ORDER,
@@ -2177,6 +2178,124 @@ async def _reconcile_completed_bucket_file(
         await enqueue_file_analysis(db, target)
 
 
+def _password_protected_pdf_error() -> HTTPException:
+    return HTTPException(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "code": upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+            "message": upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE,
+        },
+    )
+
+
+def _upload_inspection_unavailable_error() -> HTTPException:
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "code": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_CODE,
+            "message": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE,
+        },
+    )
+
+
+def _upload_validation_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, upload_validation.PasswordProtectedPDF):
+        code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+        message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+        status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+    elif isinstance(exc, upload_validation.UploadTooLarge):
+        code = upload_validation.UPLOAD_TOO_LARGE_CODE
+        message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+        status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    else:
+        code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+        message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+        status_code = status.HTTP_409_CONFLICT
+    return HTTPException(status_code, detail={"code": code, "message": message})
+
+
+async def _validate_completed_bucket_file(
+    db: AsyncSession,
+    file: BucketFile,
+    request: Request | None,
+    *,
+    action: str,
+    user: User | None = None,
+    actor_name: str | None = None,
+    actor_email: str | None = None,
+    actor_role: str | None = None,
+) -> None:
+    """Reject a locked PDF before any upload-complete side effects run."""
+
+    if getattr(file, "status", None) == "rejected":
+        prior_reason = getattr(file, "extraction_reason", None) or ""
+        if upload_validation.PASSWORD_PROTECTED_PDF_CODE in prior_reason:
+            raise _password_protected_pdf_error()
+        if upload_validation.UPLOAD_TOO_LARGE_CODE in prior_reason:
+            raise _upload_validation_error(
+                upload_validation.UploadTooLarge(upload_validation.UPLOAD_TOO_LARGE_MESSAGE)
+            )
+        if upload_validation.UPLOAD_SIZE_MISMATCH_CODE in prior_reason:
+            raise _upload_validation_error(
+                upload_validation.UploadSizeMismatch(
+                    upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+                )
+            )
+    s3_key = getattr(file, "s3_key", None)
+    if not s3_key:
+        # BucketFile.s3_key is non-null in production. Keeping this a no-op also
+        # preserves local development where a storage upload is unavailable.
+        return
+    try:
+        await upload_validation.validate_s3_pdf_upload(
+            s3_key=s3_key,
+            file_name=getattr(file, "file_name", None),
+            content_type=getattr(file, "content_type", None),
+            expected_size_bytes=getattr(file, "size_bytes", None),
+        )
+    except upload_validation.UploadInspectionUnavailable as exc:
+        raise _upload_inspection_unavailable_error() from exc
+    except (
+        upload_validation.PasswordProtectedPDF,
+        upload_validation.UploadTooLarge,
+        upload_validation.UploadSizeMismatch,
+    ) as exc:
+        error = _upload_validation_error(exc)
+        reason = error.detail["code"]
+        file.status = "rejected"
+        file.extraction_status = "rejected"
+        file.extraction_reason = json.dumps(
+            [
+                {
+                    "entry": getattr(file, "file_name", "PDF"),
+                    "reason": reason,
+                }
+            ]
+        )
+        file.delete_storage_status = (
+            "deleted"
+            if await upload_validation.discard_s3_upload(s3_key)
+            else "delete_failed"
+        )
+        await _log(
+            db,
+            file.bucket_id,
+            action,
+            request=request,
+            user=user,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            actor_role=actor_role,
+            target_type="file",
+            target_id=str(file.id),
+            detail=f"Upload rejected before completion: {reason}.",
+        )
+        # Persist the rejection so a retry cannot accidentally complete the
+        # same quarantined row. The requested-document remains outstanding.
+        await db.commit()
+        raise error from exc
+
+
 @router.post("/admin/{bucket_id}/files/complete", response_model=BucketFileRead)
 async def admin_upload_complete(
     bucket_id: UUID,
@@ -2228,6 +2347,13 @@ async def admin_upload_complete(
             await _log(db, bucket_id, "admin_file_upload_failed", request=request, user=user, target_type="requested_document", target_id=str(req.id), detail="complete failed: stale unlocked-copy request")
             await db.commit()
             raise _stale_requested_document_error(str(exc)) from exc
+    await _validate_completed_bucket_file(
+        db,
+        file,
+        request,
+        action="admin_file_upload_rejected",
+        user=user,
+    )
     file.status = "uploaded"
     # A requires_signature item is satisfied by SIGNING, which produces its
     # certificate through the sign flow — never by an arbitrary upload.
@@ -3010,6 +3136,15 @@ async def request_upload_complete(
             await _log(db, link.bucket_id, "file_upload_failed", request=request, actor_name=file.uploaded_by_name or link.recipient_name, actor_email=file.uploaded_by_email or link.recipient_email, actor_role="uploader", target_type="requested_document", target_id=str(req.id), detail="complete failed: stale unlocked-copy request")
             await db.commit()
             raise _stale_requested_document_error(str(exc)) from exc
+    await _validate_completed_bucket_file(
+        db,
+        file,
+        request,
+        action="file_upload_rejected",
+        actor_name=file.uploaded_by_name or link.recipient_name,
+        actor_email=file.uploaded_by_email or link.recipient_email,
+        actor_role="uploader",
+    )
     file.status = "uploaded"
     link.completed_at = _now()
     if req:

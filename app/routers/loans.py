@@ -33,7 +33,7 @@ from app.schemas.document import (
 )
 from app.schemas.loan import FreeCalcRequest, LoanCreate, LoanRead, LoanUpdate, PropertyUpdate, RecalcRequest, RecalcResponse, SizingBreakdown, StageTransition, TodoItemRead
 from app.models.app_settings import AppSettings
-from app.services import calendar_emitter, file_events
+from app.services import calendar_emitter, file_events, upload_validation
 from app.services.activity_log import mark_loan_dirty
 from app.services.ai.vector_store import log_event as vector_log
 from app.services.lender_connect import (
@@ -1578,10 +1578,7 @@ async def lender_attachment_upload_complete(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AttachmentReadOnly:
-    """Browser calls this after the S3 PUT completes. We don't HEAD
-    the object (boto's signed PUT already enforces size+content-type
-    server-side), just mark the row ready-for-send and return its
-    metadata."""
+    """Validate the S3 object and mark it ready for a lender reply."""
     if user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
     from app.models.message_attachment import MessageAttachment
@@ -1596,10 +1593,74 @@ async def lender_attachment_upload_complete(
     ).scalar_one_or_none()
     if att is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Attachment not found")
-    # We don't flip status here; staged → committed flip happens when
-    # the reply handler commits attachments to a Message. This call
-    # is mainly for the future when we want to validate the upload
-    # actually succeeded (e.g., HEAD against S3).
+    rejected_states = {
+        "locked_rejected": (
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+            upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE,
+        ),
+        "size_rejected": (
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            upload_validation.UPLOAD_TOO_LARGE_CODE,
+            upload_validation.UPLOAD_TOO_LARGE_MESSAGE,
+        ),
+        "mismatch_reject": (
+            status.HTTP_409_CONFLICT,
+            upload_validation.UPLOAD_SIZE_MISMATCH_CODE,
+            upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE,
+        ),
+    }
+    if att.status in rejected_states:
+        response_status, code, message = rejected_states[att.status]
+        raise HTTPException(
+            response_status,
+            detail={"code": code, "message": message},
+        )
+    if att.source == "outbound_upload":
+        try:
+            await upload_validation.validate_s3_pdf_upload(
+                s3_key=att.s3_key,
+                file_name=att.filename,
+                content_type=att.mime_type,
+                expected_size_bytes=att.size_bytes,
+                max_bytes=18 * 1024 * 1024,
+            )
+        except upload_validation.UploadInspectionUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_CODE,
+                    "message": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE,
+                },
+            ) from exc
+        except (
+            upload_validation.PasswordProtectedPDF,
+            upload_validation.UploadTooLarge,
+            upload_validation.UploadSizeMismatch,
+        ) as exc:
+            if isinstance(exc, upload_validation.PasswordProtectedPDF):
+                response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+                message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+                att.status = "locked_rejected"
+            elif isinstance(exc, upload_validation.UploadTooLarge):
+                response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                code = upload_validation.UPLOAD_TOO_LARGE_CODE
+                message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+                att.status = "size_rejected"
+            else:
+                response_status = status.HTTP_409_CONFLICT
+                code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+                message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+                att.status = "mismatch_reject"
+            await upload_validation.discard_s3_upload(att.s3_key)
+            await db.commit()
+            raise HTTPException(
+                response_status,
+                detail={"code": code, "message": message},
+            ) from exc
+        att.status = "validated"
+        await db.commit()
     return AttachmentReadOnly(
         attachment_id=str(att.id),
         filename=att.filename,

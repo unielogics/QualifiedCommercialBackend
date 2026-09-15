@@ -330,7 +330,7 @@ def test_external_rows_ignore_console_grants() -> None:
 def test_what_a_role_may_be_granted() -> None:
     assert allowed_console_keys(Role.SUPER_ADMIN) == {"funding", "field_desk", "audit"}
     assert allowed_console_keys(Role.BROKER) == {"funding", "field_desk"}
-    assert allowed_console_keys(Role.REGIONAL_MANAGER) == {"funding", "field_desk"}
+    assert allowed_console_keys(Role.REGIONAL_MANAGER) == {"funding"}
     assert allowed_console_keys(Role.FIELD_REP) == {"field_desk", "audit", "funding"}
     assert allowed_console_keys(Role.DEALER_PARTNER) == set() and allowed_console_keys(Role.CLIENT) == set()
 

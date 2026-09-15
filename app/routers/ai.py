@@ -42,6 +42,7 @@ from app.models.loan import Loan
 from app.models.prequal_request import PrequalRequest
 from app.models.user import User
 from app.scoping import scope_client_query, scope_loan_query
+from app.services import upload_validation
 from app.services.ai.bedrock_client import get_client, model_light
 from app.services.ai.context import Audience, assemble_loan_context
 from app.services.ai.usage import tracked_messages_create
@@ -1599,6 +1600,90 @@ async def append_thread_message(
             status.HTTP_400_BAD_REQUEST,
             "Message must include body text, an attachment, or both.",
         )
+
+    # The message send is the completion boundary for chat attachments. Check
+    # every pending object before persisting the user's message or starting AI
+    # work, otherwise a locked PDF would briefly become received evidence.
+    if attachment_tokens and thread.loan_id is not None:
+        for token in attachment_tokens:
+            doc = await db.get(Document, token)
+            if doc is None or doc.loan_id != thread.loan_id or doc.status != DocStatus.PENDING:
+                continue
+            if (
+                not doc.s3_key
+                and doc.ai_scan_status == "failed"
+                and doc.ai_notes
+                in {
+                    upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+                    upload_validation.UPLOAD_TOO_LARGE_CODE,
+                    upload_validation.UPLOAD_SIZE_MISMATCH_CODE,
+                }
+            ):
+                code = doc.ai_notes
+                if code == upload_validation.PASSWORD_PROTECTED_PDF_CODE:
+                    response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                    message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+                elif code == upload_validation.UPLOAD_TOO_LARGE_CODE:
+                    response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                    message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+                else:
+                    response_status = status.HTTP_409_CONFLICT
+                    message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+                raise HTTPException(
+                    response_status,
+                    detail={
+                        "code": code,
+                        "message": message,
+                        "file_id": str(doc.id),
+                    },
+                )
+            if not doc.s3_key:
+                continue
+            try:
+                await upload_validation.validate_s3_pdf_upload(
+                    s3_key=doc.s3_key,
+                    file_name=doc.name,
+                    content_type=doc.category,
+                )
+            except upload_validation.UploadInspectionUnavailable as exc:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_CODE,
+                        "message": upload_validation.UPLOAD_INSPECTION_UNAVAILABLE_MESSAGE,
+                    },
+                ) from exc
+            except (
+                upload_validation.PasswordProtectedPDF,
+                upload_validation.UploadTooLarge,
+                upload_validation.UploadSizeMismatch,
+            ) as exc:
+                if isinstance(exc, upload_validation.PasswordProtectedPDF):
+                    response_status = status.HTTP_422_UNPROCESSABLE_ENTITY
+                    code = upload_validation.PASSWORD_PROTECTED_PDF_CODE
+                    message = upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE
+                elif isinstance(exc, upload_validation.UploadTooLarge):
+                    response_status = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+                    code = upload_validation.UPLOAD_TOO_LARGE_CODE
+                    message = upload_validation.UPLOAD_TOO_LARGE_MESSAGE
+                else:
+                    response_status = status.HTTP_409_CONFLICT
+                    code = upload_validation.UPLOAD_SIZE_MISMATCH_CODE
+                    message = upload_validation.UPLOAD_SIZE_MISMATCH_MESSAGE
+                await upload_validation.discard_s3_upload(doc.s3_key)
+                doc.s3_key = None
+                doc.scan_dirty = False
+                doc.ai_scan_status = "failed"
+                doc.ai_notes = code
+                await db.commit()
+                raise HTTPException(
+                    response_status,
+                    detail={
+                        "code": code,
+                        "message": message,
+                        "file_id": str(doc.id),
+                    },
+                ) from exc
 
     # 1. Persist the user's message immediately so the panel can
     #    optimistic-render or recover after an Bedrock failure.

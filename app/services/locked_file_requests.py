@@ -26,6 +26,7 @@ from app.models.bucket import (
 )
 from app.models.user import User
 from app.services.email.user_mailer import send_as_user
+from app.services.upload_validation import PASSWORD_PROTECTED_PDF_CODE
 
 REQUEST_KIND = "password_protected_replacement"
 ACTION_KIND = "unlocked_copy_request"
@@ -140,14 +141,16 @@ def is_password_protected_analysis(analysis: BucketFileAnalysis | None) -> bool:
 
 
 def is_password_protected_file(file: BucketFile, analysis: BucketFileAnalysis | None) -> bool:
-    """Include encrypted members recorded against a ZIP transport container."""
+    """Include upload-time rejects and encrypted ZIP members in lock state."""
 
     analysis_is_current = bool(
         analysis
         and (not getattr(file, "content_hash", None) or analysis.content_hash == file.content_hash)
     )
+    extraction_reason = getattr(file, "extraction_reason", None) or ""
     return (analysis_is_current and is_password_protected_analysis(analysis)) or bool(
-        getattr(file, "extraction_reason", None) and "zip_entry_encrypted" in file.extraction_reason
+        "zip_entry_encrypted" in extraction_reason
+        or PASSWORD_PROTECTED_PDF_CODE in extraction_reason
     )
 
 

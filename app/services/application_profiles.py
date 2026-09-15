@@ -76,6 +76,11 @@ from app.services.bucket_evidence import (
     statement_months_from_analysis,
     statement_months_from_filename,
 )
+from app.services.dealer_partner_access import (
+    DEALER_INTAKE_VARIANT,
+    dealer_partner_intake_is_owned,
+    require_dealer_partner_standing,
+)
 from app.services.extracted_facts import (
     accepted_review_group_keys,
     fact_review_group_key,
@@ -585,6 +590,8 @@ def profile_read(profile: ApplicationProfile) -> ApplicationProfileRead:
 async def _profile_is_visible(
     db: AsyncSession, profile: ApplicationProfile, user: User
 ) -> bool:
+    if user.role == Role.DEALER_PARTNER:
+        await require_dealer_partner_standing(db, user)
     if profile.dealer_id:
         is_training = (
             await db.execute(
@@ -607,14 +614,16 @@ async def _profile_is_visible(
             except HTTPException:
                 return False
         if user.role == Role.DEALER_PARTNER and profile.intake_id:
-            intake_owner = (
+            visible_intake = (
                 await db.execute(
-                    select(PublicUnderwritingIntake.broker_id).where(
-                        PublicUnderwritingIntake.id == profile.intake_id
+                    select(PublicUnderwritingIntake.id).where(
+                        PublicUnderwritingIntake.id == profile.intake_id,
+                        PublicUnderwritingIntake.broker_id == user.id,
+                        PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
                     )
                 )
             ).scalar_one_or_none()
-            return intake_owner == user.id
+            return visible_intake is not None
     if profile.loan_id:
         visible = (
             await db.execute(
@@ -633,7 +642,18 @@ async def _profile_is_visible(
         ).scalar_one_or_none()
         if visible is not None:
             return True
-    if profile.intake_id and user.role in {Role.DEALER_PARTNER, Role.FIELD_REP}:
+    if profile.intake_id and user.role == Role.DEALER_PARTNER:
+        visible_intake = (
+            await db.execute(
+                select(PublicUnderwritingIntake.id).where(
+                    PublicUnderwritingIntake.id == profile.intake_id,
+                    PublicUnderwritingIntake.broker_id == user.id,
+                    PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
+                )
+            )
+        ).scalar_one_or_none()
+        return visible_intake is not None
+    if profile.intake_id and user.role == Role.FIELD_REP:
         owner = (
             await db.execute(
                 select(PublicUnderwritingIntake.broker_id).where(
@@ -657,6 +677,8 @@ async def load_profile(
 async def _load_source(
     db: AsyncSession, source_kind: str, source_id: UUID, user: User
 ) -> Deal | Loan | PublicUnderwritingIntake | DealerBusiness:
+    if user.role == Role.DEALER_PARTNER:
+        await require_dealer_partner_standing(db, user)
     if source_kind == "deal":
         source = await db.get(Deal, source_id)
         if source:
@@ -679,7 +701,9 @@ async def _load_source(
         source = await db.get(PublicUnderwritingIntake, source_id)
         if source is not None and user.role not in (Role.SUPER_ADMIN, Role.LOAN_EXEC):
             allowed = False
-            if user.role in {Role.DEALER_PARTNER, Role.FIELD_REP}:
+            if user.role == Role.DEALER_PARTNER:
+                allowed = dealer_partner_intake_is_owned(user, source)
+            elif user.role == Role.FIELD_REP:
                 allowed = source.broker_id == user.id
             elif source.client_id:
                 allowed = (

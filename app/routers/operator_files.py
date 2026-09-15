@@ -74,6 +74,10 @@ from app.scoping import regional_manager_broker_ids_subquery, scope_client_query
 from app.services import application_profiles as profiles
 from app.services import file_events
 from app.services.activity_log import log_activity, mark_loan_dirty
+from app.services.dealer_partner_access import (
+    DEALER_INTAKE_VARIANT,
+    require_dealer_partner_standing,
+)
 from app.services.operator_file_links import (
     active_links_for_sources,
     queue_link_change_review,
@@ -668,7 +672,10 @@ def _scope_intake_stmt(user: User, stmt):
             Client, Client.id == PublicUnderwritingIntake.client_id, isouter=True
         ).where(Client.broker_id.in_(regional_manager_broker_ids_subquery(user)))
     if user.role == Role.DEALER_PARTNER:
-        return stmt.where(PublicUnderwritingIntake.broker_id == user.id)
+        return stmt.where(
+            PublicUnderwritingIntake.broker_id == user.id,
+            PublicUnderwritingIntake.variant == DEALER_INTAKE_VARIANT,
+        )
     return stmt.where(sql_false())
 
 
@@ -1103,6 +1110,8 @@ async def _decorate_durable_links(rows: list[UnifiedFileRow], user: User, db: As
 
 
 async def _all_rows(user: User, db: AsyncSession) -> list[UnifiedFileRow]:
+    if user.role == Role.DEALER_PARTNER:
+        await require_dealer_partner_standing(db, user)
     rows: list[UnifiedFileRow] = []
     rows.extend(await _deal_rows(user, db))
     rows.extend(await _loan_rows(user, db))

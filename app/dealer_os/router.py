@@ -74,7 +74,7 @@ from app.services import calendar_v2
 from app.services.activity_log import log_activity
 from app.services import booking_notify, booking_reminders, provenance
 from app.services.notifications import notify_inbound_communication, notify_users
-from app.services import file_events, merchant_processing
+from app.services import file_events, merchant_processing, upload_validation
 from app.services.team_calendar import (
     effective_booking_settings,
     lock_calendar_owner,
@@ -524,6 +524,30 @@ from .services.targets import propose_targets
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dealer-os", tags=["dealer-os"])
+
+
+def _validate_user_pdf_bytes(
+    raw: bytes,
+    *,
+    file_name: str | None,
+    content_type: str | None,
+) -> None:
+    """Apply the same locked-PDF contract to multipart upload endpoints."""
+
+    try:
+        upload_validation.validate_upload_bytes(
+            raw,
+            file_name=file_name,
+            content_type=content_type,
+        )
+    except upload_validation.PasswordProtectedPDF as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": upload_validation.PASSWORD_PROTECTED_PDF_CODE,
+                "message": upload_validation.PASSWORD_PROTECTED_PDF_MESSAGE,
+            },
+        ) from exc
 
 _TRAINING_LIVE_ACTION_HEADER = "x-qc-training-live-action"
 
@@ -1973,6 +1997,11 @@ async def upload_contract_template_version(
     raw = await file.read()
     if len(raw) > 20 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF templates are limited to 20 MB.")
+    _validate_user_pdf_bytes(
+        raw,
+        file_name=file.filename,
+        content_type=file.content_type,
+    )
     anchor_values = (signature_x, signature_y, signature_date_x, signature_date_y)
     if any(value is not None for value in anchor_values) and not all(
         value is not None for value in anchor_values
@@ -2678,6 +2707,11 @@ async def upload_contract_template(
     raw = await file.read()
     if len(raw) > 25 * 1024 * 1024:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF larger than 25MB.")
+    _validate_user_pdf_bytes(
+        raw,
+        file_name=file.filename,
+        content_type=file.content_type,
+    )
     try:
         tpl = await contract_registry.ingest_template(
             db, key=key, pdf_bytes=raw, uploaded_by=user
@@ -4974,6 +5008,11 @@ async def upload_document(
         )
     filename = storage.safe_filename(file.filename)
     content_type = (file.content_type or "application/octet-stream")[:120]
+    _validate_user_pdf_bytes(
+        raw,
+        file_name=filename,
+        content_type=content_type,
+    )
 
     # Doc hub (0114): a ZIP expands into a parent 'archive' row + one child
     # row per usable entry (returned row = the PARENT; the list endpoint
