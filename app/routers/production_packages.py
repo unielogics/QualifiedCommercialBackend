@@ -8,14 +8,20 @@ application profile), the rep surface under /production-packages/shares/{token}
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+import hashlib
+from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.dealer_os.models import DealerAuditLog
 from app.deps import CurrentUser
+from app.models.production_package import ProductionTermSheet
+from app.models.referral_partner_company import ReferralPartnerCompany
 from app.schemas.production_package import (
     ProductionCapabilitiesRead,
     ProductionComparisonRead,
@@ -37,14 +43,21 @@ from app.schemas.production_package import (
     ProductionSmsConsentCapture,
     ProductionSmsConsentRead,
     ProductionTermSheetBody,
+    ProductionTermSheetEmailRequest,
+    ProductionTermSheetEmailResult,
     ProductionTermSheetResult,
     ProductionTermSheetState,
     SponsorCompanyUpdate,
     SponsorOptionRead,
 )
+from app.services import application_profiles as profiles
+from app.services import file_contacts
 from app.services import production_arrangement as pa
 from app.services import production_packages as svc
 from app.services import production_term_sheets as sheets_svc
+from app.services.email.user_mailer import send_as_user
+from app.services.production_term_sheet_pdf import filename_for as term_pdf_filename
+from app.services.production_term_sheet_pdf import render_term_sheet_pdf
 
 router = APIRouter(prefix="/production-packages", tags=["production-packages"])
 
@@ -81,6 +94,92 @@ async def _profile_access(db: AsyncSession, profile_id: UUID, user: CurrentUser)
     return await svc.resolve_package(db, profile_id, user)
 
 
+def _require_sheet_version(sheet: ProductionTermSheet, expected_version: int, action: str) -> None:
+    if sheet.version != expected_version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"A newer loan-terms version is available. Reload the file before {action}.",
+        )
+
+
+async def _locked_current_sheet(
+    db: AsyncSession,
+    access: svc.PackageAccess,
+    expected_version: int,
+    action: str,
+) -> ProductionTermSheet:
+    sheet = access.term_sheet
+    if sheet is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Record the loan terms before creating the client PDF")
+    locked = await db.get(ProductionTermSheet, sheet.id, with_for_update=True)
+    if locked is None or locked.status != "current":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"A newer loan-terms version is available. Reload the file before {action}.",
+        )
+    _require_sheet_version(locked, expected_version, action)
+    return locked
+
+
+async def _term_pdf_context(
+    db: AsyncSession,
+    access: svc.PackageAccess,
+) -> tuple[str, str | None, str | None]:
+    business_name, _email, _phone = await svc.client_contact(db, access)
+    sources = await file_contacts.load_sources(db, access.profile)
+    recipient = await file_contacts.client_recipient(db, access.profile, sources)
+    sponsor_name = "UrChoice"
+    if access.package.sponsor_company_id:
+        sponsor = await db.get(ReferralPartnerCompany, access.package.sponsor_company_id)
+        if sponsor is not None and sponsor.name.strip():
+            sponsor_name = sponsor.name.strip()
+    return business_name, recipient.name, sponsor_name
+
+
+async def _render_client_term_pdf(
+    db: AsyncSession,
+    access: svc.PackageAccess,
+    sheet: ProductionTermSheet,
+) -> tuple[bytes, str]:
+    business_name, client_name, sponsor_name = await _term_pdf_context(db, access)
+    pdf = await asyncio.to_thread(
+        render_term_sheet_pdf,
+        sheet,
+        business_name=business_name,
+        client_name=client_name,
+        sponsor_name=sponsor_name,
+    )
+    return pdf, term_pdf_filename(sheet, business_name)
+
+
+async def _email_delivery_audit(
+    db: AsyncSession,
+    *,
+    dealer_id: UUID,
+    delivery_key: UUID,
+) -> list[DealerAuditLog]:
+    return list(
+        (
+            await db.execute(
+                select(DealerAuditLog)
+                .where(
+                    DealerAuditLog.dealer_id == dealer_id,
+                    DealerAuditLog.entity_kind == "production_term_sheet",
+                    DealerAuditLog.action.in_(
+                        (
+                            "production_term_sheet.email_queued",
+                            "production_term_sheet.emailed",
+                            "production_term_sheet.email_failed",
+                        )
+                    ),
+                    DealerAuditLog.after["delivery_key"].astext == str(delivery_key),
+                )
+                .order_by(DealerAuditLog.created_at.desc())
+            )
+        ).scalars().all()
+    )
+
+
 @router.get("/term-sheets/{profile_id}", response_model=ProductionTermSheetState)
 async def read_term_sheet(profile_id: UUID, user: CurrentUser, db: AsyncSession = Depends(get_db)) -> ProductionTermSheetState:
     if user.role not in svc.OPERATOR_ROLES:
@@ -104,6 +203,170 @@ async def record_term_sheet(
         child_access = await svc.load_package_access(db, reapplied.id, user)
         final_read = await svc.serialize(db, child_access)
     return ProductionTermSheetResult(state=state, final=final_read)
+
+
+@router.get("/term-sheets/{profile_id}/client.pdf")
+async def client_term_sheet_pdf(
+    profile_id: UUID,
+    expected_version: int,
+    user: CurrentUser,
+    disposition: Literal["inline", "attachment"] = "inline",
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Preview or download the current dealer loan terms without duplicating them."""
+    sheets_svc.require_term_role(user)
+    access = await _profile_access(db, profile_id, user)
+    sheet = await _locked_current_sheet(db, access, expected_version, "opening the PDF")
+    pdf, filename = await _render_client_term_pdf(db, access, sheet)
+    digest = hashlib.sha256(pdf).hexdigest()
+    action = "production_term_sheet.pdf_previewed" if disposition == "inline" else "production_term_sheet.pdf_downloaded"
+    await profiles.log_profile_action(
+        db,
+        access.profile,
+        user,
+        action,
+        f"{'Previewed' if disposition == 'inline' else 'Downloaded'} client loan terms v{sheet.version}",
+        target_type="production_term_sheet",
+        target_id=sheet.id,
+        metadata={"version": sheet.version, "pdf_sha256": digest, "disposition": disposition},
+    )
+    await db.commit()
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post(
+    "/term-sheets/{profile_id}/client/email",
+    response_model=ProductionTermSheetEmailResult,
+)
+async def email_client_term_sheet(
+    profile_id: UUID,
+    payload: ProductionTermSheetEmailRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProductionTermSheetEmailResult:
+    """Email one explicit ProductionTermSheet version to operator-confirmed recipients."""
+    sheets_svc.require_term_role(user)
+    access = await _profile_access(db, profile_id, user)
+    if access.profile.dealer_id is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This dealer file is missing its audit owner")
+    sheet = await _locked_current_sheet(db, access, payload.expected_version, "sending the PDF")
+    sources = await file_contacts.load_sources(db, access.profile)
+    if sources.intake is not None and sources.intake.client_contact_suppressed:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Direct client contact is suppressed on this referral-managed file. Download the PDF and route it through the referring professional.",
+        )
+
+    previous = await _email_delivery_audit(
+        db,
+        dealer_id=access.profile.dealer_id,
+        delivery_key=payload.delivery_key,
+    )
+    if previous and any(row.entity_id != sheet.id for row in previous):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This delivery key belongs to a different loan-terms version")
+    if previous:
+        latest = previous[0]
+        details = latest.after or {}
+        if latest.action == "production_term_sheet.emailed":
+            return ProductionTermSheetEmailResult(
+                sent=True,
+                filename=str(details.get("filename") or "Loan-Terms.pdf"),
+                message_id=details.get("message_id"),
+                detail=details.get("provider"),
+            )
+        if latest.action == "production_term_sheet.email_queued":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This delivery is already in progress. Check the audit trail before sending again.",
+            )
+
+    pdf, filename = await _render_client_term_pdf(db, access, sheet)
+    digest = hashlib.sha256(pdf).hexdigest()
+    to_emails = [str(value) for value in payload.to_emails]
+    cc_emails = [str(value) for value in payload.cc_emails]
+    audit_common = {
+        "delivery_key": str(payload.delivery_key),
+        "version": sheet.version,
+        "filename": filename,
+        "pdf_sha256": digest,
+        "to": to_emails,
+        "cc": cc_emails,
+    }
+    await profiles.log_profile_action(
+        db,
+        access.profile,
+        user,
+        "production_term_sheet.email_queued",
+        f"Queued client loan terms v{sheet.version} for email delivery",
+        target_type="production_term_sheet",
+        target_id=sheet.id,
+        metadata=audit_common,
+    )
+    # Persist the idempotency claim before crossing the email-provider boundary.
+    # A crash is intentionally fail-closed: the operator must review the audit
+    # trail and use a new key rather than risk a duplicate client email.
+    await db.commit()
+    try:
+        result = await send_as_user(
+            db,
+            user.id,
+            to_emails=to_emails,
+            cc_emails=cc_emails or None,
+            subject=payload.subject.strip(),
+            body_text=payload.body.strip(),
+            attachments=[(filename, pdf, "application/pdf")],
+        )
+    except Exception as exc:  # noqa: BLE001
+        await profiles.log_profile_action(
+            db,
+            access.profile,
+            user,
+            "production_term_sheet.email_failed",
+            f"Client loan terms v{sheet.version} could not be delivered",
+            target_type="production_term_sheet",
+            target_id=sheet.id,
+            metadata={**audit_common, "provider": "transport_exception"},
+        )
+        await db.commit()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The email could not be sent. The audit trail was preserved.") from exc
+    if not result.ok:
+        await profiles.log_profile_action(
+            db,
+            access.profile,
+            user,
+            "production_term_sheet.email_failed",
+            f"Client loan terms v{sheet.version} could not be delivered",
+            target_type="production_term_sheet",
+            target_id=sheet.id,
+            metadata={**audit_common, "provider": result.detail},
+        )
+        await db.commit()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "The email provider did not accept the message. The audit trail was preserved.")
+    await profiles.log_profile_action(
+        db,
+        access.profile,
+        user,
+        "production_term_sheet.emailed",
+        f"Emailed client loan terms v{sheet.version}",
+        target_type="production_term_sheet",
+        target_id=sheet.id,
+        metadata={**audit_common, "provider": result.detail, "message_id": result.message_id},
+    )
+    await db.commit()
+    return ProductionTermSheetEmailResult(
+        sent=True,
+        filename=filename,
+        message_id=result.message_id,
+        detail=result.detail,
+    )
 
 
 @router.post("/term-sheets/{profile_id}/withdraw", response_model=ProductionTermSheetState)

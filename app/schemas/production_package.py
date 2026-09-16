@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.schemas.application_profile import UnifiedAuditEvent
 
@@ -304,6 +304,36 @@ class ProductionTermSheetState(BaseModel):
 class ProductionTermSheetResult(BaseModel):
     state: ProductionTermSheetState
     final: ProductionPackageRead | None = None
+
+
+class ProductionTermSheetEmailRequest(BaseModel):
+    """An explicit, operator-confirmed delivery of one saved sheet version."""
+
+    expected_version: int = Field(ge=1)
+    delivery_key: UUID
+    to_emails: list[EmailStr] = Field(min_length=1, max_length=10)
+    cc_emails: list[EmailStr] = Field(default_factory=list, max_length=10)
+    subject: str = Field(min_length=3, max_length=200)
+    body: str = Field(min_length=3, max_length=5000)
+
+    @field_validator("to_emails", "cc_emails")
+    @classmethod
+    def unique_emails(cls, values: list[EmailStr]) -> list[EmailStr]:
+        seen: set[str] = set()
+        result: list[EmailStr] = []
+        for value in values:
+            key = str(value).strip().lower()
+            if key and key not in seen:
+                result.append(value)
+                seen.add(key)
+        return result
+
+
+class ProductionTermSheetEmailResult(BaseModel):
+    sent: bool
+    filename: str
+    message_id: str | None = None
+    detail: str | None = None
 
 
 class ProductionComparisonRead(BaseModel):
