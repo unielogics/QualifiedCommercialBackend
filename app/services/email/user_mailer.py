@@ -32,9 +32,11 @@ async def _try_gmail_send_as_user(
     to_emails: list[str],
     subject: str,
     body_text: str,
+    body_html: str | None,
     cc_emails: list[str] | None,
     bcc_emails: list[str] | None,
     attachments: list[tuple[str, bytes, str]] | None,
+    headers: dict[str, str] | None,
 ) -> SesSendResult | None:
     """Send via the sender's connected Gmail. Returns a result on success/failure
     of the Gmail path, or None when the user simply isn't connected (so the caller
@@ -66,10 +68,12 @@ async def _try_gmail_send_as_user(
             to=", ".join(to_emails),
             subject=subject,
             body=body_text,
+            body_html=body_html,
             from_email=from_email,
             cc=cc_emails,
             bcc=bcc_emails,
             attachments=gmail_attachments,
+            headers=headers,
         )
         resp = svc.users().messages().send(userId="me", body={"raw": built.raw_base64}).execute()
         return resp.get("id"), resp.get("threadId")
@@ -98,12 +102,12 @@ async def send_as_user(
     cc_emails: list[str] | None = None,
     bcc_emails: list[str] | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> SesSendResult:
     """Send from the sender's connected Gmail when available, else firm SES.
 
     - sender_user_id None → straight to SES.
-    - Gmail connected → send via their Gmail (bcc supported; body_html is not
-      used on the Gmail path, which sends the plain-text body).
+    - Gmail connected → send via their Gmail (bcc and multipart HTML supported).
     - Not connected → SES send_raw_email (cc + attachments + html supported; no bcc).
     """
     if sender_user_id is not None:
@@ -113,9 +117,11 @@ async def send_as_user(
             to_emails=to_emails,
             subject=subject,
             body_text=body_text,
+            body_html=body_html,
             cc_emails=cc_emails,
             bcc_emails=bcc_emails,
             attachments=attachments,
+            headers=headers,
         )
         if gmail_result is not None:
             return gmail_result
@@ -135,4 +141,5 @@ async def send_as_user(
         cc_emails=cc_emails,
         bcc_emails=bcc_emails,
         attachments=attachments,
+        headers=headers,
     )

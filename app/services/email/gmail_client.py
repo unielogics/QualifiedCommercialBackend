@@ -140,10 +140,12 @@ def build_message(
     to: str,
     subject: str,
     body: str,
+    body_html: str | None = None,
     from_email: str | None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> BuiltMessage:
     """Pure helper — constructs the EmailMessage + base64 raw form WITHOUT
     sending. `from_email` is normally the GmailConfig.delegated_user but
@@ -169,7 +171,20 @@ def build_message(
     if from_email:
         msg["From"] = from_email
     msg["Subject"] = subject
+    allowed_headers = {
+        "message-id": "Message-ID",
+        "x-qc-offer-correlation": "X-QC-Offer-Correlation",
+        "list-unsubscribe": "List-Unsubscribe",
+        "list-unsubscribe-post": "List-Unsubscribe-Post",
+    }
+    for raw_name, raw_value in (headers or {}).items():
+        name = allowed_headers.get(str(raw_name).strip().lower())
+        value = str(raw_value or "").strip()
+        if name and value and "\r" not in value and "\n" not in value:
+            msg[name] = value
     msg.set_content(body)
+    if body_html:
+        msg.add_alternative(body_html, subtype="html")
     for att in attachments or []:
         filename = att.get("filename") or "attachment"
         mime_type = att.get("mime_type") or "application/octet-stream"
@@ -203,9 +218,11 @@ def send_message(
     to: str,
     subject: str,
     body: str,
+    body_html: str | None = None,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Tier-3: send a message via the delegated mailbox. Supports
     optional Cc / Bcc recipients and MIME attachments — same shape as
@@ -221,10 +238,12 @@ def send_message(
         to=to,
         subject=subject,
         body=body,
+        body_html=body_html,
         from_email=cfg.delegated_user,
         cc=cc,
         bcc=bcc,
         attachments=attachments,
+        headers=headers,
     )
     svc = get_gmail_service(cfg)
     return svc.users().messages().send(userId="me", body={"raw": built.raw_base64}).execute()

@@ -104,6 +104,7 @@ def send_raw_email(
     cc_emails: list[str] | None = None,
     bcc_emails: list[str] | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> SesSendResult:
     """Send a MIME email through SES.
 
@@ -134,6 +135,17 @@ def send_raw_email(
         if cc:
             msg["Cc"] = ", ".join(cc)
         msg["Subject"] = subject
+        allowed_headers = {
+            "message-id": "Message-ID",
+            "x-qc-offer-correlation": "X-QC-Offer-Correlation",
+            "list-unsubscribe": "List-Unsubscribe",
+            "list-unsubscribe-post": "List-Unsubscribe-Post",
+        }
+        for raw_name, raw_value in (headers or {}).items():
+            name = allowed_headers.get(str(raw_name).strip().lower())
+            value = str(raw_value or "").strip()
+            if name and value and "\r" not in value and "\n" not in value:
+                msg[name] = value
         msg.set_content(body_text)
         if body_html:
             msg.add_alternative(body_html, subtype="html")

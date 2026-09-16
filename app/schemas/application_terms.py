@@ -108,6 +108,7 @@ class ClientTermsCalculation(BaseModel):
 
 class ClientTermsRead(BaseModel):
     profile_id: UUID
+    term_sheet_id: UUID | None = None
     version: int = 0
     status: Literal["not_started", "draft", "issued"] = "not_started"
     loan_type: str | None = None

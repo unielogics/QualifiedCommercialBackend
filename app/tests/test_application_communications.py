@@ -332,6 +332,11 @@ async def test_attachment_options_omit_raw_offer_and_oversized_evidence(
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
+        communications.application_terms,
+        "current_term_sheet",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
         communications.profiles,
         "evidence_state",
         AsyncMock(
@@ -536,12 +541,14 @@ async def test_thread_email_passes_exact_attachments_to_outbox(
         subject="Your reviewed options",
         body="Please review the attached files.",
         attachments=attachments,
+        headers={"X-QC-Offer-Correlation": "qc-offer-test-1"},
     )
 
     draft = deliver.await_args.args[1]
     assert draft.attachments == attachments
     assert draft.to == "client@example.com"
     assert draft.cc == ["owner@example.com"]
+    assert draft.headers == {"X-QC-Offer-Correlation": "qc-offer-test-1"}
     assert thread.provider_thread_id == "gmail-thread-1"
     assert message.message_send_id == row_id
 

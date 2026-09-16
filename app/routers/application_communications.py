@@ -33,6 +33,7 @@ from app.dealer_os.services import storage as dealer_storage
 from app.deps import CurrentUser
 from app.enums import Role
 from app.models.application_profile import ApplicationOwner, ApplicationProfile
+from app.models.application_terms import ApplicationTermSheet
 from app.models.bucket import BucketFile
 from app.models.client import Client
 from app.models.lender import Lender
@@ -45,8 +46,10 @@ from app.models.user import User
 from app.routers import application_profiles as profile_routes
 from app.schemas.application_profile import FileCreditInviteRequest, VerificationInvitationCreate
 from app.services import application_profiles as profiles
-from app.services import file_contacts, production_term_sheets
+from app.services import application_terms, file_contacts, production_term_sheets
 from app.services import merchant_processing as merchant_offers
+from app.services.application_terms_pdf import filename_for as application_terms_filename
+from app.services.application_terms_pdf import render_terms_pdf
 from app.services.merchant_offer_pdf import filename_for as merchant_offer_filename
 from app.services.merchant_offer_pdf import render_merchant_offer_pdf
 from app.services.messaging import outbox
@@ -168,6 +171,12 @@ class ProductionTermSheetEmailAttachmentRef(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class ApplicationTermSheetEmailAttachmentRef(BaseModel):
+    kind: Literal["application_term_sheet"]
+    term_sheet_id: UUID
+    expected_version: int = Field(ge=1)
+
+
 class EvidenceFileEmailAttachmentRef(BaseModel):
     kind: Literal["evidence_file"]
     file_id: UUID
@@ -176,13 +185,16 @@ class EvidenceFileEmailAttachmentRef(BaseModel):
 ApplicationEmailAttachmentRef = Annotated[
     MerchantOfferEmailAttachmentRef
     | ProductionTermSheetEmailAttachmentRef
+    | ApplicationTermSheetEmailAttachmentRef
     | EvidenceFileEmailAttachmentRef,
     Field(discriminator="kind"),
 ]
 
 
 class ApplicationEmailAttachmentOption(BaseModel):
-    kind: Literal["merchant_offer", "production_term_sheet", "evidence_file"]
+    kind: Literal[
+        "merchant_offer", "production_term_sheet", "application_term_sheet", "evidence_file"
+    ]
     id: UUID
     label: str
     file_name: str
@@ -382,6 +394,19 @@ async def _email_attachment_options(
             )
         )
 
+    application_sheet = await application_terms.current_term_sheet(db, profile.id)
+    if application_sheet is not None:
+        options.append(
+            ApplicationEmailAttachmentOption(
+                kind="application_term_sheet",
+                id=application_sheet.id,
+                label=f"Application financing terms v{application_sheet.version}",
+                file_name=application_terms_filename(application_sheet, business_name),
+                content_type="application/pdf",
+                expected_version=application_sheet.version,
+            )
+        )
+
     evidence = await profiles.evidence_state(db, profile)
     raw_offer_ids = await _raw_merchant_offer_file_ids(db, profile.id)
     for item in evidence.files:
@@ -434,7 +459,7 @@ async def _resolve_email_attachments(
     for ref in refs:
         if ref.kind == "merchant_offer":
             key = (ref.kind, ref.offer_id)
-        elif ref.kind == "production_term_sheet":
+        elif ref.kind in {"production_term_sheet", "application_term_sheet"}:
             key = (ref.kind, ref.term_sheet_id)
         else:
             key = (ref.kind, ref.file_id)
@@ -511,6 +536,46 @@ async def _resolve_email_attachments(
                     "The client loan-terms PDF could not be rendered.",
                 ) from exc
             filename = production_terms_filename(sheet, business)
+            content_type = "application/pdf"
+            source_id = sheet.id
+            source_version = sheet.version
+        elif ref.kind == "application_term_sheet":
+            sheet = await application_terms.current_term_sheet(db, profile.id)
+            if sheet is None or sheet.id != ref.term_sheet_id or not sheet.is_current:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A newer application term sheet is available. Reload the email before sending.",
+                )
+            sheet = await db.get(ApplicationTermSheet, sheet.id, with_for_update=True)
+            if sheet is None or not sheet.is_current or sheet.version != ref.expected_version:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "The application terms changed. Reload the email before sending.",
+                )
+            sources = await file_contacts.load_sources(db, profile)
+            recipient = await file_contacts.client_recipient(db, profile, sources)
+            application_terms.issue(sheet)
+            try:
+                if sheet.issued_pdf_bytes:
+                    data = bytes(sheet.issued_pdf_bytes)
+                else:
+                    data = await asyncio.to_thread(
+                        render_terms_pdf,
+                        sheet,
+                        business_name=file_contacts.business_label(sources),
+                        client_name=recipient.name,
+                    )
+                    sheet.issued_pdf_bytes = data
+                    sheet.issued_pdf_sha256 = hashlib.sha256(data).hexdigest()
+                    sheet.issued_filename = application_terms_filename(
+                        sheet, file_contacts.business_label(sources)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "The application term sheet PDF could not be rendered.",
+                ) from exc
+            filename = application_terms_filename(sheet, file_contacts.business_label(sources))
             content_type = "application/pdf"
             source_id = sheet.id
             source_version = sheet.version
@@ -896,7 +961,9 @@ async def _send_thread_email(
     cc_emails: list[str],
     subject: str,
     body: str,
+    body_html: str | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> DealerRepInboxMessage:
     outcome = await outbox.deliver_email(
         db,
@@ -905,7 +972,9 @@ async def _send_thread_email(
             cc=cc_emails,
             subject=subject,
             body_text=body,
+            body_html=body_html,
             attachments=list(attachments or []),
+            headers=dict(headers or {}),
         ),
         context="ai_intake_email",
         subject=outbox.Subject(

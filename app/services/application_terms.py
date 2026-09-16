@@ -378,6 +378,7 @@ async def read_terms(
     )
     return ClientTermsRead(
         profile_id=profile.id,
+        term_sheet_id=row.id,
         version=row.version,
         status=row.status,  # type: ignore[arg-type]
         loan_type=row.program_key,

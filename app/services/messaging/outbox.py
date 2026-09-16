@@ -84,6 +84,7 @@ class Draft:
     cc: list[str] = field(default_factory=list)
     bcc: list[str] = field(default_factory=list)
     attachments: list[tuple] = field(default_factory=list)
+    headers: dict[str, str] = field(default_factory=dict)
     #: Credentials this message carries — the token or PIN the caller just
     #: minted. Declared secrets are removed by exact match, which is the only
     #: layer that cannot miss.
@@ -204,24 +205,25 @@ async def deliver_email(
         if sender_user_id is not None:
             from app.services.email.user_mailer import send_as_user
 
-            result = await send_as_user(
-                db,
-                sender_user_id,
-                to_emails=[to],
-                subject=draft.subject,
-                body_text=draft.body_text,
-                body_html=draft.body_html,
-                cc_emails=list(draft.cc),
-                bcc_emails=list(draft.bcc),
-                attachments=list(draft.attachments),
-            )
+            send_kwargs = {
+                "to_emails": [to],
+                "subject": draft.subject,
+                "body_text": draft.body_text,
+                "body_html": draft.body_html,
+                "cc_emails": list(draft.cc),
+                "bcc_emails": list(draft.bcc),
+                "attachments": list(draft.attachments),
+            }
+            if draft.headers:
+                send_kwargs["headers"] = dict(draft.headers)
+            result = await send_as_user(db, sender_user_id, **send_kwargs)
             ok, message_id, detail = result.ok, result.message_id, result.detail
             provider_thread_id = getattr(result, "provider_thread_id", None)
             provider = "gmail" if detail == "sent_gmail" else "ses"
         else:
             from app.services.email import ses_client
 
-            if draft.cc or draft.bcc or draft.attachments or draft.body_html:
+            if draft.cc or draft.bcc or draft.attachments or draft.body_html or draft.headers:
                 result = ses_client.send_raw_email(
                     to_emails=[to],
                     subject=draft.subject,
@@ -230,6 +232,7 @@ async def deliver_email(
                     cc_emails=list(draft.cc),
                     bcc_emails=list(draft.bcc),
                     attachments=list(draft.attachments),
+                    headers=dict(draft.headers),
                 )
             else:
                 result = ses_client.send_email(

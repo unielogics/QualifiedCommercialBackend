@@ -29,6 +29,7 @@ from app.routers import (
     ai_voice,
     analysis,
     application_communications,
+    application_offer_deliveries,
     application_profiles,
     application_terms,
     auth,
@@ -242,6 +243,10 @@ for r in [
     ai_preview.router,
     analysis.router,
     file_team.router,  # before application_profiles: /find and /team/candidates are not profile ids
+    # Literal /application-profiles/client routes must precede the operator's
+    # /application-profiles/{profile_id} offer routes.
+    application_offer_deliveries.client_router,
+    application_offer_deliveries.router,
     application_communications.router,
     application_terms.router,
     application_profiles.router,

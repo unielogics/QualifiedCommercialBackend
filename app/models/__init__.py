@@ -54,6 +54,10 @@ from app.models.application_profile import (  # noqa: F401
     FundingCategory,
     PlaidAssetReport,
 )
+from app.models.application_offer_delivery import (  # noqa: F401
+    ApplicationOfferDelivery,
+    ApplicationOfferDeliveryItem,
+)
 from app.models.application_terms import (  # noqa: F401
     ApplicationTermSheet,
     ApplicationTermSheetDelivery,
