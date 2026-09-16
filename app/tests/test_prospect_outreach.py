@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from pypdf import PdfWriter
 
+from app.config import Settings
 from app.dealer_os import prospect_outreach_router
 from app.models.dealer_prospect import DealerProspect, DealerProspectStageDefinition
 from app.models.notification import Notification
@@ -34,15 +35,17 @@ def _draft(*, status: str = "pending_review", version: int = 1) -> DealerProspec
         prospect_id=uuid.uuid4(),
         created_by_user_id=uuid.uuid4(),
         recipient_email="dealer@example.com",
-        from_email="dealers@qualifiedcommercial.com",
+        from_email="no-reply@qualifiedcommercial.com",
         from_name="Qualified Commercial Dealer Desk",
-        reply_to_email="dealers+replytoken1234@qualifiedcommercial.com",
+        reply_to_email="support+replytoken1234@qualifiedcommercial.com",
         reply_token_hash="a" * 64,
         unsubscribe_token_hash="b" * 64,
         rfc_message_id=f"<prospect-{draft_id}@qualifiedcommercial.com>",
         subject="Dealer financing resources",
         editable_body="Hi Alex,\n\nHere is the information we discussed.",
         locked_footer_text=(
+            "Please reply directly to this email with any questions. Replies are monitored at "
+            "support@qualifiedcommercial.com. You may also contact franco@qualifiedcommercial.com.\n\n"
             "Learn more: https://qualifiedcommercial.com/industries/auto\n\n"
             "---\nQualified Commercial · 14 53rd St #408N, Brooklyn, NY 11232\n"
             "Unsubscribe from Dealer Desk email: "
@@ -133,6 +136,8 @@ async def test_edit_stops_durable_countdown_and_locked_footer_survives(monkeypat
     assert edited.subject == "Updated subject"
     assert edited.editable_body == "New personal copy"
     assert edited.body_text.count(outreach.DEALER_WEBSITE) == 1
+    assert edited.body_text.count("support@qualifiedcommercial.com") == 1
+    assert edited.body_text.count("franco@qualifiedcommercial.com") == 1
     assert edited.body_text.endswith(edited.locked_footer_text)
     db.flush.assert_awaited_once()
 
@@ -581,6 +586,9 @@ def test_booking_link_is_application_owned_and_locked_in_footer():
     )
     assert f"Book a time: {url}" in footer
     assert outreach.DEALER_WEBSITE in footer
+    assert footer.count("support@qualifiedcommercial.com") == 1
+    assert footer.count("franco@qualifiedcommercial.com") == 1
+    assert footer.startswith("Please reply directly to this email with any questions.")
     assert outreach._render_body("Personal copy", footer).endswith(footer)
 
 
@@ -642,14 +650,44 @@ async def test_oversized_draft_requires_explicit_secure_bundle_and_restarts_revi
     db.flush.assert_awaited_once()
 
 
+def test_secure_bundle_keeps_the_locked_reply_note_first():
+    footer = outreach._locked_footer(
+        signature=["Alex Rep", "Relationship Manager"],
+        attachment_names=["dealer-guide.pdf"],
+        unsubscribe_url="https://api.qualifiedcommercial.com/unsubscribe/token",
+    )
+    updated = outreach._footer_with_secure_bundle(
+        footer,
+        bundle_url="https://api.qualifiedcommercial.com/bundle/token",
+        expires_at=datetime(2026, 9, 23, tzinfo=UTC),
+    )
+    lines = updated.splitlines()
+    assert lines[0].startswith("Please reply directly to this email")
+    assert lines.index("Learn more: https://qualifiedcommercial.com/industries/auto") < lines.index(
+        "Secure dealer information bundle (expires 2026-09-23): "
+        "https://api.qualifiedcommercial.com/bundle/token"
+    )
+
+
+def test_legacy_dealer_desk_addresses_migrate_to_selected_routing():
+    settings = Settings(
+        _env_file=None,
+        prospect_from_email=" DEALERS@qualifiedcommercial.com ",
+        prospect_reply_to_email="dealers@qualifiedcommercial.com",
+    )
+    assert settings.prospect_from_email == "no-reply@qualifiedcommercial.com"
+    assert settings.prospect_reply_to_email == "support@qualifiedcommercial.com"
+    assert settings.prospect_alternate_contact_email == "franco@qualifiedcommercial.com"
+
+
 def test_tokenized_reply_address_is_correlated_without_subject(monkeypatch):
     monkeypatch.setattr(
         prospect_reply,
         "get_settings",
-        lambda: SimpleNamespace(prospect_reply_to_email="dealers@qualifiedcommercial.com"),
+        lambda: SimpleNamespace(prospect_reply_to_email="support@qualifiedcommercial.com"),
     )
     assert prospect_reply.reply_tokens(
-        ["Qualified Commercial <dealers+Abc_123456789@qualifiedcommercial.com>"]
+        ["Qualified Commercial <support+Abc_123456789@qualifiedcommercial.com>"]
     ) == ["abc_123456789"]
     assert prospect_reply.reply_tokens(["someone@example.com"]) == []
 
@@ -669,9 +707,9 @@ def test_ses_raw_message_keeps_firm_sender_reply_alias_and_one_click_headers(mon
         to_emails=["dealer@example.com"],
         subject="Information",
         body_text="Body",
-        source_email="dealers@qualifiedcommercial.com",
+        source_email="no-reply@qualifiedcommercial.com",
         source_name="Qualified Commercial Dealer Desk",
-        reply_to="dealers+threadtoken@qualifiedcommercial.com",
+        reply_to="support+threadtoken@qualifiedcommercial.com",
         headers={
             "Message-ID": "<prospect-id@qualifiedcommercial.com>",
             "List-Unsubscribe": "<https://api.qualifiedcommercial.com/unsubscribe/token>",
@@ -682,8 +720,8 @@ def test_ses_raw_message_keeps_firm_sender_reply_alias_and_one_click_headers(mon
     assert result.ok
     raw = client.send_raw_email.call_args.kwargs["RawMessage"]["Data"]
     message = BytesParser(policy=policy.default).parsebytes(raw)
-    assert message["From"] == "Qualified Commercial Dealer Desk <dealers@qualifiedcommercial.com>"
-    assert message["Reply-To"] == "dealers+threadtoken@qualifiedcommercial.com"
+    assert message["From"] == "Qualified Commercial Dealer Desk <no-reply@qualifiedcommercial.com>"
+    assert message["Reply-To"] == "support+threadtoken@qualifiedcommercial.com"
     assert message["Message-ID"] == "<prospect-id@qualifiedcommercial.com>"
     assert message["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
     assert len(list(message.iter_attachments())) == 1

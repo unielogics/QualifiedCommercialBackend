@@ -282,6 +282,14 @@ def tokenized_reply_to(base_email: str, token: str) -> str:
     return f"{local}+{token}@{domain}".lower()
 
 
+def reply_contact_email(base_email: str) -> str:
+    """Return the public mailbox address without its internal correlation tag."""
+    local, separator, domain = normalize_email(base_email).partition("@")
+    if not separator or not local or not domain:
+        return ""
+    return f"{local.split('+', 1)[0]}@{domain}"
+
+
 def request_fingerprint(prospect: Any, payload: ProspectEmailDraftCreate) -> str:
     raw = {
         "prospect_id": str(prospect.id),
@@ -630,13 +638,26 @@ def _locked_footer(
     unsubscribe_url: str,
     booking_url: str | None = None,
 ) -> str:
-    parts = [f"Learn more: {DEALER_WEBSITE}"]
+    settings = get_settings()
+    reply_contact = reply_contact_email(settings.prospect_reply_to_email)
+    alternate_contact = normalize_email(
+        getattr(settings, "prospect_alternate_contact_email", "")
+    )
+    parts: list[str] = []
+    if reply_contact:
+        reply_note = (
+            "Please reply directly to this email with any questions. "
+            f"Replies are monitored at {reply_contact}."
+        )
+        if alternate_contact and alternate_contact != reply_contact:
+            reply_note += f" You may also contact {alternate_contact}."
+        parts.extend([reply_note, ""])
+    parts.append(f"Learn more: {DEALER_WEBSITE}")
     if booking_url:
         parts.append(f"Book a time: {booking_url}")
     if attachment_names:
         parts.append("Attached for reference: " + ", ".join(attachment_names))
     parts.extend(["", "Best,", *signature])
-    settings = get_settings()
     parts.extend(
         [
             "",
@@ -668,7 +689,11 @@ def _footer_with_secure_bundle(footer: str, *, bundle_url: str, expires_at: date
         if not line.startswith("Attached for reference:")
         and not line.startswith("Secure dealer information bundle")
     ]
-    insert_at = 1 if lines and lines[0].startswith("Learn more:") else 0
+    learn_more_at = next(
+        (index for index, line in enumerate(lines) if line.startswith("Learn more:")),
+        None,
+    )
+    insert_at = learn_more_at + 1 if learn_more_at is not None else 0
     if len(lines) > insert_at and lines[insert_at].startswith("Book a time:"):
         insert_at += 1
     lines.insert(

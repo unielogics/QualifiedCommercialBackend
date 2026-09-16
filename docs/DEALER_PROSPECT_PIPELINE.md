@@ -16,13 +16,14 @@ Complete every item before enabling the feature:
 2. Enable Amazon Nova Micro (`amazon.nova-micro-v1:0`) in the deployment
    region. The instance role already permits Amazon Nova foundation models.
 3. Verify `qualifiedcommercial.com`, including
-   `dealers@qualifiedcommercial.com`, for SES sending. Keep the SES policy's
+   `no-reply@qualifiedcommercial.com`, for SES sending. Keep the SES policy's
    allowed From addresses restricted to the configured company senders.
-4. Provision `dealers@qualifiedcommercial.com` as a Google Workspace mailbox,
-   group, or alias that accepts plus-addressed replies, for example
-   `dealers+<thread-token>@qualifiedcommercial.com`. Route those messages into
-   the mailbox configured by `GMAIL_DELEGATED_USER`; this may be the Dealer
-   Desk mailbox itself or the existing audited shared inbox.
+4. Ensure `support@qualifiedcommercial.com` accepts plus-addressed replies, for
+   example `support+<thread-token>@qualifiedcommercial.com`. Route those
+   messages into the real mailbox configured by `GMAIL_DELEGATED_USER`; this
+   may be Support's mailbox or the existing audited shared inbox. The locked
+   footer also names `franco@qualifiedcommercial.com` as an alternate contact,
+   but it is deliberately not a second Reply-To recipient.
 5. Configure domain-wide delegation for that inbox and set
    `USE_FAKE_INBOX=false`, `GMAIL_SERVICE_ACCOUNT_PATH`,
    `GMAIL_DELEGATED_USER`, and `USER_INBOX_SYNC_ENABLED=true` only after a
@@ -55,9 +56,10 @@ Required runtime settings:
 
 ```dotenv
 DEALER_PROSPECT_PIPELINE_ENABLED=true
-PROSPECT_FROM_EMAIL=dealers@qualifiedcommercial.com
+PROSPECT_FROM_EMAIL=no-reply@qualifiedcommercial.com
 PROSPECT_FROM_NAME=Qualified Commercial Dealer Desk
-PROSPECT_REPLY_TO_EMAIL=dealers@qualifiedcommercial.com
+PROSPECT_REPLY_TO_EMAIL=support@qualifiedcommercial.com
+PROSPECT_ALTERNATE_CONTACT_EMAIL=franco@qualifiedcommercial.com
 PROSPECT_MAILING_ADDRESS=14 53rd St #408N, Brooklyn, NY 11232
 PROSPECT_EMAIL_REVIEW_SECONDS=60
 PROSPECT_EMAIL_MAX_ATTACHMENT_BYTES=7000000
@@ -68,9 +70,14 @@ PROSPECT_COLLATERAL_CLAMD_TIMEOUT_SECONDS=15
 USER_INBOX_SYNC_ENABLED=true
 USE_FAKE_INBOX=false
 GMAIL_SERVICE_ACCOUNT_PATH=/etc/qcbackend/gmail-sa.json
-GMAIL_DELEGATED_USER=dealers@qualifiedcommercial.com
+GMAIL_DELEGATED_USER=<real Workspace mailbox receiving support+ aliases>
 SES_FEEDBACK_TOPIC_ARN=arn:aws:sns:us-east-1:<account-id>:qualified-commercial-ses-delivery-events
 ```
+
+The application temporarily normalizes the retired
+`dealers@qualifiedcommercial.com` sender and Reply-To values to the settings
+above so an older production secret cannot reactivate obsolete routing. Update
+the secret to the current values during the next credential maintenance window.
 
 Terraform injects `SES_FEEDBACK_TOPIC_ARN` into the production Secrets Manager
 payload from the topic it creates. The literal ARN above documents the expected
@@ -122,8 +129,9 @@ Before the pilot, send one message to a controlled external address and reply
 to it. Verify all of the following:
 
 - The From header is `Qualified Commercial Dealer Desk
-  <dealers@qualifiedcommercial.com>`.
-- Reply-To contains the draft's tokenized plus address.
+  <no-reply@qualifiedcommercial.com>`.
+- Reply-To contains the draft's `support+<thread-token>@qualifiedcommercial.com`
+  address, and the locked reply note names Support and Franco exactly once.
 - The message includes List-Unsubscribe and one-click unsubscribe headers.
 - The exact approved PDF versions are attached, or the explicitly selected
   secure-bundle link is present.

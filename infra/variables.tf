@@ -48,7 +48,7 @@ variable "ses_from_address" {
 
 variable "prospect_from_address" {
   type        = string
-  default     = "dealers@qualifiedcommercial.com"
+  default     = "no-reply@qualifiedcommercial.com"
   description = "Verified Dealer Desk sender address used for prospect outreach."
 }
 

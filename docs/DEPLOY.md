@@ -60,7 +60,7 @@ Production requirements:
   injected topic ARN, then set the flag to `true`, apply again, and verify the
   HTTPS subscription is confirmed. The event destination is created only in
   phase two.
-- IAM role policy `qcbackend-ses-qualifiedcommercial-send` allows only `ses:SendEmail` / `ses:SendRawEmail`, scoped to the `qualifiedcommercial.com` SES identity and locked to the configured transactional and Dealer Desk sender addresses (`no-reply@qualifiedcommercial.com` and `dealers@qualifiedcommercial.com` by default).
+- IAM role policy `qcbackend-ses-qualifiedcommercial-send` allows only `ses:SendEmail` / `ses:SendRawEmail`, scoped to the `qualifiedcommercial.com` SES identity and locked to the configured transactional and Dealer Desk sender addresses (`no-reply@qualifiedcommercial.com` by default).
 
 Do not grant broad `ses:*` or `Resource="*"` send permissions to the backend role. Read-only SES diagnostic permissions such as `ses:GetSendQuota` are not required by the app.
 

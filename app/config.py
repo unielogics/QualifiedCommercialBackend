@@ -228,13 +228,14 @@ class Settings(BaseSettings):
     # Empty is intentionally fail-closed at the public webhook.
     ses_feedback_topic_arn: str = ""
 
-    # Dealer Prospect Outreach.  SES still needs the From identity verified;
-    # these values deliberately do not fall back to an individual operator's
-    # mailbox.  Replies route through a per-draft plus alias at the shared
-    # Dealer Desk address.
-    prospect_from_email: str = "dealers@qualifiedcommercial.com"
+    # Dealer Prospect Outreach. SES sends from the established transactional
+    # identity, while replies route through a per-draft plus alias at Support
+    # so they can be correlated to the correct prospect. The alternate contact
+    # is displayed in the locked footer but is not added as a second Reply-To.
+    prospect_from_email: str = "no-reply@qualifiedcommercial.com"
     prospect_from_name: str = "Qualified Commercial Dealer Desk"
-    prospect_reply_to_email: str = "dealers@qualifiedcommercial.com"
+    prospect_reply_to_email: str = "support@qualifiedcommercial.com"
+    prospect_alternate_contact_email: str = "franco@qualifiedcommercial.com"
     prospect_mailing_address: str = "14 53rd St #408N, Brooklyn, NY 11232"
     prospect_email_review_seconds: int = 60
     # SES v1 raw messages have a 10 MB wire limit; MIME/base64 overhead makes
@@ -263,6 +264,22 @@ class Settings(BaseSettings):
             if normalized in {"0", "false", "no", "off"}:
                 return False
         return True
+
+    @field_validator("prospect_from_email", mode="after")
+    @classmethod
+    def migrate_legacy_prospect_sender(cls, value: str) -> str:
+        """Keep the retired Dealer Desk sender from overriding production."""
+        if value.strip().lower() == "dealers@qualifiedcommercial.com":
+            return "no-reply@qualifiedcommercial.com"
+        return value
+
+    @field_validator("prospect_reply_to_email", mode="after")
+    @classmethod
+    def migrate_legacy_prospect_reply_mailbox(cls, value: str) -> str:
+        """Route legacy Dealer Desk reply configuration through Support."""
+        if value.strip().lower() == "dealers@qualifiedcommercial.com":
+            return "support@qualifiedcommercial.com"
+        return value
 
     @property
     def cors_origins_list(self) -> list[str]:
