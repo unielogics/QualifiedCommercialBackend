@@ -55,7 +55,7 @@ from app.schemas.application_profile import (
     ProgramReadinessItem,
 )
 from app.services import application_profiles as profiles
-from app.services import file_events, locked_file_requests
+from app.services import file_events, locked_file_requests, provenance
 from app.services import funding_programs as program_catalog
 from app.services.activity_log import log_activity
 from app.services.bucket_evidence import (
@@ -177,6 +177,10 @@ async def _evidence_inventory(
         .scalars()
         .all()
     )
+    files = [file for file in files if not provenance.is_internal_package_output(file)]
+    ids = [file.id for file in files]
+    if not ids:
+        return [], {}, set()
     analyses = list(
         (
             await db.execute(
@@ -484,8 +488,7 @@ async def published_candidates(
     db: AsyncSession, profile: ApplicationProfile
 ) -> list[ProgramFitCandidate]:
     context = await profile_fit_context(db, profile)
-    if context.get("intent_kind") in {"non_lending", "route_out"}:
-        return []
+    intent_outside_lending = context.get("intent_kind") in {"non_lending", "route_out"}
 
     catalog = await program_catalog.catalog_rows(db)
     scopes = await program_catalog.scopes_by_program(db, [row.id for row in catalog])
@@ -522,8 +525,6 @@ async def published_candidates(
     candidates: list[ProgramFitCandidate] = []
     for item in catalog:
         scope_state, scope_reasons = _catalog_scope_match(scopes.get(item.id, []), context)
-        if scope_state is False:
-            continue
         playbook = latest.get(item.id)
         if playbook is None:
             candidates.append(
@@ -551,7 +552,18 @@ async def published_candidates(
             for field in sorted(_rule_fields((playbook.rules or {}).get("fit")))
             if _context_field(context, field) in (None, "", [], {})
         ]
-        if not has_fit_rule or result is None:
+        if intent_outside_lending:
+            recommendation_status = "not_eligible"
+            reasons = ["Current intake intent is not routed to lending"]
+            eligible = False
+        elif scope_state is False:
+            # Keep out-of-scope published programs visible to authorized staff.
+            # They remain ineligible for AI auto-selection, but an operator can
+            # deliberately override the screen with a reviewed reason.
+            recommendation_status = "not_eligible"
+            reasons = scope_reasons or ["Product is outside the current file scope"]
+            eligible = False
+        elif not has_fit_rule or result is None:
             recommendation_status = "criteria_unavailable"
             reasons = ["Published fit criteria are unavailable or invalid"]
             eligible = False
@@ -778,10 +790,13 @@ async def set_programs(
             selection.removed_at = timestamp
             selection.removed_by_user_id = user.id
     for key in wanted:
-        if key in current:
-            continue
         candidate = candidates[key]
         if candidate.playbook_id is None or candidate.playbook_version is None:
+            continue
+        if key in current:
+            # An active selection pins an immutable published playbook version.
+            # Adding/removing another program must never silently upgrade that
+            # retained selection or rewrite its historical requirements.
             continue
         db.add(
             ApplicationProgramSelection(
@@ -796,6 +811,7 @@ async def set_programs(
                 fit_reasons=candidate.reasons,
                 selected_by_user_id=user.id,
                 selected_at=timestamp,
+                needs_scope_review=not candidate.eligible,
             )
         )
     profile.program_selection_mode = "manual"
@@ -2230,9 +2246,14 @@ async def get_program_readiness(
         if lending_applicable
         else await active_selections(db, profile.id)
     )
-    # Preserve pinned selections in storage in case the enquiry returns to a
-    # lending path, but do not apply or expose lending criteria while routed
-    # to a non-lending workflow.
+    # An explicit desk selection is a reviewed override of automatic routing.
+    # It therefore remains visible and actionable even when the intake's
+    # original intent was classified as non-lending. AI-auto selections remain
+    # dormant until the file returns to a lending path.
+    manual_lending_override = bool(
+        stored_selections and profile.program_selection_mode == "manual"
+    )
+    lending_applicable = lending_applicable or manual_lending_override
     selections = stored_selections if lending_applicable else []
     grouped = await _selection_requirements(db, selections, context)
     policies = await ensure_evidence_policy(db, profile) if lending_applicable else []

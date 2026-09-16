@@ -27,7 +27,7 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, with_loader_criteria
 from sqlalchemy.orm.attributes import set_committed_value
@@ -396,9 +396,10 @@ async def _load_share_or_404(db: AsyncSession, token: str) -> BucketShare:
             select(BucketShare)
             .where(BucketShare.token == token)
             .options(
-                selectinload(BucketShare.files),
+                selectinload(
+                    BucketShare.files.and_(_selected_access_file_clause())
+                ),
                 selectinload(BucketShare.bucket).selectinload(Bucket.notes),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
     ).scalar_one_or_none()
@@ -417,11 +418,14 @@ async def _load_vendor_access_or_404(db: AsyncSession, bucket_id: UUID, user: Us
             )
             .options(
                 selectinload(BucketVendorAccess.vendor),
-                selectinload(BucketVendorAccess.files),
+                selectinload(
+                    BucketVendorAccess.files.and_(_selected_access_file_clause())
+                ),
                 selectinload(BucketVendorAccess.bucket).selectinload(Bucket.notes),
-                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
+                selectinload(BucketVendorAccess.bucket).selectinload(
+                    Bucket.files.and_(_active_access_file_clause())
+                ),
                 selectinload(BucketVendorAccess.bucket).selectinload(Bucket.requested_documents),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
     ).scalar_one_or_none()
@@ -436,9 +440,10 @@ async def _load_public_share_or_404(db: AsyncSession, token: str) -> BucketPubli
             select(BucketPublicShare)
             .where(BucketPublicShare.token == token)
             .options(
-                selectinload(BucketPublicShare.files),
+                selectinload(
+                    BucketPublicShare.files.and_(_selected_access_file_clause())
+                ),
                 selectinload(BucketPublicShare.bucket),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
             )
         )
     ).scalar_one_or_none()
@@ -551,23 +556,67 @@ async def _file_annotations(db: AsyncSession, bucket_id: UUID, file_id: UUID) ->
     ).scalars().all()
 
 
+def _active_access_file(file: BucketFile) -> bool:
+    return file.status == "uploaded" and file.deleted_at is None
+
+
+def _active_access_file_clause():
+    return and_(BucketFile.status == "uploaded", BucketFile.deleted_at.is_(None))
+
+
+def _selected_access_file_clause():
+    return or_(
+        _active_access_file_clause(),
+        and_(
+            BucketFile.source_kind == "generated",
+            BucketFile.source_detail.startswith(
+                provenance.PACKAGE_READINESS_SOURCE_PREFIX,
+                autoescape=True,
+            ),
+            BucketFile.status == "superseded",
+            BucketFile.deleted_at.is_not(None),
+            BucketFile.delete_storage_status == "retained_superseded",
+        ),
+    )
+
+
+def _selected_access_file(file: BucketFile) -> bool:
+    """Keep an explicitly shared package snapshot usable after supersession.
+
+    Package regeneration hides the former BucketFile row while intentionally
+    retaining the immutable artifact bytes. An explicit share/vendor file
+    selection is a delivery snapshot, so that one retained row remains visible
+    to its recipient. A manual deletion uses ``retained_package_artifact`` and
+    must stay hidden. ``all_active`` vendor access never calls this helper for
+    superseded rows.
+    """
+
+    return _active_access_file(file) or (
+        provenance.is_internal_package_output(file)
+        and file.status == "superseded"
+        and file.deleted_at is not None
+        and file.delete_storage_status == "retained_superseded"
+    )
+
+
 def _file_belongs_to_share(share: BucketShare, file_id: UUID) -> BucketFile | None:
     for file in share.files:
-        if file.id == file_id and file.status == "uploaded" and file.deleted_at is None:
+        if file.id == file_id and _selected_access_file(file):
             return file
     return None
 
 
 def _file_belongs_to_public_share(share: BucketPublicShare, file_id: UUID) -> BucketFile | None:
     for file in share.files:
-        if file.id == file_id and file.status == "uploaded" and file.deleted_at is None:
+        if file.id == file_id and _selected_access_file(file):
             return file
     return None
 
 
 def _vendor_access_files(access: BucketVendorAccess) -> list[BucketFile]:
-    source = access.bucket.files if access.file_scope == "all_active" else access.files
-    return [file for file in source if file.status == "uploaded" and file.deleted_at is None]
+    if access.file_scope == "all_active":
+        return [file for file in access.bucket.files if _active_access_file(file)]
+    return [file for file in access.files if _selected_access_file(file)]
 
 
 def _file_belongs_to_vendor_access(access: BucketVendorAccess, file_id: UUID) -> BucketFile | None:
@@ -1244,7 +1293,13 @@ async def queue_ai_review(
     context_patch = payload.context.model_dump(exclude_none=True) if payload.context else {}
     if context_patch:
         bucket.ai_context = {**(bucket.ai_context or {}), **context_patch}
-    active_files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    active_files = [
+        file
+        for file in bucket.files
+        if file.status == "uploaded"
+        and file.deleted_at is None
+        and not provenance.is_internal_package_output(file)
+    ]
     review = BucketAIReview(
         bucket_id=bucket_id,
         requested_by_user_id=user.id,
@@ -2448,7 +2503,13 @@ async def delete_admin_file(
 
     file.deleted_at = _now()
     file.deleted_by_user_id = user.id
-    file.delete_storage_status = _delete_s3_object(file.s3_key)
+    if provenance.is_internal_package_output(file):
+        # Package BucketFiles and immutable underwriting artifacts intentionally
+        # reference the same snapshot. Removing the bucket row must not destroy
+        # the artifact's historical preview/download bytes.
+        file.delete_storage_status = "retained_package_artifact"
+    else:
+        file.delete_storage_status = _delete_s3_object(file.s3_key)
     file.shares.clear()
     file.vendor_access.clear()
     await _recalculate_requested_document_status(db, file.requested_document_id)
@@ -2543,9 +2604,12 @@ async def list_vendor_buckets(
             .where(BucketVendorAccess.vendor_user_id == user.id)
             .options(
                 selectinload(BucketVendorAccess.vendor),
-                selectinload(BucketVendorAccess.files),
-                selectinload(BucketVendorAccess.bucket).selectinload(Bucket.files),
-                with_loader_criteria(BucketFile, BucketFile.deleted_at.is_(None), include_aliases=True),
+                selectinload(
+                    BucketVendorAccess.files.and_(_selected_access_file_clause())
+                ),
+                selectinload(BucketVendorAccess.bucket).selectinload(
+                    Bucket.files.and_(_active_access_file_clause())
+                ),
             )
             .order_by(BucketVendorAccess.created_at.desc())
         )
@@ -2900,7 +2964,10 @@ async def _request_access_read(
         (
             file
             for file in link.bucket.files
-            if file.status == "uploaded" and file.deleted_at is None and not is_offer_document(file)
+            if file.status == "uploaded"
+            and file.deleted_at is None
+            and not is_offer_document(file)
+            and not provenance.is_internal_package_output(file)
         ),
         key=lambda file: file.created_at,
         reverse=True,
@@ -3445,7 +3512,7 @@ async def share_access(
     share.view_count += 1
     files = []
     for file in share.files:
-        if file.status != "uploaded" or file.deleted_at is not None:
+        if not _selected_access_file(file):
             continue
         item = BucketShareFileRead.model_validate(file)
         if share.can_preview:
@@ -3500,7 +3567,7 @@ async def public_share_access(token: str, request: Request, db: AsyncSession = D
     share.view_count += 1
     files = []
     for file in share.files:
-        if file.status != "uploaded" or file.deleted_at is not None:
+        if not _selected_access_file(file):
             continue
         item = BucketPublicShareFileRead.model_validate(file)
         if share.can_preview:

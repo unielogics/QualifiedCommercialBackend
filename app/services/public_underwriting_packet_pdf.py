@@ -5,7 +5,7 @@ import io
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from html import escape
 from typing import Any
 
@@ -33,6 +33,120 @@ def _record(value: Any) -> dict[str, Any]:
 
 def _records(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _selected_programs(financials: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _records(financials.get("selected_programs"))
+        if _text(item.get("name"), fallback="")
+    ]
+
+
+def _selected_program_summary(programs: list[dict[str, Any]]) -> str:
+    labels = []
+    for item in programs:
+        name = _text(item.get("name"), fallback="")
+        version = item.get("playbook_version")
+        label = f"{name} (criteria v{version})" if version else name
+        if bool(item.get("needs_scope_review")):
+            label += " — manual scope exception; review required"
+        labels.append(label)
+    return ", ".join(labels)
+
+
+_READINESS_COMPLETE_STATES = {"verified", "waived", "not_applicable"}
+
+
+def _package_readiness(financials: dict[str, Any]) -> dict[str, Any]:
+    return _record(financials.get("package_readiness"))
+
+
+def _open_readiness_rows(financials: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Return canonical open conditions when Package Readiness was snapshotted.
+
+    ``None`` means an older package has no readiness snapshot and may use the
+    legacy AI evidence fallback. An empty list is authoritative: every current
+    condition is complete, waived, or not applicable.
+    """
+    readiness = _package_readiness(financials)
+    if "requirements" not in readiness:
+        return None
+    rows: list[dict[str, Any]] = []
+    status_detail = {
+        "missing": "Evidence has not been received",
+        "requested": "Requested; awaiting evidence",
+        "received_unverified": "Received; verification pending",
+        "stale": "Evidence must be refreshed",
+        "failed": "Evidence review needs attention",
+    }
+    for requirement in _records(readiness.get("requirements")):
+        status = str(requirement.get("status") or "missing").strip().lower()
+        if "effectively_open" in requirement and not bool(
+            requirement.get("effectively_open")
+        ):
+            continue
+        if status in _READINESS_COMPLETE_STATES:
+            continue
+        level = str(requirement.get("required_level") or "required").strip().lower()
+        reason = _text(requirement.get("state_reason"), fallback="")
+        detail = reason or status_detail.get(status, "Condition remains open")
+        rows.append(
+            {
+                "title": _text(requirement.get("label"), fallback="Open condition"),
+                "priority": level.title(),
+                "detail": detail,
+                "status": status,
+            }
+        )
+    priority = {"required": 0, "recommended": 1, "optional": 2}
+    return sorted(
+        rows,
+        key=lambda row: priority.get(str(row.get("priority") or "").lower(), 3),
+    )
+
+
+def _program_readiness_section(financials: dict[str, Any]) -> str:
+    readiness = _package_readiness(financials)
+    programs = _records(readiness.get("programs"))
+    if not programs:
+        return ""
+    selections = {
+        str(item.get("program_key") or ""): item
+        for item in _records(readiness.get("selected_programs"))
+    }
+    rows = []
+    for program in programs:
+        blockers = _strings(program.get("blocking_requirement_labels")) or _strings(
+            program.get("blocking_requirement_keys")
+        )
+        selection = selections.get(str(program.get("program_key") or ""), {})
+        needs_scope_review = bool(selection.get("needs_scope_review"))
+        rows.append(
+            {
+                "program": _text(program.get("program_name"), fallback="Selected program"),
+                "completion": f"{int(_num(program.get('completion_percent')) or 0)}%",
+                "status": (
+                    "Scope review required"
+                    if needs_scope_review
+                    else "Ready"
+                    if bool(program.get("complete"))
+                    else "Conditions open"
+                ),
+                "blockers": ", ".join(blockers[:4]) if blockers else "None",
+            }
+        )
+    return _simple_table(
+        "Selected program readiness",
+        rows,
+        [
+            ("program", "Program"),
+            ("completion", "Complete"),
+            ("status", "Status"),
+            ("blockers", "Open conditions"),
+        ],
+        empty_message="No selected program readiness is available.",
+    )
 
 
 def _strings(value: Any) -> list[str]:
@@ -533,9 +647,9 @@ def extract_tax_years(analyses: list[dict[str, Any]], limit: int = 2) -> list[di
         is_tax = cls == "tax_return" or (cls not in _NON_TAX_CLASSES and any(k in facts for k in _TAX_KEYS))
         if not is_tax:
             continue
-        def _first_num(aliases: tuple[str, ...]) -> float | None:
+        def _first_num(aliases: tuple[str, ...], source: dict[str, Any] = facts) -> float | None:
             for k in aliases:
-                v = _num(facts.get(k))
+                v = _num(source.get(k))
                 if v is not None:
                     return v
             return None
@@ -828,6 +942,144 @@ def _bullet_card(title: str, items: list[str], tone: str = "") -> str:
     return f'<section class="card {tone}"><h2>{escape(title)}</h2><ul>{lis}</ul></section>'
 
 
+def _brief(value: Any, *, limit: int = 620, fallback: str = "Awaiting evidence.") -> str:
+    """Collapse generated prose into a decision-ready paragraph.
+
+    The full source stays in the immutable artifact, while the PDF keeps the
+    first complete sentences an underwriter can scan.  We avoid a hard cut in
+    the middle of a sentence unless the model returned one very long sentence.
+    """
+    text = re.sub(r"\s+", " ", _redact(_text(value, fallback=fallback))).strip()
+    if len(text) <= limit:
+        return text
+    candidate = text[: limit + 1]
+    boundary = max(candidate.rfind(". "), candidate.rfind("; "), candidate.rfind(": "))
+    if boundary >= int(limit * 0.55):
+        return candidate[: boundary + 1].strip()
+    word = candidate.rfind(" ")
+    return candidate[: word if word > 0 else limit].rstrip(" ,;:") + "…"
+
+
+def _executive_metric_tiles(
+    *,
+    intake: Any,
+    result: dict[str, Any],
+    financials: dict[str, Any],
+) -> str:
+    """Six high-signal values for the first-page credit snapshot."""
+    key_metrics = _record(result.get("key_metrics"))
+    months = _records(financials.get("bank_months"))
+    p_and_l = _record(financials.get("p_and_l"))
+    balance_sheet = _record(financials.get("balance_sheet"))
+    credit = _record(financials.get("credit"))
+
+    deposits = [_num(row.get("deposits")) for row in months]
+    deposits = [value for value in deposits if value is not None]
+    net_values = [
+        _num(row.get("deposits")) - _num(row.get("withdrawals"))
+        for row in months
+        if _num(row.get("deposits")) is not None and _num(row.get("withdrawals")) is not None
+    ]
+    latest_balance = next(
+        (_num(row.get("ending_balance")) for row in reversed(months) if _num(row.get("ending_balance")) is not None),
+        None,
+    )
+    avg_deposits = sum(deposits) / len(deposits) if deposits else None
+    avg_net = sum(net_values) / len(net_values) if net_values else None
+    annual_revenue = (
+        _num(p_and_l.get("annualized_revenue"))
+        or _num(p_and_l.get("gross_revenue"))
+        or _num(key_metrics.get("ytd_annualized_revenue"))
+        or _num(key_metrics.get("annualized_adjusted_deposits"))
+    )
+    cash_flow = (
+        _num(p_and_l.get("annualized_ebitda"))
+        or _num(p_and_l.get("ebitda"))
+        or _num(key_metrics.get("estimated_ebitda_or_cash_flow"))
+    )
+    dscr = _num(key_metrics.get("estimated_dscr")) or _num(key_metrics.get("dscr"))
+    requested = _num(getattr(intake, "requested_loan_amount", None)) or _num(key_metrics.get("requested_amount"))
+    current_ratio = _num(balance_sheet.get("current_ratio"))
+
+    candidates: list[tuple[str, str, str]] = [
+        ("Requested", _fmt_full(requested), "Intake"),
+        ("Avg monthly deposits", _fmt_full(avg_deposits), f"{len(deposits)} bank month{'s' if len(deposits) != 1 else ''}" if deposits else "Awaiting statements"),
+        ("Avg monthly net", _fmt_full(avg_net), "Deposits less withdrawals"),
+        ("Latest ending balance", _fmt_full(latest_balance), "Most recent bank month"),
+        ("Annual revenue", _fmt_full(annual_revenue), "P&L / verified extraction"),
+        ("EBITDA / cash flow", _fmt_full(cash_flow), "P&L / verified extraction"),
+    ]
+    if dscr is not None:
+        candidates[-1] = ("DSCR", f"{dscr:.2f}x", "Current evidence")
+    elif credit.get("fico") is not None:
+        candidates[-1] = ("Verified FICO", str(credit["fico"]), "Soft pull")
+    elif current_ratio is not None:
+        candidates[-1] = ("Current ratio", f"{current_ratio:.2f}x", "Balance sheet")
+
+    cells = "".join(
+        '<td class="metric-tile">'
+        f'<span>{escape(label)}</span><strong>{escape(value)}</strong><small>{escape(source)}</small>'
+        "</td>"
+        for label, value, source in candidates[:6]
+    )
+    return f'<table class="metric-grid"><tr>{cells}</tr></table>'
+
+
+def _executive_bank_section(months: list[dict[str, Any]]) -> str:
+    """Chart-first bank section for the two-page executive brief.
+
+    The lender packet keeps the full month-by-month table.  The brief shows the
+    same verified series with only decision-level period statistics beneath it.
+    """
+    if not months:
+        return (
+            '<section class="card bank-brief"><h2>Month-to-month bank activity</h2>'
+            '<p class="empty">Awaiting bank-statement evidence.</p></section>'
+        )
+    labels = [_text(month.get("label"), fallback="") for month in months]
+    chart_svg, chart_w = _dual_axis_chart_svg(
+        "Monthly cash flow & ending balance",
+        labels,
+        left_series=[
+            {"label": "Deposits", "color": TEAL, "values": [_num(month.get("deposits")) for month in months]},
+            {"label": "Withdrawals", "color": RED, "values": [_num(month.get("withdrawals")) for month in months]},
+        ],
+        right_series=[
+            {"label": "Ending balance", "color": NAVY, "values": [_num(month.get("ending_balance")) for month in months]},
+        ],
+        height=190,
+    )
+    chart_uri = _svg_to_png_fit(chart_svg, chart_w, 650)
+    chart = f'<div class="charts"><img src="{chart_uri}" width="650"/></div>' if chart_uri else ""
+    deposits = [_num(month.get("deposits")) for month in months]
+    deposits = [value for value in deposits if value is not None]
+    net = [
+        _num(month.get("deposits")) - _num(month.get("withdrawals"))
+        for month in months
+        if _num(month.get("deposits")) is not None and _num(month.get("withdrawals")) is not None
+    ]
+    latest = next(
+        (_num(month.get("ending_balance")) for month in reversed(months) if _num(month.get("ending_balance")) is not None),
+        None,
+    )
+    negatives = sum(1 for value in net if value < 0)
+    stats = [
+        ("Period", f"{len(months)} months"),
+        ("Avg deposits", _fmt_full(sum(deposits) / len(deposits) if deposits else None)),
+        ("Avg net activity", _fmt_full(sum(net) / len(net) if net else None)),
+        ("Negative months", str(negatives)),
+        ("Latest balance", _fmt_full(latest)),
+    ]
+    cells = "".join(
+        f'<td><span>{escape(label)}</span><strong>{escape(value)}</strong></td>'
+        for label, value in stats
+    )
+    return (
+        '<section class="card bank-brief"><h2>Month-to-month bank activity</h2>'
+        f'{chart}<table class="bank-stats"><tr>{cells}</tr></table></section>'
+    )
+
+
 def _bank_section(months: list[dict[str, Any]]) -> str:
     if not months:
         return (
@@ -853,9 +1105,10 @@ def _bank_section(months: list[dict[str, Any]]) -> str:
         right_series=[
             {"label": "Ending balance", "color": NAVY, "values": [m["ending_balance"] for m in months]},
         ],
+        height=140,
     )
     # Target ~656pt so the chart sits inside the card's inner width on a landscape page.
-    target = 656
+    target = 620
     chart_uri = _svg_to_png_fit(chart_svg, chart_w, target)
     charts = f'<div class="charts"><img src="{chart_uri}" width="{target}"/></div>' if chart_uri else ""
 
@@ -876,14 +1129,16 @@ def _bank_section(months: list[dict[str, Any]]) -> str:
     deposits_vals = [m["deposits"] for m in months if m["deposits"] is not None]
     avg_dep = sum(deposits_vals) / len(deposits_vals) if deposits_vals else None
     return (
-        '<section class="card wide"><h2>Bank activity — last 6 months</h2>'
+        '<section class="card wide bank-section"><h2>Bank activity — last 6 months</h2>'
         f"{charts}"
-        '<table class="grid-table"><thead><tr>'
-        f"<th>Metric</th>{month_headers}"
-        f"</tr></thead><tbody>{body}</tbody></table>"
         f'<p class="note">Average monthly deposits across the period: <strong>{_fmt_full(avg_dep)}</strong> '
         f"({len(months)} month{'s' if len(months) != 1 else ''} of statements analyzed). "
         "Account numbers redacted for confidentiality.</p>"
+        "</section>"
+        '<section class="card wide bank-table"><h2>Month-by-month bank detail</h2>'
+        '<table class="grid-table"><thead><tr>'
+        f"<th>Metric</th>{month_headers}"
+        f"</tr></thead><tbody>{body}</tbody></table>"
         "</section>"
     )
 
@@ -1111,7 +1366,7 @@ def _metric_table(metric_rows: list[dict[str, Any]]) -> str:
         f'<td>{escape(_text(r.get("value")))}</td>'
         f'<td>{escape(_text(r.get("source")))}</td>'
         "</tr>"
-        for r in metric_rows[:20]
+        for r in metric_rows[:12]
     )
     return (
         '<section class="card wide"><h2>Key figures &amp; application fields</h2>'
@@ -1201,6 +1456,232 @@ def _minimal_pdf(lines: list[str]) -> bytes:
     return bytes(output)
 
 
+def render_executive_summary_pdf(
+    *,
+    intake: Any,
+    result: dict[str, Any] | None,
+    executive_summary: dict[str, Any] | None,
+    financials: dict[str, Any] | None,
+) -> bytes:
+    """Render a compact, branded credit brief from the same facts as the packet.
+
+    This is deliberately not a prose export.  The immutable structured summary
+    remains the source of record; the PDF is a two-page-at-most desk view built
+    around the decision, the month-to-month cash activity, and open exceptions.
+    """
+    result = result or {}
+    executive_summary = executive_summary or {}
+    financials = financials or {}
+    bank_months = _records(financials.get("bank_months"))
+    bankability = _record(result.get("bankability_assessment"))
+    evidence = _record(result.get("document_evidence_map"))
+
+    borrower = getattr(intake, "full_name", None)
+    business = getattr(intake, "business_name", None)
+    requested = _money(getattr(intake, "requested_loan_amount", None))
+    purpose = getattr(intake, "loan_purpose", None)
+    status = _text(
+        result.get("probability_status")
+        or result.get("fundability_status")
+        or bankability.get("status"),
+        fallback="Review pending",
+    )
+    selected_programs = _selected_programs(financials)
+    scope_exceptions = [
+        _text(item.get("name"), fallback="Selected program")
+        for item in selected_programs
+        if bool(item.get("needs_scope_review"))
+    ]
+    applications = (
+        [_text(item.get("name"), fallback="") for item in selected_programs]
+        if selected_programs
+        else _strings(executive_summary.get("suggested_application_types"))
+    )
+    program = applications[0] if applications else _text(
+        result.get("program_fit") or executive_summary.get("suggested_product_path"),
+        fallback="Structure under review",
+    )
+    summary_text = _brief(
+        executive_summary.get("executive_summary")
+        or result.get("executive_summary")
+        or bankability.get("reason"),
+        limit=760,
+    )
+    approach = (
+        "Use the desk-selected "
+        f"{_selected_program_summary(selected_programs)}. Confirm its current evidence conditions before submission."
+        if selected_programs
+        else _brief(
+            executive_summary.get("recommended_approach")
+            or executive_summary.get("vendor_submission_angle")
+            or result.get("one_next_step"),
+            limit=430,
+        )
+    )
+    next_action = _brief(
+        executive_summary.get("next_best_action") or result.get("one_next_step"),
+        limit=260,
+        fallback="Complete the open evidence items and confirm the proposed structure.",
+    )
+    strengths = [_redact(item) for item in (_strings(executive_summary.get("strengths")) or _strings(result.get("strengths")))][:4]
+    risks = [_redact(item) for item in (_strings(executive_summary.get("risks")) or _strings(result.get("risks")))][:4]
+    mitigants = [_redact(item) for item in (_strings(executive_summary.get("mitigants")) or _strings(result.get("mitigants")))][:4]
+    readiness_rows = _open_readiness_rows(financials)
+    missing_rows = readiness_rows if readiness_rows is not None else _records(result.get("missing_or_incomplete_items"))
+    if readiness_rows is None and not missing_rows:
+        coverage = _records(evidence.get("baseline_coverage"))
+        missing_rows = [
+            {"title": row.get("category"), "detail": row.get("gap")}
+            for row in coverage
+            if str(row.get("status") or "").strip().lower() not in {"satisfied", "uploaded", "complete"}
+        ]
+    open_items = [
+        _brief(
+            f"{_text(row.get('title'), fallback='Open item')}: {_text(row.get('detail'), fallback='Evidence required')}",
+            limit=180,
+        )
+        for row in missing_rows[:4]
+    ]
+
+    logo = _logo_datauri()
+    logo_img = f'<img src="{logo}" width="42" height="42"/>' if logo else ""
+    generated = datetime.now(UTC).strftime("%b %d, %Y %H:%M UTC")
+    metric_tiles = _executive_metric_tiles(intake=intake, result=result, financials=financials)
+    bank_html = _executive_bank_section(bank_months)
+    strengths_html = _bullet_card("Credit strengths", strengths, "green") or _prose_card("Credit strengths", "No verified strengths recorded yet.")
+    scope_risks = [
+        f"Manual scope exception: {name} requires underwriting review before submission."
+        for name in scope_exceptions
+    ]
+    risk_items = [*scope_risks, *risks[:2], *open_items[:2]][:4]
+    risks_html = _bullet_card("Risks & open items", risk_items, "amber") or _prose_card("Risks & open items", "No material exceptions recorded in the current review.")
+    mitigants_html = _bullet_card("Mitigants", mitigants, "green")
+
+    fallback_lines = [
+        "Qualified Commercial — Executive Credit Brief",
+        f"Generated: {generated}",
+        f"Borrower: {_text(borrower)}",
+        f"Business: {_text(business)}",
+        f"Requested: {requested}",
+        f"Purpose: {_text(purpose)}",
+        f"Status: {status}",
+        f"Suggested structure: {program}",
+        "",
+        "Decision summary:",
+        *_wrap(summary_text),
+        "",
+        "Recommended structure:",
+        *_wrap(approach),
+        "",
+        "Month-to-month bank activity:",
+        *[
+            f"{month.get('label')}: in {_fmt_full(_num(month.get('deposits')))}, out {_fmt_full(_num(month.get('withdrawals')))}, ending {_fmt_full(_num(month.get('ending_balance')))}"
+            for month in bank_months
+        ],
+        "",
+        f"Next action: {next_action}",
+        "",
+        "CONFIDENTIAL — Preliminary underwriting support; not a commitment to lend.",
+    ]
+
+    html_doc = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    @page {{ size: Letter landscape; margin: 30px; }}
+    * {{ box-sizing: border-box; }}
+    body {{ font-family: Arial, Helvetica, sans-serif; background:#fff; color:{INK}; font-size:10.5px; margin:0; }}
+    h1 {{ font-size:21px; margin:0; color:{NAVY}; letter-spacing:-.02em; }}
+    h2 {{ font-size:10.5px; margin:0 0 7px; color:{NAVY}; text-transform:uppercase; letter-spacing:.07em; border-bottom:2px solid {TEAL}; padding-bottom:4px; }}
+    p {{ color:{SLATE}; line-height:1.42; margin:0; }}
+    ul {{ margin:0; padding-left:16px; }} li {{ color:{SLATE}; line-height:1.35; margin:3px 0; }}
+    .header {{ width:100%; border-bottom:3px solid {NAVY}; padding-bottom:9px; margin-bottom:10px; }}
+    .header td {{ vertical-align:middle; }}
+    .brand {{ font-size:9px; font-weight:800; color:{TEAL}; text-transform:uppercase; letter-spacing:.16em; }}
+    .sub {{ color:{MUTE}; font-size:9px; margin-top:2px; }}
+    .pill {{ display:inline-block; max-width:190px; border:1px solid #99f6e4; border-radius:999px; padding:5px 10px; color:{TEAL}; background:#ecfeff; font-weight:800; font-size:9px; text-align:center; }}
+    .snapshot {{ width:100%; border-collapse:separate; border-spacing:6px 0; margin:0 0 9px; }}
+    .field {{ border:1px solid {LINE}; border-radius:8px; padding:7px 8px; width:16.66%; vertical-align:top; background:#fbfcfe; }}
+    .field span, .metric-tile span {{ display:block; color:{MUTE}; font-size:8px; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }}
+    .field strong {{ display:block; margin-top:3px; font-size:10.5px; color:{INK}; }}
+    .cols {{ width:100%; border-collapse:separate; border-spacing:0; }}
+    .cols td {{ width:50%; vertical-align:top; }} .cols td:first-child {{ padding-right:6px; }} .cols td:last-child {{ padding-left:6px; }}
+    .card {{ border:1px solid {LINE}; border-radius:9px; padding:10px 12px; margin-bottom:9px; background:#fff; page-break-inside:avoid; }}
+    .card.green {{ border-left:4px solid {TEAL}; }} .card.amber {{ border-left:4px solid #d97706; }}
+    .summary-card {{ min-height:104px; }}
+    .metric-grid {{ width:100%; table-layout:fixed; border-collapse:separate; border-spacing:4px 0; margin:0 0 9px; }}
+    .metric-tile {{ vertical-align:top; width:16.66%; height:63px; border:1px solid {LINE}; padding:7px; background:{ZEBRA}; }}
+    .metric-tile strong {{ display:block; margin:4px 0 2px; color:{NAVY}; font-size:14px; }}
+    .metric-tile small {{ color:{MUTE}; font-size:8px; }}
+    .next {{ border:1px solid #99f6e4; background:#f0fdfa; border-radius:9px; padding:9px 12px; margin-top:2px; }}
+    .next strong {{ color:{TEAL}; margin-right:8px; }}
+    .bank-brief {{ page-break-inside:avoid; }}
+    .bank-stats {{ width:100%; table-layout:fixed; border-collapse:separate; border-spacing:4px 0; }}
+    .bank-stats td {{ padding:5px 7px; background:{ZEBRA}; }}
+    .bank-stats span {{ display:block; color:{MUTE}; font-size:8px; font-weight:800; text-transform:uppercase; }}
+    .bank-stats strong {{ display:block; margin-top:2px; color:{NAVY}; font-size:10px; }}
+    .grid-table {{ width:100%; border-collapse:collapse; margin-top:5px; font-size:9.5px; }}
+    .grid-table th {{ background:{HEADFILL}; color:#fff; text-transform:uppercase; font-size:8px; letter-spacing:.04em; padding:5px 6px; text-align:left; }}
+    .grid-table th.num, .grid-table td.num {{ text-align:right; }}
+    .grid-table td {{ border-bottom:1px solid {LINE}; padding:4px 6px; color:{INK}; }}
+    .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; background:{ZEBRA}; }}
+    .grid-table tbody tr:nth-child(even) td {{ background:{ZEBRA}; }}
+    .charts {{ width:100%; margin-bottom:5px; text-align:center; }}
+    .note {{ color:{MUTE}; font-size:8.5px; margin-top:5px; }}
+    .empty {{ color:{MUTE}; font-style:italic; }}
+    .footer {{ color:{MUTE}; font-size:8px; margin-top:7px; border-top:1px solid {LINE}; padding-top:5px; }}
+  </style>
+</head>
+<body>
+  <table class="header"><tr>
+    <td width="54">{logo_img}</td>
+    <td><div class="brand">Qualified Commercial</div><h1>Executive Credit Brief</h1><div class="sub">Decision snapshot · generated {escape(generated)}</div></td>
+    <td align="right" width="200"><span class="pill">{escape(status)}</span></td>
+  </tr></table>
+
+  <table class="snapshot"><tr>
+    {_field("Borrower / guarantor", borrower)}
+    {_field("Business / entity", business)}
+    {_field("Requested", requested)}
+    {_field("Purpose", purpose)}
+    {_field("Suggested structure", program)}
+    {_field("Bank months", len(bank_months) if bank_months else "Awaiting evidence")}
+  </tr></table>
+
+  {bank_html}
+
+  <table class="cols"><tr>
+    <td><section class="card summary-card"><h2>Credit decision summary</h2><p>{escape(summary_text)}</p></section></td>
+    <td><section class="card summary-card"><h2>Recommended structure</h2><p>{escape(approach)}</p></section></td>
+  </tr></table>
+  {metric_tiles}
+  <div class="next"><strong>Next desk action</strong>&nbsp;{escape(next_action)}</div>
+  <table class="cols"><tr><td>{strengths_html}</td><td>{risks_html}</td></tr></table>
+  {mitigants_html}
+  <div class="footer">Qualified Commercial LLC · CONFIDENTIAL · Internal underwriting support only. This brief is not a commitment to lend or final credit approval.</div>
+</body>
+</html>
+"""
+
+    pdf: bytes | None = None
+    try:
+        from weasyprint import HTML
+
+        pdf = HTML(string=html_doc).write_pdf()
+    except Exception:
+        log.warning("executive-summary: WeasyPrint unavailable, trying PyMuPDF Story renderer")
+    if pdf is None:
+        try:
+            pdf = _render_html_pymupdf(html_doc)
+        except Exception:
+            log.exception("executive-summary: PyMuPDF Story render failed; using plain-text fallback")
+    if pdf is None:
+        pdf = _minimal_pdf(fallback_lines)
+    return _apply_watermark(pdf) or pdf
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1222,35 +1703,67 @@ def render_underwriting_packet_pdf(
     balance_sheet = _record(financials.get("balance_sheet")) or None
     credit = financials.get("credit")
     loan_program_fit = financials.get("program_fit")
+    selected_programs = _selected_programs(financials)
+    selected_program_labels = [
+        _text(item.get("name"), fallback="") for item in selected_programs
+    ]
 
     variant = str(getattr(intake, "variant", "") or "")
-    is_real_estate = variant.startswith("real_estate")
+    normalized_variant = variant.lower()
     key_metrics = _record(result.get("key_metrics"))
     bankability = _record(result.get("bankability_assessment"))
     title = "Underwriting Packet"
-    subtitle = "Real estate / DSCR funding review" if is_real_estate else "Dealer capital funding review"
+    if "foreclosure" in normalized_variant:
+        subtitle = "Commercial foreclosure rescue review"
+    elif "real_estate" in normalized_variant or "funding_review" in normalized_variant:
+        subtitle = "Real estate / DSCR funding review"
+    elif "main_street" in normalized_variant:
+        subtitle = "Main Street business funding review"
+    elif "mca" in normalized_variant:
+        subtitle = "MCA refinance review"
+    else:
+        subtitle = "Dealer capital funding review"
     borrower_name = getattr(intake, "full_name", None)
     business_name = getattr(intake, "business_name", None)
     requested_amount = _money(getattr(intake, "requested_loan_amount", None))
     purpose = getattr(intake, "loan_purpose", None)
     status = result.get("probability_status") or result.get("fundability_status") or bankability.get("status")
-    program_fit = result.get("program_fit") or executive_summary.get("suggested_product_path") or executive_summary.get("recommended_approach")
+    application_types = (
+        selected_program_labels
+        if selected_program_labels
+        else _strings(executive_summary.get("suggested_application_types"))
+    )
+    program_fit = _brief(
+        (application_types[0] if application_types else None)
+        or result.get("program_fit")
+        or executive_summary.get("suggested_product_path")
+        or executive_summary.get("recommended_approach"),
+        limit=92,
+        fallback="Structure under review",
+    )
 
-    summary_text = _redact(_text(
+    summary_text = _brief(
         executive_summary.get("executive_summary")
         or result.get("executive_summary")
         or bankability.get("reason")
-        or "The file has not produced a complete AI underwriting summary yet."
-    ))
-    recommended_angle = _redact(_text(
-        executive_summary.get("vendor_submission_angle")
-        or executive_summary.get("submission_angle")
-        or result.get("one_next_step")
-        or "Awaiting final submission angle."
-    ))
-    risks = [_redact(s) for s in (_strings(executive_summary.get("risks")) or _strings(result.get("risks")))]
-    mitigants = [_redact(s) for s in (_strings(executive_summary.get("mitigants")) or _strings(result.get("mitigants")))]
-    strengths = [_redact(s) for s in (_strings(executive_summary.get("strengths")) or _strings(result.get("strengths")))]
+        or "The file has not produced a complete AI underwriting summary yet.",
+        limit=900,
+    )
+    recommended_angle = (
+        "Submit under the desk-selected "
+        f"{_selected_program_summary(selected_programs)}; confirm every open condition in Package Readiness."
+        if selected_programs
+        else _brief(
+            executive_summary.get("vendor_submission_angle")
+            or executive_summary.get("submission_angle")
+            or result.get("one_next_step")
+            or "Awaiting final submission angle.",
+            limit=440,
+        )
+    )
+    risks = [_brief(s, limit=220) for s in (_strings(executive_summary.get("risks")) or _strings(result.get("risks")))][:6]
+    mitigants = [_brief(s, limit=220) for s in (_strings(executive_summary.get("mitigants")) or _strings(result.get("mitigants")))][:6]
+    strengths = [_brief(s, limit=220) for s in (_strings(executive_summary.get("strengths")) or _strings(result.get("strengths")))][:6]
 
     evidence = _record(result.get("document_evidence_map"))
     coverage_rows = _records(evidence.get("baseline_coverage")) or _records(evidence.get("file_classifications"))
@@ -1262,8 +1775,9 @@ def render_underwriting_packet_pdf(
     # coverage row already marks satisfied, so a fully-satisfied file shows no
     # phantom "missing" items (which would contradict a "ready for lending" state).
     _satisfied_states = {"satisfied", "uploaded", "complete"}
-    missing_rows = _records(result.get("missing_or_incomplete_items"))
-    if not missing_rows and coverage_rows:
+    readiness_rows = _open_readiness_rows(financials)
+    missing_rows = readiness_rows if readiness_rows is not None else _records(result.get("missing_or_incomplete_items"))
+    if readiness_rows is None and not missing_rows and coverage_rows:
         missing_rows = [
             {
                 "title": _text(row.get("category"), fallback="Baseline item"),
@@ -1273,7 +1787,7 @@ def render_underwriting_packet_pdf(
             for row in coverage_rows
             if str(row.get("status") or "").strip().lower() not in _satisfied_states
         ]
-    elif not missing_rows:
+    elif readiness_rows is None and not missing_rows:
         satisfied_categories = {
             str(row.get("category") or "").strip().lower()
             for row in coverage_rows
@@ -1284,14 +1798,6 @@ def render_underwriting_packet_pdf(
             for doc in missing_docs
             if str(getattr(doc, "name", "") or "").strip().lower() not in satisfied_categories
         ]
-    reviewed_docs = [
-        {
-            "file": getattr(file, "zip_entry_path", None) or getattr(file, "file_name", "Uploaded file"),
-            "type": getattr(file, "content_type", ""),
-            "status": getattr(file, "status", ""),
-        }
-        for file in files
-    ]
     metric_rows = [
         {"metric": "Probability status", "value": status or "Awaiting review", "source": "AI review"},
         {"metric": "Suggested path", "value": program_fit or "Awaiting evidence", "source": "AI review"},
@@ -1315,31 +1821,6 @@ def render_underwriting_packet_pdf(
                 continue
             metric_rows.append({"metric": key_text.replace("_", " ").title(), "value": _text(value), "source": "AI extraction"})
 
-    def _prose(value: Any) -> str | None:
-        text = _text(value, fallback="")
-        return _redact(text) if text and text.lower() != "awaiting evidence" else None
-
-    borrower_profile = _prose(executive_summary.get("borrower_profile"))
-    entity_vesting = _prose(executive_summary.get("entity_vesting_notes"))
-    property_collateral = _prose(executive_summary.get("property_collateral"))
-    requested_terms = _prose(executive_summary.get("requested_terms"))
-    application_types = _strings(executive_summary.get("suggested_application_types"))
-
-    narrative_pairs = [
-        ("Borrower profile", borrower_profile),
-        ("Entity &amp; vesting", entity_vesting),
-        ("Property / collateral", property_collateral),
-        ("Requested terms", requested_terms),
-    ]
-    narrative_present = [(label, text) for label, text in narrative_pairs if text]
-    # Two-column grid of narrative cards (pairs per row).
-    narrative_rows = []
-    for i in range(0, len(narrative_present), 2):
-        left = _prose_card(*narrative_present[i])
-        right = _prose_card(*narrative_present[i + 1]) if i + 1 < len(narrative_present) else ""
-        narrative_rows.append(f'<table class="cols"><tr><td>{left}</td><td>{right}</td></tr></table>')
-    narrative_cards = "".join(narrative_rows)
-
     # Executive summary as one or more real <p> paragraphs (prose, not JSON).
     exec_paras = [p.strip() for p in re.split(r"\n{2,}|\r\n\r\n", summary_text) if p.strip()]
     if not exec_paras:
@@ -1348,7 +1829,7 @@ def render_underwriting_packet_pdf(
 
     logo = _logo_datauri()
     logo_img = f'<img src="{logo}" width="46" height="46"/>' if logo else ""
-    generated = datetime.utcnow().strftime("%b %d, %Y %H:%M UTC")
+    generated = datetime.now(UTC).strftime("%b %d, %Y %H:%M UTC")
 
     fallback_lines = [
         f"Qualified Commercial {title}", subtitle,
@@ -1380,38 +1861,38 @@ def render_underwriting_packet_pdf(
 <head>
   <meta charset="utf-8">
   <style>
-    @page {{ size: Letter landscape; margin: 34px; }}
+    @page {{ size: Letter landscape; margin: 30px; }}
     * {{ box-sizing: border-box; }}
-    body {{ font-family: Arial, Helvetica, sans-serif; background:#ffffff; color:{INK}; font-size:11px; margin:0; }}
-    h1 {{ font-size:22px; margin:0; color:{NAVY}; letter-spacing:-.01em; }}
-    h2 {{ font-size:12px; margin:0 0 8px; color:{NAVY}; text-transform:uppercase; letter-spacing:.06em; border-bottom:2px solid {TEAL}; padding-bottom:4px; }}
-    p {{ color:{SLATE}; line-height:1.55; margin:0 0 8px; }}
-    .header {{ width:100%; border-bottom:3px solid {NAVY}; padding-bottom:12px; margin-bottom:14px; }}
+    body {{ font-family: Arial, Helvetica, sans-serif; background:#ffffff; color:{INK}; font-size:10px; margin:0; }}
+    h1 {{ font-size:21px; margin:0; color:{NAVY}; letter-spacing:-.01em; }}
+    h2 {{ font-size:10.5px; margin:0 0 6px; color:{NAVY}; text-transform:uppercase; letter-spacing:.06em; border-bottom:2px solid {TEAL}; padding-bottom:4px; }}
+    p {{ color:{SLATE}; line-height:1.42; margin:0 0 6px; }}
+    .header {{ width:100%; border-bottom:3px solid {NAVY}; padding-bottom:9px; margin-bottom:10px; }}
     .header td {{ vertical-align:middle; }}
     .brand {{ font-weight:800; color:{TEAL}; text-transform:uppercase; letter-spacing:.14em; font-size:10px; }}
     .sub {{ color:{MUTE}; font-size:10px; margin-top:2px; }}
     .pill {{ border:1px solid {TEAL_LT}; border-radius:999px; padding:6px 12px; color:{TEAL}; background:#ecfeff; font-weight:800; font-size:11px; white-space:nowrap; }}
-    .snapshot {{ width:100%; border-collapse:separate; border-spacing:8px 0; margin:0 0 14px; }}
-    .field {{ border:1px solid {LINE}; border-radius:10px; padding:9px 11px; background:#fbfcfe; width:16.6%; vertical-align:top; }}
-    .field span {{ color:{MUTE}; display:block; font-size:9px; text-transform:uppercase; letter-spacing:.07em; font-weight:800; }}
-    .field strong {{ display:block; margin-top:4px; color:{INK}; font-size:12px; }}
-    .card {{ border:1px solid {LINE}; border-radius:12px; padding:14px 16px; background:#ffffff; margin-bottom:12px; }}
+    .snapshot {{ width:100%; border-collapse:separate; border-spacing:6px 0; margin:0 0 9px; }}
+    .field {{ border:1px solid {LINE}; border-radius:8px; padding:7px 8px; background:#fbfcfe; width:16.6%; vertical-align:top; }}
+    .field span {{ color:{MUTE}; display:block; font-size:8px; text-transform:uppercase; letter-spacing:.06em; font-weight:800; }}
+    .field strong {{ display:block; margin-top:3px; color:{INK}; font-size:10.5px; }}
+    .card {{ border:1px solid {LINE}; border-radius:9px; padding:10px 12px; background:#ffffff; margin-bottom:9px; page-break-inside:avoid; }}
     .card.wide {{ page-break-inside:avoid; }}
     .cols {{ width:100%; }} .cols td {{ vertical-align:top; width:50%; }}
-    .cols td:first-child {{ padding-right:8px; }} .cols td:last-child {{ padding-left:8px; }}
-    ul {{ margin:0; padding-left:18px; }} li {{ margin:4px 0; line-height:1.45; color:{SLATE}; }}
-    .grid-table {{ width:100%; border-collapse:collapse; margin-top:6px; font-size:10.5px; }}
-    .grid-table th {{ background:{HEADFILL}; color:#ffffff; text-transform:uppercase; font-size:9px; letter-spacing:.05em; padding:7px 8px; text-align:left; }}
+    .cols td:first-child {{ padding-right:6px; }} .cols td:last-child {{ padding-left:6px; }}
+    ul {{ margin:0; padding-left:16px; }} li {{ margin:3px 0; line-height:1.35; color:{SLATE}; }}
+    .grid-table {{ width:100%; border-collapse:collapse; margin-top:5px; font-size:9.5px; }}
+    .grid-table th {{ background:#ffffff; color:{NAVY}; border-bottom:2px solid {NAVY}; text-transform:uppercase; font-size:8px; letter-spacing:.05em; padding:5px 6px; text-align:left; }}
     .grid-table th.num, .grid-table td.num {{ text-align:right; }}
-    .grid-table td {{ border-bottom:1px solid {LINE}; padding:6px 8px; color:{INK}; }}
-    .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; text-align:left; background:{ZEBRA}; }}
-    .grid-table tbody tr:nth-child(even) td {{ background:{ZEBRA}; }}
-    .charts {{ width:100%; margin-bottom:8px; text-align:center; }}
-    .note {{ color:{MUTE}; font-size:10px; font-style:italic; margin-top:8px; }}
+    .grid-table td {{ border-bottom:1px solid {LINE}; padding:4px 6px; color:{INK}; }}
+    .grid-table td.rowhead {{ font-weight:700; color:{NAVY}; text-align:left; background:#ffffff; }}
+    .grid-table tbody tr:nth-child(even) td {{ background:#ffffff; }}
+    .charts {{ width:100%; margin-bottom:5px; text-align:center; }}
+    .note {{ color:{MUTE}; font-size:8.5px; font-style:italic; margin-top:5px; }}
     .empty {{ color:{MUTE}; font-style:italic; }}
     .green {{ border-left:4px solid {TEAL}; }} .amber {{ border-left:4px solid #d97706; }}
     .disclaimer {{ background:#fff7ed; border-color:#fed7aa; color:#7c2d12; }}
-    .footer {{ color:{MUTE}; font-size:9px; margin-top:12px; border-top:1px solid {LINE}; padding-top:8px; }}
+    .footer {{ color:{MUTE}; font-size:8px; margin-top:8px; border-top:1px solid {LINE}; padding-top:5px; }}
   </style>
 </head>
 <body>
@@ -1434,6 +1915,8 @@ def render_underwriting_packet_pdf(
     {_field("Status", status)}
   </tr></table>
 
+  {_bank_section(bank_months)}
+
   <section class="card">
     <h2>Executive summary</h2>
     {exec_html}
@@ -1444,22 +1927,15 @@ def render_underwriting_packet_pdf(
     <td>{_bullet_card("Applications suggested", application_types) or _prose_card("Applications suggested", "Awaiting evidence.")}</td>
   </tr></table>
 
-  {narrative_cards}
-
-  {_credit_section(credit)}
-  {_program_fit_section(loan_program_fit)}
-  {_bank_section(bank_months)}
-  {_tax_section(tax_years)}
-  {_pl_bs_section(p_and_l, balance_sheet)}
-
   {_metric_table(metric_rows)}
-
-  <table class="cols"><tr>
-    <td>{_simple_table("Documents reviewed", reviewed_docs, [("file", "Document"), ("type", "Type"), ("status", "Status")])}</td>
-    <td>{_simple_table("Evidence coverage", coverage_rows, [("category", "Category"), ("status", "Status"), ("gap", "Evidence / gap")])}</td>
-  </tr></table>
-
   {_simple_table("Missing confirmations", missing_rows, [("title", "Item"), ("priority", "Priority"), ("detail", "Detail")], empty_message="All Stage 1 baseline evidence received — no outstanding confirmations.")}
+
+  {_pl_bs_section(p_and_l, balance_sheet)}
+  <table class="cols"><tr>
+    <td>{_tax_section(tax_years)}</td>
+    <td>{_credit_section(credit)}</td>
+  </tr></table>
+  {_program_readiness_section(financials) if selected_programs else _program_fit_section(loan_program_fit)}
 
   <table class="cols"><tr>
     <td>{_bullet_card("Strengths", strengths, "green")}</td>
@@ -1467,12 +1943,7 @@ def render_underwriting_packet_pdf(
   </tr></table>
   {_bullet_card("Mitigants", mitigants, "green")}
 
-  <section class="card disclaimer">
-    <h2>Important disclaimer</h2>
-    <p>This packet is a Qualified Commercial underwriting support package generated from submitted evidence, chat answers, and AI analysis. It is not an official 1003, not a lender-specific application, not a commitment to lend, and not final underwriting approval. Sensitive account and identity numbers have been redacted. Unsupported values are marked as awaiting evidence.</p>
-  </section>
-
-  <div class="footer">Qualified Commercial LLC &mdash; CONFIDENTIAL. Internal and vendor underwriting support only.</div>
+  <div class="footer">Qualified Commercial LLC &mdash; CONFIDENTIAL. Internal/vendor underwriting support only; not a 1003, lender application, commitment to lend, or final credit approval.</div>
 </body>
 </html>
 """

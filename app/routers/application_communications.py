@@ -46,7 +46,7 @@ from app.models.user import User
 from app.routers import application_profiles as profile_routes
 from app.schemas.application_profile import FileCreditInviteRequest, VerificationInvitationCreate
 from app.services import application_profiles as profiles
-from app.services import application_terms, file_contacts, production_term_sheets
+from app.services import application_terms, file_contacts, production_term_sheets, provenance
 from app.services import merchant_processing as merchant_offers
 from app.services.application_terms_pdf import filename_for as application_terms_filename
 from app.services.application_terms_pdf import render_terms_pdf
@@ -415,6 +415,7 @@ async def _email_attachment_options(
             file is None
             or file.id in raw_offer_ids
             or merchant_offers.is_offer_document(file)
+            or provenance.is_internal_package_output(file)
             or file.status != "uploaded"
             or file.deleted_at is not None
             or int(file.size_bytes or 0) > MAX_EMAIL_ATTACHMENT_BYTES
@@ -591,10 +592,14 @@ async def _resolve_email_attachments(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     "A selected attachment is no longer available.",
                 )
-            if file.id in raw_offer_ids or merchant_offers.is_offer_document(file):
+            if (
+                file.id in raw_offer_ids
+                or merchant_offers.is_offer_document(file)
+                or provenance.is_internal_package_output(file)
+            ):
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "The uploaded partner PDF is internal. Select the client-safe merchant offer instead.",
+                    "This internal underwriting document cannot be sent to the client.",
                 )
             if int(file.size_bytes or 0) > MAX_EMAIL_ATTACHMENT_BYTES:
                 raise HTTPException(

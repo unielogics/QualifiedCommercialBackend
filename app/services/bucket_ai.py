@@ -38,7 +38,7 @@ from app.models.bucket import (
     BucketVendorAccess,
 )
 from app.models.user import User
-from app.services import merchant_processing
+from app.services import merchant_processing, provenance
 from app.services.ai.bedrock_client import get_client, model_heavy, model_light
 from app.services.ai.structured_output import is_truncated_response, require_complete_response
 from app.services.ai.usage import _usage_tokens, json_safe_metadata, tracked_messages_create
@@ -2428,6 +2428,10 @@ async def analyze_bucket_file(
     review_type picks the per-file persona (dealer vs real-estate). Returns None
     only if the file bytes cannot be fetched from storage.
     """
+    if provenance.is_internal_package_output(file):
+        # This PDF was produced from evidence by the underwriting pipeline; it
+        # must never be analyzed as new evidence or consume another model call.
+        return None
     await _lock_analysis_scope(db, file)
     # High-signal filenames can satisfy the matching checklist slot and expose
     # statement coverage immediately, while the durable content analysis runs.
@@ -2705,6 +2709,10 @@ async def run_bucket_ai_review(db: AsyncSession, review_id: UUID) -> BucketAIRev
     if intake is not None:
         linked_files = await selected_files_for_intake(db, intake.id)
         files = list({file.id: file for file in [*files, *linked_files]}.values())
+    # Generated executive summaries and lender packages are outputs of this
+    # review pipeline, never source evidence. Feeding them back into a later
+    # review creates circular citations and can double-count financial facts.
+    files = [file for file in files if not provenance.is_internal_package_output(file)]
     extracted_zip_parent_ids = {
         file.parent_zip_file_id
         for file in files
@@ -3139,6 +3147,14 @@ async def drain_file_analyses(db: AsyncSession, *, limit: int = 5) -> int:
                         BucketFile.status == "uploaded",
                         BucketFile.deleted_at.is_(None),
                         ~current_analysis,
+                        or_(
+                            BucketFile.source_kind.is_(None),
+                            BucketFile.source_kind != "generated",
+                            BucketFile.source_detail.is_(None),
+                            ~BucketFile.source_detail.startswith(
+                                provenance.PACKAGE_READINESS_SOURCE_PREFIX
+                            ),
+                        ),
                     )
                     .order_by(BucketFile.created_at.desc())
                     .limit(remaining)
@@ -3245,7 +3261,13 @@ def _visible_review_items(items: Any, visible_names: set[str]) -> list[dict[str,
 
 
 def upload_link_visible_summary(review: BucketAIReview | None, bucket: Bucket) -> dict[str, Any] | None:
-    active_files = [file for file in bucket.files if file.status == "uploaded" and file.deleted_at is None]
+    active_files = [
+        file
+        for file in bucket.files
+        if file.status == "uploaded"
+        and file.deleted_at is None
+        and not provenance.is_internal_package_output(file)
+    ]
     active_names = {file.file_name for file in active_files}
     active_ids = {str(file.id) for file in active_files}
     if review is None or not isinstance(review.result, dict):
@@ -3846,7 +3868,13 @@ async def _chat_context(
             "recipient_name": upload_link.recipient_name,
             "ai_context": public_ai_context or None,
             "requested_documents": [_doc_context(doc) for doc in bucket.requested_documents],
-            "uploaded_files": [_file_context(file) for file in bucket.files if file.status == "uploaded" and file.deleted_at is None],
+            "uploaded_files": [
+                _file_context(file)
+                for file in bucket.files
+                if file.status == "uploaded"
+                and file.deleted_at is None
+                and not provenance.is_internal_package_output(file)
+            ],
             "visible_summary": upload_link_visible_summary(review, bucket),
             "document_evidence_map": evidence_map,
             "next_best_action": latest_result.get("next_best_action") if latest_result else None,

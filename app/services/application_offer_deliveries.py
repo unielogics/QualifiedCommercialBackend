@@ -46,6 +46,7 @@ from app.services import (
     merchant_processing,
     production_term_sheets,
     production_term_structure,
+    provenance,
 )
 from app.services.ai import orchestrator
 from app.services.application_terms_pdf import (
@@ -970,10 +971,10 @@ async def evidence_snapshot(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "A selected attachment is no longer available."
         )
-    if merchant_processing.is_offer_document(row):
+    if merchant_processing.is_offer_document(row) or provenance.is_internal_package_output(row):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "The partner source PDF is internal and cannot be sent.",
+            "This internal underwriting document cannot be sent to the client.",
         )
     raw_offer_source = (
         await db.execute(

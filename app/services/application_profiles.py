@@ -69,7 +69,7 @@ from app.schemas.application_profile import (
     UnlockedCopyRequestStateRead,
 )
 from app.scoping import scope_client_query, scope_loan_query
-from app.services import locked_file_requests, plaid_policy
+from app.services import locked_file_requests, plaid_policy, provenance
 from app.services.bucket_evidence import (
     classifications_for_requested_doc,
     effective_file_classification,
@@ -733,7 +733,11 @@ def _vertical_for_intake(intake: PublicUnderwritingIntake) -> str:
         return "mca"
     if "dealer" in variant:
         return "dealer"
-    if "real_estate" in variant or "funding_review" in variant:
+    if (
+        "real_estate" in variant
+        or "funding_review" in variant
+        or "foreclosure" in variant
+    ):
         return "real_estate"
     return "main_street"
 
@@ -1179,10 +1183,10 @@ async def _profile_evidence_file_ids(
 ) -> set[UUID]:
     file_ids: set[UUID] = set()
     if profile.primary_bucket_id:
-        file_ids.update(
+        primary_files = list(
             (
                 await db.execute(
-                    select(BucketFile.id).where(
+                    select(BucketFile).where(
                         BucketFile.bucket_id == profile.primary_bucket_id,
                         BucketFile.status == "uploaded",
                         BucketFile.deleted_at.is_(None),
@@ -1190,11 +1194,16 @@ async def _profile_evidence_file_ids(
                 )
             ).scalars().all()
         )
-    if profile.intake_id:
         file_ids.update(
+            file.id
+            for file in primary_files
+            if not provenance.is_internal_package_output(file)
+        )
+    if profile.intake_id:
+        linked_files = list(
             (
                 await db.execute(
-                    select(BucketFile.id)
+                    select(BucketFile)
                     .join(BucketIntakeLinkFile, BucketIntakeLinkFile.bucket_file_id == BucketFile.id)
                     .join(BucketIntakeLink, BucketIntakeLink.id == BucketIntakeLinkFile.link_id)
                     .where(
@@ -1206,6 +1215,11 @@ async def _profile_evidence_file_ids(
                     )
                 )
             ).scalars().all()
+        )
+        file_ids.update(
+            file.id
+            for file in linked_files
+            if not provenance.is_internal_package_output(file)
         )
     return file_ids
 
@@ -1470,10 +1484,10 @@ async def draft_analysis_status(
         return ApplicationDraftAnalysisStatus(profile_id=profile.id, can_finalize=True)
     from app.services.bucket_ai import CURRENT_FILE_ANALYSIS_VERSION
 
-    file_ids = list(
+    file_rows = list(
         (
             await db.execute(
-                select(BucketFile.id).where(
+                select(BucketFile).where(
                     BucketFile.bucket_id == profile.primary_bucket_id,
                     BucketFile.status == "uploaded",
                     BucketFile.deleted_at.is_(None),
@@ -1481,6 +1495,12 @@ async def draft_analysis_status(
             )
         ).scalars().all()
     )
+    file_ids = [
+        file if isinstance(file, UUID) else file.id
+        for file in file_rows
+        if isinstance(file, UUID)
+        or not provenance.is_internal_package_output(file)
+    ]
     analysis_rows = list(
         (
             await db.execute(
@@ -1757,6 +1777,11 @@ async def evidence_state(
                 )
             ).scalars().all()
         )
+        primary_files = [
+            file
+            for file in primary_files
+            if not provenance.is_internal_package_output(file)
+        ]
         source_id = f"bucket:{primary_id}"
         raw_files.update((file.id, file) for file in primary_files)
         sources.append(
@@ -1811,16 +1836,25 @@ async def evidence_state(
                     )
                 ).scalars().all()
             )
-            active_count = int(
+            rows = [
+                file
+                for file in rows
+                if not provenance.is_internal_package_output(file)
+            ]
+            active_rows = list(
                 (
                     await db.execute(
-                        select(func.count()).select_from(BucketFile).where(
+                        select(BucketFile).where(
                             BucketFile.bucket_id == link.bucket_id,
                             BucketFile.deleted_at.is_(None),
                             BucketFile.status == "uploaded",
                         )
                     )
-                ).scalar_one()
+                ).scalars().all()
+            )
+            active_count = sum(
+                not provenance.is_internal_package_output(file)
+                for file in active_rows
             )
             source_id = f"link:{link.id}"
             raw_files.update((file.id, file) for file in rows)

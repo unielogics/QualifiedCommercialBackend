@@ -64,6 +64,11 @@ UNATTENDED_SOURCES = frozenset({"generated", "vendor", "system"})
 #: a client actor is a bug in the calling route.
 CLIENT_SOURCES = frozenset({"client_room", "email"})
 
+# Internal underwriting deliverables live in the same durable bucket as source
+# evidence so operators and explicitly invited vendors can use one package.
+# They are not client uploads and must not appear in the generic client room.
+PACKAGE_READINESS_SOURCE_PREFIX = "package_readiness:"
+
 
 @dataclass(frozen=True)
 class Origin:
@@ -177,3 +182,14 @@ def describe_file(row) -> str:
     name = (getattr(row, "source_actor_name", "") or "").strip()
     detail = (getattr(row, "source_detail", "") or "").strip()
     return Origin(kind=kind, actor_name=name, detail=detail).describe()
+
+
+def is_internal_package_output(row) -> bool:
+    """Whether a BucketFile is an underwriter-only generated package PDF."""
+
+    return bool(
+        getattr(row, "source_kind", None) == "generated"
+        and str(getattr(row, "source_detail", None) or "").startswith(
+            PACKAGE_READINESS_SOURCE_PREFIX
+        )
+    )

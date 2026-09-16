@@ -68,6 +68,7 @@ from app.routers.buckets import (
     _bucket_storage_config,
     _client_ip,
     _delete_s3_object,
+    _download_url,
     _generate_passcode,
     _hash_passcode,
     _log,
@@ -141,7 +142,10 @@ from app.services.main_street_programs import (
     normalize_intent,
 )
 from app.services.payment_authorization import primary_super_admin
-from app.services.public_underwriting_packet_pdf import render_underwriting_packet_pdf
+from app.services.public_underwriting_packet_pdf import (
+    render_executive_summary_pdf,
+    render_underwriting_packet_pdf,
+)
 from app.services.sms import send_sms_checked
 from app.services.team_calendar import lock_calendar_owner, team_booking_settings
 
@@ -997,6 +1001,16 @@ class PublicUnderwritingArtifactRead(ORMModel):
     body_json: dict[str, Any] | None = None
     s3_key: str | None = None
     download_url: str | None = None
+    preview_url: str | None = None
+    version: int = 1
+    status: Literal["current", "superseded"] = "current"
+    bucket_file_id: UUID | None = None
+    supersedes_artifact_id: UUID | None = None
+    superseded_by_artifact_id: UUID | None = None
+    sha256: str | None = None
+    generation_id: UUID | None = None
+    input_fingerprint: str | None = None
+    is_fresh: bool | None = None
     created_by_user_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
@@ -1066,6 +1080,30 @@ class VendorEmailPreviewResponse(BaseModel):
 class VendorEmailSendResponse(BaseModel):
     email_sends: list[PublicUnderwritingEmailSendRead]
     vendor_access_ids: list[UUID]
+
+
+class PackageReadinessBucketFileRead(BaseModel):
+    id: UUID
+    bucket_id: UUID
+    file_name: str
+    content_type: str
+    size_bytes: int
+    source_kind: str | None = None
+    source_detail: str | None = None
+    status: str
+    preview_url: str | None = None
+    download_url: str | None = None
+    created_at: datetime
+
+
+class PackageReadinessGenerationRead(BaseModel):
+    generation_id: UUID
+    generated_at: datetime
+    executive_summary: PublicUnderwritingArtifactRead
+    lender_packet: PublicUnderwritingArtifactRead
+    bucket_files: list[PackageReadinessBucketFileRead]
+    superseded_bucket_file_ids: list[UUID] = Field(default_factory=list)
+    artifact_history: list[PublicUnderwritingArtifactRead] = Field(default_factory=list)
 
 
 class DealerIntakeRead(ORMModel):
@@ -2675,6 +2713,8 @@ def _has_uploaded_doc_name(intake: PublicUnderwritingIntake, needle: str) -> boo
     wanted = needle.lower()
     docs = {doc.id: doc for doc in intake.bucket.requested_documents}
     for file in _active_files(intake.bucket):
+        if _is_package_readiness_output(file):
+            continue
         doc = docs.get(file.requested_document_id) if file.requested_document_id else None
         haystack = f"{file.file_name} {doc.name if doc else ''} {doc.category if doc else ''}".lower()
         if wanted in haystack:
@@ -2742,7 +2782,10 @@ def _message_for_widget(widget: dict[str, Any] | None, intake: PublicUnderwritin
         # real-estate file never sees dealer-flavored fallback text.
         if intake.variant == FUNDING_VARIANT:
             return _funding_empty_message(intake.preferred_language)
-        if not _active_files(intake.bucket):
+        if not any(
+            not _is_package_readiness_output(file)
+            for file in _active_files(intake.bucket)
+        ):
             return (
                 "Your secure underwriter chat is open. Attach PDFs, images, ZIP files, spreadsheets, or bank/tax documents here, "
                 "and I will screen what they prove before asking the next underwriting question."
@@ -3192,16 +3235,16 @@ def _record_chat_fact(intake: PublicUnderwritingIntake, message: str | None, *, 
 
 
 async def _recent_dealer_chat(db: AsyncSession, intake: PublicUnderwritingIntake) -> list[dict[str, str]]:
-    # Include BOTH the client (uploader) thread and the internal admin thread. The
-    # operator often corrects or supplements facts in the admin chat (e.g. a
-    # restated credit score), and those corrections are authoritative — excluding
-    # them made the summary/email report a stale client-stated value.
+    # Only the shared client/uploader thread belongs in a lender-facing package.
+    # Internal admin AI threads are private per operator. Explicit operator facts
+    # are promoted into intake_state.chat_facts when written and are consumed by
+    # the authoritative-facts resolver below, without exposing private dialogue.
     rows = (
         await db.execute(
             select(BucketAIMessage)
             .where(
                 BucketAIMessage.bucket_id == intake.bucket_id,
-                BucketAIMessage.audience.in_(["uploader", "admin"]),
+                BucketAIMessage.audience == "uploader",
             )
             .order_by(BucketAIMessage.created_at.desc(), CHAT_TURN_ORDER.desc())
             .limit(32)
@@ -3937,7 +3980,11 @@ def _requested_document_read(
     return data
 
 
-def _artifact_download_url(artifact: PublicUnderwritingIntakeArtifact) -> str | None:
+def _artifact_download_url(
+    artifact: PublicUnderwritingIntakeArtifact,
+    *,
+    disposition: Literal["inline", "attachment"] = "attachment",
+) -> str | None:
     if not artifact.s3_key:
         return None
     try:
@@ -3948,7 +3995,8 @@ def _artifact_download_url(artifact: PublicUnderwritingIntakeArtifact) -> str | 
             Params={
                 "Bucket": bucket,
                 "Key": artifact.s3_key,
-                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+                "ResponseContentDisposition": f'{disposition}; filename="{filename}"',
+                "ResponseContentType": "application/pdf",
             },
             ExpiresIn=900,
         )
@@ -3957,9 +4005,59 @@ def _artifact_download_url(artifact: PublicUnderwritingIntakeArtifact) -> str | 
         return None
 
 
-def _artifact_read(artifact: PublicUnderwritingIntakeArtifact) -> PublicUnderwritingArtifactRead:
+def _artifact_read(
+    artifact: PublicUnderwritingIntakeArtifact,
+    *,
+    current_input_fingerprint: str | None = None,
+    active_bucket_file_ids: set[UUID] | None = None,
+) -> PublicUnderwritingArtifactRead:
+    body = artifact.body_json if isinstance(artifact.body_json, dict) else {}
+    package = body.get("_package") if isinstance(body.get("_package"), dict) else {}
+    pdf_metadata = body.get("_pdf") if isinstance(body.get("_pdf"), dict) else {}
+    input_fingerprint = str(pdf_metadata.get("package_input_sha256") or "") or None
+
+    def _uuid(value: Any) -> UUID | None:
+        try:
+            return UUID(str(value)) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def _version(value: Any) -> int:
+        try:
+            return max(1, int(value or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    bucket_file_id = _uuid(package.get("bucket_file_id"))
+    bucket_link_is_active = (
+        bucket_file_id in active_bucket_file_ids
+        if active_bucket_file_ids is not None and bucket_file_id is not None
+        else active_bucket_file_ids is None
+    )
+
     return PublicUnderwritingArtifactRead.model_validate(artifact).model_copy(
-        update={"download_url": _artifact_download_url(artifact)}
+        update={
+            "download_url": _artifact_download_url(artifact),
+            "preview_url": _artifact_download_url(artifact, disposition="inline"),
+            "version": _version(package.get("version")),
+            "status": (
+                "superseded" if package.get("status") == "superseded" else "current"
+            ),
+            "bucket_file_id": bucket_file_id,
+            "supersedes_artifact_id": _uuid(package.get("supersedes_artifact_id")),
+            "superseded_by_artifact_id": _uuid(
+                package.get("superseded_by_artifact_id")
+            ),
+            "sha256": str(package.get("sha256") or "") or None,
+            "generation_id": _uuid(package.get("generation_id")),
+            "input_fingerprint": input_fingerprint,
+            "is_fresh": (
+                input_fingerprint == current_input_fingerprint
+                and bucket_link_is_active
+                if current_input_fingerprint is not None
+                else None
+            ),
+        }
     )
 
 
@@ -3973,6 +4071,7 @@ async def _management_artifacts(db: AsyncSession, intake_id: UUID) -> list[Publi
             select(PublicUnderwritingIntakeArtifact)
             .where(PublicUnderwritingIntakeArtifact.intake_id == intake_id)
             .order_by(PublicUnderwritingIntakeArtifact.created_at.desc())
+            .execution_options(populate_existing=True)
         )
     ).scalars().all()
 
@@ -4119,10 +4218,27 @@ def _latest_result_for_intake(intake: PublicUnderwritingIntake) -> dict[str, Any
     return {}
 
 
-async def _lead_management_context(db: AsyncSession, intake: PublicUnderwritingIntake) -> dict[str, Any]:
+async def _lead_management_context(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    files_snapshot: list[BucketFile] | None = None,
+) -> dict[str, Any]:
     docs_by_id = {str(doc.id): doc for doc in intake.bucket.requested_documents}
     files = []
-    for file in sorted(_active_files(intake.bucket), key=lambda item: item.created_at, reverse=True):
+    for file in sorted(
+        (
+            item
+            for item in (
+                files_snapshot
+                if files_snapshot is not None
+                else _active_files(intake.bucket)
+            )
+            if not _is_package_readiness_output(item)
+        ),
+        key=lambda item: item.created_at,
+        reverse=True,
+    ):
         doc = docs_by_id.get(str(file.requested_document_id)) if file.requested_document_id else None
         files.append(
             {
@@ -4205,6 +4321,24 @@ def _authoritative_facts_from_chat(
         facts["credit_score"] = str(credit_state["fico"])
         facts["credit_score_source"] = "verified credit bureau soft pull"
         return facts
+    stored_facts = _intake_state(intake).get("chat_facts")
+    if isinstance(stored_facts, list):
+        for item in reversed(stored_facts):
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("text") or "")
+            match = _CREDIT_RE.search(content)
+            if not match:
+                continue
+            score = match.group(1) or match.group(2)
+            if score and 300 <= int(score) <= 850:
+                plus = "+" if "+" in content else ""
+                facts["credit_score"] = f"{score}{plus}"
+                facts["credit_score_source"] = (
+                    "most recent recorded chat fact "
+                    f"({item.get('at') or 'chat'})"
+                )
+                return facts
     # chat_history is oldest→newest; walk newest-first for the latest statement.
     # ONLY trust user/borrower/operator messages — an assistant reply may echo a
     # stale value, so counting assistant text would defeat the correction.
@@ -4259,7 +4393,10 @@ async def _credit_financials_section(db: AsyncSession, intake: PublicUnderwritin
 
 
 async def _collect_packet_financials(
-    db: AsyncSession, intake: PublicUnderwritingIntake
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+    *,
+    active_file_ids: set[UUID] | None = None,
 ) -> dict[str, Any]:
     """Pull the structured per-file facts the lender packet visualizes: month-over-month
     bank activity (last 6 months), 2-year tax-return figures, and (when a soft pull has
@@ -4270,7 +4407,15 @@ async def _collect_packet_financials(
     # program_fit is a dealer-only signal — never computed/rendered for a
     # real-estate lead's packet.
     program_fit = _loan_program_fit(intake) if intake.variant != FUNDING_VARIANT else None
-    active_ids = {file.id for file in _active_files(intake.bucket)}
+    active_ids = (
+        active_file_ids
+        if active_file_ids is not None
+        else {
+            file.id
+            for file in _active_files(intake.bucket)
+            if not _is_package_readiness_output(file)
+        }
+    )
     if not active_ids:
         return {
             "bank_months": [],
@@ -4330,8 +4475,13 @@ async def _generate_management_json(
     *,
     purpose: str,
     extra: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    context = await _lead_management_context(db, intake)
+    context = (
+        context_snapshot
+        if context_snapshot is not None
+        else await _lead_management_context(db, intake)
+    )
     variant_label = _variant_label(intake.variant)
     if purpose == "executive_summary":
         schema = {
@@ -4362,6 +4512,9 @@ async def _generate_management_json(
             "message AND any figure in the prior 'latest_review' text (that prior review may be stale). "
             "If context.authoritative_facts.credit_score is present, you MUST use that exact credit score value "
             "everywhere and ignore any other credit number in the evidence or prior review. "
+            "If context.package_readiness.selected_programs is non-empty, those pinned desk selections are "
+            "authoritative. Use only those exact program names in every product, facility, and structure "
+            "recommendation; never substitute an AI-suggested product. "
             "If context.program_fit is present (dealer leads only), use context.program_labels to name every "
             "program where program_fit[key].eligible is true, and weave the eligible programs and, where "
             "requested_loan_amount or the program's own sizing fields support it, an estimate of total addressable "
@@ -4586,10 +4739,61 @@ async def _create_executive_summary_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
     user: CurrentUser,
+    *,
+    financials: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
+    source_snapshot_metadata: dict[str, Any] | None = None,
+    cleanup_s3_keys: list[str] | None = None,
 ) -> PublicUnderwritingIntakeArtifact:
-    summary = await _generate_management_json(db, intake, user, purpose="executive_summary")
+    summary = await _generate_management_json(
+        db,
+        intake,
+        user,
+        purpose="executive_summary",
+        context_snapshot=context_snapshot,
+    )
+    readiness_snapshot = (
+        context_snapshot.get("package_readiness")
+        if isinstance(context_snapshot, dict)
+        and isinstance(context_snapshot.get("package_readiness"), dict)
+        else {}
+    )
+    selected_programs = (
+        readiness_snapshot.get("selected_programs")
+        if isinstance(readiness_snapshot.get("selected_programs"), list)
+        else []
+    )
+    selected_names = [
+        str(item.get("name") or "").strip()
+        for item in selected_programs
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    if selected_names:
+        pinned = ", ".join(selected_names)
+        scope_review_required = any(
+            bool(item.get("needs_scope_review"))
+            for item in selected_programs
+            if isinstance(item, dict)
+        )
+        summary["suggested_application_types"] = selected_names
+        if scope_review_required:
+            summary["recommended_approach"] = (
+                f"Desk-selected {pinned} is a manual scope exception. Complete underwriting scope review and every open Package Readiness condition before submission."
+            )
+            summary["vendor_submission_angle"] = (
+                f"Do not submit {pinned} until the manual scope exception is reviewed and cleared."
+            )
+        else:
+            summary["recommended_approach"] = (
+                f"Use the desk-selected {pinned}. Confirm the current Package Readiness conditions before submission."
+            )
+            summary["vendor_submission_angle"] = (
+                f"Submit under the pinned {pinned} criteria and address every open package condition."
+            )
+        summary["program_selection"] = readiness_snapshot
     _prepend_credit_key_metric(summary, intake)
-    _prepend_program_fit_key_metric(summary, intake)
+    if not selected_names:
+        _prepend_program_fit_key_metric(summary, intake)
     title = str(summary.get("title") or _summary_title(intake))[:240]
     body_text = _format_executive_summary_markdown(summary)
     if not body_text:
@@ -4600,12 +4804,34 @@ async def _create_executive_summary_artifact(
             recovered = _repair_truncated_json(candidate) or {}
             candidate = str(recovered.get("executive_summary") or "").strip()
         body_text = candidate
+    if financials is None:
+        financials = await _collect_packet_financials(db, intake)
+    pdf_bytes = await asyncio.to_thread(
+        render_executive_summary_pdf,
+        intake=intake,
+        result=_latest_result_for_intake(intake),
+        executive_summary=summary,
+        financials=financials,
+    )
+    s3_key = await _store_underwriting_pdf(intake, pdf_bytes, title, "executive-summary")
+    if cleanup_s3_keys is not None:
+        cleanup_s3_keys.append(s3_key)
+    summary = {
+        **summary,
+        "_pdf": {
+            "size_bytes": len(pdf_bytes),
+            "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+            "content_type": "application/pdf",
+            **(source_snapshot_metadata or {}),
+        },
+    }
     artifact = PublicUnderwritingIntakeArtifact(
         intake_id=intake.id,
         artifact_type="executive_summary",
         title=title,
         body_text=body_text,
         body_json=summary,
+        s3_key=s3_key,
         created_by_user_id=user.id,
     )
     db.add(artifact)
@@ -4733,14 +4959,15 @@ async def _ensure_prequalification_artifact(
     return existing or await _create_prequalification_artifact(db, intake, user)
 
 
-async def _store_lender_packet_pdf(
+async def _store_underwriting_pdf(
     intake: PublicUnderwritingIntake,
     pdf_bytes: bytes,
     title: str,
+    document_slug: str,
 ) -> str:
     bucket, prefix, kms_key_id = _bucket_storage_config()
     key_prefix = f"{prefix}/public-underwriting/{intake.id}/artifacts" if prefix else f"public-underwriting/{intake.id}/artifacts"
-    key = f"{key_prefix}/{uuid4()}-{_safe_filename(title)}.pdf"
+    key = f"{key_prefix}/{uuid4()}-{_safe_filename(document_slug or title)}.pdf"
     await asyncio.to_thread(
         _s3_client().put_object,
         Bucket=bucket,
@@ -4753,16 +4980,44 @@ async def _store_lender_packet_pdf(
     return key
 
 
+async def _store_lender_packet_pdf(
+    intake: PublicUnderwritingIntake,
+    pdf_bytes: bytes,
+    title: str,
+) -> str:
+    """Compatibility wrapper for callers/tests that predate package readiness."""
+
+    return await _store_underwriting_pdf(intake, pdf_bytes, title, "lender-packet")
+
+
 async def _create_lender_packet_artifact(
     db: AsyncSession,
     intake: PublicUnderwritingIntake,
     user: CurrentUser,
     executive_summary: PublicUnderwritingIntakeArtifact | None = None,
+    *,
+    files_snapshot: list[BucketFile] | None = None,
+    financials: dict[str, Any] | None = None,
+    source_snapshot_metadata: dict[str, Any] | None = None,
+    cleanup_s3_keys: list[str] | None = None,
 ) -> PublicUnderwritingIntakeArtifact:
     summary_artifact = executive_summary or await _ensure_executive_summary_artifact(db, intake, user)
-    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    files = sorted(
+        (
+            file
+            for file in (
+                files_snapshot
+                if files_snapshot is not None
+                else _active_files(intake.bucket)
+            )
+            if not _is_package_readiness_output(file)
+        ),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
     missing_docs = _missing_required_docs(intake.bucket)
-    financials = await _collect_packet_financials(db, intake)
+    if financials is None:
+        financials = await _collect_packet_financials(db, intake)
     title = f"{intake.business_name or intake.full_name or 'Lead'} lender packet"
     pdf_bytes = await asyncio.to_thread(
         render_underwriting_packet_pdf,
@@ -4774,12 +5029,22 @@ async def _create_lender_packet_artifact(
         financials=financials,
     )
     s3_key = await _store_lender_packet_pdf(intake, pdf_bytes, title)
+    if cleanup_s3_keys is not None:
+        cleanup_s3_keys.append(s3_key)
     artifact = PublicUnderwritingIntakeArtifact(
         intake_id=intake.id,
         artifact_type="lender_packet",
         title=title,
         body_text="Qualified Commercial underwriting packet PDF generated for lender/vendor review.",
-        body_json={"source_summary_artifact_id": str(summary_artifact.id), "size_bytes": len(pdf_bytes)},
+        body_json={
+            "source_summary_artifact_id": str(summary_artifact.id),
+            "_pdf": {
+                "size_bytes": len(pdf_bytes),
+                "sha256": hashlib.sha256(pdf_bytes).hexdigest(),
+                "content_type": "application/pdf",
+                **(source_snapshot_metadata or {}),
+            },
+        },
         s3_key=s3_key,
         created_by_user_id=user.id,
     )
@@ -4807,6 +5072,540 @@ async def _ensure_lender_packet_artifact(
     return existing or await _create_lender_packet_artifact(db, intake, user)
 
 
+_PACKAGE_READINESS_SOURCE_PREFIX = provenance.PACKAGE_READINESS_SOURCE_PREFIX
+_PACKAGE_READINESS_TYPES = ("executive_summary", "lender_packet")
+
+
+def _is_package_readiness_output(file: Any) -> bool:
+    return provenance.is_internal_package_output(file)
+
+
+def _artifact_pdf_metadata(artifact: PublicUnderwritingIntakeArtifact) -> dict[str, Any]:
+    body = artifact.body_json if isinstance(artifact.body_json, dict) else {}
+    metadata = body.get("_pdf") if isinstance(body.get("_pdf"), dict) else {}
+    return metadata
+
+
+def _source_snapshot_metadata(files: list[BucketFile]) -> dict[str, Any]:
+    """Fingerprint the exact evidence set shared by both generated PDFs."""
+
+    items = sorted(
+        (
+            {
+                "id": str(file.id),
+                "sha256": str(file.content_hash or ""),
+                "size_bytes": int(file.size_bytes or 0),
+                "created_at": file.created_at.isoformat() if file.created_at else None,
+            }
+            for file in files
+            if not _is_package_readiness_output(file)
+        ),
+        key=lambda item: item["id"],
+    )
+    payload = json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "source_file_count": len(items),
+        "source_file_ids": [item["id"] for item in items],
+        "source_snapshot_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _normalized_package_readiness(readiness: Any) -> dict[str, Any]:
+    selected_programs = [
+        {
+            "program_key": item.program_key,
+            "name": item.program_name,
+            "playbook_id": str(item.playbook_id),
+            "playbook_version": item.playbook_version,
+            "source": item.source,
+            "needs_scope_review": item.needs_scope_review,
+        }
+        for item in readiness.selections
+    ]
+    selected_keys = {item["program_key"] for item in selected_programs}
+    blocking_keys = {
+        key
+        for program in readiness.programs
+        for key in program.blocking_requirement_keys
+    }
+    requirements = []
+    for item in readiness.requirements:
+        overrides = dict(item.program_overrides or {})
+        applicable_programs = (
+            selected_keys.intersection(item.source_program_keys)
+            if item.source_program_keys
+            else selected_keys
+        )
+        overridden_everywhere = bool(applicable_programs) and all(
+            overrides.get(key) in {"waived", "not_applicable"}
+            for key in applicable_programs
+        )
+        state_complete = item.status in {"verified", "waived", "not_applicable"}
+        effectively_open = not state_complete and not overridden_everywhere
+        if item.required_level == "required" and readiness.programs:
+            effectively_open = item.requirement_key in blocking_keys
+        requirements.append(
+            {
+                "requirement_key": item.requirement_key,
+            "label": item.label,
+            "category": item.category,
+            "required_level": item.required_level,
+            "status": item.status,
+            "evidence_count": item.evidence_count,
+            "verified_evidence_count": item.verified_evidence_count,
+            "coverage_complete": item.coverage_complete,
+            "verified_coverage_complete": item.verified_coverage_complete,
+                "verification_required": item.verification_required,
+                "source_program_keys": item.source_program_keys,
+                "source_policy_keys": item.source_policy_keys,
+                "program_overrides": overrides,
+                "blocks_selected_program": item.requirement_key in blocking_keys,
+                "effectively_open": effectively_open,
+                "state_reason": item.state_reason,
+            }
+        )
+    requirement_labels = {
+        item["requirement_key"]: item["label"] for item in requirements
+    }
+    programs = [
+        {
+            "program_key": item.program_key,
+            "program_name": item.program_name,
+            "complete": item.complete,
+            "completion_percent": item.completion_percent,
+            "required_count": item.required_count,
+            "satisfied_count": item.satisfied_count,
+            "blocking_requirement_keys": item.blocking_requirement_keys,
+            "blocking_requirement_labels": [
+                requirement_labels.get(key, key)
+                for key in item.blocking_requirement_keys
+            ],
+        }
+        for item in readiness.programs
+    ]
+    return {
+        "selection_mode": readiness.selection_mode,
+        "selected_programs": selected_programs,
+        "programs": programs,
+        "requirements": requirements,
+        "can_advance": readiness.can_advance,
+        # `advanced` is returned on the transition request and
+        # `already_in_underwriting` on the next read. They describe the same
+        # durable state and must hash identically or a new package goes stale
+        # immediately after generation.
+        "automatic_stage_status": (
+            "in_underwriting"
+            if readiness.automatic_stage_status
+            in {"advanced", "already_in_underwriting"}
+            else readiness.automatic_stage_status
+        ),
+    }
+
+
+def _package_input_fingerprint(
+    *,
+    source_metadata: dict[str, Any],
+    context_snapshot: dict[str, Any],
+    financials: dict[str, Any],
+) -> str:
+    """Hash every mutable fact that can change the two-package PDF pair."""
+    payload = {
+        "source_evidence": {
+            "source_file_count": source_metadata.get("source_file_count"),
+            "source_file_ids": source_metadata.get("source_file_ids"),
+            "source_snapshot_sha256": source_metadata.get("source_snapshot_sha256"),
+        },
+        "context": context_snapshot,
+        "financials": financials,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _package_generation_inputs(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+) -> tuple[
+    list[BucketFile],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    str,
+]:
+    """Build the one canonical input snapshot used to render and validate PDFs."""
+    # Never derive a delivery fingerprint from the relationship populated when
+    # the admin page first loaded. A file can be uploaded, superseded, or
+    # removed in another request while an operator keeps the composer open.
+    # ``populate_existing`` also refreshes rows already present in this
+    # session's identity map, so a status/deleted_at change cannot be hidden by
+    # an earlier eager load.
+    current_bucket_files = list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(
+                    BucketFile.bucket_id == intake.bucket_id,
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                )
+                .order_by(BucketFile.created_at.desc(), BucketFile.id.desc())
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    source_files = sorted(
+        (
+            file
+            for file in current_bucket_files
+            if not _is_package_readiness_output(file)
+        ),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
+    source_metadata = _source_snapshot_metadata(source_files)
+    profile = await profiles_service.provision_profile_for_intake(db, intake)
+    from app.services.application_programs import get_program_readiness
+
+    readiness = await get_program_readiness(db, profile)
+    readiness_snapshot = _normalized_package_readiness(readiness)
+    readiness_payload = json.dumps(
+        readiness_snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    context_snapshot = await _lead_management_context(
+        db,
+        intake,
+        files_snapshot=source_files,
+    )
+    context_snapshot = {
+        **context_snapshot,
+        "package_readiness": readiness_snapshot,
+    }
+    financials = await _collect_packet_financials(
+        db,
+        intake,
+        active_file_ids={file.id for file in source_files},
+    )
+    financials = {
+        **financials,
+        "program_selection_mode": readiness.selection_mode,
+        "selected_programs": readiness_snapshot["selected_programs"],
+        "package_readiness": readiness_snapshot,
+    }
+    input_fingerprint = _package_input_fingerprint(
+        source_metadata=source_metadata,
+        context_snapshot=context_snapshot,
+        financials=financials,
+    )
+    source_metadata = {
+        **source_metadata,
+        "program_selection_mode": readiness.selection_mode,
+        "selected_programs": readiness_snapshot["selected_programs"],
+        "package_readiness": readiness_snapshot,
+        "package_readiness_snapshot_sha256": hashlib.sha256(
+            readiness_payload
+        ).hexdigest(),
+        "package_input_sha256": input_fingerprint,
+    }
+    return (
+        source_files,
+        source_metadata,
+        context_snapshot,
+        financials,
+        input_fingerprint,
+    )
+
+
+async def _current_package_input_fingerprint(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+) -> str:
+    *_, input_fingerprint = await _package_generation_inputs(db, intake)
+    return input_fingerprint
+
+
+async def _fresh_package_artifact_pair(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+) -> tuple[PublicUnderwritingIntakeArtifact, PublicUnderwritingIntakeArtifact]:
+    """Resolve one synchronized, current pair or require regeneration.
+
+    External delivery must never mix independently generated documents or ship
+    PDFs whose evidence, selected program, requirements, or review has changed.
+    """
+    summary = await _latest_artifact(db, intake.id, "executive_summary")
+    packet = await _latest_artifact(db, intake.id, "lender_packet")
+    if summary is None or packet is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Generate the executive summary and lender package together before delivery.",
+        )
+    summary_package = _artifact_package_metadata(summary)
+    packet_package = _artifact_package_metadata(packet)
+    summary_generation = str(summary_package.get("generation_id") or "")
+    packet_generation = str(packet_package.get("generation_id") or "")
+    if (
+        not summary_generation
+        or summary_generation != packet_generation
+        or summary_package.get("status") != "current"
+        or packet_package.get("status") != "current"
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Refresh Package Readiness so both PDFs use the same evidence snapshot.",
+        )
+    try:
+        summary_bucket_file_id = UUID(str(summary_package.get("bucket_file_id")))
+        packet_bucket_file_id = UUID(str(packet_package.get("bucket_file_id")))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Refresh Package Readiness to restore both current bucket PDFs.",
+        ) from None
+    bucket_files = list(
+        (
+            await db.execute(
+                select(BucketFile).where(
+                    BucketFile.id.in_(
+                        [summary_bucket_file_id, packet_bucket_file_id]
+                    ),
+                    BucketFile.bucket_id == intake.bucket_id,
+                    BucketFile.deleted_at.is_(None),
+                    BucketFile.status == "uploaded",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {file.id: file for file in bucket_files}
+    if (
+        set(by_id) != {summary_bucket_file_id, packet_bucket_file_id}
+        or by_id[summary_bucket_file_id].s3_key != summary.s3_key
+        or by_id[packet_bucket_file_id].s3_key != packet.s3_key
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A current package PDF was removed from the bucket. Refresh before delivery.",
+        )
+    current_fingerprint = await _current_package_input_fingerprint(db, intake)
+    summary_fingerprint = str(
+        _artifact_pdf_metadata(summary).get("package_input_sha256") or ""
+    )
+    packet_fingerprint = str(
+        _artifact_pdf_metadata(packet).get("package_input_sha256") or ""
+    )
+    if (
+        not summary_fingerprint
+        or summary_fingerprint != packet_fingerprint
+        or summary_fingerprint != current_fingerprint
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The file or program readiness changed. Refresh both PDFs before delivery.",
+        )
+    return summary, packet
+
+
+def _artifact_package_metadata(artifact: PublicUnderwritingIntakeArtifact | None) -> dict[str, Any]:
+    if artifact is None or not isinstance(artifact.body_json, dict):
+        return {}
+    metadata = artifact.body_json.get("_package")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _set_artifact_package_metadata(
+    artifact: PublicUnderwritingIntakeArtifact,
+    metadata: dict[str, Any],
+) -> None:
+    body = dict(artifact.body_json) if isinstance(artifact.body_json, dict) else {}
+    body["_package"] = metadata
+    # Assign a fresh mapping so SQLAlchemy persists the JSONB change even when
+    # the artifact was loaded before this generation began.
+    artifact.body_json = body
+
+
+def _package_bucket_file_read(file: BucketFile) -> PackageReadinessBucketFileRead:
+    def _safe_url(disposition: Literal["inline", "attachment"]) -> str | None:
+        try:
+            return _download_url(
+                file.s3_key,
+                disposition=disposition,
+                content_type="application/pdf",
+            )
+        except Exception:
+            # A temporary signing/configuration failure must not invalidate the
+            # PDFs already committed to storage. The UI can refresh to obtain a
+            # URL later and the artifact history remains intact.
+            log.exception("Unable to build package-readiness bucket file URL")
+            return None
+
+    return PackageReadinessBucketFileRead(
+        id=file.id,
+        bucket_id=file.bucket_id,
+        file_name=file.file_name,
+        content_type=file.content_type,
+        size_bytes=file.size_bytes,
+        source_kind=file.source_kind,
+        source_detail=file.source_detail,
+        status=file.status,
+        preview_url=_safe_url("inline"),
+        download_url=_safe_url("attachment"),
+        created_at=file.created_at,
+    )
+
+
+async def _publish_package_artifact_to_bucket(
+    db: AsyncSession,
+    *,
+    intake: PublicUnderwritingIntake,
+    artifact: PublicUnderwritingIntakeArtifact,
+    previous_artifact: PublicUnderwritingIntakeArtifact | None,
+    generation_id: UUID,
+    generated_at: datetime,
+    user: CurrentUser,
+) -> tuple[BucketFile, list[UUID]]:
+    """Make one immutable PDF snapshot the bucket's current package document.
+
+    Historical artifact rows and S3 bytes remain immutable. The former active
+    BucketFile is hidden as ``superseded`` while the new version becomes the
+    single visible file for its document kind.
+    """
+
+    if artifact.artifact_type not in _PACKAGE_READINESS_TYPES or not artifact.s3_key:
+        raise RuntimeError("Package artifact is not a stored PDF")
+    source_base = f"{_PACKAGE_READINESS_SOURCE_PREFIX}{artifact.artifact_type}"
+    current_files = list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(
+                    BucketFile.bucket_id == intake.bucket_id,
+                    BucketFile.source_kind == "generated",
+                    BucketFile.source_detail.startswith(f"{source_base}:", autoescape=True),
+                    BucketFile.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    superseded_ids: list[UUID] = []
+    for file in current_files:
+        file.status = "superseded"
+        file.deleted_at = generated_at
+        file.deleted_by_user_id = user.id
+        # The historical artifact continues to reference these immutable bytes.
+        # Supersession hides the bucket row but intentionally retains storage.
+        file.delete_storage_status = "retained_superseded"
+        superseded_ids.append(file.id)
+
+    prior_artifacts = list(
+        (
+            await db.execute(
+                select(PublicUnderwritingIntakeArtifact)
+                .where(
+                    PublicUnderwritingIntakeArtifact.intake_id == intake.id,
+                    PublicUnderwritingIntakeArtifact.artifact_type == artifact.artifact_type,
+                    PublicUnderwritingIntakeArtifact.id != artifact.id,
+                )
+                .order_by(PublicUnderwritingIntakeArtifact.created_at)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Allocate one monotonically increasing version per chronological artifact.
+    # Preserve valid historical numbers, while assigning later legacy rows the
+    # next unused number instead of duplicating the preceding current version.
+    assigned_versions: dict[UUID, int] = {}
+    next_version = 1
+    for prior_artifact in prior_artifacts:
+        prior_meta = _artifact_package_metadata(prior_artifact)
+        try:
+            known_version = int(prior_meta.get("version") or 0)
+        except (TypeError, ValueError):
+            known_version = 0
+        assigned = known_version if known_version >= next_version else next_version
+        assigned_versions[prior_artifact.id] = assigned
+        next_version = assigned + 1
+    version = next_version
+    pdf_meta = _artifact_pdf_metadata(artifact)
+    label = intake.business_name or intake.full_name or "Underwriting file"
+    document_label = (
+        "Executive Summary"
+        if artifact.artifact_type == "executive_summary"
+        else "Lender Package"
+    )
+    bucket_file = BucketFile(
+        bucket_id=intake.bucket_id,
+        requested_document_id=None,
+        upload_link_id=None,
+        file_name=_safe_filename(f"{label} - {document_label}.pdf"),
+        s3_key=artifact.s3_key,
+        content_type="application/pdf",
+        size_bytes=max(0, int(pdf_meta.get("size_bytes") or 0)),
+        content_hash=str(pdf_meta.get("sha256") or "") or None,
+        uploaded_by_name=user.name or "Qualified Commercial",
+        uploaded_by_email=user.email,
+        uploaded_by_user_id=user.id,
+        source_kind="generated",
+        source_detail=f"{source_base}:v{version}",
+        status="uploaded",
+    )
+    db.add(bucket_file)
+    await db.flush()
+
+    ordered_chain = [*prior_artifacts, artifact]
+    for inferred_version, prior_artifact in enumerate(prior_artifacts, start=1):
+        prior_meta = _artifact_package_metadata(prior_artifact)
+        if prior_meta and prior_meta.get("status") == "superseded":
+            # Historical snapshots are immutable once their successor has been
+            # recorded. Do not rewrite v1 -> v3 when a later v3 is generated.
+            continue
+        successor = ordered_chain[inferred_version]
+        _set_artifact_package_metadata(
+            prior_artifact,
+            {
+                **prior_meta,
+                "version": assigned_versions.get(prior_artifact.id, inferred_version),
+                "status": "superseded",
+                "superseded_by_artifact_id": str(successor.id),
+                "superseded_at": (
+                    prior_meta.get("superseded_at") or generated_at.isoformat()
+                ),
+            },
+        )
+    _set_artifact_package_metadata(
+        artifact,
+        {
+            "version": version,
+            "status": "current",
+            "bucket_file_id": str(bucket_file.id),
+            "supersedes_artifact_id": (
+                str(previous_artifact.id) if previous_artifact is not None else None
+            ),
+            "generation_id": str(generation_id),
+            "generated_at": generated_at.isoformat(),
+            "sha256": str(pdf_meta.get("sha256") or "") or None,
+            "size_bytes": bucket_file.size_bytes,
+        },
+    )
+    await db.flush()
+    return bucket_file, superseded_ids
+
+
 async def _s3_bytes(s3_key: str) -> bytes:
     bucket, _prefix, _kms = _bucket_storage_config()
 
@@ -4815,6 +5614,35 @@ async def _s3_bytes(s3_key: str) -> bytes:
         return response["Body"].read()
 
     return await asyncio.to_thread(_read)
+
+
+async def _lender_package_bucket_files(
+    db: AsyncSession,
+    intake: PublicUnderwritingIntake,
+) -> list[BucketFile]:
+    """Freeze the lender-visible bucket scope at delivery time.
+
+    The processing partner's raw proposal contains desk-only economics and is
+    never lender evidence. Selected scope also prevents unrelated future bucket
+    uploads from silently becoming visible through an old vendor invitation.
+    """
+    files = list(
+        (
+            await db.execute(
+                select(BucketFile)
+                .where(
+                    BucketFile.bucket_id == intake.bucket_id,
+                    BucketFile.status == "uploaded",
+                    BucketFile.deleted_at.is_(None),
+                )
+                .order_by(BucketFile.created_at, BucketFile.id)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [file for file in files if not merchant_processing.is_offer_document(file)]
 
 
 async def _prepare_vendor_access(
@@ -4832,10 +5660,12 @@ async def _prepare_vendor_access(
     )
     access = (
         await db.execute(
-            select(BucketVendorAccess).where(
+            select(BucketVendorAccess)
+            .where(
                 BucketVendorAccess.bucket_id == intake.bucket_id,
                 BucketVendorAccess.vendor_user_id == vendor.id,
             )
+            .options(selectinload(BucketVendorAccess.files))
         )
     ).scalar_one_or_none()
     if access is None:
@@ -4846,8 +5676,8 @@ async def _prepare_vendor_access(
     else:
         event_name = "vendor_access_updated"
     access.status = "active"
-    access.file_scope = "all_active"
-    access.files = []
+    access.file_scope = "selected"
+    access.files = await _lender_package_bucket_files(db, intake)
     access.can_preview = payload.can_preview
     access.can_download = payload.can_download
     access.can_add_notes = payload.can_add_notes
@@ -4940,7 +5770,17 @@ async def _response(
                 reason="Stage 1 screen shows good probability.",
             ),
         )
-    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    files = sorted(
+        (
+            file
+            for file in _active_files(intake.bucket)
+            if include_management
+            or admin_thread
+            or not provenance.is_internal_package_output(file)
+        ),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
     summary = upload_link_visible_summary(review, intake.bucket)
     if messages is None:
         # The admin cockpit reads the PRIVATE internal thread (audience='admin');
@@ -4975,6 +5815,25 @@ async def _response(
     # dealer-lead endpoint (include_management=True); every public/uploader/
     # funding caller gets empty lists.
     artifacts = await _management_artifacts(db, intake.id) if include_management else []
+    current_package_fingerprint: str | None = None
+    active_package_bucket_file_ids = {
+        file.id
+        for file in _active_files(intake.bucket)
+        if _is_package_readiness_output(file)
+    }
+    if include_management and any(
+        artifact.artifact_type in _PACKAGE_READINESS_TYPES for artifact in artifacts
+    ):
+        try:
+            current_package_fingerprint = await _current_package_input_fingerprint(
+                db,
+                intake,
+            )
+        except Exception:
+            # Artifact history must remain readable even if readiness refresh is
+            # temporarily unavailable. A null freshness state disables neither
+            # preview nor download; delivery endpoints still validate strictly.
+            log.exception("Unable to calculate package freshness for intake %s", intake.id)
     email_sends = await _management_email_sends(db, intake.id) if include_management else []
     # Internal notes thread — admin/dealer-partner only, never the client.
     notes = (
@@ -5035,7 +5894,14 @@ async def _response(
         latest_review=review_read,
         messages=[BucketAIMessageRead.model_validate(message) for message in (messages or [])],
         chat_actions=await actions_for_messages(db, list(messages or [])),
-        artifacts=[_artifact_read(artifact) for artifact in artifacts],
+        artifacts=[
+            _artifact_read(
+                artifact,
+                current_input_fingerprint=current_package_fingerprint,
+                active_bucket_file_ids=active_package_bucket_file_ids,
+            )
+            for artifact in artifacts
+        ],
         email_sends=[_email_send_read(row) for row in email_sends],
         notes=[
             BucketNoteRead.model_validate(n).model_copy(
@@ -6290,7 +7156,15 @@ async def download_dealer_intelligence_pdf(
     _require_dealer_intake(intake)
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
-    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    files = sorted(
+        (
+            file
+            for file in _active_files(intake.bucket)
+            if not _is_package_readiness_output(file)
+        ),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
     missing_docs = _missing_required_docs(intake.bucket)
     pdf_bytes = await asyncio.to_thread(
         render_dealer_intelligence_pdf,
@@ -6335,7 +7209,11 @@ def _lead_result(intake: PublicUnderwritingIntake) -> dict[str, Any]:
 
 def _lead_row(intake: PublicUnderwritingIntake) -> DealerAILeadRow:
     result = _lead_result(intake)
-    active_files = _active_files(intake.bucket)
+    active_files = [
+        file
+        for file in _active_files(intake.bucket)
+        if not _is_package_readiness_output(file)
+    ]
     missing_docs = _missing_required_docs(intake.bucket)
     return DealerAILeadRow(
         id=intake.id,
@@ -6497,7 +7375,11 @@ async def _execute_intake_review(
         requested_by_user_id=requested_by_user_id,
         status="queued",
         context_snapshot=review_context,
-        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
+        file_ids=[
+            str(file.id)
+            for file in _active_files(intake.bucket)
+            if not _is_package_readiness_output(file)
+        ],
         provider="bedrock",
     )
     review.progress = {"stage": "queued", "label": "Preparing the review…", "percent": 0, "files_total": 0, "files_done": 0}
@@ -6563,7 +7445,11 @@ async def _create_queued_review(
         requested_by_user_id=requested_by_user_id,
         status="queued",
         context_snapshot=review_context,
-        file_ids=[str(file.id) for file in _active_files(intake.bucket)],
+        file_ids=[
+            str(file.id)
+            for file in _active_files(intake.bucket)
+            if not _is_package_readiness_output(file)
+        ],
         provider="bedrock",
         progress={"stage": "queued", "label": "Preparing the review…", "percent": 0, "files_total": 0, "files_done": 0},
     )
@@ -6710,7 +7596,15 @@ async def download_admin_dealer_intelligence_pdf(
     intake = await _load_admin_dealer_lead(db, intake_id)
     review = intake.latest_review if intake.latest_review else None
     latest_result = review.result if review and isinstance(review.result, dict) else intake.result_snapshot if isinstance(intake.result_snapshot, dict) else None
-    files = sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True)
+    files = sorted(
+        (
+            file
+            for file in _active_files(intake.bucket)
+            if not _is_package_readiness_output(file)
+        ),
+        key=lambda file: file.created_at,
+        reverse=True,
+    )
     missing_docs = _missing_required_docs(intake.bucket)
     is_re = intake.variant == FUNDING_VARIANT
     if is_re:
@@ -9613,12 +10507,8 @@ async def create_dealer_ai_executive_summary(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PublicUnderwritingArtifactRead:
-    _require_super_admin(user)
-    intake = await _load_admin_dealer_lead(db, intake_id)
-    artifact = await _create_executive_summary_artifact(db, intake, user)
-    await db.commit()
-    artifact = await _latest_artifact(db, intake_id, "executive_summary") or artifact
-    return _artifact_read(artifact)
+    generated = await generate_package_readiness_documents(intake_id, user, db)
+    return generated.executive_summary
 
 
 @admin_router.post("/{intake_id}/prequalification", response_model=PublicUnderwritingArtifactRead)
@@ -9647,12 +10537,166 @@ async def create_dealer_ai_lender_packet(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> PublicUnderwritingArtifactRead:
-    _require_super_admin(user)
+    generated = await generate_package_readiness_documents(intake_id, user, db)
+    return generated.lender_packet
+
+
+@admin_router.post(
+    "/{intake_id}/package-readiness/generate",
+    response_model=PackageReadinessGenerationRead,
+)
+async def generate_package_readiness_documents(
+    intake_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> PackageReadinessGenerationRead:
+    """Regenerate the two current underwriting PDFs as one audited action.
+
+    Both PDFs are immutable artifact snapshots and are also published into the
+    connected bucket. A new run supersedes (but never destroys) the prior
+    bucket versions, so the current file list stays clean while the artifact
+    history remains available for audit and preview.
+    """
+
+    _require_intake_operator(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    artifact = await _create_lender_packet_artifact(db, intake, user)
-    await db.commit()
-    artifact = await _latest_artifact(db, intake_id, "lender_packet") or artifact
-    return _artifact_read(artifact)
+    # Serialize regeneration clicks for this file. Without this lock, two
+    # browsers could each publish a "current" pair before either sees the
+    # other's BucketFile rows.
+    await db.execute(
+        select(PublicUnderwritingIntake.id)
+        .where(PublicUnderwritingIntake.id == intake.id)
+        .with_for_update()
+    )
+    previous_summary = await _latest_artifact(db, intake.id, "executive_summary")
+    previous_packet = await _latest_artifact(db, intake.id, "lender_packet")
+    generation_id = uuid4()
+    generated_at = _now()
+    created_s3_keys: list[str] = []
+    commit_attempted = False
+    try:
+        (
+            source_files,
+            source_metadata,
+            context_snapshot,
+            financials,
+            input_fingerprint,
+        ) = await _package_generation_inputs(
+            db,
+            intake,
+        )
+        summary = await _create_executive_summary_artifact(
+            db,
+            intake,
+            user,
+            financials=financials,
+            context_snapshot=context_snapshot,
+            source_snapshot_metadata=source_metadata,
+            cleanup_s3_keys=created_s3_keys,
+        )
+        packet = await _create_lender_packet_artifact(
+            db,
+            intake,
+            user,
+            executive_summary=summary,
+            files_snapshot=source_files,
+            financials=financials,
+            source_snapshot_metadata=source_metadata,
+            cleanup_s3_keys=created_s3_keys,
+        )
+
+        summary_file, superseded_summary_ids = await _publish_package_artifact_to_bucket(
+            db,
+            intake=intake,
+            artifact=summary,
+            previous_artifact=previous_summary,
+            generation_id=generation_id,
+            generated_at=generated_at,
+            user=user,
+        )
+        packet_file, superseded_packet_ids = await _publish_package_artifact_to_bucket(
+            db,
+            intake=intake,
+            artifact=packet,
+            previous_artifact=previous_packet,
+            generation_id=generation_id,
+            generated_at=generated_at,
+            user=user,
+        )
+        await _log(
+            db,
+            intake.bucket_id,
+            "underwriting_package_readiness_generated",
+            user=user,
+            actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
+            target_type="public_underwriting_intake",
+            target_id=str(intake.id),
+            detail=(
+                "Generated executive summary and lender package PDFs "
+                f"as package version {generation_id}"
+            ),
+        )
+        # Build the full response while the transaction is still open. This
+        # keeps database/read failures inside the rollback + S3 cleanup path;
+        # after commit there is no fallible enrichment that could falsely tell
+        # the operator generation failed even though the PDFs were published.
+        artifacts = [
+            item
+            for item in await _management_artifacts(db, intake.id)
+            if item.artifact_type in _PACKAGE_READINESS_TYPES
+        ]
+        current = {item.id: item for item in artifacts}
+        summary = current.get(summary.id, summary)
+        packet = current.get(packet.id, packet)
+        response = PackageReadinessGenerationRead(
+            generation_id=generation_id,
+            generated_at=generated_at,
+            executive_summary=_artifact_read(
+                summary,
+                current_input_fingerprint=input_fingerprint,
+                active_bucket_file_ids={summary_file.id, packet_file.id},
+            ),
+            lender_packet=_artifact_read(
+                packet,
+                current_input_fingerprint=input_fingerprint,
+                active_bucket_file_ids={summary_file.id, packet_file.id},
+            ),
+            bucket_files=[
+                _package_bucket_file_read(summary_file),
+                _package_bucket_file_read(packet_file),
+            ],
+            superseded_bucket_file_ids=[
+                *superseded_summary_ids,
+                *superseded_packet_ids,
+            ],
+            artifact_history=[
+                _artifact_read(
+                    item,
+                    current_input_fingerprint=input_fingerprint,
+                    active_bucket_file_ids={summary_file.id, packet_file.id},
+                )
+                for item in artifacts
+            ],
+        )
+        commit_attempted = True
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        if not commit_attempted:
+            for key in created_s3_keys:
+                await asyncio.to_thread(_delete_s3_object, key)
+        else:
+            # A lost commit acknowledgement is ambiguous: the rows may already
+            # be durable. Never delete bytes that a committed artifact/file can
+            # reference; orphan reconciliation is safer than broken packages.
+            log.exception(
+                "Package commit outcome is ambiguous for intake %s; retaining %d stored PDFs",
+                intake.id,
+                len(created_s3_keys),
+            )
+        raise
+
+    return response
 
 
 async def build_package_zip_bytes(
@@ -9666,10 +10710,13 @@ async def build_package_zip_bytes(
 
     Pure builder — returns (filename, bytes) with NO Response and NO DB commit, so
     both the download route and the vendor-email send path can attach the same ZIP.
-    It DOES ensure the summary/packet artifacts + regenerate the email template
-    (side-effects the caller is expected to commit)."""
-    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
-    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user)
+    It validates that both current PDFs belong to one fresh generation and
+    regenerates the email template (side-effects the caller is expected to
+    commit)."""
+    summary_artifact, packet_artifact = await _fresh_package_artifact_pair(
+        db,
+        intake,
+    )
     email_draft = await _generate_management_json(
         db,
         intake,
@@ -9682,7 +10729,12 @@ async def build_package_zip_bytes(
     # The processing partner's proposal (residual lines and all) is not a
     # borrower document and never ships to a lender.
     files = sorted(
-        (f for f in _active_files(intake.bucket) if not merchant_processing.is_offer_document(f)),
+        (
+            f
+            for f in _active_files(intake.bucket)
+            if not merchant_processing.is_offer_document(f)
+            and not _is_package_readiness_output(f)
+        ),
         key=lambda f: f.file_name.lower(),
     )
     manifest_lines = [
@@ -9692,7 +10744,7 @@ async def build_package_zip_bytes(
         f"Generated: {_now().strftime('%b %d, %Y %I:%M %p UTC')}",
         "",
         "Contents:",
-        "  executive-summary.md   — AI executive summary",
+        "  executive-summary.pdf  — concise underwriter executive summary",
         "  lender-packet.pdf       — formatted lender/vendor packet",
         "  email-template.txt      — ready-to-edit vendor outreach email",
         f"  documents/              — {len(files)} uploaded file(s)",
@@ -9702,8 +10754,22 @@ async def build_package_zip_bytes(
 
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Executive summary (markdown prose).
-        zf.writestr("executive-summary.md", summary_artifact.body_text or "Awaiting AI executive summary.")
+        # Executive summary PDF. Legacy artifacts created before PDF support
+        # retain the markdown fallback so old files remain downloadable.
+        if summary_artifact.s3_key:
+            try:
+                zf.writestr("executive-summary.pdf", await _s3_bytes(summary_artifact.s3_key))
+            except Exception:  # noqa: BLE001
+                log.exception("package.zip: executive summary fetch failed intake=%s", intake.id)
+                zf.writestr(
+                    "executive-summary.md",
+                    summary_artifact.body_text or "Awaiting AI executive summary.",
+                )
+        else:
+            zf.writestr(
+                "executive-summary.md",
+                summary_artifact.body_text or "Awaiting AI executive summary.",
+            )
         # Lender packet PDF.
         if packet_artifact.s3_key:
             try:
@@ -9744,7 +10810,11 @@ async def download_dealer_ai_package_zip(
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
     filename, payload = await build_package_zip_bytes(db, intake, user)
-    files = _active_files(intake.bucket)
+    files = [
+        file
+        for file in _active_files(intake.bucket)
+        if not _is_package_readiness_output(file)
+    ]
     await _log(
         db,
         intake.bucket_id,
@@ -9772,8 +10842,8 @@ async def preview_dealer_ai_vendor_email(
 ) -> VendorEmailPreviewResponse:
     _require_super_admin(user)
     intake = await _load_admin_dealer_lead(db, intake_id)
-    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
-    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if payload.include_lender_packet else None
+    summary_artifact, current_packet = await _fresh_package_artifact_pair(db, intake)
+    packet_artifact = current_packet if payload.include_lender_packet else None
     draft = await _generate_management_json(
         db,
         intake,
@@ -9810,13 +10880,56 @@ async def send_dealer_ai_vendor_email(
     if not payload.to_emails:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "At least one vendor email is required")
     intake = await _load_admin_dealer_lead(db, intake_id)
-    summary_artifact = await _ensure_executive_summary_artifact(db, intake, user)
+    # Serialize package sends for this intake until the durable dispatch row is
+    # committed.  A concurrent retry then observes ``dispatching`` instead of
+    # crossing the provider boundary a second time.
+    await db.execute(
+        select(PublicUnderwritingIntake.id)
+        .where(PublicUnderwritingIntake.id == intake.id)
+        .with_for_update()
+    )
+    summary_artifact, current_packet = await _fresh_package_artifact_pair(db, intake)
     # The lender packet is attached when explicitly requested (attach_lender_packet)
     # or, for backward-compat, via the legacy include_lender_packet flag.
     want_packet = payload.attach_lender_packet if payload.attach_lender_packet is not None else payload.include_lender_packet
-    packet_artifact = await _ensure_lender_packet_artifact(db, intake, user) if want_packet else None
+    packet_artifact = current_packet if want_packet else None
     cc_emails = [str(email).lower().strip() for email in payload.cc_emails if str(email).strip()]
+    requested_recipients = [
+        str(email).lower().strip()
+        for email in payload.to_emails
+        if str(email).strip()
+    ]
+    ambiguous_dispatches = list(
+        (
+            await db.execute(
+                select(PublicUnderwritingIntakeEmailSend).where(
+                    PublicUnderwritingIntakeEmailSend.intake_id == intake.id,
+                    PublicUnderwritingIntakeEmailSend.executive_summary_artifact_id
+                    == summary_artifact.id,
+                    PublicUnderwritingIntakeEmailSend.lender_packet_artifact_id
+                    == (packet_artifact.id if packet_artifact else None),
+                    PublicUnderwritingIntakeEmailSend.ses_status == "dispatching",
+                    PublicUnderwritingIntakeEmailSend.subject
+                    == payload.subject.strip(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(
+        row.to_emails == [email]
+        and row.cc_emails == cc_emails
+        and row.body.startswith(payload.body.strip())
+        for row in ambiguous_dispatches
+        for email in requested_recipients
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This exact lender-package delivery is already in progress or has an uncertain provider outcome. Review the send history before trying again.",
+        )
     sends: list[PublicUnderwritingIntakeEmailSend] = []
+    completed_statuses: list[tuple[PublicUnderwritingIntakeEmailSend, str]] = []
     access_ids: list[UUID] = []
     _MAX_ATTACH = 8 * 1024 * 1024  # per-file cap
     # Aggregate RAW cap for the whole message. Base64 inflates attachments ~1.37x,
@@ -9850,14 +10963,25 @@ async def send_dealer_ai_vendor_email(
             )
         except Exception as exc:  # noqa: BLE001
             attachment_note += f"\n\nThe underwriting packet is available through the secure vendor bucket. Attachment fallback reason: {exc}"
-    # Executive summary (markdown → .txt).
-    if payload.attach_executive_summary and summary_artifact.body_text:
-        _try_attach(
-            f"{_safe_filename(summary_artifact.title or 'executive-summary')}.txt",
-            summary_artifact.body_text.encode("utf-8"),
-            "text/plain; charset=utf-8",
-            too_big_note="\n\nThe executive summary is available through the secure vendor bucket (too large to attach).",
-        )
+    # Executive summary PDF (legacy markdown artifacts fall back to text).
+    if payload.attach_executive_summary:
+        if summary_artifact.s3_key:
+            try:
+                _try_attach(
+                    f"{_safe_filename(summary_artifact.title or 'executive-summary')}.pdf",
+                    await _s3_bytes(summary_artifact.s3_key),
+                    "application/pdf",
+                    too_big_note="\n\nThe executive summary is available through the secure vendor bucket (too large to attach).",
+                )
+            except Exception as exc:  # noqa: BLE001
+                attachment_note += f"\n\nThe executive summary is available through the secure vendor bucket. Attachment fallback reason: {exc}"
+        elif summary_artifact.body_text:
+            _try_attach(
+                f"{_safe_filename(summary_artifact.title or 'executive-summary')}.txt",
+                summary_artifact.body_text.encode("utf-8"),
+                "text/plain; charset=utf-8",
+                too_big_note="\n\nThe executive summary is available through the secure vendor bucket (too large to attach).",
+            )
     # Full shipping package ZIP (built on the fly).
     if payload.attach_package_zip:
         try:
@@ -9914,9 +11038,9 @@ async def send_dealer_ai_vendor_email(
             can_view_ai_tasks=payload.can_view_ai_tasks,
             can_propose_tasks=payload.can_propose_tasks,
         )
-        # Grant the share the bucket's active uploaded files, else the recipient
-        # opens the link to an empty package.
-        share.files = list(_active_files(intake.bucket))
+        # Freeze only lender-safe files. Raw merchant terms contain desk-only
+        # economics, and later unrelated uploads must not leak through this link.
+        share.files = await _lender_package_bucket_files(db, intake)
         db.add(share)
         await db.flush()
         share_url = _public_url(f"/buckets/share/{share.token}")
@@ -9958,17 +11082,6 @@ async def send_dealer_ai_vendor_email(
         # copied N times (once per To recipient). The send row still records the
         # intended cc list for audit.
         send_cc = cc_emails if idx == 0 else []
-        # Send from the operator's connected Gmail when available, else firm SES.
-        result = await send_as_user(
-            db,
-            user.id,
-            to_emails=[email],
-            cc_emails=send_cc,
-            subject=payload.subject.strip(),
-            body_text=body,
-            body_html=f"<p>{html_body}</p>",
-            attachments=attachments or None,
-        )
         send_row = PublicUnderwritingIntakeEmailSend(
             intake_id=intake.id,
             executive_summary_artifact_id=summary_artifact.id,
@@ -9978,23 +11091,112 @@ async def send_dealer_ai_vendor_email(
             subject=payload.subject.strip(),
             body=body_for_record,
             vendor_access_ids=[str(access.id)] if access is not None else None,
-            ses_status=result.detail,
-            ses_message_ids=[result.message_id] if result.message_id else None,
-            ses_error=result.error,
+            ses_status="dispatching",
+            ses_message_ids=None,
+            ses_error=None,
             sent_by_user_id=user.id,
         )
         db.add(send_row)
         sends.append(send_row)
-        await _log(
-            db,
-            intake.bucket_id,
-            "underwriting_vendor_email_sent" if result.ok else "underwriting_vendor_email_failed",
-            user=user,
-            actor_role=user.role.value if hasattr(user.role, "value") else str(user.role),
-            target_type="public_underwriting_email",
-            target_id=email,
-            detail=result.detail if result.ok else result.error or result.detail,
+        # Persist the exact access grant/share and a fail-closed dispatch ledger
+        # before calling Gmail/SES. If the process dies after provider
+        # acceptance, retries see ``dispatching`` and do not silently duplicate
+        # the lender email.
+        await db.commit()
+
+        try:
+            # The pre-provider commit released the first lock. Reacquire it and
+            # hold it through freshness validation, provider handoff, and the
+            # durable outcome commit. Package generation takes this same lock,
+            # eliminating the last regenerate-vs-send TOCTOU window.
+            await db.execute(
+                select(PublicUnderwritingIntake.id)
+                .where(PublicUnderwritingIntake.id == intake.id)
+                .with_for_update()
+            )
+            fresh_summary, fresh_packet = await _fresh_package_artifact_pair(db, intake)
+            if (
+                fresh_summary.id != summary_artifact.id
+                or fresh_packet.id != current_packet.id
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "The package was regenerated while this email was being prepared. Review and send the current PDF pair.",
+                )
+        except HTTPException:
+            send_row.ses_status = "failed"
+            send_row.ses_error = "package_changed_before_provider_handoff"
+            for completed_row, completed_status in completed_statuses:
+                completed_row.ses_status = completed_status
+            await db.commit()
+            raise
+
+        try:
+            # Send from the operator's connected Gmail when available, else
+            # firm SES. This is intentionally after the durable dispatch row.
+            result = await send_as_user(
+                db,
+                user.id,
+                to_emails=[email],
+                cc_emails=send_cc,
+                subject=payload.subject.strip(),
+                body_text=body,
+                body_html=f"<p>{html_body}</p>",
+                attachments=attachments or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # An exception does not prove the provider rejected the request; it
+            # can occur after acceptance while parsing the response. Leave this
+            # recipient fail-closed as ``dispatching`` so an automatic retry
+            # cannot create a duplicate, while finalizing prior recipients.
+            send_row.ses_error = "transport_exception_provider_outcome_uncertain"
+            for completed_row, completed_status in completed_statuses:
+                completed_row.ses_status = completed_status
+            await db.commit()
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                "The lender email provider outcome is uncertain. The dispatch attempt and secure access were preserved; review the send history before retrying.",
+            ) from exc
+
+        # Keep the row in ``dispatching`` through the whole recipient batch so
+        # a concurrent retry cannot resend recipient one while recipient two is
+        # still being processed. The message id/error below is nevertheless
+        # committed immediately as the durable provider outcome.
+        send_row.ses_message_ids = [result.message_id] if result.message_id else None
+        send_row.ses_error = result.error
+        completed_statuses.append(
+            (send_row, result.detail[:40] if result.ok else "failed")
         )
+        # Commit the provider outcome on its own. A later activity-log failure
+        # must not roll back the recipient's working access link or erase a
+        # provider-accepted message id.
+        await db.commit()
+        try:
+            await _log(
+                db,
+                intake.bucket_id,
+                "underwriting_vendor_email_sent"
+                if result.ok
+                else "underwriting_vendor_email_failed",
+                user=user,
+                actor_role=(
+                    user.role.value if hasattr(user.role, "value") else str(user.role)
+                ),
+                target_type="public_underwriting_email",
+                target_id=email,
+                detail=result.detail if result.ok else result.error or result.detail,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            log.exception(
+                "vendor-email: provider outcome persisted but activity log failed intake=%s recipient=%s",
+                intake.id,
+                email,
+            )
+
+    for row, completed_status in completed_statuses:
+        row.ses_status = completed_status
     await db.commit()
     for row in sends:
         await db.refresh(row)
@@ -10936,7 +12138,15 @@ async def download_funding_review_intelligence_pdf(
     pdf_bytes = await asyncio.to_thread(
         render_dealer_intelligence_pdf,
         intake=intake,
-        files=sorted(_active_files(intake.bucket), key=lambda file: file.created_at, reverse=True),
+        files=sorted(
+            (
+                file
+                for file in _active_files(intake.bucket)
+                if not _is_package_readiness_output(file)
+            ),
+            key=lambda file: file.created_at,
+            reverse=True,
+        ),
         missing_docs=_missing_required_docs(intake.bucket),
         result=latest_result,
     )
