@@ -245,7 +245,11 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append(_field("Minimum activation amount", _money(arr.get("min_activation")) if arr.get("min_activation") else ""))
     out.append(_field("Term", f"{term} months" if stage_two else tbd))
     out.append(_field("Rate", _pct(arr.get("dealer_cof")) if stage_two and arr.get("dealer_cof") else tbd))
-    out.append(_field("Monthly payment", _money(arr.get("debt_service")) if stage_two and arr.get("debt_service") else tbd))
+    out.append(_field("Repayment structure", str(arr.get("repayment_structure") or "").replace("_", " ").title() if stage_two else tbd))
+    payment_equivalent = arr.get("monthly_equivalent_payment") or arr.get("debt_service")
+    coverage_amount = arr.get("monthly_program_coverage_amount") or arr.get("debt_service")
+    out.append(_field("Monthly payment equivalent", _money(payment_equivalent) if stage_two and payment_equivalent else tbd))
+    out.append(_field("Monthly program coverage", _money(coverage_amount) if stage_two and coverage_amount else tbd))
     out.append(_field("Exclusivity window", f'{pa.exclusivity_days(arr)} days from written approval'))
     out.append(_field("Breach fee (Section 3.5)", _money(pa.BREACH_FEE_USD)))
     out.append(_field("Program support", tbd if not stage_two else ", ".join(str(s) for s in (arr.get("program_support") or [])) or "None"))
@@ -267,24 +271,25 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
         out.append("</tbody></table>")
 
     # 6. Policy buildout
-    out.append("<h2>6. Policy buildout — does the product carry the payment?</h2>")
+    out.append("<h2>6. Policy buildout — does the product support program coverage?</h2>")
     for key in ("with", "without"):
         s = build["scenarios"][key]
         tone = "ok" if s["free"] else ("" if key == "with" else "warning")
         out.append(
             f'<div class="callout {tone}"><b>{_e(s["title"])}</b> — {_e(s["sub"])}<br>'
-            f'Monthly payment {_money(s["payment"])} · funded by policies {_money(s["funded"])} ({_pct(s["funded_pct"])}) · '
-            f'from operations {_money(s["from_operations"])} a month, {_money(s["total_from_operations"])} over the term · '
+            f'Monthly program coverage {_money(s["coverage"])} · actual payment equivalent {_money(s["actual_payment"])} · '
+            f'funded by policies {_money(s["funded"])} ({_pct(s["funded_pct"])}) · '
+            f'coverage shortfall {_money(s["from_operations"])} a month, {_money(s["total_from_operations"])} over the term · '
             f'product gross {_money(s["gross"])} a month.</div>'
         )
     if build["solve_rows"]:
-        out.append(f'<p>To carry {_pct(build["fund_target_pct"], 0)} of the payment out of the cushion, each covered product carries:</p>')
+        out.append(f'<p>To support {_pct(build["fund_target_pct"], 0)} of the program coverage target out of the cushion, each covered product carries:</p>')
         out.append("<table><thead><tr><th>Product</th><th class=\"n\">Contracts / mo</th><th class=\"n\">Pays today</th><th class=\"n\">Room / contract</th><th class=\"n\">Carries / contract</th><th class=\"n\">Pays with us</th><th class=\"n\">Still saves</th></tr></thead><tbody>")
         for r in build["solve_rows"]:
             out.append(f'<tr><td>{_e(r["label"])}</td><td class="n">{_num(r["contracts"])}</td><td class="n">{_money(r["cur_premium"])}</td><td class="n">{_money(float(r.get("room") or 0.0))}</td><td class="n">{_money(r["solve_repay"])}</td><td class="n">{_money(r["needed"])}</td><td class="n">{_signed_money(float(r.get("savings_after") if r.get("savings_after") is not None else -r["uplift"]))}</td></tr>')
         out.append("</tbody></table>")
         if build.get("shortfall"):
-            out.append(f'<div class="callout warning">The room across the covered products carries {_money(float(build.get("room_m") or 0.0))} a month; the payment target is {_money(build["need_monthly"])}. The rest is spread on top, and the dealer pays more than today on the products marked.</div>')
+            out.append(f'<div class="callout warning">The room across the covered products supports {_money(float(build.get("room_m") or 0.0))} a month; the program coverage target is {_money(build["need_monthly"])}. The rest is spread on top, and the dealer pays more than today on the products marked.</div>')
 
     # 7. Operative thresholds
     out.append("<h2>7. Operative thresholds (Addendum A.2, A.3 guideline)</h2>")
@@ -340,7 +345,7 @@ def build_presentation_html(arrangement: dict[str, Any], computed: dict[str, Any
     out.append(_field("Cure period", f'{_num(arr.get("cure_days"))} business days after notice' if arr.get("cure_days") else ""))
     out.append(_field("Corrective period", arr.get("corrective")))
     out.append(_field("Program rate adjustment", adj_text))
-    out.append(_field("Remittance coverage", "125% of monthly debt service"))
+    out.append(_field("Remittance coverage", "125% of the monthly program coverage amount"))
     out.append(_field("Reporting deadline", "Fifth business day"))
     out.append("</div>")
     if arr.get("exclusions"):
@@ -468,7 +473,7 @@ def build_agreement_html(
     out.append(_field("Remittance shortage cure (A.6)", _blank_or(arr.get("cure_days"), lambda v: f"{_num(v)} business days after notice")))
     out.append(_field("Corrective period", _blank_or(arr.get("corrective"), _e)))
     out.append(_field("Program rate adjustment", adj_text))
-    out.append(_field("Minimum remittance coverage", "125% of monthly Funding Facility debt service"))
+    out.append(_field("Minimum remittance coverage", "125% of the monthly program coverage amount"))
     out.append(_field("Monthly reporting deadline", "Fifth business day"))
     out.append("</div>")
     out.append(f'<p><b>Approved exclusions (A.5).</b> {_e(arr.get("exclusions") or "None.")}</p>')

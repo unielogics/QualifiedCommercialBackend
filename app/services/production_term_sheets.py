@@ -21,6 +21,7 @@ from app.models.production_package import ProductionPackage, ProductionTermSheet
 from app.models.user import User
 from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
+from app.services import production_term_structure as term_structure
 from app.services.payment_authorization import client_ip
 
 TERM_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC})
@@ -65,11 +66,20 @@ async def sheet_history(db: AsyncSession, profile_id: UUID) -> list[ProductionTe
 
 def sheet_terms(sheet: ProductionTermSheet) -> dict[str, Any]:
     """The sheet as the pure functions expect it (JSON-safe)."""
-    return pa.jsonable({
+    raw = {
         "id": sheet.id, "version": sheet.version, "status": sheet.status,
         **{f: getattr(sheet, f) for f in TERM_FIELDS},
         "entered_at": sheet.entered_at, "entered_by_user_id": sheet.entered_by_user_id,
-    })
+    }
+    # Promote the versioned JSON structure for downstream callers while still
+    # returning ``extra`` intact for old integrations.
+    raw.update(term_structure.public_values(raw))
+    return pa.jsonable(raw)
+
+
+def sheet_structure(sheet: ProductionTermSheet) -> dict[str, Any]:
+    """Typed repayment/rate fields for API reads, PDFs, and offer summaries."""
+    return term_structure.public_values({f: getattr(sheet, f, None) for f in TERM_FIELDS})
 
 
 async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: ProductionPackage | None) -> dict[str, Any]:
@@ -102,7 +112,17 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
     put("term_months", int(pa._num(arrangement.get("term"))) or None, "stage_one")
     if out.get("approved_amount") and out.get("term_months"):
         put("monthly_debt_service", round(pa.level_payment(out["approved_amount"], out.get("rate_pct", 0.0), out["term_months"]), 2), "level_payment")
+        put("periodic_payment", out["monthly_debt_service"], "level_payment")
+        put("monthly_equivalent_payment", out["monthly_debt_service"], "level_payment")
+        put("monthly_program_coverage_amount", out["monthly_debt_service"], "level_payment")
+    put("facility_kind", term_structure.infer_facility_kind(out.get("facility_type")), "stage_one")
+    put("repayment_structure", "fully_amortizing", "level_payment")
+    put("payment_frequency", "monthly", "level_payment")
+    put("payments_per_year", 12, "level_payment")
+    put("rate_structure", "fixed", "level_payment")
+    put("structure_version", term_structure.STRUCTURE_VERSION, "level_payment")
     put("funding_party_kind", arrangement.get("funding_party") or "Lender", "stage_one")
+    put("funder_type", term_structure.infer_funder_type(out.get("funding_party_kind")), "stage_one")
     dealer = await db.get(DealerBusiness, profile.dealer_id) if profile.dealer_id else None
     if dealer is not None and dealer.use_of_proceeds:
         put("use_of_funds_note", " · ".join(str(u) for u in dealer.use_of_proceeds) + (f" — {dealer.use_of_proceeds_note}" if dealer.use_of_proceeds_note else ""), "dealer")
@@ -119,9 +139,56 @@ async def defaults(db: AsyncSession, profile: ApplicationProfile, parent: Produc
 
 
 def _validate_body(body: dict[str, Any]) -> None:
-    errors = pa.validate_terms(body)
+    errors = pa.validate_terms(body) + term_structure.validation_errors(body)
     if errors:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "term_sheet_invalid", "errors": errors})
+
+
+async def _add_dscr_snapshot(
+    db: AsyncSession,
+    profile: ApplicationProfile,
+    values: dict[str, Any],
+) -> None:
+    """Reuse the application-term DSCR evidence pipeline when it is available.
+
+    Missing evidence is a first-class result and must not prevent the desk from
+    recording otherwise valid terms.  A provider/evidence failure is likewise
+    captured as unavailable instead of replacing a correctly calculated offer.
+    """
+    try:
+        from app.services import application_terms
+
+        context = await application_terms._dscr_context(db, profile)
+        calculation = application_terms._calculation(
+            context=context,
+            payment=values.get("periodic_payment"),
+            payment_count=values.get("payment_count"),
+            payments_per_year=values.get("payments_per_year"),
+            new_annual_debt_service=values.get("annual_debt_service"),
+            amount=values.get("payment_basis_amount"),
+            total_repayment=values.get("total_repayment"),
+            treatment=str(values.get("debt_service_treatment") or "additive"),
+            retained_annual_debt_service=values.get("retained_annual_debt_service"),
+        )
+        values.update(
+            {
+                "dscr_before": calculation.dscr_before,
+                "dscr_after": calculation.dscr_after,
+                "dscr_status": calculation.dscr_status,
+                "dscr_explanation": calculation.dscr_explanation,
+                "dscr_source": calculation.source,
+            }
+        )
+    except Exception:
+        values.update(
+            {
+                "dscr_before": None,
+                "dscr_after": None,
+                "dscr_status": "needs_evidence",
+                "dscr_explanation": "DSCR could not be completed from the evidence currently on file.",
+                "dscr_source": "File evidence unavailable",
+            }
+        )
 
 
 async def record_sheet(
@@ -137,10 +204,22 @@ async def record_sheet(
         body.setdefault("funding_party_name", lender.name)
         if not body.get("funding_party_name"):
             body["funding_party_name"] = lender.name
-    if body.get("monthly_debt_service") in (None, "", 0) and body.get("approved_amount") and body.get("term_months"):
-        body["monthly_debt_service"] = round(pa.level_payment(float(body["approved_amount"]), float(body.get("rate_pct") or 0), int(body["term_months"])), 2)
-        body["debt_service_is_level_payment"] = True
-    _validate_body(body)
+    now = _now()
+    structure = term_structure.calculate(body, entered_on=now.date())
+    await _add_dscr_snapshot(db, profile, structure)
+    body["rate_pct"] = structure["effective_rate_pct"]
+    body["monthly_debt_service"] = structure["monthly_equivalent_payment"]
+    body["debt_service_is_level_payment"] = term_structure.is_level_payment(
+        structure,
+        term_months=int(body.get("term_months") or 0),
+    )
+    body["extra"] = term_structure.stored_extra(body.get("extra"), structure)
+    # Validate the enriched values, not only the sparse request.  This keeps
+    # every saved version internally complete even when the caller is legacy.
+    validation_view = {**body, **structure}
+    validation_view["rate_pct"] = body["rate_pct"]
+    validation_view["monthly_debt_service"] = body["monthly_debt_service"]
+    _validate_body(validation_view)
     previous = await current_sheet(db, profile.id)
     if previous is not None:
         previous = await db.get(ProductionTermSheet, previous.id, with_for_update=True)
@@ -156,7 +235,6 @@ async def record_sheet(
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "final_out_for_signature", "message": "Reopen the final before changing the terms."})
     if child is not None and child.status == "executed":
         raise HTTPException(status.HTTP_409_CONFLICT, detail={"code": "final_executed", "message": "The final has been executed; its terms are fixed."})
-    now = _now()
     version = (previous.version + 1) if previous is not None else 1
     if previous is not None:
         previous.status = "superseded"
@@ -189,7 +267,7 @@ async def record_sheet(
     await apply_underwriting_changes(db, profile, user, changes)
     await profiles.log_profile_action(
         db, profile, user, "production_term_sheet.recorded",
-        f"Term sheet v{version} recorded: {pa.money(float(body['approved_amount']))} at {float(body.get('rate_pct') or 0):g}% for {int(body['term_months'])} months",
+        f"Term sheet v{version} recorded: {pa.money(float(body['approved_amount']))} at {float(body.get('rate_pct') or 0):g}% for {int(body['term_months'])} months ({term_structure.structure_label(structure['repayment_structure'])})",
         target_type="production_term_sheet", target_id=sheet.id,
         metadata={"version": version, "supersedes_id": str(previous.id) if previous else None, "terms": sheet_terms(sheet), "ip": client_ip(request)},
     )

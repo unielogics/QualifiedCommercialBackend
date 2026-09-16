@@ -21,6 +21,65 @@ from app.services import production_signing as signing
 fitz = pytest.importorskip("fitz")
 
 
+def test_production_term_read_promotes_structure_and_preserves_full_extra() -> None:
+    entered_by = uuid.uuid4()
+    payment_summary = {
+        "periodic_payment": 3_750,
+        "lines": ["$3,750.00 monthly interest-only estimate"],
+        "assumptions": ["Based on the current draw."],
+    }
+    sheet = SimpleNamespace(
+        id=uuid.uuid4(),
+        version=2,
+        status="current",
+        funding_party_kind="Lender",
+        lender_id=None,
+        funding_party_name="Northstar Bank",
+        facility_type="Revolving line of credit",
+        approved_amount=500_000,
+        min_activation_amount=1,
+        rate_pct=9,
+        term_months=24,
+        monthly_debt_service=3_750,
+        debt_service_is_level_payment=False,
+        expected_funding_date=None,
+        activation_date=None,
+        commencement_date=None,
+        maturity_date=None,
+        use_of_funds={"working_capital": 100_000},
+        conditions=None,
+        notes=None,
+        extra={
+            "facility_kind": "revolving_loc",
+            "repayment_structure": "interest_only_then_amortizing",
+            "payment_frequency": "monthly",
+            "funder_type": "bank",
+            "initial_draw_amount": 100_000,
+            "payment_basis_amount": 500_000,
+            "interest_only_months": 12,
+            "amortization_months": 12,
+            "apr_pct": 10.25,
+            "payment_summary": payment_summary,
+            "future_metadata": {"owner": "desk"},
+        },
+        entered_at=datetime(2026, 9, 16, tzinfo=UTC),
+        entered_by_user_id=entered_by,
+        superseded_at=None,
+        withdrawn_at=None,
+        consumed_by_package_id=None,
+    )
+
+    result = pkgs._term_sheet_read(sheet, {entered_by: "Underwriter"})
+
+    assert result.facility_kind == "revolving_loc"
+    assert result.repayment_structure == "interest_only_then_amortizing"
+    assert result.payment_basis_amount == 500_000
+    assert result.post_io_monthly_equivalent == result.post_io_payment
+    assert result.apr_pct == 10.25
+    assert result.extra["payment_summary"] == payment_summary
+    assert result.extra["future_metadata"] == {"owner": "desk"}
+
+
 def _agreement_like_pdf() -> bytes:
     """A PDF carrying the three signature blocks the way the agreement renders them."""
     doc = fitz.open()

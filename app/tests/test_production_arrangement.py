@@ -341,6 +341,46 @@ def test_validate_terms_catches_amounts_dates_and_allocation():
         assert needle in joined, needle
 
 
+def test_validate_terms_enforces_ordered_milestones_and_first_payment_bounds():
+    errors = pa.validate_terms(
+        _sheet(
+            activation_date="2026-10-02",
+            commencement_date="2026-10-01",
+            maturity_date="2026-10-01",
+            first_payment_date="2026-09-09",
+        )
+    )
+    joined = " ".join(errors)
+    assert "after production commencement" in joined
+    assert "Maturity must fall after the activation date" in joined
+    assert "Maturity must fall after production commencement" in joined
+    assert "First payment may not be earlier than funding or opening" in joined
+
+    late_payment = pa.validate_terms(_sheet(first_payment_date="2029-09-11"))
+    assert "First payment may not fall after maturity" in " ".join(late_payment)
+
+    assert pa.validate_terms(
+        _sheet(
+            activation_date="2026-10-01",
+            commencement_date="2026-10-01",
+            first_payment_date="2029-09-10",
+        )
+    ) == []
+
+
+def test_validate_revolving_use_of_funds_against_initial_draw_not_credit_limit():
+    revolving = _sheet(
+        facility_kind="revolving_loc",
+        approved_amount=500000,
+        min_activation_amount=1,
+        initial_draw_amount=100000,
+        use_of_funds={"working_capital": 100000},
+    )
+    assert pa.validate_terms(revolving) == []
+    errors = pa.validate_terms({**revolving, "use_of_funds": {"working_capital": 500000}})
+    assert "initial draw" in " ".join(errors)
+
+
 def test_apply_term_sheet_fixes_the_advance_and_marks_the_lender_protected():
     arr, applied = pa.apply_term_sheet(seed(), _sheet())
     assert arr["requested"] == 1000000 and arr["sizing"] == "fixed" and arr["funded_amount"] == 1000000
@@ -351,6 +391,28 @@ def test_apply_term_sheet_fixes_the_advance_and_marks_the_lender_protected():
     assert "requested" in applied and applied["requested"]["before"] == 1200000
     c = pa.compute(arr, stage=2)
     assert c["advance"]["advance"] == 1000000 and c["advance"]["sizing"] == "fixed"
+
+
+def test_apply_structured_term_sheet_separates_payment_from_program_coverage():
+    arr, _ = pa.apply_term_sheet(
+        seed(),
+        _sheet(
+            facility_kind="revolving_loc",
+            repayment_structure="revolving_interest_only",
+            initial_draw_amount=250000,
+            monthly_equivalent_payment=2500,
+            monthly_program_coverage_amount=7000,
+            monthly_program_coverage_basis="underwriting_budget",
+        ),
+    )
+
+    assert arr["funded_amount"] == 250000
+    assert arr["monthly_equivalent_payment"] == 2500
+    assert arr["monthly_program_coverage_amount"] == 7000
+    assert arr["debt_service"] == 7000
+    computed = pa.compute(arr, stage=2)
+    assert computed["buildout"]["actual_payment"] == 2500
+    assert computed["buildout"]["coverage_amount"] == 7000
 
 
 def test_compute_stage_two_reports_closing_blanks_and_funding_rules():

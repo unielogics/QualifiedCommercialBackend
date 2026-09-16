@@ -633,15 +633,10 @@ async def _retry_failed_delivery(
     delivery.room_token_hash = hashlib.sha256(link.token.encode("utf-8")).hexdigest()
     delivery.access_passcode_hash = link.passcode_hash
     prepared_at = datetime.now(UTC)
-    default_expiry = offers.default_offer_expiry(prepared_at)
     item_links: dict[str, str] = {}
     for item in offer_items:
         source = resolved_by_key[item.item_key]
-        expiry = (
-            min(default_expiry, source.source_expires_at)
-            if source.source_expires_at
-            else default_expiry
-        )
+        expiry = offers.item_offer_expiry(source, prepared_at)
         if expiry <= prepared_at:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -930,13 +925,7 @@ async def send_combined_offer_delivery(
             "Set a PIN on the client secure room before sending an offer package.",
         )
     prepared_at = datetime.now(UTC)
-    default_expiry = offers.default_offer_expiry(prepared_at)
-    item_expiries = [
-        min(default_expiry, item.source_expires_at)
-        if item.source_expires_at is not None
-        else default_expiry
-        for item in resolved
-    ]
+    item_expiries = [offers.item_offer_expiry(item, prepared_at) for item in resolved]
     if any(value <= prepared_at for value in item_expiries):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

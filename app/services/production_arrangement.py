@@ -36,7 +36,7 @@ STAGE_ONE_TITLE = "Production Commitment and Capital Engagement Agreement"
 STAGE_TWO_TITLE = "Program Activation and Production Agreement"
 STAGE_ONE_DOCUMENT_KEY = "production_commitment_v1"
 STAGE_TWO_DOCUMENT_KEY = "program_activation_v1"
-DOCUMENT_VERSION = "2026-09-09-1"
+DOCUMENT_VERSION = "2026-09-16-2"
 
 PRODUCT_KEYS: tuple[str, ...] = ("vsc", "gap", "theft", "appearance", "key", "tire", "maint", "power")
 PRODUCT_LABELS: dict[str, str] = {
@@ -82,7 +82,7 @@ THRESHOLD_LABELS: dict[str, str] = {
     "vsc_pen3": "Minimum rolling 3-month VSC penetration",
     "vsc_gross": "Minimum monthly VSC gross",
     "total_gross": "Minimum total monthly Covered Product gross",
-    "debt_service": "Monthly Funding Facility debt service",
+    "debt_service": "Monthly program coverage amount",
     "remittance": "Fixed minimum Eligible Net Remittance",
 }
 SPREAD_FLOOR_POINTS = 3.0
@@ -92,7 +92,7 @@ STEPS: tuple[tuple[str, str, str], ...] = (
     ("lot", "The lot and the verified baseline", "What the dealer has on the ground today, and the trailing production the thresholds are derived from."),
     ("products", "Covered products and attachment rates", "Which products carry a commitment, how often they attach, and what each contract is worth."),
     ("advance", "Advance and programme cost", "What the dealer is asking for, what the programme actually costs to run, and whether the deal clears."),
-    ("buildout", "Policy buildout", "Whether the policies carry the loan payment, and what the dealer is left paying out of pocket."),
+    ("buildout", "Policy buildout", "Whether the policies support the monthly program coverage target, and any remaining coverage shortfall."),
     ("thresholds", "Operative thresholds", "The exact figures that become enforceable at activation."),
     ("shortfall", "Shortfall billing and cure", "What happens in a month when production comes in light."),
     ("funding", "Funding facility — Schedule 1", "The facility as funded: party, amounts, dates, accounts and use of funds, from the term sheet."),
@@ -299,9 +299,9 @@ FIELD_RULES: tuple[FieldRule, ...] = (
     FieldRule("mgmt_fee", "advance", "Programme management (monthly)", kind="number"),
     FieldRule("loss_prov", "advance", "Loss provision (%)", kind="number"),
     FieldRule("fund_target", "buildout", "Share of payment policies should fund (%)", kind="number"),
-    FieldRule("debt_service", "advance", "Monthly facility debt service", kind="number", required_for="presentation",
-              non_zero=True, title="Monthly debt service is not set",
-              detail="The minimum remittance covenant is 125% of debt service — it cannot be derived until this is filled.",
+    FieldRule("debt_service", "advance", "Monthly program coverage amount", kind="number", required_for="presentation",
+              non_zero=True, title="Monthly program coverage is not set",
+              detail="The minimum remittance covenant is 125% of the program coverage amount — it cannot be derived until this is filled.",
               always="Sets the 125% remittance covenant"),
     FieldRule("sizing", "advance", "Advance sizing", kind="select", options=SIZING_MODES),
     FieldRule("buildout_mode", "buildout", "Buildout mode", kind="select", options=BUILDOUT_MODES),
@@ -408,7 +408,17 @@ NUMBER_KEYS: frozenset[str] = frozenset(r.key for r in FIELD_RULES if r.kind == 
 # Keys the term sheet owns on the final; the desk changes them on the sheet, not the form.
 TERM_SHEET_KEYS: frozenset[str] = frozenset({
     "requested", "sizing", "funded_amount", "dealer_cof", "term", "debt_service", "min_activation", "facility_type",
+    "structure_version",
     "funding_party", "funding_party_name", "funding_date", "activation_date", "commencement", "maturity", "use_of_funds",
+    "facility_kind", "facility_catalog_key", "funder_type", "repayment_structure", "payment_frequency",
+    "custom_payment_frequency",
+    "payments_per_year", "rate_structure", "rate_index", "rate_index_rate_pct", "rate_margin_pct",
+    "rate_floor_pct", "rate_cap_pct", "rate_as_of", "apr_pct", "custom_rate_description", "initial_draw_amount", "payment_basis_amount",
+    "draw_period_months", "interest_only_months", "amortization_months", "balloon_amount",
+    "periodic_payment", "post_io_payment", "post_io_monthly_equivalent", "monthly_equivalent_payment", "monthly_program_coverage_amount",
+    "monthly_program_coverage_basis", "lender_payment_override", "custom_payment_description",
+    "first_payment_date", "expiration_days", "expires_on", "closing_estimate_days", "payment_count", "annual_debt_service",
+    "total_repayment", "financing_cost", "debt_service_treatment", "retained_annual_debt_service",
 })
 SPONSOR_KEYS: frozenset[str] = frozenset(
     {"sponsor_name", "sponsor_state", "sponsor_entity", "sponsor_address", "sponsor_platform", "sponsor_email"}
@@ -828,7 +838,7 @@ def advance_econ(arr: dict[str, Any], e: PortfolioEcon) -> AdvanceEcon:
 
 def derived_thresholds(arr: dict[str, Any], e: PortfolioEcon) -> dict[str, dict[str, Any]]:
     vsc = e.row(PRIMARY_PRODUCT)
-    ds = _num(arr.get("debt_service"))
+    ds = _num(arr.get("monthly_program_coverage_amount")) or _num(arr.get("debt_service"))
     floor = A3_GUIDELINE["monthly_floor_pct"] / 100
     rolling = A3_GUIDELINE["rolling_three_month_pct"] / 100
     remit = A3_GUIDELINE["remittance_pct_of_debt_service"] / 100
@@ -1017,25 +1027,26 @@ def exclusivity_days(arr: dict[str, Any]) -> int:
 
 
 def buildout_mode(arr: dict[str, Any]) -> str:
-    """`reverse` — build the payment into the policies; `forward` — the dealer
-    pays it from operations. normalize_changes stores a select with no
+    """`reverse` — build program coverage into the policies; `forward` — the
+    dealer funds the coverage target from operations. normalize_changes stores a select with no
     membership check, so the stored string is not trusted."""
     mode = arr.get("buildout_mode")
     return mode if mode in BUILDOUT_MODES else "reverse"
 
 
 def buildout(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon) -> dict[str, Any]:
-    ds = _num(arr.get("debt_service"))
+    coverage_amount = _num(arr.get("monthly_program_coverage_amount")) or _num(arr.get("debt_service"))
+    actual_payment = _num(arr.get("monthly_equivalent_payment")) or coverage_amount
     target = _num(arr.get("fund_target"))
     mode = buildout_mode(arr)
     build = mode != "forward"
     # With the dealer paying directly, the withholdings are not carrying the
     # loan whatever the products say.
     policy_funded = e.repay_m if build else 0.0
-    funded_pct = (policy_funded / ds) * 100 if ds > 0 else 0.0
-    out_of_pocket = max(0.0, ds - policy_funded)
-    loan_free = ds > 0 and policy_funded >= ds
-    need_monthly = ds * (target / 100)
+    funded_pct = (policy_funded / coverage_amount) * 100 if coverage_amount > 0 else 0.0
+    out_of_pocket = max(0.0, coverage_amount - policy_funded)
+    loan_free = coverage_amount > 0 and policy_funded >= coverage_amount
+    need_monthly = coverage_amount * (target / 100)
     solve_rows, shortfall = room_solve(e, need_monthly)
     room_m = sum(r.room_m for r in e.on if r.stack_known)
     required_vs_room_pct = (need_monthly / room_m) * 100 if room_m > 0 else None
@@ -1046,24 +1057,28 @@ def buildout(arr: dict[str, Any], e: PortfolioEcon, adv: AdvanceEcon) -> dict[st
     required_uplift_pct = (required_per_contract / avg_cur_premium) * 100 if avg_cur_premium > 0 else 0.0
 
     def scenario(with_build: bool) -> dict[str, Any]:
-        funded = min(policy_funded, ds) if with_build else 0.0
-        ops = max(0.0, ds - funded)
-        free = with_build and ds > 0 and funded >= ds
+        funded = min(policy_funded, coverage_amount) if with_build else 0.0
+        ops = max(0.0, coverage_amount - funded)
+        free = with_build and coverage_amount > 0 and funded >= coverage_amount
         return {
             "key": "with" if with_build else "without",
             "title": "With policy buildout" if with_build else "Without policy buildout",
-            "sub": ("The repayment is built into every contract the dealer already sells." if with_build
-                    else "The dealer services the loan out of operating cash, the way any other note works."),
-            "tag": "No cost to the dealer" if free else ("Partly funded" if with_build else "Full payment"),
-            "free": free, "payment": ds, "funded": funded, "from_operations": ops,
+            "sub": ("The program coverage target is built into every contract the dealer already sells." if with_build
+                    else "The dealer funds the program coverage target from operating cash."),
+            "tag": "No coverage shortfall" if free else ("Partly funded" if with_build else "Full coverage target"),
+            # ``payment`` and ``debt_service`` remain compatibility aliases for
+            # older UI consumers; their value is the covenant coverage target.
+            "free": free, "coverage": coverage_amount, "payment": coverage_amount,
+            "actual_payment": actual_payment, "funded": funded, "from_operations": ops,
             "total_from_operations": ops * adv.term,
-            "funded_pct": (funded / ds * 100) if ds > 0 else 0.0,
+            "funded_pct": (funded / coverage_amount * 100) if coverage_amount > 0 else 0.0,
             "gross": e.gross if with_build else e.cur_gross,
         }
 
     return {
         "mode": mode, "build": build,
-        "debt_service": ds, "fund_target_pct": target, "policy_funded": policy_funded,
+        "coverage_amount": coverage_amount, "actual_payment": actual_payment,
+        "debt_service": coverage_amount, "fund_target_pct": target, "policy_funded": policy_funded,
         "funded_pct": funded_pct, "out_of_pocket": out_of_pocket, "loan_free": loan_free,
         "need_monthly": need_monthly, "solve_rows": solve_rows,
         "room_m": room_m, "shortfall": shortfall, "over_room": any(r["over_room"] for r in solve_rows),
@@ -1288,7 +1303,8 @@ def preview_rows(arr: dict[str, Any], computed: dict[str, Any], *, stage: int = 
         _pv("Activation date", arr.get("activation_date"), schedule="Certificate"),
         _pv("Original maturity date", arr.get("maturity"), schedule="Certificate"),
         _pv("Production commencement date", arr.get("commencement"), schedule="Addendum A"),
-        _pv("Monthly scheduled debt service", _money(_num(arr.get("debt_service"))) if _num(arr.get("debt_service")) else "", schedule="Schedule 1"),
+        _pv("Monthly payment equivalent", _money(_num(arr.get("monthly_equivalent_payment")) or _num(arr.get("debt_service"))) if (_num(arr.get("monthly_equivalent_payment")) or _num(arr.get("debt_service"))) else "", schedule="Schedule 1"),
+        _pv("Monthly program coverage amount", _money(_num(arr.get("monthly_program_coverage_amount")) or _num(arr.get("debt_service"))) if (_num(arr.get("monthly_program_coverage_amount")) or _num(arr.get("debt_service"))) else "", schedule="Addendum A"),
         _pv("Minimum monthly retail units", op("units", "count"), schedule="Schedule 1"),
         _pv("Minimum monthly VSC count", op("vsc_count", "count"), schedule="Schedule 1"),
         _pv("Minimum single-month VSC penetration", op("vsc_pen", "pct"), schedule="Schedule 1"),
@@ -1381,8 +1397,9 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
     adv = advance_econ(arr, e)
     thr_rows, thr_attention = threshold_rows(arr, e)
     dt = derived_thresholds(arr, e)
+    coverage_amount = _num(arr.get("monthly_program_coverage_amount")) or _num(arr.get("debt_service"))
     remittance_req = max(_num(_thr_val(arr.get("thresholds"), "remittance", dt["remittance"]["req"])),
-                         _num(arr.get("debt_service")) * (A3_GUIDELINE["remittance_pct_of_debt_service"] / 100))
+                         coverage_amount * (A3_GUIDELINE["remittance_pct_of_debt_service"] / 100))
     coverage = (e.repay_m / remittance_req) * 100 if remittance_req > 0 else 0.0
     build = buildout(arr, e, adv)
     proj = projection(e, adv)
@@ -1403,12 +1420,12 @@ def compute(arrangement: dict[str, Any] | None, *, stage: int = 1) -> dict[str, 
         attention += funding_attention(arr)
     attention += thr_attention
     attention += econ_attention(arr, e, adv, remittance_req)
-    if build["build"] and build["debt_service"] > 0 and build["policy_funded"] < build["debt_service"] * 0.5:
+    if build["build"] and build["coverage_amount"] > 0 and build["policy_funded"] < build["coverage_amount"] * 0.5:
         attention.append({
             "step": "buildout", "key": "buildout",
-            "title": "Policies carry less than half the payment",
-            "detail": (f"{_money(build['policy_funded'])} against a {_money(build['debt_service'])} payment. "
-                       f"The dealer would fund {_money(build['out_of_pocket'])} a month out of operations."),
+            "title": "Policies support less than half the program coverage target",
+            "detail": (f"{_money(build['policy_funded'])} against {_money(build['coverage_amount'])} of monthly program coverage. "
+                       f"The remaining coverage shortfall is {_money(build['out_of_pocket'])} a month."),
         })
 
     computed: dict[str, Any] = {
@@ -1644,17 +1661,40 @@ def validate_terms(terms: dict[str, Any], stage_one: dict[str, Any] | None = Non
             errors.append(f"{key.replace('_', ' ').capitalize()} is not a valid date.")
             return None
 
-    funding, activation, commencement, maturity = d("expected_funding_date"), d("activation_date"), d("commencement_date"), d("maturity_date")
+    funding, activation, commencement, maturity, first_payment = (
+        d("expected_funding_date"),
+        d("activation_date"),
+        d("commencement_date"),
+        d("maturity_date"),
+        d("first_payment_date"),
+    )
     if funding and activation and activation < funding:
         errors.append("Activation date may not be earlier than the funding date.")
     if funding and commencement and commencement < funding:
         errors.append("Production commencement may not be earlier than the funding date.")
     if funding and maturity and maturity <= funding:
         errors.append("Maturity must fall after the funding date.")
+    if activation and commencement and activation > commencement:
+        errors.append("Activation date may not fall after production commencement.")
+    if activation and maturity and maturity <= activation:
+        errors.append("Maturity must fall after the activation date.")
+    if commencement and maturity and maturity <= commencement:
+        errors.append("Maturity must fall after production commencement.")
+    if funding and first_payment and first_payment < funding:
+        errors.append("First payment may not be earlier than funding or opening.")
+    if maturity and first_payment and first_payment > maturity:
+        errors.append("First payment may not fall after maturity.")
     uof = terms.get("use_of_funds") if isinstance(terms.get("use_of_funds"), dict) else {}
     total = sum(_num(v) for k, v in uof.items() if k != "other_label")
-    if total and approved and abs(total - approved) > 1.0:
-        errors.append(f"Use of funds ({_money(total)}) must add up to the approved amount ({_money(approved)}).")
+    facility_kind = str(terms.get("facility_kind") or "")
+    initial_draw = _num(terms.get("initial_draw_amount"))
+    revolving_draw = facility_kind in {"revolving_loc", "heloc", "hybrid"} and terms.get("initial_draw_amount") is not None
+    use_of_funds_target = initial_draw if revolving_draw else approved
+    if total and use_of_funds_target >= 0 and abs(total - use_of_funds_target) > 1.0:
+        target_label = "initial draw" if revolving_draw else "approved amount"
+        errors.append(
+            f"Use of funds ({_money(total)}) must add up to the {target_label} ({_money(use_of_funds_target)})."
+        )
     return errors
 
 
@@ -1668,13 +1708,21 @@ def apply_term_sheet(arrangement: dict[str, Any], sheet: dict[str, Any]) -> tupl
         return str(v or "").strip()[:10]
 
     approved = _num(sheet.get("approved_amount"))
+    initial_draw = _num(sheet.get("initial_draw_amount")) if sheet.get("initial_draw_amount") is not None else approved
+    monthly_payment = _num(sheet.get("monthly_equivalent_payment")) or _num(sheet.get("monthly_debt_service"))
+    monthly_coverage = _num(sheet.get("monthly_program_coverage_amount")) or monthly_payment
     writes: dict[str, Any] = {
         "requested": approved or "",
         "sizing": "fixed",
-        "funded_amount": approved or "",
+        "funded_amount": initial_draw or "",
         "dealer_cof": _num(sheet.get("rate_pct")),
         "term": int(_num(sheet.get("term_months"))) or "",
-        "debt_service": _num(sheet.get("monthly_debt_service")) or "",
+        # Existing final-package math treats ``debt_service`` as the program
+        # coverage input. Keep the actual payment snapshot separately so an IO
+        # or non-monthly facility is not misrepresented as that covenant value.
+        "debt_service": monthly_coverage or "",
+        "monthly_equivalent_payment": monthly_payment or "",
+        "monthly_program_coverage_amount": monthly_coverage or "",
         "min_activation": _num(sheet.get("min_activation_amount")) or "",
         "facility_type": str(sheet.get("facility_type") or ""),
         "funding_party": str(sheet.get("funding_party_kind") or ""),
@@ -1684,6 +1732,15 @@ def apply_term_sheet(arrangement: dict[str, Any], sheet: dict[str, Any]) -> tupl
         "commencement": iso(sheet.get("commencement_date")),
         "maturity": iso(sheet.get("maturity_date")),
     }
+    for key in TERM_SHEET_KEYS:
+        if key in writes or key in {
+            "requested", "sizing", "funded_amount", "dealer_cof", "term", "debt_service", "min_activation",
+            "facility_type", "funding_party", "funding_party_name", "funding_date", "activation_date",
+            "commencement", "maturity", "use_of_funds",
+        }:
+            continue
+        if key in sheet and sheet.get(key) is not None:
+            writes[key] = sheet.get(key)
     uof = sheet.get("use_of_funds") if isinstance(sheet.get("use_of_funds"), dict) else None
     if uof is not None:
         writes["use_of_funds"] = {k: _coerce_number(uof.get(k)) for k, _ in USE_OF_FUNDS_KEYS} | {"other_label": str(uof.get("other_label") or "")}
@@ -1741,9 +1798,15 @@ def arrangement_diff(original: dict[str, Any], final: dict[str, Any]) -> dict[st
                      "changed": b != a, "original_blank": original_blank, "dealer_visible": dealer_visible})
 
     # Facility and terms
-    for key, label, fmt in (("facility_type", "Facility type", "text"), ("requested", "Approved / requested amount", "money"),
+    for key, label, fmt in (("facility_type", "Facility type", "text"), ("facility_kind", "Facility kind", "text"),
+                            ("repayment_structure", "Repayment structure", "text"), ("payment_frequency", "Payment frequency", "text"),
+                            ("requested", "Approved / requested amount", "money"),
                             ("term", "Term (months)", "count"), ("dealer_cof", "Rate / dealer cost of funds", "pct"),
-                            ("debt_service", "Monthly debt service", "money"), ("min_activation", "Minimum activation amount", "money"),
+                            ("debt_service", "Monthly program coverage amount", "money"),
+                            ("monthly_equivalent_payment", "Monthly payment equivalent", "money"),
+                            ("monthly_program_coverage_amount", "Monthly program coverage amount", "money"),
+                            ("initial_draw_amount", "Initial draw", "money"), ("balloon_amount", "Balloon at maturity", "money"),
+                            ("min_activation", "Minimum activation amount", "money"),
                             ("exclusivity", "Exclusivity window (days)", "count"), ("funding_party", "Funding party", "text"),
                             ("funding_party_name", "Funding party legal name", "text"), ("funding_date", "Funding date", "text"),
                             ("activation_date", "Activation date", "text"), ("commencement", "Production commencement", "text"),

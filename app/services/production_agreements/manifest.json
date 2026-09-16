@@ -1,7 +1,7 @@
 {
   "templates": {
     "commitment_v1": {
-      "sha256": "1d97a273347aff1d446e1a0242b3b18449a72bb26b752267cef738832ef23125",
+      "sha256": "78840b85e1000671899fcf3bbe674747c94fa074c9a036b7ebc1896626e2d59c",
       "fields": [
         "sponsor_logo_text",
         "agreement_no",
@@ -200,7 +200,7 @@
       "source_artifact": "artifact-633d324a-1788403760-21c1.html"
     },
     "activation_v1": {
-      "sha256": "b8b3c6e2a90bef70e5a7618150f8c5c311566e6211395632034ce87f6c703687",
+      "sha256": "f8496c5bf62222489dc1e5b27b488e4bd12636199ae73886326b10d4d965f60e",
       "fields": [
         "sponsor_logo_text",
         "agreement_no",
@@ -261,6 +261,7 @@
         "s1_activation_date",
         "s1_maturity_date",
         "s1_monthly_debt_service",
+        "s1_post_io_monthly_equivalent",
         "s1_production_commencement",
         "s1_controlled_account",
         "s1_ach_account",
@@ -392,5 +393,5 @@
       "source_artifact": "artifact-2dd2d613-1788403699-c6f9.html"
     }
   },
-  "version": "2026-09-09-1"
+  "version": "2026-09-16-2"
 }

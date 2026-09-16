@@ -45,6 +45,7 @@ from app.services import (
     file_contacts,
     merchant_processing,
     production_term_sheets,
+    production_term_structure,
 )
 from app.services.ai import orchestrator
 from app.services.application_terms_pdf import (
@@ -199,6 +200,23 @@ def default_offer_expiry(prepared_at: datetime) -> datetime:
     )
 
 
+def item_offer_expiry(item: ResolvedOffer, prepared_at: datetime) -> datetime:
+    """Start relative production-term validity when the delivery is prepared."""
+    candidates = [default_offer_expiry(prepared_at)]
+    if item.source_expires_at is not None:
+        candidates.append(item.source_expires_at)
+    if item.kind == "production_term_sheet":
+        extra = getattr(item.source, "extra", None)
+        raw_days = extra.get("expiration_days") if isinstance(extra, dict) else None
+        try:
+            days = int(raw_days) if raw_days is not None else 0
+        except (TypeError, ValueError):
+            days = 0
+        if days > 0:
+            candidates.append(prepared_at + timedelta(days=days))
+    return min(candidates)
+
+
 def _application_expiry(row: ApplicationTermSheet) -> datetime | None:
     if not row.expires_on:
         return None
@@ -219,6 +237,69 @@ def _production_expiry(row: ProductionTermSheet) -> datetime | None:
             return datetime.combine(parsed_date, time.max, tzinfo=UTC)
         except (TypeError, ValueError):
             return None
+
+
+def production_term_lines(row: ProductionTermSheet) -> list[str]:
+    """Canonical client-visible summary for every production loan structure."""
+    structure = production_term_sheets.sheet_structure(row)
+    facility_kind = str(structure.get("facility_kind") or "term_loan")
+    amount_label = "Credit limit" if facility_kind in {"revolving_loc", "heloc", "hybrid"} else "Approved amount"
+    cadence = production_term_structure.cadence_label(structure)
+    repayment = production_term_structure.structure_label(str(structure["repayment_structure"]))
+    lines = [
+        f"Facility: {_text(row.facility_type)} ({_human_key(facility_kind)})",
+        f"{amount_label}: {_money(row.approved_amount)}",
+        f"Rate: {production_term_structure.rate_label(structure)}",
+        f"Term: {row.term_months} months",
+        f"Funder: {_text(row.funding_party_name or row.funding_party_kind)} ({_human_key(structure.get('funder_type'))})",
+        f"Repayment structure: {repayment}",
+        f"Payment cadence: {cadence}",
+    ]
+    if structure.get("apr_pct") is not None:
+        lines.insert(3, f"Lender-disclosed APR: {float(structure['apr_pct']):.2f}%")
+    initial_draw = structure.get("initial_draw_amount")
+    if initial_draw is not None and (
+        facility_kind in {"revolving_loc", "heloc", "hybrid"}
+        or abs(float(initial_draw) - float(row.approved_amount)) >= 0.005
+    ):
+        lines.append(f"Initial draw: {_money(initial_draw)}")
+    basis = structure.get("payment_basis_amount")
+    if basis is not None and (initial_draw is None or abs(float(basis) - float(initial_draw)) >= 0.005):
+        lines.append(f"Payment basis: {_money(basis)}")
+    if structure.get("draw_period_months") is not None:
+        lines.append(f"Draw period: {int(structure['draw_period_months'])} months")
+    if int(structure.get("interest_only_months") or 0) > 0:
+        lines.append(f"Interest-only period: {int(structure['interest_only_months'])} months")
+    if structure.get("amortization_months") is not None:
+        lines.append(f"Amortization: {int(structure['amortization_months'])} months")
+    lines.append(f"Payment summary: {production_term_structure.payment_summary_text(structure)}")
+    lines.append(f"Estimated payment ({cadence}): {_money(structure.get('periodic_payment'))}")
+    if structure.get("post_io_payment") is not None:
+        lines.append(f"Estimated payment after IO ({cadence}): {_money(structure['post_io_payment'])}")
+    lines.extend(
+        [
+            f"Monthly payment equivalent: {_money(structure.get('monthly_equivalent_payment'))}",
+            f"Annual scheduled debt service: {_money(structure.get('annual_debt_service'))}",
+        ]
+    )
+    if float(structure.get("balloon_amount") or 0) > 0:
+        lines.append(f"Balloon due at maturity: {_money(structure['balloon_amount'])}")
+    coverage = structure.get("monthly_program_coverage_amount")
+    if coverage is not None:
+        lines.append(f"Monthly program coverage amount: {_money(coverage)}")
+    if structure.get("closing_estimate_days") is not None:
+        lines.append(f"Estimated closing: {int(structure['closing_estimate_days'])} business days after final approval")
+    if structure.get("expiration_days") is not None:
+        lines.append(f"Offer validity: {int(structure['expiration_days'])} days after issuance")
+    lines.extend(
+        [
+            f"DSCR before acceptance: {_ratio(structure.get('dscr_before'))}",
+            f"DSCR after acceptance: {_ratio(structure.get('dscr_after'))}",
+        ]
+    )
+    if row.conditions:
+        lines.append(f"Conditions: {row.conditions}")
+    return lines
 
 
 async def _business_context(
@@ -309,21 +390,7 @@ async def resolve_offers(
                 raise HTTPException(
                     status.HTTP_409_CONFLICT, "The loan terms changed. Reload before continuing."
                 )
-            extra = row.extra if isinstance(row.extra, dict) else {}
-            lines = [
-                f"Facility: {_human_key(row.facility_type)}",
-                f"Approved amount: {_money(row.approved_amount)}",
-                f"Rate: {_pct(row.rate_pct)}",
-                f"Term: {row.term_months} months",
-                f"Funder: {_text(row.funding_party_name)} ({_human_key(row.funding_party_kind)})",
-                f"Repayment: {_text(extra.get('repayment_frequency'), 'Monthly')}",
-                f"Estimated payment: {_money(row.monthly_debt_service)} per month",
-                f"Estimated closing: {_text(extra.get('closing_estimate_days'), 'Subject to final approval')} business days after approval",
-                f"DSCR before acceptance: {_ratio(extra.get('dscr_before'))}",
-                f"DSCR after acceptance: {_ratio(extra.get('dscr_after'))}",
-            ]
-            if row.conditions:
-                lines.append(f"Conditions: {row.conditions}")
+            lines = production_term_lines(row)
             resolved.append(
                 ResolvedOffer(
                     kind=ref.kind,

@@ -36,6 +36,7 @@ def _sheet(**overrides):
         "use_of_funds": {"inventory": 300_000, "working_capital": 200_000},
         "conditions": "Final bank verification.\nSatisfactory closing documents.",
         "notes": "INTERNAL: do not show this client note",
+        "extra": {},
         "entered_at": datetime(2026, 9, 15, 20, 14, tzinfo=UTC),
     }
     values.update(overrides)
@@ -74,6 +75,64 @@ def test_client_loan_terms_html_is_branded_exact_and_client_safe() -> None:
     assert "INTERNAL: do not show this client note" not in html
     assert filename_for(sheet, "Watertown Motors LLC") == "Watertown-Motors-LLC-Loan-Terms-v3.pdf"
     assert filename_for(sheet, "株式会社") == "Client-Loan-Terms-v3.pdf"
+
+
+def test_revolving_io_pdf_discloses_draw_rate_balloon_and_nonbinding_validity() -> None:
+    sheet = _sheet(
+        facility_type="HELOC",
+        rate_pct=10.5,
+        monthly_debt_service=875,
+        debt_service_is_level_payment=False,
+        extra={
+            "facility_kind": "heloc",
+            "funder_type": "bank",
+            "repayment_structure": "revolving_interest_only",
+            "payment_frequency": "monthly",
+            "payments_per_year": 12,
+            "rate_structure": "variable",
+            "rate_index": "Prime",
+            "rate_index_rate_pct": 8.5,
+            "rate_margin_pct": 2,
+            "rate_as_of": "2026-09-16",
+            "apr_pct": 11.25,
+            "initial_draw_amount": 100_000,
+            "payment_basis_amount": 100_000,
+            "monthly_program_coverage_amount": 1_000,
+            "dscr_before": 1.42,
+            "dscr_after": 1.21,
+            "dscr_status": "ready",
+            "expiration_days": 7,
+            "payment_summary": {
+                "lines": ["STALE BROWSER SNAPSHOT MUST NOT PRINT"],
+                "assumptions": [],
+            },
+        },
+    )
+
+    html = render_term_sheet_html(sheet, business_name="Watertown Motors LLC")
+
+    for required in (
+        "Credit limit",
+        "Revolving interest only",
+        "10.50% current (Prime 8.50% + 2.00%) as of 2026-09-16",
+        "Lender-disclosed APR",
+        "11.25%",
+        "Initial draw",
+        "$100,000.00",
+        "Annual scheduled debt service",
+        "$10,500.00",
+        "Balloon due at maturity",
+        "Monthly program coverage",
+        "$1,000.00",
+        "DSCR before",
+        "1.42x",
+        "DSCR after",
+        "1.21x",
+        "7 days after issuance",
+    ):
+        assert required in html
+    assert "STALE BROWSER SNAPSHOT MUST NOT PRINT" not in html
+    assert "any balloon is shown separately" in html
 
 
 def test_term_email_payload_deduplicates_explicit_recipients() -> None:

@@ -19,7 +19,7 @@ from app.services import production_fields as pf
 sys.path.insert(0, "app/tests")
 from test_production_arrangement import seed  # noqa: E402
 
-DESIGN_SLOTS = {"commitment_v1": 148, "activation_v1": 150}
+DESIGN_SLOTS = {"commitment_v1": 148, "activation_v1": 151}
 DESIGN_CHECKS = {"commitment_v1": 28, "activation_v1": 19}
 EXPECTED_ANCHORS = {
     "commitment_v1": {"qc": 1, "dealer": 1, "sponsor": 1, "fp": 0, "rm": 1},
@@ -121,7 +121,7 @@ def test_manifest_inventories(key: str):
     assert entry["anchors"] == EXPECTED_ANCHORS[key]
     assert entry["initials"] == EXPECTED_INITIALS
     assert entry["source_artifact"].startswith("artifact-")
-    assert tpl.manifest()["version"] == "2026-09-09-1"
+    assert tpl.manifest()["version"] == "2026-09-16-2"
     html, sha = tpl.load_template(key)
     assert sha == entry["sha256"] == hashlib.sha256(html.encode("utf-8")).hexdigest()
 
@@ -445,6 +445,36 @@ def test_activation_values_funding_override_joinder_and_original_backfill():
     assert values3["s1_funding_party"] == ""
 
 
+def test_activation_separates_actual_payment_from_program_coverage_covenant():
+    arr = _stage_two_arrangement()
+    arr.update(
+        {
+            "debt_service": 7_000,
+            "monthly_program_coverage_amount": 7_000,
+            "monthly_equivalent_payment": 2_500,
+            "post_io_monthly_equivalent": 8_250,
+        }
+    )
+    values, checks = pf.activation_values(
+        arr,
+        pa.compute(arr),
+        SPONSOR,
+        PARTIES,
+        FILE_CTX,
+        META,
+        original=seed(),
+    )
+
+    assert values["s1_monthly_debt_service"] == "$2,500"
+    assert values["s1_post_io_monthly_equivalent"] == "$8,250"
+    assert values["a2_debt_service_op"] == "$7,000"
+    html = tpl.fill_template("activation_v1", values, checks, footer="Program Activation")
+    assert "Initial monthly payment equivalent (see Funding Documents)" in html
+    assert "Post-IO monthly payment equivalent (see Funding Documents)" in html
+    assert "Monthly program coverage amount" in html
+    assert "separate from the scheduled payment stated in Schedule 1" in html
+
+
 def test_activation_values_blank_on_an_empty_arrangement():
     arr = pa.empty_arrangement()
     values, checks = pf.activation_values(arr, pa.compute(arr), None, {}, {}, {})
@@ -483,7 +513,7 @@ def test_rendered_pdfs_carry_every_anchor():
         assert not re.search(r"\[\[(SIG|DATE|INI):", tpl.strip_anchors(text))
 
 
-ACTIVATION_SHA_BEFORE_THE_BREACH_FEE = "b8b3c6e2a90bef70e5a7618150f8c5c311566e6211395632034ce87f6c703687"
+ACTIVATION_SHA_WITH_PHASED_PAYMENTS = "f8496c5bf62222489dc1e5b27b488e4bd12636199ae73886326b10d4d965f60e"
 
 
 def test_the_breach_fee_changed_the_commitment_and_nothing_else():
@@ -491,7 +521,7 @@ def test_the_breach_fee_changed_the_commitment_and_nothing_else():
     commitment's §3.5 names the fee stated in Schedule A; §2.2, §6 and §7.5
     each gain the same carve-out; expiry (§2.6), declining (§3.2) and exiting
     by written notice (§3.3) stay word-for-word. The Activation agreement is
-    untouched, hash and all."""
+    pinned to the separately versioned program-coverage revision."""
     html, _sha = tpl.load_template("commitment_v1")
     text = BeautifulSoup(html, "html.parser").get_text(" ")
     text = " ".join(text.split())
@@ -505,4 +535,4 @@ def test_the_breach_fee_changed_the_commitment_and_nothing_else():
     assert "Create any fee if the Dealer declines the financing" in text
     assert "the Dealer owes no fee and no further obligation under this Section" in text
     assert "sa_breach_fee" in tpl.template_field_keys("commitment_v1")
-    assert tpl.manifest()["templates"]["activation_v1"]["sha256"] == ACTIVATION_SHA_BEFORE_THE_BREACH_FEE
+    assert tpl.manifest()["templates"]["activation_v1"]["sha256"] == ACTIVATION_SHA_WITH_PHASED_PAYMENTS

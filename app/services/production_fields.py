@@ -628,7 +628,10 @@ def activation_values(
         "s1_funding_date": fmt_date(arr.get("funding_date")),
         "s1_activation_date": fmt_date(arr.get("activation_date")),
         "s1_maturity_date": fmt_date(arr.get("maturity")),
-        "s1_monthly_debt_service": money(arr.get("debt_service")),
+        # Schedule 1 states the facility's actual normalized payment. The
+        # separate Addendum A covenant uses the program coverage amount.
+        "s1_monthly_debt_service": money(arr.get("monthly_equivalent_payment") or arr.get("debt_service")),
+        "s1_post_io_monthly_equivalent": money(arr.get("post_io_monthly_equivalent")),
         "s1_production_commencement": fmt_date(arr.get("commencement")),
         "s1_controlled_account": text(arr.get("controlled_account")),
         "s1_ach_account": text(arr.get("ach_account")),

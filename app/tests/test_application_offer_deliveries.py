@@ -91,6 +91,58 @@ def test_offer_draft_fingerprint_is_stable_and_term_sensitive() -> None:
     assert offers.draft_fingerprint([row]) != first
 
 
+def test_production_revolving_summary_uses_canonical_cadence_and_separate_balloon() -> None:
+    row = SimpleNamespace(
+        facility_type="Revolving line of credit",
+        approved_amount=500_000,
+        min_activation_amount=1,
+        rate_pct=10.5,
+        term_months=24,
+        monthly_debt_service=875,
+        debt_service_is_level_payment=False,
+        funding_party_kind="Lender",
+        funding_party_name="Northstar Bank",
+        conditions="Final verification.",
+        extra={
+            "facility_kind": "revolving_loc",
+            "funder_type": "bank",
+            "repayment_structure": "revolving_interest_only",
+            "payment_frequency": "monthly",
+            "rate_structure": "variable",
+            "rate_index": "Prime",
+            "rate_index_rate_pct": 8.5,
+            "rate_margin_pct": 2,
+            "rate_as_of": "2026-09-16",
+            "apr_pct": 11.25,
+            "initial_draw_amount": 100_000,
+            "payment_basis_amount": 100_000,
+            "monthly_program_coverage_amount": 1_000,
+            "closing_estimate_days": 5,
+            "expiration_days": 7,
+            "payment_summary": {"lines": ["stale browser summary"], "assumptions": []},
+        },
+    )
+
+    text = "\n".join(offers.production_term_lines(row))
+
+    for required in (
+        "Credit limit: $500,000.00",
+        "Rate: 10.50% current (Prime 8.50% + 2.00%) as of 2026-09-16",
+        "Lender-disclosed APR: 11.25%",
+        "Repayment structure: Revolving interest only",
+        "Initial draw: $100,000.00",
+        "Estimated payment (Monthly): $875.00",
+        "Annual scheduled debt service: $10,500.00",
+        "Balloon due at maturity: $100,000.00",
+        "Monthly program coverage amount: $1,000.00",
+        "Offer validity: 7 days after issuance",
+    ):
+        assert required in text
+    assert "stale browser summary" not in text
+    assert "per month" not in text
+    assert offers._production_expiry(row) is None
+
+
 def test_draft_items_expose_authenticated_current_version_previews() -> None:
     profile_id = uuid4()
     row = _resolved()
@@ -116,6 +168,26 @@ def test_locked_deadline_includes_provider_handoff_grace() -> None:
     )
     accepted_at = prepared_at + timedelta(minutes=offers.HANDOFF_GRACE_MINUTES)
     assert expiry - accepted_at >= timedelta(hours=offers.DEADLINE_HOURS)
+
+
+def test_production_relative_validity_starts_at_send_and_caps_the_item_deadline() -> None:
+    prepared_at = datetime(2026, 9, 16, 12, tzinfo=UTC)
+    item = _resolved()
+    item.source = SimpleNamespace(extra={"expiration_days": 1})
+
+    assert offers.item_offer_expiry(item, prepared_at) == prepared_at + timedelta(days=1)
+
+    item.source = SimpleNamespace(extra={"expiration_days": 7})
+    assert offers.item_offer_expiry(item, prepared_at) == offers.default_offer_expiry(prepared_at)
+
+
+def test_absolute_source_expiry_still_beats_relative_production_validity() -> None:
+    prepared_at = datetime(2026, 9, 16, 12, tzinfo=UTC)
+    item = _resolved()
+    item.source = SimpleNamespace(extra={"expiration_days": 7})
+    item.source_expires_at = prepared_at + timedelta(hours=6)
+
+    assert offers.item_offer_expiry(item, prepared_at) == item.source_expires_at
 
 
 def test_ai_personal_copy_cannot_author_financial_terms_or_links() -> None:

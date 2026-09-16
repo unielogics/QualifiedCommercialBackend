@@ -65,6 +65,7 @@ from app.services import application_profiles as profiles
 from app.services import production_arrangement as pa
 from app.services import production_prefill as prefill_svc
 from app.services import production_term_sheets as sheets_svc
+from app.services import production_term_structure as term_structure
 from app.services.payment_authorization import client_ip, presign_private_s3_object
 
 OPERATOR_ROLES: frozenset[Role] = frozenset({Role.SUPER_ADMIN, Role.LOAN_EXEC})
@@ -1464,6 +1465,24 @@ async def history(db: AsyncSession, access: PackageAccess, limit: int = 250) -> 
 # ---------------------------------------------------------------------------
 
 def _term_sheet_read(sheet: ProductionTermSheet, names: dict[UUID, str]) -> ProductionTermSheetRead:
+    structure = sheets_svc.sheet_structure(sheet)
+    structure_fields = {
+        key: structure.get(key)
+        for key in (
+            "structure_version", "facility_kind", "facility_catalog_key", "funder_type",
+            "repayment_structure", "payment_frequency", "payments_per_year", "custom_payment_frequency", "rate_structure",
+            "rate_index", "rate_index_rate_pct", "rate_margin_pct", "rate_floor_pct", "rate_cap_pct",
+            "rate_as_of", "apr_pct", "custom_rate_description", "initial_draw_amount", "payment_basis_amount", "draw_period_months",
+            "interest_only_months", "amortization_months", "balloon_amount", "periodic_payment",
+            "post_io_payment", "post_io_monthly_equivalent", "monthly_equivalent_payment",
+            "monthly_program_coverage_amount",
+            "monthly_program_coverage_basis", "lender_payment_override", "custom_payment_description",
+            "first_payment_date", "expiration_days", "expires_on", "closing_estimate_days",
+            "payment_count", "annual_debt_service", "total_repayment", "financing_cost",
+            "debt_service_treatment", "retained_annual_debt_service", "dscr_before", "dscr_after",
+            "dscr_status", "dscr_explanation", "dscr_source",
+        )
+    }
     return ProductionTermSheetRead(
         id=sheet.id, version=sheet.version, status=sheet.status, funding_party_kind=sheet.funding_party_kind, lender_id=sheet.lender_id,
         funding_party_name=sheet.funding_party_name, facility_type=sheet.facility_type, approved_amount=float(sheet.approved_amount),
@@ -1471,9 +1490,11 @@ def _term_sheet_read(sheet: ProductionTermSheet, names: dict[UUID, str]) -> Prod
         monthly_debt_service=float(sheet.monthly_debt_service), debt_service_is_level_payment=bool(sheet.debt_service_is_level_payment),
         expected_funding_date=sheet.expected_funding_date, activation_date=sheet.activation_date, commencement_date=sheet.commencement_date,
         maturity_date=sheet.maturity_date, use_of_funds=sheet.use_of_funds, conditions=sheet.conditions, notes=sheet.notes,
+        extra=pa.jsonable(sheet.extra or {}),
         entered_at=sheet.entered_at, entered_by_name=names.get(sheet.entered_by_user_id), superseded_at=sheet.superseded_at,
         withdrawn_at=sheet.withdrawn_at, consumed_by_package_id=sheet.consumed_by_package_id,
         level_payment=round(pa.level_payment(float(sheet.approved_amount), float(sheet.rate_pct), int(sheet.term_months)), 2),
+        **structure_fields,
     )
 
 
@@ -1489,6 +1510,11 @@ async def term_sheet_state(db: AsyncSession, access: PackageAccess) -> dict[str,
         "defaults": defaults["values"], "defaults_source": defaults["sources"], "lenders": defaults["lenders"],
         "can_edit": access.is_operator and access.role in SEND_ROLES,
         "facility_types": list(pa.FACILITY_TYPES), "funding_party_kinds": list(pa.FUNDING_PARTIES),
+        "facility_kinds": list(term_structure.FACILITY_KINDS),
+        "repayment_structures": list(term_structure.REPAYMENT_STRUCTURES),
+        "payment_frequencies": list(term_structure.PAYMENT_FREQUENCIES),
+        "rate_structures": list(term_structure.RATE_STRUCTURES),
+        "funder_types": list(term_structure.FUNDER_TYPES),
     }
 
 

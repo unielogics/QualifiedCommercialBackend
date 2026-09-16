@@ -240,6 +240,25 @@ class ProductionCapabilities(BaseModel):
     can_adopt_sponsor_signature: bool = False
 
 
+ProductionFacilityKind = Literal["term_loan", "revolving_loc", "heloc", "hybrid", "other"]
+ProductionRepaymentStructure = Literal[
+    "fully_amortizing",
+    "interest_only",
+    "interest_only_then_amortizing",
+    "balloon",
+    "revolving_interest_only",
+    "fixed_payment",
+    "custom",
+]
+ProductionPaymentFrequency = Literal["daily", "weekly", "biweekly", "monthly", "custom"]
+ProductionRateStructure = Literal["fixed", "variable", "custom"]
+ProductionFunderType = Literal[
+    "bank", "credit_union", "private_credit", "nonbank_lender",
+    "balance_sheet", "family_office", "sponsor", "other",
+]
+ProductionDebtServiceTreatment = Literal["additive", "refinance"]
+
+
 class ProductionTermSheetBody(BaseModel):
     funding_party_kind: Literal["Sponsor", "Qualified Commercial LLC", "Lender"]
     lender_id: UUID | None = None
@@ -251,6 +270,45 @@ class ProductionTermSheetBody(BaseModel):
     term_months: int = Field(gt=0, le=600)
     monthly_debt_service: float | None = Field(default=None, ge=0)
     debt_service_is_level_payment: bool = False
+    # Rich terms are persisted in ProductionTermSheet.extra so this expansion
+    # remains deployable without a table migration.  Every field is optional to
+    # preserve the original request contract; the service derives safe legacy
+    # defaults when omitted.
+    structure_version: int | None = Field(default=None, ge=1, le=1)
+    facility_kind: ProductionFacilityKind | None = None
+    facility_catalog_key: str | None = Field(default=None, max_length=80)
+    funder_type: ProductionFunderType | None = None
+    repayment_structure: ProductionRepaymentStructure | None = None
+    payment_frequency: ProductionPaymentFrequency | None = None
+    payments_per_year: float | None = Field(default=None, gt=0, le=365)
+    custom_payment_frequency: str | None = Field(default=None, max_length=120)
+    rate_structure: ProductionRateStructure | None = None
+    rate_index: str | None = Field(default=None, max_length=80)
+    rate_index_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    rate_margin_pct: float | None = Field(default=None, ge=-100, le=100)
+    rate_floor_pct: float | None = Field(default=None, ge=0, le=100)
+    rate_cap_pct: float | None = Field(default=None, ge=0, le=100)
+    rate_as_of: date | None = None
+    apr_pct: float | None = Field(default=None, ge=0, le=100)
+    custom_rate_description: str | None = Field(default=None, max_length=500)
+    initial_draw_amount: float | None = Field(default=None, ge=0)
+    payment_basis_amount: float | None = Field(default=None, ge=0)
+    draw_period_months: int | None = Field(default=None, ge=0, le=600)
+    interest_only_months: int | None = Field(default=None, ge=0, le=600)
+    amortization_months: int | None = Field(default=None, ge=1, le=1200)
+    balloon_amount: float | None = Field(default=None, ge=0)
+    periodic_payment: float | None = Field(default=None, ge=0)
+    post_io_payment: float | None = Field(default=None, ge=0)
+    monthly_equivalent_payment: float | None = Field(default=None, ge=0)
+    monthly_program_coverage_amount: float | None = Field(default=None, ge=0)
+    monthly_program_coverage_basis: str | None = Field(default=None, max_length=240)
+    lender_payment_override: bool | None = None
+    custom_payment_description: str | None = Field(default=None, max_length=1000)
+    first_payment_date: date | None = None
+    expiration_days: int | None = Field(default=None, ge=1, le=180)
+    closing_estimate_days: int | None = Field(default=None, ge=0, le=180)
+    debt_service_treatment: ProductionDebtServiceTreatment | None = None
+    retained_annual_debt_service: float | None = Field(default=None, ge=0)
     expected_funding_date: date | None = None
     activation_date: date | None = None
     commencement_date: date | None = None
@@ -275,6 +333,52 @@ class ProductionTermSheetRead(BaseModel):
     term_months: int
     monthly_debt_service: float
     debt_service_is_level_payment: bool
+    structure_version: int = 1
+    facility_kind: ProductionFacilityKind = "term_loan"
+    facility_catalog_key: str | None = None
+    funder_type: ProductionFunderType | None = None
+    repayment_structure: ProductionRepaymentStructure = "fully_amortizing"
+    payment_frequency: ProductionPaymentFrequency = "monthly"
+    payments_per_year: float = 12
+    custom_payment_frequency: str | None = None
+    rate_structure: ProductionRateStructure = "fixed"
+    rate_index: str | None = None
+    rate_index_rate_pct: float | None = None
+    rate_margin_pct: float | None = None
+    rate_floor_pct: float | None = None
+    rate_cap_pct: float | None = None
+    rate_as_of: date | None = None
+    apr_pct: float | None = None
+    custom_rate_description: str | None = None
+    initial_draw_amount: float | None = None
+    payment_basis_amount: float | None = None
+    draw_period_months: int | None = None
+    interest_only_months: int = 0
+    amortization_months: int | None = None
+    balloon_amount: float = 0
+    periodic_payment: float | None = None
+    post_io_payment: float | None = None
+    post_io_monthly_equivalent: float | None = None
+    monthly_equivalent_payment: float | None = None
+    monthly_program_coverage_amount: float | None = None
+    monthly_program_coverage_basis: str | None = None
+    lender_payment_override: bool = False
+    custom_payment_description: str | None = None
+    first_payment_date: date | None = None
+    expiration_days: int | None = None
+    expires_on: date | None = None
+    closing_estimate_days: int | None = None
+    payment_count: int | None = None
+    annual_debt_service: float | None = None
+    total_repayment: float | None = None
+    financing_cost: float | None = None
+    debt_service_treatment: ProductionDebtServiceTreatment = "additive"
+    retained_annual_debt_service: float | None = None
+    dscr_before: float | None = None
+    dscr_after: float | None = None
+    dscr_status: str | None = None
+    dscr_explanation: str | None = None
+    dscr_source: str | None = None
     expected_funding_date: date | None = None
     activation_date: date | None = None
     commencement_date: date | None = None
@@ -282,6 +386,9 @@ class ProductionTermSheetRead(BaseModel):
     use_of_funds: dict[str, Any] | None = None
     conditions: str | None = None
     notes: str | None = None
+    # Retain caller-owned presentation metadata that is not promoted into the
+    # typed contract (for example custom labels and payment summaries).
+    extra: dict[str, Any] = Field(default_factory=dict)
     entered_at: datetime
     entered_by_name: str | None = None
     superseded_at: datetime | None = None
@@ -299,6 +406,11 @@ class ProductionTermSheetState(BaseModel):
     can_edit: bool = False
     facility_types: list[str] = Field(default_factory=list)
     funding_party_kinds: list[str] = Field(default_factory=list)
+    facility_kinds: list[str] = Field(default_factory=list)
+    repayment_structures: list[str] = Field(default_factory=list)
+    payment_frequencies: list[str] = Field(default_factory=list)
+    rate_structures: list[str] = Field(default_factory=list)
+    funder_types: list[str] = Field(default_factory=list)
 
 
 class ProductionTermSheetResult(BaseModel):
