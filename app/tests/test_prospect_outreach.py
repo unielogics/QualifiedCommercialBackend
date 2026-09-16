@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import HTTPException
 from pydantic import ValidationError
 from pypdf import PdfWriter
@@ -27,6 +28,7 @@ from app.models.user import User
 from app.routers import settings as settings_router
 from app.schemas.prospect_outreach import (
     ProspectDraftAction,
+    ProspectEmailDraftCreate,
     ProspectOutreachPolicyPatch,
     ProspectTestEmailRequest,
 )
@@ -96,6 +98,28 @@ def test_interactive_draft_actions_require_the_reviewed_version():
         assert payload.default is inspect.Parameter.empty
 
 
+@pytest.mark.asyncio
+async def test_live_draft_read_exposes_honest_generation_and_instruction_diagnostics():
+    row = _draft()
+    row.created_at = datetime.now(UTC)
+    row.ai_instructions = "Use a concise tone."
+    names_result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [])
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=names_result))
+
+    fallback = await outreach.draft_read(db, row)
+
+    assert fallback.generation_reason == "approved_fallback"
+    assert fallback.instruction_disposition == "not_applied_fallback"
+
+    row.draft_source = "ai"
+    generated = await outreach.draft_read(db, row)
+
+    assert generated.generation_reason == "ai_generated"
+    assert generated.instruction_disposition == "submitted_to_ai"
+
+
 def test_outreach_policy_normalizes_guidance_and_blocked_phrase_duplicates():
     policy = ProspectOutreachPolicyPatch(
         drafting_guidance="  Warm and concise.\nUse a direct call to action.  ",
@@ -104,6 +128,21 @@ def test_outreach_policy_normalizes_guidance_and_blocked_phrase_duplicates():
 
     assert policy.drafting_guidance == "Warm and concise.\nUse a direct call to action."
     assert policy.additional_blocked_phrases == ["Instant approval", "No paperwork"]
+
+
+def test_verified_conversation_context_is_normalized_and_bound_to_live_idempotency():
+    prospect = SimpleNamespace(id=uuid.uuid4(), email="alex@example.com")
+    with_context = ProspectEmailDraftCreate(
+        idempotency_key=uuid.uuid4(),
+        verified_conversation_context="  We spoke   earlier today at 10 AM.  ",
+    )
+    without_context = ProspectEmailDraftCreate(idempotency_key=uuid.uuid4())
+
+    assert with_context.verified_conversation_context == "We spoke earlier today at 10 AM."
+    assert outreach.request_fingerprint(prospect, with_context) != outreach.request_fingerprint(
+        prospect,
+        without_context,
+    )
 
 
 @pytest.mark.asyncio
@@ -639,33 +678,163 @@ def test_ai_copy_cannot_invent_links_attachments_approvals_or_products(body, mes
         )
 
 
-def test_program_section_is_rendered_only_from_the_versioned_catalog():
+def test_program_section_is_rendered_only_from_the_canonical_dealer_catalog():
     rendered = outreach._with_approved_program_section(
         "Hi Alex,\n\nThanks for speaking with me.",
         [
-            {"program_key": "equipment", "version": 4, "copy": {"name": "Equipment financing"}},
-            {"program_key": "sba_7a", "version": 2, "copy": {"name": "SBA 7(a)"}},
-        ],
-    )
-
-    assert "- Equipment financing" in rendered
-    assert "- SBA 7(a)" in rendered
-    assert "invoice factoring" not in rendered.lower()
-
-
-def test_program_section_supports_localized_catalog_copy():
-    rendered = outreach._with_approved_program_section(
-        "Hi Alex,",
-        [
             {
-                "program_key": "sba_7a",
-                "version": 2,
-                "copy": {"en": {"name": "SBA 7(a)"}, "es": {"name": "SBA 7(a)"}},
-            }
+                "program_key": "dealer_working_capital",
+                "name": "Dealer Working Capital",
+                "required_fact_keys": [],
+            },
+            {
+                "program_key": "dealer_real_estate_capital",
+                "name": "Real-Estate-Backed Dealer Capital",
+                "required_fact_keys": ["declared_collateral"],
+            },
         ],
     )
 
+    assert "Dealer-focused programs we can discuss:" in rendered
+    assert "- Dealer Working Capital" in rendered
+    assert "Specialized options, when relevant:" in rendered
+    assert "- Real-Estate-Backed Dealer Capital" in rendered
+    assert "invoice factoring" not in rendered.lower()
+    assert rendered.count("Availability and terms depend") == 1
+
+
+def test_dealer_information_fallback_has_only_one_availability_disclaimer():
+    fallback = outreach._purpose_fallback(
+        purpose="dealer_information",
+        contact_name="Alex",
+        dealer_name="Example Motors",
+    )
+    rendered = outreach._with_approved_program_section(
+        fallback.body,
+        [{"program_key": "sba_7a", "name": "SBA 7(a)", "required_fact_keys": []}],
+    )
+
     assert "- SBA 7(a)" in rendered
+    assert rendered.count("Availability and terms depend") == 1
+
+
+def test_verified_context_is_inserted_once_after_greeting_and_keeps_all_copy_guards():
+    context = "We spoke earlier today at 10 AM."
+    body = outreach._insert_verified_conversation_context(
+        f"Hi Alex,\n\n{context}\n\nThanks for your time. {context}",
+        context,
+    )
+
+    assert body.startswith(f"Hi Alex,\n\n{context}\n\n")
+    assert body.casefold().count(context.casefold()) == 1
+
+    unsafe = outreach._insert_verified_conversation_context(
+        "Hi Alex,\n\nThanks for your time.",
+        "We spoke at https://example.com.",
+    )
+    with pytest.raises(ValueError, match="contains a link"):
+        outreach.validate_generated_copy(
+            subject="Dealer information",
+            body=unsafe,
+            catalog_snapshot=[],
+        )
+
+    blocked = outreach._insert_verified_conversation_context(
+        "No greeting in this body.",
+        "This is a guaranteed approval.",
+    )
+    assert blocked.startswith("This is a guaranteed approval.\n\n")
+    with pytest.raises(ValueError, match="unsupported claim"):
+        outreach.validate_generated_copy(
+            subject="Dealer information",
+            body=blocked,
+            catalog_snapshot=[],
+        )
+
+
+def test_canonical_snapshot_excludes_non_dealer_and_separates_conditional_programs():
+    now = datetime.now(UTC)
+
+    def program(key: str, name: str, order: int, *, status: str = "active"):
+        return SimpleNamespace(
+            id=uuid.uuid4(),
+            program_key=key,
+            public_slug=key.replace("_", "-"),
+            name=name,
+            short_description=f"Approved description for {name}",
+            display_order=order,
+            status=status,
+            updated_at=now,
+        )
+
+    def scope(
+        program_id,
+        *,
+        vertical: str = "dealer",
+        active: bool = True,
+        required: list[str] | None = None,
+        industry: list[str] | None = None,
+    ):
+        return SimpleNamespace(
+            program_id=program_id,
+            vertical=vertical,
+            scope_key="default",
+            intake_variants=[],
+            intent_keys=[],
+            naics_prefixes=[],
+            industry_keys=industry or [],
+            required_fact_keys=required or [],
+            is_active=active,
+            updated_at=now,
+        )
+
+    dealer = program("dealer_working_capital", "Dealer Working Capital", 10)
+    specialized = program("floorplan_support", "Floorplan Support", 20)
+    ez = program("ez_term", "EZ Term", 1)
+    microcap = program("microcap", "MicroCap", 2)
+    restricted = program("dealer_inventory", "Dealer Inventory", 30)
+    retired = program("old_dealer", "Old Dealer Program", 3, status="retired")
+
+    snapshot = outreach._dealer_catalog_snapshot(
+        [
+            (dealer, scope(dealer.id)),
+            (
+                specialized,
+                scope(specialized.id, required=["floorplan_inventory_present"]),
+            ),
+            (ez, scope(ez.id, vertical="main_street")),
+            (microcap, scope(microcap.id, vertical="main_street")),
+            (restricted, scope(restricted.id, industry=["franchise_dealer"])),
+            (retired, scope(retired.id)),
+        ]
+    )
+
+    assert [row["program_key"] for row in snapshot] == [
+        "dealer_working_capital",
+        "floorplan_support",
+        "dealer_inventory",
+    ]
+    assert snapshot[0]["required_fact_keys"] == []
+    assert snapshot[1]["required_fact_keys"] == ["floorplan_inventory_present"]
+    assert snapshot[2]["required_fact_keys"] == []
+    assert snapshot[2]["is_specialized"] is True
+    rendered = outreach._approved_program_section(snapshot)
+    assert rendered.index("Specialized options, when relevant:") < rendered.index(
+        "- Dealer Inventory"
+    )
+    assert "EZ Term" not in rendered
+    assert "MicroCap" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_missing_canonical_dealer_catalog_fails_closed():
+    result = SimpleNamespace(all=lambda: [])
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    with pytest.raises(outreach.OutreachBlocked) as blocked:
+        await outreach._active_catalog_snapshot(db)
+
+    assert blocked.value.code == "dealer_program_catalog_not_configured"
 
 
 def test_firm_blocked_phrases_are_normalized_across_case_punctuation_and_unicode():
@@ -786,16 +955,77 @@ async def test_nova_micro_uses_bedrock_converse_and_records_usage(monkeypatch):
         prospect=prospect,
         identity=identity,
         purpose="dealer_information",
-        ai_instructions="Warm and concise",
+        ai_instructions="Be warm and concise.",
         catalog_snapshot=[],
         actor_user_id=uuid.uuid4(),
     )
 
     assert composed.source == "ai"
     assert composed.model_id == "amazon.nova-micro-v1:0"
+    assert composed.generation_reason == "ai_generated"
+    assert composed.instruction_disposition == "submitted_to_ai"
     runtime.converse.assert_called_once()
     assert runtime.converse.call_args.kwargs["modelId"] == "amazon.nova-micro-v1:0"
+    system_prompt = runtime.converse.call_args.kwargs["system"][0]["text"]
+    assert "style and formatting directions only" in system_prompt
+    assert "not a source of factual conversation context" in system_prompt
+    assert "inserted after generation" in system_prompt
+    user_prompt = json.loads(runtime.converse.call_args.kwargs["messages"][0]["content"][0]["text"])
+    assert user_prompt["PERSONALIZATION_INSTRUCTIONS"] == "Be warm and concise."
+    assert "paragraphs" not in user_prompt["requirements"]
     record.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nova_access_denied_maps_to_safe_fallback_reason(monkeypatch):
+    settings = SimpleNamespace(
+        ai_provider_enabled=True,
+        prospect_bedrock_model="amazon.nova-micro-v1:0",
+        aws_bearer_token_bedrock="",
+        bedrock_runtime_region="us-east-1",
+    )
+    monkeypatch.setattr(outreach, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
+    runtime = SimpleNamespace(
+        converse=MagicMock(
+            side_effect=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+                "Converse",
+            )
+        )
+    )
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: runtime)
+    from app.services.ai import usage
+
+    monkeypatch.setattr(usage, "assert_ai_allowed", AsyncMock())
+    monkeypatch.setattr(usage, "record_ai_usage", AsyncMock())
+    identity = outreach.ProspectIdentity(
+        contact_id=uuid.uuid4(),
+        contact_name="Alex Smith",
+        dealer_name="Sunrise Auto",
+        email="alex@example.com",
+        owner_user_id=uuid.uuid4(),
+    )
+
+    composed = await outreach._compose_with_nova(
+        SimpleNamespace(),
+        prospect=SimpleNamespace(id=uuid.uuid4()),
+        identity=identity,
+        purpose="dealer_information",
+        ai_instructions="Be concise",
+        catalog_snapshot=[],
+        actor_user_id=uuid.uuid4(),
+    )
+
+    assert composed.source == "fallback"
+    assert composed.generation_reason == "ai_access_blocked"
+    assert composed.instruction_disposition == "not_applied_fallback"
 
 
 @pytest.mark.asyncio
@@ -840,7 +1070,19 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
     )
     monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
     monkeypatch.setattr(outreach, "is_suppressed", AsyncMock(return_value=None))
-    monkeypatch.setattr(outreach, "_active_catalog_snapshot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        outreach,
+        "_active_catalog_snapshot",
+        AsyncMock(
+            return_value=[
+                {
+                    "program_key": "dealer_working_capital",
+                    "name": "Dealer Working Capital",
+                    "required_fact_keys": [],
+                }
+            ]
+        ),
+    )
     monkeypatch.setattr(
         outreach,
         "_compose_with_nova",
@@ -849,6 +1091,8 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
                 subject="Information for Example Motors",
                 body="Hi Alex,\n\nReply with what you are planning and we can discuss next steps.",
                 source="fallback",
+                generation_reason="ai_provider_error",
+                instruction_disposition="not_applied_fallback",
             )
         ),
     )
@@ -895,6 +1139,8 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
             purpose="dealer_information",
             sample_contact_name="Alex",
             sample_dealer_name="Example Motors",
+            ai_instructions="Mention that we spoke earlier today at 10 AM",
+            verified_conversation_context="We spoke earlier today at 10 AM.",
             include_collateral=False,
         ),
     )
@@ -910,6 +1156,10 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
     assert draft.headers["Message-ID"] == outreach._test_email_message_id(actor.id, idempotency_key)
     assert "List-Unsubscribe" not in draft.headers
     assert "TEST EMAIL" in draft.body_text
+    assert "TEST DRAFT STATUS" in draft.body_text
+    assert "AI provider could not produce a draft" in draft.body_text
+    assert "One-off instructions: NOT APPLIED" in draft.body_text
+    assert draft.body_text.count("We spoke earlier today at 10 AM.") == 1
     assert "prospect-email-unsubscribe/" not in draft.body_text
     assert "one-click unsubscribe" in draft.body_text
     assert record.await_args.kwargs["context"] == "dealer_prospect_test"
@@ -917,6 +1167,8 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
     assert send.call_args.kwargs["to_emails"] == [actor.email]
     assert ledger.status == expected_ledger_status
     assert ledger.provider_message_id == provider_result.message_id
+    assert result.generation_reason == "ai_provider_error"
+    assert result.instruction_disposition == "not_applied_fallback"
     if expected_state == "uncertain":
         assert "No automatic retry" in result.detail
         assert ledger.failed_at is None
@@ -967,6 +1219,8 @@ async def test_test_email_idempotency_replays_sent_ledger_without_resending(monk
     assert response.delivery_state == "sent"
     assert response.subject == "[TEST] Existing delivery"
     assert response.draft_source == "ai"
+    assert response.generation_reason == "ai_generated"
+    assert response.instruction_disposition == "unknown"
     assert response.attachment_names == ["dealer-guide.pdf"]
     suppressed.assert_not_awaited()
     send.assert_not_called()
@@ -986,7 +1240,86 @@ def test_ambiguous_test_email_ledger_is_never_resent():
 
     assert response.ok is False
     assert response.delivery_state == "uncertain"
+    assert response.generation_reason == "fallback_reason_not_recorded"
+    assert response.instruction_disposition == "unknown"
     assert "No duplicate was sent" in response.detail
+
+
+def test_test_ledger_round_trips_safe_generation_diagnostics():
+    composed = outreach.ComposedCopy(
+        subject="Dealer information",
+        body="Hi Alex",
+        source="fallback",
+        generation_reason="ai_provider_error",
+        instruction_disposition="not_applied_fallback",
+    )
+    row = SimpleNamespace(
+        status="sent",
+        template_key=outreach._test_template_key("dealer_information", composed, "a" * 64),
+        to_email="admin@qualifiedcommercial.com",
+        subject="[TEST] Dealer information",
+        attachment_names=[],
+        detail="accepted",
+    )
+
+    response = outreach._test_response_from_ledger(row)
+
+    assert outreach._test_template_fingerprint(row.template_key) == "a" * 12
+    assert len(row.template_key) <= 64
+    assert response.draft_source == "fallback"
+    assert response.generation_reason == "ai_provider_error"
+    assert response.instruction_disposition == "not_applied_fallback"
+
+
+@pytest.mark.asyncio
+async def test_test_email_idempotency_rejects_a_different_payload_for_new_ledger_keys(
+    monkeypatch,
+):
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="test-admin-conflict",
+        email="admin@qualifiedcommercial.com",
+        name="Admin User",
+        role="super_admin",
+        account_status="active",
+    )
+    key = uuid.uuid4()
+    original = ProspectTestEmailRequest(
+        idempotency_key=key,
+        sample_contact_name="Alex",
+        sample_dealer_name="Example Motors",
+        verified_conversation_context="We spoke earlier today at 10 AM.",
+        include_collateral=False,
+    )
+    composed = outreach.ComposedCopy(
+        subject="Dealer information",
+        body="Hi Alex",
+        source="ai",
+        generation_reason="ai_generated",
+    )
+    existing = SimpleNamespace(
+        status="sent",
+        template_key=outreach._test_template_key(
+            original.purpose,
+            composed,
+            outreach.test_request_fingerprint(actor, original),
+        ),
+        to_email=actor.email,
+        subject="[TEST] Existing delivery",
+        attachment_names=[],
+        detail="accepted",
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: existing))
+    )
+    monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
+
+    with pytest.raises(outreach.OutreachConflict, match="different test email request"):
+        await outreach.send_test_email(
+            db,
+            actor=actor,
+            payload=original.model_copy(update={"sample_dealer_name": "Changed Motors"}),
+        )
 
 
 def test_pdf_validation_rejects_encryption_and_active_content(monkeypatch):

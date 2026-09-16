@@ -68,6 +68,7 @@ class ProspectTestEmailRequest(BaseModel):
     sample_contact_name: str = Field(default="Alex Morgan", min_length=1, max_length=160)
     sample_dealer_name: str = Field(default="Example Motors", min_length=1, max_length=180)
     ai_instructions: str | None = Field(default=None, max_length=1500)
+    verified_conversation_context: str | None = Field(default=None, max_length=500)
     include_collateral: bool = True
 
     @field_validator("sample_contact_name", "sample_dealer_name")
@@ -84,6 +85,12 @@ class ProspectTestEmailRequest(BaseModel):
         clean = (value or "").strip()
         return clean or None
 
+    @field_validator("verified_conversation_context")
+    @classmethod
+    def normalize_verified_context(cls, value: str | None) -> str | None:
+        clean = " ".join((value or "").split())
+        return clean or None
+
 
 class ProspectTestEmailResponse(BaseModel):
     ok: bool
@@ -91,6 +98,19 @@ class ProspectTestEmailResponse(BaseModel):
     to_email: str
     subject: str
     draft_source: Literal["ai", "fallback"]
+    generation_reason: Literal[
+        "ai_generated",
+        "ai_disabled",
+        "ai_access_blocked",
+        "ai_provider_error",
+        "ai_output_rejected",
+        "ai_usage_record_failed",
+        "approved_fallback",
+        "fallback_reason_not_recorded",
+    ]
+    instruction_disposition: Literal[
+        "none", "submitted_to_ai", "not_applied_fallback", "unknown"
+    ]
     attachment_names: list[str] = Field(default_factory=list)
     detail: str = ""
 
@@ -99,6 +119,7 @@ class ProspectEmailDraftCreate(BaseModel):
     idempotency_key: UUID = Field(default_factory=uuid4)
     purpose: DraftPurpose = "dealer_information"
     ai_instructions: str | None = Field(default=None, max_length=1500)
+    verified_conversation_context: str | None = Field(default=None, max_length=500)
     # This value is routed directly to DealerProspectActivity.  It is never
     # stored on the email draft and never included in the model prompt.
     private_note: str | None = Field(default=None, max_length=4000)
@@ -107,6 +128,12 @@ class ProspectEmailDraftCreate(BaseModel):
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         clean = (value or "").strip()
+        return clean or None
+
+    @field_validator("verified_conversation_context")
+    @classmethod
+    def normalize_verified_context(cls, value: str | None) -> str | None:
+        clean = " ".join((value or "").split())
         return clean or None
 
 
@@ -152,6 +179,10 @@ class ProspectEmailDraftRead(BaseModel):
     countdown_seconds: int | None = None
     version: int
     draft_source: Literal["ai", "fallback"]
+    generation_reason: Literal["ai_generated", "approved_fallback"]
+    instruction_disposition: Literal[
+        "none", "submitted_to_ai", "not_applied_fallback"
+    ]
     model_id: str | None = None
     error: str | None = None
     failure_code: str | None = None
