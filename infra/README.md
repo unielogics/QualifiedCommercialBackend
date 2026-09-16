@@ -40,6 +40,16 @@ terraform apply tfplan
 terraform output -raw manual_post_apply
 ```
 
+### SES feedback requires two applies
+
+Leave `ses_feedback_subscription_enabled = false` for the first apply. This
+creates the SNS topic and puts its exact ARN into the backend secret without
+issuing a confirmation request that the old process would reject. Restart or
+redeploy `qcbackend` so systemd refreshes `/etc/qcbackend.env`, then set
+`ses_feedback_subscription_enabled = true` and apply again. The second apply
+creates both the HTTPS subscription and the SES event destination. Do not
+enable Dealer Prospect outreach until the subscription is `Confirmed`.
+
 ## Updating the secret
 
 Edit `terraform.tfvars`'s `secret_payload`, then:

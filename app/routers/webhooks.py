@@ -576,14 +576,29 @@ async def ses_events(request: Request) -> Response:
     if not isinstance(envelope, dict):
         return Response(status_code=status.HTTP_400_BAD_REQUEST)
 
+    # An SNS signature proves only that AWS signed the envelope; it does not
+    # prove that the topic belongs to Qualified Commercial. Any AWS account can
+    # create a topic and request an HTTPS subscription, so bind both the
+    # subscription confirmation and every notification to the one provisioned
+    # feedback topic before fetching a certificate or following SubscribeURL.
+    expected_topic = get_settings().ses_feedback_topic_arn.strip()
+    received_topic = str(envelope.get("TopicArn") or "").strip()
+    if not expected_topic or not hmac.compare_digest(received_topic, expected_topic):
+        log.warning("ses webhook: rejected unexpected SNS topic %r", received_topic)
+        return Response(status_code=status.HTTP_403_FORBIDDEN)
+
     if not await sns.verify(envelope):
         log.warning("ses webhook: rejected unverified SNS message")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
     kind = str(envelope.get("Type") or "")
     if kind == "SubscriptionConfirmation":
-        await sns.confirm_subscription(envelope)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        if await sns.confirm_subscription(envelope):
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        # A transient failure while following SubscribeURL must remain
+        # retryable. Returning success here would acknowledge the notification
+        # while leaving the subscription permanently pending.
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
     if kind != "Notification":
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 

@@ -11,6 +11,7 @@ domain_root   = "qualifiedcommercial.com"
 api_subdomain = "api"
 ses_from_address = "no-reply@qualifiedcommercial.com"
 ses_configuration_set = "my-first-configuration-set"
+ses_feedback_subscription_enabled = false
 
 github_org  = "REPLACE-ME-with-your-github-org-or-username"
 github_repo = "QualifiedCommercial"

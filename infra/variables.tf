@@ -43,13 +43,25 @@ variable "route53_zone_id" {
 variable "ses_from_address" {
   type        = string
   default     = "no-reply@qualifiedcommercial.com"
-  description = "Only this verified sender address may be used by the backend EC2 role for SES outbound mail."
+  description = "Primary verified sender address used by the backend for SES outbound mail."
+}
+
+variable "prospect_from_address" {
+  type        = string
+  default     = "dealers@qualifiedcommercial.com"
+  description = "Verified Dealer Desk sender address used for prospect outreach."
 }
 
 variable "ses_configuration_set" {
   type        = string
   default     = "my-first-configuration-set"
   description = "Optional SES configuration set used for bounce/complaint tracking."
+}
+
+variable "ses_feedback_subscription_enabled" {
+  type        = bool
+  default     = false
+  description = "Phase-two switch for the SNS HTTPS subscription and SES event destination. Enable only after the API has reloaded the provisioned topic ARN."
 }
 
 # ---------- GitHub Actions OIDC ----------
@@ -80,8 +92,8 @@ variable "ghcr_image" {
 # print to stdout.
 
 variable "secret_payload" {
-  type      = map(string)
-  sensitive = true
+  type        = map(string)
+  sensitive   = true
   description = <<-EOT
     Map of env-var name to value, written into Secrets Manager as a JSON blob.
 

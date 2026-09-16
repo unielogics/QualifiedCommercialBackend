@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -11,10 +11,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models.app_settings import AppSettings
 from app.models.ai_usage_event import AIUsageEvent
+from app.models.app_settings import AppSettings
 from app.schemas.settings import AISpendSettings, AppSettingsData
-
 
 CHAT_FEATURES = {
     "chat",
@@ -62,7 +61,10 @@ def _is_heavy_model(model: str) -> bool:
 
 def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     settings = get_settings()
-    if _is_heavy_model(model):
+    if "nova-micro" in (model or "").lower():
+        in_rate = settings.ai_pricing_nova_micro_input_per_mtok
+        out_rate = settings.ai_pricing_nova_micro_output_per_mtok
+    elif _is_heavy_model(model):
         in_rate = settings.ai_pricing_heavy_input_per_mtok
         out_rate = settings.ai_pricing_heavy_output_per_mtok
     else:
@@ -117,7 +119,7 @@ def json_safe_metadata(value: Any) -> Any:
 
 
 def _day_start() -> datetime:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 

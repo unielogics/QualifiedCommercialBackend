@@ -53,6 +53,16 @@ class Settings(BaseSettings):
     ai_pricing_light_output_per_mtok: float = 4.00
     ai_pricing_heavy_input_per_mtok: float = 3.00
     ai_pricing_heavy_output_per_mtok: float = 15.00
+    # Dealer-prospect outreach uses Nova Micro through the Bedrock Converse
+    # API.  Keep its model and published token rates separate from the Claude
+    # light/heavy switch so usage attribution remains honest.
+    prospect_bedrock_model: str = "amazon.nova-micro-v1:0"
+    ai_pricing_nova_micro_input_per_mtok: float = 0.035
+    ai_pricing_nova_micro_output_per_mtok: float = 0.14
+
+    # Dealer prospect pipeline rollout. Keep disabled until the shared mailbox,
+    # approved collateral, and pilot-agent UI are configured in an environment.
+    dealer_prospect_pipeline_enabled: bool = False
 
     # AWS
     aws_access_key_id: str = ""
@@ -125,7 +135,9 @@ class Settings(BaseSettings):
     # console and point at GET /api/v1/google/oauth/callback.
     gmail_oauth_client_id: str = ""
     gmail_oauth_client_secret: str = ""
-    google_oauth_redirect_uri: str = ""  # e.g. https://api.qualifiedcommercial.com/api/v1/google/oauth/callback
+    google_oauth_redirect_uri: str = (
+        ""  # e.g. https://api.qualifiedcommercial.com/api/v1/google/oauth/callback
+    )
     # Gmail Pub/Sub push — real-time inbound. When `gmail_pubsub_topic`
     # is set (projects/<proj>/topics/<topic>) the app registers a
     # users.watch() on the delegated mailbox's INBOX; Gmail then pushes
@@ -212,6 +224,28 @@ class Settings(BaseSettings):
     ses_region: str = "us-east-1"
     ses_from_address: str = ""
     ses_configuration_set: str = ""
+    # Exact SNS topic allowed to drive SES delivery state and suppression.
+    # Empty is intentionally fail-closed at the public webhook.
+    ses_feedback_topic_arn: str = ""
+
+    # Dealer Prospect Outreach.  SES still needs the From identity verified;
+    # these values deliberately do not fall back to an individual operator's
+    # mailbox.  Replies route through a per-draft plus alias at the shared
+    # Dealer Desk address.
+    prospect_from_email: str = "dealers@qualifiedcommercial.com"
+    prospect_from_name: str = "Qualified Commercial Dealer Desk"
+    prospect_reply_to_email: str = "dealers@qualifiedcommercial.com"
+    prospect_mailing_address: str = "14 53rd St #408N, Brooklyn, NY 11232"
+    prospect_email_review_seconds: int = 60
+    # SES v1 raw messages have a 10 MB wire limit; MIME/base64 overhead makes
+    # seven million attachment bytes a conservative all-or-none ceiling.
+    prospect_email_max_attachment_bytes: int = 7_000_000
+    prospect_secure_bundle_days: int = 7
+    # Collateral uploads fail closed unless a ClamAV daemon completes an
+    # INSTREAM scan. The daemon should be reachable only from the API runtime.
+    prospect_collateral_clamd_host: str = ""
+    prospect_collateral_clamd_port: int = 3310
+    prospect_collateral_clamd_timeout_seconds: float = 15.0
 
     app_env: str = "development"
     log_level: str = "INFO"

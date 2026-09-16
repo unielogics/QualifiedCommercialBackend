@@ -15,6 +15,11 @@ output "secret_arn" {
   value       = aws_secretsmanager_secret.qcbackend.arn
 }
 
+output "ses_feedback_topic_arn" {
+  description = "Only this SNS topic is trusted by the SES delivery-feedback webhook."
+  value       = aws_sns_topic.ses_delivery_events.arn
+}
+
 output "instance_profile_name" {
   description = "Attach this to the existing EC2 with the command in 'manual_post_apply'."
   value       = aws_iam_instance_profile.qcbackend.name
@@ -38,7 +43,7 @@ output "api_url" {
 
 output "manual_post_apply" {
   description = "Copy/paste these once after terraform apply."
-  value = <<-EOT
+  value       = <<-EOT
 
     # 1. Attach the IAM instance profile to the EC2 (one-shot, idempotent)
     aws ec2 associate-iam-instance-profile \

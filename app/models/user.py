@@ -47,6 +47,12 @@ class User(TimestampMixin, Base):
     account_access_types: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default="[]"
     )
+    # Feature entitlement within Field Desk.  The environment setting remains
+    # the master rollout/kill switch; this persisted flag lets an administrator
+    # pilot the prospect pipeline with selected eligible agents only.
+    dealer_prospect_pipeline_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Soft-delete: super-admin revoke sets this rather than physically deleting,
     # so historical FK references (loans.broker_id → brokers.user_id, etc.) survive.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

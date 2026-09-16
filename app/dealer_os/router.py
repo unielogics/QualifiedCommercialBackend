@@ -12602,28 +12602,65 @@ async def create_rep_inbox_thread(
     if "sms" in channels and not phone:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Provide a valid mobile number for SMS.")
 
-    contact = await _ensure_rep_contact(
-        db,
-        owner_user_id=user.id,
-        dealer_id=dealer.id if dealer else None,
-        full_name=payload.recipient_name,
-        company=payload.company or (dealer.name if dealer else None),
-        email=email,
-        phone_e164=phone,
-        source="manual",
-    )
-    await _capture_rep_contact_sms_consent(
-        db,
-        request=request,
-        user=user,
-        contact=contact,
-        dealer=dealer,
-        phone_e164=phone,
-        recipient_name=payload.recipient_name,
-        transactional=payload.transactional_sms_consent,
-        marketing=payload.marketing_sms_consent,
-        method=payload.consent_method,
-    )
+    contact = None
+    prospect_id = getattr(payload, "prospect_id", None)
+    if prospect_id is not None:
+        from app.dealer_os.services import prospects as prospect_service
+
+        prospect_service.require_pipeline_enabled()
+        if channels != ["sms"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Prospect messaging permits one consented SMS recipient only.",
+            )
+        prospect = await prospect_service.load_visible_prospect(
+            db, user, prospect_id, for_update=True
+        )
+        if prospect.do_not_contact:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                prospect.do_not_contact_reason or "This prospect is marked do not contact.",
+            )
+        contact = await db.get(DealerRepContact, prospect.primary_contact_id)
+        if contact is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Prospect contact is unavailable.")
+        authoritative_phone = consent_delivery.normalize_phone(contact.phone_e164)
+        if not authoritative_phone or phone != authoritative_phone:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "The SMS recipient no longer matches the phone number that granted consent.",
+            )
+        if contact.sms_opted_out_at is not None or contact.sms_marketing_consented_at is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This prospect has not granted active marketing SMS consent.",
+            )
+        phone = authoritative_phone
+        email = contact.email.strip().lower() if contact.email else None
+
+    if contact is None:
+        contact = await _ensure_rep_contact(
+            db,
+            owner_user_id=user.id,
+            dealer_id=dealer.id if dealer else None,
+            full_name=payload.recipient_name,
+            company=payload.company or (dealer.name if dealer else None),
+            email=email,
+            phone_e164=phone,
+            source="manual",
+        )
+        await _capture_rep_contact_sms_consent(
+            db,
+            request=request,
+            user=user,
+            contact=contact,
+            dealer=dealer,
+            phone_e164=phone,
+            recipient_name=payload.recipient_name,
+            transactional=payload.transactional_sms_consent,
+            marketing=payload.marketing_sms_consent,
+            method=payload.consent_method,
+        )
 
     if "sms" in channels:
         if contact.sms_opted_out_at is not None:
@@ -12639,7 +12676,7 @@ async def create_rep_inbox_thread(
             db,
             owner_user_id=user.id,
             contact=contact,
-            dealer_id=dealer.id if dealer else None,
+            dealer_id=dealer.id if dealer else getattr(contact, "dealer_id", None),
             channel=channel,
             subject=payload.subject,
             source="manual",

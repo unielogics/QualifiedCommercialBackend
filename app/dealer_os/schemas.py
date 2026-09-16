@@ -1387,6 +1387,7 @@ class ContactShareCreate(BaseModel):
 
 class RepInboxThreadCreate(BaseModel):
     dealer_id: UUID | None = None
+    prospect_id: UUID | None = None
     recipient_name: str = Field(min_length=1, max_length=160)
     company: str | None = Field(default=None, max_length=180)
     recipient_email: str | None = Field(default=None, max_length=320)

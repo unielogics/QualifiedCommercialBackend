@@ -8,6 +8,7 @@ defaulting to everybody.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -15,6 +16,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.enums import Role
 from app.models.message_send import MessageSend
@@ -223,11 +225,163 @@ async def test_an_unknown_event_or_id_changes_nothing():
 def test_only_amazon_may_supply_the_signing_certificate():
     """The certificate URL arrives inside the payload we are trying to
     authenticate, so this check is what stops an attacker signing their own."""
-    assert sns._cert_url_is_amazon("https://sns.us-east-1.amazonaws.com/c.pem") is True
+    assert (
+        sns._cert_url_is_amazon(
+            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-deadbeef.pem"
+        )
+        is True
+    )
     assert sns._cert_url_is_amazon("http://sns.us-east-1.amazonaws.com/c.pem") is False
     assert sns._cert_url_is_amazon("https://evil.example.com/c.pem") is False
     assert sns._cert_url_is_amazon("https://amazonaws.com.evil.example.com/c.pem") is False
+    assert (
+        sns._cert_url_is_amazon(
+            "https://attacker-bucket.s3.amazonaws.com/SimpleNotificationService-deadbeef.pem"
+        )
+        is False
+    )
     assert sns._cert_url_is_amazon("") is False
+    assert (
+        sns._subscribe_url_is_amazon(
+            "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&Token=abc"
+        )
+        is True
+    )
+    assert (
+        sns._subscribe_url_is_amazon(
+            "https://attacker-bucket.s3.amazonaws.com/?Action=ConfirmSubscription&Token=abc"
+        )
+        is False
+    )
+
+
+def _json_request(payload: dict) -> Request:
+    body = json.dumps(payload).encode()
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "https",
+            "path": "/api/v1/webhooks/ses",
+            "raw_path": b"/api/v1/webhooks/ses",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 443),
+        },
+        receive,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_topic", "received_topic"),
+    [
+        ("", "arn:aws:sns:us-east-1:111122223333:expected"),
+        (
+            "arn:aws:sns:us-east-1:111122223333:expected",
+            "arn:aws:sns:us-east-1:999900001111:attacker",
+        ),
+    ],
+)
+async def test_ses_webhook_rejects_unconfigured_or_wrong_topic_before_verification(
+    monkeypatch, configured_topic, received_topic
+):
+    from app.routers import webhooks
+
+    verify = AsyncMock(return_value=True)
+    confirm = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        webhooks,
+        "get_settings",
+        lambda: SimpleNamespace(ses_feedback_topic_arn=configured_topic),
+    )
+    monkeypatch.setattr(sns, "verify", verify)
+    monkeypatch.setattr(sns, "confirm_subscription", confirm)
+
+    response = await webhooks.ses_events(
+        _json_request(
+            {
+                "Type": "SubscriptionConfirmation",
+                "TopicArn": received_topic,
+                "Message": "confirm",
+            }
+        )
+    )
+
+    assert response.status_code == 403
+    verify.assert_not_awaited()
+    confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ses_webhook_allows_only_the_configured_topic_to_reach_verification(monkeypatch):
+    from app.routers import webhooks
+
+    expected = "arn:aws:sns:us-east-1:111122223333:expected"
+    verify = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        webhooks,
+        "get_settings",
+        lambda: SimpleNamespace(ses_feedback_topic_arn=expected),
+    )
+    monkeypatch.setattr(sns, "verify", verify)
+
+    response = await webhooks.ses_events(
+        _json_request(
+            {
+                "Type": "Notification",
+                "TopicArn": expected,
+                "Message": "{}",
+            }
+        )
+    )
+
+    assert response.status_code == 202
+    verify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confirmed", "expected_status"), [(True, 204), (False, 503)])
+async def test_ses_subscription_confirmation_failure_is_retryable(
+    monkeypatch, confirmed, expected_status
+):
+    from app.routers import webhooks
+
+    expected = "arn:aws:sns:us-east-1:111122223333:expected"
+    verify = AsyncMock(return_value=True)
+    confirm = AsyncMock(return_value=confirmed)
+    monkeypatch.setattr(
+        webhooks,
+        "get_settings",
+        lambda: SimpleNamespace(ses_feedback_topic_arn=expected),
+    )
+    monkeypatch.setattr(sns, "verify", verify)
+    monkeypatch.setattr(sns, "confirm_subscription", confirm)
+
+    response = await webhooks.ses_events(
+        _json_request(
+            {
+                "Type": "SubscriptionConfirmation",
+                "TopicArn": expected,
+                "Message": "confirm",
+            }
+        )
+    )
+
+    assert response.status_code == expected_status
+    verify.assert_awaited_once()
+    confirm.assert_awaited_once()
 
 
 @pytest.mark.asyncio

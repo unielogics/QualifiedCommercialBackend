@@ -10,8 +10,13 @@ resource "aws_secretsmanager_secret" "qcbackend" {
 }
 
 resource "aws_secretsmanager_secret_version" "qcbackend" {
-  secret_id     = aws_secretsmanager_secret.qcbackend.id
-  secret_string = jsonencode(var.secret_payload)
+  secret_id = aws_secretsmanager_secret.qcbackend.id
+  secret_string = jsonencode(merge(var.secret_payload, {
+    # Keep the webhook trust boundary coupled to the topic Terraform actually
+    # provisions. Operators cannot accidentally paste a topic from another
+    # account into the production runtime secret.
+    SES_FEEDBACK_TOPIC_ARN = aws_sns_topic.ses_delivery_events.arn
+  }))
 }
 
 # ---------- Instance role ----------
@@ -106,6 +111,7 @@ resource "aws_iam_role_policy" "qcbackend_bedrock" {
         ]
         Resource = [
           "arn:aws:bedrock:*::foundation-model/anthropic.*",
+          "arn:aws:bedrock:*::foundation-model/amazon.nova-*",
           "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
           "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:application-inference-profile/*"
         ]
@@ -158,7 +164,10 @@ resource "aws_iam_role_policy" "qcbackend_ses_send" {
       )
       Condition = {
         StringEquals = {
-          "ses:FromAddress" = var.ses_from_address
+          "ses:FromAddress" = distinct([
+            var.ses_from_address,
+            var.prospect_from_address
+          ])
         }
       }
     }]

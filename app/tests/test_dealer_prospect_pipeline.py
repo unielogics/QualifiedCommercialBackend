@@ -1,0 +1,448 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
+
+import pytest
+from fastapi import HTTPException
+from starlette.requests import Request
+
+from app.dealer_os import prospect_router
+from app.dealer_os.prospect_schemas import (
+    ProspectConversionRequest,
+    ProspectCreate,
+    ProspectDefinitionReorder,
+    ProspectMoveResult,
+    ProspectMoveStage,
+)
+from app.dealer_os.services import prospects
+from app.enums import Role
+from app.models.dealer_prospect import DealerProspect
+
+
+def _user(role: Role, *, user_id=None):
+    return SimpleNamespace(
+        id=user_id or uuid4(),
+        role=role,
+        account_access_types=[],
+        account_status="active",
+        deleted_at=None,
+        dealer_prospect_pipeline_enabled=True,
+        name="Pipeline User",
+        email="agent@example.com",
+    )
+
+
+def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
+    contact_id = uuid4()
+    payload = ProspectCreate(
+        contact_id=contact_id,
+        name="  Rocio Martinez  ",
+        dealer_name=" Grace Auto Sales ",
+        email="ROCIO@EXAMPLE.COM",
+        phone="(973) 555-0148",
+    )
+
+    assert payload.contact_name == "Rocio Martinez"
+    assert payload.contact_id == contact_id
+    assert payload.dealer_name == "Grace Auto Sales"
+    assert payload.phone == "+19735550148"
+
+
+def test_drag_move_accepts_explicit_null_action() -> None:
+    payload = ProspectMoveStage(
+        stage_key=" Follow Up 1 ",
+        expected_version=4,
+        action=None,
+    )
+
+    assert payload.stage_key == "follow up 1"
+    assert payload.action is None
+
+
+def test_conversion_requires_candidate_id_only_for_existing_actions() -> None:
+    candidate_id = uuid4()
+    assert ProspectConversionRequest(expected_version=1).action == "detect"
+    assert (
+        ProspectConversionRequest(
+            action="link", expected_version=1, intake_id=candidate_id
+        ).intake_id
+        == candidate_id
+    )
+    with pytest.raises(ValueError):
+        ProspectConversionRequest(action="reactivate", expected_version=1)
+    with pytest.raises(ValueError):
+        ProspectConversionRequest(action="create", expected_version=1, intake_id=candidate_id)
+
+
+def test_reorder_rejects_duplicate_definition_ids() -> None:
+    row_id = uuid4()
+    with pytest.raises(ValueError):
+        ProspectDefinitionReorder(ordered_ids=[row_id, row_id])
+
+
+def test_dealer_identity_normalization_is_case_and_spacing_stable() -> None:
+    assert prospects.normalize_dealer_name("  GRACE   Auto Sales  ") == "grace auto sales"
+    assert prospects.normalize_dealer_name("Ｇｒａｃｅ Auto") == "grace auto"
+
+
+def test_ai_intake_candidate_explains_all_matching_identity_signals() -> None:
+    prospect = SimpleNamespace(
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+        dealer_name_normalized="grace auto sales",
+    )
+    intake = SimpleNamespace(
+        email="ROCIO@example.com",
+        phone="(973) 555-0148",
+        business_name="  Grace   Auto Sales ",
+    )
+
+    assert prospects.intake_candidate_match_reasons(prospect, intake) == [
+        "email",
+        "phone",
+        "dealer_name",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        ("new", "emailed"),
+        ("emailed", "follow_up_1"),
+        ("follow_up_1", "follow_up_2"),
+        ("follow_up_2", "follow_up_2"),
+        ("booked", None),
+    ],
+)
+def test_not_connected_advances_only_the_follow_up_sequence(
+    current: str, expected: str | None
+) -> None:
+    assert (
+        prospects.outcome_target_stage(current, {"stage_strategy": "advance_follow_up"}) == expected
+    )
+
+
+def test_not_connected_uses_configured_automatic_follow_up_delay() -> None:
+    current = datetime(2026, 9, 16, 12, tzinfo=UTC)
+    explicit = datetime(2026, 9, 18, 15, tzinfo=UTC)
+
+    assert prospects.outcome_follow_up_at(
+        {"follow_up_delay_hours": 24}, None, current_time=current
+    ) == current + timedelta(hours=24)
+    assert (
+        prospects.outcome_follow_up_at(
+            {"follow_up_delay_hours": 24}, explicit, current_time=current
+        )
+        == explicit
+    )
+    with pytest.raises(HTTPException) as error:
+        prospects.validate_action_config({"follow_up_delay_hours": 0})
+    assert error.value.status_code == 422
+
+
+def test_outcome_action_config_is_allowlisted() -> None:
+    assert prospects.validate_action_config(
+        {"target_stage_key": "Follow Up 1", "requires_follow_up": True}
+    ) == {"target_stage_key": "follow_up_1", "requires_follow_up": True}
+    with pytest.raises(HTTPException) as error:
+        prospects.validate_action_config({"send_arbitrary_webhook": True})
+    assert error.value.status_code == 422
+    assert (
+        prospects.validate_action_config(
+            {"target_stage_key": "", "email_action": "", "workflow_action": ""}
+        )
+        == {}
+    )
+    with pytest.raises(HTTPException):
+        prospects.validate_action_config({"email_action": "send_whatever"})
+    with pytest.raises(HTTPException):
+        prospects.validate_action_config({"workflow_action": "run_whatever"})
+
+
+def test_optimistic_version_conflict_returns_machine_readable_detail() -> None:
+    prospect = SimpleNamespace(version=7)
+    with pytest.raises(HTTPException) as error:
+        prospects.assert_expected_version(prospect, 6)
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "prospect_version_conflict"
+    assert error.value.detail["current_version"] == 7
+
+
+def test_duplicate_response_does_not_leak_another_reps_record() -> None:
+    owner_id = uuid4()
+    rows = [SimpleNamespace(id=uuid4(), owner_user_id=owner_id)]
+
+    detail = prospects.duplicate_detail(rows, _user(Role.FIELD_REP))
+
+    assert detail["candidates"] == []
+    assert detail["assignment_required"] is True
+
+
+def test_duplicate_response_can_name_an_explicitly_selected_contact() -> None:
+    contact_id = uuid4()
+    row = SimpleNamespace(id=uuid4(), owner_user_id=uuid4(), primary_contact_id=contact_id)
+
+    detail = prospects.duplicate_detail([row], _user(Role.FIELD_REP), known_contact_id=contact_id)
+
+    assert detail["candidates"] == [
+        {"prospect_id": str(row.id), "owner_user_id": str(row.owner_user_id)}
+    ]
+    assert detail["assignment_required"] is False
+
+
+def test_pipeline_rollout_flag_is_fail_closed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        prospects,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=False),
+    )
+    with pytest.raises(HTTPException) as error:
+        prospects.require_pipeline_enabled()
+    assert error.value.status_code == 404
+
+    monkeypatch.setattr(
+        prospects,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    prospects.require_pipeline_enabled()
+
+
+def test_pipeline_access_roles_are_explicit() -> None:
+    prospects.require_prospect_actor(_user(Role.SUPER_ADMIN))
+    prospects.require_prospect_actor(_user(Role.LOAN_EXEC))
+    prospects.require_prospect_actor(_user(Role.FIELD_REP))
+    with pytest.raises(HTTPException) as error:
+        prospects.require_prospect_actor(_user(Role.CLIENT))
+    assert error.value.status_code == 403
+
+
+def test_pipeline_access_requires_per_user_assignment() -> None:
+    user = _user(Role.FIELD_REP)
+    user.dealer_prospect_pipeline_enabled = False
+
+    with pytest.raises(HTTPException) as error:
+        prospects.require_prospect_actor(user)
+
+    assert error.value.status_code == 404
+
+
+def test_effective_pipeline_access_combines_master_user_and_eligibility(monkeypatch) -> None:
+    user = _user(Role.FIELD_REP)
+    monkeypatch.setattr(
+        prospects,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    assert prospects.pipeline_effective_enabled(user) is True
+
+    user.dealer_prospect_pipeline_enabled = False
+    assert prospects.pipeline_effective_enabled(user) is False
+    user.dealer_prospect_pipeline_enabled = True
+    user.account_status = "suspended"
+    assert prospects.pipeline_effective_enabled(user) is False
+
+
+def test_access_admin_endpoint_bypasses_master_switch(monkeypatch) -> None:
+    def disabled() -> None:
+        raise HTTPException(status_code=404, detail="disabled")
+
+    monkeypatch.setattr(prospects, "require_pipeline_enabled", disabled)
+    admin_request = Request(
+        {"type": "http", "method": "GET", "path": "/api/v1/dealer-os/admin/prospect-access", "headers": []}
+    )
+    prospect_router._require_pipeline_master(admin_request)
+
+    agent_request = Request(
+        {"type": "http", "method": "GET", "path": "/api/v1/dealer-os/prospects", "headers": []}
+    )
+    with pytest.raises(HTTPException):
+        prospect_router._require_pipeline_master(agent_request)
+
+
+@pytest.mark.asyncio
+async def test_admin_can_enable_one_eligible_pipeline_user(monkeypatch) -> None:
+    actor = _user(Role.SUPER_ADMIN)
+    target = _user(Role.FIELD_REP)
+    target.dealer_prospect_pipeline_enabled = False
+    target.updated_at = None
+    result = SimpleNamespace(scalar_one_or_none=lambda: target)
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=result),
+        add=Mock(),
+        flush=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        prospects,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "path": f"/api/v1/dealer-os/admin/prospect-access/{target.id}",
+            "headers": [],
+        }
+    )
+
+    response = await prospect_router.update_prospect_user_access(
+        target.id,
+        prospect_router.ProspectUserAccessPatch(enabled=True, reason="Pilot cohort"),
+        request,
+        actor,
+        db,
+    )
+
+    assert target.dealer_prospect_pipeline_enabled is True
+    assert response.enabled is True
+    assert response.effective_enabled is True
+    event = db.add.call_args.args[0]
+    assert event.action == "dealer_prospect_pipeline.enabled"
+    assert event.reason == "Pilot cohort"
+
+
+def test_unique_identity_indexes_are_scoped_to_dealer() -> None:
+    indexes = {index.name: index for index in DealerProspect.__table__.indexes}
+    assert [column.name for column in indexes["uq_dealer_prospect_email_active"].columns] == [
+        "dealer_name_normalized",
+        "email_normalized",
+    ]
+    assert [column.name for column in indexes["uq_dealer_prospect_phone_active"].columns] == [
+        "dealer_name_normalized",
+        "phone_normalized",
+    ]
+
+
+def test_router_exposes_board_and_configuration_contracts() -> None:
+    paths = {
+        (route.path, method) for route in prospect_router.router.routes for method in route.methods
+    }
+    assert ("/dealer-os/prospects", "GET") in paths
+    assert ("/dealer-os/prospects", "POST") in paths
+    assert ("/dealer-os/prospect-owners", "GET") in paths
+    assert ("/dealer-os/admin/prospect-access", "GET") in paths
+    assert ("/dealer-os/admin/prospect-access/{user_id}", "PATCH") in paths
+    assert ("/dealer-os/prospects/{prospect_id}/move-stage", "POST") in paths
+    assert ("/dealer-os/prospects/{prospect_id}/outcomes", "POST") in paths
+    assert (
+        "/dealer-os/prospects/{prospect_id}/activities/{activity_id}/undo",
+        "POST",
+    ) in paths
+    assert ("/dealer-os/prospects/{prospect_id}/convert-to-ai-intake", "POST") in paths
+    assert ("/dealer-os/prospect-stages/reorder", "POST") in paths
+    assert ("/dealer-os/prospect-outcomes/reorder", "POST") in paths
+    move_route = next(
+        route
+        for route in prospect_router.router.routes
+        if route.path == "/dealer-os/prospects/{prospect_id}/move-stage"
+    )
+    assert move_route.response_model is ProspectMoveResult
+
+
+def _prospect_for_move(*, converted_intake_id=None):
+    return SimpleNamespace(
+        id=uuid4(),
+        stage_definition_id=uuid4(),
+        primary_contact_id=uuid4(),
+        appointment_id=None,
+        converted_intake_id=converted_intake_id,
+        next_follow_up_at=None,
+        do_not_contact=False,
+        do_not_contact_reason=None,
+        last_activity_at=None,
+        version=1,
+    )
+
+
+def _move_db(current_key: str, destination_key: str):
+    current = SimpleNamespace(id=uuid4(), key=current_key)
+    destination = SimpleNamespace(id=uuid4(), key=destination_key)
+    result = SimpleNamespace(scalar_one_or_none=lambda: destination)
+
+    async def get(model, _row_id):
+        if model.__name__ == "DealerProspectStageDefinition":
+            return current
+        return None
+
+    return SimpleNamespace(get=get, execute=AsyncMock(return_value=result))
+
+
+@pytest.mark.asyncio
+async def test_not_interested_move_requires_explicit_do_not_contact_confirmation() -> None:
+    with pytest.raises(HTTPException) as error:
+        await prospects.move_stage(
+            _move_db("new", "not_interested"),
+            _user(Role.FIELD_REP),
+            _prospect_for_move(),
+            stage_key="not_interested",
+            expected_version=1,
+            note=None,
+            next_follow_up_at=None,
+            action="none",
+            appointment_id=None,
+            confirm_do_not_contact=False,
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "do_not_contact_confirmation_required"
+
+
+@pytest.mark.asyncio
+async def test_not_interested_move_cannot_create_an_email_draft() -> None:
+    with pytest.raises(HTTPException) as error:
+        await prospects.move_stage(
+            _move_db("new", "not_interested"),
+            _user(Role.FIELD_REP),
+            _prospect_for_move(),
+            stage_key="not_interested",
+            expected_version=1,
+            note=None,
+            next_follow_up_at=None,
+            action="draft_email",
+            appointment_id=None,
+            confirm_do_not_contact=True,
+        )
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "do_not_contact_email_forbidden"
+
+
+@pytest.mark.asyncio
+async def test_booked_move_requires_an_appointment() -> None:
+    with pytest.raises(HTTPException) as error:
+        await prospects.move_stage(
+            _move_db("new", "booked"),
+            _user(Role.FIELD_REP),
+            _prospect_for_move(),
+            stage_key="booked",
+            expected_version=1,
+            note=None,
+            next_follow_up_at=None,
+            action="none",
+            appointment_id=None,
+            confirm_do_not_contact=False,
+        )
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "appointment_required"
+
+
+@pytest.mark.asyncio
+async def test_converted_move_requires_the_conversion_endpoint() -> None:
+    with pytest.raises(HTTPException) as error:
+        await prospects.move_stage(
+            _move_db("new", "converted"),
+            _user(Role.FIELD_REP),
+            _prospect_for_move(),
+            stage_key="converted",
+            expected_version=1,
+            note=None,
+            next_follow_up_at=None,
+            action="none",
+            appointment_id=None,
+            confirm_do_not_contact=False,
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "conversion_required"

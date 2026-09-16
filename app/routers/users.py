@@ -166,6 +166,7 @@ class UserRead(BaseModel):
     last_invited_at: datetime | None = None
     last_invite_status: str | None = None
     last_invite_error: str | None = None
+    dealer_prospect_pipeline_enabled: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -553,6 +554,7 @@ async def invite_user(
             clerk_id=None,  # bound on first sign-in via JIT provision
             referral_partner_company_id=referral_partner_company_id,
             account_access_types=sorted(requested_access),
+            dealer_prospect_pipeline_enabled=False,
             phone=store_phone(body.phone),
             account_status="active",
         )

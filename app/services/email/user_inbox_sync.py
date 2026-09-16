@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 # threads) so a lender reply isn't ingested by both paths (double breadcrumb + dual
 # storage). The lender poller owns tagged mail (Message + email.inbound Activity).
 _INBOX_QUERY = 'in:inbox newer_than:14d -subject:"[QC-"'
-_BATCH_LIMIT = 40
+_PAGE_LIMIT = 100
 _TRACKED_KIND = "email.tracked"  # breadcrumb kind — DISTINCT from the lender poller's email.inbound
 _sync_lock = asyncio.Lock()
 
@@ -284,12 +284,8 @@ async def _run_impl(cfg) -> dict[str, int]:
         log.exception("user_inbox_sync: could not build gmail service")
         return {"error": 1}
 
-    def _list() -> list[dict]:
-        resp = svc.users().messages().list(userId="me", q=_INBOX_QUERY, maxResults=_BATCH_LIMIT).execute()
-        return resp.get("messages", []) or []
-
     try:
-        refs = await asyncio.to_thread(_list)
+        refs = await asyncio.to_thread(_list_message_refs, svc)
     except Exception:  # noqa: BLE001
         log.exception("user_inbox_sync: list failed mailbox=%s", mailbox)
         return {"error": 1}
@@ -320,6 +316,25 @@ async def _run_impl(cfg) -> dict[str, int]:
 
     log.info("user_inbox_sync: mailbox=%s ingested=%d skipped=%d", mailbox, ingested, skipped)
     return {"ingested": ingested, "skipped": skipped}
+
+
+def _list_message_refs(svc) -> list[dict]:
+    """Drain every page in the bounded Gmail query.
+
+    Reading only the newest page permanently starves older unprocessed replies
+    whenever more than one page arrives between scheduler runs.
+    """
+    refs: list[dict] = []
+    page_token: str | None = None
+    while True:
+        kwargs = {"userId": "me", "q": _INBOX_QUERY, "maxResults": _PAGE_LIMIT}
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = svc.users().messages().list(**kwargs).execute()
+        refs.extend(response.get("messages", []) or [])
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return refs
 
 
 async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmail_id: str, detail: dict) -> None:
@@ -383,6 +398,21 @@ async def _ingest_message(db: AsyncSession, *, owner_user_id, mailbox: str, gmai
         gmail_id=gmail_id,
         gmail_thread_id=thread_id,
         owner_user_id=owner_user_id,
+    )
+    # Dealer Desk outreach uses a tokenized plus-address Reply-To.  Correlate
+    # that narrow namespace here while the parsed headers/body are already in
+    # memory; unrelated inbox mail remains a cheap no-op.
+    from app.services.email.prospect_reply import ingest_synced_reply
+
+    await ingest_synced_reply(
+        db,
+        from_email=from_email,
+        to_addresses=[*(to_emails or []), *(cc_emails or [])],
+        subject=subject,
+        body=body_text,
+        gmail_id=gmail_id,
+        headers=headers,
+        received_at=received_at,
     )
 
     # Body-less breadcrumbs on the SHARED loan/client feeds (isolation rule 2):

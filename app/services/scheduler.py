@@ -195,6 +195,18 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+    # Durable Dealer Prospect drafts become eligible exactly 60 seconds after
+    # creation. A short scan interval keeps that promise close to exact; the
+    # dispatcher commits its `sending` claim before SES, so overlap is safe.
+    scheduler.add_job(
+        _wrap(job_prospect_email_dispatch),
+        "interval",
+        seconds=5,
+        id="prospect_email_dispatch",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
     # The financial forms' PDFs, redrawn once the typing stops (0206). Saves
     # queue a deadline 120 seconds out and push it further out on every further
     # edit, so this tick is a no-op for a form somebody is still working in and
@@ -555,6 +567,15 @@ async def job_booking_reminders() -> None:
     sent = await dispatch_due_reminders()
     if sent:
         log.info("booking_reminders sent=%d", sent)
+
+
+async def job_prospect_email_dispatch() -> None:
+    """Claim and send Dealer Prospect drafts whose review window elapsed."""
+    from app.services.prospect_outreach import dispatch_due_drafts
+
+    sent = await dispatch_due_drafts()
+    if sent:
+        log.info("prospect_email_dispatch sent=%d", sent)
 
 
 async def job_archive_stale_booking_drafts() -> None:

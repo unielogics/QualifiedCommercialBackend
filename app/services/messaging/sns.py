@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import base64
 import logging
-from urllib.parse import urlparse
+import re
+from urllib.parse import ParseResult, urlparse
 
 import httpx
 from cryptography import x509
@@ -38,19 +39,44 @@ _SIGNED_FIELDS = {
 }
 
 _CERT_CACHE: dict[str, bytes] = {}
+_SNS_HOST_RE = re.compile(r"^sns\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?$")
+_SNS_CERT_PATH_RE = re.compile(r"^/SimpleNotificationService-[A-Za-z0-9_-]+\.pem$")
+
+
+def _sns_url(url: str) -> ParseResult | None:
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or not _SNS_HOST_RE.fullmatch(host)
+    ):
+        return None
+    return parsed
 
 
 def _cert_url_is_amazon(url: str) -> bool:
     """The certificate URL travels inside the unverified payload, so this is the
     check that stops an attacker signing their own notifications."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    if parsed.scheme != "https":
-        return False
-    host = (parsed.hostname or "").lower()
-    return host == "amazonaws.com" or host.endswith(".amazonaws.com")
+    parsed = _sns_url(url)
+    return bool(
+        parsed is not None
+        and not parsed.query
+        and not parsed.fragment
+        and _SNS_CERT_PATH_RE.fullmatch(parsed.path)
+    )
+
+
+def _subscribe_url_is_amazon(url: str) -> bool:
+    """Allow subscription confirmation only through the regional SNS API."""
+    parsed = _sns_url(url)
+    return bool(parsed is not None and not parsed.fragment)
 
 
 def _canonical(message: dict) -> bytes:
@@ -108,7 +134,7 @@ async def confirm_subscription(message: dict) -> bool:
     is Amazon's own.
     """
     url = str(message.get("SubscribeURL") or "")
-    if not _cert_url_is_amazon(url):
+    if not _subscribe_url_is_amazon(url):
         return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:

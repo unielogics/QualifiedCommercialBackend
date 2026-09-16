@@ -61,6 +61,9 @@ class Subject:
     dealer_id: Any = None
     loan_id: Any = None
     intake_id: Any = None
+    prospect_id: Any = None
+    contact_id: Any = None
+    prospect_draft_id: Any = None
 
     def as_columns(self) -> dict[str, Any]:
         return {
@@ -70,6 +73,9 @@ class Subject:
             "dealer_id": self.dealer_id,
             "loan_id": self.loan_id,
             "intake_id": self.intake_id,
+            "prospect_id": self.prospect_id,
+            "contact_id": self.contact_id,
+            "prospect_draft_id": self.prospect_draft_id,
         }
 
 
@@ -84,6 +90,9 @@ class Draft:
     cc: list[str] = field(default_factory=list)
     bcc: list[str] = field(default_factory=list)
     attachments: list[tuple] = field(default_factory=list)
+    from_email: str | None = None
+    from_name: str | None = None
+    reply_to: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     #: Credentials this message carries — the token or PIN the caller just
     #: minted. Declared secrets are removed by exact match, which is the only
@@ -132,6 +141,9 @@ async def record(
             template_key=(template_key or None),
             to_email=(draft.to[:320] if draft else None),
             to_phone=to_phone,
+            from_email=((draft.from_email or "")[:320] or None) if draft else None,
+            reply_to_email=((draft.reply_to or "")[:320] or None) if draft else None,
+            rfc_message_id=((draft.headers.get("Message-ID") or "")[:320] or None) if draft else None,
             cc_emails=cc,
             subject=row_subject,
             body_text_enc=text_enc,
@@ -223,7 +235,15 @@ async def deliver_email(
         else:
             from app.services.email import ses_client
 
-            if draft.cc or draft.bcc or draft.attachments or draft.body_html or draft.headers:
+            if (
+                draft.cc
+                or draft.bcc
+                or draft.attachments
+                or draft.body_html
+                or draft.from_email
+                or draft.reply_to
+                or draft.headers
+            ):
                 result = ses_client.send_raw_email(
                     to_emails=[to],
                     subject=draft.subject,
@@ -232,11 +252,19 @@ async def deliver_email(
                     cc_emails=list(draft.cc),
                     bcc_emails=list(draft.bcc),
                     attachments=list(draft.attachments),
+                    source_email=draft.from_email,
+                    source_name=draft.from_name,
+                    reply_to=draft.reply_to,
                     headers=dict(draft.headers),
                 )
             else:
                 result = ses_client.send_email(
-                    to_email=to, subject=draft.subject, body_text=draft.body_text
+                    to_email=to,
+                    subject=draft.subject,
+                    body_text=draft.body_text,
+                    source_email=draft.from_email,
+                    source_name=draft.from_name,
+                    reply_to=draft.reply_to,
                 )
             ok, message_id, detail = result.ok, result.message_id, result.detail
     except Exception as exc:  # noqa: BLE001
@@ -303,5 +331,21 @@ async def mark_delivery(
         row.failed_at = now
         if detail:
             row.detail = detail[:500]
+        if row.prospect_id is not None and row.to_email:
+            # Delivery feedback is a global safety signal, not merely a status
+            # badge on one send. Future prospect drafts must be blocked.
+            from app.services.prospect_outreach import set_suppression
+
+            await set_suppression(
+                db,
+                email=row.to_email,
+                reason="bounce" if status == "bounced" else "complaint",
+                source="ses_event",
+                details={
+                    "message_send_id": str(row.id),
+                    "prospect_id": str(row.prospect_id),
+                    "provider_message_id": provider_message_id,
+                },
+            )
     await db.flush()
     return True

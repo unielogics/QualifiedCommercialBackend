@@ -47,6 +47,12 @@ class MessageSend(Base):
 
     to_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     to_phone: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # Explicit sender identity matters for the audited Dealer Desk outbox.
+    # Historically SES_FROM_ADDRESS was implicit and therefore unrecoverable
+    # from the ledger after configuration changed.
+    from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    reply_to_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     cc_emails: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
@@ -89,6 +95,24 @@ class MessageSend(Base):
     dealer_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     loan_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     intake_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    prospect_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dealer_prospects.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    contact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_rep_contacts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    prospect_draft_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dealer_prospect_email_drafts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

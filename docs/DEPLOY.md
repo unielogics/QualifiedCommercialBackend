@@ -52,7 +52,15 @@ Production requirements:
   SES_REGION=us-east-1
   SES_CONFIGURATION_SET=my-first-configuration-set
   ```
-- IAM role policy `qcbackend-ses-qualifiedcommercial-send` allows only `ses:SendEmail` / `ses:SendRawEmail`, scoped to the `qualifiedcommercial.com` SES identity and locked with `ses:FromAddress = no-reply@qualifiedcommercial.com`.
+- Terraform injects the exact `SES_FEEDBACK_TOPIC_ARN` it provisions into the
+  runtime secret. The public SES webhook fails closed when that value is absent
+  or the signed SNS envelope names any other topic.
+- SES feedback is a two-phase apply: first apply with
+  `ses_feedback_subscription_enabled=false`, restart the backend to load the
+  injected topic ARN, then set the flag to `true`, apply again, and verify the
+  HTTPS subscription is confirmed. The event destination is created only in
+  phase two.
+- IAM role policy `qcbackend-ses-qualifiedcommercial-send` allows only `ses:SendEmail` / `ses:SendRawEmail`, scoped to the `qualifiedcommercial.com` SES identity and locked to the configured transactional and Dealer Desk sender addresses (`no-reply@qualifiedcommercial.com` and `dealers@qualifiedcommercial.com` by default).
 
 Do not grant broad `ses:*` or `Resource="*"` send permissions to the backend role. Read-only SES diagnostic permissions such as `ses:GetSendQuota` are not required by the app.
 
@@ -181,3 +189,10 @@ ssh ubuntu@54.157.222.116 "sudo /etc/cron.daily/qcbackend-refresh-env"
 - **Bedrock spend:** AWS Cost Explorer / Bedrock usage, filter on the Qualified Commercial account/project tags
 - **Cost watch:** AWS Cost Explorer, filter on tag `Project=qualified-commercial`
 - **Security:** Bedrock runs through the EC2 IAM role by default; rotate Clerk `sk_live_*` and any optional provider API keys every 90 days via Terraform.
+
+### Dealer Prospect Pipeline
+
+The outreach pipeline is disabled by default and has external mailbox,
+deliverability, collateral, and compliance prerequisites. Complete the
+[Dealer Prospect Pipeline operations checklist](DEALER_PROSPECT_PIPELINE.md)
+before setting `DEALER_PROSPECT_PIPELINE_ENABLED=true`.

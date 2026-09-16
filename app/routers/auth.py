@@ -65,6 +65,10 @@ class MeResponse(ORMModel):
     needs_acknowledgment: bool = False
     can_access_funding: bool
     can_access_audit: bool
+    # Stored pilot assignment and effective access after the global master
+    # switch, account state, role, and Field Desk eligibility are applied.
+    dealer_prospect_pipeline_assigned: bool = False
+    dealer_prospect_pipeline_enabled: bool = False
     # The consoles this login may sign in to — Funding, Field Desk, Audit —
     # with their URLs. The frontends render the switcher from it and show an
     # entry notice when their own key is absent. For operator roles it is
@@ -75,6 +79,8 @@ class MeResponse(ORMModel):
 
 @router.get("/me", response_model=MeResponse)
 async def me(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> MeResponse:
+    from app.dealer_os.services.prospects import pipeline_effective_enabled
+
     products = account_types(user)
     effective_account_types = sorted(
         {*console_keys(user), *(product.value for product in products)}
@@ -96,6 +102,10 @@ async def me(user: CurrentUser, db: AsyncSession = Depends(get_db)) -> MeRespons
         needs_acknowledgment=ack.needs_acknowledgment(user, latest),
         can_access_funding=has_product_access(user, ProductAccountType.FUNDING),
         can_access_audit=has_product_access(user, ProductAccountType.AUDIT),
+        dealer_prospect_pipeline_assigned=bool(
+            getattr(user, "dealer_prospect_pipeline_enabled", False)
+        ),
+        dealer_prospect_pipeline_enabled=pipeline_effective_enabled(user),
         consoles=[ConsoleLink(**c) for c in console_links(user)],
     )
 

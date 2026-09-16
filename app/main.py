@@ -11,6 +11,8 @@ from sqlalchemy import text
 from app.config import get_settings
 from app.db import SessionLocal
 from app.dealer_os import crm_router as dealer_os_crm_router
+from app.dealer_os import prospect_outreach_router as dealer_os_prospect_outreach_router
+from app.dealer_os import prospect_router as dealer_os_prospect_router
 from app.dealer_os import router as dealer_os_router
 from app.private_api_cache import PrivateApiCacheMiddleware
 from app.request_context import RequestContextMiddleware
@@ -204,6 +206,8 @@ api_prefix = "/api/v1"
 for r in [
     dealer_os_router.router,
     dealer_os_crm_router.router,
+    dealer_os_prospect_router.router,
+    dealer_os_prospect_outreach_router.router,
     meta.router,
     funding_programs.public_router,
     auth.router,

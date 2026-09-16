@@ -53,6 +53,9 @@ def send_email(
     subject: str,
     body_text: str,
     body_html: str | None = None,
+    source_email: str | None = None,
+    source_name: str | None = None,
+    reply_to: str | None = None,
 ) -> SesSendResult:
     """Send one email via SES. Never raises — returns SesSendResult so
     the caller (the re-engagement engine) can record the outcome and
@@ -61,7 +64,7 @@ def send_email(
     Returns ok=False with detail='not_configured' when SES has no
     From address yet (dormant)."""
     settings = get_settings()
-    from_addr = settings.ses_from_address.strip()
+    from_addr = (source_email or settings.ses_from_address).strip()
     if not from_addr:
         return SesSendResult(False, None, "not_configured")
     to = (to_email or "").strip()
@@ -76,13 +79,15 @@ def send_email(
         if body_html:
             body["Html"] = {"Data": body_html, "Charset": "UTF-8"}
         kwargs: dict = {
-            "Source": from_addr,
+            "Source": formataddr(((source_name or "").strip(), from_addr)) if source_name else from_addr,
             "Destination": {"ToAddresses": [to]},
             "Message": {
                 "Subject": {"Data": subject, "Charset": "UTF-8"},
                 "Body": body,
             },
         }
+        if reply_to and "@" in reply_to:
+            kwargs["ReplyToAddresses"] = [reply_to.strip()]
         cfg_set = settings.ses_configuration_set.strip()
         if cfg_set:
             kwargs["ConfigurationSetName"] = cfg_set
@@ -104,6 +109,9 @@ def send_raw_email(
     cc_emails: list[str] | None = None,
     bcc_emails: list[str] | None = None,
     attachments: list[tuple[str, bytes, str]] | None = None,
+    source_email: str | None = None,
+    source_name: str | None = None,
+    reply_to: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> SesSendResult:
     """Send a MIME email through SES.
@@ -117,7 +125,7 @@ def send_raw_email(
     the SES fallback path.
     """
     settings = get_settings()
-    from_addr = settings.ses_from_address.strip()
+    from_addr = (source_email or settings.ses_from_address).strip()
     if not from_addr:
         return SesSendResult(False, None, "not_configured")
     recipients = [email.strip() for email in to_emails if email and "@" in email]
@@ -130,11 +138,16 @@ def send_raw_email(
         import boto3  # local import — keeps module import cheap
 
         msg = EmailMessage()
-        msg["From"] = formataddr(("Qualified Commercial", from_addr))
+        msg["From"] = formataddr(((source_name or "Qualified Commercial").strip(), from_addr))
         msg["To"] = ", ".join(recipients)
         if cc:
             msg["Cc"] = ", ".join(cc)
         msg["Subject"] = subject
+        if reply_to and "@" in reply_to:
+            msg["Reply-To"] = reply_to.strip()
+        # Only the narrow header vocabulary needed for correlation and RFC
+        # 8058 one-click unsubscribe is accepted.  Values containing CR/LF are
+        # rejected to prevent header injection from any upstream caller.
         allowed_headers = {
             "message-id": "Message-ID",
             "x-qc-offer-correlation": "X-QC-Offer-Correlation",
@@ -160,7 +173,7 @@ def send_raw_email(
 
         client = boto3.client("ses", region_name=settings.ses_region or "us-east-1")
         kwargs: dict = {
-            "Source": from_addr,
+            "Source": formataddr(((source_name or "Qualified Commercial").strip(), from_addr)),
             # Envelope recipients include BCC; the MIME message has no Bcc header,
             # so blind recipients get the mail but stay hidden from To/Cc.
             "Destinations": recipients + cc + bcc,
