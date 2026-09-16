@@ -17,6 +17,84 @@ DraftPurpose = Literal[
 ]
 
 
+class ProspectOutreachPolicyPatch(BaseModel):
+    drafting_guidance: str | None = Field(default=None, max_length=3000)
+    additional_blocked_phrases: list[str] | None = Field(default=None, max_length=50)
+
+    @field_validator("drafting_guidance")
+    @classmethod
+    def strip_guidance(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @field_validator("additional_blocked_phrases")
+    @classmethod
+    def normalize_blocked_phrases(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            phrase = " ".join(str(raw or "").split())
+            if not phrase:
+                continue
+            if len(phrase) > 160:
+                raise ValueError("blocked phrases must be 160 characters or fewer")
+            key = phrase.casefold()
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(phrase)
+        return cleaned
+
+    @model_validator(mode="after")
+    def require_a_change(self) -> ProspectOutreachPolicyPatch:
+        if self.drafting_guidance is None and self.additional_blocked_phrases is None:
+            raise ValueError("Provide drafting guidance or blocked phrases to update")
+        return self
+
+
+class ProspectOutreachPolicyRead(BaseModel):
+    drafting_guidance: str
+    additional_blocked_phrases: list[str] = Field(default_factory=list)
+    locked_rules: list[str] = Field(default_factory=list)
+    review_seconds: int = Field(ge=1)
+    test_recipient_email: str
+    updated_at: datetime | None = None
+    updated_by_user_id: UUID | None = None
+
+
+class ProspectTestEmailRequest(BaseModel):
+    idempotency_key: UUID
+    purpose: DraftPurpose = "dealer_information"
+    sample_contact_name: str = Field(default="Alex Morgan", min_length=1, max_length=160)
+    sample_dealer_name: str = Field(default="Example Motors", min_length=1, max_length=180)
+    ai_instructions: str | None = Field(default=None, max_length=1500)
+    include_collateral: bool = True
+
+    @field_validator("sample_contact_name", "sample_dealer_name")
+    @classmethod
+    def strip_sample_names(cls, value: str) -> str:
+        clean = " ".join(value.split())
+        if not clean:
+            raise ValueError("sample names cannot be blank")
+        return clean
+
+    @field_validator("ai_instructions")
+    @classmethod
+    def strip_test_instructions(cls, value: str | None) -> str | None:
+        clean = (value or "").strip()
+        return clean or None
+
+
+class ProspectTestEmailResponse(BaseModel):
+    ok: bool
+    delivery_state: Literal["sent", "failed", "uncertain"]
+    to_email: str
+    subject: str
+    draft_source: Literal["ai", "fallback"]
+    attachment_names: list[str] = Field(default_factory=list)
+    detail: str = ""
+
+
 class ProspectEmailDraftCreate(BaseModel):
     idempotency_key: UUID = Field(default_factory=uuid4)
     purpose: DraftPurpose = "dealer_information"

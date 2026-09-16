@@ -28,6 +28,7 @@ from app.schemas.settings import (
 )
 from app.schemas.stored_signature import StoredSignatureRead
 from app.services import stored_signatures as stored_sigs
+from app.services.app_settings_lock import lock_app_settings
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -39,10 +40,26 @@ SIGNATURE_S3_KEY = "firm_settings/letterhead_signature.png"
 AI_MASTER_SWITCH_OWNER_EMAIL = "franco@qualifiedcommercial.com"
 
 
-async def _get_or_create(db: AsyncSession) -> AppSettings:
-    row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+async def _get_or_create(db: AsyncSession, *, lock: bool = False) -> AppSettings:
+    if lock:
+        await lock_app_settings(db)
+    statement = select(AppSettings).limit(1)
+    if lock:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
     if row is None:
-        row = AppSettings(id=uuid.uuid4(), singleton=True, data=AppSettingsData().model_dump(mode="json"))
+        if not lock:
+            # A SELECT ... FOR UPDATE cannot lock a missing row. Serialize the
+            # first insert and re-check after acquiring the transaction lock.
+            await lock_app_settings(db)
+            row = (
+                await db.execute(select(AppSettings).limit(1).with_for_update())
+            ).scalar_one_or_none()
+        if row is not None:
+            return row
+        row = AppSettings(
+            id=uuid.uuid4(), singleton=True, data=AppSettingsData().model_dump(mode="json")
+        )
         db.add(row)
         await db.flush()
         await db.refresh(row)
@@ -70,18 +87,25 @@ async def update_settings(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> AppSettingsRead:
-    row = await _get_or_create(db)
+    row = await _get_or_create(db, lock=True)
 
     # Section-level merge — replace whole sections that the caller sent,
     # leave the rest untouched. Keeps the wire format simple.
-    current = _coerce(row.data).model_dump(mode="json")
+    # Start from the raw JSON so admin-only/private settings owned by dedicated
+    # endpoints survive a normal public-settings update, then overlay the
+    # fully-defaulted public schema.
+    current = dict(row.data or {})
+    current.update(_coerce(row.data).model_dump(mode="json"))
     patch = payload.model_dump(mode="json", exclude_none=True)
     if not patch:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No settings sections supplied.")
     if "ai_spend" in patch and "master_enabled" in patch["ai_spend"]:
         current_master = bool(_coerce(row.data).ai_spend.master_enabled)
         next_master = bool(patch["ai_spend"]["master_enabled"])
-        if current_master != next_master and (user.email or "").lower() != AI_MASTER_SWITCH_OWNER_EMAIL:
+        if (
+            current_master != next_master
+            and (user.email or "").lower() != AI_MASTER_SWITCH_OWNER_EMAIL
+        ):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "Only franco@qualifiedcommercial.com can change the AI master switch.",
@@ -207,7 +231,9 @@ def _letterhead_signature_key(row: AppSettings) -> str | None:
 
 
 @router.get("/company-signature", response_model=CompanySignatureState)
-async def get_company_signature(_: CurrentUser, db: AsyncSession = Depends(get_db)) -> CompanySignatureState:
+async def get_company_signature(
+    _: CurrentUser, db: AsyncSession = Depends(get_db)
+) -> CompanySignatureState:
     row = await _get_or_create(db)
     sig = await stored_sigs.current(db, "qc", None)
     return _company_signature_state(sig, letterhead_present=bool(_letterhead_signature_key(row)))
@@ -232,8 +258,13 @@ async def adopt_company_signature(
     row = await _get_or_create(db)
     key = _letterhead_signature_key(row)
     sig = await stored_sigs.adopt_qc_signature(
-        db, admin=user, signature_s3_key=key, signature_sha256=None,
-        typed_name=payload.typed_name, title=payload.title, request=request,
+        db,
+        admin=user,
+        signature_s3_key=key,
+        signature_sha256=None,
+        typed_name=payload.typed_name,
+        title=payload.title,
+        request=request,
     )
     db.add(
         Activity(
@@ -241,8 +272,13 @@ async def adopt_company_signature(
             actor_id=user.id,
             actor_label=user.role.value if hasattr(user.role, "value") else str(user.role),
             kind="settings.company_signature_adopted",
-            summary=f"Adopted the company signature on file: {sig.typed_name}" + (f", {sig.title}" if sig.title else ""),
-            payload={"stored_signature_id": str(sig.id), "signature_s3_key": key, "signature_sha256": sig.signature_sha256},
+            summary=f"Adopted the company signature on file: {sig.typed_name}"
+            + (f", {sig.title}" if sig.title else ""),
+            payload={
+                "stored_signature_id": str(sig.id),
+                "signature_s3_key": key,
+                "signature_sha256": sig.signature_sha256,
+            },
         )
     )
     await db.flush()

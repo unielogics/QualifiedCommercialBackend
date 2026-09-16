@@ -288,6 +288,55 @@ def validate_action_config(value: dict[str, Any] | None) -> dict[str, Any]:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported email action")
     if config.get("workflow_action") not in _WORKFLOW_ACTIONS | {None}:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unsupported workflow action")
+
+    target = config.get("target_stage_key")
+    if target and strategy:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Choose either a fixed target stage or an automatic stage strategy, not both",
+        )
+
+    email_action = config.get("email_action")
+    if email_action and (config.get("set_do_not_contact") or config.get("suppress_email")):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "An outcome that blocks contact cannot also create an email draft",
+        )
+
+    if config.get("clear_follow_up") and (
+        config.get("requires_follow_up") or "follow_up_delay_hours" in config
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "An outcome cannot clear follow-up while requiring or scheduling a follow-up",
+        )
+    if config.get("requires_follow_up") and "follow_up_delay_hours" in config:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Choose either a required follow-up time or an automatic follow-up delay, not both",
+        )
+
+    if target == "converted":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Converted must use the AI Intake conversion workflow, not an outcome automation",
+        )
+    if target == "booked" and not config.get("requires_appointment"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Moving to Booked requires a linked appointment",
+        )
+    if target == "not_interested":
+        if not config.get("set_do_not_contact") or not config.get("clear_follow_up"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Moving to Not interested must mark do-not-contact and clear follow-up",
+            )
+        if email_action or config.get("workflow_action"):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Moving to Not interested cannot create an email or start a workflow",
+            )
     return config
 
 

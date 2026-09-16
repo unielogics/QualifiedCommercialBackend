@@ -19,11 +19,23 @@ from pypdf import PdfWriter
 
 from app.config import Settings
 from app.dealer_os import prospect_outreach_router
+from app.models.app_settings import AppSettings
 from app.models.dealer_prospect import DealerProspect, DealerProspectStageDefinition
 from app.models.notification import Notification
 from app.models.prospect_outreach import DealerProspectEmailDraft, DealerProspectEmailDraftAsset
 from app.models.user import User
-from app.schemas.prospect_outreach import ProspectDraftAction
+from app.routers import settings as settings_router
+from app.schemas.prospect_outreach import (
+    ProspectDraftAction,
+    ProspectOutreachPolicyPatch,
+    ProspectTestEmailRequest,
+)
+from app.schemas.settings import (
+    AppSettingsData,
+    AppSettingsRead,
+    AppSettingsUpdate,
+    ProspectOutreachAISettings,
+)
 from app.services import prospect_outreach as outreach
 from app.services.email import prospect_reply, ses_client
 
@@ -84,8 +96,170 @@ def test_interactive_draft_actions_require_the_reviewed_version():
         assert payload.default is inspect.Parameter.empty
 
 
+def test_outreach_policy_normalizes_guidance_and_blocked_phrase_duplicates():
+    policy = ProspectOutreachPolicyPatch(
+        drafting_guidance="  Warm and concise.\nUse a direct call to action.  ",
+        additional_blocked_phrases=["Instant approval", " instant approval ", "No paperwork"],
+    )
+
+    assert policy.drafting_guidance == "Warm and concise.\nUse a direct call to action."
+    assert policy.additional_blocked_phrases == ["Instant approval", "No paperwork"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("patch", "expected_guidance", "expected_phrases"),
+    [
+        (
+            {"drafting_guidance": "Use a direct call to action."},
+            "Use a direct call to action.",
+            ["No guarantees"],
+        ),
+        (
+            {"additional_blocked_phrases": ["Instant approval"]},
+            "Keep it warm.",
+            ["Instant approval"],
+        ),
+    ],
+)
+async def test_outreach_policy_patch_preserves_omitted_fields(
+    patch,
+    expected_guidance,
+    expected_phrases,
+    monkeypatch,
+):
+    row = AppSettings(
+        data={
+            "prospect_outreach_ai": {
+                "drafting_guidance": "Keep it warm.",
+                "additional_blocked_phrases": ["No guarantees"],
+            }
+        }
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)),
+        add=MagicMock(),
+        flush=AsyncMock(),
+    )
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="policy-admin",
+        email="admin@qualifiedcommercial.com",
+        name="Policy Admin",
+        role="super_admin",
+        account_status="active",
+    )
+
+    lock_settings = AsyncMock()
+    monkeypatch.setattr(outreach, "lock_app_settings", lock_settings)
+
+    policy = await outreach.update_outreach_ai_settings(
+        db,
+        actor=actor,
+        payload=ProspectOutreachPolicyPatch(**patch),
+    )
+
+    assert policy.drafting_guidance == expected_guidance
+    assert policy.additional_blocked_phrases == expected_phrases
+    assert row.data["prospect_outreach_ai"]["drafting_guidance"] == expected_guidance
+    assert row.data["prospect_outreach_ai"]["additional_blocked_phrases"] == expected_phrases
+    lock_settings.assert_awaited_once_with(db)
+
+
+def test_public_app_settings_serialization_does_not_expose_outreach_policy():
+    public = AppSettingsRead(
+        data=AppSettingsData.model_validate(
+            {
+                "prospect_outreach_ai": {
+                    "drafting_guidance": "Private drafting instructions",
+                    "additional_blocked_phrases": ["Private phrase"],
+                }
+            }
+        )
+    ).model_dump(mode="json")
+
+    assert "prospect_outreach_ai" not in public["data"]
+
+
+@pytest.mark.asyncio
+async def test_current_draft_validation_requests_locked_policy_read(monkeypatch):
+    db = SimpleNamespace()
+    load_policy = AsyncMock(return_value=ProspectOutreachAISettings())
+    monkeypatch.setattr(outreach, "load_outreach_ai_settings", load_policy)
+
+    await outreach.validate_current_draft_copy(
+        db,
+        subject="Dealer financing resources",
+        editable_body="Hi Alex, tell us what you are planning.",
+        catalog_snapshot=[],
+        lock_policy=True,
+    )
+
+    load_policy.assert_awaited_once_with(db, lock=True)
+
+
+@pytest.mark.asyncio
+async def test_generic_settings_patch_preserves_private_outreach_policy(monkeypatch):
+    private_policy = {
+        "drafting_guidance": "Private drafting instructions",
+        "additional_blocked_phrases": ["Private phrase"],
+        "updated_by_user_id": str(uuid.uuid4()),
+    }
+    row = AppSettings(data={"prospect_outreach_ai": private_policy})
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="settings-admin",
+        email="admin@qualifiedcommercial.com",
+        name="Settings Admin",
+        role="super_admin",
+        account_status="active",
+    )
+
+    lock_settings = AsyncMock()
+    monkeypatch.setattr(settings_router, "lock_app_settings", lock_settings)
+
+    response = await settings_router.update_settings(
+        AppSettingsUpdate(file_updates={"team_email_enabled": False}),
+        actor,
+        db,
+    )
+
+    assert row.data["prospect_outreach_ai"] == private_policy
+    assert row.data["file_updates"]["team_email_enabled"] is False
+    assert "prospect_outreach_ai" not in response.model_dump(mode="json")["data"]
+    lock_settings.assert_awaited_once_with(db)
+
+
+@pytest.mark.asyncio
+async def test_settings_first_row_creation_is_serialized_and_rechecked(monkeypatch):
+    no_row = SimpleNamespace(scalar_one_or_none=lambda: None)
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[no_row, no_row]),
+        add=MagicMock(),
+        flush=AsyncMock(),
+        refresh=AsyncMock(),
+    )
+    lock_settings = AsyncMock()
+    monkeypatch.setattr(settings_router, "lock_app_settings", lock_settings)
+
+    row = await settings_router._get_or_create(db)
+
+    assert isinstance(row, AppSettings)
+    assert db.execute.await_count == 2
+    lock_settings.assert_awaited_once_with(db)
+    db.add.assert_called_once_with(row)
+
+
 def test_outreach_migration_has_unique_columns_and_snapshot_scan_provenance(monkeypatch):
-    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / "0220_prospect_outreach.py"
+    path = (
+        Path(__file__).resolve().parents[2] / "alembic" / "versions" / "0220_prospect_outreach.py"
+    )
     spec = importlib.util.spec_from_file_location("migration_0220_prospect_outreach", path)
     assert spec is not None and spec.loader is not None
     migration = importlib.util.module_from_spec(spec)
@@ -114,6 +288,11 @@ async def test_edit_stops_durable_countdown_and_locked_footer_survives(monkeypat
     row = _draft(version=3)
     db = SimpleNamespace(flush=AsyncMock())
     monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
 
     async def load(*_args, **_kwargs):
         return row
@@ -223,6 +402,16 @@ async def test_suppression_is_rechecked_immediately_before_claim(monkeypatch):
     row = _draft(status="pending_review", version=2)
     db = SimpleNamespace(commit=AsyncMock())
     monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
 
     async def load(*_args, **_kwargs):
         return row
@@ -239,6 +428,93 @@ async def test_suppression_is_rechecked_immediately_before_claim(monkeypatch):
     assert result.failure_code == "email_suppressed"
     assert "complaint" in result.failure_detail
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_suppression_check_follows_prospect_row_lock(monkeypatch):
+    row = _draft(status="pending_review", version=2)
+    prospect = DealerProspect(
+        id=row.prospect_id,
+        owner_user_id=row.created_by_user_id,
+        company_id=uuid.uuid4(),
+        primary_contact_id=uuid.uuid4(),
+        stage_definition_id=uuid.uuid4(),
+        email_normalized=row.recipient_email,
+        phone_normalized="+12025550100",
+        dealer_name_normalized="dealer",
+        do_not_contact=False,
+        version=1,
+    )
+    actor = User(
+        id=row.created_by_user_id,
+        clerk_id="dispatch-actor",
+        email="rep@qualifiedcommercial.com",
+        name="Rep",
+        role="field_rep",
+        account_status="active",
+    )
+    events: list[str] = []
+
+    async def get(model, _key, **kwargs):
+        if model is DealerProspect:
+            assert kwargs.get("with_for_update") is True
+            events.append("prospect_lock")
+            return prospect
+        if model is User:
+            return actor
+        return None
+
+    suppression_results = iter([None, SimpleNamespace(reason="complaint")])
+
+    async def check_suppression(*_args, **_kwargs):
+        events.append("suppression_check")
+        return next(suppression_results)
+
+    assets_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    db = SimpleNamespace(
+        get=get,
+        execute=AsyncMock(return_value=assets_result),
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(outreach, "load_draft", AsyncMock(side_effect=[row, row]))
+    monkeypatch.setattr(outreach, "validate_current_draft_copy", AsyncMock())
+    monkeypatch.setattr(outreach, "is_suppressed", check_suppression)
+    monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(
+            dealer_prospect_pipeline_enabled=True,
+            prospect_email_max_attachment_bytes=7_000_000,
+        ),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "prospect_identity",
+        AsyncMock(
+            return_value=outreach.ProspectIdentity(
+                contact_id=prospect.primary_contact_id,
+                contact_name="Alex",
+                dealer_name="Dealer",
+                email=row.recipient_email,
+                owner_user_id=prospect.owner_user_id,
+            )
+        ),
+    )
+    from app.dealer_os.services import prospects as prospect_service
+
+    monkeypatch.setattr(prospect_service, "load_visible_prospect", AsyncMock(return_value=prospect))
+
+    result = await outreach.dispatch_draft(db, row.id, automatic=True)
+
+    assert result.status == "blocked"
+    assert result.failure_code == "email_suppressed"
+    assert events == [
+        "suppression_check",
+        "prospect_lock",
+        "prospect_lock",
+        "suppression_check",
+    ]
 
 
 @pytest.mark.asyncio
@@ -270,6 +546,16 @@ async def test_creator_access_is_rechecked_before_claim(monkeypatch):
 
     db = SimpleNamespace(get=get, commit=AsyncMock())
     monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
 
     async def load(*_args, **_kwargs):
         return row
@@ -337,6 +623,8 @@ def test_sba_microloan_and_unapproved_financial_claims_are_rejected():
         ("Review our offer at https://example.com.", "contains a link"),
         ("Your approval is ready.", "approval or attachment"),
         ("See the attached approval letter.", "approval or attachment"),
+        ("We can have you funded within 24 hours.", "funding timeline"),
+        ("Let us prequalify your dealership today.", "unsupported claim"),
         ("We offer cryptocurrency loans.", "unapproved product language"),
         ("We offer invoice factoring.", "unapproved product language"),
         ("Qualified Commercial can provide a quantum liquidity plan.", "capability language"),
@@ -365,6 +653,85 @@ def test_program_section_is_rendered_only_from_the_versioned_catalog():
     assert "invoice factoring" not in rendered.lower()
 
 
+def test_program_section_supports_localized_catalog_copy():
+    rendered = outreach._with_approved_program_section(
+        "Hi Alex,",
+        [
+            {
+                "program_key": "sba_7a",
+                "version": 2,
+                "copy": {"en": {"name": "SBA 7(a)"}, "es": {"name": "SBA 7(a)"}},
+            }
+        ],
+    )
+
+    assert "- SBA 7(a)" in rendered
+
+
+def test_firm_blocked_phrases_are_normalized_across_case_punctuation_and_unicode():
+    with pytest.raises(ValueError, match="firm-blocked phrase"):
+        outreach.validate_generated_copy(
+            subject="A special invitation",
+            body="This is our BEST—EVER approach for your dealership.",
+            catalog_snapshot=[],
+            additional_blocked_phrases=["best ever"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_manual_edit_cannot_bypass_current_firm_policy(monkeypatch):
+    row = _draft(status="editing", version=3)
+    db = SimpleNamespace(flush=AsyncMock())
+    monkeypatch.setattr(outreach, "load_draft", AsyncMock(return_value=row))
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(
+            return_value=ProspectOutreachAISettings(additional_blocked_phrases=["instant decision"])
+        ),
+    )
+
+    with pytest.raises(outreach.OutreachBlocked) as blocked:
+        await outreach.edit_draft(
+            db,
+            row.id,
+            expected_version=3,
+            subject=row.subject,
+            body="Hi Alex, we can provide an instant-decision today.",
+        )
+
+    assert blocked.value.code == "copy_guardrail_violation"
+    assert row.editable_body == "Hi Alex,\n\nHere is the information we discussed."
+    db.flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_policy_blocks_an_already_pending_draft_at_dispatch(monkeypatch):
+    row = _draft(status="pending_review", version=2)
+    row.editable_body = "Hi Alex, ask about our special phrase."
+    db = SimpleNamespace(commit=AsyncMock())
+    monkeypatch.setattr(outreach, "load_draft", AsyncMock(return_value=row))
+    monkeypatch.setattr(outreach, "sync_draft_notifications", AsyncMock())
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(dealer_prospect_pipeline_enabled=True),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(
+            return_value=ProspectOutreachAISettings(additional_blocked_phrases=["special phrase"])
+        ),
+    )
+
+    result = await outreach.dispatch_draft(db, row.id, automatic=True)
+
+    assert result.status == "blocked"
+    assert result.failure_code == "copy_guardrail_violation"
+    db.commit.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_nova_micro_uses_bedrock_converse_and_records_usage(monkeypatch):
     settings = SimpleNamespace(
@@ -374,6 +741,11 @@ async def test_nova_micro_uses_bedrock_converse_and_records_usage(monkeypatch):
         bedrock_runtime_region="us-east-1",
     )
     monkeypatch.setattr(outreach, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
     response = {
         "output": {
             "message": {
@@ -424,6 +796,197 @@ async def test_nova_micro_uses_bedrock_converse_and_records_usage(monkeypatch):
     runtime.converse.assert_called_once()
     assert runtime.converse.call_args.kwargs["modelId"] == "amazon.nova-micro-v1:0"
     record.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_result", "expected_state", "expected_ledger_status"),
+    [
+        (
+            SimpleNamespace(ok=True, detail="accepted", message_id="ses-message-id"),
+            "sent",
+            "sent",
+        ),
+        (
+            SimpleNamespace(ok=False, detail="send_failed: timeout", message_id=None),
+            "uncertain",
+            "queued",
+        ),
+    ],
+)
+async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
+    monkeypatch, provider_result, expected_state, expected_ledger_status
+):
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="test-admin",
+        email="admin@qualifiedcommercial.com",
+        name="Admin User",
+        role="super_admin",
+        account_status="active",
+    )
+
+    class CountResult:
+        @staticmethod
+        def scalar_one():
+            return 0
+
+    added = []
+    empty_result = SimpleNamespace(scalar_one_or_none=lambda: None)
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[empty_result, CountResult()]),
+        add=added.append,
+        commit=AsyncMock(),
+    )
+    monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
+    monkeypatch.setattr(outreach, "is_suppressed", AsyncMock(return_value=None))
+    monkeypatch.setattr(outreach, "_active_catalog_snapshot", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        outreach,
+        "_compose_with_nova",
+        AsyncMock(
+            return_value=outreach.ComposedCopy(
+                subject="Information for Example Motors",
+                body="Hi Alex,\n\nReply with what you are planning and we can discuss next steps.",
+                source="fallback",
+            )
+        ),
+    )
+    monkeypatch.setattr(outreach, "_active_collateral", AsyncMock(return_value=[]))
+    monkeypatch.setattr(outreach, "_load_signature", AsyncMock(return_value=["Admin User"]))
+    monkeypatch.setattr(
+        outreach,
+        "load_outreach_ai_settings",
+        AsyncMock(return_value=ProspectOutreachAISettings()),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(
+            prospect_email_max_attachment_bytes=7_000_000,
+            prospect_reply_to_email="support@qualifiedcommercial.com",
+            prospect_alternate_contact_email="franco@qualifiedcommercial.com",
+            prospect_mailing_address="14 53rd St #408N, Brooklyn, NY 11232",
+            prospect_from_email="no-reply@qualifiedcommercial.com",
+            prospect_from_name="Qualified Commercial Dealer Desk",
+        ),
+    )
+
+    from app.services.messaging import outbox
+
+    ledger = SimpleNamespace(
+        provider="",
+        provider_message_id=None,
+        status="queued",
+        detail="",
+        failed_at=None,
+    )
+    record = AsyncMock(return_value=ledger)
+    monkeypatch.setattr(outbox, "record", record)
+    send = MagicMock(return_value=provider_result)
+    monkeypatch.setattr(ses_client, "send_raw_email", send)
+    idempotency_key = uuid.uuid4()
+
+    result = await outreach.send_test_email(
+        db,
+        actor=actor,
+        payload=ProspectTestEmailRequest(
+            idempotency_key=idempotency_key,
+            purpose="dealer_information",
+            sample_contact_name="Alex",
+            sample_dealer_name="Example Motors",
+            include_collateral=False,
+        ),
+    )
+
+    assert result.ok is provider_result.ok
+    assert result.delivery_state == expected_state
+    assert result.to_email == actor.email
+    assert result.subject.startswith("[TEST]")
+    draft = record.await_args.kwargs["draft"]
+    assert draft.to == actor.email
+    assert draft.reply_to == "support@qualifiedcommercial.com"
+    assert "+" not in draft.reply_to
+    assert draft.headers["Message-ID"] == outreach._test_email_message_id(actor.id, idempotency_key)
+    assert "List-Unsubscribe" not in draft.headers
+    assert "TEST EMAIL" in draft.body_text
+    assert "prospect-email-unsubscribe/" not in draft.body_text
+    assert "one-click unsubscribe" in draft.body_text
+    assert record.await_args.kwargs["context"] == "dealer_prospect_test"
+    send.assert_called_once()
+    assert send.call_args.kwargs["to_emails"] == [actor.email]
+    assert ledger.status == expected_ledger_status
+    assert ledger.provider_message_id == provider_result.message_id
+    if expected_state == "uncertain":
+        assert "No automatic retry" in result.detail
+        assert ledger.failed_at is None
+    assert not any(isinstance(item, DealerProspectEmailDraft) for item in added)
+    assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_test_email_idempotency_replays_sent_ledger_without_resending(monkeypatch):
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="test-admin-retry",
+        email="admin@qualifiedcommercial.com",
+        name="Admin User",
+        role="super_admin",
+        account_status="active",
+    )
+    key = uuid.uuid4()
+    existing = SimpleNamespace(
+        status="sent",
+        template_key="prospect_test_dealer_information_ai",
+        to_email=actor.email,
+        subject="[TEST] Existing delivery",
+        attachment_names=["dealer-guide.pdf"],
+        detail="accepted",
+    )
+    result = SimpleNamespace(scalar_one_or_none=lambda: existing)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+    monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
+    suppressed = AsyncMock()
+    monkeypatch.setattr(outreach, "is_suppressed", suppressed)
+    send = MagicMock()
+    monkeypatch.setattr(ses_client, "send_raw_email", send)
+
+    response = await outreach.send_test_email(
+        db,
+        actor=actor,
+        payload=ProspectTestEmailRequest(
+            idempotency_key=key,
+            purpose="dealer_information",
+            sample_contact_name="Alex",
+            sample_dealer_name="Example Motors",
+            include_collateral=False,
+        ),
+    )
+
+    assert response.ok is True
+    assert response.delivery_state == "sent"
+    assert response.subject == "[TEST] Existing delivery"
+    assert response.draft_source == "ai"
+    assert response.attachment_names == ["dealer-guide.pdf"]
+    suppressed.assert_not_awaited()
+    send.assert_not_called()
+
+
+def test_ambiguous_test_email_ledger_is_never_resent():
+    queued = SimpleNamespace(
+        status="queued",
+        template_key="prospect_test_missed_call_fallback",
+        to_email="admin@qualifiedcommercial.com",
+        subject="[TEST] Missed call",
+        attachment_names=[],
+        detail="",
+    )
+
+    response = outreach._test_response_from_ledger(queued)
+
+    assert response.ok is False
+    assert response.delivery_state == "uncertain"
+    assert "No duplicate was sent" in response.detail
 
 
 def test_pdf_validation_rejects_encryption_and_active_content(monkeypatch):
@@ -872,6 +1435,8 @@ def test_rollout_gate_keeps_public_links_and_collateral_setup_available(monkeypa
         "/api/v1/dealer-os/prospect-email-bundles/already-issued-token",
         "/api/v1/dealer-os/marketing-collateral",
         f"/api/v1/dealer-os/marketing-collateral/{uuid.uuid4()}/approve",
+        "/api/v1/dealer-os/prospect-outreach/policy",
+        "/api/v1/dealer-os/prospect-outreach/test-email",
     ):
         prospect_outreach_router._require_outreach_enabled(
             SimpleNamespace(url=SimpleNamespace(path=path))
@@ -901,3 +1466,47 @@ async def test_collateral_setup_remains_config_admin_only(monkeypatch):
     assert exc.value.status_code == 403
     denied.assert_called_once_with(user)
     db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_get_only_validates_and_renders_confirmation(monkeypatch):
+    validate = AsyncMock(return_value=_draft())
+    mutate = AsyncMock()
+    monkeypatch.setattr(prospect_outreach_router, "_get_unsubscribe_draft", validate)
+    monkeypatch.setattr(prospect_outreach_router, "_apply_unsubscribe", mutate)
+    db = SimpleNamespace()
+
+    response = await prospect_outreach_router.unsubscribe_prospect_email_get(
+        token="issued-token",
+        db=db,
+    )
+
+    validate.assert_awaited_once_with(db, "issued-token", lock=False)
+    mutate.assert_not_awaited()
+    assert response.status_code == 200
+    assert b"Confirm unsubscribe" in response.body
+    assert b'<form method="post">' in response.body
+    assert b"You are unsubscribed" not in response.body
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_post_applies_suppression_and_returns_confirmation(monkeypatch):
+    mutate = AsyncMock(return_value=_draft())
+    monkeypatch.setattr(prospect_outreach_router, "_apply_unsubscribe", mutate)
+    db = SimpleNamespace()
+
+    response = await prospect_outreach_router.unsubscribe_prospect_email_post(
+        token="issued-token",
+        db=db,
+    )
+
+    mutate.assert_awaited_once_with(db, "issued-token")
+    assert response.status_code == 200
+    assert b"You are unsubscribed" in response.body
+    assert b"suppression list" in response.body
+    assert b"<form" not in response.body
+    assert set(
+        inspect.signature(prospect_outreach_router.unsubscribe_prospect_email_post).parameters
+    ) == {"token", "db"}

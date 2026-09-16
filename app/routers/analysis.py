@@ -43,6 +43,7 @@ from app.schemas.prequal import PrequalRequestRead
 from app.schemas.settings import AppSettingsData
 from app.scoping import regional_manager_broker_ids_subquery, scope_client_query, scope_loan_query
 from app.services.analysis_reports import generate_analysis_report
+from app.services.app_settings_lock import lock_app_settings
 from app.services.property_intelligence import (
     address_autocomplete,
     address_resolve,
@@ -72,9 +73,13 @@ def _enforce_property_lookup_access(user, payload: PropertyIntelligenceLookupReq
     if _is_operator(user):
         return
     if user.role not in {Role.BROKER, Role.CLIENT}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Property intelligence is not available to this role")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Property intelligence is not available to this role"
+        )
     if payload.force_refresh:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only operators can force-refresh property intelligence")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only operators can force-refresh property intelligence"
+        )
     if not _has_property_intelligence_scope(payload):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -102,7 +107,13 @@ def _provider_switch_ready(
 
 def _request_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
-    return (forwarded.split(",", 1)[0].strip() if forwarded else request.client.host if request.client else "?")[:80]
+    return (
+        forwarded.split(",", 1)[0].strip()
+        if forwarded
+        else request.client.host
+        if request.client
+        else "?"
+    )[:80]
 
 
 def _public_address_throttle(store: dict[str, deque[float]], request: Request, limit: int) -> None:
@@ -112,7 +123,9 @@ def _public_address_throttle(store: dict[str, deque[float]], request: Request, l
     while rows and now - rows[0] >= 60:
         rows.popleft()
     if len(rows) >= limit:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many address searches. Please wait a minute.")
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, "Too many address searches. Please wait a minute."
+        )
     rows.append(now)
 
 
@@ -151,13 +164,20 @@ def _parse_date(value: str | date | None) -> date | None:
     try:
         return date.fromisoformat(str(value)[:10])
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "expected_closing_date must be YYYY-MM-DD") from exc
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "expected_closing_date must be YYYY-MM-DD"
+        ) from exc
 
 
-async def _get_app_settings(db: AsyncSession) -> AppSettings:
-    row = (await db.execute(select(AppSettings).limit(1))).scalar_one_or_none()
+async def _get_app_settings(db: AsyncSession, *, lock: bool = False) -> AppSettings:
+    statement = select(AppSettings).limit(1)
+    if lock:
+        statement = statement.with_for_update()
+    row = (await db.execute(statement)).scalar_one_or_none()
     if row is None:
-        row = AppSettings(id=uuid.uuid4(), singleton=True, data=AppSettingsData().model_dump(mode="json"))
+        row = AppSettings(
+            id=uuid.uuid4(), singleton=True, data=AppSettingsData().model_dump(mode="json")
+        )
         db.add(row)
         await db.flush()
         await db.refresh(row)
@@ -195,7 +215,12 @@ async def _require_deal_access(db: AsyncSession, user, deal_id: UUID | None) -> 
     client = await db.get(Client, deal.client_id)
     if user.role == Role.CLIENT and user.client is not None and deal.client_id == user.client.id:
         return deal
-    if user.role == Role.BROKER and user.broker is not None and client is not None and client.broker_id == user.broker.id:
+    if (
+        user.role == Role.BROKER
+        and user.broker is not None
+        and client is not None
+        and client.broker_id == user.broker.id
+    ):
         return deal
     if user.role == Role.REGIONAL_MANAGER and client is not None:
         visible = (
@@ -239,7 +264,9 @@ def _scope_analysis_query(user, stmt):
     if user.role == Role.CLIENT:
         if user.client is None:
             return stmt.where(False)
-        return stmt.where(AnalysisRun.client_id == user.client.id, AnalysisRun.shared_at.is_not(None))
+        return stmt.where(
+            AnalysisRun.client_id == user.client.id, AnalysisRun.shared_at.is_not(None)
+        )
     if user.role == Role.BROKER:
         if user.broker is None:
             return stmt.where(False)
@@ -296,11 +323,21 @@ async def _validate_links(
     snapshot = await _require_snapshot_access(db, user, property_snapshot_id)
     if client is not None:
         if loan is not None and loan.client_id != client.id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Loan does not belong to linked client")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Loan does not belong to linked client"
+            )
         if deal is not None and deal.client_id != client.id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Deal does not belong to linked client")
-        if snapshot is not None and snapshot.client_id is not None and snapshot.client_id != client.id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Snapshot does not belong to linked client")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Deal does not belong to linked client"
+            )
+        if (
+            snapshot is not None
+            and snapshot.client_id is not None
+            and snapshot.client_id != client.id
+        ):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Snapshot does not belong to linked client"
+            )
     return client, deal, loan, snapshot
 
 
@@ -313,7 +350,9 @@ def _default_title(product: str, address: str | None) -> str:
     return f"{label} - {address}"[:180] if address else label
 
 
-async def _refresh_report(db: AsyncSession, user, row: AnalysisRun, snapshot: PropertyIntelligenceSnapshot | None) -> None:
+async def _refresh_report(
+    db: AsyncSession, user, row: AnalysisRun, snapshot: PropertyIntelligenceSnapshot | None
+) -> None:
     ai_report, client_report = await generate_analysis_report(
         db,
         product=row.product,
@@ -349,12 +388,23 @@ def _prequal_payload_from_run(row: AnalysisRun) -> dict[str, Any]:
     )
     arv = _float_from(inputs.get("arv"), inputs.get("arv_estimate"), calc.get("arv"))
     if product == "fix_flip":
-        purchase = _float_from(inputs.get("brv"), inputs.get("purchase_price"), inputs.get("as_is_value"), purchase)
-        requested = _float_from(inputs.get("requested_loan_amount"), inputs.get("loan_amount"), calc.get("total_loan_amount"), requested)
+        purchase = _float_from(
+            inputs.get("brv"), inputs.get("purchase_price"), inputs.get("as_is_value"), purchase
+        )
+        requested = _float_from(
+            inputs.get("requested_loan_amount"),
+            inputs.get("loan_amount"),
+            calc.get("total_loan_amount"),
+            requested,
+        )
     if not purchase or purchase <= 0:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Analysis run is missing a purchase/value number")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Analysis run is missing a purchase/value number"
+        )
     if not requested or requested <= 0:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Analysis run is missing a requested loan amount")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "Analysis run is missing a requested loan amount"
+        )
     address = _non_empty_text(
         row.target_property_address,
         inputs.get("target_property_address"),
@@ -362,7 +412,10 @@ def _prequal_payload_from_run(row: AnalysisRun) -> dict[str, Any]:
         inputs.get("property_address"),
     )
     if not address:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Analysis run is missing a target property address")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Analysis run is missing a target property address",
+        )
     notes = _non_empty_text(
         report.get("narrative"),
         inputs.get("notes"),
@@ -370,9 +423,13 @@ def _prequal_payload_from_run(row: AnalysisRun) -> dict[str, Any]:
     )
     sow_items = inputs.get("sow_items")
     if product == "fix_flip" and not sow_items:
-        rehab = _float_from(inputs.get("rehab_cost"), inputs.get("rehab_budget"), calc.get("total_construction"))
+        rehab = _float_from(
+            inputs.get("rehab_cost"), inputs.get("rehab_budget"), calc.get("total_construction")
+        )
         if rehab and rehab > 0:
-            sow_items = [{"category": "Rehab", "description": "Estimated rehab budget", "total_usd": rehab}]
+            sow_items = [
+                {"category": "Rehab", "description": "Estimated rehab budget", "total_usd": rehab}
+            ]
     return {
         "target_property_address": address,
         "purchase_price": purchase,
@@ -384,17 +441,28 @@ def _prequal_payload_from_run(row: AnalysisRun) -> dict[str, Any]:
     }
 
 
-def _manual_credit_from_run(row: AnalysisRun, explicit: dict[str, Any] | None) -> dict[str, Any] | None:
+def _manual_credit_from_run(
+    row: AnalysisRun, explicit: dict[str, Any] | None
+) -> dict[str, Any] | None:
     if explicit:
         return explicit
     inputs = row.inputs or {}
-    fico = _float_from(inputs.get("fico"), inputs.get("borrower_fico"), inputs.get("credit_score"), inputs.get("effective_fico"))
+    fico = _float_from(
+        inputs.get("fico"),
+        inputs.get("borrower_fico"),
+        inputs.get("credit_score"),
+        inputs.get("effective_fico"),
+    )
     if fico is None:
         return None
     return {
         "fico": int(fico),
-        "property_count": int(_float_from(inputs.get("property_count"), inputs.get("owned_property_count")) or 0),
-        "has_year_of_ownership": bool(inputs.get("has_year_of_ownership") or inputs.get("year_of_ownership")),
+        "property_count": int(
+            _float_from(inputs.get("property_count"), inputs.get("owned_property_count")) or 0
+        ),
+        "has_year_of_ownership": bool(
+            inputs.get("has_year_of_ownership") or inputs.get("year_of_ownership")
+        ),
     }
 
 
@@ -405,7 +473,9 @@ async def get_provider_settings(
 ) -> ProviderSettingsRead:
     if user.role not in {Role.SUPER_ADMIN, Role.LOAN_EXEC}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
-    return ProviderSettingsRead(**await provider_settings_status(db, include_secret_values=user.role == Role.SUPER_ADMIN))
+    return ProviderSettingsRead(
+        **await provider_settings_status(db, include_secret_values=user.role == Role.SUPER_ADMIN)
+    )
 
 
 @property_router.patch(
@@ -432,20 +502,25 @@ async def update_provider_settings(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Address provider credentials are managed in the backend environment.",
         )
-    for key in (
-        "rentcast_api_key",
-    ):
+    for key in ("rentcast_api_key",):
         value = data.pop(key, None)
         if isinstance(value, str) and value.strip():
             await set_secret(db, key=key, value=value.strip(), updated_by_id=user.id)
     for key in environment_managed:
         data.pop(key, None)
 
+    if data:
+        await lock_app_settings(db)
+
     requested_provider = data.get("address_provider")
     if requested_provider is not None:
-        settings_row = await _get_app_settings(db)
-        current_settings = AppSettingsData.model_validate(settings_row.data or {}).model_dump(mode="json")
-        current_provider = (current_settings.get("property_intelligence") or {}).get("address_provider", "google")
+        settings_row = await _get_app_settings(db, lock=True)
+        current_settings = AppSettingsData.model_validate(settings_row.data or {}).model_dump(
+            mode="json"
+        )
+        current_provider = (current_settings.get("property_intelligence") or {}).get(
+            "address_provider", "google"
+        )
 
         # Re-saving the current provider is allowed so unrelated settings can
         # be updated even if deployment configuration is temporarily missing.
@@ -461,12 +536,18 @@ async def update_provider_settings(
             )
 
     if data:
-        row = await _get_app_settings(db)
-        current = AppSettingsData.model_validate(row.data or {}).model_dump(mode="json")
+        row = await _get_app_settings(db, lock=True)
+        # Preserve private settings owned by dedicated endpoints while
+        # overlaying the fully-defaulted public settings schema.
+        current = dict(row.data or {})
+        current.update(AppSettingsData.model_validate(row.data or {}).model_dump(mode="json"))
         pi = current.get("property_intelligence") or {}
         if "property_analysis_ai_enabled" in data:
             pi["ai_report_enabled"] = bool(data["property_analysis_ai_enabled"])
-        if "property_intelligence_cache_ttl_hours" in data and data["property_intelligence_cache_ttl_hours"] is not None:
+        if (
+            "property_intelligence_cache_ttl_hours" in data
+            and data["property_intelligence_cache_ttl_hours"] is not None
+        ):
             pi["cache_ttl_hours"] = int(data["property_intelligence_cache_ttl_hours"])
         if "address_provider" in data and data["address_provider"] is not None:
             pi["address_provider"] = data["address_provider"]
@@ -479,7 +560,10 @@ async def update_provider_settings(
                 actor_label=_actor_label(user),
                 kind="settings.updated",
                 summary="Updated property intelligence provider settings",
-                payload={"property_intelligence": pi, "provider_secret_keys": list(payload.model_fields_set)},
+                payload={
+                    "property_intelligence": pi,
+                    "provider_secret_keys": list(payload.model_fields_set),
+                },
             )
         )
     await db.flush()
@@ -519,7 +603,11 @@ async def resolve_address(
     if not payload.place_id and not payload.address:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "place_id or address is required")
     readiness = await provider_settings_status(db)
-    requested_provider = "geoapify" if (payload.place_id or "").startswith("geoapify:") else readiness["address_provider"]
+    requested_provider = (
+        "geoapify"
+        if (payload.place_id or "").startswith("geoapify:")
+        else readiness["address_provider"]
+    )
     requested_ready = (
         readiness["geoapify_configured"]
         if requested_provider == "geoapify"
@@ -573,8 +661,14 @@ async def static_address_map(
             zoom=zoom,
         )
     except Exception as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address map is temporarily unavailable.") from exc
-    return Response(content=content, media_type=content_type, headers={"Cache-Control": "private, max-age=86400"})
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Address map is temporarily unavailable."
+        ) from exc
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 @public_address_router.post("/autocomplete", response_model=list[AddressSuggestion])
@@ -586,7 +680,9 @@ async def public_autocomplete_address(
     _public_address_throttle(_PUBLIC_AUTOCOMPLETE, request, 60)
     readiness = await provider_settings_status(db)
     if not readiness["address_provider_ready"]:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address search is not configured.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Address search is not configured."
+        )
     _provider, rows = await address_autocomplete(db, payload.input, payload.session_token)
     return [AddressSuggestion(**row) for row in rows]
 
@@ -602,7 +698,9 @@ async def public_resolve_address(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "place_id or address is required")
     readiness = await provider_settings_status(db)
     if not readiness["address_provider_ready"]:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Address resolution is not configured.")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Address resolution is not configured."
+        )
     provider, address, provider_place = await address_resolve(
         db,
         place_id=payload.place_id,
@@ -650,7 +748,15 @@ async def create_analysis_run(
         loan_id=payload.loan_id,
         property_snapshot_id=payload.property_snapshot_id,
     )
-    client_id = client.id if client is not None else loan.client_id if loan is not None else deal.client_id if deal is not None else None
+    client_id = (
+        client.id
+        if client is not None
+        else loan.client_id
+        if loan is not None
+        else deal.client_id
+        if deal is not None
+        else None
+    )
     address = _non_empty_text(
         payload.target_property_address,
         (snapshot.address or {}).get("full") if snapshot else None,
@@ -683,7 +789,11 @@ async def create_analysis_run(
             actor_label=_actor_label(user),
             kind="analysis.created",
             summary=f"Saved {row.product.replace('_', ' ')} analysis",
-            payload={"analysis_run_id": str(row.id), "product": row.product, "tool_source": row.tool_source},
+            payload={
+                "analysis_run_id": str(row.id),
+                "product": row.product,
+                "tool_source": row.tool_source,
+            },
         )
     )
     await db.flush()
@@ -715,7 +825,11 @@ async def list_analysis_runs(
         stmt = stmt.where(AnalysisRun.tool_source == tool_source)
     if updated_since is not None:
         stmt = stmt.where(AnalysisRun.updated_at >= updated_since)
-    rows = (await db.execute(stmt.order_by(AnalysisRun.updated_at.desc()).limit(limit))).scalars().all()
+    rows = (
+        (await db.execute(stmt.order_by(AnalysisRun.updated_at.desc()).limit(limit)))
+        .scalars()
+        .all()
+    )
     return [_to_read(r) for r in rows]
 
 
@@ -786,7 +900,10 @@ async def share_analysis_to_client(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "This role cannot share analysis runs")
     row = await _load_analysis_run(db, user, run_id)
     if row.client_id is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Link an owned client before sharing this analysis")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Link an owned client before sharing this analysis",
+        )
     await _require_client_access(db, user, row.client_id)
     if row.sanitized_client_report is None:
         snapshot = await _require_snapshot_access(db, user, row.property_snapshot_id)
@@ -810,7 +927,11 @@ async def share_analysis_to_client(
     return ShareAnalysisResponse(analysis_run=_to_read(row), shared=True)
 
 
-@router.post("/{run_id}/prequal-request", response_model=AnalysisRunPrequalResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{run_id}/prequal-request",
+    response_model=AnalysisRunPrequalResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def convert_analysis_to_prequal(
     run_id: UUID,
     payload: AnalysisRunPrequalRequest,
@@ -821,7 +942,10 @@ async def convert_analysis_to_prequal(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Operator role required")
     row = await _load_analysis_run(db, user, run_id)
     if row.client_id is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Link an owned client before creating a prequalification")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Link an owned client before creating a prequalification",
+        )
     client = await _require_client_access(db, user, row.client_id)
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found")
@@ -829,7 +953,10 @@ async def convert_analysis_to_prequal(
     if row.prequal_request_id is not None:
         existing = await db.get(PrequalRequest, row.prequal_request_id)
         if existing is not None:
-            return AnalysisRunPrequalResponse(analysis_run=_to_read(row), prequal_request=PrequalRequestRead.model_validate(existing))
+            return AnalysisRunPrequalResponse(
+                analysis_run=_to_read(row),
+                prequal_request=PrequalRequestRead.model_validate(existing),
+            )
 
     mapped = _prequal_payload_from_run(row)
     notes = _non_empty_text(payload.notes, mapped.get("borrower_notes"))
@@ -870,7 +997,11 @@ async def convert_analysis_to_prequal(
             actor_label=_actor_label(user),
             kind="analysis.prequal_requested",
             summary=f"Created pending prequalification from {row.product.replace('_', ' ')} analysis",
-            payload={"analysis_run_id": str(row.id), "prequal_request_id": str(req.id), "product": row.product},
+            payload={
+                "analysis_run_id": str(row.id),
+                "prequal_request_id": str(req.id),
+                "product": row.product,
+            },
         )
     )
     await db.flush()

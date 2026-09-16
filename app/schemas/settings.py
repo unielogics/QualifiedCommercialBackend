@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- Section: doc checklists ---------------------------------------------
+
 
 class DocChecklistItem(BaseModel):
     """One row in the per-loan-type doc checklist.
@@ -73,6 +76,7 @@ class LoanTypeChecklist(BaseModel):
 
 # --- Section: AI cadence -------------------------------------------------
 
+
 class AICadence(BaseModel):
     morning_digest: str = "08:00"
     evening_summary: str = "17:30"
@@ -90,6 +94,7 @@ class AICadence(BaseModel):
 
 # --- Section: AI spend monitoring ----------------------------------------
 
+
 class AISpendSettings(BaseModel):
     """Super-admin managed AI spend policy.
 
@@ -97,6 +102,7 @@ class AISpendSettings(BaseModel):
     pause categories, but crossing a threshold never shuts down agent
     workflows by itself.
     """
+
     daily_warning_usd: float = 10.0
     daily_critical_usd: float = 25.0
     avg_client_file_warning_usd: float = 1.50
@@ -115,12 +121,14 @@ class PropertyIntelligenceSettings(BaseModel):
     Secrets live in provider_secrets; these are safe non-secret toggles
     that can be carried in the normal settings blob.
     """
+
     ai_report_enabled: bool = True
     cache_ttl_hours: int = Field(default=24, ge=1, le=720)
     address_provider: Literal["google", "geoapify"] = "google"
 
 
 # --- Section: referrals --------------------------------------------------
+
 
 class ReferralSettings(BaseModel):
     require_approval: bool = True
@@ -135,6 +143,7 @@ class ReferralSettings(BaseModel):
 
 # --- Section: pricing ----------------------------------------------------
 
+
 class PricingSettings(BaseModel):
     daily_pull_time: str = "07:00"
     auto_publish_threshold_bps: int = 25
@@ -143,6 +152,7 @@ class PricingSettings(BaseModel):
 
 
 # --- Section: security --------------------------------------------------
+
 
 class SecuritySettings(BaseModel):
     sso_enabled: bool = True
@@ -155,6 +165,7 @@ class SecuritySettings(BaseModel):
 
 # --- Section: simulator -------------------------------------------------
 
+
 class SimulatorSettings(BaseModel):
     """Bounds + toggles for the borrower-facing Simulator screen.
 
@@ -162,6 +173,7 @@ class SimulatorSettings(BaseModel):
     to these limits. `advanced_mode_enabled` exposes the taxes/insurance/HOA
     inputs in the UI (the recalc endpoint always accepts them).
     """
+
     points_min: float = 0.0
     points_max: float = 3.0
     points_step: float = 0.5
@@ -180,6 +192,7 @@ class SimulatorSettings(BaseModel):
 
 # --- Section: prequal auto-approval ------------------------------------
 
+
 class PrequalAutoApprovalSettings(BaseModel):
     """Deterministic gate for auto-approving prequalification requests.
     See app/services/prequal_auto_approve.py — only when ALL conditions
@@ -188,6 +201,7 @@ class PrequalAutoApprovalSettings(BaseModel):
 
     The kill-switch: set `enabled=False` to revert to 100% manual
     approval if the auto path ever causes a problem in prod."""
+
     enabled: bool = True
 
     # Borrowers below this score never auto-approve. Tighter than the
@@ -207,6 +221,7 @@ class PrequalAutoApprovalSettings(BaseModel):
 
 # --- Section: letterhead ------------------------------------------------
 
+
 class LetterheadSettings(BaseModel):
     """Configurable letterhead values that get rendered into every
     pre-qualification PDF — office address, signing officer's name and
@@ -216,6 +231,7 @@ class LetterheadSettings(BaseModel):
     Edited by SUPER_ADMIN only via the firm-letterhead settings page.
     Used by app/services/prequal_pdf.py:render_letter.
     """
+
     # Officer / signer identity (full first + last name).
     officer_name: str = "Franco Pellegrino"
     officer_title: str = "Managing Director | Qualified Commercial LLC"
@@ -234,7 +250,7 @@ class LetterheadSettings(BaseModel):
 
 # --- Aggregate ----------------------------------------------------------
 
-_DEFAULT_TRANSACTION_CHECKLISTS: dict[str, "LoanTypeChecklist"] = {
+_DEFAULT_TRANSACTION_CHECKLISTS: dict[str, LoanTypeChecklist] = {
     "buyer": LoanTypeChecklist(
         docs=[
             DocChecklistItem(name="Government ID", side="buyer"),
@@ -263,6 +279,7 @@ _DEFAULT_TRANSACTION_CHECKLISTS: dict[str, "LoanTypeChecklist"] = {
 class DscrRateTier(BaseModel):
     """One credit tier for DSCR-potential pricing: files at or above min_fico
     (and below the next-higher tier) price from annual_rate (decimal)."""
+
     min_fico: int = Field(ge=300, le=850)
     annual_rate: float = Field(gt=0.0, lt=0.30)
 
@@ -272,6 +289,7 @@ class DscrPricingSettings(BaseModel):
     real-estate leads (app/routers/dealer_ai_intake.py::_compute_dscr_potential).
     Admin-editable so pricing moves without a deploy. The screen shows three
     scenarios: base rate for the file's credit tier ± band_spread."""
+
     rate_tiers: list[DscrRateTier] = Field(
         default_factory=lambda: [
             DscrRateTier(min_fico=760, annual_rate=0.0675),
@@ -287,6 +305,7 @@ class DscrPricingSettings(BaseModel):
 class AdminNotificationSettings(BaseModel):
     """Client/broker activity email digest for super admins
     (services/admin_activity.py). recipients empty = every super admin."""
+
     enabled: bool = True
     recipients: list[str] = Field(default_factory=list)
     max_lookback_hours: int = Field(default=24, ge=1, le=168)
@@ -298,6 +317,7 @@ class MerchantProcessingSettings(BaseModel):
     that goes out with no operator in the loop — the partner is told the
     moment a client accepts or declines. Off, the answer is still recorded
     and the desk sees "skipped" with a Resend button."""
+
     partner_email_enabled: bool = True
 
 
@@ -307,14 +327,53 @@ class FileUpdatesSettings(BaseModel):
     one-minute drain sends. The company address is a legal-notice address from
     the signed referral agreement, not a working inbox, so it is off until a
     partner asks for it."""
+
     client_email_enabled: bool = True
     team_email_enabled: bool = True
     company_email_enabled: bool = False
 
 
+class ProspectOutreachAISettings(BaseModel):
+    """Firm-managed preferences layered under immutable outreach safeguards.
+
+    This is deliberately policy, not fine-tuning. Guidance may steer tone and
+    emphasis, while blocked phrases are enforced after generation (including
+    deterministic fallback copy) so a prompt alone is never the control.
+    """
+
+    drafting_guidance: str = Field(default="", max_length=3000)
+    additional_blocked_phrases: list[str] = Field(default_factory=list, max_length=50)
+    updated_at: datetime | None = None
+    updated_by_user_id: UUID | None = None
+
+    @field_validator("drafting_guidance")
+    @classmethod
+    def clean_guidance(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("additional_blocked_phrases")
+    @classmethod
+    def clean_blocked_phrases(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            phrase = " ".join(str(raw or "").split())
+            if not phrase:
+                continue
+            if len(phrase) > 160:
+                raise ValueError("blocked phrases must be 160 characters or fewer")
+            key = phrase.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(phrase)
+        return cleaned
+
+
 class AppSettingsData(BaseModel):
     """Full settings blob. Each section has sensible defaults so a bare table
     row still produces usable values for the UI."""
+
     checklists: dict[str, LoanTypeChecklist] = Field(default_factory=dict)
     # Transaction-side defaults (alembic 0025 / realtor overhaul). Keyed by
     # `"buyer"` | `"seller"`. Used by the agent's lead-stage checklist surfaces
@@ -330,11 +389,19 @@ class AppSettingsData(BaseModel):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     simulator: SimulatorSettings = Field(default_factory=SimulatorSettings)
     letterhead: LetterheadSettings = Field(default_factory=LetterheadSettings)
-    prequal_auto_approval: PrequalAutoApprovalSettings = Field(default_factory=PrequalAutoApprovalSettings)
-    property_intelligence: PropertyIntelligenceSettings = Field(default_factory=PropertyIntelligenceSettings)
+    prequal_auto_approval: PrequalAutoApprovalSettings = Field(
+        default_factory=PrequalAutoApprovalSettings
+    )
+    property_intelligence: PropertyIntelligenceSettings = Field(
+        default_factory=PropertyIntelligenceSettings
+    )
     dscr_pricing: DscrPricingSettings = Field(default_factory=DscrPricingSettings)
-    admin_notifications: AdminNotificationSettings = Field(default_factory=AdminNotificationSettings)
-    merchant_processing: MerchantProcessingSettings = Field(default_factory=MerchantProcessingSettings)
+    admin_notifications: AdminNotificationSettings = Field(
+        default_factory=AdminNotificationSettings
+    )
+    merchant_processing: MerchantProcessingSettings = Field(
+        default_factory=MerchantProcessingSettings
+    )
     file_updates: FileUpdatesSettings = Field(default_factory=FileUpdatesSettings)
 
 
@@ -345,6 +412,7 @@ class AppSettingsRead(BaseModel):
 class AppSettingsUpdate(BaseModel):
     """PATCH body — every section is optional. We deep-merge keys present in
     the payload onto the persisted JSONB and leave the rest untouched."""
+
     checklists: dict[str, LoanTypeChecklist] | None = None
     transaction_checklists: dict[str, LoanTypeChecklist] | None = None
     ai_cadence: AICadence | None = None
@@ -364,6 +432,7 @@ class AppSettingsUpdate(BaseModel):
 
 # --- Signature image upload ---------------------------------------------
 
+
 class SignatureUploadInitResponse(BaseModel):
     """Response from POST /settings/letterhead/signature/upload-init.
 
@@ -372,5 +441,6 @@ class SignatureUploadInitResponse(BaseModel):
     upload_url  — presigned PUT URL (expires in 5 min). None when the
                   backend is running without S3 credentials (local dev).
     """
+
     s3_key: str
     upload_url: str | None

@@ -27,6 +27,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.db import get_db
 from app.deps import CurrentUser
 from app.models.dealer_prospect import DealerProspect, DealerProspectActivity
@@ -38,6 +39,7 @@ from app.models.prospect_outreach import (
     MarketingCollateralAsset,
     MarketingCollateralAssetEvent,
 )
+from app.models.user import User
 from app.schemas.prospect_outreach import (
     EmailSuppressionCreate,
     EmailSuppressionRead,
@@ -54,10 +56,14 @@ from app.schemas.prospect_outreach import (
     ProspectEmailDraftPatch,
     ProspectEmailDraftRead,
     ProspectEmailOutboxList,
+    ProspectOutreachPolicyPatch,
+    ProspectOutreachPolicyRead,
     ProspectReplyIngest,
     ProspectReplyIngestResult,
     ProspectReplyList,
     ProspectReplyRead,
+    ProspectTestEmailRequest,
+    ProspectTestEmailResponse,
 )
 from app.services import prospect_outreach as outreach
 from app.services.email import prospect_reply
@@ -74,11 +80,14 @@ def _require_outreach_enabled(request: Request) -> None:
     # ``require_config_admin``.
     path = request.url.path
     collateral_root = "/dealer-os/marketing-collateral"
+    outreach_config_root = "/dealer-os/prospect-outreach"
     if (
         "/prospect-email-unsubscribe/" in path
         or "/prospect-email-bundles/" in path
         or path.endswith(collateral_root)
         or f"{collateral_root}/" in path
+        or path.endswith(outreach_config_root)
+        or f"{outreach_config_root}/" in path
     ):
         return
     prospect_service.require_pipeline_enabled()
@@ -143,6 +152,57 @@ def _collateral_read(row: MarketingCollateralAsset) -> MarketingCollateralRead:
         preview_url=f"/api/v1/dealer-os/marketing-collateral/{row.id}/document?disposition=inline",
         download_url=f"/api/v1/dealer-os/marketing-collateral/{row.id}/document?disposition=attachment",
     )
+
+
+def _policy_read(policy, *, user: User) -> ProspectOutreachPolicyRead:
+    settings = get_settings()
+    return ProspectOutreachPolicyRead(
+        drafting_guidance=policy.drafting_guidance,
+        additional_blocked_phrases=policy.additional_blocked_phrases,
+        locked_rules=list(outreach.LOCKED_DRAFTING_RULES),
+        review_seconds=max(1, settings.prospect_email_review_seconds),
+        test_recipient_email=user.email,
+        updated_at=policy.updated_at,
+        updated_by_user_id=policy.updated_by_user_id,
+    )
+
+
+@router.get("/prospect-outreach/policy", response_model=ProspectOutreachPolicyRead)
+async def get_prospect_outreach_policy(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectOutreachPolicyRead:
+    prospect_service.require_config_admin(user)
+    try:
+        return _policy_read(await outreach.load_outreach_ai_settings(db), user=user)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.patch("/prospect-outreach/policy", response_model=ProspectOutreachPolicyRead)
+async def patch_prospect_outreach_policy(
+    payload: ProspectOutreachPolicyPatch,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectOutreachPolicyRead:
+    prospect_service.require_config_admin(user)
+    policy = await outreach.update_outreach_ai_settings(db, actor=user, payload=payload)
+    return _policy_read(policy, user=user)
+
+
+@router.post("/prospect-outreach/test-email", response_model=ProspectTestEmailResponse)
+async def send_prospect_outreach_test_email(
+    payload: ProspectTestEmailRequest,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectTestEmailResponse:
+    prospect_service.require_config_admin(user)
+    try:
+        return await outreach.send_test_email(db, actor=user, payload=payload)
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
 
 
 @router.post(
@@ -327,9 +387,7 @@ async def start_prospect_email_edit(
 ) -> ProspectEmailDraftRead:
     await _visible_draft(db, user, draft_id)
     try:
-        row = await outreach.start_editing(
-            db, draft_id, expected_version=payload.expected_version
-        )
+        row = await outreach.start_editing(db, draft_id, expected_version=payload.expected_version)
         return await outreach.draft_read(db, row)
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
@@ -398,9 +456,7 @@ async def cancel_prospect_email_draft(
 ) -> ProspectEmailDraftRead:
     await _visible_draft(db, user, draft_id)
     try:
-        row = await outreach.cancel_draft(
-            db, draft_id, expected_version=payload.expected_version
-        )
+        row = await outreach.cancel_draft(db, draft_id, expected_version=payload.expected_version)
         return await outreach.draft_read(db, row)
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
@@ -805,17 +861,26 @@ async def revoke_email_suppression(
     )
 
 
-async def _apply_unsubscribe(db: AsyncSession, token: str) -> DealerProspectEmailDraft:
+async def _get_unsubscribe_draft(
+    db: AsyncSession,
+    token: str,
+    *,
+    lock: bool,
+) -> DealerProspectEmailDraft:
     digest = outreach.token_hash(token)
-    draft = (
-        await db.execute(
-            select(DealerProspectEmailDraft).where(
-                DealerProspectEmailDraft.unsubscribe_token_hash == digest
-            ).with_for_update()
-        )
-    ).scalar_one_or_none()
+    statement = select(DealerProspectEmailDraft).where(
+        DealerProspectEmailDraft.unsubscribe_token_hash == digest
+    )
+    if lock:
+        statement = statement.with_for_update()
+    draft = (await db.execute(statement)).scalar_one_or_none()
     if draft is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unsubscribe link is invalid.")
+    return draft
+
+
+async def _apply_unsubscribe(db: AsyncSession, token: str) -> DealerProspectEmailDraft:
+    draft = await _get_unsubscribe_draft(db, token, lock=True)
     await outreach.set_suppression(
         db,
         email=draft.recipient_email,
@@ -841,21 +906,51 @@ async def _apply_unsubscribe(db: AsyncSession, token: str) -> DealerProspectEmai
     return draft
 
 
+def _unsubscribe_confirmation_page(*, completed: bool) -> Response:
+    if completed:
+        content = (
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>Unsubscribed</title></head><body><main>"
+            "<h1>You are unsubscribed</h1>"
+            "<p>Qualified Commercial has added this address to its suppression list. "
+            "Dealer Desk marketing email will stop.</p>"
+            "</main></body></html>"
+        )
+    else:
+        content = (
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>Confirm unsubscribe</title></head><body><main>"
+            "<h1>Confirm unsubscribe</h1>"
+            "<p>Use the button below to stop Dealer Desk marketing email from "
+            "Qualified Commercial.</p>"
+            '<form method="post"><button type="submit">Unsubscribe</button></form>'
+            "</main></body></html>"
+        )
+    return Response(
+        content=content,
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @router.get("/prospect-email-unsubscribe/{token}", include_in_schema=False)
 async def unsubscribe_prospect_email_get(
     token: str,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    await _apply_unsubscribe(db, token)
-    return Response(
-        content=(
-            "<!doctype html><html><body><h1>You are unsubscribed</h1>"
-            "<p>Qualified Commercial will not send further Dealer Desk email to this address.</p>"
-            "</body></html>"
-        ),
-        media_type="text/html",
-        headers={"Cache-Control": "no-store"},
-    )
+    # Email-security scanners commonly follow links with GET. Validate the token, but
+    # require an explicit POST before changing suppression or prospect state.
+    await _get_unsubscribe_draft(db, token, lock=False)
+    return _unsubscribe_confirmation_page(completed=False)
 
 
 @router.post("/prospect-email-unsubscribe/{token}", include_in_schema=False)
@@ -864,7 +959,9 @@ async def unsubscribe_prospect_email_post(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     await _apply_unsubscribe(db, token)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # RFC 8058 one-click clients only require a successful POST response; returning
+    # the same useful confirmation shown to browser users remains compatible.
+    return _unsubscribe_confirmation_page(completed=True)
 
 
 @router.post("/prospect-email-replies/ingest", response_model=ProspectReplyIngestResult)

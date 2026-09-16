@@ -2,7 +2,9 @@ import base64
 import hashlib
 import hmac
 import sys
+import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -10,8 +12,10 @@ from fastapi import HTTPException
 from app.config import Settings
 from app.dealer_os.services import sms_provider
 from app.dealer_os.services.sms_provider import provider_readiness, validate_twilio_signature
+from app.models.app_settings import AppSettings
+from app.routers import analysis
 from app.routers.analysis import _provider_switch_ready, _public_address_throttle
-from app.schemas.analysis import ProviderSettingsRead
+from app.schemas.analysis import ProviderSettingsRead, ProviderSettingsUpdate
 from app.services import provider_secrets
 from app.services.property_intelligence import _address_from_geoapify_properties
 
@@ -98,6 +102,55 @@ def test_provider_settings_read_contract_has_no_address_secret_fields() -> None:
     assert secret_fields.isdisjoint(ProviderSettingsRead.model_fields)
 
 
+@pytest.mark.asyncio
+async def test_provider_settings_patch_locks_row_and_preserves_private_settings(
+    monkeypatch,
+) -> None:
+    private_policy = {
+        "drafting_guidance": "Private drafting instructions",
+        "additional_blocked_phrases": ["Private phrase"],
+    }
+    row = AppSettings(data={"prospect_outreach_ai": private_policy})
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)),
+        add=MagicMock(),
+        flush=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        analysis,
+        "provider_settings_status",
+        AsyncMock(
+            return_value={
+                "rentcast_configured": False,
+                "google_server_configured": True,
+                "geoapify_configured": False,
+                "address_provider": "google",
+                "address_provider_ready": True,
+                "address_credentials_source": "environment",
+                "rentcast_api_key": None,
+                "property_analysis_ai_enabled": False,
+                "property_intelligence_cache_ttl_hours": 24,
+            }
+        ),
+    )
+
+    lock_settings = AsyncMock()
+    monkeypatch.setattr(analysis, "lock_app_settings", lock_settings)
+
+    response = await analysis.update_provider_settings(
+        ProviderSettingsUpdate(property_analysis_ai_enabled=False),
+        SimpleNamespace(id=uuid.uuid4(), role="super_admin"),
+        db,
+    )
+
+    statement = db.execute.await_args.args[0]
+    assert "FOR UPDATE" in str(statement)
+    assert row.data["prospect_outreach_ai"] == private_policy
+    assert row.data["property_intelligence"]["ai_report_enabled"] is False
+    assert response.property_analysis_ai_enabled is False
+    lock_settings.assert_awaited_once_with(db)
+
+
 def test_public_address_throttle_is_scoped_by_request_ip() -> None:
     store = {}
     request = SimpleNamespace(headers={"x-forwarded-for": "203.0.113.10"}, client=None)
@@ -140,7 +193,9 @@ def test_twilio_readiness_requires_webhook_token_and_sender() -> None:
 
 
 def test_sms_provider_selection_never_falls_back() -> None:
-    status = provider_readiness(Settings(_env_file=None, sms_provider="unknown", sms_production=True))
+    status = provider_readiness(
+        Settings(_env_file=None, sms_provider="unknown", sms_production=True)
+    )
     assert status["provider"] == "invalid"
     assert status["configured"] is False
 
@@ -267,8 +322,9 @@ def test_aws_outbound_uses_pinpoint_sms_voice_v2(monkeypatch) -> None:
             return {"MessageId": "aws-message-123"}
 
     fake_boto3 = SimpleNamespace(
-        client=lambda service, *, region_name: captured.update(service=service, region_name=region_name)
-        or FakeAwsSmsClient()
+        client=lambda service, *, region_name: (
+            captured.update(service=service, region_name=region_name) or FakeAwsSmsClient()
+        )
     )
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
     monkeypatch.setattr(sms_provider, "get_settings", lambda: settings)

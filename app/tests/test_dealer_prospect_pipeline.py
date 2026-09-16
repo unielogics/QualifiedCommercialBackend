@@ -162,6 +162,102 @@ def test_outcome_action_config_is_allowlisted() -> None:
         prospects.validate_action_config({"workflow_action": "run_whatever"})
 
 
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (
+            {"target_stage_key": "emailed", "stage_strategy": "advance_follow_up"},
+            "either a fixed target stage or an automatic stage strategy",
+        ),
+        (
+            {"email_action": "missed_call", "set_do_not_contact": True},
+            "blocks contact",
+        ),
+        (
+            {"email_action": "missed_call", "suppress_email": True},
+            "blocks contact",
+        ),
+        (
+            {"clear_follow_up": True, "requires_follow_up": True},
+            "clear follow-up while requiring or scheduling",
+        ),
+        (
+            {"clear_follow_up": True, "follow_up_delay_hours": 24},
+            "clear follow-up while requiring or scheduling",
+        ),
+        (
+            {"requires_follow_up": True, "follow_up_delay_hours": 24},
+            "either a required follow-up time or an automatic follow-up delay",
+        ),
+        (
+            {"target_stage_key": "converted"},
+            "AI Intake conversion workflow",
+        ),
+        (
+            {"target_stage_key": "booked"},
+            "requires a linked appointment",
+        ),
+        (
+            {"target_stage_key": "not_interested", "clear_follow_up": True},
+            "mark do-not-contact and clear follow-up",
+        ),
+        (
+            {"target_stage_key": "not_interested", "set_do_not_contact": True},
+            "mark do-not-contact and clear follow-up",
+        ),
+        (
+            {
+                "target_stage_key": "not_interested",
+                "set_do_not_contact": True,
+                "clear_follow_up": True,
+                "workflow_action": "book_appointment",
+            },
+            "cannot create an email or start a workflow",
+        ),
+    ],
+)
+def test_outcome_action_config_rejects_contradictory_or_unsafe_effects(
+    config: dict[str, object], message: str
+) -> None:
+    with pytest.raises(HTTPException) as error:
+        prospects.validate_action_config(config)
+
+    assert error.value.status_code == 422
+    assert message in str(error.value.detail)
+
+
+def test_default_outcome_action_configs_remain_valid() -> None:
+    for outcome in prospects.DEFAULT_OUTCOMES:
+        assert (
+            prospects.validate_action_config(outcome["action_config"]) == outcome["action_config"]
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "target_stage_key": "booked",
+            "requires_appointment": True,
+        },
+        {
+            "target_stage_key": "not_interested",
+            "set_do_not_contact": True,
+            "clear_follow_up": True,
+        },
+        {
+            "set_do_not_contact": True,
+            "clear_follow_up": True,
+            "suppress_email": True,
+        },
+    ],
+)
+def test_outcome_action_config_accepts_safe_terminal_effects(
+    config: dict[str, object],
+) -> None:
+    assert prospects.validate_action_config(config) == config
+
+
 def test_optimistic_version_conflict_returns_machine_readable_detail() -> None:
     prospect = SimpleNamespace(version=7)
     with pytest.raises(HTTPException) as error:
@@ -252,7 +348,12 @@ def test_access_admin_endpoint_bypasses_master_switch(monkeypatch) -> None:
 
     monkeypatch.setattr(prospects, "require_pipeline_enabled", disabled)
     admin_request = Request(
-        {"type": "http", "method": "GET", "path": "/api/v1/dealer-os/admin/prospect-access", "headers": []}
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/dealer-os/admin/prospect-access",
+            "headers": [],
+        }
     )
     prospect_router._require_pipeline_master(admin_request)
 
