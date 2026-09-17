@@ -492,6 +492,7 @@ async def quick_add_prospect(
             source=payload.source,
             owner_user_id=payload.owner_user_id,
             contact_id=payload.contact_id,
+            initial_note=payload.initial_note,
         )
     except IntegrityError as exc:
         # The scoped unique indexes are the race-proof second line after the

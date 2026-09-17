@@ -157,11 +157,19 @@ class ProspectCreate(BaseModel):
     phone: RequiredPhone
     source: str = Field(default="quick_add", min_length=1, max_length=32)
     owner_user_id: UUID | None = None
+    initial_note: str | None = Field(default=None, max_length=4000)
 
     @field_validator("contact_name", "dealer_name", "source", mode="before")
     @classmethod
     def strip_required(cls, value: object) -> object:
         return str(value).strip() if value is not None else value
+
+    @field_validator("initial_note", mode="before")
+    @classmethod
+    def strip_initial_note(cls, value: object) -> object:
+        if value is None:
+            return None
+        return str(value).strip() or None
 
 
 class ProspectPatch(BaseModel):

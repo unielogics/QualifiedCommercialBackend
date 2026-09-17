@@ -543,7 +543,10 @@ async def prospect_read(
                 await db.execute(
                     select(DealerProspectActivity)
                     .where(DealerProspectActivity.prospect_id == prospect.id)
-                    .order_by(DealerProspectActivity.created_at.desc())
+                    .order_by(
+                        DealerProspectActivity.created_at.desc(),
+                        DealerProspectActivity.id.desc(),
+                    )
                     .limit(200)
                 )
             )
@@ -761,6 +764,7 @@ async def create_prospect(
     source: str,
     owner_user_id: UUID | None,
     contact_id: UUID | None = None,
+    initial_note: str | None = None,
 ) -> DealerProspect:
     require_prospect_actor(user)
     contact: DealerRepContact | None = None
@@ -939,6 +943,15 @@ async def create_prospect(
             "source": source,
         },
     )
+    if initial_note:
+        await add_activity(
+            db,
+            prospect,
+            user,
+            "internal_note",
+            body=initial_note,
+            metadata={"private": True, "source": "prospect_creation"},
+        )
     return prospect
 
 

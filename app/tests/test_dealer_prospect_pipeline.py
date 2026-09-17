@@ -43,12 +43,160 @@ def test_quick_add_accepts_frontend_name_alias_and_normalizes_phone() -> None:
         dealer_name=" Grace Auto Sales ",
         email="ROCIO@EXAMPLE.COM",
         phone="(973) 555-0148",
+        initial_note="  Spoke about dealership working capital.  ",
     )
 
     assert payload.contact_name == "Rocio Martinez"
     assert payload.contact_id == contact_id
     assert payload.dealer_name == "Grace Auto Sales"
     assert payload.phone == "+19735550148"
+    assert payload.initial_note == "Spoke about dealership working capital."
+
+
+def test_quick_add_normalizes_blank_initial_note_to_none() -> None:
+    payload = ProspectCreate(
+        contact_name="Rocio Martinez",
+        dealer_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="(973) 555-0148",
+        initial_note="   ",
+    )
+
+    assert payload.initial_note is None
+
+
+@pytest.mark.asyncio
+async def test_quick_add_route_forwards_private_initial_note(monkeypatch) -> None:
+    payload = ProspectCreate(
+        contact_name="Rocio Martinez",
+        dealer_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="(973) 555-0148",
+        initial_note="Spoke about dealership working capital.",
+    )
+    created = SimpleNamespace(id=uuid4())
+    create_prospect = AsyncMock(return_value=created)
+    stop_after_create = AsyncMock(side_effect=RuntimeError("stop after create"))
+    monkeypatch.setattr(prospect_router.service, "create_prospect", create_prospect)
+    monkeypatch.setattr(prospect_router, "_refresh_for_read", stop_after_create)
+
+    with pytest.raises(RuntimeError, match="stop after create"):
+        await prospect_router.quick_add_prospect(payload, _user(Role.LOAN_EXEC), SimpleNamespace())
+
+    assert create_prospect.await_args.kwargs["initial_note"] == (
+        "Spoke about dealership working capital."
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_prospect_records_private_initial_note_after_created_activity(
+    monkeypatch,
+) -> None:
+    user = _user(Role.LOAN_EXEC)
+    stage = SimpleNamespace(id=uuid4(), key="new")
+    added = []
+
+    class ScalarResult:
+        @staticmethod
+        def scalar_one_or_none():
+            return stage
+
+    class EmptyRowsResult:
+        def scalars(self):
+            return self
+
+        @staticmethod
+        def first():
+            return None
+
+    async def flush() -> None:
+        for row in added:
+            if hasattr(row, "id") and row.id is None:
+                row.id = uuid4()
+
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=user),
+        execute=AsyncMock(
+            side_effect=[ScalarResult(), EmptyRowsResult(), EmptyRowsResult()]
+        ),
+        add=Mock(side_effect=added.append),
+        flush=AsyncMock(side_effect=flush),
+    )
+    monkeypatch.setattr(prospects, "find_duplicates", AsyncMock(return_value=[]))
+    monkeypatch.setattr(prospects, "ensure_default_definitions", AsyncMock())
+
+    prospect = await prospects.create_prospect(
+        db,
+        user,
+        contact_name="Rocio Martinez",
+        dealer_name="Grace Auto Sales",
+        email="rocio@example.com",
+        phone="+19735550148",
+        source="quick_add",
+        owner_user_id=None,
+        initial_note="Spoke about dealership working capital.",
+    )
+
+    activities = [row for row in added if row.__class__.__name__ == "DealerProspectActivity"]
+    assert [row.kind for row in activities] == ["prospect_created", "internal_note"]
+    assert activities[1].body == "Spoke about dealership working capital."
+    assert activities[1].metadata_json == {
+        "private": True,
+        "source": "prospect_creation",
+    }
+    assert prospect.last_activity_at is not None
+
+
+@pytest.mark.asyncio
+async def test_prospect_timeline_uses_stable_same_timestamp_tie_breaker() -> None:
+    prospect = DealerProspect(
+        id=uuid4(),
+        owner_user_id=uuid4(),
+        company_id=uuid4(),
+        primary_contact_id=uuid4(),
+        stage_definition_id=uuid4(),
+        email_normalized="rocio@example.com",
+        phone_normalized="+19735550148",
+        dealer_name_normalized="grace auto sales",
+        source="quick_add",
+        version=1,
+    )
+    prospect.created_at = datetime.now(UTC)
+    prospect.updated_at = prospect.created_at
+    contact = SimpleNamespace(
+        full_name="Rocio Martinez",
+        email="rocio@example.com",
+        phone_e164="+19735550148",
+        sms_marketing_consented_at=None,
+        sms_opted_out_at=None,
+    )
+    company = SimpleNamespace(name="Grace Auto Sales")
+    stage = SimpleNamespace(id=prospect.stage_definition_id, key="new", label="New", sort_order=0)
+    owner = SimpleNamespace(name="Pipeline User")
+
+    async def get(model, _row_id):
+        return {
+            "DealerRepContact": contact,
+            "DealerRepCompany": company,
+            "DealerProspectStageDefinition": stage,
+            "User": owner,
+        }[model.__name__]
+
+    class EmptyRowsResult:
+        def scalars(self):
+            return self
+
+        @staticmethod
+        def all():
+            return []
+
+    db = SimpleNamespace(get=get, execute=AsyncMock(return_value=EmptyRowsResult()))
+
+    await prospects.prospect_read(db, prospect, include_activities=True)
+
+    statement = str(db.execute.await_args_list[0].args[0])
+    assert "dealer_prospect_activities.created_at DESC" in statement
+    assert "dealer_prospect_activities.id DESC" in statement
 
 
 def test_drag_move_accepts_explicit_null_action() -> None:
