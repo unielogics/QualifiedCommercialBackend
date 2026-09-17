@@ -50,6 +50,8 @@ from app.schemas.prospect_outreach import (
     MarketingCollateralPatch,
     MarketingCollateralRead,
     MarketingCollateralReorder,
+    ProspectCollateralOptionList,
+    ProspectCollateralOptionRead,
     ProspectDraftAction,
     ProspectEmailDraftCreate,
     ProspectEmailDraftList,
@@ -62,6 +64,7 @@ from app.schemas.prospect_outreach import (
     ProspectReplyIngestResult,
     ProspectReplyList,
     ProspectReplyRead,
+    ProspectSenderPreviewRead,
     ProspectTestEmailRequest,
     ProspectTestEmailResponse,
 )
@@ -116,6 +119,14 @@ def _raise_service(exc: Exception) -> None:
     raise exc
 
 
+def _require_outreach_reader_or_config_admin(user: User) -> None:
+    """Admins may configure/test while rollout is paused; reps need both gates."""
+    if user.role in prospect_service.TEAM_ROLES:
+        return
+    prospect_service.require_pipeline_enabled()
+    prospect_service.require_prospect_actor(user)
+
+
 async def _visible_draft(
     db: AsyncSession, user, draft_id: UUID, *, lock: bool = False
 ) -> tuple[DealerProspectEmailDraft, DealerProspect]:
@@ -154,14 +165,44 @@ def _collateral_read(row: MarketingCollateralAsset) -> MarketingCollateralRead:
     )
 
 
-def _policy_read(policy, *, user: User) -> ProspectOutreachPolicyRead:
+def _sender_preview(
+    branding: outreach.AgentBranding,
+    *,
+    alternate_contact_email: str | None,
+) -> ProspectSenderPreviewRead:
+    return ProspectSenderPreviewRead(
+        sender_display_name=branding.display_name,
+        sender_title=branding.title,
+        sender_phone=branding.phone,
+        sender_display_email=branding.display_email,
+        sender_from_name=branding.from_name,
+        envelope_from_email=branding.envelope_from_email,
+        reply_contact_email=branding.reply_contact_email,
+        alternate_contact_email=alternate_contact_email,
+    )
+
+
+async def _policy_read(
+    db: AsyncSession,
+    policy,
+    *,
+    user: User,
+) -> ProspectOutreachPolicyRead:
     settings = get_settings()
+    branding = await outreach.load_agent_branding(db, user)
+    sender = _sender_preview(
+        branding,
+        alternate_contact_email=(
+            outreach.normalize_email(settings.prospect_alternate_contact_email) or None
+        ),
+    )
     return ProspectOutreachPolicyRead(
         drafting_guidance=policy.drafting_guidance,
         additional_blocked_phrases=policy.additional_blocked_phrases,
         locked_rules=list(outreach.LOCKED_DRAFTING_RULES),
         review_seconds=max(1, settings.prospect_email_review_seconds),
         test_recipient_email=user.email,
+        **sender.model_dump(),
         updated_at=policy.updated_at,
         updated_by_user_id=policy.updated_by_user_id,
     )
@@ -174,7 +215,7 @@ async def get_prospect_outreach_policy(
 ) -> ProspectOutreachPolicyRead:
     prospect_service.require_config_admin(user)
     try:
-        return _policy_read(await outreach.load_outreach_ai_settings(db), user=user)
+        return await _policy_read(db, await outreach.load_outreach_ai_settings(db), user=user)
     except Exception as exc:  # noqa: BLE001
         _raise_service(exc)
         raise
@@ -188,7 +229,96 @@ async def patch_prospect_outreach_policy(
 ) -> ProspectOutreachPolicyRead:
     prospect_service.require_config_admin(user)
     policy = await outreach.update_outreach_ai_settings(db, actor=user, payload=payload)
-    return _policy_read(policy, user=user)
+    return await _policy_read(db, policy, user=user)
+
+
+@router.get(
+    "/prospect-outreach/sender-preview",
+    response_model=ProspectSenderPreviewRead,
+)
+async def get_prospect_outreach_sender_preview(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectSenderPreviewRead:
+    """Preview the authenticated actor identity before a countdown exists."""
+    _require_outreach_reader_or_config_admin(user)
+    settings = get_settings()
+    try:
+        branding = await outreach.load_agent_branding(db, user)
+        return _sender_preview(
+            branding,
+            alternate_contact_email=(
+                outreach.normalize_email(settings.prospect_alternate_contact_email) or None
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise_service(exc)
+        raise
+
+
+@router.get(
+    "/prospect-outreach/collateral-options",
+    response_model=ProspectCollateralOptionList,
+)
+async def list_prospect_outreach_collateral_options(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> ProspectCollateralOptionList:
+    """List only PDFs an outreach-enabled actor may attach right now."""
+    _require_outreach_reader_or_config_admin(user)
+    rows = await outreach._active_collateral(db)
+    return ProspectCollateralOptionList(
+        items=[
+            ProspectCollateralOptionRead(
+                id=row.id,
+                name=row.name,
+                file_name=row.file_name,
+                version=row.version,
+                sort_order=row.sort_order,
+                size_bytes=row.size_bytes,
+                preview_url=(
+                    "/api/v1/dealer-os/prospect-outreach/"
+                    f"collateral-options/{row.id}/document"
+                ),
+            )
+            for row in rows
+        ]
+    )
+
+
+@router.get("/prospect-outreach/collateral-options/{asset_id}/document")
+async def preview_prospect_outreach_collateral_option(
+    asset_id: UUID,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    disposition: str = Query(default="inline", pattern="^(inline|attachment)$"),
+) -> Response:
+    """Preview/download an active approved option without admin metadata."""
+    _require_outreach_reader_or_config_admin(user)
+    row = (
+        await db.execute(
+            select(MarketingCollateralAsset).where(
+                MarketingCollateralAsset.id == asset_id,
+                MarketingCollateralAsset.assignment == outreach.COLLATERAL_ASSIGNMENT,
+                MarketingCollateralAsset.status == "active",
+                MarketingCollateralAsset.validation_status == "passed_antivirus",
+                MarketingCollateralAsset.content_type == "application/pdf",
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Collateral option not found.")
+    safe_name = row.file_name.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    return Response(
+        content=bytes(row.document_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "ETag": f'"{row.sha256}"',
+        },
+    )
 
 
 @router.post("/prospect-outreach/test-email", response_model=ProspectTestEmailResponse)

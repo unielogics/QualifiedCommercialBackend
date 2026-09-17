@@ -23,7 +23,10 @@ from app.dealer_os import prospect_outreach_router
 from app.models.app_settings import AppSettings
 from app.models.dealer_prospect import DealerProspect, DealerProspectStageDefinition
 from app.models.notification import Notification
-from app.models.prospect_outreach import DealerProspectEmailDraft, DealerProspectEmailDraftAsset
+from app.models.prospect_outreach import (
+    DealerProspectEmailDraft,
+    DealerProspectEmailDraftAsset,
+)
 from app.models.user import User
 from app.routers import settings as settings_router
 from app.schemas.prospect_outreach import (
@@ -40,6 +43,19 @@ from app.schemas.settings import (
 )
 from app.services import prospect_outreach as outreach
 from app.services.email import prospect_reply, ses_client
+
+
+def _branding(actor: User) -> outreach.AgentBranding:
+    name = actor.name or "Dealer Desk"
+    return outreach.AgentBranding(
+        display_name=name,
+        title=actor.title,
+        phone=actor.phone,
+        display_email=actor.email,
+        from_name=f"{name} · Qualified Commercial",
+        envelope_from_email="no-reply@qualifiedcommercial.com",
+        reply_contact_email="support@qualifiedcommercial.com",
+    )
 
 
 def _draft(*, status: str = "pending_review", version: int = 1) -> DealerProspectEmailDraft:
@@ -132,6 +148,15 @@ def test_outreach_policy_normalizes_guidance_and_blocked_phrase_duplicates():
 
 def test_verified_conversation_context_is_normalized_and_bound_to_live_idempotency():
     prospect = SimpleNamespace(id=uuid.uuid4(), email="alex@example.com")
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="fingerprint-actor",
+        email="agent@qualifiedcommercial.com",
+        name="Agent One",
+        role="loan_exec",
+        account_status="active",
+    )
+    branding = _branding(actor)
     with_context = ProspectEmailDraftCreate(
         idempotency_key=uuid.uuid4(),
         verified_conversation_context="  We spoke   earlier today at 10 AM.  ",
@@ -139,10 +164,275 @@ def test_verified_conversation_context_is_normalized_and_bound_to_live_idempoten
     without_context = ProspectEmailDraftCreate(idempotency_key=uuid.uuid4())
 
     assert with_context.verified_conversation_context == "We spoke earlier today at 10 AM."
-    assert outreach.request_fingerprint(prospect, with_context) != outreach.request_fingerprint(
-        prospect,
-        without_context,
+    assert outreach.request_fingerprint(
+        prospect, with_context, actor=actor, branding=branding
+    ) != outreach.request_fingerprint(
+        prospect, without_context, actor=actor, branding=branding
     )
+
+
+def test_collateral_request_has_explicit_all_selected_and_none_semantics():
+    first = uuid.uuid4()
+
+    assert ProspectEmailDraftCreate().include_collateral is True
+    assert ProspectEmailDraftCreate().collateral_asset_ids == []
+    selected = ProspectEmailDraftCreate(
+        include_collateral=False,
+        collateral_asset_ids=[first],
+    )
+    assert selected.collateral_asset_ids == [first]
+    assert ProspectEmailDraftCreate(include_collateral=False).collateral_asset_ids == []
+
+    with pytest.raises(ValidationError, match="must be empty"):
+        ProspectEmailDraftCreate(include_collateral=True, collateral_asset_ids=[first])
+    with pytest.raises(ValidationError, match="cannot contain duplicates"):
+        ProspectTestEmailRequest(
+            idempotency_key=uuid.uuid4(),
+            include_collateral=False,
+            collateral_asset_ids=[first, first],
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_branding_uses_canonical_user_identity_not_self_service_profile(
+    monkeypatch,
+):
+    actor = User(
+        id=uuid.uuid4(),
+        clerk_id="canonical-agent",
+        email="canonical@qualifiedcommercial.com",
+        name="Canonical Agent",
+        title="Loan Executive",
+        phone="+12125550100",
+        role="loan_exec",
+        account_status="active",
+    )
+    profile = SimpleNamespace(
+        display_name="Another Agent",
+        display_email="victim@qualifiedcommercial.com",
+        title="Automotive Specialist",
+        phone="+18623841951",
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar_one_or_none=lambda: profile)
+        )
+    )
+    monkeypatch.setattr(
+        outreach,
+        "get_settings",
+        lambda: SimpleNamespace(
+            prospect_from_email="no-reply@qualifiedcommercial.com",
+            prospect_reply_to_email="support@qualifiedcommercial.com",
+        ),
+    )
+
+    branding = await outreach.load_agent_branding(db, actor)
+
+    assert branding.display_name == "Canonical Agent"
+    assert branding.display_email == "canonical@qualifiedcommercial.com"
+    assert branding.from_name == "Canonical Agent · Qualified Commercial"
+    assert "Another Agent" not in branding.signature
+    assert "victim@qualifiedcommercial.com" not in branding.signature
+    assert branding.title == "Automotive Specialist"
+    assert branding.phone == "+18623841951"
+    assert branding.envelope_from_email == "no-reply@qualifiedcommercial.com"
+    assert branding.reply_contact_email == "support@qualifiedcommercial.com"
+
+
+@pytest.mark.asyncio
+async def test_live_idempotency_key_cannot_replay_another_actors_branded_draft(
+    monkeypatch,
+):
+    key = uuid.uuid4()
+    prospect = SimpleNamespace(id=uuid.uuid4(), email="dealer@example.com")
+    actor_a = User(
+        id=uuid.uuid4(),
+        clerk_id="actor-a",
+        email="a@qualifiedcommercial.com",
+        name="Agent A",
+        role="loan_exec",
+        account_status="active",
+    )
+    actor_b = User(
+        id=uuid.uuid4(),
+        clerk_id="actor-b",
+        email="b@qualifiedcommercial.com",
+        name="Agent B",
+        role="loan_exec",
+        account_status="active",
+    )
+    payload = ProspectEmailDraftCreate(idempotency_key=key, include_collateral=False)
+    existing = _draft()
+    existing.idempotency_key = key
+    existing.request_fingerprint = outreach.request_fingerprint(
+        prospect,
+        payload,
+        actor=actor_a,
+        branding=_branding(actor_a),
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar_one_or_none=lambda: existing)
+        )
+    )
+    monkeypatch.setattr(
+        outreach,
+        "load_agent_branding",
+        AsyncMock(return_value=_branding(actor_b)),
+    )
+
+    with pytest.raises(outreach.OutreachConflict, match="different request"):
+        await outreach.create_draft(
+            db,
+            prospect=prospect,
+            actor=actor_b,
+            payload=payload,
+        )
+
+
+@pytest.mark.asyncio
+async def test_selected_collateral_fails_closed_and_preserves_library_order():
+    first_id = uuid.uuid4()
+    second_id = uuid.uuid4()
+    first = SimpleNamespace(
+        id=first_id,
+        assignment=outreach.COLLATERAL_ASSIGNMENT,
+        status="active",
+        validation_status="passed_antivirus",
+        content_type="application/pdf",
+        sort_order=20,
+        logical_key="first",
+        version=1,
+    )
+    second = SimpleNamespace(
+        id=second_id,
+        assignment=outreach.COLLATERAL_ASSIGNMENT,
+        status="active",
+        validation_status="passed_antivirus",
+        content_type="application/pdf",
+        sort_order=10,
+        logical_key="second",
+        version=1,
+    )
+    result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [first, second])
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    rows = await outreach.resolve_collateral_selection(
+        db,
+        include_all_active=False,
+        asset_ids=[first_id, second_id],
+    )
+    assert [row.id for row in rows] == [second_id, first_id]
+
+    first.status = "retired"
+    with pytest.raises(outreach.OutreachBlocked) as blocked:
+        await outreach.resolve_collateral_selection(
+            db,
+            include_all_active=False,
+            asset_ids=[first_id, second_id],
+        )
+    assert blocked.value.code == "collateral_selection_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_all_active_collateral_uses_the_same_pdf_eligibility_predicate():
+    result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    assert await outreach._active_collateral(db) == []
+
+    statement = str(db.execute.await_args.args[0])
+    assert "marketing_collateral_assets.assignment" in statement
+    assert "marketing_collateral_assets.status" in statement
+    assert "marketing_collateral_assets.validation_status" in statement
+    assert "marketing_collateral_assets.content_type" in statement
+
+
+def test_collateral_options_allow_config_admin_during_paused_rollout(monkeypatch):
+    admin = User(
+        id=uuid.uuid4(),
+        clerk_id="collateral-admin",
+        email="admin@qualifiedcommercial.com",
+        name="Admin",
+        role="super_admin",
+        account_status="active",
+    )
+    global_gate = MagicMock(side_effect=AssertionError("admin must bypass rollout gate"))
+    user_gate = MagicMock(side_effect=AssertionError("admin must bypass user gate"))
+    monkeypatch.setattr(prospect_outreach_router.prospect_service, "require_pipeline_enabled", global_gate)
+    monkeypatch.setattr(prospect_outreach_router.prospect_service, "require_prospect_actor", user_gate)
+
+    prospect_outreach_router._require_outreach_reader_or_config_admin(admin)
+
+    global_gate.assert_not_called()
+    user_gate.assert_not_called()
+
+
+def test_collateral_options_require_both_rollout_gates_for_rep(monkeypatch):
+    rep = User(
+        id=uuid.uuid4(),
+        clerk_id="collateral-rep",
+        email="rep@qualifiedcommercial.com",
+        name="Rep",
+        role="field_rep",
+        account_status="active",
+    )
+    global_gate = MagicMock()
+    user_gate = MagicMock()
+    monkeypatch.setattr(prospect_outreach_router.prospect_service, "require_pipeline_enabled", global_gate)
+    monkeypatch.setattr(prospect_outreach_router.prospect_service, "require_prospect_actor", user_gate)
+
+    prospect_outreach_router._require_outreach_reader_or_config_admin(rep)
+
+    global_gate.assert_called_once_with()
+    user_gate.assert_called_once_with(rep)
+
+
+@pytest.mark.asyncio
+async def test_agent_collateral_options_expose_only_safe_selection_metadata(monkeypatch):
+    row = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="Dealer guide",
+        file_name="dealer-guide.pdf",
+        version=3,
+        sort_order=10,
+        size_bytes=1234,
+    )
+    monkeypatch.setattr(
+        prospect_outreach_router,
+        "_require_outreach_reader_or_config_admin",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        outreach,
+        "_active_collateral",
+        AsyncMock(return_value=[row]),
+    )
+
+    result = await prospect_outreach_router.list_prospect_outreach_collateral_options(
+        user=SimpleNamespace(),
+        db=SimpleNamespace(),
+    )
+
+    dumped = result.items[0].model_dump()
+    assert dumped == {
+        "id": row.id,
+        "name": "Dealer guide",
+        "file_name": "dealer-guide.pdf",
+        "version": 3,
+        "sort_order": 10,
+        "size_bytes": 1234,
+        "preview_url": (
+            "/api/v1/dealer-os/prospect-outreach/"
+            f"collateral-options/{row.id}/document"
+        ),
+    }
+    assert "status" not in dumped
+    assert "sha256" not in dumped
+    assert "uploaded_by_user_id" not in dumped
 
 
 @pytest.mark.asyncio
@@ -1097,7 +1387,11 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
         ),
     )
     monkeypatch.setattr(outreach, "_active_collateral", AsyncMock(return_value=[]))
-    monkeypatch.setattr(outreach, "_load_signature", AsyncMock(return_value=["Admin User"]))
+    monkeypatch.setattr(
+        outreach,
+        "load_agent_branding",
+        AsyncMock(return_value=_branding(actor)),
+    )
     monkeypatch.setattr(
         outreach,
         "load_outreach_ai_settings",
@@ -1151,6 +1445,8 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
     assert result.subject.startswith("[TEST]")
     draft = record.await_args.kwargs["draft"]
     assert draft.to == actor.email
+    assert draft.from_name == "Admin User · Qualified Commercial"
+    assert draft.from_email == "no-reply@qualifiedcommercial.com"
     assert draft.reply_to == "support@qualifiedcommercial.com"
     assert "+" not in draft.reply_to
     assert draft.headers["Message-ID"] == outreach._test_email_message_id(actor.id, idempotency_key)
@@ -1169,6 +1465,10 @@ async def test_test_email_is_self_only_marked_and_does_not_create_a_live_draft(
     assert ledger.provider_message_id == provider_result.message_id
     assert result.generation_reason == "ai_provider_error"
     assert result.instruction_disposition == "not_applied_fallback"
+    assert result.sender_display_name == "Admin User"
+    assert result.sender_from_name == "Admin User · Qualified Commercial"
+    assert result.envelope_from_email == "no-reply@qualifiedcommercial.com"
+    assert result.reply_contact_email == "support@qualifiedcommercial.com"
     if expected_state == "uncertain":
         assert "No automatic retry" in result.detail
         assert ledger.failed_at is None
@@ -1197,6 +1497,11 @@ async def test_test_email_idempotency_replays_sent_ledger_without_resending(monk
     )
     result = SimpleNamespace(scalar_one_or_none=lambda: existing)
     db = SimpleNamespace(execute=AsyncMock(return_value=result))
+    monkeypatch.setattr(
+        outreach,
+        "load_agent_branding",
+        AsyncMock(return_value=_branding(actor)),
+    )
     monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
     suppressed = AsyncMock()
     monkeypatch.setattr(outreach, "is_suppressed", suppressed)
@@ -1302,7 +1607,7 @@ async def test_test_email_idempotency_rejects_a_different_payload_for_new_ledger
         template_key=outreach._test_template_key(
             original.purpose,
             composed,
-            outreach.test_request_fingerprint(actor, original),
+            outreach.test_request_fingerprint(actor, original, branding=_branding(actor)),
         ),
         to_email=actor.email,
         subject="[TEST] Existing delivery",
@@ -1311,6 +1616,11 @@ async def test_test_email_idempotency_rejects_a_different_payload_for_new_ledger
     )
     db = SimpleNamespace(
         execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: existing))
+    )
+    monkeypatch.setattr(
+        outreach,
+        "load_agent_branding",
+        AsyncMock(return_value=_branding(actor)),
     )
     monkeypatch.setattr(outreach, "_lock_test_email_actor", AsyncMock())
 

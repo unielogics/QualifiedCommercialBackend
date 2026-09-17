@@ -216,6 +216,43 @@ class ProspectIdentity:
     owner_user_id: uuid.UUID | None
 
 
+@dataclass(frozen=True)
+class AgentBranding:
+    """Validated, immutable public identity for one outbound draft."""
+
+    display_name: str
+    title: str | None
+    phone: str | None
+    display_email: str
+    from_name: str
+    envelope_from_email: str
+    reply_contact_email: str
+
+    @property
+    def signature(self) -> list[str]:
+        return [
+            value
+            for value in (
+                self.display_name,
+                self.title,
+                self.phone,
+                self.display_email,
+            )
+            if value
+        ]
+
+    def snapshot(self) -> dict[str, str | None]:
+        return {
+            "display_name": self.display_name,
+            "title": self.title,
+            "phone": self.phone,
+            "display_email": self.display_email,
+            "from_name": self.from_name,
+            "envelope_from_email": self.envelope_from_email,
+            "reply_contact_email": self.reply_contact_email,
+        }
+
+
 async def load_outreach_ai_settings(
     db: AsyncSession, *, lock: bool = False
 ) -> ProspectOutreachAISettings:
@@ -429,8 +466,15 @@ def reply_contact_email(base_email: str) -> str:
     return f"{local.split('+', 1)[0]}@{domain}"
 
 
-def request_fingerprint(prospect: Any, payload: ProspectEmailDraftCreate) -> str:
+def request_fingerprint(
+    prospect: Any,
+    payload: ProspectEmailDraftCreate,
+    *,
+    actor: User,
+    branding: AgentBranding,
+) -> str:
     raw = {
+        "actor_id": str(actor.id),
         "prospect_id": str(prospect.id),
         "email": normalize_email(
             getattr(prospect, "email", None) or getattr(prospect, "email_normalized", None)
@@ -439,13 +483,21 @@ def request_fingerprint(prospect: Any, payload: ProspectEmailDraftCreate) -> str
         "ai_instructions": payload.ai_instructions,
         "verified_conversation_context": payload.verified_conversation_context,
         "private_note": payload.private_note,
+        "include_collateral": payload.include_collateral,
+        "collateral_asset_ids": sorted(str(value) for value in payload.collateral_asset_ids),
+        "sender_branding": branding.snapshot(),
     }
     return hashlib.sha256(
         json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
-def test_request_fingerprint(actor: User, payload: ProspectTestEmailRequest) -> str:
+def test_request_fingerprint(
+    actor: User,
+    payload: ProspectTestEmailRequest,
+    *,
+    branding: AgentBranding,
+) -> str:
     """Bind a self-test idempotency key to the complete operator request."""
     raw = {
         "actor_id": str(actor.id),
@@ -456,6 +508,8 @@ def test_request_fingerprint(actor: User, payload: ProspectTestEmailRequest) -> 
         "ai_instructions": payload.ai_instructions,
         "verified_conversation_context": payload.verified_conversation_context,
         "include_collateral": payload.include_collateral,
+        "collateral_asset_ids": sorted(str(value) for value in payload.collateral_asset_ids),
+        "sender_branding": branding.snapshot(),
     }
     return hashlib.sha256(
         json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1039,16 +1093,24 @@ async def _compose_with_nova(
         )
 
 
-async def _load_signature(db: AsyncSession, actor: User) -> list[str]:
+async def load_agent_branding(db: AsyncSession, actor: User) -> AgentBranding:
+    """Build the public sender only from the authenticated actor's profile.
+
+    No request payload can select another user or override these fields.  SES
+    continues to use the configured verified no-reply identity; the agent is
+    represented by the From display name and locked signature, while replies
+    go to the monitored Support mailbox.
+    """
     profile = (
         await db.execute(
             select(DealerFieldDeskProfile).where(DealerFieldDeskProfile.user_id == actor.id)
         )
     ).scalar_one_or_none()
-    name = _clean_label(
-        getattr(profile, "display_name", None) if profile else None,
-        _clean_label(actor.name, "Dealer Desk"),
-    )
+    # Name and email are canonical authenticated User fields. Field Desk
+    # profile identity fields are self-service and therefore cannot choose the
+    # From identity or impersonate another agent. Title and phone are merely
+    # supplemental signature/contact information.
+    name = _clean_label(actor.name, "Dealer Desk")
     title = _clean_label(
         getattr(profile, "title", None) if profile else None,
         _clean_label(actor.title, "Relationship Manager"),
@@ -1057,10 +1119,34 @@ async def _load_signature(db: AsyncSession, actor: User) -> list[str]:
         getattr(profile, "phone", None) if profile else None,
         _clean_label(actor.phone, ""),
     )
-    display_email = normalize_email(
-        getattr(profile, "display_email", None) if profile else None
-    ) or normalize_email(actor.email)
-    return [part for part in (name, title, phone, display_email) if part]
+    actor_email = normalize_email(actor.email)
+    display_email = actor_email
+    if not valid_email(display_email):
+        raise OutreachBlocked(
+            "sender_profile_incomplete",
+            "Your Field Desk sender profile needs a valid display email before outreach can be sent.",
+        )
+
+    settings = get_settings()
+    envelope_from = normalize_email(settings.prospect_from_email)
+    reply_contact = reply_contact_email(settings.prospect_reply_to_email)
+    if not valid_email(envelope_from) or not valid_email(reply_contact):
+        raise OutreachBlocked(
+            "sender_not_configured",
+            "Dealer Desk no-reply sender and monitored Support Reply-To must be valid before email can be sent.",
+        )
+    # Collapse CR/LF and all other whitespace through _clean_label before a
+    # profile value can reach an RFC display-name header.
+    from_name = f"{name} · Qualified Commercial"[:160]
+    return AgentBranding(
+        display_name=name,
+        title=title or None,
+        phone=phone or None,
+        display_email=display_email,
+        from_name=from_name,
+        envelope_from_email=envelope_from,
+        reply_contact_email=reply_contact,
+    )
 
 
 def _locked_footer(
@@ -1248,6 +1334,7 @@ async def _active_collateral(db: AsyncSession) -> list[MarketingCollateralAsset]
                     MarketingCollateralAsset.assignment == COLLATERAL_ASSIGNMENT,
                     MarketingCollateralAsset.status == "active",
                     MarketingCollateralAsset.validation_status == "passed_antivirus",
+                    MarketingCollateralAsset.content_type == "application/pdf",
                 )
                 .order_by(
                     MarketingCollateralAsset.sort_order,
@@ -1258,6 +1345,66 @@ async def _active_collateral(db: AsyncSession) -> list[MarketingCollateralAsset]
         )
         .scalars()
         .all()
+    )
+
+
+async def resolve_collateral_selection(
+    db: AsyncSession,
+    *,
+    include_all_active: bool,
+    asset_ids: Iterable[uuid.UUID],
+) -> list[MarketingCollateralAsset]:
+    """Resolve an all/selected/none request without silently dropping files.
+
+    Selected rows must still be the currently active, approved Dealer Outreach
+    versions at draft time. If any requested id is stale, retired, pending, or
+    belongs to another assignment, the entire request fails before a draft or
+    test delivery can be created.
+    """
+    requested = list(asset_ids)
+    if include_all_active:
+        if requested:
+            raise OutreachBlocked(
+                "ambiguous_collateral_selection",
+                "Choose every active PDF or selected PDFs, not both.",
+            )
+        return await _active_collateral(db)
+    if not requested:
+        return []
+    if len(set(requested)) != len(requested):
+        raise OutreachBlocked(
+            "duplicate_collateral_selection",
+            "The selected PDF list contains a duplicate.",
+        )
+
+    rows = list(
+        (
+            await db.execute(
+                select(MarketingCollateralAsset)
+                .where(MarketingCollateralAsset.id.in_(requested))
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    eligible = {
+        row.id: row
+        for row in rows
+        if row.assignment == COLLATERAL_ASSIGNMENT
+        and row.status == "active"
+        and row.validation_status == "passed_antivirus"
+        and row.content_type == "application/pdf"
+    }
+    if len(eligible) != len(requested):
+        raise OutreachBlocked(
+            "collateral_selection_unavailable",
+            "One or more selected PDFs are no longer active and approved. Refresh the collateral list and choose again.",
+        )
+    # Preserve library order rather than trusting client-controlled ordering.
+    return sorted(
+        eligible.values(),
+        key=lambda row: (row.sort_order, row.logical_key, row.version, str(row.id)),
     )
 
 
@@ -1314,7 +1461,13 @@ async def create_draft(
     actor: User,
     payload: ProspectEmailDraftCreate,
 ) -> DealerProspectEmailDraft:
-    fingerprint = request_fingerprint(prospect, payload)
+    branding = await load_agent_branding(db, actor)
+    fingerprint = request_fingerprint(
+        prospect,
+        payload,
+        actor=actor,
+        branding=branding,
+    )
     existing = (
         await db.execute(
             select(DealerProspectEmailDraft).where(
@@ -1379,7 +1532,11 @@ async def create_draft(
         catalog_snapshot=catalog,
     )
 
-    assets = await _active_collateral(db)
+    assets = await resolve_collateral_selection(
+        db,
+        include_all_active=payload.include_collateral,
+        asset_ids=payload.collateral_asset_ids,
+    )
     attachment_names = [asset.file_name for asset in assets]
     total_bytes = sum(int(asset.size_bytes) for asset in assets)
     settings = get_settings()
@@ -1391,9 +1548,8 @@ async def create_draft(
         f"{settings.public_api_url.rstrip('/')}/api/v1/dealer-os/"
         f"prospect-email-unsubscribe/{quote(unsubscribe_token, safe='')}"
     )
-    signature = await _load_signature(db, actor)
     locked_footer = _locked_footer(
-        signature=signature,
+        signature=branding.signature,
         attachment_names=attachment_names,
         unsubscribe_url=unsubscribe_url,
         booking_url=booking_url,
@@ -1405,8 +1561,8 @@ async def create_draft(
         prospect_id=prospect.id,
         created_by_user_id=actor.id,
         recipient_email=recipient,
-        from_email=normalize_email(settings.prospect_from_email),
-        from_name=settings.prospect_from_name.strip() or "Qualified Commercial Dealer Desk",
+        from_email=branding.envelope_from_email,
+        from_name=branding.from_name,
         reply_to_email=tokenized_reply_to(settings.prospect_reply_to_email, reply_token),
         reply_token_hash=token_hash(reply_token),
         unsubscribe_token_hash=token_hash(unsubscribe_token),
@@ -1491,6 +1647,14 @@ async def create_draft(
                 "instruction_disposition": composed.instruction_disposition,
                 "send_after": draft.auto_send_at.isoformat() if draft.auto_send_at else None,
                 "attachment_count": draft.attachment_count,
+                "collateral_mode": (
+                    "all_active"
+                    if payload.include_collateral
+                    else "selected"
+                    if payload.collateral_asset_ids
+                    else "none"
+                ),
+                "sender_from_name": branding.from_name,
                 "blocked": oversized,
             },
         )
@@ -1610,7 +1774,11 @@ def _test_generation_banner(composed: ComposedCopy) -> str:
     )
 
 
-def _test_response_from_ledger(row: MessageSend) -> ProspectTestEmailResponse:
+def _test_response_from_ledger(
+    row: MessageSend,
+    *,
+    branding: AgentBranding | None = None,
+) -> ProspectTestEmailResponse:
     source, generation_reason, instruction_disposition = _test_generation_metadata(
         row.template_key
     )
@@ -1630,6 +1798,21 @@ def _test_response_from_ledger(row: MessageSend) -> ProspectTestEmailResponse:
         generation_reason=generation_reason,
         instruction_disposition=instruction_disposition,
         attachment_names=list(row.attachment_names or []),
+        sender_display_name=branding.display_name if branding else None,
+        sender_title=branding.title if branding else None,
+        sender_phone=branding.phone if branding else None,
+        sender_display_email=branding.display_email if branding else None,
+        sender_from_name=branding.from_name if branding else None,
+        envelope_from_email=(
+            branding.envelope_from_email
+            if branding
+            else getattr(row, "from_email", None)
+        ),
+        reply_contact_email=(
+            branding.reply_contact_email
+            if branding
+            else getattr(row, "reply_to_email", None)
+        ),
         detail=(
             "Delivery is still in progress or its provider outcome is uncertain. "
             "No duplicate was sent; check the inbox before starting a separate test."
@@ -1657,7 +1840,8 @@ async def send_test_email(
             "invalid_test_recipient",
             "Your login account needs a valid email address before a test can be sent.",
         )
-    request_hash = test_request_fingerprint(actor, payload)
+    branding = await load_agent_branding(db, actor)
+    request_hash = test_request_fingerprint(actor, payload, branding=branding)
     await _lock_test_email_actor(db, actor.id)
     test_message_id = _test_email_message_id(actor.id, payload.idempotency_key)
     existing = (
@@ -1677,7 +1861,7 @@ async def send_test_email(
             raise OutreachConflict(
                 "Idempotency key was already used with a different test email request."
             )
-        return _test_response_from_ledger(existing)
+        return _test_response_from_ledger(existing, branding=branding)
     if await is_suppressed(db, recipient) is not None:
         raise OutreachBlocked(
             "test_recipient_suppressed",
@@ -1735,7 +1919,11 @@ async def send_test_email(
         catalog_snapshot=catalog,
     )
 
-    assets = await _active_collateral(db) if payload.include_collateral else []
+    assets = await resolve_collateral_selection(
+        db,
+        include_all_active=payload.include_collateral,
+        asset_ids=payload.collateral_asset_ids,
+    )
     total_bytes = sum(int(asset.size_bytes) for asset in assets)
     if attachment_bundle_too_large(total_bytes):
         raise OutreachBlocked(
@@ -1766,7 +1954,7 @@ async def send_test_email(
             )
     attachment_names = [asset.file_name for asset in assets]
     footer = _locked_footer(
-        signature=await _load_signature(db, actor),
+        signature=branding.signature,
         attachment_names=attachment_names,
         unsubscribe_url=None,
         booking_url=booking_url,
@@ -1774,14 +1962,8 @@ async def send_test_email(
     )
     body_text = f"{_test_generation_banner(composed)}\n\n{_render_body(editable_body, footer)}"
     subject = f"[TEST] {composed.subject}"[:240]
-    settings = get_settings()
-    from_email = normalize_email(settings.prospect_from_email)
-    reply_to = reply_contact_email(settings.prospect_reply_to_email)
-    if not valid_email(from_email) or not valid_email(reply_to):
-        raise OutreachBlocked(
-            "sender_not_configured",
-            "Dealer Desk sender and support Reply-To must be valid before a test can be sent.",
-        )
+    from_email = branding.envelope_from_email
+    reply_to = branding.reply_contact_email
 
     from app.services.messaging.outbox import Draft as OutboxDraft
     from app.services.messaging.outbox import Subject as OutboxSubject
@@ -1796,7 +1978,7 @@ async def send_test_email(
             (asset.file_name, bytes(asset.document_bytes), asset.content_type) for asset in assets
         ],
         from_email=from_email,
-        from_name=settings.prospect_from_name.strip() or "Qualified Commercial Dealer Desk",
+        from_name=branding.from_name,
         reply_to=reply_to,
         headers={"Message-ID": test_message_id},
     )
@@ -1877,6 +2059,14 @@ async def send_test_email(
                 "generation_reason": composed.generation_reason,
                 "instruction_disposition": composed.instruction_disposition,
                 "attachment_count": len(assets),
+                "collateral_mode": (
+                    "all_active"
+                    if payload.include_collateral
+                    else "selected"
+                    if payload.collateral_asset_ids
+                    else "none"
+                ),
+                "sender_from_name": branding.from_name,
                 "provider_accepted": ok,
                 "delivery_state": delivery_state,
                 "idempotency_key": str(payload.idempotency_key),
@@ -1893,6 +2083,13 @@ async def send_test_email(
         generation_reason=composed.generation_reason,
         instruction_disposition=composed.instruction_disposition,
         attachment_names=attachment_names,
+        sender_display_name=branding.display_name,
+        sender_title=branding.title,
+        sender_phone=branding.phone,
+        sender_display_email=branding.display_email,
+        sender_from_name=branding.from_name,
+        envelope_from_email=branding.envelope_from_email,
+        reply_contact_email=branding.reply_contact_email,
         detail=detail,
     )
 
@@ -2706,6 +2903,14 @@ async def draft_read(db: AsyncSession, row: DealerProspectEmailDraft) -> Prospec
         to_email=row.recipient_email,
         from_email=formataddr((row.from_name, row.from_email)),
         reply_to=row.reply_to_email,
+        sender_display_name=(
+            row.from_name.removesuffix(" · Qualified Commercial")
+            if row.from_name
+            else None
+        ),
+        sender_from_name=row.from_name,
+        envelope_from_email=row.from_email,
+        reply_contact_email=reply_contact_email(row.reply_to_email),
         subject=row.subject,
         body=row.body_text,
         status=row.status,

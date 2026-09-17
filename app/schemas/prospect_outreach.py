@@ -17,6 +17,17 @@ DraftPurpose = Literal[
 ]
 
 
+class ProspectSenderPreviewRead(BaseModel):
+    sender_display_name: str
+    sender_title: str | None = None
+    sender_phone: str | None = None
+    sender_display_email: str
+    sender_from_name: str
+    envelope_from_email: str
+    reply_contact_email: str
+    alternate_contact_email: str | None = None
+
+
 class ProspectOutreachPolicyPatch(BaseModel):
     drafting_guidance: str | None = Field(default=None, max_length=3000)
     additional_blocked_phrases: list[str] | None = Field(default=None, max_length=50)
@@ -58,6 +69,14 @@ class ProspectOutreachPolicyRead(BaseModel):
     locked_rules: list[str] = Field(default_factory=list)
     review_seconds: int = Field(ge=1)
     test_recipient_email: str
+    sender_display_name: str
+    sender_title: str | None = None
+    sender_phone: str | None = None
+    sender_display_email: str
+    sender_from_name: str
+    envelope_from_email: str
+    reply_contact_email: str
+    alternate_contact_email: str | None = None
     updated_at: datetime | None = None
     updated_by_user_id: UUID | None = None
 
@@ -69,7 +88,10 @@ class ProspectTestEmailRequest(BaseModel):
     sample_dealer_name: str = Field(default="Example Motors", min_length=1, max_length=180)
     ai_instructions: str | None = Field(default=None, max_length=1500)
     verified_conversation_context: str | None = Field(default=None, max_length=500)
+    # True means the complete current active Dealer Outreach library. False
+    # means exactly ``collateral_asset_ids`` (an empty list means no PDFs).
     include_collateral: bool = True
+    collateral_asset_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
     @field_validator("sample_contact_name", "sample_dealer_name")
     @classmethod
@@ -90,6 +112,16 @@ class ProspectTestEmailRequest(BaseModel):
     def normalize_verified_context(cls, value: str | None) -> str | None:
         clean = " ".join((value or "").split())
         return clean or None
+
+    @model_validator(mode="after")
+    def validate_collateral_selection(self) -> ProspectTestEmailRequest:
+        if len(set(self.collateral_asset_ids)) != len(self.collateral_asset_ids):
+            raise ValueError("collateral_asset_ids cannot contain duplicates")
+        if self.include_collateral and self.collateral_asset_ids:
+            raise ValueError(
+                "collateral_asset_ids must be empty when include_collateral is true"
+            )
+        return self
 
 
 class ProspectTestEmailResponse(BaseModel):
@@ -112,6 +144,13 @@ class ProspectTestEmailResponse(BaseModel):
         "none", "submitted_to_ai", "not_applied_fallback", "unknown"
     ]
     attachment_names: list[str] = Field(default_factory=list)
+    sender_display_name: str | None = None
+    sender_title: str | None = None
+    sender_phone: str | None = None
+    sender_display_email: str | None = None
+    sender_from_name: str | None = None
+    envelope_from_email: str | None = None
+    reply_contact_email: str | None = None
     detail: str = ""
 
 
@@ -123,6 +162,10 @@ class ProspectEmailDraftCreate(BaseModel):
     # This value is routed directly to DealerProspectActivity.  It is never
     # stored on the email draft and never included in the model prompt.
     private_note: str | None = Field(default=None, max_length=4000)
+    # True snapshots every current active Dealer Outreach PDF. False snapshots
+    # exactly the selected ids; false + [] deliberately means no attachments.
+    include_collateral: bool = True
+    collateral_asset_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
     @field_validator("ai_instructions", "private_note")
     @classmethod
@@ -135,6 +178,16 @@ class ProspectEmailDraftCreate(BaseModel):
     def normalize_verified_context(cls, value: str | None) -> str | None:
         clean = " ".join((value or "").split())
         return clean or None
+
+    @model_validator(mode="after")
+    def validate_collateral_selection(self) -> ProspectEmailDraftCreate:
+        if len(set(self.collateral_asset_ids)) != len(self.collateral_asset_ids):
+            raise ValueError("collateral_asset_ids cannot contain duplicates")
+        if self.include_collateral and self.collateral_asset_ids:
+            raise ValueError(
+                "collateral_asset_ids must be empty when include_collateral is true"
+            )
+        return self
 
 
 class ProspectEmailDraftPatch(BaseModel):
@@ -166,6 +219,13 @@ class ProspectEmailDraftRead(BaseModel):
     to_email: str
     from_email: str
     reply_to: str
+    sender_display_name: str | None = None
+    sender_title: str | None = None
+    sender_phone: str | None = None
+    sender_display_email: str | None = None
+    sender_from_name: str | None = None
+    envelope_from_email: str | None = None
+    reply_contact_email: str | None = None
     subject: str
     body: str
     status: Literal[
@@ -231,6 +291,22 @@ class MarketingCollateralRead(BaseModel):
 
 class MarketingCollateralList(BaseModel):
     items: list[MarketingCollateralRead]
+
+
+class ProspectCollateralOptionRead(BaseModel):
+    """Minimum safe metadata exposed to outreach-enabled pipeline actors."""
+
+    id: UUID
+    name: str
+    file_name: str
+    version: int
+    sort_order: int
+    size_bytes: int
+    preview_url: str
+
+
+class ProspectCollateralOptionList(BaseModel):
+    items: list[ProspectCollateralOptionRead]
 
 
 class MarketingCollateralAction(BaseModel):
