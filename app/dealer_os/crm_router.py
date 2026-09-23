@@ -60,7 +60,8 @@ from .models import (
     DealerRepLead,
     DealerSourceConnection,
 )
-from .services import buckets_link, consent_delivery, storage
+from .services import buckets_link, storage
+from .services import prospects as prospect_service
 from .services.catalog_pricing import normalize_catalog_pricing
 from .services.product_finder import QUESTIONS, screen_products
 from .services.targets import propose_targets
@@ -1062,19 +1063,13 @@ async def update_product(program_key: str, payload: ProductCatalogUpdate, user: 
 
 
 async def _find_or_create_company_contact(db: AsyncSession, user: User, payload: CompanyContactIn) -> tuple[DealerRepCompany, DealerRepContact]:
-    email = payload.email.strip().lower() if payload.email else None
-    contact = None
-    if email:
-        contact = (await db.execute(select(DealerRepContact).where(
-            DealerRepContact.owner_user_id == user.id,
-            DealerRepContact.email == email,
-            or_(
-                DealerRepContact.dealer_id.is_(None),
-                DealerRepContact.dealer_id.in_(
-                    select(DealerBusiness.id).where(DealerBusiness.is_training.is_(False))
-                ),
-            ),
-        ).order_by(DealerRepContact.updated_at.desc()))).scalars().first()
+    contact, email, phone = await prospect_service.resolve_contact_identity(
+        db,
+        actor_user=user,
+        owner_user_id=user.id,
+        email=payload.email,
+        phone=payload.phone,
+    )
     company = await db.get(DealerRepCompany, contact.company_id) if contact and contact.company_id else None
     if company is None:
         company = (await db.execute(select(DealerRepCompany).where(
@@ -1112,11 +1107,13 @@ async def _find_or_create_company_contact(db: AsyncSession, user: User, payload:
         company.activity_entry_id = payload.activity_entry_id or company.activity_entry_id
     if contact is None:
         contact = DealerRepContact(owner_user_id=user.id, company_id=company.id, full_name=payload.contact_name.strip(),
-            company=company.name, email=email, phone_e164=payload.phone, source="product_finder", last_activity_at=datetime.now(timezone.utc))
+            company=company.name, email=email, phone_e164=phone, source="product_finder", last_activity_at=datetime.now(timezone.utc))
         db.add(contact); await db.flush()
     else:
         contact.company_id = contact.company_id or company.id
-        contact.company = company.name; contact.phone_e164 = payload.phone or contact.phone_e164
+        contact.company = company.name
+        contact.email = contact.email or email
+        contact.phone_e164 = contact.phone_e164 or phone
         contact.last_activity_at = datetime.now(timezone.utc)
     return company, contact
 
@@ -1398,7 +1395,7 @@ async def _presentation_contact(
         first = (payload.first_name or "").strip()
         last = (payload.last_name or "").strip()
         email = (payload.email or "").strip().lower() or None
-        phone = consent_delivery.normalize_phone(payload.phone)
+        phone = payload.phone
         if not first or not last:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1409,19 +1406,13 @@ async def _presentation_contact(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "Add an email address or phone number",
             )
-        matches = []
-        if email:
-            matches.append(func.lower(func.coalesce(DealerRepContact.email, "")) == email)
-        if phone:
-            matches.append(DealerRepContact.phone_e164 == phone)
-        contact = (
-            await db.execute(
-                select(DealerRepContact).where(
-                    DealerRepContact.owner_user_id == user.id,
-                    or_(*matches),
-                ).order_by(DealerRepContact.updated_at.desc())
-            )
-        ).scalars().first()
+        contact, email, phone = await prospect_service.resolve_contact_identity(
+            db,
+            actor_user=user,
+            owner_user_id=user.id,
+            email=email,
+            phone=phone,
+        )
         if contact is None:
             contact = DealerRepContact(
                 owner_user_id=user.id,

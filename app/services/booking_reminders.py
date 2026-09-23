@@ -88,6 +88,7 @@ async def register_booking(
         sms_reminder_status="pending" if sms_due else ("blocked_no_consent" if invitee_phone and not sms_consent else "disabled"),
         confirmation_email_status="pending" if booking.confirmation_email_enabled and invitee_email else "disabled",
         confirmation_sms_status="pending" if booking.confirmation_sms_enabled and invitee_phone and sms_consent else ("blocked_no_consent" if invitee_phone and not sms_consent else "disabled"),
+        delivery_next_attempt_at=datetime.now(UTC),
     )
     db.add(row)
     await db.flush()
@@ -212,6 +213,7 @@ async def send_confirmation_sms(
     timezone_name: str | None = None,
     template: str | None = None,
     values: dict[str, str] | None = None,
+    commit: bool = True,
 ) -> None:
     """The booking confirmation text.
 
@@ -240,7 +242,8 @@ async def send_confirmation_sms(
         log.exception("booking confirmation SMS raised notification=%s", row.id)
         row.confirmation_sms_status = "failed"
         row.record_delivery_error("sms_provider_exception")
-        await db.commit()
+        if commit:
+            await db.commit()
         return
     row.confirmation_sms_status = "sent" if result.ok else "failed"
     if result.ok:
@@ -249,7 +252,199 @@ async def send_confirmation_sms(
         row.clear_delivery_error()
     else:
         row.record_delivery_error(result.detail)
-    await db.commit()
+    if commit:
+        await db.commit()
+
+
+_INITIAL_DELIVERY_MAX_ATTEMPTS = 8
+
+
+def _initial_delivery_complete(
+    row: BookingNotification,
+    event: CalendarEvent,
+    appointment,
+    *,
+    google_meet_enabled: bool = True,
+) -> bool:
+    google_ready = bool(event.google_event_id) and (
+        appointment.meeting_mode != "video"
+        or not google_meet_enabled
+        or bool(appointment.join_url)
+    )
+    email_ready = row.confirmation_email_status in {"sent", "disabled"}
+    sms_ready = row.confirmation_sms_status in {
+        "sent",
+        "disabled",
+        "blocked_no_consent",
+    }
+    return google_ready and email_ready and sms_ready
+
+
+async def dispatch_pending_confirmations() -> int:
+    """Drain durable initial booking delivery without blocking booking writes.
+
+    Google creation is safe to retry because the event id is deterministic.
+    Email/SMS attempts run only while still ``pending``; an explicit failed
+    result becomes action-required rather than being auto-sent repeatedly.
+    """
+
+    from app.db import SessionLocal
+    from app.dealer_os.models import DealerRepAppointment
+    from app.services import booking_notify
+
+    completed = 0
+    async with SessionLocal() as db:
+        # Claim exactly one notification per transaction. A commit releases
+        # every PostgreSQL row lock held by the transaction, so selecting a
+        # batch and committing inside its loop would leave the unprocessed
+        # rows unclaimed. Re-querying one at a time keeps the background
+        # wake-up and scheduler mutually exclusive for the whole set of
+        # provider effects while retaining the previous 25-row work cap.
+        for _ in range(25):
+            now = datetime.now(UTC)
+            row = (
+                await db.execute(
+                    select(
+                        BookingNotification,
+                        CalendarEvent,
+                        DealerRepAppointment,
+                        BookingSettings,
+                        User,
+                    )
+                    .join(CalendarEvent, CalendarEvent.id == BookingNotification.event_id)
+                    .join(
+                        DealerRepAppointment,
+                        DealerRepAppointment.calendar_event_id == CalendarEvent.id,
+                    )
+                    .join(User, User.id == CalendarEvent.owner_user_id)
+                    .join(BookingSettings, BookingSettings.user_id == User.id)
+                    .where(
+                        BookingNotification.delivery_completed_at.is_(None),
+                        BookingNotification.delivery_next_attempt_at.is_not(None),
+                        BookingNotification.delivery_next_attempt_at <= now,
+                        CalendarEvent.status != CalendarEventStatus.CANCELLED,
+                        DealerRepAppointment.archived_at.is_(None),
+                        DealerRepAppointment.status != "cancelled",
+                        CalendarEvent.starts_at > now,
+                    )
+                    .order_by(BookingNotification.delivery_next_attempt_at.asc())
+                    .with_for_update(skip_locked=True, of=BookingNotification)
+                    .limit(1)
+                )
+            ).first()
+            if row is None:
+                break
+
+            notice, event, appointment, booking, host = row
+            booking = await effective_booking_settings(db, booking)
+            notice.delivery_attempt_count = int(notice.delivery_attempt_count or 0) + 1
+            notice.delivery_last_attempt_at = now
+            rep = (
+                await db.get(User, appointment.booked_by_user_id)
+                if appointment.booked_by_user_id
+                else None
+            )
+            staff_attendees, private_properties = (
+                await booking_notify.prospect_google_context(db, appointment)
+            )
+            needs_meet = bool(
+                booking.google_meet_enabled
+                and appointment.meeting_mode == "video"
+                and not appointment.join_url
+            )
+            if not event.google_event_id or needs_meet:
+                join = await booking_notify.push_to_google(
+                    db,
+                    event,
+                    invitee_email=appointment.invitee_email,
+                    invitee_name=appointment.invitee_name,
+                    rep_email=rep.email if rep else None,
+                    rep_name=rep.name if rep else None,
+                    staff_attendees=staff_attendees,
+                    private_properties=private_properties,
+                    want_meet=bool(booking.google_meet_enabled and needs_meet),
+                )
+                if join and not appointment.join_url:
+                    appointment.join_url = join
+                    notice.join_url = join
+                    event.description = f"{event.description or ''}\n\nJoin: {join}".strip()
+
+            google_ready = bool(event.google_event_id) and (
+                appointment.meeting_mode != "video"
+                or not booking.google_meet_enabled
+                or bool(appointment.join_url)
+            )
+            if not google_ready:
+                if notice.delivery_attempt_count >= _INITIAL_DELIVERY_MAX_ATTEMPTS:
+                    notice.record_delivery_error("google_calendar_action_required")
+                    notice.delivery_next_attempt_at = None
+                else:
+                    notice.record_delivery_error("google_calendar_pending")
+                    backoff_minutes = min(
+                        60, 2 ** min(notice.delivery_attempt_count, 6)
+                    )
+                    notice.delivery_next_attempt_at = now + timedelta(
+                        minutes=backoff_minutes
+                    )
+                await db.commit()
+                continue
+
+            if (
+                appointment.invitee_email
+                and booking.confirmation_email_enabled
+                and notice.confirmation_email_status == "pending"
+            ):
+                result = await asyncio.to_thread(
+                    booking_notify.send_invitee_invite,
+                    host,
+                    booking,
+                    event,
+                    appointment.starts_at,
+                    invitee_name=appointment.invitee_name,
+                    invitee_email=appointment.invitee_email,
+                    join_url=appointment.join_url,
+                )
+                notice.confirmation_email_status = (
+                    "sent" if result and result.ok else "failed"
+                )
+                if result and result.ok:
+                    notice.clear_delivery_error()
+                else:
+                    notice.record_delivery_error(
+                        result.detail if result else "email_provider_unavailable"
+                    )
+
+            if notice.confirmation_sms_status == "pending":
+                await db.flush()
+                await send_confirmation_sms(
+                    db,
+                    notice,
+                    event,
+                    timezone_name=appointment.timezone,
+                    commit=False,
+                )
+
+            if _initial_delivery_complete(
+                notice,
+                event,
+                appointment,
+                google_meet_enabled=booking.google_meet_enabled,
+            ):
+                notice.delivery_completed_at = datetime.now(UTC)
+                notice.delivery_next_attempt_at = None
+                notice.clear_delivery_error()
+                completed += 1
+            elif (
+                notice.confirmation_email_status == "failed"
+                or notice.confirmation_sms_status == "failed"
+            ):
+                # Unknown provider outcomes are never blindly repeated. The
+                # existing delivery retry action lets an employee choose.
+                notice.delivery_next_attempt_at = None
+            else:
+                notice.delivery_next_attempt_at = now + timedelta(minutes=5)
+            await db.commit()
+    return completed
 
 
 #: Placeholders an operator can put in a reminder message. Kept small and

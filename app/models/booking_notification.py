@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -62,6 +63,17 @@ class BookingNotification(TimestampMixin, Base):
     #: any later write to the booking moves `updated_at`, so a resolved
     #: failure redated itself every time a reminder went out.
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable initial-delivery retry state. Confirmations and Google sync are
+    # intentionally completed after the local appointment transaction, so an
+    # API timeout/restart cannot lose the work.
+    delivery_attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    delivery_last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    delivery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Pre-call prep. Field Desk bookings use a DealerBusiness; enabled direct
     # booking pages and opted-in operator appointments use an AI Intake. The
     # reminder sequence hangs off the booking notification in both cases.
@@ -151,4 +163,110 @@ class BookingNotificationReminder(TimestampMixin, Base):
             name="uq_booking_notification_reminder_schedule",
         ),
         Index("ix_booking_notification_reminders_due", "status", "due_at"),
+    )
+
+
+class BookingDeliveryOperation(TimestampMixin, Base):
+    """A durable booking change whose provider work happens after commit.
+
+    Initial delivery and later cancellation/update delivery use distinct
+    operations and effect rows.  That separation prevents a stale
+    confirmation from being mistaken for the current lifecycle action while
+    giving every booking surface the same crash-safe provider boundary.
+    """
+
+    __tablename__ = "booking_delivery_operations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    appointment_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dos_rep_appointments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("calendar_events.id", ondelete="SET NULL")
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    operation_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(160), nullable=False, unique=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "operation_type IN ('create','cancel','reschedule','update')",
+            name="ck_booking_delivery_operation_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending','processing','completed','action_required','superseded')",
+            name="ck_booking_delivery_operation_status",
+        ),
+        Index(
+            "ix_booking_delivery_operations_due",
+            "status",
+            "next_attempt_at",
+        ),
+    )
+
+
+class BookingDeliveryEffect(TimestampMixin, Base):
+    """One idempotency boundary within a booking lifecycle operation."""
+
+    __tablename__ = "booking_delivery_effects"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("booking_delivery_operations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    effect_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_message_id: Mapped[str | None] = mapped_column(String(300))
+    error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_id",
+            "effect_key",
+            name="uq_booking_delivery_effect_operation_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending','processing','sent','failed','unavailable','skipped','action_required')",
+            name="ck_booking_delivery_effect_status",
+        ),
+        Index(
+            "ix_booking_delivery_effects_operation_status",
+            "operation_id",
+            "status",
+        ),
     )

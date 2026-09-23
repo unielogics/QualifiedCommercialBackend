@@ -561,10 +561,20 @@ async def job_form_pdf_refresh() -> None:
 
 
 async def job_booking_reminders() -> None:
-    """Deliver persisted booking reminders exactly once per channel."""
-    from app.services.booking_reminders import dispatch_due_reminders
+    """Deliver persisted booking operations and reminders exactly once."""
+    from app.services.booking_operations import dispatch_due_operations
+    from app.services.booking_reminders import (
+        dispatch_due_reminders,
+        dispatch_pending_confirmations,
+    )
 
+    operated = await dispatch_due_operations()
+    confirmed = await dispatch_pending_confirmations()
     sent = await dispatch_due_reminders()
+    if operated:
+        log.info("booking_operations completed=%d", operated)
+    if confirmed:
+        log.info("booking_confirmations completed=%d", confirmed)
     if sent:
         log.info("booking_reminders sent=%d", sent)
 

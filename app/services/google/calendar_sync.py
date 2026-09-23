@@ -21,6 +21,7 @@ best-effort: callers wrap it so a Google outage never breaks the local write.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -39,6 +40,7 @@ from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatu
 from app.models.event import CalendarEvent
 from app.models.google_account import GoogleAccount
 from app.models.user import User
+from app.services import booking_metrics
 from app.services.google import google_oauth_client
 from app.services.google.google_oauth_client import CALENDAR_SCOPES
 from app.services.notifications import notify_users
@@ -55,6 +57,17 @@ def _google_pull_external_ref(user_id: uuid.UUID, google_event_id: str) -> str:
 
 
 _DEFAULT_DURATION_MIN = 30
+_GOOGLE_READ_TIMEOUT_SECONDS = 12
+_GOOGLE_WRITE_TIMEOUT_SECONDS = 15
+
+
+def _emit_provider_failure(operation: str, exc: BaseException) -> None:
+    metric = (
+        "booking.provider.timeout"
+        if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold()
+        else "booking.provider.error"
+    )
+    booking_metrics.emit(metric, provider="google", operation=operation)
 
 _RSVP_MAP = {
     "needsaction": "needs_action",
@@ -220,8 +233,9 @@ async def busy_periods(
         google_oauth_client.GoogleTokenRevoked,
     ):
         return CalendarBusySnapshot(status="disconnected", intervals=[])
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("calendar freebusy: credential resolution failed user=%s", user_id)
+        _emit_provider_failure("freebusy", exc)
         return CalendarBusySnapshot(status="unavailable", intervals=[])
 
     start = time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)
@@ -242,11 +256,12 @@ async def busy_periods(
         )
 
     try:
-        import asyncio
-
-        response = await asyncio.to_thread(_query)
+        response = await asyncio.wait_for(
+            asyncio.to_thread(_query), timeout=_GOOGLE_READ_TIMEOUT_SECONDS
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("calendar freebusy failed user=%s: %s", user_id, exc)
+        _emit_provider_failure("freebusy", exc)
         return CalendarBusySnapshot(status="unavailable", intervals=[])
 
     intervals: list[tuple[datetime, datetime]] = []
@@ -259,7 +274,12 @@ async def busy_periods(
     return CalendarBusySnapshot(status="connected", intervals=intervals)
 
 
-def _event_body(ev: CalendarEvent, *, color_id: str | None = None) -> dict:
+def _event_body(
+    ev: CalendarEvent,
+    *,
+    color_id: str | None = None,
+    private_properties: dict[str, object] | None = None,
+) -> dict:
     """Map an internal CalendarEvent to a Google Calendar event resource."""
     start = ev.starts_at
     if start.tzinfo is None:
@@ -274,6 +294,26 @@ def _event_body(ev: CalendarEvent, *, color_id: str | None = None) -> dict:
         body["description"] = ev.description
     if color_id:
         body["colorId"] = color_id
+    # Google Calendar private extended properties are not shown to invitees,
+    # but they make a provider event traceable to the exact QC record without
+    # scraping the human-readable description.  Keep the generic identifiers
+    # on every event and let workflow callers add their own stable references.
+    private = {
+        "qc_event_id": str(ev.id),
+        "qc_owner_user_id": str(ev.owner_user_id) if ev.owner_user_id else "",
+        "qc_external_ref_kind": str(ev.external_ref_kind or ""),
+        "qc_external_ref_id": str(ev.external_ref_id or ""),
+    }
+    private.update(
+        {
+            str(key): str(value)
+            for key, value in (private_properties or {}).items()
+            if key and value is not None and str(value)
+        }
+    )
+    body["extendedProperties"] = {
+        "private": {key: value for key, value in private.items() if value}
+    }
     # Cancelled internal events map to a Google 'cancelled' status on patch.
     if ev.status == CalendarEventStatus.CANCELLED:
         body["status"] = "cancelled"
@@ -315,6 +355,7 @@ async def push_event(
     want_conference: bool = False,
     send_updates: str | None = None,
     color_id: str | None = None,
+    private_properties: dict[str, object] | None = None,
 ) -> str | None:
     """Mirror one internal event to the owner's Google primary calendar.
 
@@ -338,8 +379,9 @@ async def push_event(
         creds = await google_oauth_client.credentials_for_user(db, ev.owner_user_id, CALENDAR_SCOPES)
     except (google_oauth_client.GoogleNotConnected, google_oauth_client.GoogleScopeMissing, google_oauth_client.GoogleTokenRevoked):
         return None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("calendar push: credential resolution failed owner=%s", ev.owner_user_id)
+        _emit_provider_failure("calendar_write", exc)
         return None
 
     cal_id = ev.google_calendar_id or "primary"
@@ -347,12 +389,17 @@ async def push_event(
     # the same internal row can't create two Google events. Google-origin rows
     # already carry their real google_event_id.
     gid = ev.google_event_id or _deterministic_google_id(ev)
-    body = _event_body(ev, color_id=color_id)
+    body = _event_body(
+        ev,
+        color_id=color_id,
+        private_properties=private_properties,
+    )
     if attendees:
         body["attendees"] = attendees
-    if want_conference and not ev.google_event_id:
-        # Only on insert. Asking again on patch replaces the existing link and
-        # invalidates the one already sitting in the invitee's invitation.
+    if want_conference:
+        # Callers request a conference only while their appointment has no
+        # stored join URL. Supporting patch here lets a failed first insert be
+        # retried without minting a second local or Google event.
         body["conferenceData"] = {
             "createRequest": {
                 "requestId": _deterministic_google_id(ev),
@@ -365,6 +412,8 @@ async def push_event(
         extra: dict = {}
         if send_updates:
             extra["sendUpdates"] = send_updates
+        if want_conference:
+            extra["conferenceDataVersion"] = 1
         if deleted:
             if ev.google_event_id:
                 try:
@@ -378,9 +427,6 @@ async def push_event(
         # (409, e.g. a racing duplicate push), patch it instead of duplicating.
         insert_body = {**body, "id": gid}
         insert_extra = dict(extra)
-        if want_conference:
-            # Without this version flag Google drops the createRequest silently.
-            insert_extra["conferenceDataVersion"] = 1
         try:
             return svc.events().insert(calendarId=cal_id, body=insert_body, **insert_extra).execute()
         except Exception as exc:  # noqa: BLE001
@@ -389,11 +435,12 @@ async def push_event(
             raise
 
     try:
-        import asyncio
-
-        resp = await asyncio.to_thread(_do)
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(_do), timeout=_GOOGLE_WRITE_TIMEOUT_SECONDS
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("calendar push failed event=%s owner=%s: %s", ev.id, ev.owner_user_id, exc)
+        _emit_provider_failure("calendar_write", exc)
         return None
 
     if resp is None:
@@ -458,8 +505,6 @@ async def pull_events(db: AsyncSession, user_id: uuid.UUID, *, max_pages: int = 
             # Full sync: bound the window so we don't ingest years of history.
             params["timeMin"] = (datetime.now(UTC) - timedelta(days=30)).isoformat()
         return svc.events().list(**params).execute()
-
-    import asyncio
 
     applied = 0
     page_token: str | None = None

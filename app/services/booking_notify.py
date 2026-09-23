@@ -80,8 +80,8 @@ def notify_host(
     invitee_phone: str | None,
     notes: str | None,
     join_url: str | None = None,
-) -> None:
-    """Tell the host a call was booked. Never raises."""
+) -> SesSendResult | None:
+    """Tell the host a call was booked and expose the provider result."""
     to = _host_email(user)
     if not to:
         return
@@ -108,8 +108,10 @@ def notify_host(
         )
         if not result.ok:
             log.warning("booking: host notify failed to=%s detail=%s", to, result.detail)
+        return result
     except Exception:  # noqa: BLE001
         log.exception("booking: host notification raised")
+        return None
 
 
 def send_invitee_invite(
@@ -258,6 +260,8 @@ async def push_to_google(
     invitee_name: str,
     rep_email: str | None = None,
     rep_name: str | None = None,
+    staff_attendees: list[dict] | None = None,
+    private_properties: dict[str, object] | None = None,
     want_meet: bool = True,
     color_id: str | None = None,
     send_updates: str | None = "all",
@@ -271,11 +275,49 @@ async def push_to_google(
     try:
         from app.services.google.calendar_sync import push_event
 
+        # Every later reschedule, cancellation, outcome-color update, or manual
+        # retry must preserve the prospect's private references and both staff
+        # guests. Centralizing the lookup here prevents a legacy caller from
+        # replacing the Google attendees/properties with only its one ``rep``.
+        if getattr(event, "external_ref_kind", None) == "dealer_rep_appointment":
+            from sqlalchemy import select
+
+            from app.dealer_os.models import DealerRepAppointment
+
+            appointment = (
+                await db.execute(
+                    select(DealerRepAppointment).where(
+                        DealerRepAppointment.calendar_event_id == event.id
+                    )
+                )
+            ).scalar_one_or_none()
+            if appointment is not None:
+                automatic_staff, automatic_private = await prospect_google_context(
+                    db, appointment
+                )
+                staff_attendees = [*automatic_staff, *(staff_attendees or [])]
+                private_properties = {
+                    **automatic_private,
+                    **(private_properties or {}),
+                }
+
         attendees: list[dict] = []
+        seen_emails: set[str] = set()
+
+        def add_attendee(email: str | None, display_name: str | None) -> None:
+            normalized = (email or "").strip().lower()
+            if not normalized or normalized in seen_emails:
+                return
+            seen_emails.add(normalized)
+            attendees.append(
+                {"email": normalized, "displayName": display_name or normalized}
+            )
+
         if invitee_email:
-            attendees.append({"email": invitee_email, "displayName": invitee_name})
-        if rep_email and rep_email.lower() != (invitee_email or "").lower():
-            attendees.append({"email": rep_email, "displayName": rep_name or rep_email})
+            add_attendee(invitee_email, invitee_name)
+        add_attendee(rep_email, rep_name)
+        for attendee in staff_attendees or []:
+            add_attendee(attendee.get("email"), attendee.get("displayName"))
         return await push_event(
             db,
             event,
@@ -283,7 +325,51 @@ async def push_to_google(
             want_conference=want_meet,
             send_updates=send_updates,
             color_id=color_id,
+            private_properties=private_properties,
         )
     except Exception:  # noqa: BLE001
         log.exception("booking: google push failed event=%s", getattr(event, "id", None))
         return None
+
+
+async def prospect_google_context(
+    db: AsyncSession,
+    appointment,
+) -> tuple[list[dict[str, str]], dict[str, object]]:
+    """Return staff guests and private provider metadata for a prospect booking.
+
+    The shared-calendar owner already owns the event.  The assigned agent and
+    the employee who booked it are added as guests (deduplicated later by
+    :func:`push_to_google`) so reassignment and assisted booking are both
+    visible on the Google event.  Private properties keep provider callbacks
+    traceable without putting internal identifiers in invitee-visible copy.
+    """
+
+    from app.models.dealer_prospect import DealerProspect
+    from app.models.user import User
+
+    prospect_id = getattr(appointment, "prospect_id", None)
+    prospect = await db.get(DealerProspect, prospect_id) if prospect_id else None
+    assigned_user_id = getattr(prospect, "owner_user_id", None) if prospect else None
+    booked_by_user_id = getattr(appointment, "booked_by_user_id", None)
+    attendees: list[dict[str, str]] = []
+    for user_id in dict.fromkeys((booked_by_user_id, assigned_user_id)):
+        if not user_id:
+            continue
+        member = await db.get(User, user_id)
+        if member is not None and member.email:
+            attendees.append(
+                {
+                    "email": member.email,
+                    "displayName": member.name or member.email,
+                }
+            )
+    properties: dict[str, object] = {
+        "qc_appointment_id": getattr(appointment, "id", None),
+        "qc_prospect_id": prospect_id,
+        "qc_contact_id": getattr(appointment, "contact_id", None),
+        "qc_booked_by_user_id": booked_by_user_id,
+        "qc_owner_user_id": getattr(appointment, "owner_user_id", None),
+        "qc_assigned_user_id": assigned_user_id,
+    }
+    return attendees, properties

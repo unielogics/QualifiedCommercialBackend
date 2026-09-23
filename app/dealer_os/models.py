@@ -648,6 +648,7 @@ class DealerRepAppointment(TimestampMixin, Base):
         Index("ix_dos_rep_appointments_dealer", "dealer_id", "starts_at"),
         Index("ix_dos_rep_appointments_owner", "owner_user_id", "starts_at"),
         Index("ix_dos_rep_appointments_event", "calendar_event_id"),
+        Index("ix_dos_rep_appointments_prospect", "prospect_id", "starts_at"),
         Index("ix_dos_rep_appointments_crm_status", "crm_status", "follow_up_at"),
         CheckConstraint(
             "crm_status IN ('scheduled','confirmed','completed','follow_up','no_show','not_qualified','converted','cancelled')",
@@ -667,6 +668,19 @@ class DealerRepAppointment(TimestampMixin, Base):
     )
     contact_id: Mapped[uuid.UUID | None] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("dos_rep_contacts.id", ondelete="SET NULL")
+    )
+    # Marketing prospect bookings retain their source identity rather than
+    # looking a contact up again from mutable email/phone text.  The client
+    # request key makes a browser retry after a timeout return this same row.
+    prospect_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("dealer_prospects.id", ondelete="SET NULL")
+    )
+    creation_idempotency_key: Mapped[str | None] = mapped_column(
+        String(80), unique=True
+    )
+    return_stage_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("dealer_prospect_stage_definitions.id", ondelete="SET NULL"),
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="callback", server_default="callback")
     title: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -1452,6 +1466,16 @@ class DealerRepContact(TimestampMixin, Base):
         Index("ix_dos_rep_contacts_owner", "owner_user_id", "last_activity_at"),
         Index("ix_dos_rep_contacts_email", "owner_user_id", "email"),
         Index("ix_dos_rep_contacts_phone", "owner_user_id", "phone_e164"),
+        Index(
+            "ix_dos_rep_contacts_email_identity",
+            text("lower(email)"),
+            postgresql_where=text("email IS NOT NULL"),
+        ),
+        Index(
+            "ix_dos_rep_contacts_phone_identity",
+            "phone_e164",
+            postgresql_where=text("phone_e164 IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _pk()

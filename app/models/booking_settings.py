@@ -119,6 +119,15 @@ class BookingSettings(TimestampMixin, Base):
         default=2,
         server_default="2",
     )
+    # Minute precision is authoritative. ``minimum_notice_days`` remains for
+    # one compatibility release so older Field Desk clients can continue to
+    # round-trip the policy while they migrate to the unit-aware control.
+    minimum_notice_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=2880,
+        server_default="2880",
+    )
     maximum_advance_days: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -169,3 +178,20 @@ class BookingSettings(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_booking_settings_enabled_slug", "enabled", "slug"),
     )
+
+
+class BookingSlugAlias(TimestampMixin, Base):
+    """A retired public booking slug that still resolves to its owner."""
+
+    __tablename__ = "booking_slug_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)

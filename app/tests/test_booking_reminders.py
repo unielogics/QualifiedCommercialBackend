@@ -11,6 +11,8 @@ from app.models.event import CalendarEvent
 from app.schemas.booking_settings import UserBookingSettingsUpdate
 from app.services import booking_reminders
 from app.services.booking_availability import (
+    available_slot_starts,
+    booking_date_page,
     booking_window_bounds,
     daily_booking_windows,
     slot_fits_daily_schedule,
@@ -36,6 +38,46 @@ class _FakeSession:
 
     async def commit(self) -> None:
         return None
+
+
+def test_booking_date_page_returns_complete_local_dates_and_next_cursor() -> None:
+    zone = ZoneInfo("America/New_York")
+    earliest = datetime(2026, 9, 23, 14, 17, tzinfo=zone)
+    window_end = datetime(2026, 10, 3, 23, 59, 59, tzinfo=zone)
+
+    first = booking_date_page(earliest, window_end, days=3)
+    assert first.page_start_date.isoformat() == "2026-09-23"
+    assert first.page_end_date.isoformat() == "2026-09-25"
+    assert first.earliest_local == earliest
+    assert first.window_end_local.date() == first.page_end_date
+    assert first.window_end_local.time() == datetime.max.time()
+    assert first.next_start_date.isoformat() == "2026-09-26"
+    assert first.configured_window_end_date.isoformat() == "2026-10-03"
+
+    final = booking_date_page(
+        earliest,
+        window_end,
+        start_date=first.next_start_date,
+        days=30,
+    )
+    assert final.page_start_date.isoformat() == "2026-09-26"
+    assert final.page_end_date.isoformat() == "2026-10-03"
+    assert final.window_end_local == window_end
+    assert final.next_start_date is None
+
+
+def test_booking_date_page_rejects_dates_outside_the_configured_window() -> None:
+    zone = ZoneInfo("America/New_York")
+    earliest = datetime(2026, 9, 23, 14, 17, tzinfo=zone)
+    window_end = datetime(2026, 9, 30, 23, 59, 59, tzinfo=zone)
+
+    with pytest.raises(ValueError, match="outside"):
+        booking_date_page(
+            earliest,
+            window_end,
+            start_date=(window_end + timedelta(days=1)).date(),
+            days=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -294,6 +336,25 @@ def test_booking_settings_rejects_reversed_advance_window() -> None:
         )
 
 
+def test_booking_settings_accepts_minute_notice_and_normalizes_legacy_days() -> None:
+    minute_payload = UserBookingSettingsUpdate(
+        advance_booking_window_enabled=True,
+        minimum_notice_minutes=90,
+        maximum_advance_days=5,
+    )
+    assert minute_payload.minimum_notice_minutes == 90
+    # The retained legacy field rounds up so an old client never weakens the
+    # configured minimum if it subsequently edits the policy.
+    assert minute_payload.minimum_notice_days == 1
+
+    legacy_payload = UserBookingSettingsUpdate(
+        advance_booking_window_enabled=True,
+        minimum_notice_days=2,
+        maximum_advance_days=5,
+    )
+    assert legacy_payload.minimum_notice_minutes == 2 * 24 * 60
+
+
 def test_booking_settings_rejects_unknown_firm_policy_overrides() -> None:
     with pytest.raises(ValueError, match="Unknown firm policy override"):
         UserBookingSettingsUpdate(firm_policy_overrides=["not_a_real_setting"])
@@ -332,6 +393,91 @@ def test_booking_window_uses_custom_days_only_when_enabled() -> None:
     default_earliest, default_latest = booking_window_bounds(default, now)
     assert default_earliest == datetime(2026, 8, 31, 12, 15, tzinfo=zone)
     assert default_latest.date().isoformat() == "2026-09-15"
+
+
+def test_booking_window_uses_minute_precision_and_inclusive_final_day() -> None:
+    zone = ZoneInfo("America/New_York")
+    now = datetime(2026, 9, 1, 16, 45, tzinfo=zone)
+    booking = SimpleNamespace(
+        advance_booking_window_enabled=True,
+        minimum_notice_minutes=90,
+        minimum_notice_days=2,
+        maximum_advance_days=10,
+    )
+
+    earliest, latest = booking_window_bounds(booking, now)
+
+    assert earliest == datetime(2026, 9, 1, 18, 15, tzinfo=zone)
+    assert latest == datetime(2026, 9, 11, 23, 59, 59, 999999, tzinfo=zone)
+
+
+def test_available_slots_are_not_globally_truncated_and_dates_are_complete() -> None:
+    zone = ZoneInfo("America/New_York")
+    first_day = datetime(2026, 9, 21, 9, 0, tzinfo=zone)
+    last_day = datetime(2026, 9, 30, 23, 59, 59, tzinfo=zone)
+    booking = SimpleNamespace(
+        weekly_schedule=[],
+        available_days=[1, 2, 3, 4, 5],
+        start_time="09:00",
+        end_time="18:00",
+        buffer_before_min=0,
+        buffer_after_min=0,
+        blocked_intervals=[],
+    )
+    # A fully busy first date must not prevent later dates from being returned.
+    starts = available_slot_starts(
+        booking,
+        earliest_local=first_day,
+        window_end_local=last_day,
+        duration_min=15,
+        busy_intervals=[
+            (
+                datetime(2026, 9, 21, 9, 0, tzinfo=zone),
+                datetime(2026, 9, 21, 18, 0, tzinfo=zone),
+            )
+        ],
+    )
+
+    counts_by_day = {
+        day: sum(start.date() == day for start in starts)
+        for day in {start.date() for start in starts}
+    }
+    assert len(starts) > 80
+    assert datetime(2026, 9, 21).date() not in counts_by_day
+    # 15-minute meetings on five-minute starts from 09:00 through 17:45.
+    assert set(counts_by_day.values()) == {106}
+    assert datetime(2026, 9, 30).date() in counts_by_day
+
+
+def test_available_slots_apply_candidate_and_existing_event_buffers() -> None:
+    zone = ZoneInfo("America/New_York")
+    booking = SimpleNamespace(
+        weekly_schedule=[],
+        available_days=[1],
+        start_time="09:00",
+        end_time="12:00",
+        buffer_before_min=5,
+        buffer_after_min=5,
+        blocked_intervals=[],
+    )
+    # The existing event ran 10:00-10:30 and its interval has already been
+    # expanded by its own five-minute buffers. A candidate also needs its own
+    # five-minute buffer, so 10:35 is still too close and 10:40 is first valid.
+    starts = available_slot_starts(
+        booking,
+        earliest_local=datetime(2026, 9, 21, 9, 0, tzinfo=zone),
+        window_end_local=datetime(2026, 9, 21, 23, 59, tzinfo=zone),
+        duration_min=20,
+        busy_intervals=[
+            (
+                datetime(2026, 9, 21, 9, 55, tzinfo=zone),
+                datetime(2026, 9, 21, 10, 35, tzinfo=zone),
+            )
+        ],
+    )
+
+    assert datetime(2026, 9, 21, 10, 35, tzinfo=zone) not in starts
+    assert datetime(2026, 9, 21, 10, 40, tzinfo=zone) in starts
 
 
 def test_daily_booking_windows_supports_different_and_split_day_hours() -> None:

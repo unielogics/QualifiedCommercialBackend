@@ -26,6 +26,7 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from time import perf_counter
 
 
 @dataclass(frozen=True)
@@ -134,4 +135,42 @@ class RequestContextMiddleware:
                 incoming = value.decode("latin-1", "ignore").strip()[:64]
                 break
         with bind(request_id=incoming or new_id(), actor_label="public"):
-            await self.app(scope, receive, send)
+            # Keep route-level booking latency and error metrics in the same
+            # correlation context as audit rows and provider effects. Import
+            # lazily to avoid making the context primitive depend on services
+            # during application startup.
+            from app.services import booking_metrics
+
+            route = booking_metrics.route_name(str(scope.get("path") or ""))
+            if route is None:
+                await self.app(scope, receive, send)
+                return
+
+            started = perf_counter()
+            response_status = 500
+
+            async def observe(message):
+                nonlocal response_status
+                if message.get("type") == "http.response.start":
+                    response_status = int(message.get("status") or 500)
+                await send(message)
+
+            try:
+                await self.app(scope, receive, observe)
+            finally:
+                duration_ms = round((perf_counter() - started) * 1000, 2)
+                booking_metrics.emit(
+                    "booking.http.duration",
+                    duration_ms,
+                    unit="milliseconds",
+                    route=route,
+                    method=str(scope.get("method") or ""),
+                    status_code=response_status,
+                )
+                if response_status >= 400:
+                    booking_metrics.emit(
+                        "booking.http.error",
+                        route=route,
+                        method=str(scope.get("method") or ""),
+                        status_code=response_status,
+                    )

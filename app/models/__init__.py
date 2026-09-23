@@ -69,7 +69,7 @@ from app.models.billing import (  # noqa: F401
     ESignEvent,
     PaymentAuthorization,
 )
-from app.models.booking_settings import BookingSettings  # noqa: F401
+from app.models.booking_settings import BookingSettings, BookingSlugAlias  # noqa: F401
 from app.models.broker import Broker  # noqa: F401
 from app.models.business_financial_statement import BusinessFinancialStatement  # noqa: F401
 from app.models.bucket import (  # noqa: F401
@@ -90,7 +90,12 @@ from app.models.bucket import (  # noqa: F401
     BucketUploadLink,
     BucketVendorAccess,
 )
-from app.models.booking_notification import BookingNotification, BookingNotificationReminder  # noqa: F401
+from app.models.booking_notification import (  # noqa: F401
+    BookingDeliveryEffect,
+    BookingDeliveryOperation,
+    BookingNotification,
+    BookingNotificationReminder,
+)
 from app.models.capital_partner_application import (  # noqa: F401
     APPLICATION_STATUSES,
     CapitalPartnerApplication,

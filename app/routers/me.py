@@ -41,7 +41,11 @@ from app.schemas.booking_settings import (
     UserBookingSettingsUpdate,
 )
 from app.services.payment_authorization import primary_super_admin
-from app.services.team_calendar import INHERITABLE_BOOKING_FIELDS, effective_booking_settings
+from app.services.team_calendar import (
+    INHERITABLE_BOOKING_FIELDS,
+    effective_booking_settings,
+    retain_booking_slug_alias,
+)
 from app.schemas.broker_settings import AgentSettingsData, AgentSettingsRead
 from app.schemas.stored_signature import StoredSignatureAdoptBody, StoredSignatureState
 from app.services import stored_signatures as stored_sigs
@@ -180,6 +184,7 @@ def _booking_settings_read(row: BookingSettings) -> UserBookingSettingsRead:
         weekly_schedule=weekly_schedule,
         advance_booking_window_enabled=row.advance_booking_window_enabled,
         minimum_notice_days=row.minimum_notice_days,
+        minimum_notice_minutes=row.minimum_notice_minutes,
         maximum_advance_days=row.maximum_advance_days,
         blocked_intervals=row.blocked_intervals or [],
         booking_questions=row.booking_questions or {
@@ -371,6 +376,7 @@ def _apply_booking_settings(row: BookingSettings, payload: UserBookingSettingsUp
     row.weekly_schedule = [schedule.model_dump() for schedule in payload.weekly_schedule]
     row.advance_booking_window_enabled = payload.advance_booking_window_enabled
     row.minimum_notice_days = payload.minimum_notice_days
+    row.minimum_notice_minutes = payload.minimum_notice_minutes
     row.maximum_advance_days = payload.maximum_advance_days
     row.blocked_intervals = [interval.model_dump() for interval in payload.blocked_intervals]
     row.booking_questions = dict(payload.booking_questions)
@@ -490,6 +496,16 @@ async def put_booking_settings(
         if existing is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"booking slug {payload.slug!r} is already used")
 
+    previous_slug = row.slug
+    try:
+        await retain_booking_slug_alias(
+            db,
+            user_id=user.id,
+            previous_slug=previous_slug,
+            next_slug=payload.slug,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     _apply_booking_settings(row, payload)
 
     await db.commit()
@@ -527,6 +543,16 @@ async def put_team_booking_settings(
         ).scalar_one_or_none()
         if existing is not None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"booking slug {payload.slug!r} is already used")
+    previous_slug = row.slug
+    try:
+        await retain_booking_slug_alias(
+            db,
+            user_id=target.id,
+            previous_slug=previous_slug,
+            next_slug=payload.slug,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     _apply_booking_settings(row, payload)
     db.add(
         Activity(

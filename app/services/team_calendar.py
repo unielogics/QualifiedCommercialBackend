@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import uuid
+from time import perf_counter
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.booking_settings import BookingSettings
+from app.models.booking_settings import BookingSettings, BookingSlugAlias
 from app.models.user import User
+from app.services import booking_metrics
 from app.services.payment_authorization import primary_super_admin
 
 INHERITABLE_BOOKING_FIELDS = frozenset({
@@ -35,6 +37,7 @@ INHERITABLE_BOOKING_FIELDS = frozenset({
     "weekly_schedule",
     "advance_booking_window_enabled",
     "minimum_notice_days",
+    "minimum_notice_minutes",
     "maximum_advance_days",
     "blocked_intervals",
     "booking_questions",
@@ -77,7 +80,50 @@ async def effective_booking_settings(
 
 async def lock_calendar_owner(db: AsyncSession, user_id: uuid.UUID) -> None:
     """Serialize bookings for one calendar owner inside the caller transaction."""
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    started = perf_counter()
+    try:
+        await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    finally:
+        booking_metrics.emit(
+            "booking.calendar_owner_lock.wait",
+            round((perf_counter() - started) * 1000, 2),
+            unit="milliseconds",
+        )
+
+
+async def retain_booking_slug_alias(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    previous_slug: str | None,
+    next_slug: str | None,
+) -> None:
+    """Keep published booking URLs alive when their canonical slug changes."""
+
+    old = (previous_slug or "").strip() or None
+    new = (next_slug or "").strip() or None
+    if old == new:
+        return
+    if new:
+        reclaimed = (
+            await db.execute(
+                select(BookingSlugAlias).where(BookingSlugAlias.slug == new)
+            )
+        ).scalar_one_or_none()
+        if reclaimed is not None:
+            if reclaimed.user_id != user_id:
+                raise ValueError(f"booking slug {new!r} is already used")
+            await db.delete(reclaimed)
+    if old:
+        existing = (
+            await db.execute(
+                select(BookingSlugAlias).where(BookingSlugAlias.slug == old)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(BookingSlugAlias(user_id=user_id, slug=old))
+        elif existing.user_id != user_id:
+            raise ValueError(f"booking slug {old!r} is already used")
 
 
 async def team_calendar_host(db: AsyncSession) -> User:
@@ -119,6 +165,7 @@ async def team_booking_settings(db: AsyncSession, host: User | None = None) -> t
         )
         db.add(row)
         await db.flush()
-        await db.commit()
-        await db.refresh(row)
+        # The caller owns the transaction. Committing here can silently
+        # release prospect/contact/calendar locks acquired earlier in a
+        # booking workflow and split what must be one atomic local change.
     return host, row

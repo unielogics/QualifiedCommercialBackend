@@ -97,6 +97,7 @@ async def notify_users(
     meta: dict[str, Any] | None = None,
     batch_key: str | None = None,
     email: bool = False,
+    defer_email: bool = False,
     push: bool = True,
     actor_user_id: UUID | None = None,
 ) -> list[Notification]:
@@ -168,7 +169,7 @@ async def notify_users(
                 },
             )
             row.pushed_at = now
-        if email and recipient.email:
+        if email and recipient.email and not defer_email:
             # emailed_at used to be stamped here, next to a fire-and-forget task
             # whose result was discarded — so a bounced or refused send was
             # recorded as a delivered one, on every caller. Stamp it only when
@@ -352,6 +353,41 @@ async def _send_notification_email(
         # The recipient is a colleague, so the notification is theirs to see.
         subject=outbox.Subject(owner_user_id=owner_user_id),
     )
+    return result
+
+
+async def deliver_deferred_notification_email(
+    db: AsyncSession, notification_id: UUID
+) -> SesSendResult | None:
+    """Deliver one already-persisted notification email exactly once.
+
+    Lifecycle routes use ``notify_users(..., email=True, defer_email=True)`` so
+    the in-app record and requested channels commit atomically with the local
+    appointment change.  The booking operation worker calls this function
+    later.  ``emailed_at`` is the durable success gate; the surrounding effect
+    row supplies the stronger in-flight/idempotency boundary.
+    """
+
+    row = await db.get(Notification, notification_id)
+    if row is None:
+        return None
+    if row.emailed_at is not None:
+        return SesSendResult(True, None, "already_sent")
+    recipient = await db.get(User, row.recipient_user_id)
+    if recipient is None or not recipient.email:
+        return None
+    result = await _send_notification_email(
+        db,
+        recipient.email,
+        subject=row.title,
+        body=f"{row.body}\n\nOpen Qualified Commercial: {row.deep_link or '/'}",
+        event_type=row.event_type,
+        owner_user_id=recipient.id,
+    )
+    if result.ok:
+        row.emailed_at = datetime.now(UTC)
+    else:
+        row.meta = {**(row.meta or {}), "email_error": result.detail[:200]}
     return result
 
 

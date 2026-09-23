@@ -31,8 +31,7 @@ import asyncio
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone, tzinfo
-from types import SimpleNamespace
+from datetime import date, datetime, timezone, tzinfo
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -42,24 +41,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
+from app.dealer_os.models import DealerRepAppointment
+from app.dealer_os.schemas import BookingAvailabilityRead
 from app.dealer_os.services import consent_delivery
 from app.dealer_os.services import sms_consent as sms_consent_service
 from app.enums import CalendarEventKind, CalendarEventSource, CalendarEventStatus
 from app.models.activity import Activity
-from app.models.booking_settings import BookingSettings
+from app.models.booking_notification import BookingDeliveryOperation, BookingNotification
+from app.models.booking_settings import BookingSettings, BookingSlugAlias
 from app.models.event import CalendarEvent
 from app.models.user import User
 from app.routers.fred import _build_summary, _current_spreads
 from app.schemas.fred import FredSeriesSummary
 from app.schemas.phone import RequiredPhone
-from app.services import booking_notify, booking_reminders
+from app.services import booking_operations, booking_reminders
 from app.services import fred as fred_service
-from app.services.booking_availability import (
-    booking_window_bounds,
-    daily_booking_windows,
-    slot_overlaps_blocked_interval,
-)
-from app.services.google import calendar_sync
 from app.services.team_calendar import effective_booking_settings, lock_calendar_owner
 
 log = logging.getLogger(__name__)
@@ -75,6 +71,7 @@ CAPITAL_PARTNER_NOTIFY = ("franco@qualifiedcommercial.com", "support@qualifiedco
 # Best-effort in-memory throttle (single-instance deploy — see scheduler
 # note in app/services/scheduler.py). Maps client IP → last submit ts.
 _LAST_SUBMIT: dict[str, float] = {}
+_LAST_BOOKING_REPLAY: dict[str, float] = {}
 _THROTTLE_SECONDS = 20.0
 
 
@@ -358,9 +355,15 @@ class PublicBookingProfile(BaseModel):
     background_color: str
     duration_min: int
     timezone: str
+    google_meet_enabled: bool = True
+    meeting_mode: Literal["video", "phone"] = "video"
     logo_url: str | None = None
     profile_photo_url: str | None = None
     slots: list[PublicBookingSlot]
+    page_start_date: date
+    page_end_date: date
+    next_start_date: date | None = None
+    window_end_date: date
     #: The exact consent sentence stored as proof when the box is ticked. The
     #: page must render this, not its own paraphrase.
     sms_disclosure_text: str = ""
@@ -374,6 +377,15 @@ class PublicBookingProfile(BaseModel):
 
 
 class PublicBookingCreate(BaseModel):
+    creation_idempotency_key: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        ),
+    )
     starts_at: datetime
     full_name: str = Field(min_length=1, max_length=160)
     email: str = Field(min_length=5, max_length=320)
@@ -396,18 +408,112 @@ class PublicBookingCreateResult(BaseModel):
     #: The client's secure room, when the booking opened a draft file.
     room_url: str | None = None
     pin_delivered_via: str | None = None
+    delivery_state: dict[str, str] | None = None
+
+
+async def _public_booking_replay_result(
+    db: AsyncSession,
+    appointment: DealerRepAppointment,
+    *,
+    include_sensitive: bool,
+) -> PublicBookingCreateResult:
+    """Return the original local booking for an exact retried submission."""
+
+    notice = (
+        await db.execute(
+            select(BookingNotification).where(
+                BookingNotification.event_id == appointment.calendar_event_id
+            )
+        )
+    ).scalar_one_or_none()
+    room_url = None
+    if include_sensitive and notice is not None and notice.precall_dealer_id:
+        from app.dealer_os.models import DealerBusiness
+        from app.dealer_os.services import client_room
+
+        dealer = await db.get(DealerBusiness, notice.precall_dealer_id)
+        room = await client_room.get_room(db, dealer) if dealer is not None else None
+        room_url = room.url if room is not None else None
+    elif include_sensitive and notice is not None and notice.precall_intake_id:
+        from app.dealer_os.services import application_precall
+        from app.models.public_underwriting_intake import PublicUnderwritingIntake
+
+        intake = await db.get(PublicUnderwritingIntake, notice.precall_intake_id)
+        if intake is not None:
+            room = await application_precall.room_for_intake(db, intake)
+            room_url = room.url
+    operation = await booking_operations.find_by_idempotency_key(
+        db, f"booking:create:{appointment.id}"
+    )
+    return PublicBookingCreateResult(
+        ok=True,
+        event_id=str(appointment.calendar_event_id),
+        appointment_id=str(appointment.id),
+        room_url=room_url,
+        pin_delivered_via=(
+            notice.precall_pin_delivered_via
+            if include_sensitive and notice
+            else None
+        ),
+        delivery_state=(
+            await booking_operations.queued_results(db, operation)
+            if operation is not None
+            else None
+        ),
+    )
+
+
+def _assert_public_booking_replay_matches(
+    appointment: DealerRepAppointment,
+    *,
+    owner_user_id: uuid.UUID,
+    starts_at: datetime,
+    duration_min: int,
+    email: str | None,
+    phone: str | None,
+    request_fingerprint: str | None,
+) -> None:
+    if booking_operations.creation_replay_matches(
+        appointment,
+        owner_user_id=owner_user_id,
+        dealer_id=None,
+        starts_at=starts_at,
+        duration_min=duration_min,
+        invitee_email=email,
+        invitee_phone=phone,
+        request_fingerprint=request_fingerprint,
+    ):
+        return
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "code": "idempotency_key_reused",
+            "message": "That booking request key was already used for different booking details.",
+        },
+    )
 
 
 @router.get("/booking/{slug}", response_model=PublicBookingProfile)
 async def public_booking_profile(
     slug: str,
     db: AsyncSession = Depends(get_db),
+    start_date: date | None = None,
+    days: int | None = None,
 ) -> PublicBookingProfile:
     user, booking = await _load_public_booking(db, slug)
     from app.dealer_os.deps import is_rep
 
     field_desk_page = is_rep(user)
-    slots = await _available_booking_slots(db, user, booking)
+    try:
+        availability = await _available_booking_slots(
+            db,
+            user,
+            booking,
+            start_date=start_date,
+            days=days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     host_name = user.name or "Qualified Commercial"
     return PublicBookingProfile(
         slug=booking.slug or slug,
@@ -420,9 +526,22 @@ async def public_booking_profile(
         background_color=booking.background_color,
         duration_min=booking.duration_min,
         timezone=booking.timezone,
+        google_meet_enabled=bool(booking.google_meet_enabled),
+        meeting_mode="video" if booking.google_meet_enabled else "phone",
         logo_url=_booking_asset_get_url(booking.logo_s3_key),
         profile_photo_url=_booking_asset_get_url(booking.profile_photo_s3_key),
-        slots=slots,
+        slots=[
+            PublicBookingSlot(
+                starts_at=slot.starts_at,
+                label=slot.label,
+                date_label=slot.date_label,
+            )
+            for slot in availability.slots
+        ],
+        page_start_date=availability.page_start_date,
+        page_end_date=availability.page_end_date,
+        next_start_date=availability.next_start_date,
+        window_end_date=availability.window_end_date,
         sms_disclosure_text=sms_consent_service.text_for("transactional"),
         precall_enabled=bool(booking.precall_enabled),
         booking_questions=dict(booking.booking_questions or {}),
@@ -447,13 +566,19 @@ async def public_booking_create(
 ) -> PublicBookingCreateResult:
     ip = (request.client.host if request.client else "?") or "?"
     now = time.monotonic()
-    last = _LAST_SUBMIT.get(ip)
-    if last is not None and (now - last) < _THROTTLE_SECONDS:
-        raise HTTPException(
-            status.HTTP_429_TOO_MANY_REQUESTS,
-            "Please wait a moment before submitting again.",
-        )
-    _LAST_SUBMIT[ip] = now
+    # A caller-token retry must be allowed to reach the idempotency ledger
+    # even when it arrives inside the anti-spam window (double-click or a
+    # response timeout). Legacy requests without an unguessable caller token
+    # remain throttled before any replay lookup can expose sensitive data.
+    defer_throttle = bool(payload.creation_idempotency_key)
+    if not defer_throttle:
+        last = _LAST_SUBMIT.get(ip)
+        if last is not None and (now - last) < _THROTTLE_SECONDS:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "Please wait a moment before submitting again.",
+            )
+        _LAST_SUBMIT[ip] = now
 
     user, booking = await _load_public_booking(db, slug)
     from app.dealer_os.deps import is_rep
@@ -473,7 +598,11 @@ async def public_booking_create(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a banking evidence method.")
     selected_variant = "dealer" if host_is_rep else booking.precall_default_variant or "main_street"
     if booking.precall_enabled and not host_is_rep:
-        if payload.vertical and not booking.precall_allow_vertical_choice:
+        if (
+            payload.vertical
+            and not booking.precall_allow_vertical_choice
+            and payload.vertical != selected_variant
+        ):
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "This booking page does not allow the application type to be changed.",
@@ -491,11 +620,144 @@ async def public_booking_create(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "That application type is not available on this booking page.",
             )
-    await lock_calendar_owner(db, user.id)
     starts_at = _to_utc_minute(payload.starts_at)
-    slots = await _available_booking_slots(db, user, booking)
-    valid_slot = any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in slots)
+    request_fingerprint = booking_operations.creation_request_fingerprint(
+        {
+            "surface": "public",
+            "owner_user_id": user.id,
+            "starts_at": starts_at,
+            "duration_min": booking.duration_min,
+            "origin": public_booking_origin(host_is_rep),
+            "selected_variant": selected_variant,
+            "meeting_mode": (
+                "video" if booking.google_meet_enabled else "phone"
+            ),
+            "payload": payload.model_dump(
+                mode="json", exclude={"creation_idempotency_key"}
+            ),
+        }
+    )
+    creation_key = booking_operations.creation_idempotency_key(
+        owner_user_id=user.id,
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        invitee_email=payload.email,
+        invitee_phone=normalized_phone,
+        origin=public_booking_origin(host_is_rep),
+        scope=f"public:{booking.slug or slug}:{selected_variant}",
+        caller_token=payload.creation_idempotency_key,
+    )
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        _assert_public_booking_replay_matches(
+            existing,
+            owner_user_id=user.id,
+            starts_at=starts_at,
+            duration_min=booking.duration_min,
+            email=payload.email,
+            phone=normalized_phone,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="public_booking",
+        )
+        replay_guard = f"{ip}:{creation_key}"
+        last_replay = _LAST_BOOKING_REPLAY.get(replay_guard)
+        if (
+            last_replay is not None
+            and (now - last_replay) < _THROTTLE_SECONDS
+        ):
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "Please wait before checking this booking again.",
+            )
+        _LAST_BOOKING_REPLAY[replay_guard] = now
+        return await _public_booking_replay_result(
+            db,
+            existing,
+            include_sensitive=False,
+        )
+    if defer_throttle:
+        last = _LAST_SUBMIT.get(ip)
+        if last is not None and (now - last) < _THROTTLE_SECONDS:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "Please wait a moment before submitting again.",
+            )
+        _LAST_SUBMIT[ip] = now
+    try:
+        availability = await _available_booking_slots(
+            db,
+            user,
+            booking,
+            start_date=starts_at.astimezone(_booking_tz(booking.timezone)).date(),
+            days=1,
+        )
+    except ValueError:
+        availability = None
+    valid_slot = availability is not None and any(
+        abs((slot.starts_at - starts_at).total_seconds()) < 1
+        for slot in availability.slots
+    )
     if not valid_slot:
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    # Never hold the owner row lock while consulting Google. The full
+    # provider-backed slot check above runs first; under the lock we repeat
+    # only local collision detection so simultaneous QC requests serialize.
+    from app.dealer_os.router import _appointment_slot_is_available
+
+    await lock_calendar_owner(db, user.id)
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        _assert_public_booking_replay_matches(
+            existing,
+            owner_user_id=user.id,
+            starts_at=starts_at,
+            duration_min=booking.duration_min,
+            email=payload.email,
+            phone=normalized_phone,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="public_booking_locked",
+        )
+        return await _public_booking_replay_result(
+            db,
+            existing,
+            include_sensitive=False,
+        )
+    if not await _appointment_slot_is_available(
+        db,
+        user,
+        booking,
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        check_google=False,
+    ):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
 
     who = f"{payload.full_name} <{payload.email}>"
@@ -559,6 +821,9 @@ async def public_booking_create(
         requested_amount=(str(payload.requested_amount) if payload.requested_amount is not None else None),
         booked_by_user_id=user.id if host_is_rep else None,
         contact_source="public_booking",
+        creation_idempotency_key=creation_key,
+        meeting_mode="video" if booking.google_meet_enabled else "phone",
+        creation_request_fingerprint=request_fingerprint,
     )
     draft = await _open_public_booking_draft(
         db,
@@ -600,18 +865,30 @@ async def public_booking_create(
         )
     )
 
-    # Commit before any outbound work. The booking is real at this point; mail
-    # and Google are follow-on effects that must not be able to undo it.
+    delivery_operation = await _deliver_booking(
+        db,
+        user,
+        payload,
+        starts_at,
+        booking,
+        ev,
+        notice,
+        draft=draft,
+        appointment=appointment,
+    )
+    # Appointment and every provider effect commit together. Provider work
+    # happens only after this durable local transaction.
     await db.commit()
     await db.refresh(ev)
-
-    await _deliver_booking(db, user, payload, starts_at, booking, ev, notice, draft=draft, appointment=appointment)
+    delivery_state = await booking_operations.queued_results(db, delivery_operation)
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     return PublicBookingCreateResult(
         ok=True,
         event_id=str(ev.id),
         appointment_id=str(appointment.id),
         room_url=draft.room.url if draft is not None else None,
         pin_delivered_via=notice.precall_pin_delivered_via,
+        delivery_state=delivery_state,
     )
 
 
@@ -632,6 +909,20 @@ async def _load_public_booking(
     ).first()
     if row:
         return row[0], await effective_booking_settings(db, row[1])
+    alias_row = (
+        await db.execute(
+            select(User, BookingSettings)
+            .join(BookingSlugAlias, BookingSlugAlias.user_id == User.id)
+            .join(BookingSettings, BookingSettings.user_id == User.id)
+            .where(
+                User.deleted_at.is_(None),
+                BookingSettings.enabled.is_(True),
+                BookingSlugAlias.slug == slug,
+            )
+        )
+    ).first()
+    if alias_row:
+        return alias_row[0], await effective_booking_settings(db, alias_row[1])
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Booking page not found.")
 
 
@@ -639,74 +930,27 @@ async def _available_booking_slots(
     db: AsyncSession,
     user: User,
     booking: BookingSettings,
-) -> list[PublicBookingSlot]:
-    tz = _booking_tz(booking.timezone)
-    now_local = datetime.now(tz)
-    earliest_local, window_end_local = booking_window_bounds(booking, now_local)
-    earliest_local = _round_up_to_step(earliest_local, 5)
-    live_google = await calendar_sync.busy_periods(
+    *,
+    start_date: date | None = None,
+    days: int | None = None,
+) -> BookingAvailabilityRead:
+    """Use the same authoritative implementation as Field Desk availability.
+
+    That shared query includes orphan ``DealerRepAppointment`` rows with no
+    CalendarEvent mirror, preventing public and authenticated pages from
+    offering different times after a partial provider failure.
+    """
+
+    from app.dealer_os.router import _booking_slots
+
+    return await _booking_slots(
         db,
-        user.id,
-        time_min=now_local.astimezone(timezone.utc),
-        time_max=window_end_local.astimezone(timezone.utc),
+        user,
+        booking,
+        duration_min=booking.duration_min,
+        start_date=start_date,
+        days=days,
     )
-    busy_rows = (
-        await db.execute(
-            select(CalendarEvent)
-            .where(
-                CalendarEvent.owner_user_id == user.id,
-                CalendarEvent.status != CalendarEventStatus.CANCELLED,
-                CalendarEvent.starts_at >= now_local.astimezone(timezone.utc),
-                CalendarEvent.starts_at <= window_end_local.astimezone(timezone.utc),
-            )
-            .order_by(CalendarEvent.starts_at)
-        )
-    ).scalars().all()
-    busy = [
-        (
-            ev.starts_at.astimezone(tz) - timedelta(minutes=booking.buffer_before_min),
-            ev.starts_at.astimezone(tz)
-            + timedelta(minutes=max(15, ev.duration_min or booking.duration_min) + booking.buffer_after_min),
-        )
-        for ev in busy_rows
-    ]
-    busy.extend(
-        (
-            start.astimezone(tz) - timedelta(minutes=booking.buffer_before_min),
-            end.astimezone(tz) + timedelta(minutes=booking.buffer_after_min),
-        )
-        for start, end in live_google.intervals
-    )
-
-    duration = timedelta(minutes=booking.duration_min)
-    slots: list[PublicBookingSlot] = []
-
-    day_count = (window_end_local.date() - earliest_local.date()).days + 1
-    for offset in range(max(0, day_count)):
-        day = earliest_local.date() + timedelta(days=offset)
-        for start_min, end_min in daily_booking_windows(booking, day):
-            day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz) + timedelta(minutes=start_min)
-            day_end = datetime.combine(day, datetime.min.time(), tzinfo=tz) + timedelta(minutes=end_min)
-            cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-            cursor = _round_up_to_step(cursor, 5)
-            while cursor + duration <= day_end:
-                slot_end = cursor + duration
-                if (
-                    not slot_overlaps_blocked_interval(booking, cursor, slot_end)
-                    and not any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy)
-                ):
-                    starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
-                    slots.append(
-                        PublicBookingSlot(
-                            starts_at=starts_utc,
-                            label=_slot_time_label(cursor),
-                            date_label=_slot_date_label(cursor),
-                        )
-                    )
-                    if len(slots) >= 80:
-                        return slots
-                cursor += timedelta(minutes=5)
-    return slots
 
 
 def _booking_tz(name: str) -> tzinfo:
@@ -717,23 +961,6 @@ def _booking_tz(name: str) -> tzinfo:
             return ZoneInfo("America/New_York")
         except ZoneInfoNotFoundError:
             return timezone.utc
-
-
-def _round_up_to_step(value: datetime, step_min: int) -> datetime:
-    value = value.replace(second=0, microsecond=0)
-    minute = value.minute
-    remainder = minute % step_min
-    if remainder:
-        value += timedelta(minutes=step_min - remainder)
-    return value
-
-
-def _slot_time_label(value: datetime) -> str:
-    return value.strftime("%I:%M %p").lstrip("0")
-
-
-def _slot_date_label(value: datetime) -> str:
-    return f"{value.strftime('%a, %b')} {value.day}"
 
 
 def _to_utc_minute(value: datetime) -> datetime:
@@ -825,109 +1052,26 @@ async def _deliver_booking(
     notice,
     draft=None,
     appointment=None,
-) -> None:
-    """Everything that happens after the booking row is safely committed.
+) -> "BookingDeliveryOperation":
+    """Persist public-booking provider effects; never call a provider here.
 
-    Ordering matters and used to be wrong: the notification fired before the
-    flush, so a later failure would have emailed a booking that did not exist.
-    It now runs after the commit, which also means a slow mail send cannot roll
-    anything back.
-
-    Google goes first, because if it mints a Meet link we want that link inside
-    both emails rather than sending a follow-up correction.
+    This function intentionally runs before the route's single local commit.
+    The scheduler (and best-effort wake-up) executes Google, SES and SMS later
+    with one durable idempotency boundary per effect.
     """
-    join_url = await booking_notify.push_to_google(
+
+    del starts_at, booking, notice, draft
+    if appointment is None:
+        raise RuntimeError("public booking delivery requires an appointment")
+    return await booking_operations.enqueue(
         db,
-        ev,
-        invitee_email=payload.email,
-        invitee_name=payload.full_name,
-        want_meet=booking.google_meet_enabled,
+        appointment=appointment,
+        event=ev,
+        actor_user_id=user.id,
+        operation_type="create",
+        idempotency_key=f"booking:create:{appointment.id}",
+        delivery_payload={"notes": payload.notes},
     )
-    if join_url:
-        notice.join_url = join_url
-        if appointment is not None:
-            appointment.join_url = join_url
-        try:
-            ev.description = f"{ev.description or ''}\n\nJoin: {join_url}".strip()
-            await db.commit()
-        except Exception:  # noqa: BLE001
-            await db.rollback()
-            log.exception("public-booking: could not persist meet link event=%s", ev.id)
-
-    # Blocking SES calls, kept off the event loop.
-    await asyncio.to_thread(
-        booking_notify.notify_host,
-        user,
-        booking,
-        starts_at,
-        invitee_name=payload.full_name,
-        invitee_email=payload.email,
-        invitee_phone=payload.phone,
-        notes=payload.notes,
-        join_url=join_url,
-    )
-    kit = None
-    if draft is not None:
-        from app.dealer_os.services import application_precall, precall
-
-        try:
-            if hasattr(draft, "profile"):
-                ready = await application_precall.readiness(db, draft.profile)
-                template_target = SimpleNamespace(name=draft.intake.business_name or draft.intake.full_name)
-            else:
-                ready = await precall.readiness(db, draft.dealer)
-                template_target = draft.dealer
-            values = precall.template_values(
-                notice=notice, event=ev, booking=booking, host=user, dealer=template_target,
-                room_link=draft.room.url, ready=ready, pin=draft.room.passcode,
-                stop_link=precall.stop_url(notice), timezone_name=booking.timezone,
-            )
-            cm = booking.confirmation_messages or {}
-            kit = {
-                "block": precall.precall_block(booking, values),
-                "email_template": {"subject": cm.get("email_subject"), "body": cm.get("email_body")},
-                "sms_template": precall.message_text(booking, "confirmation_sms"),
-                "values": values,
-            }
-        except Exception:  # noqa: BLE001
-            log.exception("public-booking: could not build the room kit for %s", notice.id)
-    if booking.confirmation_email_enabled:
-        email_result = await asyncio.to_thread(
-            booking_notify.send_invitee_invite,
-            user,
-            booking,
-            ev,
-            starts_at,
-            invitee_name=payload.full_name,
-            invitee_email=payload.email,
-            join_url=join_url,
-            precall_block=kit["block"] if kit else None,
-            template=kit["email_template"] if kit else None,
-            template_values=kit["values"] if kit else None,
-        )
-        notice.confirmation_email_status = (
-            "sent" if email_result and email_result.ok else "failed"
-        )
-        if email_result and not email_result.ok:
-            notice.record_delivery_error(email_result.detail)
-        elif email_result:
-            notice.clear_delivery_error()
-    await db.commit()
-    await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone,
-        template=kit["sms_template"] if kit else None, values=kit["values"] if kit else None,
-    )
-    if kit and draft is not None and draft.room.passcode:
-        from app.dealer_os.services import precall
-
-        if notice.sms_consent and notice.invitee_phone and notice.confirmation_sms_status == "sent":
-            notice.precall_pin_delivered_via = "sms"
-        else:
-            try:
-                await precall.deliver_pin(db, notice=notice, booking=booking, values=kit["values"])
-            except Exception:  # noqa: BLE001
-                log.exception("public-booking: PIN delivery raised for %s", notice.id)
-        await db.commit()
 
 
 # ---------------------------------------------------------------------------

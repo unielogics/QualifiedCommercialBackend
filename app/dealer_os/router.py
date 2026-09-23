@@ -19,6 +19,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -59,25 +60,43 @@ from app.models.application_profile import (
 from app.models.public_underwriting_intake import PublicUnderwritingIntake
 from app.models.booking_settings import BookingSettings
 from app.services.booking_availability import (
+    BookingDatePage,
+    available_slot_starts,
+    booking_date_page,
     booking_window_bounds,
-    daily_booking_windows,
     slot_fits_daily_schedule,
     slot_overlaps_blocked_interval,
     slot_within_custom_booking_window,
 )
-from app.models.booking_notification import BookingNotification, BookingNotificationReminder
+from app.models.booking_notification import (
+    BookingDeliveryEffect,
+    BookingDeliveryOperation,
+    BookingNotification,
+    BookingNotificationReminder,
+)
 from app.models.event import CalendarEvent
 from app.models.notification import Notification
+from app.models.dealer_prospect import DealerProspect, DealerProspectStageDefinition
+from app.models.google_account import GoogleAccount
+from app.schemas.booking_settings import UserBookingSettingsUpdate
 from app.services import application_profiles as application_profile_service
 from app.services import inline_images
 from app.services import calendar_v2
 from app.services.activity_log import log_activity
-from app.services import booking_notify, booking_reminders, provenance
+from app.services import (
+    booking_metrics,
+    booking_notify,
+    booking_operations,
+    booking_reminders,
+    provenance,
+    prospect_outreach as prospect_outreach_service,
+)
 from app.services.notifications import notify_inbound_communication, notify_users
 from app.services import file_events, merchant_processing, upload_validation
 from app.services.team_calendar import (
     effective_booking_settings,
     lock_calendar_owner,
+    retain_booking_slug_alias,
     team_booking_settings,
 )
 from app.services import plaid_lifecycle, plaid_policy
@@ -408,6 +427,7 @@ from .schemas import (
     SubmissionReadinessRead,
     BookingAvailabilityRead,
     BookingAvailabilitySlot,
+    SharedBookingSettingsRead,
     ContactCardRead,
     ContactCardProgramPdfRead,
     ContactShareCreate,
@@ -463,6 +483,7 @@ from .services import (
     recurrence,
     report_pdf,
     rollups,
+    prospects as prospect_service,
     storage,
     workflow_readiness,
 )
@@ -956,10 +977,36 @@ def _global_search_contact_access_filter(user: User):
     )
 
 
+def _appointment_access_filter(user: User):
+    """Keep appointment access aligned with the appointment's live CRM scope.
+
+    The booking agent remains the authority for appointments that are not tied
+    to a Marketing prospect.  Once an appointment is linked to a prospect,
+    however, ownership and explicit contact assignments are the source of
+    truth.  That makes reassignment effective immediately in both directions:
+    the new owner can manage the booking and the previous owner loses it unless
+    they still have an explicit assignment.
+    """
+
+    if user.role in prospect_service.TEAM_ROLES or not is_rep(user):
+        return True
+    visible_prospect_ids = select(DealerProspect.id).where(
+        prospect_service.prospect_access_filter(user)
+    )
+    return or_(
+        and_(
+            DealerRepAppointment.prospect_id.is_(None),
+            DealerRepAppointment.booked_by_user_id == user.id,
+        ),
+        and_(
+            DealerRepAppointment.prospect_id.is_not(None),
+            DealerRepAppointment.prospect_id.in_(visible_prospect_ids),
+        ),
+    )
+
+
 def _global_search_appointment_access_filter(user: User):
-    if is_rep(user):
-        return DealerRepAppointment.booked_by_user_id == user.id
-    return True
+    return _appointment_access_filter(user)
 
 
 def _search_context(*values: str | None) -> str | None:
@@ -6853,6 +6900,38 @@ def _to_utc_minute(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(second=0, microsecond=0)
 
 
+def _appointment_patch_start(
+    value: datetime,
+    *,
+    timezone_name: str | None,
+) -> datetime:
+    """Interpret datetime-local PATCH values in the appointment timezone."""
+
+    if value.tzinfo is not None:
+        return _to_utc_minute(value)
+    zone = rep_workflows.tz(timezone_name)
+    wall = value.replace(second=0, microsecond=0)
+    first = wall.replace(tzinfo=zone, fold=0)
+    second = wall.replace(tzinfo=zone, fold=1)
+    first_round_trip = first.astimezone(timezone.utc).astimezone(zone).replace(
+        tzinfo=None
+    )
+    second_round_trip = second.astimezone(timezone.utc).astimezone(zone).replace(
+        tzinfo=None
+    )
+    if first_round_trip != wall and second_round_trip != wall:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "That local time does not exist because of daylight saving time.",
+        )
+    if first.utcoffset() != second.utcoffset():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "That local time is ambiguous because of daylight saving time. Choose another time.",
+        )
+    return first.astimezone(timezone.utc).replace(second=0, microsecond=0)
+
+
 def _round_up_to_step(value: datetime, step_min: int) -> datetime:
     value = value.replace(second=0, microsecond=0)
     remainder = value.minute % step_min
@@ -6947,7 +7026,10 @@ def _local_calendar_busy_intervals(
 
     for appointment in appointment_rows:
         if (
-            appointment.calendar_event_id == exclude_event_id
+            (
+                exclude_event_id is not None
+                and appointment.calendar_event_id == exclude_event_id
+            )
             or not _appointment_blocks_shared_calendar(appointment)
         ):
             continue
@@ -7028,36 +7110,56 @@ async def _booking_slots(
     *,
     duration_min: int | None = None,
     exclude_event_id: UUID | None = None,
+    start_date: date | None = None,
+    days: int | None = None,
 ) -> BookingAvailabilityRead:
     zone = rep_workflows.tz(booking.timezone)
     duration = duration_min or booking.duration_min or 30
     now_local = datetime.now(zone)
-    earliest_local, window_end_local = booking_window_bounds(booking, now_local)
-    earliest_local = _round_up_to_step(earliest_local, 5)
+    configured_earliest, configured_window_end = booking_window_bounds(booking, now_local)
+    page = booking_date_page(
+        configured_earliest,
+        configured_window_end,
+        start_date=start_date,
+        days=days,
+    )
+    earliest_local = _round_up_to_step(page.earliest_local, 5)
+    window_end_local = page.window_end_local
     live_google = await calendar_sync.busy_periods(
         db,
         host.id,
-        time_min=now_local.astimezone(timezone.utc),
+        time_min=earliest_local.astimezone(timezone.utc),
         time_max=window_end_local.astimezone(timezone.utc),
     )
     # Field Desk books against the shared Franco calendar. Fail closed when the
     # live calendar cannot be consulted; otherwise a revoked token or Google
     # outage could expose a slot that is already occupied outside QC.
     if live_google.status != "connected":
+        _emit_booking_availability_metrics(
+            page=page,
+            slots=[],
+            calendar_state=live_google.status,
+            zone=zone,
+        )
         return BookingAvailabilityRead(
             timezone=booking.timezone,
             duration_min=duration,
             buffer_before_min=booking.buffer_before_min,
             buffer_after_min=booking.buffer_after_min,
             host_name=host.name,
+            google_meet_enabled=bool(booking.google_meet_enabled),
             calendar_sync_status=live_google.status,
+            page_start_date=page.page_start_date,
+            page_end_date=page.page_end_date,
+            next_start_date=page.next_start_date,
+            window_end_date=page.configured_window_end_date,
             slots=[],
         )
     busy, excluded_event = await _shared_calendar_local_busy(
         db,
         host,
         booking,
-        time_min=now_local,
+        time_min=earliest_local,
         time_max=window_end_local,
         fallback_duration=duration,
         exclude_event_id=exclude_event_id,
@@ -7075,52 +7177,71 @@ async def _booking_slots(
             start.astimezone(zone) - timedelta(minutes=booking.buffer_before_min),
             end.astimezone(zone) + timedelta(minutes=booking.buffer_after_min),
         ))
-    slot_duration = timedelta(minutes=duration)
-    slots: list[BookingAvailabilitySlot] = []
-    day_count = (window_end_local.date() - earliest_local.date()).days + 1
-    for offset in range(max(0, day_count)):
-        day = earliest_local.date() + timedelta(days=offset)
-        for start_min, end_min in daily_booking_windows(booking, day):
-            day_start = datetime.combine(day, datetime.min.time(), tzinfo=zone) + timedelta(minutes=start_min)
-            day_end = datetime.combine(day, datetime.min.time(), tzinfo=zone) + timedelta(minutes=end_min)
-            cursor = max(day_start, earliest_local if day == earliest_local.date() else day_start)
-            cursor = _round_up_to_step(cursor, 5)
-            while cursor + slot_duration <= day_end:
-                slot_end = cursor + slot_duration
-                candidate_start = cursor - timedelta(minutes=booking.buffer_before_min)
-                candidate_end = slot_end + timedelta(minutes=booking.buffer_after_min)
-                if (
-                    not slot_overlaps_blocked_interval(booking, cursor, slot_end)
-                    and not any(
-                        candidate_start < busy_end and candidate_end > busy_start
-                        for busy_start, busy_end in busy
-                    )
-                ):
-                    starts_utc = cursor.astimezone(timezone.utc).replace(second=0, microsecond=0)
-                    slots.append(BookingAvailabilitySlot(
-                        starts_at=starts_utc,
-                        label=_time_label(cursor),
-                        date_label=_date_label(cursor),
-                    ))
-                    if len(slots) >= 80:
-                        return BookingAvailabilityRead(
-                            timezone=booking.timezone,
-                            duration_min=duration,
-                            buffer_before_min=booking.buffer_before_min,
-                            buffer_after_min=booking.buffer_after_min,
-                            host_name=host.name,
-                            calendar_sync_status=live_google.status,
-                            slots=slots,
-                        )
-                cursor += timedelta(minutes=5)
+    starts = available_slot_starts(
+        booking,
+        earliest_local=earliest_local,
+        window_end_local=window_end_local,
+        duration_min=duration,
+        busy_intervals=busy,
+    )
+    slots = [
+        BookingAvailabilitySlot(
+            starts_at=start.astimezone(timezone.utc).replace(second=0, microsecond=0),
+            label=_time_label(start),
+            date_label=_date_label(start),
+        )
+        for start in starts
+    ]
+    _emit_booking_availability_metrics(
+        page=page,
+        slots=slots,
+        calendar_state=live_google.status,
+        zone=zone,
+    )
     return BookingAvailabilityRead(
         timezone=booking.timezone,
         duration_min=duration,
         buffer_before_min=booking.buffer_before_min,
         buffer_after_min=booking.buffer_after_min,
         host_name=host.name,
+        google_meet_enabled=bool(booking.google_meet_enabled),
         calendar_sync_status=live_google.status,
+        page_start_date=page.page_start_date,
+        page_end_date=page.page_end_date,
+        next_start_date=page.next_start_date,
+        window_end_date=page.configured_window_end_date,
         slots=slots,
+    )
+
+
+def _emit_booking_availability_metrics(
+    *,
+    page: BookingDatePage,
+    slots: list[BookingAvailabilitySlot],
+    calendar_state: str,
+    zone: ZoneInfo,
+) -> None:
+    requested_dates = (page.page_end_date - page.page_start_date).days + 1
+    returned_dates = len(
+        {slot.starts_at.astimezone(zone).date() for slot in slots}
+    )
+    booking_metrics.emit(
+        "booking.availability.slots",
+        len(slots),
+        requested_dates=requested_dates,
+        calendar_state=calendar_state,
+    )
+    booking_metrics.emit(
+        "booking.availability.date_coverage",
+        returned_dates,
+        unit="dates",
+        requested_dates=requested_dates,
+        calendar_state=calendar_state,
+    )
+    booking_metrics.emit(
+        "booking.availability.fail_closed",
+        int(calendar_state != "connected"),
+        calendar_state=calendar_state,
     )
 
 
@@ -7132,8 +7253,14 @@ async def _appointment_slot_is_available(
     starts_at: datetime,
     duration_min: int,
     exclude_event_id: UUID | None = None,
+    check_google: bool = True,
 ) -> bool:
-    """Validate one arbitrary calendar slot without a rolling 15-day limit."""
+    """Validate one arbitrary calendar slot without a rolling 15-day limit.
+
+    ``check_google=False`` is used only for the second, in-lock local recheck
+    after a full provider-backed preflight. This prevents a simultaneous QC
+    booking without holding a database row lock across a Google network call.
+    """
     starts_at = _to_utc_minute(starts_at)
     if starts_at < datetime.now(timezone.utc).replace(second=0, microsecond=0):
         return False
@@ -7168,6 +7295,9 @@ async def _appointment_slot_is_available(
     for busy_start, busy_end in local_busy:
         if proposed_busy_start < busy_end and proposed_busy_end > busy_start:
             return False
+
+    if not check_google:
+        return True
 
     google = await calendar_sync.busy_periods(
         db,
@@ -7306,13 +7436,21 @@ def _booking_description(
 
 
 async def _load_owned_appointment(
-    db: AsyncSession, appointment_id: UUID, user: User
+    db: AsyncSession,
+    appointment_id: UUID,
+    user: User,
+    *,
+    for_update: bool = False,
 ) -> DealerRepAppointment:
     require_team_or_rep(user)
+    query = select(DealerRepAppointment).where(
+        DealerRepAppointment.id == appointment_id,
+        _appointment_access_filter(user),
+    )
+    if for_update:
+        query = query.with_for_update()
     row = (
-        await db.execute(
-            select(DealerRepAppointment).where(DealerRepAppointment.id == appointment_id)
-        )
+        await db.execute(query)
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
@@ -7320,8 +7458,6 @@ async def _load_owned_appointment(
         dealer = await db.get(DealerBusiness, row.dealer_id)
         if dealer is not None and dealer.is_training and user.role != Role.SUPER_ADMIN:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
-    if is_rep(user) and row.booked_by_user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appointment not found.")
     return row
 
 
@@ -7333,6 +7469,7 @@ async def _appointment_read_rows(
     events = {}
     rep_reminders: dict[UUID, list[BookingNotificationReminder]] = {}
     rep_notifications: dict[str, Notification] = {}
+    google_effects: dict[UUID, BookingDeliveryEffect] = {}
     user_ids = {
         user_id
         for row in rows
@@ -7397,6 +7534,31 @@ async def _appointment_read_rows(
         ).scalars().all()
         events = {row.id: row for row in event_rows}
     appointment_ids = [str(row.id) for row in rows]
+    appointment_uuid_ids = [row.id for row in rows]
+    if appointment_uuid_ids:
+        google_rows = (
+            await db.execute(
+                select(BookingDeliveryOperation, BookingDeliveryEffect)
+                .join(
+                    BookingDeliveryEffect,
+                    BookingDeliveryEffect.operation_id
+                    == BookingDeliveryOperation.id,
+                )
+                .where(
+                    BookingDeliveryOperation.appointment_id.in_(
+                        appointment_uuid_ids
+                    ),
+                    BookingDeliveryOperation.status != "superseded",
+                    BookingDeliveryEffect.effect_key == "google",
+                )
+                .order_by(
+                    BookingDeliveryOperation.created_at.desc(),
+                    BookingDeliveryEffect.created_at.desc(),
+                )
+            )
+        ).all()
+        for operation, effect in google_rows:
+            google_effects.setdefault(operation.appointment_id, effect)
     if appointment_ids:
         notification_rows = (
             await db.execute(
@@ -7449,11 +7611,26 @@ async def _appointment_read_rows(
             else "in_app" if notification
             else "unavailable"
         )
-        data["google_sync_status"] = (
-            "connected" if event and event.google_event_id
-            else "pending" if event and event.owner_user_id
-            else "unavailable"
-        )
+        google_effect = google_effects.get(row.id)
+        if google_effect and google_effect.status in {
+            "action_required",
+            "failed",
+            "unavailable",
+        }:
+            data["google_sync_status"] = "action_required"
+            data["google_sync_error"] = (
+                google_effect.error or "google_calendar_action_required"
+            )
+        elif google_effect and google_effect.status in {"pending", "processing"}:
+            data["google_sync_status"] = "pending"
+            data["google_sync_error"] = google_effect.error
+        else:
+            data["google_sync_status"] = (
+                "connected" if event and event.google_event_id
+                else "pending" if event and event.owner_user_id
+                else "unavailable"
+            )
+            data["google_sync_error"] = None
         data["precall"] = _appointment_precall_summary(
             notice,
             dealer=drafts.get(notice.precall_dealer_id) if notice and notice.precall_dealer_id else None,
@@ -7477,7 +7654,6 @@ def _appointment_payload(
         company=appt.company,
         invitee_email=appt.invitee_email,
         invitee_phone=appt.invitee_phone,
-        join_url=appt.join_url,
         meeting_mode=appt.meeting_mode,
         location=appt.location,
         notes=appt.notes,
@@ -7516,6 +7692,7 @@ def _appointment_local_time(starts_at: datetime, timezone_name: str | None) -> s
 async def _ensure_rep_contact(
     db: AsyncSession,
     *,
+    actor_user: User | None,
     owner_user_id: UUID,
     dealer_id: UUID | None,
     full_name: str,
@@ -7524,14 +7701,28 @@ async def _ensure_rep_contact(
     phone_e164: str | None,
     source: str,
 ) -> DealerRepContact:
-    q = select(DealerRepContact).where(DealerRepContact.owner_user_id == owner_user_id)
-    if email:
-        q = q.where(DealerRepContact.email == email.strip().lower())
-    elif phone_e164:
-        q = q.where(DealerRepContact.phone_e164 == phone_e164)
-    else:
-        q = q.where(DealerRepContact.full_name == full_name.strip())
-    row = (await db.execute(q.order_by(DealerRepContact.updated_at.desc()))).scalar_one_or_none()
+    row, email, phone_e164 = await prospect_service.resolve_contact_identity(
+        db,
+        actor_user=actor_user,
+        owner_user_id=owner_user_id,
+        email=email,
+        phone=phone_e164,
+    )
+    if row is None and not email and not phone_e164:
+        # Name-only legacy workflows have no stable identity signal.  Keep the
+        # prior owner-scoped reuse behavior without pretending a name is a
+        # globally unique person identifier.
+        row = (
+            await db.execute(
+                select(DealerRepContact)
+                .where(
+                    DealerRepContact.owner_user_id == owner_user_id,
+                    DealerRepContact.full_name == full_name.strip(),
+                )
+                .order_by(DealerRepContact.updated_at.desc())
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
     now = datetime.now(timezone.utc)
     if row is None:
         row = DealerRepContact(
@@ -7539,7 +7730,7 @@ async def _ensure_rep_contact(
             dealer_id=dealer_id,
             full_name=full_name.strip(),
             company=company,
-            email=email.strip().lower() if email else None,
+            email=email,
             phone_e164=phone_e164,
             source=source,
             last_activity_at=now,
@@ -7550,7 +7741,7 @@ async def _ensure_rep_contact(
     row.dealer_id = row.dealer_id or dealer_id
     row.full_name = full_name.strip() or row.full_name
     row.company = company or row.company
-    row.email = email.strip().lower() if email else row.email
+    row.email = email or row.email
     row.phone_e164 = phone_e164 or row.phone_e164
     row.last_activity_at = now
     await db.flush()
@@ -7842,6 +8033,7 @@ async def _mirror_file_message_to_rep_inbox(
     email = dealer.email.strip().lower() if dealer.email else None
     contact = await _ensure_rep_contact(
         db,
+        actor_user=user,
         owner_user_id=owner_user_id,
         dealer_id=dealer.id,
         full_name=dealer.name or "Business owner",
@@ -8357,7 +8549,9 @@ async def act_on_rep_appointment_precall(
     """Rep-side control: resend the room kit, rotate the PIN (read it out),
     stop or resume the nudges. Every action is audited on the dealer file."""
     require_team_or_rep(user)
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     if not appointment.calendar_event_id:
         raise HTTPException(status.HTTP_409_CONFLICT, "This appointment has no booking record.")
     notice = (
@@ -8721,12 +8915,115 @@ async def patch_application_finalization(
     return await _dealer_read(db, dealer)
 
 
+async def _shared_booking_settings_read(
+    db: AsyncSession,
+    *,
+    user: User,
+    host: User,
+    booking: BookingSettings,
+) -> SharedBookingSettingsRead:
+    # Reuse the canonical settings serializer so Funding and Field Desk show
+    # exactly the same policy fields and compatibility defaults.
+    from app.routers.me import _booking_public_url, _booking_settings_read
+
+    account = (
+        await db.execute(select(GoogleAccount).where(GoogleAccount.user_id == host.id))
+    ).scalar_one_or_none()
+    if (
+        account is not None
+        and account.status == "active"
+        and account.calendar_connected
+        and account.encrypted_refresh_token
+    ):
+        connection_status = "connected"
+    elif account is not None and (account.last_error or account.status != "active"):
+        connection_status = "error"
+    else:
+        connection_status = "disconnected"
+    return SharedBookingSettingsRead(
+        host={"id": host.id, "name": host.name or host.email, "email": host.email},
+        settings=_booking_settings_read(booking),
+        can_edit=user.role == Role.SUPER_ADMIN,
+        public_url=_booking_public_url(booking),
+        calendar_connection={
+            "status": connection_status,
+            "email": account.google_email if account else None,
+            "last_error": account.last_error if account else None,
+        },
+    )
+
+
+@router.get("/booking/settings", response_model=SharedBookingSettingsRead)
+async def get_shared_booking_settings(
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SharedBookingSettingsRead:
+    require_team_or_rep(user)
+    host, booking = await team_booking_settings(db)
+    # This read endpoint may have initialized the shared settings row. Persist
+    # that default explicitly; transactional booking callers commit only with
+    # their appointment and prospect changes.
+    await db.commit()
+    await db.refresh(booking)
+    return await _shared_booking_settings_read(
+        db, user=user, host=host, booking=booking
+    )
+
+
+@router.put("/booking/settings", response_model=SharedBookingSettingsRead)
+async def put_shared_booking_settings(
+    payload: UserBookingSettingsUpdate,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> SharedBookingSettingsRead:
+    require_super_admin(user)
+    host, booking = await team_booking_settings(db)
+    if payload.enabled and not payload.slug:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "booking.slug is required when the booking page is enabled",
+        )
+    if payload.slug:
+        existing = (
+            await db.execute(
+                select(BookingSettings.id).where(
+                    BookingSettings.slug == payload.slug,
+                    BookingSettings.user_id != host.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"booking slug {payload.slug!r} is already used",
+            )
+    from app.routers.me import _apply_booking_settings
+
+    try:
+        await retain_booking_slug_alias(
+            db,
+            user_id=host.id,
+            previous_slug=booking.slug,
+            next_slug=payload.slug,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    _apply_booking_settings(booking, payload)
+    await db.commit()
+    await db.refresh(booking)
+    return await _shared_booking_settings_read(
+        db, user=user, host=host, booking=booking
+    )
+
+
 @router.get("/booking/availability", response_model=BookingAvailabilityRead)
 async def booking_availability(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
     dealer_id: UUID | None = None,
     duration_min: int | None = Query(default=None, ge=15, le=180),
+    start_date: date | None = Query(default=None),
+    days: int | None = Query(default=None, ge=1, le=31),
 ) -> BookingAvailabilityRead:
     require_team_or_rep(user)
     dealer: DealerBusiness | None = None
@@ -8736,7 +9033,17 @@ async def booking_availability(
     booking = await _booking_settings_for(db, host)
     # Availability follows the shared host policy. The retained query argument
     # is ignored for API compatibility so callers cannot bypass meeting length.
-    return await _booking_slots(db, host, booking, duration_min=booking.duration_min)
+    try:
+        return await _booking_slots(
+            db,
+            host,
+            booking,
+            duration_min=booking.duration_min,
+            start_date=start_date,
+            days=days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 @router.get("/appointments", response_model=list[RepAppointmentRead])
@@ -8758,7 +9065,7 @@ async def list_all_rep_appointments(
         )
     )
     if is_rep(user):
-        q = q.where(DealerRepAppointment.booked_by_user_id == user.id)
+        q = q.where(_appointment_access_filter(user))
     if starts_from is not None:
         q = q.where(DealerRepAppointment.starts_at >= _to_utc_minute(starts_from))
     if starts_to is not None:
@@ -8803,7 +9110,9 @@ async def patch_rep_appointment_crm(
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentWorkspaceRead:
     _require_appointment_crm(user)
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     current = appointment.crm_status or "scheduled"
     if current == "converted" and payload.status != "converted":
         raise HTTPException(
@@ -8897,19 +9206,27 @@ async def create_rep_appointment_note(
     )
 
 
-@router.post(
-    "/appointments/{appointment_id}/start-application",
-    response_model=RepAppointmentStartApplicationResult,
-)
-async def start_rep_appointment_application(
+async def _start_rep_appointment_application(
     appointment_id: UUID,
     payload: RepAppointmentStartApplication,
     request: Request,
     user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession,
+    *,
+    commit: bool,
 ) -> RepAppointmentStartApplicationResult:
     _require_appointment_crm(user)
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    if payload.notify_client:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            (
+                "Create or link the application first, then send room access from "
+                "the committed secure-room workflow."
+            ),
+        )
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     if appointment.status == "cancelled" or appointment.archived_at is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "A cancelled appointment cannot start an application.")
     if not appointment.invitee_email:
@@ -8959,13 +9276,16 @@ async def start_rep_appointment_application(
             request=request,
             user=user,
             db=db,
+            commit=False,
         )
         intake_id = result.intake.id
         created = True
         delivery_status = result.room_delivery_status
         delivery_detail = result.room_delivery_detail
 
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     if appointment.converted_intake_id and appointment.converted_intake_id != intake_id:
         raise HTTPException(status.HTTP_409_CONFLICT, "This appointment already has another application.")
     appointment.converted_intake_id = intake_id
@@ -8999,7 +9319,10 @@ async def start_rep_appointment_application(
             "profile_id": str(profile.id),
         },
     )
-    await db.commit()
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     return RepAppointmentStartApplicationResult(
         intake_id=intake_id,
         profile_id=profile.id,
@@ -9009,6 +9332,27 @@ async def start_rep_appointment_application(
         href=f"/admin/ai-underwriter-leads?lead={intake_id}&view=underwriting",
         room_delivery_status=delivery_status,
         room_delivery_detail=delivery_detail,
+    )
+
+
+@router.post(
+    "/appointments/{appointment_id}/start-application",
+    response_model=RepAppointmentStartApplicationResult,
+)
+async def start_rep_appointment_application(
+    appointment_id: UUID,
+    payload: RepAppointmentStartApplication,
+    request: Request,
+    user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> RepAppointmentStartApplicationResult:
+    return await _start_rep_appointment_application(
+        appointment_id,
+        payload,
+        request,
+        user,
+        db,
+        commit=True,
     )
 
 
@@ -9379,6 +9723,20 @@ async def _create_calendar_follow_up(
             status="failed",
             detail="The selected follow-up time is unavailable.",
         )
+    await lock_calendar_owner(db, (host or user).id)
+    if not await _appointment_slot_is_available(
+        db,
+        host or user,
+        booking,
+        starts_at=starts_at,
+        duration_min=duration,
+        check_google=False,
+    ):
+        return RepAppointmentActionResult(
+            action="schedule_follow_up",
+            status="failed",
+            detail="The selected follow-up time is unavailable.",
+        )
     event = CalendarEvent(
         kind=CalendarEventKind.CALL,
         title=f"Follow up: {appointment.invitee_name}",
@@ -9510,48 +9868,23 @@ async def _create_calendar_document_requests(
     )
 
 
-async def _send_calendar_rebooking(
+async def _calendar_rebooking_url(
     db: AsyncSession,
     appointment: DealerRepAppointment,
     user: User,
-) -> RepAppointmentActionResult:
+) -> str | None:
     if not appointment.invitee_email:
-        return RepAppointmentActionResult(
-            action="send_no_show_rebooking",
-            status="failed",
-            detail="The appointment does not have a client email.",
-        )
+        return None
     host = await db.get(User, appointment.owner_user_id) if appointment.owner_user_id else user
     booking = await _booking_settings_for(db, host or user)
     settings = get_settings()
     base = (getattr(settings, "frontend_app_url", "") or "").rstrip("/")
     if settings.app_env.lower() == "production" and (not base or "localhost" in base):
         base = "https://app.qualifiedcommercial.com"
-    booking_url = f"{base}/book/{booking.slug}" if base and booking.enabled and booking.slug else None
-    if not booking_url:
-        return RepAppointmentActionResult(
-            action="send_no_show_rebooking",
-            status="failed",
-            detail="Enable the public booking link before sending a rebooking message.",
-        )
-    from app.services.email.user_mailer import send_as_user
-
-    result = await send_as_user(
-        db,
-        (host or user).id,
-        to_emails=[appointment.invitee_email],
-        subject="Let's reschedule your Qualified Commercial appointment",
-        body_text=(
-            f"Hi {appointment.invitee_name},\n\n"
-            "We missed you at the scheduled appointment. Choose a new time here:\n"
-            f"{booking_url}"
-        ),
-    )
-    return RepAppointmentActionResult(
-        action="send_no_show_rebooking",
-        status="completed" if result.ok else "failed",
-        detail=result.detail or ("Rebooking email accepted by the provider." if result.ok else "Email failed."),
-        href=booking_url,
+    return (
+        f"{base}/book/{booking.slug}"
+        if base and booking.enabled and booking.slug
+        else None
     )
 
 
@@ -9567,7 +9900,9 @@ async def apply_rep_appointment_outcome(
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentApplyOutcomeResult:
     _require_appointment_crm(user)
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     definition = (
         await db.execute(
             select(AppointmentOutcomeDefinition).where(
@@ -9581,8 +9916,60 @@ async def apply_rep_appointment_outcome(
     key_hash = hashlib.sha256(
         f"{appointment.id}:{payload.idempotency_key}".encode()
     ).hexdigest()
+    request_fingerprint = booking_operations.creation_request_fingerprint(
+        {
+            "actor_user_id": str(user.id),
+            "appointment_id": str(appointment.id),
+            "request": payload.model_dump(
+                mode="json", exclude={"idempotency_key"}
+            ),
+        }
+    )
+    operation_key = (
+        f"booking:outcome:{appointment.id}:"
+        f"{hashlib.sha256(payload.idempotency_key.encode()).hexdigest()}"
+    )
+    existing_operation = (
+        await db.execute(
+            select(BookingDeliveryOperation)
+            .where(BookingDeliveryOperation.idempotency_key == operation_key)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing_operation is not None:
+        stored_operation = existing_operation.payload or {}
+        if stored_operation.get("request_fingerprint") != request_fingerprint:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This outcome request key was already used for different details.",
+            )
+        result = stored_operation.get("result")
+        if existing_operation.status == "completed" and isinstance(result, dict):
+            return RepAppointmentApplyOutcomeResult(
+                appointment_id=appointment.id,
+                outcome_definition_id=UUID(result["outcome_definition_id"]),
+                outcome_label=result["outcome_label"],
+                crm_status=result["crm_status"],
+                idempotent_replay=True,
+                actions=[
+                    RepAppointmentActionResult(**item)
+                    for item in result.get("actions", [])
+                ],
+                workspace=await _appointment_workspace(db, appointment, user),
+                attempted_at=datetime.fromisoformat(result["attempted_at"]),
+            )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This outcome request is still processing or requires review.",
+        )
     if appointment.workflow_outcome_idempotency_key == key_hash:
         stored = appointment.workflow_outcome_results or {}
+        stored_fingerprint = stored.get("request_fingerprint")
+        if stored_fingerprint != request_fingerprint:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This outcome request key was already used for different details.",
+            )
         actions = [RepAppointmentActionResult(**item) for item in stored.get("actions", [])]
         return RepAppointmentApplyOutcomeResult(
             appointment_id=appointment.id,
@@ -9609,6 +9996,23 @@ async def apply_rep_appointment_outcome(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose a follow-up time.")
     if "file_action" in effects and payload.file_action == "none":
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Choose what to do with the client file.")
+
+    outcome_operation = BookingDeliveryOperation(
+        appointment_id=appointment.id,
+        event_id=appointment.calendar_event_id,
+        actor_user_id=user.id,
+        operation_type="update",
+        idempotency_key=operation_key,
+        status="processing",
+        payload={
+            "kind": "appointment_outcome",
+            "request_fingerprint": request_fingerprint,
+            "outcome_definition_id": str(definition.id),
+        },
+        claimed_at=datetime.now(timezone.utc),
+    )
+    db.add(outcome_operation)
+    await db.flush()
 
     actions: list[RepAppointmentActionResult] = []
     if "file_action" in effects:
@@ -9640,7 +10044,7 @@ async def apply_rep_appointment_outcome(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     "Choose an AI Intake type and six-digit room PIN.",
                 )
-            result = await start_rep_appointment_application(
+            result = await _start_rep_appointment_application(
                 appointment.id,
                 RepAppointmentStartApplication(
                     variant=payload.variant,
@@ -9650,6 +10054,7 @@ async def apply_rep_appointment_outcome(
                 request,
                 user,
                 db,
+                commit=False,
             )
             actions.append(
                 RepAppointmentActionResult(
@@ -9714,8 +10119,7 @@ async def apply_rep_appointment_outcome(
                 db, appointment, user, payload.requested_document_keys
             )
         )
-    if "send_no_show_rebooking" in effects:
-        actions.append(await _send_calendar_rebooking(db, appointment, user))
+    queue_rebooking = "send_no_show_rebooking" in effects
     if "close_enquiry" in effects:
         actions.append(
             RepAppointmentActionResult(
@@ -9769,6 +10173,7 @@ async def apply_rep_appointment_outcome(
     appointment.workflow_outcome_effects = effects
     appointment.workflow_outcome_results = {
         "color": definition.color,
+        "request_fingerprint": request_fingerprint,
         "actions": [item.model_dump(mode="json") for item in actions],
     }
     appointment.workflow_outcome_applied_at = attempted_at
@@ -9787,6 +10192,100 @@ async def apply_rep_appointment_outcome(
         appointment.outcome_at = attempted_at
         appointment.outcome_by_user_id = user.id
     appointment.outcome_note = (payload.note or "").strip() or None
+    event = (
+        await db.get(CalendarEvent, appointment.calendar_event_id)
+        if appointment.calendar_event_id
+        else None
+    )
+    delivery_operations: list[BookingDeliveryOperation] = []
+    if queue_rebooking:
+        booking_url = await _calendar_rebooking_url(db, appointment, user)
+        if event is None:
+            actions.append(
+                RepAppointmentActionResult(
+                    action="send_no_show_rebooking",
+                    status="failed",
+                    detail="This appointment has no linked calendar event.",
+                )
+            )
+        elif not appointment.invitee_email:
+            actions.append(
+                RepAppointmentActionResult(
+                    action="send_no_show_rebooking",
+                    status="failed",
+                    detail="The appointment does not have a client email.",
+                )
+            )
+        elif not booking_url:
+            actions.append(
+                RepAppointmentActionResult(
+                    action="send_no_show_rebooking",
+                    status="failed",
+                    detail="Enable the public booking link before sending a rebooking message.",
+                )
+            )
+        else:
+            operation, effect = await booking_operations.enqueue_manual_retry(
+                db,
+                appointment=appointment,
+                event=event,
+                actor_user_id=user.id,
+                effect_key="rebooking_email",
+                delivery_payload={"rebooking_url": booking_url},
+            )
+            delivery_operations.append(operation)
+            actions.append(
+                RepAppointmentActionResult(
+                    action="send_no_show_rebooking",
+                    status="completed" if effect.status == "sent" else "pending",
+                    detail=(
+                        "Rebooking email was already accepted by the provider."
+                        if effect.status == "sent"
+                        else "Rebooking email queued."
+                    ),
+                    href=booking_url,
+                )
+            )
+
+    if event is None:
+        actions.append(
+            RepAppointmentActionResult(
+                action="sync_google_color",
+                status="skipped",
+                detail="This appointment has no linked Google Calendar event.",
+            )
+        )
+    else:
+        operation, effect = await booking_operations.enqueue_manual_retry(
+            db,
+            appointment=appointment,
+            event=event,
+            actor_user_id=user.id,
+            effect_key="google",
+            delivery_payload={
+                "google_color_id": _appointment_workflow_google_color(
+                    definition.color
+                ),
+                "google_send_updates": "none",
+            },
+        )
+        delivery_operations.append(operation)
+        actions.append(
+            RepAppointmentActionResult(
+                action="sync_google_color",
+                status="completed" if effect.status == "sent" else "pending",
+                detail=(
+                    "Google Calendar color is already current."
+                    if effect.status == "sent"
+                    else "Google Calendar color update queued."
+                ),
+            )
+        )
+    appointment.workflow_outcome_results = {
+        "color": definition.color,
+        "request_fingerprint": request_fingerprint,
+        "actions": [item.model_dump(mode="json") for item in actions],
+    }
     _record_appointment_activity(
         db,
         appointment,
@@ -9814,48 +10313,22 @@ async def apply_rep_appointment_outcome(
                 "effects": effects,
             },
         )
-    await db.commit()
-    await db.refresh(appointment)
-
-    event = await db.get(CalendarEvent, appointment.calendar_event_id) if appointment.calendar_event_id else None
-    if event is None:
-        actions.append(
-            RepAppointmentActionResult(
-                action="sync_google_color",
-                status="skipped",
-                detail="This appointment has no linked Google Calendar event.",
-            )
-        )
-    else:
-        previous_synced_at = event.synced_at
-        await booking_notify.push_to_google(
-            db,
-            event,
-            invitee_email=appointment.invitee_email,
-            invitee_name=appointment.invitee_name,
-            rep_email=rep.email if rep else None,
-            rep_name=rep.name if rep else None,
-            want_meet=False,
-            color_id=_appointment_workflow_google_color(definition.color),
-            send_updates="none",
-        )
-        google_updated = event.synced_at is not None and event.synced_at != previous_synced_at
-        actions.append(
-            RepAppointmentActionResult(
-                action="sync_google_color",
-                status="completed" if google_updated else "failed",
-                detail=(
-                    "Google Calendar color updated."
-                    if google_updated
-                    else "Google Calendar was not updated. The outcome is saved; retry delivery when the connection is available."
-                ),
-            )
-        )
-    appointment.workflow_outcome_results = {
-        "color": definition.color,
-        "actions": [item.model_dump(mode="json") for item in actions],
+    outcome_operation.status = "completed"
+    outcome_operation.completed_at = attempted_at
+    outcome_operation.claimed_at = None
+    outcome_operation.payload = {
+        **(outcome_operation.payload or {}),
+        "result": {
+            "outcome_definition_id": str(definition.id),
+            "outcome_label": definition.name,
+            "crm_status": appointment.crm_status,
+            "actions": [item.model_dump(mode="json") for item in actions],
+            "attempted_at": attempted_at.isoformat(),
+        },
     }
     await db.commit()
+    for operation_id in dict.fromkeys(row.id for row in delivery_operations):
+        asyncio.create_task(booking_operations.wake_operation(operation_id))
     await db.refresh(appointment)
     return RepAppointmentApplyOutcomeResult(
         appointment_id=appointment.id,
@@ -9879,7 +10352,9 @@ async def retry_rep_appointment_delivery(
     db: AsyncSession = Depends(get_db),
 ) -> RepAppointmentDeliveryRetryResult:
     _require_appointment_crm(user)
-    appointment = await _load_owned_appointment(db, appointment_id, user)
+    appointment = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     if appointment.calendar_event_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "This appointment has no calendar event.")
     event = await db.get(CalendarEvent, appointment.calendar_event_id)
@@ -9892,76 +10367,86 @@ async def retry_rep_appointment_delivery(
             )
         )
     ).scalar_one_or_none()
-    host = await db.get(User, event.owner_user_id) if event.owner_user_id else None
-    host = host or user
-    booking = await _booking_settings_for(db, host)
     attempted_at = datetime.now(timezone.utc)
-    detail: str | None = None
-    if payload.action == "google_sync":
-        rep_id = appointment.booked_by_user_id or appointment.owner_user_id
-        rep = await db.get(User, rep_id) if rep_id else None
-        previous_synced_at = event.synced_at
-        workflow_color = (appointment.workflow_outcome_results or {}).get("color")
-        await booking_notify.push_to_google(
-            db,
-            event,
-            invitee_email=appointment.invitee_email,
-            invitee_name=appointment.invitee_name,
-            rep_email=rep.email if rep else None,
-            rep_name=rep.name if rep else None,
-            want_meet=False,
-            color_id=(
-                _appointment_workflow_google_color(str(workflow_color))
-                or _appointment_google_color(appointment.outcome)
-            ),
-            send_updates="none",
-        )
-        google_updated = event.synced_at is not None and event.synced_at != previous_synced_at
-        retry_status = "sent" if google_updated else "failed"
-        detail = None if google_updated else "Google Calendar connection is unavailable or rejected the update."
-    elif payload.action == "email_confirmation":
+    if payload.action == "email_confirmation":
         if notice is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Email delivery state is unavailable.")
         if not appointment.invitee_email:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no email address.")
-        result = booking_notify.send_invitee_invite(
-            host,
-            booking,
-            event,
-            appointment.starts_at,
-            invitee_name=appointment.invitee_name,
-            invitee_email=appointment.invitee_email,
-            join_url=appointment.join_url,
-            sequence=int(attempted_at.timestamp()),
-        )
-        retry_status = "sent" if result and result.ok else "failed"
-        detail = result.detail if result else "Email provider unavailable"
-        notice.confirmation_email_status = retry_status
-    else:
+        if notice.confirmation_email_status == "sent":
+            return RepAppointmentDeliveryRetryResult(
+                action=payload.action,
+                status="sent",
+                detail="This delivery was already completed.",
+                attempted_at=attempted_at,
+            )
+        notice.confirmation_email_status = "pending"
+    elif payload.action == "sms_confirmation":
         if notice is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "SMS delivery state is unavailable.")
         if not notice.invitee_phone:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "The client has no phone number.")
         if not notice.sms_consent:
-            retry_status = "blocked_no_consent"
             detail = "Transactional SMS consent is required for this phone number."
-            notice.confirmation_sms_status = retry_status
-        else:
-            notice.confirmation_sms_status = "pending"
-            await db.flush()
-            await booking_reminders.send_confirmation_sms(
+            notice.confirmation_sms_status = "blocked_no_consent"
+            _record_appointment_activity(
                 db,
-                notice,
-                event,
-                timezone_name=appointment.timezone,
+                appointment,
+                event_type="delivery_retry_blocked",
+                user=user,
+                body=detail,
+                after={"action": payload.action, "status": "blocked_no_consent"},
             )
-            retry_status = notice.confirmation_sms_status
-            detail = notice.last_error if retry_status == "failed" else None
-    if notice is not None:
-        if retry_status == "failed" and detail:
-            notice.record_delivery_error(detail)
-        elif retry_status == "sent":
-            notice.clear_delivery_error()
+            await db.commit()
+            return RepAppointmentDeliveryRetryResult(
+                action=payload.action,
+                status="blocked_no_consent",
+                detail=detail,
+                attempted_at=attempted_at,
+            )
+        if notice.confirmation_sms_status == "sent":
+            return RepAppointmentDeliveryRetryResult(
+                action=payload.action,
+                status="sent",
+                detail="This delivery was already completed.",
+                attempted_at=attempted_at,
+            )
+
+    effect_key = {
+        "google_sync": "google",
+        "email_confirmation": "client_email",
+        "sms_confirmation": "client_sms",
+    }[payload.action]
+    retry_payload: dict[str, Any] = {}
+    if payload.action == "google_sync":
+        workflow_color = (appointment.workflow_outcome_results or {}).get("color")
+        retry_payload = {
+            "google_color_id": (
+                _appointment_workflow_google_color(str(workflow_color))
+                or _appointment_google_color(appointment.outcome)
+            ),
+            "google_send_updates": "none",
+        }
+    elif payload.action == "sms_confirmation":
+        retry_payload = {"manual_confirmation": True}
+        if notice is not None:
+            notice.confirmation_sms_status = "pending"
+
+    operation, effect = await booking_operations.enqueue_manual_retry(
+        db,
+        appointment=appointment,
+        event=event,
+        actor_user_id=user.id,
+        effect_key=effect_key,
+        delivery_payload=retry_payload,
+    )
+    already_sent = effect.status == "sent"
+    retry_status = "sent" if already_sent else "queued"
+    detail = (
+        "This delivery was already completed."
+        if already_sent
+        else "Delivery retry queued."
+    )
     _record_appointment_activity(
         db,
         appointment,
@@ -9971,6 +10456,8 @@ async def retry_rep_appointment_delivery(
         after={"action": payload.action, "status": retry_status},
     )
     await db.commit()
+    if not already_sent:
+        asyncio.create_task(booking_operations.wake_operation(operation.id))
     return RepAppointmentDeliveryRetryResult(
         action=payload.action,
         status=retry_status,
@@ -9987,6 +10474,7 @@ async def _prepare_underwriting_review_room(
     recipient_email: str | None,
     recipient_phone: str | None,
     requested_document_keys: list[str] | None = None,
+    defer_delivery: bool = False,
 ) -> dict[str, str]:
     """Create the post-booking checklist without risking the appointment.
 
@@ -9994,6 +10482,8 @@ async def _prepare_underwriting_review_room(
     three proposed windows never call it, so they cannot create rooms, rotate
     codes, or send document requests. Checklist writes are idempotent.
     """
+
+    from sqlalchemy.exc import SQLAlchemyError
 
     results: dict[str, str] = {}
     try:
@@ -10069,21 +10559,24 @@ async def _prepare_underwriting_review_room(
         purpose = "review the underwriting document request"
         if room.passcode:
             purpose += f" using access code {room.passcode}"
-        delivery = await _notify_client_request(
-            db,
-            dealer,
-            user,
-            purpose=purpose,
-            path=room.url,
-            channel="email" if recipient_email else "sms",
-            action="client_request.underwriting_review_documents",
-            recipient_email=recipient_email,
-            recipient_phone=recipient_phone,
-            strict_recipient=True,
-        )
-        results["document_request_delivery"] = "sent" if delivery.ok else "failed"
-        if not delivery.ok:
-            results["document_request_error"] = (delivery.detail or "delivery_failed")[:240]
+        if defer_delivery:
+            results["document_request_delivery"] = "queued"
+        else:
+            delivery = await _notify_client_request(
+                db,
+                dealer,
+                user,
+                purpose=purpose,
+                path=room.url,
+                channel="email" if recipient_email else "sms",
+                action="client_request.underwriting_review_documents",
+                recipient_email=recipient_email,
+                recipient_phone=recipient_phone,
+                strict_recipient=True,
+            )
+            results["document_request_delivery"] = "sent" if delivery.ok else "failed"
+            if not delivery.ok:
+                results["document_request_error"] = (delivery.detail or "delivery_failed")[:240]
         await log_action(
             db,
             dealer.id,
@@ -10098,6 +10591,8 @@ async def _prepare_underwriting_review_room(
                 "delivery": results["document_request_delivery"],
             },
         )
+    except SQLAlchemyError:
+        raise
     except Exception:  # noqa: BLE001
         logger.exception("underwriting review room setup failed dealer=%s", dealer.id)
         results["secure_room"] = "failed"
@@ -10116,11 +10611,122 @@ async def create_standalone_rep_appointment(
     require_team_or_rep(user)
     host = await _rep_host_for(db, None, user)
     booking = await _booking_settings_for(db, host)
-    await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
     duration = payload.duration_min or booking.duration_min or 20
+    phone = consent_delivery.normalize_phone(payload.invitee_phone)
+    origin = precall.origin_for(payload.origin, is_rep=is_rep(user))
+    request_fingerprint = booking_operations.creation_request_fingerprint(
+        {
+            "surface": "standalone",
+            "owner_user_id": host.id,
+            "actor_user_id": user.id,
+            "starts_at": starts_at,
+            "duration_min": duration,
+            "origin": origin,
+            "payload": payload.model_dump(
+                mode="json", exclude={"creation_idempotency_key"}
+            ),
+        }
+    )
+    creation_key = booking_operations.creation_idempotency_key(
+        owner_user_id=host.id,
+        starts_at=starts_at,
+        duration_min=duration,
+        invitee_email=payload.invitee_email,
+        invitee_phone=phone,
+        origin=origin,
+        scope=(
+            f"standalone:{user.id}:{payload.kind}:"
+            f"{(payload.company or '').strip().lower()}"
+        ),
+        caller_token=payload.creation_idempotency_key,
+    )
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not booking_operations.creation_replay_matches(
+            existing,
+            owner_user_id=host.id,
+            dealer_id=None,
+            starts_at=starts_at,
+            duration_min=duration,
+            invitee_email=payload.invitee_email,
+            invitee_phone=phone,
+            actor_user_id=user.id,
+            require_actor_match=True,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "idempotency_key_reused",
+                    "message": "That booking request key was already used for different booking details.",
+                },
+            )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="standalone_appointment",
+        )
+        return (await _appointment_read_rows(db, [existing]))[0]
     if not await _appointment_slot_is_available(
         db, host, booking, starts_at=starts_at, duration_min=duration
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    await lock_calendar_owner(db, host.id)
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not booking_operations.creation_replay_matches(
+            existing,
+            owner_user_id=host.id,
+            dealer_id=None,
+            starts_at=starts_at,
+            duration_min=duration,
+            invitee_email=payload.invitee_email,
+            invitee_phone=phone,
+            actor_user_id=user.id,
+            require_actor_match=True,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "idempotency_key_reused",
+                    "message": "That booking request key was already used for different booking details.",
+                },
+            )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="standalone_appointment_locked",
+        )
+        return (await _appointment_read_rows(db, [existing]))[0]
+    if not await _appointment_slot_is_available(
+        db,
+        host,
+        booking,
+        starts_at=starts_at,
+        duration_min=duration,
+        check_google=False,
     ):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
     program_key, program_name = await _resolve_appointment_program(
@@ -10173,13 +10779,18 @@ async def create_standalone_rep_appointment(
         city=payload.city,
         state=payload.state,
         zip=payload.zip,
-        join_url=payload.join_url,
+        join_url=None,
         meeting_mode=payload.meeting_mode,
         location=payload.location,
         notes=payload.notes,
         status="pending",
         client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
         booked_by_user_id=user.id,
+        creation_idempotency_key=creation_key,
+        precall_application_data={
+            "creation_request_fingerprint": request_fingerprint
+        },
+        origin=origin,
     )
     db.add(appt)
     await db.flush()
@@ -10209,11 +10820,11 @@ async def create_standalone_rep_appointment(
         full_address=full_address,
     )
 
-    phone = consent_delivery.normalize_phone(payload.invitee_phone)
     if not payload.invitee_email and not phone:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Provide a valid email or mobile number.")
     contact = await _ensure_rep_contact(
         db,
+        actor_user=user,
         owner_user_id=user.id,
         dealer_id=None,
         full_name=payload.invitee_name,
@@ -10235,7 +10846,6 @@ async def create_standalone_rep_appointment(
         marketing=False,
         method="in_person_device",
     )
-    appt.origin = precall.origin_for(payload.origin, is_rep=is_rep(user))
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=contact,
         booked_by=user, company=payload.company, notes=payload.notes, kind=payload.kind, origin=appt.origin,
@@ -10270,7 +10880,7 @@ async def create_standalone_rep_appointment(
         sender=user.email if thread.channel == "email" else consent_delivery.sms_sender(),
         recipient=payload.invitee_email or phone,
     )
-    await notify_users(
+    rep_notifications = await notify_users(
         db,
         recipient_ids={user.id},
         event_type="appointment_created",
@@ -10283,70 +10893,39 @@ async def create_standalone_rep_appointment(
         deep_link=f"/calendar?appointment={appt.id}",
         meta={"appointment_id": str(appt.id), "calendar_event_id": str(ev.id)},
         email=True,
+        defer_email=True,
         push=True,
+    )
+    kit = await _booking_kit(
+        db,
+        notice=notice,
+        event=ev,
+        booking=booking,
+        host=host,
+        draft=draft,
+        timezone_name=appt.timezone,
+    )
+    delivery_operation = await booking_operations.enqueue(
+        db,
+        appointment=appt,
+        event=ev,
+        actor_user_id=user.id,
+        operation_type="create",
+        idempotency_key=f"booking:create:{appt.id}",
+        notification_ids=[row.id for row in rep_notifications],
+        delivery_payload={"notes": payload.notes},
     )
     await db.commit()
     await db.refresh(appt)
-    join = await booking_notify.push_to_google(
-        db,
-        ev,
-        invitee_email=payload.invitee_email,
-        invitee_name=payload.invitee_name,
-        rep_email=user.email,
-        rep_name=user.name,
-        want_meet=booking.google_meet_enabled,
-    )
-    if join and not appt.join_url:
-        appt.join_url = join
-        notice.join_url = join
-        ev.description = f"{description}\n\nJoin: {join}"
-        await db.commit()
-        await db.refresh(appt)
-    kit = await _booking_kit(
-        db, notice=notice, event=ev, booking=booking, host=host, draft=draft, timezone_name=appt.timezone
-    )
-    booking_notify.notify_host(
-        host,
-        booking,
-        starts_at,
-        invitee_name=payload.invitee_name,
-        invitee_email=payload.invitee_email or "not provided",
-        invitee_phone=payload.invitee_phone,
-        notes=payload.notes,
-        join_url=appt.join_url,
-    )
-    if payload.invitee_email:
-        if booking.confirmation_email_enabled:
-            email_result = booking_notify.send_invitee_invite(
-                host,
-                booking,
-                ev,
-                starts_at,
-                invitee_name=payload.invitee_name,
-                invitee_email=payload.invitee_email,
-                join_url=appt.join_url,
-                precall_block=kit.block if kit else None,
-                template=kit.email_template if kit else None,
-                template_values=kit.values if kit else None,
-            )
-            notice.confirmation_email_status = (
-                "sent" if email_result and email_result.ok else "failed"
-            )
-            if email_result and not email_result.ok:
-                notice.record_delivery_error(email_result.detail)
-            elif email_result:
-                notice.clear_delivery_error()
-        await db.commit()
-    booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
-    await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone,
-        template=kit.sms_template if kit else None, values=kit.values if kit else None,
-    )
-    await _deliver_booking_pin(db, notice=notice, booking=booking, kit=kit)
     result = (await _appointment_read_rows(db, [appt]))[0]
+    result["notification_results"] = {
+        **(result.get("notification_results") or {}),
+        **await booking_operations.queued_results(db, delivery_operation),
+    }
     if kit is not None:
         result["room_url"] = kit.room_url
         result["room_passcode"] = kit.pin
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     return result
 
 
@@ -10411,11 +10990,119 @@ async def create_rep_appointment(
     )
     host = await _rep_host_for(db, dealer, user)
     booking = await _booking_settings_for(db, host)
-    await lock_calendar_owner(db, host.id)
     starts_at = _to_utc_minute(payload.starts_at)
     duration = payload.duration_min or booking.duration_min or 20
+    phone = consent_delivery.normalize_phone(payload.invitee_phone)
+    request_fingerprint = booking_operations.creation_request_fingerprint(
+        {
+            "surface": "dealer",
+            "owner_user_id": host.id,
+            "actor_user_id": user.id,
+            "dealer_id": dealer.id,
+            "starts_at": starts_at,
+            "duration_min": duration,
+            "origin": "field_desk",
+            "payload": payload.model_dump(
+                mode="json", exclude={"creation_idempotency_key"}
+            ),
+        }
+    )
+    creation_key = booking_operations.creation_idempotency_key(
+        owner_user_id=host.id,
+        starts_at=starts_at,
+        duration_min=duration,
+        invitee_email=payload.invitee_email,
+        invitee_phone=phone,
+        origin="field_desk",
+        scope=f"dealer:{dealer.id}:{user.id}:{payload.kind}",
+        caller_token=payload.creation_idempotency_key,
+    )
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not booking_operations.creation_replay_matches(
+            existing,
+            owner_user_id=host.id,
+            dealer_id=dealer.id,
+            starts_at=starts_at,
+            duration_min=duration,
+            invitee_email=payload.invitee_email,
+            invitee_phone=phone,
+            actor_user_id=user.id,
+            require_actor_match=True,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "idempotency_key_reused",
+                    "message": "That booking request key was already used for different booking details.",
+                },
+            )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="dealer_appointment",
+        )
+        return (await _appointment_read_rows(db, [existing]))[0]
     if not await _appointment_slot_is_available(
         db, host, booking, starts_at=starts_at, duration_min=duration
+    ):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
+    await lock_calendar_owner(db, host.id)
+    existing = (
+        await db.execute(
+            select(DealerRepAppointment).where(
+                DealerRepAppointment.creation_idempotency_key == creation_key
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not booking_operations.creation_replay_matches(
+            existing,
+            owner_user_id=host.id,
+            dealer_id=dealer.id,
+            starts_at=starts_at,
+            duration_min=duration,
+            invitee_email=payload.invitee_email,
+            invitee_phone=phone,
+            actor_user_id=user.id,
+            require_actor_match=True,
+            request_fingerprint=(
+                request_fingerprint
+                if payload.creation_idempotency_key
+                else None
+            ),
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "idempotency_key_reused",
+                    "message": "That booking request key was already used for different booking details.",
+                },
+            )
+        booking_operations.record_idempotency_replay(
+            operation_type="create",
+            appointment_id=existing.id,
+            surface="dealer_appointment_locked",
+        )
+        return (await _appointment_read_rows(db, [existing]))[0]
+    if not await _appointment_slot_is_available(
+        db,
+        host,
+        booking,
+        starts_at=starts_at,
+        duration_min=duration,
+        check_google=False,
     ):
         raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available.")
     program_key, program_name = await _resolve_appointment_program(
@@ -10468,13 +11155,18 @@ async def create_rep_appointment(
         city=payload.city,
         state=payload.state,
         zip=payload.zip,
-        join_url=payload.join_url,
+        join_url=None,
         meeting_mode=payload.meeting_mode,
         location=payload.location,
         notes=payload.notes,
         status="pending",
         client_rsvp_status="needs_action" if payload.invitee_email else "unknown",
         booked_by_user_id=user.id,
+        creation_idempotency_key=creation_key,
+        precall_application_data={
+            "creation_request_fingerprint": request_fingerprint
+        },
+        origin="field_desk",
     )
     db.add(appt)
     await db.flush()
@@ -10506,15 +11198,14 @@ async def create_rep_appointment(
     if dealer.is_training:
         await booking_reminders.cancel_pending(db, notice)
         notice.record_delivery_error("Training file: unattended reminders are suppressed.")
-    appt.origin = "field_desk"
     draft = await _open_booking_draft(
         db, notice=notice, event=ev, booking=booking, host=host, appointment=appt, contact=None,
         dealer=dealer, booked_by=user, company=payload.company or dealer.name, notes=payload.notes, kind=payload.kind,
         origin=appt.origin,
     )
-    phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
+        actor_user=user,
         owner_user_id=user.id,
         dealer_id=dealer.id,
         full_name=payload.invitee_name,
@@ -10559,8 +11250,9 @@ async def create_rep_appointment(
             recipient_email=payload.invitee_email,
             recipient_phone=payload.invitee_phone,
             requested_document_keys=payload.requested_document_keys,
+            defer_delivery=True,
         )
-    await notify_users(
+    rep_notifications = await notify_users(
         db,
         recipient_ids={user.id},
         event_type="appointment_created",
@@ -10573,67 +11265,40 @@ async def create_rep_appointment(
         deep_link=f"/calendar?appointment={appt.id}",
         meta={"appointment_id": str(appt.id), "calendar_event_id": str(ev.id)},
         email=True,
+        defer_email=True,
         push=True,
+    )
+    kit = await _booking_kit(
+        db,
+        notice=notice,
+        event=ev,
+        booking=booking,
+        host=host,
+        draft=draft,
+        timezone_name=appt.timezone,
+    )
+    delivery_operation = await booking_operations.enqueue(
+        db,
+        appointment=appt,
+        event=ev,
+        actor_user_id=user.id,
+        operation_type="create",
+        idempotency_key=f"booking:create:{appt.id}",
+        notification_ids=[row.id for row in rep_notifications],
+        delivery_payload={
+            "notes": payload.notes,
+            "document_request_dealer_id": (
+                str(dealer.id) if payload.kind == "underwriting_review" else None
+            ),
+        },
     )
     await db.commit()
     await db.refresh(appt)
-    join = await booking_notify.push_to_google(
-        db,
-        ev,
-        invitee_email=payload.invitee_email,
-        invitee_name=payload.invitee_name,
-        rep_email=user.email,
-        rep_name=user.name,
-        want_meet=booking.google_meet_enabled,
-    )
-    if join and not appt.join_url:
-        appt.join_url = join
-        notice.join_url = join
-        ev.description = f"{description}\n\nJoin: {join}"
-        await db.commit()
-        await db.refresh(appt)
-    kit = await _booking_kit(
-        db, notice=notice, event=ev, booking=booking, host=host, draft=draft, timezone_name=appt.timezone
-    )
-    booking_notify.notify_host(
-        host,
-        booking,
-        starts_at,
-        invitee_name=payload.invitee_name,
-        invitee_email=payload.invitee_email or "not provided",
-        invitee_phone=payload.invitee_phone,
-        notes=payload.notes,
-        join_url=appt.join_url,
-    )
-    if payload.invitee_email:
-        if booking.confirmation_email_enabled:
-            email_result = booking_notify.send_invitee_invite(
-                host,
-                booking,
-                ev,
-                starts_at,
-                invitee_name=payload.invitee_name,
-                invitee_email=payload.invitee_email,
-                join_url=appt.join_url,
-                precall_block=kit.block if kit else None,
-                template=kit.email_template if kit else None,
-                template_values=kit.values if kit else None,
-            )
-            notice.confirmation_email_status = (
-                "sent" if email_result and email_result.ok else "failed"
-            )
-            if email_result and not email_result.ok:
-                notice.record_delivery_error(email_result.detail)
-            elif email_result:
-                notice.clear_delivery_error()
-        await db.commit()
-    booking_notify.send_rep_invite(host, booking, ev, starts_at, rep=user, join_url=appt.join_url)
-    await booking_reminders.send_confirmation_sms(
-        db, notice, ev, timezone_name=booking.timezone,
-        template=kit.sms_template if kit else None, values=kit.values if kit else None,
-    )
-    await _deliver_booking_pin(db, notice=notice, booking=booking, kit=kit)
     result = (await _appointment_read_rows(db, [appt]))[0]
+    result["notification_results"] = {
+        **(result.get("notification_results") or {}),
+        **await booking_operations.queued_results(db, delivery_operation),
+    }
     if kit is not None:
         result["room_url"] = kit.room_url
         result["room_passcode"] = kit.pin
@@ -10642,6 +11307,7 @@ async def create_rep_appointment(
             **(result.get("notification_results") or {}),
             **room_results,
         }
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     return result
 
 
@@ -10687,6 +11353,135 @@ async def _cancel_rep_appointment(
         before={"crm_status": previous_crm_status},
         after={"crm_status": "cancelled"},
     )
+    # Only the prospect's current appointment controls its pipeline stage. An
+    # old calendar event cancelled later must not rewind a prospect that has
+    # already booked something else or moved on.
+    if appt.prospect_id is not None:
+        from .services import prospects as prospect_service
+
+        prospect = (
+            await db.execute(
+                select(DealerProspect)
+                .where(DealerProspect.id == appt.prospect_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        current_stage = (
+            await db.get(DealerProspectStageDefinition, prospect.stage_definition_id)
+            if prospect is not None
+            else None
+        )
+        if (
+            prospect is not None
+            and prospect.appointment_id == appt.id
+            and current_stage is not None
+            and current_stage.key == "booked"
+        ):
+            suppression = (
+                await prospect_outreach_service.is_suppressed(
+                    db, prospect.email_normalized
+                )
+                if prospect.email_normalized
+                else None
+            )
+            contact_blocked = prospect.do_not_contact or suppression is not None
+            if contact_blocked:
+                # Cancelling a meeting cannot resurrect outreach after an
+                # unsubscribe, complaint, bounce, or administrative block.
+                # Prefer the active terminal stage; if it was retired, retain
+                # the current stage while the DNC flag remains authoritative.
+                return_stage = (
+                    await db.execute(
+                        select(DealerProspectStageDefinition).where(
+                            DealerProspectStageDefinition.key == "not_interested",
+                            DealerProspectStageDefinition.is_active.is_(True),
+                        )
+                    )
+                ).scalar_one_or_none() or current_stage
+            else:
+                return_stage = (
+                    await db.get(
+                        DealerProspectStageDefinition, appt.return_stage_id
+                    )
+                    if appt.return_stage_id is not None
+                    else None
+                )
+                if (
+                    return_stage is None
+                    or not return_stage.is_active
+                    or return_stage.key
+                    in {"booked", "converted", "not_interested"}
+                ):
+                    fallback_rows = list(
+                        (
+                            await db.execute(
+                                select(DealerProspectStageDefinition)
+                                .where(
+                                    or_(
+                                        DealerProspectStageDefinition.key.like(
+                                            "follow_up_%"
+                                        ),
+                                        DealerProspectStageDefinition.key
+                                        == "emailed",
+                                    ),
+                                    DealerProspectStageDefinition.is_active.is_(
+                                        True
+                                    ),
+                                )
+                                .order_by(
+                                    DealerProspectStageDefinition.sort_order.asc(),
+                                    DealerProspectStageDefinition.id.asc(),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    return_stage = next(
+                        (
+                            row
+                            for row in fallback_rows
+                            if row.key.startswith("follow_up_")
+                        ),
+                        None,
+                    ) or next(
+                        (row for row in fallback_rows if row.key == "emailed"),
+                        None,
+                    )
+            if return_stage is not None:
+                version_before = prospect.version
+                prospect.stage_definition_id = return_stage.id
+                prospect.appointment_id = None
+                prospect.next_follow_up_at = (
+                    None
+                    if contact_blocked
+                    else prospect_service.business_follow_up_at(
+                        business_days=1,
+                        timezone_name=booking.timezone,
+                        current_time=now,
+                    )
+                )
+                prospect.version += 1
+                await prospect_service.add_activity(
+                    db,
+                    prospect,
+                    user,
+                    "appointment_cancelled",
+                    body=cancellation_reason,
+                    metadata={
+                        "appointment_id": str(appt.id),
+                        "from_stage_key": "booked",
+                        "to_stage_key": return_stage.key,
+                        "contact_blocked": contact_blocked,
+                        "next_follow_up_at": (
+                            prospect.next_follow_up_at.isoformat()
+                            if prospect.next_follow_up_at
+                            else None
+                        ),
+                        "version_before": version_before,
+                        "version_after": prospect.version,
+                    },
+                )
     if event:
         event.status = CalendarEventStatus.CANCELLED
     if notice:
@@ -10697,8 +11492,9 @@ async def _cancel_rep_appointment(
             entity_id=appt.id,
             after={"reason": appt.cancellation_reason, "archived_at": now.isoformat()},
         )
+    rep_notifications: list[Notification] = []
     if rep:
-        await notify_users(
+        rep_notifications = await notify_users(
             db,
             recipient_ids={rep.id},
             event_type="appointment_cancelled",
@@ -10710,69 +11506,24 @@ async def _cancel_rep_appointment(
             target_id=str(appt.id),
             deep_link="/calendar?include_cancelled=1",
             email=True,
+            defer_email=True,
             push=True,
         )
+    delivery_operation = await booking_operations.enqueue(
+        db,
+        appointment=appt,
+        event=event,
+        actor_user_id=user.id,
+        operation_type="cancel",
+        notification_ids=[row.id for row in rep_notifications],
+        idempotency_key=f"booking:cancel:{appt.id}",
+    )
     await db.commit()
-
-    results: dict[str, str] = {"rep": "queued" if rep else "unavailable"}
-    if event:
-        await booking_notify.push_to_google(
-            db,
-            event,
-            invitee_email=appt.invitee_email,
-            invitee_name=appt.invitee_name,
-            rep_email=rep.email if rep else None,
-            rep_name=rep.name if rep else None,
-            want_meet=False,
-            color_id=_appointment_google_color(appt.outcome),
-        )
-        results["google"] = "sent" if event.google_event_id else "unavailable"
-        rep_result = booking_notify.send_rep_invite(
-            host or user,
-            booking,
-            event,
-            appt.starts_at,
-            rep=rep,
-            join_url=appt.join_url,
-            cancel=True,
-            sequence=int(now.timestamp()),
-        )
-        results["rep_calendar"] = "sent" if rep_result and rep_result.ok else "unavailable" if rep_result is None else "failed"
-    if event and appt.invitee_email:
-        email_result = booking_notify.send_invitee_invite(
-            host or user,
-            booking,
-            event,
-            appt.starts_at,
-            invitee_name=appt.invitee_name,
-            invitee_email=appt.invitee_email,
-            join_url=appt.join_url,
-            cancel=True,
-            sequence=int(now.timestamp()),
-        )
-        results["client_email"] = "sent" if email_result and email_result.ok else "failed"
-        if notice and email_result and not email_result.ok:
-            notice.record_delivery_error(email_result.detail)
-        elif notice and email_result:
-            notice.clear_delivery_error()
-    if notice and notice.invitee_phone and notice.sms_consent:
-        sms_body = f"Qualified Commercial: your appointment on {_appointment_local_time(appt.starts_at, appt.timezone)} was cancelled."
-        try:
-            sms_result = await consent_delivery.send_sms_guarded(
-                db, notice.invitee_phone, sms_body, context="booking_cancellation"
-            )
-            results["client_sms"] = "sent" if sms_result.ok else "failed"
-            if sms_result.ok:
-                notice.clear_delivery_error()
-            else:
-                notice.record_delivery_error(sms_result.detail)
-        except Exception:  # noqa: BLE001
-            logger.exception("appointment cancellation SMS raised appointment=%s", appt.id)
-            results["client_sms"] = "failed"
-            notice.record_delivery_error("sms_provider_exception")
-    elif appt.invitee_phone:
+    results = await booking_operations.queued_results(db, delivery_operation)
+    results.setdefault("rep", "unavailable" if rep is None else "queued")
+    if appt.invitee_phone and not (notice and notice.sms_consent):
         results["client_sms"] = "blocked_no_consent"
-    await db.commit()
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     await db.refresh(appt)
     data = (await _appointment_read_rows(db, [appt]))[0]
     data["notification_results"] = results
@@ -10787,7 +11538,21 @@ async def patch_rep_appointment(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    appt = await _load_owned_appointment(db, appointment_id, user)
+    appt = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
+    if appt.prospect_id is not None and payload.model_fields_set.intersection(
+        {"dealer_id", "invitee_name", "invitee_email", "invitee_phone", "company"}
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "prospect_identity_managed_in_marketing",
+                "message": (
+                    "Edit this prospect's contact and dealership identity in Marketing."
+                ),
+            },
+        )
     dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
     if dealer is not None:
         await _require_training_live_action(
@@ -10823,11 +11588,22 @@ async def patch_rep_appointment(
     else:
         dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
 
-    proposed_start = _to_utc_minute(payload.starts_at) if payload.starts_at is not None else appt.starts_at
+    proposed_timezone = (
+        payload.timezone
+        if "timezone" in payload.model_fields_set and payload.timezone
+        else appt.timezone
+    )
+    proposed_start = (
+        _appointment_patch_start(
+            payload.starts_at,
+            timezone_name=proposed_timezone,
+        )
+        if payload.starts_at is not None
+        else appt.starts_at
+    )
     proposed_duration = payload.duration_min or appt.duration_min
     rescheduled = proposed_start != appt.starts_at or proposed_duration != appt.duration_min
     if rescheduled:
-        await lock_calendar_owner(db, (host or user).id)
         if not await _appointment_slot_is_available(
             db,
             host or user,
@@ -10837,6 +11613,20 @@ async def patch_rep_appointment(
             exclude_event_id=event.id if event else None,
         ):
             raise HTTPException(status.HTTP_409_CONFLICT, "That time is no longer available on the shared calendar.")
+        await lock_calendar_owner(db, (host or user).id)
+        if not await _appointment_slot_is_available(
+            db,
+            host or user,
+            booking,
+            starts_at=proposed_start,
+            duration_min=proposed_duration,
+            exclude_event_id=event.id if event else None,
+            check_google=False,
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "That time is no longer available on the shared calendar.",
+            )
         appt.starts_at = proposed_start
         appt.duration_min = proposed_duration
         if appt.outcome in {"not_converted", "did_not_show"} and not payload.reopen_outcome:
@@ -10882,7 +11672,7 @@ async def patch_rep_appointment(
 
     for field in (
         "kind", "title", "timezone", "invitee_name", "company",
-        "requested_amount", "full_address", "join_url", "meeting_mode", "location", "notes",
+        "requested_amount", "full_address", "meeting_mode", "location", "notes",
     ):
         value = getattr(payload, field)
         if field in payload.model_fields_set:
@@ -10927,6 +11717,23 @@ async def patch_rep_appointment(
     if appt.contact_id:
         contact = await db.get(DealerRepContact, appt.contact_id)
         if contact:
+            await prospect_service.resolve_contact_identity(
+                db,
+                actor_user=user,
+                owner_user_id=appt.owner_user_id or user.id,
+                email=appt.invitee_email,
+                phone=appt.invitee_phone,
+                exclude_contact_id=contact.id,
+                additional_emails=(contact.email or "",),
+                additional_phones=(contact.phone_e164 or "",),
+            )
+            contact = (
+                await db.execute(
+                    select(DealerRepContact)
+                    .where(DealerRepContact.id == contact.id)
+                    .with_for_update()
+                )
+            ).scalar_one()
             contact.full_name = appt.invitee_name
             contact.company = appt.company or contact.company
             contact.email = appt.invitee_email
@@ -10961,8 +11768,13 @@ async def patch_rep_appointment(
             "appointment", entity_id=appt.id, before=before,
             after=payload.model_dump(exclude_unset=True, mode="json"),
         )
-    if rep:
-        await notify_users(
+    delivery_key = booking_operations.lifecycle_idempotency_key(appt, event)
+    existing_delivery = await booking_operations.find_by_idempotency_key(
+        db, delivery_key
+    )
+    rep_notifications: list[Notification] = []
+    if rep and existing_delivery is None:
+        rep_notifications = await notify_users(
             db,
             recipient_ids={rep.id},
             event_type="appointment_rescheduled" if rescheduled else "appointment_updated",
@@ -10974,6 +11786,7 @@ async def patch_rep_appointment(
             target_id=str(appt.id),
             deep_link=f"/calendar?appointment={appt.id}",
             email=True,
+            defer_email=True,
             push=True,
         )
     _record_appointment_activity(
@@ -10984,56 +11797,22 @@ async def patch_rep_appointment(
         before=before,
         after=payload.model_dump(exclude_unset=True, mode="json"),
     )
+    operation_type = "reschedule" if rescheduled else "update"
+    delivery_operation = await booking_operations.enqueue(
+        db,
+        appointment=appt,
+        event=event,
+        actor_user_id=user.id,
+        operation_type=operation_type,
+        old_email=old_email,
+        old_starts_at=old_starts_at,
+        notification_ids=[row.id for row in rep_notifications],
+        idempotency_key=delivery_key,
+    )
     await db.commit()
-
-    results: dict[str, str] = {"rep": "queued" if rep else "unavailable"}
-    if event:
-        join = await booking_notify.push_to_google(
-            db,
-            event,
-            invitee_email=appt.invitee_email,
-            invitee_name=appt.invitee_name,
-            rep_email=rep.email if rep else None,
-            rep_name=rep.name if rep else None,
-            want_meet=booking.google_meet_enabled,
-            color_id=_appointment_google_color(appt.outcome),
-        )
-        if join and not appt.join_url:
-            appt.join_url = join
-            if notice:
-                notice.join_url = join
-        results["google"] = "sent" if event.google_event_id else "unavailable"
-        sequence = int(datetime.now(timezone.utc).timestamp())
-        if old_email and old_email != appt.invitee_email:
-            booking_notify.send_invitee_invite(
-                host or user, booking, event, old_starts_at,
-                invitee_name=appt.invitee_name, invitee_email=old_email,
-                join_url=appt.join_url, cancel=True, sequence=sequence,
-            )
-        if appt.invitee_email:
-            email_result = booking_notify.send_invitee_invite(
-                host or user, booking, event, appt.starts_at,
-                invitee_name=appt.invitee_name, invitee_email=appt.invitee_email,
-                join_url=appt.join_url, sequence=sequence,
-            )
-            results["client_email"] = "sent" if email_result and email_result.ok else "failed"
-            if notice:
-                notice.confirmation_email_status = results["client_email"]
-                if email_result and not email_result.ok:
-                    notice.record_delivery_error(email_result.detail)
-                elif email_result:
-                    notice.clear_delivery_error()
-        rep_result = booking_notify.send_rep_invite(
-            host or user,
-            booking,
-            event,
-            appt.starts_at,
-            rep=rep,
-            join_url=appt.join_url,
-            sequence=sequence,
-        )
-        results["rep_calendar"] = "sent" if rep_result and rep_result.ok else "unavailable" if rep_result is None else "failed"
-    await db.commit()
+    results = await booking_operations.queued_results(db, delivery_operation)
+    results.setdefault("rep", "unavailable" if rep is None else "queued")
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     await db.refresh(appt)
     data = (await _appointment_read_rows(db, [appt]))[0]
     data["notification_results"] = results
@@ -11048,7 +11827,9 @@ async def cancel_rep_appointment(
     user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    appt = await _load_owned_appointment(db, appointment_id, user)
+    appt = await _load_owned_appointment(
+        db, appointment_id, user, for_update=True
+    )
     dealer = await db.get(DealerBusiness, appt.dealer_id) if appt.dealer_id else None
     if dealer is not None:
         await _require_training_live_action(
@@ -11827,6 +12608,11 @@ async def book_underwriting_review_preference(
             existing_start = _to_utc_minute(existing.starts_at)
             requested_start = _to_utc_minute(payload.starts_at)
             if existing_start == requested_start or existing.client_rsvp_status != "declined":
+                booking_operations.record_idempotency_replay(
+                    operation_type="create",
+                    appointment_id=existing.id,
+                    surface="underwriting_preference",
+                )
                 return (await _appointment_read_rows(db, [existing]))[0]
             # A declined invitation may be replaced by one of the other stored
             # proposals. Keep the declined appointment as immutable history.
@@ -11847,7 +12633,15 @@ async def book_underwriting_review_preference(
     booking_rep = booking_rep or user
     host = await _rep_host_for(db, dealer, booking_rep)
     booking = await _booking_settings_for(db, host)
-    await lock_calendar_owner(db, host.id)
+    creation_key = booking_operations.creation_idempotency_key(
+        owner_user_id=host.id,
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        invitee_email=str(payload.invitee_email),
+        invitee_phone=consent_delivery.normalize_phone(payload.invitee_phone),
+        origin="field_desk",
+        scope=f"underwriting_preference:{preference.id}",
+    )
     availability = await _booking_slots(
         db,
         host,
@@ -11860,6 +12654,19 @@ async def book_underwriting_review_preference(
             "The shared calendar is unavailable. Reconnect it before sending the invitation.",
         )
     if not any(abs((slot.starts_at - starts_at).total_seconds()) < 1 for slot in availability.slots):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "That proposed time is no longer available. Choose another window or request new options.",
+        )
+    await lock_calendar_owner(db, host.id)
+    if not await _appointment_slot_is_available(
+        db,
+        host,
+        booking,
+        starts_at=starts_at,
+        duration_min=booking.duration_min,
+        check_google=False,
+    ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "That proposed time is no longer available. Choose another window or request new options.",
@@ -11930,6 +12737,7 @@ async def book_underwriting_review_preference(
         status="pending",
         client_rsvp_status="needs_action",
         booked_by_user_id=booking_rep.id,
+        creation_idempotency_key=creation_key,
     )
     db.add(appointment)
     await db.flush()
@@ -11969,6 +12777,7 @@ async def book_underwriting_review_preference(
     phone = consent_delivery.normalize_phone(payload.invitee_phone)
     contact = await _ensure_rep_contact(
         db,
+        actor_user=user,
         owner_user_id=booking_rep.id,
         dealer_id=dealer.id,
         full_name=payload.invitee_name,
@@ -12010,8 +12819,9 @@ async def book_underwriting_review_preference(
         recipient_email=str(payload.invitee_email),
         recipient_phone=payload.invitee_phone,
         requested_document_keys=payload.requested_document_keys,
+        defer_delivery=True,
     )
-    await notify_users(
+    rep_notifications = await notify_users(
         db,
         recipient_ids={booking_rep.id, user.id},
         event_type="underwriting_review_invitation_sent",
@@ -12024,62 +12834,37 @@ async def book_underwriting_review_preference(
         deep_link=f"/calendar?appointment={appointment.id}",
         meta={"appointment_id": str(appointment.id), "preference_id": str(preference.id)},
         email=True,
+        defer_email=True,
         push=True,
+    )
+    delivery_operation = await booking_operations.enqueue(
+        db,
+        appointment=appointment,
+        event=event,
+        actor_user_id=user.id,
+        operation_type="create",
+        idempotency_key=f"booking:create:{appointment.id}",
+        notification_ids=[row.id for row in rep_notifications],
+        delivery_payload={
+            "notes": payload.notes,
+            "notify_host": False,
+            "document_request_dealer_id": str(dealer.id),
+        },
     )
     # Appointment, selected preference, and idempotency link commit together.
     await db.commit()
     await db.refresh(appointment)
-
-    join = await booking_notify.push_to_google(
-        db,
-        event,
-        invitee_email=str(payload.invitee_email),
-        invitee_name=payload.invitee_name,
-        rep_email=booking_rep.email,
-        rep_name=booking_rep.name,
-        want_meet=booking.google_meet_enabled,
-    )
-    if join:
-        appointment.join_url = join
-        notice.join_url = join
-        event.description = f"{description}\n\nJoin: {join}"
-    if booking.confirmation_email_enabled:
-        email_result = booking_notify.send_invitee_invite(
-            host,
-            booking,
-            event,
-            starts_at,
-            invitee_name=payload.invitee_name,
-            invitee_email=str(payload.invitee_email),
-            join_url=join,
-        )
-        notice.confirmation_email_status = "sent" if email_result and email_result.ok else "failed"
-        if email_result and not email_result.ok:
-            notice.record_delivery_error(email_result.detail)
-        elif email_result:
-            notice.clear_delivery_error()
-    booking_notify.send_rep_invite(
-        host,
-        booking,
-        event,
-        starts_at,
-        rep=booking_rep,
-        join_url=join,
-    )
-    await booking_reminders.send_confirmation_sms(
-        db,
-        notice,
-        event,
-        timezone_name=booking.timezone,
-    )
-    await db.commit()
-    await db.refresh(appointment)
     result = (await _appointment_read_rows(db, [appointment]))[0]
+    result["notification_results"] = {
+        **(result.get("notification_results") or {}),
+        **await booking_operations.queued_results(db, delivery_operation),
+    }
     if room_results:
         result["notification_results"] = {
             **(result.get("notification_results") or {}),
             **room_results,
         }
+    asyncio.create_task(booking_operations.wake_operation(delivery_operation.id))
     return result
 
 
@@ -12118,6 +12903,7 @@ async def create_contact_share(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     contact = await _ensure_rep_contact(
         db,
+        actor_user=user,
         owner_user_id=user.id,
         dealer_id=dealer.id if dealer else None,
         full_name=payload.recipient_name,
@@ -12641,6 +13427,7 @@ async def create_rep_inbox_thread(
     if contact is None:
         contact = await _ensure_rep_contact(
             db,
+            actor_user=user,
             owner_user_id=user.id,
             dealer_id=dealer.id if dealer else None,
             full_name=payload.recipient_name,
@@ -13416,7 +14203,7 @@ async def create_session(
         title=payload.title.strip(),
         kind=payload.kind,
         starts_at=payload.starts_at,
-        join_url=(payload.join_url or None),
+        join_url=None,
         notes=payload.notes,
         created_by_user_id=user.id,
     )

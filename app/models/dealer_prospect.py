@@ -99,6 +99,16 @@ class DealerProspect(TimestampMixin, Base):
         Index("ix_dealer_prospect_company", "company_id"),
         Index("ix_dealer_prospect_last_outcome", "last_outcome_definition_id"),
         Index(
+            "ix_dealer_prospect_email_identity",
+            "email_normalized",
+            postgresql_where=text("email_normalized IS NOT NULL"),
+        ),
+        Index(
+            "ix_dealer_prospect_phone_identity",
+            "phone_normalized",
+            postgresql_where=text("phone_normalized IS NOT NULL"),
+        ),
+        Index(
             "uq_dealer_prospect_email_active",
             "dealer_name_normalized",
             "email_normalized",

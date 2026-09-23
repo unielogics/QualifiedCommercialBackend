@@ -23,8 +23,35 @@ from email.message import EmailMessage
 from email.utils import formataddr
 
 from app.config import get_settings
+from app.services import booking_metrics
 
 log = logging.getLogger(__name__)
+
+
+def _emit_provider_failure(operation: str, exc: BaseException) -> None:
+    metric = (
+        "booking.provider.timeout"
+        if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.casefold()
+        else "booking.provider.error"
+    )
+    booking_metrics.emit(metric, provider="ses", operation=operation)
+
+
+def _ses_client(region_name: str):
+    """Create a bounded SES client so a provider stall cannot pin an API worker."""
+
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "ses",
+        region_name=region_name,
+        config=Config(
+            connect_timeout=5,
+            read_timeout=10,
+            retries={"max_attempts": 2, "mode": "standard"},
+        ),
+    )
 
 
 @dataclass
@@ -72,9 +99,7 @@ def send_email(
         return SesSendResult(False, None, f"bad recipient: {to_email!r}")
 
     try:
-        import boto3  # local import — keeps module import cheap
-
-        client = boto3.client("ses", region_name=settings.ses_region or "us-east-1")
+        client = _ses_client(settings.ses_region or "us-east-1")
         body: dict = {"Text": {"Data": body_text, "Charset": "UTF-8"}}
         if body_html:
             body["Html"] = {"Data": body_html, "Charset": "UTF-8"}
@@ -97,6 +122,7 @@ def send_email(
         return SesSendResult(True, msg_id, "sent")
     except Exception as exc:  # noqa: BLE001
         log.warning("ses_client: send failed to=%s: %s", to, exc)
+        _emit_provider_failure("send_email", exc)
         return SesSendResult(False, None, f"send_failed: {exc}")
 
 
@@ -135,8 +161,6 @@ def send_raw_email(
         return SesSendResult(False, None, "bad recipients")
 
     try:
-        import boto3  # local import — keeps module import cheap
-
         msg = EmailMessage()
         msg["From"] = formataddr(((source_name or "Qualified Commercial").strip(), from_addr))
         msg["To"] = ", ".join(recipients)
@@ -171,7 +195,7 @@ def send_raw_email(
                 filename=filename,
             )
 
-        client = boto3.client("ses", region_name=settings.ses_region or "us-east-1")
+        client = _ses_client(settings.ses_region or "us-east-1")
         kwargs: dict = {
             "Source": formataddr(((source_name or "Qualified Commercial").strip(), from_addr)),
             # Envelope recipients include BCC; the MIME message has no Bcc header,
@@ -188,4 +212,5 @@ def send_raw_email(
         return SesSendResult(True, msg_id, "sent")
     except Exception as exc:  # noqa: BLE001
         log.warning("ses_client: raw send failed to=%s cc=%s: %s", recipients, cc, exc)
+        _emit_provider_failure("send_raw_email", exc)
         return SesSendResult(False, None, f"send_failed: {exc}")

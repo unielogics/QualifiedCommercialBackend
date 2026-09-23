@@ -45,6 +45,9 @@ async def create_booking_appointment(
     converted_intake_id: UUID | None = None,
     precall_intake_id: UUID | None = None,
     contact_source: str = "public_booking",
+    creation_idempotency_key: str | None = None,
+    meeting_mode: str = "video",
+    creation_request_fingerprint: str | None = None,
 ) -> DealerRepAppointment:
     """Open the appointment row for a booking that has none, and point the
     calendar event at it. Flushes, never commits."""
@@ -72,11 +75,18 @@ async def create_booking_appointment(
         requested_amount=(requested_amount or "").strip()[:40] or None,
         full_address=(full_address or "").strip()[:500] or None,
         notes=notes,
+        meeting_mode=meeting_mode,
         status="pending",
         crm_status="scheduled",
         booked_by_user_id=booked_by_user_id,
         converted_intake_id=converted_intake_id,
         precall_intake_id=precall_intake_id,
+        creation_idempotency_key=creation_idempotency_key,
+        precall_application_data=(
+            {"creation_request_fingerprint": creation_request_fingerprint}
+            if creation_request_fingerprint
+            else {}
+        ),
     )
     db.add(appt)
     await db.flush()
@@ -87,6 +97,7 @@ async def create_booking_appointment(
     if email or phone:
         contact = await _ensure_rep_contact(
             db,
+            actor_user=host,
             owner_user_id=host.id,
             dealer_id=None,
             full_name=invitee_name,

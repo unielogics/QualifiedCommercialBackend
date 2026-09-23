@@ -18,6 +18,8 @@ from pydantic import (
 
 from app.schemas.phone import RequiredPhone
 
+from .schemas import RepAppointmentRead
+
 
 class ProspectStageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -77,6 +79,7 @@ class ProspectRead(BaseModel):
     stage_sort_order: int
     source: str
     next_follow_up_at: datetime | None
+    follow_up_state: Literal["none", "upcoming", "due", "overdue"] = "none"
     last_activity_at: datetime | None
     call_attempt_count: int
     last_outcome_key: str | None = None
@@ -97,6 +100,50 @@ class ProspectRead(BaseModel):
     activities: list[ProspectActivityRead] = Field(default_factory=list)
 
 
+class ProspectAppointmentCreate(BaseModel):
+    """Book from authoritative prospect data, never retyped contact fields."""
+
+    expected_version: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=8, max_length=80)
+    starts_at: datetime
+    duration_min: int | None = Field(default=None, ge=15, le=180)
+    meeting_mode: Literal["video", "phone", "in_person"] = "video"
+    location: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=4000)
+    transactional_sms_consent: bool = False
+    # Outcome definitions are admin-configurable. The route resolves this key
+    # against the active definitions and verifies that its configured action
+    # is a booking action; keeping a hard-coded Literal here made valid custom
+    # outcomes impossible to use.
+    trigger_outcome_key: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("idempotency_key", mode="before")
+    @classmethod
+    def strip_idempotency_key(cls, value: object) -> object:
+        return str(value).strip() if value is not None else value
+
+    @field_validator("trigger_outcome_key", mode="before")
+    @classmethod
+    def normalize_trigger_outcome_key(cls, value: object) -> object:
+        return str(value).strip().lower() if value is not None else value
+
+
+class ProspectAppointmentDeliveryRead(BaseModel):
+    state: Literal["queued", "meet_ready", "action_required"]
+    google_sync_status: str
+    email_status: str
+    sms_status: str
+    meet_url: str | None = None
+    error: str | None = None
+
+
+class ProspectAppointmentResult(BaseModel):
+    appointment: RepAppointmentRead
+    prospect: ProspectRead
+    delivery: ProspectAppointmentDeliveryRead
+    idempotent_replay: bool = False
+
+
 class ProspectListRead(BaseModel):
     items: list[ProspectRead]
     total: int
@@ -104,6 +151,8 @@ class ProspectListRead(BaseModel):
     offset: int
     stages: list[ProspectStageRead]
     outcomes: list[ProspectOutcomeRead]
+    server_now: datetime
+    follow_up_timezone: str
 
 
 class ProspectOwnerRead(BaseModel):
@@ -224,6 +273,91 @@ class ProspectActivityCreate(BaseModel):
         return str(value).strip() if value is not None else value
 
 
+class ProspectCallAttemptCreate(BaseModel):
+    method: Literal["google_voice", "device_dialer"]
+    # Optional for one-release compatibility with older Field Desk clients.
+    # Current clients keep this stable while retrying an uncertain audit write.
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=80)
+
+
+FollowUpChoice = Literal["next_business_day", "two_business_days", "custom"]
+
+
+class ProspectFollowUpSuggestionRead(BaseModel):
+    scheduled_at: datetime
+    timezone: str
+    business_days: int
+
+
+class ProspectDuplicateMatchRead(BaseModel):
+    entity_type: Literal["prospect", "contact"] = "prospect"
+    prospect_id: UUID | None = None
+    contact_id: UUID
+    owner_user_id: UUID | None = None
+    archived: bool
+    version: int | None = None
+    matched_on: list[Literal["email", "phone"]] = Field(default_factory=list)
+
+
+class ProspectDuplicateCheckRead(BaseModel):
+    blocked: bool
+    state: Literal[
+        "clear",
+        "active_match",
+        "archived_match",
+        "hidden_match",
+        "identity_conflict",
+    ]
+    email_normalized: str | None = None
+    phone_normalized: str | None = None
+    visible_matches: list[ProspectDuplicateMatchRead] = Field(default_factory=list)
+    assignment_required: bool = False
+    can_restore: bool = False
+    message: str
+
+
+class ProspectReassignmentRequestCreate(BaseModel):
+    email: EmailStr | None = None
+    phone: str | None = Field(default=None, max_length=48)
+    idempotency_key: str = Field(min_length=8, max_length=80)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> ProspectReassignmentRequestCreate:
+        if not self.email and not (self.phone or "").strip():
+            raise ValueError("Enter an email address or phone number")
+        return self
+
+    @field_validator("idempotency_key", "reason", mode="before")
+    @classmethod
+    def strip_reassignment_text(cls, value: object) -> object:
+        if value is None:
+            return None
+        return str(value).strip()
+
+
+class ProspectReassignmentRequestRead(BaseModel):
+    status: Literal["accepted"] = "accepted"
+    request_token: str
+
+
+class ProspectTimelineItemRead(BaseModel):
+    id: str
+    source: Literal["prospect", "message", "sms", "appointment"]
+    source_id: UUID
+    kind: str
+    body: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    actor_user_id: UUID | None = None
+    actor_name: str | None = None
+    occurred_at: datetime
+
+
+class ProspectTimelineRead(BaseModel):
+    items: list[ProspectTimelineItemRead] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 class ProspectUndoRequest(BaseModel):
     expected_version: int = Field(ge=1)
 
@@ -233,7 +367,16 @@ class ProspectOutcomeApply(BaseModel):
     expected_version: int = Field(ge=1)
     note: str | None = Field(default=None, max_length=2000)
     next_follow_up_at: datetime | None = None
+    follow_up_choice: FollowUpChoice | None = None
     appointment_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_follow_up_choice(self) -> ProspectOutcomeApply:
+        if self.follow_up_choice == "custom" and self.next_follow_up_at is None:
+            raise ValueError("next_follow_up_at is required for a custom follow-up")
+        if self.follow_up_choice not in {None, "custom"} and self.next_follow_up_at is not None:
+            raise ValueError("next_follow_up_at is only valid for a custom follow-up")
+        return self
 
     @field_validator("outcome_key", mode="before")
     @classmethod

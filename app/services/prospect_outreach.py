@@ -2418,6 +2418,17 @@ async def _advance_new_prospect_after_delivery(
     prospect.stage_definition_id = emailed.id
     prospect.version = before_version + 1
     at = utcnow()
+    # The first outreach always creates the next actionable work block.  Keep
+    # this server-owned so closing the browser during the review/send window
+    # cannot leave a prospect in Emailed with no follow-up.
+    from app.dealer_os.services import prospects as prospect_service
+
+    follow_up_timezone = await prospect_service.firm_booking_timezone(db)
+    prospect.next_follow_up_at = prospect_service.business_follow_up_at(
+        business_days=1,
+        timezone_name=follow_up_timezone,
+        current_time=at,
+    )
     prospect.last_activity_at = at
     db.add(
         DealerProspectActivity(
@@ -2432,6 +2443,8 @@ async def _advance_new_prospect_after_delivery(
                 "draft_id": str(row.id),
                 "version_before": before_version,
                 "version_after": prospect.version,
+                "next_follow_up_at": prospect.next_follow_up_at.isoformat(),
+                "follow_up_timezone": follow_up_timezone,
                 "reversible": False,
             },
         )

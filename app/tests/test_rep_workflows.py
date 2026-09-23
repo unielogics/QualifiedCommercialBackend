@@ -149,7 +149,7 @@ def test_field_desk_inbox_filter_is_owner_only_for_every_staff_role() -> None:
     assert "owner_user_id" in str(clause.left)
 
 
-def test_global_search_keeps_rep_files_and_bookings_owner_scoped() -> None:
+def test_global_search_keeps_rep_files_scoped_and_follows_live_prospect_access() -> None:
     user_id = uuid4()
     user = SimpleNamespace(id=user_id, role=Role.FIELD_REP)
 
@@ -158,8 +158,14 @@ def test_global_search_keeps_rep_files_and_bookings_owner_scoped() -> None:
 
     assert "owner_user_id" in str(file_clause)
     assert user_id.hex in str(file_clause.compile(compile_kwargs={"literal_binds": True}))
-    assert "booked_by_user_id" in str(appointment_clause)
-    assert appointment_clause.right.value == user_id
+    rendered = str(
+        appointment_clause.compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "dos_rep_appointments.prospect_id IS NULL" in rendered
+    assert "dos_rep_appointments.booked_by_user_id" in rendered
+    assert "dealer_prospects.owner_user_id" in rendered
+    assert "dos_rep_contact_assignments" in rendered
+    assert user_id.hex in rendered
 
 
 def test_global_search_keeps_assigned_contacts_available_to_reps() -> None:

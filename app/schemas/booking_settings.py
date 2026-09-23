@@ -116,7 +116,10 @@ class UserBookingSettingsBase(BaseModel):
     available_days: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5])
     weekly_schedule: list[BookingDaySchedule] = Field(default_factory=list, max_length=7)
     advance_booking_window_enabled: bool = False
+    # ``minimum_notice_days`` is retained for legacy clients. New clients send
+    # minutes so same-day windows such as 15, 30, 60 and 90 minutes are exact.
     minimum_notice_days: int = Field(default=2, ge=0, le=365)
+    minimum_notice_minutes: int = Field(default=2880, ge=0, le=525600)
     maximum_advance_days: int = Field(default=5, ge=1, le=365)
     blocked_intervals: list[BookingBlockedInterval] = Field(default_factory=list, max_length=56)
     booking_questions: dict[Literal["business_name", "phone", "requested_amount", "bank_statement"], bool] = Field(
@@ -229,6 +232,17 @@ class UserBookingSettingsBase(BaseModel):
     def _validate_booking_window(self) -> UserBookingSettingsBase:
         from app.services.team_calendar import INHERITABLE_BOOKING_FIELDS
 
+        # Prefer the minute field whenever it was supplied. A days-only payload
+        # is an older client and remains authoritative for this transition
+        # release. Keep the legacy value conservatively rounded up so it never
+        # advertises a weaker policy than the minute-precise value.
+        if "minimum_notice_minutes" in self.model_fields_set:
+            self.minimum_notice_days = (
+                self.minimum_notice_minutes + (24 * 60) - 1
+            ) // (24 * 60)
+        elif "minimum_notice_days" in self.model_fields_set:
+            self.minimum_notice_minutes = self.minimum_notice_days * 24 * 60
+
         self.precall_allowed_variants = list(dict.fromkeys(self.precall_allowed_variants))
         if self.precall_default_variant not in self.precall_allowed_variants:
             raise ValueError("The default pre-call vertical must be one of the allowed verticals")
@@ -238,7 +252,7 @@ class UserBookingSettingsBase(BaseModel):
             raise ValueError(
                 "Unknown firm policy override(s): " + ", ".join(sorted(unknown_overrides))
             )
-        if self.maximum_advance_days < self.minimum_notice_days:
+        if self.maximum_advance_days * 24 * 60 < self.minimum_notice_minutes:
             raise ValueError("Latest booking day must be on or after the earliest booking day")
 
         for field_name in ("reminder_email_minutes", "reminder_sms_minutes"):
